@@ -760,22 +760,121 @@ fn office_early_scope_exit_explains_uncertainty_and_checks_in_cli() {
 }
 
 // ===========================================================================
-// office_05 — QB41: prepared_hash drift (renderer change) confirms, then
-// creates gen+1 while preserving gen 0 (first-instance-wins)
+// office_05 — prepared_hash drift creates gen+1 without confirmation
 // ===========================================================================
 
 #[test]
-fn office_05_qb41_renderer_drift_prompts_then_gen1() {
+fn office_05_qb41_renderer_drift_creates_gen1_without_confirmation() {
+    assert_renderer_drift(false, false);
+}
+
+#[test]
+fn office_05_watch_renderer_drift_creates_gen1_without_confirmation() {
+    assert_renderer_drift(true, true);
+}
+
+/// Relocating the renderer changes its preparation profile, not its output.
+#[test]
+fn office_05_identical_output_at_another_renderer_path_keeps_generation_and_provenance() {
+    let dir = canonical_tempdir();
+    let fixtures = tempfile::tempdir().unwrap();
+    let fixture_a = write_office_fixture_pdf(
+        &fixtures,
+        "renderer_a.pdf",
+        &["same prepared output across renderer paths"],
+    );
+    let fixture_b = fixtures.path().join("renderer_b.pdf");
+    fs::copy(&fixture_a, &fixture_b).unwrap();
+    write_office_input(&dir, "report.docx");
+    init(&dir);
+    let units_root = dir.path().join(".kio/objects/normalized_units");
+    kio(&dir, &["index"])
+        .env(TEST_OFFICE_CONVERT_ENV, &fixture_a)
+        .arg("--json")
+        .assert()
+        .success();
+    let gen0 = gen_dir_with_suffix(&units_root, ".g0");
+    let before = file_snapshot(&gen0);
+    let manifests = dir.path().join(".kio/objects/manifests");
+    let immutable_before = file_snapshot(&manifests);
+    for fixture in [&fixture_b, &fixture_a, &fixture_b] {
+        kio(&dir, &["index"])
+            .env(TEST_OFFICE_CONVERT_ENV, fixture)
+            .arg("--json")
+            .assert()
+            .success();
+        assert_eq!(
+            gen_dir_names_under(&units_root).len(),
+            1,
+            "identical unit keys and prepared hashes must preserve g0"
+        );
+        assert_eq!(
+            file_snapshot(&gen0),
+            before,
+            "the original profile, provenance and units must remain unchanged"
+        );
+        assert_eq!(file_snapshot(&manifests), immutable_before);
+    }
+}
+
+struct WatchChild(std::process::Child);
+impl Drop for WatchChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn file_snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    fn visit(root: &Path, dir: &Path, result: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                visit(root, &entry.path(), result);
+            } else {
+                result.insert(
+                    entry.path().strip_prefix(root).unwrap().to_owned(),
+                    fs::read(entry.path()).unwrap(),
+                );
+            }
+        }
+    }
+    let mut result = std::collections::BTreeMap::new();
+    visit(root, root, &mut result);
+    result
+}
+
+#[test]
+fn office_05_pagination_drift_with_unchanged_profile_creates_gen1() {
+    assert_renderer_drift(false, true);
+}
+
+fn assert_renderer_drift(watch: bool, pagination_changed: bool) {
     let dir = canonical_tempdir();
     // Fixtures live OUTSIDE the scope root — see office_01's comment.
     let fixtures = tempfile::tempdir().unwrap();
+    let kio = |dir: &TempDir, args: &[&str]| {
+        let mut command = kio(dir, args);
+        command.envs(support::home_env(fixtures.path()));
+        command
+    };
+    let json_success = |dir: &TempDir, args: &[&str]| -> Value {
+        let output = kio(dir, args)
+            .arg("--json")
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        serde_json::from_slice(&output).unwrap()
+    };
     let fixture_a = write_office_fixture_pdf(
         &fixtures,
         "fixture_a.pdf",
         &["office05 renderer version ALPHA distinct text"],
     );
     write_office_input(&dir, "report.docx");
-    init(&dir);
+    kio(&dir, &["init"]).assert().success();
 
     kio(&dir, &["index", "--yes"])
         .env(TEST_OFFICE_CONVERT_ENV, fixture_a.display().to_string())
@@ -790,59 +889,89 @@ fn office_05_qb41_renderer_drift_prompts_then_gen1() {
         "exactly one (g0) instance after the first index"
     );
 
+    let gen0_dir = gen_dir_with_suffix(&units_root, ".g0");
+    let gen0_before = file_snapshot(&gen0_dir);
+    let raw_root = dir.path().join(".kio/objects/raw");
+    let raw_before = file_snapshot(&raw_root);
+    let old_search = json_success(&dir, &["search", "ALPHA", "--mode", "text"]);
+    let old_pointer = serde_json::to_string(&old_search["results"][0]["evidence_pointer"]).unwrap();
+    let old_view = json_success(&dir, &["view", &old_pointer]);
+    assert_eq!(
+        json_success(&dir, &["evidence", "verify", &old_pointer])["status"],
+        "alive"
+    );
+
     // Switch the seam to fixture B (a different renderer output — different
     // text, changing every unit's prepared_hash under the SAME raw_hash).
     let fixture_b = write_office_fixture_pdf(
         &fixtures,
-        "fixture_b.pdf",
-        &["office05 renderer version BETA completely different wording"],
+        if pagination_changed {
+            "fixture_a.pdf"
+        } else {
+            "fixture_b.pdf"
+        },
+        if pagination_changed {
+            &[
+                "office05 renderer version BETA completely different wording",
+                "office05 extra rendered page",
+            ]
+        } else {
+            &["office05 renderer version BETA completely different wording"]
+        },
     );
 
-    // Non-interactive `kio index` (no --yes): refused.
-    let stderr = kio(&dir, &["index"])
-        .env(TEST_OFFICE_CONVERT_ENV, fixture_b.display().to_string())
-        .arg("--json")
-        .assert()
-        .code(9)
-        .get_output()
-        .stderr
-        .clone();
-    let error: Value = serde_json::from_slice(&stderr).unwrap();
-    assert_eq!(error["error_code"], "KIO-E-CONFIRM-REJECTED-001", "{error}");
+    // Neither foreground watch nor index has local preparation confirmation.
+    if watch {
+        let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("kio"));
+        for name in KIO_CHILD_ENV_DENYLIST {
+            command.env_remove(name);
+        }
+        command
+            .envs(support::home_env(fixtures.path()))
+            .current_dir(dir.path())
+            .args(["watch", "run", "--reconcile-interval-seconds", "1"])
+            .env(TEST_OFFICE_CONVERT_ENV, fixture_b.display().to_string())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::fs::File::create(fixtures.path().join("watch.stderr")).unwrap());
+        let mut child = WatchChild(command.spawn().unwrap());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
+        while gen_dir_names_under(&units_root).len() != 2 {
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "watch exited before publishing g1: {}",
+                fs::read_to_string(fixtures.path().join("watch.stderr")).unwrap()
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "watch did not publish g1"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        // Let another reconciliation observe identical output.
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        assert!(child.0.try_wait().unwrap().is_none());
+    } else {
+        kio(&dir, &["index"])
+            .env(TEST_OFFICE_CONVERT_ENV, fixture_b.display().to_string())
+            .arg("--json")
+            .assert()
+            .success();
+    }
 
-    // NO new instance was created by the refused attempt.
-    let gens_after_refusal = gen_dir_names_under(&units_root);
+    let generations = gen_dir_names_under(&units_root);
     assert_eq!(
-        gens_after_refusal.len(),
-        1,
-        "a refused confirmation must not create a new generation: {gens_after_refusal:?}"
-    );
-    assert!(
-        gens_after_refusal[0].ends_with(".g0"),
-        "{gens_after_refusal:?}"
-    );
-
-    // Re-run with the yes-flag: new gen instance exists (gen advanced), old
-    // preserved (first-instance-wins).
-    kio(&dir, &["index", "--yes"])
-        .env(TEST_OFFICE_CONVERT_ENV, fixture_b.display().to_string())
-        .arg("--json")
-        .assert()
-        .success();
-
-    let gens_after_confirm = gen_dir_names_under(&units_root);
-    assert_eq!(
-        gens_after_confirm.len(),
+        generations.len(),
         2,
-        "gen 0 must be preserved AND a new gen created: {gens_after_confirm:?}"
+        "gen 0 must be preserved AND a new gen created: {generations:?}"
     );
     assert!(
-        gens_after_confirm.iter().any(|name| name.ends_with(".g0")),
-        "{gens_after_confirm:?}"
+        generations.iter().any(|name| name.ends_with(".g0")),
+        "{generations:?}"
     );
     assert!(
-        gens_after_confirm.iter().any(|name| name.ends_with(".g1")),
-        "{gens_after_confirm:?}"
+        generations.iter().any(|name| name.ends_with(".g1")),
+        "{generations:?}"
     );
 
     // The new generation's manifest declares gen=1, parent_gen=0, and reflects
@@ -851,6 +980,31 @@ fn office_05_qb41_renderer_drift_prompts_then_gen1() {
     let gen1_dir = gen_dir_with_suffix(&units_root, ".g1");
     let gen0_manifest = manifest_json(&gen0_dir);
     let gen1_manifest = manifest_json(&gen1_dir);
+    assert_eq!(file_snapshot(&gen0_dir), gen0_before);
+    assert_eq!(file_snapshot(&raw_root), raw_before);
+    assert_eq!(json_success(&dir, &["view", &old_pointer]), old_view);
+    assert_eq!(
+        json_success(&dir, &["evidence", "verify", &old_pointer])["status"],
+        "alive"
+    );
+    let provenance = &gen1_manifest["preparation_provenance"];
+    assert!(provenance["renderer_name"].is_string(), "{provenance}");
+    assert!(provenance["renderer_version"].is_string(), "{provenance}");
+    assert!(provenance["producer_os"].is_string(), "{provenance}");
+    assert!(provenance["producer_arch"].is_string(), "{provenance}");
+    let manifest_bytes = kio_core::cas::canonical_json_bytes(&gen1_manifest).unwrap();
+    let manifest_hash = kio_core::cas::hash_bytes(&manifest_bytes);
+    let manifest_cas =
+        kio_core::cas::fanout_path(dir.path().join(".kio/objects/manifests"), &manifest_hash)
+            .unwrap();
+    assert_eq!(fs::read(manifest_cas).unwrap(), manifest_bytes);
+    if pagination_changed {
+        assert_eq!(
+            gen0_manifest["units"][0]["preparation_profile_hash"],
+            gen1_manifest["units"][0]["preparation_profile_hash"]
+        );
+        assert_eq!(gen1_manifest["units"].as_array().unwrap().len(), 2);
+    }
     assert_eq!(gen1_manifest["gen"], 1, "{gen1_manifest}");
     assert_eq!(gen1_manifest["parent_gen"], 0, "{gen1_manifest}");
     assert_eq!(gen0_manifest["gen"], 0, "gen 0 untouched: {gen0_manifest}");
@@ -858,6 +1012,36 @@ fn office_05_qb41_renderer_drift_prompts_then_gen1() {
         gen0_manifest["units"][0]["prepared_hash"], gen1_manifest["units"][0]["prepared_hash"],
         "the renderer drift must be reflected in a changed prepared_hash: \
          gen0={gen0_manifest} gen1={gen1_manifest}"
+    );
+    kio(&dir, &["index"])
+        .env(TEST_OFFICE_CONVERT_ENV, fixture_b.display().to_string())
+        .arg("--json")
+        .assert()
+        .success();
+    assert_eq!(gen_dir_names_under(&units_root).len(), 2);
+    let latest = json_success(&dir, &["search", "BETA", "--mode", "text"]);
+    assert!(
+        !latest["results"].as_array().unwrap().is_empty(),
+        "{latest}"
+    );
+    // Explicit regenerate still requires confirmation and cannot mutate storage on refusal.
+    kio(&dir, &["reindex", "--regenerate"])
+        .env(TEST_OFFICE_CONVERT_ENV, fixture_b.display().to_string())
+        .arg("--json")
+        .assert()
+        .code(9);
+    assert_eq!(gen_dir_names_under(&units_root).len(), 2);
+    let status = json_success(&dir, &["status"]);
+    let online_task = online_markdownize_task_for(&status, "report.docx").unwrap();
+    assert_eq!(online_task["status"], "paused", "{status}");
+    assert_eq!(
+        online_task["hold_reason"], "ledger_initialization_required",
+        "{status}"
+    );
+    assert!(
+        markdownize_tasks_for(&status, "report.docx")
+            .iter()
+            .all(|task| task["fallback_reason"] != "online_adapter_done")
     );
 }
 
@@ -940,8 +1124,8 @@ fn office_06_conversion_failure_contract_violation() {
 /// of every real-world FlateDecode-compressed PDF, including real soffice
 /// output), while its done ONLINE instance discovered its units from the OCR
 /// response. "Empty fresh prepare" vs "OCR-discovered manifest" must never
-/// read as renderer drift (exit-9 churn on every re-index; an `--yes`
-/// offline gen+1 from unreadable input would shadow the OCR content). Today
+/// read as renderer drift (an offline gen+1 from unreadable input would
+/// shadow the OCR content). Today
 /// TWO independent layers keep this true — run_index_pipeline's R20-5
 /// empty-prepare arm peels the candidate off before the done-instance branch,
 /// and `prepared_hash_drift_new_gen`'s guards (a)/(b) refuse the verdict at

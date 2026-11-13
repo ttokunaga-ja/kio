@@ -969,7 +969,7 @@ mod tests {
             .write_content_object(ContentObjectKind::NormalizedUnit, &bytes)
             .unwrap();
         let mut manifest: NormalizedInstanceManifest = serde_json::from_value(json!({
-            "raw_hash":raw,"tool_profile_hash":profile,"gen":0,"parent_gen":null,
+            "raw_hash":raw,"tool_profile_hash":profile,"gen":0,"parent_gen":null,"preparation_provenance":{"renderer_name":null,"renderer_version":null,"producer_os":"linux","producer_arch":"x86_64"},
             "run_id":"test","generated_at":"2026-09-27T00:00:00Z",
             "units":[
                 {"order":0,"unit_key":"file:1","unit_ref":kio_pipeline::prepare::unit_ref("file:1"),

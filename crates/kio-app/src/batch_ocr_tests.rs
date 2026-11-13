@@ -68,6 +68,7 @@ fn batch_ocr_image_is_owned_reopenable_and_retained_for_its_source_unit() {
     );
 
     let prepared = PreparedUnit {
+        renderer: None,
         order: 0,
         unit_key: "image:0".to_owned(),
         unit_type: UnitType::Image,

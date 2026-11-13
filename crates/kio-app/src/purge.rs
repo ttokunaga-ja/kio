@@ -3085,6 +3085,7 @@ mod image_ownership_tests {
             generated_at: "2026-09-08T00:00:00Z".to_owned(),
         };
         let manifest = NormalizedInstanceManifest {
+            preparation_provenance: kio_pipeline::markdownize::PreparationProvenance::local(),
             raw_hash: unit.raw_hash.clone(),
             tool_profile_hash: unit.tool_profile_hash.clone(),
             r#gen: 0,

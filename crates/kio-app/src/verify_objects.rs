@@ -2853,6 +2853,7 @@ mod tests {
             .write_content_object(ContentObjectKind::NormalizedUnit, &unit_bytes)
             .unwrap();
         let manifest = NormalizedInstanceManifest {
+            preparation_provenance: kio_pipeline::markdownize::PreparationProvenance::local(),
             raw_hash: raw_hash.clone(),
             tool_profile_hash: profile_hash.clone(),
             r#gen: 4,

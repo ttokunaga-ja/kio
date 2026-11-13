@@ -1881,6 +1881,15 @@ fn load_previous_instance_identity(
         .units
         .iter()
         .map(|entry| PreparedUnit {
+            renderer: manifest
+                .preparation_provenance
+                .renderer_name
+                .as_ref()
+                .zip(manifest.preparation_provenance.renderer_version.as_ref())
+                .map(|(name, version)| kio_pipeline::prepare::RendererIdentity {
+                    name: name.clone(),
+                    version: version.clone(),
+                }),
             order: entry.order,
             unit_key: entry.unit_key.clone(),
             unit_type: entry.unit_type,
@@ -2192,6 +2201,17 @@ pub(crate) fn merged_failed_unit_retry_kinds(
     kinds
 }
 
+fn preparation_provenance_from_units(
+    prepared: &[PreparedUnit],
+) -> kio_pipeline::markdownize::PreparationProvenance {
+    let mut provenance = kio_pipeline::markdownize::PreparationProvenance::local();
+    if let Some(renderer) = prepared.iter().find_map(|unit| unit.renderer.as_ref()) {
+        provenance.renderer_name = Some(renderer.name.clone());
+        provenance.renderer_version = Some(renderer.version.clone());
+    }
+    provenance
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn manifest_from_units(
     prepared_units: &[PreparedUnit],
@@ -2238,6 +2258,7 @@ fn manifest_from_units_with_failed_kinds(
         .map(|unit| unit.unit_key.as_str())
         .collect::<BTreeSet<_>>();
     NormalizedInstanceManifest {
+        preparation_provenance: preparation_provenance_from_units(prepared_units),
         raw_hash: raw_hash.to_owned(),
         tool_profile_hash: tool_profile_hash.to_owned(),
         r#gen,
@@ -2334,6 +2355,7 @@ mod resource_failure_tests {
             let unit: NormalizedUnitObject=serde_json::from_value(serde_json::json!({"unit_key":"page:1","unit_type":"page","raw_hash":raw_hash,"prepared_hash":profile,"preparation_profile_hash":profile,"tool_profile_hash":profile,"gen":0,"mode":"full","markdown":"verified first page\n","owned_image_hashes":[],"metadata":{},"reused_from":null,"generated_at":"2026-07-03T00:00:00Z"})).unwrap();
             let units = if done { vec![unit] } else { vec![] };
             let manifest = NormalizedInstanceManifest {
+                preparation_provenance: kio_pipeline::markdownize::PreparationProvenance::local(),
                 raw_hash: raw_hash.clone(),
                 tool_profile_hash: profile.clone(),
                 r#gen: 0,

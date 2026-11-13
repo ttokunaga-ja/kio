@@ -1037,6 +1037,7 @@ mod tests {
         let prepared_hash = hash_bytes(b"prepared");
         let unit_key = "page:1".to_owned();
         let manifest = NormalizedInstanceManifest {
+            preparation_provenance: kio_pipeline::markdownize::PreparationProvenance::local(),
             raw_hash: raw_hash.clone(),
             tool_profile_hash: profile_hash.clone(),
             r#gen: 0,
@@ -1143,6 +1144,7 @@ mod tests {
         let profile_hash = hash_bytes(b"profile");
         let prepared_hash = hash_bytes(b"prepared");
         let manifest = NormalizedInstanceManifest {
+            preparation_provenance: kio_pipeline::markdownize::PreparationProvenance::local(),
             raw_hash: raw_hash.clone(),
             tool_profile_hash: profile_hash.clone(),
             r#gen: 0,
