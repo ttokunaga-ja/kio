@@ -2,7 +2,7 @@ pub(crate) const GC_RETIRE_SENTINEL: &[u8] = b"kio gc retirement sentinel\n";
 use super::gc_io::{open_verified_file_handle, sync_bound_directory};
 use crate::error::Result;
 use crate::gc::{
-    FileObservation, MAX_METADATA, corrupt, create_new_bound, id_meta, ioerr,
+    FileObservation, MAX_METADATA, corrupt, create_new_bound, id_meta, ioerr, observe_cas_regular,
     read_regular_observed, unique_internal_name,
 };
 use crate::platform::{
@@ -86,7 +86,7 @@ pub(crate) fn exchange_capture_verified_named(
     // The deterministic captured state is a recovery state, so it must reach
     // stable storage before any caller can expose a crash seam after capture.
     sync_bound_directory(dir, leaf)?;
-    let (_bytes, observed) = read_regular_observed(dir, captured, max)?;
+    let observed = observe_cas_regular(&crate::cas::CasReadAccess::Unmetered, dir, captured, max)?;
     if observed.identity != expected.identity
         || observed.state.len != expected.state.len
         || observed.digest != expected.digest
@@ -112,7 +112,7 @@ pub(crate) fn remove_verified_leaf(
     max: u64,
     label: &str,
 ) -> Result<()> {
-    let (bytes, observed) = read_regular_observed(dir, leaf, max)?;
+    let observed = observe_cas_regular(&crate::cas::CasReadAccess::Unmetered, dir, leaf, max)?;
     if observed != *expected {
         return Err(corrupt(&format!("{label} changed before unlink")));
     }
@@ -120,7 +120,7 @@ pub(crate) fn remove_verified_leaf(
     let handle_observed =
         cap_fs::Metadata::from_file(&handle).map_err(|error| ioerr(error, leaf))?;
     if id_meta(&handle_observed)? != observed.identity
-        || handle_observed.len() != bytes.len() as u64
+        || handle_observed.len() != observed.state.len
     {
         return Err(corrupt(&format!(
             "{label} changed while binding unlink handle"

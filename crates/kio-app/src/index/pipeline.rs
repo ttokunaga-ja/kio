@@ -676,21 +676,24 @@ pub(crate) fn run_index_pipeline(
     let max_input_bytes = effective_max_input_bytes(repo)?;
     // R12-1: the documented `[markdownize.incremental]` overrides (were hardcoded).
     let incremental_config = effective_incremental_config(repo)?;
-    let head_ocr_normalizes = repo
-        .head_commit_hash()?
-        .map(|head| read_head_tree_for_rebuild(repo, &head))
-        .transpose()?
-        .map(|tree| {
-            tree.entries
-                .into_iter()
-                .filter_map(|entry| {
-                    entry
-                        .normalize
-                        .map(|normalize| (entry.path, (entry.raw_hash, normalize)))
-                })
-                .collect::<BTreeMap<_, _>>()
-        })
-        .unwrap_or_default();
+    let candidate_paths = preview
+        .candidates
+        .iter()
+        .filter(|candidate| !candidate.ignored && candidate.media_type != "inode/directory")
+        .map(|candidate| candidate.input_path.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut head_ocr_normalizes = BTreeMap::new();
+    if let Some(head) = repo.head_commit_hash()? {
+        let tree = read_head_tree_for_rebuild(repo, &head)?;
+        for entry in &tree.entries {
+            let entry = entry?;
+            if candidate_paths.contains(entry.path.as_str())
+                && let Some(normalize) = entry.normalize
+            {
+                head_ocr_normalizes.insert(entry.path, (entry.raw_hash, normalize));
+            }
+        }
+    }
 
     for candidate in preview
         .candidates

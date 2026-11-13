@@ -93,8 +93,8 @@ impl Repository {
         // (docs/05 §3.4.1: "片方が shallow なら全ファイル差分は不能と明示").
         let a_tree = self.diff_side_tree("a", &a_hash)?;
         let b_tree = self.diff_side_tree("b", &b_hash)?;
-        let a_map = tree_map(&a_tree);
-        let b_map = tree_map(&b_tree);
+        let a_map = tree_map(&a_tree)?;
+        let b_map = tree_map(&b_tree)?;
 
         let mut paths = BTreeSet::new();
         paths.extend(a_map.keys().cloned());
@@ -433,19 +433,7 @@ impl Repository {
     }
 
     pub fn read_tree(&self, hash: &str) -> Result<TreeObject> {
-        let object = self.store.read_object(ObjectKind::Tree, hash)?;
-        if object.kind != ObjectKind::Tree {
-            return Err(KioError::schema("hash does not identify a tree"));
-        }
-        let tree: TreeObject = serde_json::from_slice(&object.bytes)
-            .map_err(|err| KioError::schema(err.to_string()))?;
-        if tree.entries.len() > MAX_TREE_ENTRIES {
-            return Err(KioError::schema(format!(
-                "tree entries exceed the limit of {MAX_TREE_ENTRIES}"
-            )));
-        }
-        tree.validate()?;
-        Ok(tree)
+        self.store.read_tree(hash).map(|(tree, _)| tree)
     }
 
     pub fn head_commit_hash(&self) -> Result<Option<String>> {

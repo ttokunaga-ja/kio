@@ -415,7 +415,7 @@ pub(super) fn explained_historical_manifests(
     reachable: &BTreeSet<String>,
     head: Option<&str>,
     now: &str,
-) -> BTreeMap<String, (String, NormalizeRef)> {
+) -> Result<BTreeMap<String, (String, NormalizeRef)>> {
     let mut eligible = BTreeMap::new();
     let mut rejected = BTreeSet::new();
     for hash in reachable {
@@ -423,6 +423,7 @@ pub(super) fn explained_historical_manifests(
             continue;
         };
         for entry in &tree.entries {
+            let entry = entry?;
             let Some(reference) = &entry.normalize else {
                 continue;
             };
@@ -452,7 +453,7 @@ pub(super) fn explained_historical_manifests(
             }
         }
     }
-    eligible
+    Ok(eligible)
 }
 
 /// Read-only missing-closure classification shared by replica materialization.
@@ -498,13 +499,7 @@ pub(crate) fn purge_explains_missing_retained_instance(
                 if shallow.contains_key(&hash) {
                     return Err(KioError::schema("shallow receipt coexists with tree"));
                 }
-                state.add_bytes(
-                    canonical_json_bytes(
-                        &serde_json::to_value(&tree)
-                            .map_err(|error| KioError::schema(error.to_string()))?,
-                    )?
-                    .len() as u64,
-                );
+                state.add_bytes(kio_core::dag::tree_json_size(&tree)?);
                 trees.insert(commit.tree.clone(), tree);
             }
             Err(error)
@@ -525,7 +520,7 @@ pub(crate) fn purge_explains_missing_retained_instance(
         &reachable,
         repo.head_commit_hash()?.as_deref(),
         &repo.control().now_utc_seconds(),
-    );
+    )?;
     if !authority
         .get(&normalize.manifest_hash)
         .is_some_and(|(raw, reference)| raw == raw_hash && reference == normalize)

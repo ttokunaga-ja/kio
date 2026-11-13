@@ -272,14 +272,14 @@ fn retained_history_instances_from_graph(
     control: &ControlHandle,
 ) -> Result<Vec<RetainedNormalizedInstance>> {
     let mut all_paths_by_raw = BTreeMap::<String, BTreeSet<String>>::new();
-    for appearance in graph.bindings() {
+    for appearance in graph.bindings()? {
         all_paths_by_raw
             .entry(appearance.binding.raw_hash)
             .or_default()
             .insert(appearance.binding.path);
     }
     let exact_bindings = graph
-        .bindings()
+        .bindings()?
         .into_iter()
         .map(|appearance| appearance.binding)
         .filter(|binding| binding.normalize.is_some())
@@ -306,7 +306,7 @@ fn retained_history_instances_from_graph(
             normalize.r#gen,
             normalize.manifest_hash.clone(),
         );
-        let introductions = graph.ancestor_most_introductions(&binding);
+        let introductions = graph.ancestor_most_introductions(&binding)?;
         if introductions.is_empty() {
             return Err(KioError::schema(
                 "retained history binding has no introduction commit",
@@ -438,6 +438,7 @@ pub(super) fn run(
     // so cache both outcomes instead of reopening its receipts per alias.
     let mut historical_purge_decisions = BTreeMap::<String, bool>::new();
     for entry in &snapshot.tree.entries {
+        let entry = entry?;
         // R23-10 (05-runtime.md §3.5 L813/L934, AUD-08's shrunk finding):
         // `purge.read_tombstone(...).is_some()` blocked on marker EXISTENCE
         // (any tombstone at all, even a retired/resurrected one), not the
@@ -799,6 +800,7 @@ fn selected_history_introductions(
             continue;
         }
         for entry in &node.tree.entries {
+            let entry = entry?;
             let Some(normalize) = &entry.normalize else {
                 continue;
             };

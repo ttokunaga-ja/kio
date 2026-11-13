@@ -1154,36 +1154,30 @@ fn scheduled_preview_change_count(
                 .and_then(|commit| repo.read_tree(&commit.tree))
         })
         .transpose()?;
-    let old = head_tree
-        .as_ref()
-        .map(|tree| {
-            tree.entries
-                .iter()
-                .map(|e| (&e.path, &e.raw_hash))
-                .collect::<BTreeMap<_, _>>()
-        })
-        .unwrap_or_default();
-    let new = preview
+    let mut new = preview
         .candidates
         .iter()
         .filter(|candidate| !candidate.ignored)
         .map(|candidate| {
             Ok((
-                &candidate.input_path,
+                candidate.input_path.as_str(),
                 candidate
                     .raw_hash
-                    .as_ref()
+                    .as_deref()
                     .ok_or_else(|| KioError::schema("bound scheduled scan omitted a raw hash"))?,
             ))
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
-    let changes = old
-        .keys()
-        .chain(new.keys())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .filter(|path| old.get(*path) != new.get(*path))
-        .count() as u64;
+    let mut changes = 0u64;
+    if let Some(tree) = head_tree {
+        for entry in &tree.entries {
+            let entry = entry?;
+            if new.remove(entry.path.as_str()) != Some(entry.raw_hash.as_str()) {
+                changes += 1;
+            }
+        }
+    }
+    changes += new.len() as u64;
     session.assert_public_identity()?;
     Ok(changes)
 }

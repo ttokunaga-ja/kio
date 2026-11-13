@@ -478,6 +478,7 @@ fn retarget_missing_target_manifest_is_store_corruption() {
     let entry = tree
         .entries
         .iter()
+        .map(Result::unwrap)
         .find(|entry| entry.raw_hash == pointer["raw_hash"].as_str().unwrap())
         .unwrap();
     let manifest = &entry.normalize.as_ref().unwrap().manifest_hash;
@@ -592,10 +593,10 @@ fn retarget_marker_classification_precedes_old_manifest_preflight() {
     let manifest_hash = &old_tree
         .entries
         .iter()
+        .map(Result::unwrap)
         .find(|entry| entry.raw_hash == raw_hash)
         .unwrap()
         .normalize
-        .as_ref()
         .unwrap()
         .manifest_hash;
     let store = ObjectStore::new(dir.path().join(".kio"));

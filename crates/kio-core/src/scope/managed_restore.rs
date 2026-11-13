@@ -337,12 +337,12 @@ impl Repository {
             });
         }
         let new_tree = build_tree_with_chunking_config(
-            target_entries.into_values().collect(),
+            target_entries.into_values(),
             head_tree.chunking_config_hash.clone(),
         )?;
         let new_tree_hash = tree_hash(&new_tree)?;
         let (tool_lock_hash, _) = self.tool_lock_identity()?;
-        let stats = commit_stats(Some(&head_tree), &new_tree);
+        let stats = commit_stats(Some(&head_tree), &new_tree)?;
         let paths = changes.iter().map(|change| change.path.clone()).collect();
         let new_commit = CommitObject::new_restored(
             new_tree_hash.clone(),
@@ -400,9 +400,7 @@ impl Repository {
         }
         validate_plan(self, plan)?;
 
-        let tree_value = serde_json::to_value(&plan.new_tree)
-            .map_err(|error| KioError::schema(error.to_string()))?;
-        let (stored_tree_hash, _) = self.store.write_json(ObjectKind::Tree, &tree_value)?;
+        let stored_tree_hash = self.store.write_tree(&plan.new_tree)?;
         if stored_tree_hash != plan.new_tree_hash {
             return Err(restore_incomplete(
                 "managed restore tree hash changed before publication",
@@ -870,10 +868,8 @@ impl Repository {
                 .map(|entry| entry.raw_hash.clone());
             let source = source_entries.get(&change.path);
             let new = restored_tree
-                .entries
-                .iter()
-                .find(|entry| entry.path == change.path)
-                .map(|entry| entry.raw_hash.clone());
+                .find_entry(&change.path)?
+                .map(|entry| entry.raw_hash);
             if old != change.old_raw_hash
                 || new != change.new_raw_hash
                 || change.old_raw_hash == change.new_raw_hash
@@ -897,7 +893,7 @@ impl Repository {
             }
         }
         let expected_restored = build_tree_with_chunking_config(
-            expected_entries.into_values().collect(),
+            expected_entries.into_values(),
             expected_tree.chunking_config_hash,
         )?;
         if expected_restored != restored_tree || tree_hash(&restored_tree)? != journal.new_tree {
@@ -940,13 +936,16 @@ impl Repository {
                 "publication journal is not this managed restore",
             ));
         }
-        let value = serde_json::to_value(&publication)
-            .map_err(|error| KioError::schema(error.to_string()))?;
-        let bytes = canonical_json_bytes(&value)?;
-        self.store_directory()?.quarantine_then_remove(
+        let (hash, size) = crate::cas::hash_stream(
+            &mut super::repository::publication_json_reader(&publication)?,
+        )?;
+        let directory = self.store_directory()?;
+        directory.quarantine_then_remove_hash_with_owner(
+            &directory,
             Path::new(super::PUBLICATION_JOURNAL_LEAF),
-            &bytes,
-            super::MAX_PUBLICATION_JOURNAL_BYTES,
+            &hash,
+            size,
+            size,
         )
     }
 }
@@ -1025,6 +1024,7 @@ fn ensure_reachable_ancestor(repo: &Repository, head: &str, source: &str) -> Res
 fn entries_by_path(tree: &TreeObject) -> Result<BTreeMap<String, TreeEntry>> {
     let mut entries = BTreeMap::new();
     for entry in &tree.entries {
+        let entry = entry?;
         validate_restore_path(&entry.path)?;
         if entries.insert(entry.path.clone(), entry.clone()).is_some() {
             return Err(restore_incomplete("restore tree has duplicate path"));

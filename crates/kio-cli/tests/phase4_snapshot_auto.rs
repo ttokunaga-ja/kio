@@ -329,6 +329,7 @@ fn tree_paths(dir: &TempDir) -> Vec<String> {
         .unwrap()
         .entries
         .into_iter()
+        .map(Result::unwrap)
         .map(|entry| entry.path)
         .collect()
 }
@@ -547,7 +548,9 @@ fn auto_preserves_existing_normalize_refs_and_never_runs_after_index_gc() {
         .read_tree(&initial_commit.tree)
         .unwrap()
         .entries
-        .remove(0);
+        .get(0)
+        .unwrap()
+        .unwrap();
     assert!(initial_entry.normalize.is_some());
     configure(&dir, true, 60, 1);
     fs::write(dir.path().join("new.md"), "new raw has no normalized CAS\n").unwrap();
@@ -559,11 +562,13 @@ fn auto_preserves_existing_normalize_refs_and_never_runs_after_index_gc() {
     let unchanged = preserved_tree
         .entries
         .iter()
+        .map(Result::unwrap)
         .find(|entry| entry.path == "note.md")
         .unwrap();
     let new = preserved_tree
         .entries
         .iter()
+        .map(Result::unwrap)
         .find(|entry| entry.path == "new.md")
         .unwrap();
     assert_eq!(unchanged.normalize, initial_entry.normalize);
@@ -584,7 +589,9 @@ fn auto_preserves_existing_normalize_refs_and_never_runs_after_index_gc() {
         .read_tree(&repo.read_commit(&current).unwrap().tree)
         .unwrap()
         .entries
-        .remove(0);
+        .get(0)
+        .unwrap()
+        .unwrap();
     assert!(
         entry.normalize.is_none(),
         "changed raw cannot retain normalize ref"
@@ -1133,6 +1140,7 @@ fn working_file_change_after_final_observation_is_not_published() {
         assert_eq!(
             tree.entries
                 .iter()
+                .map(Result::unwrap)
                 .find(|entry| entry.path == "new.md")
                 .unwrap()
                 .raw_hash,
@@ -1459,6 +1467,7 @@ fn active_purge_barrier_blocks_raw_republication_and_state_advance() {
     let raw = tree
         .entries
         .iter()
+        .map(Result::unwrap)
         .find(|entry| entry.path == "note.md")
         .unwrap()
         .raw_hash

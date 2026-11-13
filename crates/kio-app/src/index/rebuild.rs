@@ -340,6 +340,7 @@ pub(crate) fn rebuild_step3_index(
         .map_err(|error| annotate_index_stage(error, "walk retained history"))?;
     for node in graph.nodes_in_visit_order() {
         for entry in &node.tree.entries {
+            let entry = entry?;
             let (tool_profile_hash, r#gen, manifest_hash) =
                 entry
                     .normalize
@@ -392,21 +393,19 @@ pub(crate) fn rebuild_step3_index(
     // membership itself is unaffected (`retained_instance_keys` above, from the
     // untouched `retained_history_instances`, still governs the head-direct loop's
     // own dedup).
-    let head_identity_keys = head_tree
-        .as_ref()
-        .map(|tree| &tree.entries)
-        .into_iter()
-        .flatten()
-        .filter_map(|entry| {
-            entry.normalize.as_ref().map(|normalize| {
-                (
-                    entry.raw_hash.clone(),
-                    normalize.tool_profile_hash.clone(),
+    let mut head_identity_keys = BTreeSet::<(String, String, u64)>::new();
+    if let Some(tree) = &head_tree {
+        for entry in &tree.entries {
+            let entry = entry?;
+            if let Some(normalize) = entry.normalize {
+                head_identity_keys.insert((
+                    entry.raw_hash,
+                    normalize.tool_profile_hash,
                     normalize.r#gen,
-                )
-            })
-        })
-        .collect::<BTreeSet<(String, String, u64)>>();
+                ));
+            }
+        }
+    }
     let config = read_chunking_config(repo)?;
     // PC61/62: identities that already have AT LEAST ONE durable association
     // (under any config) as of the start of this rebuild. Combined with
@@ -561,6 +560,7 @@ pub(crate) fn rebuild_step3_index(
         .into_iter()
         .flat_map(|tree| &tree.entries)
     {
+        let entry = entry?;
         let normalize = match &entry.normalize {
             Some(normalize) => normalize.clone(),
             // A tree's omitted normalized reference is immutable historical
@@ -1379,6 +1379,7 @@ pub(crate) fn authenticate_publication_event_cached(
         let mut normalized_entries =
             BTreeMap::<TreeNormalizedEntryKey, BTreeSet<NormalizeRef>>::new();
         for entry in tree.entries {
+            let entry = entry?;
             let Some(normalize) = entry.normalize else {
                 continue;
             };

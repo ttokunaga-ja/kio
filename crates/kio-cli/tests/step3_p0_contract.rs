@@ -1771,6 +1771,7 @@ fn ct4_rebuild_uses_pinned_manifest_unit_status_not_current_working_manifest() {
     let entry = tree
         .entries
         .iter()
+        .map(Result::unwrap)
         .find(|entry| entry.path == "auth.md")
         .unwrap();
     let normalize = entry.normalize.as_ref().unwrap();
@@ -1801,6 +1802,7 @@ fn ct4_rebuild_uses_immutable_pinned_unit_body_not_mutable_cache_body() {
     let entry = tree
         .entries
         .iter()
+        .map(Result::unwrap)
         .find(|entry| entry.path == "auth.md")
         .unwrap();
     let normalize = entry.normalize.as_ref().unwrap();
@@ -1852,6 +1854,7 @@ fn ct4_rebuild_missing_pinned_unit_cas_skips_without_reading_mutable_cache() {
     let entry = tree
         .entries
         .iter()
+        .map(Result::unwrap)
         .find(|entry| entry.path == "auth.md")
         .unwrap();
     let normalize = entry.normalize.as_ref().unwrap();
@@ -1906,6 +1909,7 @@ fn ct4_reindex_at_does_not_publish_later_same_gen_unit_into_failed_snapshot() {
     let entry = tree
         .entries
         .iter()
+        .map(Result::unwrap)
         .find(|entry| entry.path == "auth.md")
         .unwrap();
     let normalize = entry.normalize.as_ref().unwrap();
@@ -1936,10 +1940,10 @@ fn ct4_rebuild_rejects_pinned_manifest_for_a_different_raw_identity() {
     let normalize = tree
         .entries
         .iter()
+        .map(Result::unwrap)
         .find(|entry| entry.path == "auth.md")
         .unwrap()
         .normalize
-        .as_ref()
         .unwrap();
     let store = ObjectStore::new(repo.kio_dir());
     let manifest_path = store
@@ -1964,10 +1968,10 @@ fn ct4_rebuild_rejects_pinned_done_unit_with_mismatched_prepared_hash() {
     let normalize = tree
         .entries
         .iter()
+        .map(Result::unwrap)
         .find(|entry| entry.path == "auth.md")
         .unwrap()
         .normalize
-        .as_ref()
         .unwrap();
     let store = ObjectStore::new(repo.kio_dir());
     let manifest_path = store

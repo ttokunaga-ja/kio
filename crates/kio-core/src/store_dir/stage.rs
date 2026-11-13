@@ -208,6 +208,55 @@ impl StageWriter {
             .map_err(|e| stage_io("cannot protect stage", e))
     }
 
+    /// Publish a previously synced stage after releasing its write handle.
+    /// The saved physical identity and nonce remain the authority, including
+    /// when an OS has reused a file ID while the handle was closed.
+    pub(crate) fn publish_saved(
+        directory: &StoreDirectory,
+        source: &Path,
+        identity: &StageIdentity,
+        target: &StoreDirectory,
+        leaf: &Path,
+    ) -> Result<()> {
+        Self::publish_saved_with(
+            directory,
+            source,
+            identity,
+            target,
+            leaf,
+            Publication::CreateOnly,
+        )
+    }
+
+    pub(crate) fn publish_saved_with(
+        directory: &StoreDirectory,
+        source: &Path,
+        identity: &StageIdentity,
+        target: &StoreDirectory,
+        leaf: &Path,
+        publication: Publication,
+    ) -> Result<()> {
+        if super::relative_components(source, false, directory.path())?.len() != 1
+            || super::relative_components(leaf, false, target.path())?.len() != 1
+        {
+            return Err(failure("saved stage publication requires direct leaves"));
+        }
+        let file = crate::platform::stage_operations::open_file(directory, source)?;
+        crate::private_fs::verify_private_regular_file_handle(&file)?;
+        identity.verify(&file)?;
+        crate::platform::stage_operations::publish(
+            directory,
+            source,
+            &file,
+            target,
+            leaf,
+            publication,
+            identity,
+        )?;
+        directory.sync()?;
+        target.sync()
+    }
+
     /// Sync and publish only this file. The caller retires its durable journal
     /// after publication; an absent stage on recovery never authorizes deletion
     /// of the public destination.
@@ -867,6 +916,40 @@ mod tests {
                 .is_symlink()
         );
         assert!(temp.path().join("owned").is_file());
+    }
+
+    #[test]
+    fn saved_stage_publication_reopens_only_the_recorded_identity() {
+        let (temp, directory) = directory();
+        let mut writer = StageWriter::create(&directory, Path::new("stage")).unwrap();
+        writer.write_chunk(b"complete").unwrap();
+        writer.sync().unwrap();
+        let identity = writer.identity().clone();
+        drop(writer);
+        StageWriter::publish_saved(
+            &directory,
+            Path::new("stage"),
+            &identity,
+            &directory,
+            Path::new("public"),
+        )
+        .unwrap();
+        assert_eq!(fs::read(temp.path().join("public")).unwrap(), b"complete");
+        let mut replacement = StageWriter::create(&directory, Path::new("stage")).unwrap();
+        replacement.write_chunk(b"foreign").unwrap();
+        drop(replacement);
+        assert!(
+            StageWriter::publish_saved(
+                &directory,
+                Path::new("stage"),
+                &identity,
+                &directory,
+                Path::new("other")
+            )
+            .is_err()
+        );
+        assert!(!temp.path().join("other").exists());
+        assert_eq!(fs::read(temp.path().join("stage")).unwrap(), b"foreign");
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use super::gc_io::{directory, observe, retire_expected};
-use crate::cas::{CasReadAccess, MAX_TREE_OBJECT_BYTES, hash_bytes};
+use crate::cas::{CasReadAccess, hash_bytes};
 use crate::error::Result;
 use crate::gc::exchange;
 use crate::gc::{
@@ -161,15 +161,17 @@ pub(crate) fn marker_archive_presence(
     archives: &File,
     archive: &str,
     _captured_name: &str,
-    validate_bytes: impl Fn(&[u8]) -> Result<()>,
+    expected_size: u64,
+    validate_observation: impl Fn(&FileObservation) -> Result<()>,
 ) -> Result<(bool, bool)> {
     Ok(
-        match crate::gc::read_cas_regular_observed(reads, archives, archive, MAX_TREE_OBJECT_BYTES)
+        match crate::gc::read_tree_archive_observed(reads, archives, archive, expected_size.max(64))
         {
-            Ok((bytes, _)) => {
-                validate_bytes(&bytes)?;
+            Ok((Some(_), observation)) => {
+                validate_observation(&observation)?;
                 (true, false)
             }
+            Ok((None, _)) => return Err(corrupt("invalid tree archive sentinel")),
             Err(error) if is_io_not_found(&error) => (false, false),
             Err(error) => return Err(error),
         },

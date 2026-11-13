@@ -16,6 +16,9 @@ mod image;
 pub use image::ImageStore;
 use image::write_bound_content_at;
 mod store;
+mod tree;
+#[cfg(test)]
+pub(crate) use tree::fail_next_tree_write;
 
 mod removal;
 use removal::{CasRemovalKind, bound_remove_verified, remove_verified_cas_path};
@@ -43,9 +46,38 @@ use crate::platform::cas_io::{
 };
 use crate::platform::cas_semantics;
 
+pub(crate) fn stream_error(error: std::io::Error, path: &Path) -> KioError {
+    if error.get_ref().is_some_and(|inner| inner.is::<KioError>()) {
+        return *error
+            .into_inner()
+            .expect("typed stream error")
+            .downcast::<KioError>()
+            .expect("typed stream error");
+    }
+    crate::store_dir::ioerr(path, error)
+}
+
+pub(crate) fn hash_stream(reader: &mut impl Read) -> Result<(String, u64)> {
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; CAS_STREAM_BUFFER_BYTES];
+    let mut size = 0u64;
+    loop {
+        let count = reader
+            .read(&mut buffer)
+            .map_err(|e| stream_error(e, Path::new("JSON stage")))?;
+        if count == 0 {
+            break;
+        }
+        size = size
+            .checked_add(count as u64)
+            .ok_or_else(|| KioError::schema("stream byte count overflow"))?;
+        digest.update(&buffer[..count]);
+    }
+    Ok((format!("sha256:{}", lower_hex(&digest.finalize())), size))
+}
+
 pub const CAS_STREAM_BUFFER_BYTES: usize = 64 * 1024;
 pub const MAX_CONTENT_OBJECT_BYTES: u64 = 512 * 1024 * 1024;
-pub const MAX_TREE_OBJECT_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_COMMIT_OBJECT_BYTES: u64 = 1024 * 1024;
 /// Semantic chunk objects contain bounded normalized text, never raw file bytes.
 pub const MAX_CHUNK_OBJECT_BYTES: u64 = 128 * 1024 * 1024;
@@ -532,7 +564,7 @@ impl ObjectKind {
     pub const fn max_bytes(self) -> u64 {
         match self {
             Self::Raw => u64::MAX,
-            Self::Tree => MAX_TREE_OBJECT_BYTES,
+            Self::Tree => u64::MAX,
             Self::Commit => MAX_COMMIT_OBJECT_BYTES,
         }
     }
@@ -583,6 +615,7 @@ struct BoundObjectDirs {
     manifests: Arc<Mutex<Option<Arc<File>>>>,
     toollocks: Arc<Mutex<Option<Arc<File>>>>,
     normalized_units: Arc<Mutex<Option<Arc<File>>>>,
+    stage_directories: Arc<Mutex<Option<bound::RawStageDirectories>>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -602,7 +635,25 @@ pub struct BoundRawStage {
     raw_hash: String,
     size_bytes: u64,
 }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct SavedRawStage {
+    name: String,
+    identity: crate::store_dir::StageIdentity,
+    raw_hash: String,
+    size_bytes: u64,
+}
 impl BoundRawStage {
+    pub(crate) fn saved(&self) -> SavedRawStage {
+        SavedRawStage {
+            name: self.name.clone(),
+            identity: self.identity.clone(),
+            raw_hash: self.raw_hash.clone(),
+            size_bytes: self.size_bytes,
+        }
+    }
+    pub(crate) fn detach(&mut self) {
+        self.name.clear();
+    }
     fn verify(&self) -> Result<()> {
         let mut file = self
             .directory
@@ -624,16 +675,45 @@ impl BoundRawStage {
         control: &crate::control::ControlHandle,
     ) -> Result<()> {
         self.verify()?;
-        self.writer.as_ref().expect("live raw stage").sync()?;
         control.checkpoint(crate::durability::DurabilityPoint::AtomicWriteStaged)?;
-        self.writer.take().expect("live raw stage").publish(
-            target,
-            leaf,
-            crate::store_dir::Publication::CreateOnly,
-        )?;
+        self.publish_saved_to(target, leaf)?;
         self.journals.remove_file(Path::new(&self.name))?;
         self.name.clear();
         control.checkpoint(crate::durability::DurabilityPoint::AtomicWritePublished)
+    }
+
+    pub(crate) fn publish_metadata_to(
+        mut self,
+        target: &crate::store_dir::StoreDirectory,
+        leaf: &Path,
+        publication: crate::store_dir::Publication,
+    ) -> Result<()> {
+        self.verify()?;
+        crate::store_dir::StageWriter::publish_saved_with(
+            &self.directory,
+            Path::new(&self.name),
+            &self.identity,
+            target,
+            leaf,
+            publication,
+        )?;
+        self.journals.remove_file(Path::new(&self.name))?;
+        self.name.clear();
+        Ok(())
+    }
+
+    fn publish_saved_to(
+        &mut self,
+        target: &crate::store_dir::StoreDirectory,
+        leaf: &Path,
+    ) -> Result<()> {
+        crate::store_dir::StageWriter::publish_saved(
+            &self.directory,
+            Path::new(&self.name),
+            &self.identity,
+            target,
+            leaf,
+        )
     }
 
     #[must_use]
@@ -3763,7 +3843,9 @@ mod tests {
         ] {
             let hash = hash_bytes(bytes);
             store.write_object_bytes(kind, &hash, bytes).unwrap();
-            assert_eq!(store.read_object(kind, &hash).unwrap().bytes, bytes);
+            let mut copied = Vec::new();
+            store.copy_object_to(kind, &hash, &mut copied).unwrap();
+            assert_eq!(copied, bytes);
         }
         let bytes = b"bound raw publication";
         let hash = store.write_raw(bytes).unwrap();

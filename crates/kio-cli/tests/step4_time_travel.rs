@@ -1114,6 +1114,7 @@ fn ct4_timetravel_004_include_deleted_uses_final_version_and_frozen_tree() {
     assert!(
         tree.entries
             .iter()
+            .map(Result::unwrap)
             .any(|entry| entry.path == "gone.md" && entry.raw_hash == hash_bytes(b))
     );
 
@@ -1660,11 +1661,13 @@ fn ct4_timetravel_011_historical_reindex_rejects_config_drift_without_mutation()
     let c1_entry = c1_tree
         .entries
         .iter()
+        .map(Result::unwrap)
         .find(|entry| entry.path == "history.md")
         .unwrap();
     let c2_entry = c2_tree
         .entries
         .iter()
+        .map(Result::unwrap)
         .find(|entry| entry.path == "history.md")
         .unwrap();
     let c1_raw = c1_entry.raw_hash.clone();

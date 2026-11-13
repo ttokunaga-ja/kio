@@ -229,6 +229,7 @@ fn requested_paths(
     let tree = repo.read_tree(&source.tree)?;
     let mut selected = Vec::new();
     for entry in tree.entries {
+        let entry = entry?;
         if policy.allows_path(&entry.path).map_err(pipeline_to_kio)? {
             selected.push(entry.path);
         }
