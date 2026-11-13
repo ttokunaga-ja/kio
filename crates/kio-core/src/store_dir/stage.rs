@@ -626,12 +626,21 @@ mod tests {
         fs::rename(temp.path().join("stage"), temp.path().join("retained")).unwrap();
         let mut replacement = StageWriter::create(&directory, Path::new("stage")).unwrap();
         replacement.write_chunk(b"expected").unwrap();
-        assert!(
-            writer
-                .publish(&directory, Path::new("public"), Publication::CreateOnly)
-                .is_err()
-        );
-        assert!(!temp.path().join("public").exists());
+        let published = writer.publish(&directory, Path::new("public"), Publication::CreateOnly);
+        // Unix publishes by name after verifying it, so the replaced name is refused.
+        #[cfg(not(windows))]
+        {
+            assert!(published.is_err());
+            assert!(!temp.path().join("public").exists());
+        }
+        // Windows renames the retained handle itself: the writer's own verified
+        // file is published from wherever it now is, never the replacement.
+        #[cfg(windows)]
+        {
+            published.unwrap();
+            assert!(temp.path().join("public").exists());
+            assert!(!temp.path().join("retained").exists());
+        }
         assert!(temp.path().join("stage").exists());
     }
 
