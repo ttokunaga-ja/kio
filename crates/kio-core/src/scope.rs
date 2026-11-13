@@ -88,6 +88,7 @@ use locks::{
 pub(crate) use managed_restore::reject_pending_managed_restore;
 pub use managed_restore::{
     ManagedRestoreChange, ManagedRestoreOutcome, ManagedRestorePlan, ManagedRestoreRequest,
+    ManagedRestoreStatus,
 };
 
 /// Exact on-disk scope format understood by this pre-stable reader.

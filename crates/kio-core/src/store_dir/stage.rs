@@ -53,12 +53,62 @@ impl DirectoryStageIdentity {
     }
 }
 
+/// Persist this reservation before creating a stage. Its unpredictable nonce
+/// binds an interrupted creation even before a physical ID can be recorded.
+/// An uninitialized or foreign entry is preserved, never adopted by its name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StageReservation {
+    nonce: [u8; 32],
+}
+impl StageReservation {
+    pub(crate) fn new() -> Result<Self> {
+        let mut nonce = [0; 32];
+        getrandom::fill(&mut nonce)
+            .map_err(|e| failure(format!("cannot reserve stage nonce: {e}")))?;
+        Ok(Self { nonce })
+    }
+    pub(crate) fn key(&self) -> String {
+        crate::cas::lower_hex(&self.nonce)
+    }
+    pub(crate) fn create(&self, directory: &StoreDirectory, leaf: &Path) -> Result<StageWriter> {
+        StageWriter::create_with(directory, leaf, |file| {
+            directory
+                .control()
+                .checkpoint(crate::durability::DurabilityPoint::StageFileCreated)?;
+            StageIdentity::initialize_nonce(file, self.nonce)
+        })
+    }
+    pub(crate) fn identity_if_matches(
+        &self,
+        directory: &StoreDirectory,
+        leaf: &Path,
+    ) -> Result<Option<StageIdentity>> {
+        if !directory.contains_entry(leaf)? {
+            return Ok(None);
+        }
+        let file = directory.open_regular_read(leaf, u64::MAX)?;
+        let identity = StageIdentity {
+            physical: file_id(&file)?,
+            nonce: self.nonce,
+        };
+        if identity.verify(&file).is_err() {
+            return Ok(None);
+        }
+        Ok(Some(identity))
+    }
+}
+
 impl StageIdentity {
     pub(crate) fn initialize(file: &File) -> Result<Self> {
-        let physical = file_id(file)?;
         let mut nonce = [0; 32];
         getrandom::fill(&mut nonce)
             .map_err(|e| failure(format!("cannot generate stage nonce: {e}")))?;
+        Self::initialize_nonce(file, nonce)
+    }
+
+    fn initialize_nonce(file: &File, nonce: [u8; 32]) -> Result<Self> {
+        let physical = file_id(file)?;
         crate::platform::stage_nonce::create(file, &nonce).map_err(|e| {
             nonce_error(
                 "cannot persist stage nonce (filesystem must support xattr/EA; no fallback)",
@@ -494,6 +544,45 @@ mod tests {
         let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let directory = StoreDirectory::open(temp.path()).unwrap();
         (temp, directory)
+    }
+
+    #[test]
+    fn reserved_creation_recovers_tagged_stage_and_preserves_uninitialized_or_foreign_entries() {
+        let (temp, directory) = directory();
+        let reservation = StageReservation::new().unwrap();
+        let saved: StageReservation =
+            serde_json::from_slice(&serde_jcs::to_vec(&reservation).unwrap()).unwrap();
+        let writer = saved.create(&directory, Path::new("reserved")).unwrap();
+        let expected = writer.identity().clone();
+        drop(writer);
+        let recovered = saved
+            .identity_if_matches(&directory, Path::new("reserved"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered, expected);
+        directory
+            .discard_stage(Path::new("reserved"), &recovered)
+            .unwrap();
+        directory
+            .create_private_file(Path::new("uninitialized"))
+            .unwrap();
+        assert!(
+            saved
+                .identity_if_matches(&directory, Path::new("uninitialized"))
+                .unwrap()
+                .is_none()
+        );
+        let mut foreign = StageWriter::create(&directory, Path::new("foreign")).unwrap();
+        foreign.write_chunk(b"keep").unwrap();
+        drop(foreign);
+        assert!(
+            saved
+                .identity_if_matches(&directory, Path::new("foreign"))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(fs::read(temp.path().join("foreign")).unwrap(), b"keep");
+        assert!(temp.path().join("uninitialized").exists());
     }
 
     #[test]
