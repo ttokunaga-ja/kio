@@ -107,10 +107,7 @@ fn retained_repository_allows_namespace_moves_but_rejects_named_authority_replac
     let scope_json: serde_json::Value = serde_json::from_slice(&scope_json).unwrap();
     assert_eq!(scope_json["scope_id"].as_str().unwrap(), old_scope_id);
     assert_eq!(
-        repo.object_store()
-            .read_object(ObjectKind::Raw, &hash)
-            .unwrap()
-            .bytes,
+        read_raw_fixture(&repo.object_store(), &hash).unwrap().bytes,
         bytes
     );
     assert_eq!(
@@ -119,12 +116,7 @@ fn retained_repository_allows_namespace_moves_but_rejects_named_authority_replac
             .unwrap(),
         image_bytes
     );
-    assert!(
-        replacement
-            .object_store()
-            .read_object(ObjectKind::Raw, &hash)
-            .is_err()
-    );
+    assert!(read_raw_fixture(&replacement.object_store(), &hash).is_err());
 
     fs::rename(&root_path, fixture_path.join("retained-scope")).unwrap();
     fs::create_dir(&root_path).unwrap();
@@ -135,10 +127,7 @@ fn retained_repository_allows_namespace_moves_but_rejects_named_authority_replac
     );
     assert!(binding.revalidate().is_err());
     assert_eq!(
-        repo.object_store()
-            .read_object(ObjectKind::Raw, &hash)
-            .unwrap()
-            .bytes,
+        read_raw_fixture(&repo.object_store(), &hash).unwrap().bytes,
         bytes
     );
     assert_eq!(
@@ -445,4 +434,18 @@ fn retained_directory_normalization_accepts_namespace_timestamp_changes() {
     revalidated.sync().unwrap();
 
     assert!(root_path.join("private").is_dir());
+}
+
+#[cfg(windows)]
+fn read_raw_fixture(
+    store: &kio_core::cas::ObjectStore,
+    hash: &str,
+) -> kio_core::Result<kio_core::cas::StoredObject> {
+    let mut bytes = Vec::new();
+    store.copy_object_to(kio_core::cas::ObjectKind::Raw, hash, &mut bytes)?;
+    Ok(kio_core::cas::StoredObject {
+        kind: kio_core::cas::ObjectKind::Raw,
+        hash: hash.to_owned(),
+        bytes,
+    })
 }

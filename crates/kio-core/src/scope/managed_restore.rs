@@ -8,11 +8,14 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::{CommitObject, CommitType, Repository, TreeEntry, TreeObject, commit_stats};
+use super::{
+    ArchiveLimits, CommitObject, CommitType, Repository, TreeEntry, TreeObject, commit_stats,
+    hash_scope_file, scheduled_source_identity,
+};
 use crate::ExitCode;
-use crate::cas::{ObjectKind, canonical_json_bytes, hash_bytes};
+use crate::cas::{ObjectKind, canonical_json_bytes};
 use crate::dag::{build_tree_with_chunking_config, is_materializable_direct_child, tree_hash};
-use crate::error::{KioError, Result};
+use crate::error::{IoResultExt, KioError, Result};
 use crate::store_dir::{Publication, StoreDirectory};
 
 const MANAGED_RESTORE_JOURNAL_LEAF: &str = "managed-restore-v1.json";
@@ -530,6 +533,7 @@ impl Repository {
         )
     }
 
+    #[cfg(test)]
     fn write_working_atomic(
         &self,
         relative: &Path,
@@ -544,6 +548,7 @@ impl Repository {
         )
     }
 
+    #[cfg(test)]
     fn remove_working_atomic(
         &self,
         relative: &Path,
@@ -562,6 +567,7 @@ impl Repository {
     /// restore/publication journal. Both permitted retained roots are explicit.
     pub fn recover_atomic_storage(&self) -> Result<bool> {
         let _lock = self.lock_store_in_session(self.lock_session())?;
+        self.store.cleanup_bound_raw_stages()?;
         let owner = self.store_directory()?;
         let root = self.root_directory()?;
         owner.recover_atomic(&[&owner, &root])
@@ -617,33 +623,57 @@ impl Repository {
     fn working_raw_hash(&self, path: &str) -> Result<Option<String>> {
         validate_restore_path(path)?;
         let directory = self.root_directory()?;
-        let Some(bytes) =
-            directory.read_optional(Path::new(path), MAX_MANAGED_RESTORE_FILE_BYTES)?
-        else {
+        if !directory.contains_entry(Path::new(path))? {
             return Ok(None);
-        };
-        Ok(Some(hash_bytes(&bytes)))
+        }
+        let mut file =
+            directory.open_regular_read(Path::new(path), MAX_MANAGED_RESTORE_FILE_BYTES)?;
+        let metadata = file.metadata().kio_io(Path::new(path))?;
+        let identity = scheduled_source_identity(&file)?;
+        let (hash, size) = hash_scope_file(
+            &mut file,
+            Path::new(path),
+            path,
+            MAX_MANAGED_RESTORE_FILE_BYTES,
+            ArchiveLimits::new(
+                MAX_MANAGED_RESTORE_FILE_BYTES,
+                MAX_MANAGED_RESTORE_FILE_BYTES,
+            ),
+        )?;
+        if size != metadata.len()
+            || file.metadata().kio_io(Path::new(path))?.len() != size
+            || scheduled_source_identity(&file)? != identity
+        {
+            return Err(restore_conflict("working file changed while hashing"));
+        }
+        Ok(Some(hash))
     }
 
-    fn raw_bytes(&self, raw_hash: &str) -> Result<Vec<u8>> {
+    fn remove_working_raw(&self, relative: &Path, raw_hash: &str) -> Result<()> {
         let metadata = self.store.inspect_object(ObjectKind::Raw, raw_hash)?;
-        if metadata.size_bytes > MAX_MANAGED_RESTORE_FILE_BYTES {
-            return Err(restore_incomplete(
-                "restore file exceeds the managed restore byte limit",
-            ));
-        }
-        let object = self.store.read_by_hash(raw_hash)?;
-        if object.kind != ObjectKind::Raw {
-            return Err(restore_incomplete(
-                "restore raw hash does not identify a raw object",
-            ));
-        }
-        if object.bytes.len() as u64 != metadata.size_bytes {
-            return Err(restore_incomplete(
-                "restore raw object changed while it was materialized",
-            ));
-        }
-        Ok(object.bytes)
+        self.root_directory()?
+            .quarantine_then_remove_hash_with_owner(
+                &self.store_directory()?,
+                relative,
+                raw_hash,
+                metadata.size_bytes,
+                MAX_MANAGED_RESTORE_FILE_BYTES,
+            )
+    }
+
+    fn write_working_raw(&self, relative: &Path, raw_hash: &str) -> Result<()> {
+        self.store
+            .stage_raw_copy(raw_hash, MAX_MANAGED_RESTORE_FILE_BYTES)?
+            .publish_to(&self.root_directory()?, relative, self.control())
+    }
+
+    #[cfg(test)]
+    fn raw_bytes(&self, raw_hash: &str) -> Result<Vec<u8>> {
+        // Tiny test fixtures only; production restore never collects raw bytes.
+        let mut bytes = Vec::new();
+        self.store
+            .copy_object_to(ObjectKind::Raw, raw_hash, &mut bytes)?;
+        Ok(bytes)
     }
 
     fn persist_restore_progress(
@@ -677,24 +707,14 @@ impl Repository {
         if let Some(old) = &change.old_raw_hash {
             journal.progress[index] = RestoreProgress::RemovingOld;
             self.persist_restore_progress(journal, bytes)?;
-            let old_bytes = self.raw_bytes(old)?;
-            self.remove_working_atomic(
-                Path::new(&change.path),
-                &old_bytes,
-                MAX_MANAGED_RESTORE_FILE_BYTES,
-            )?;
+            self.remove_working_raw(Path::new(&change.path), old)?;
             journal.progress[index] = RestoreProgress::OldRemoved;
             self.persist_restore_progress(journal, bytes)?;
         }
         if let Some(new) = &change.new_raw_hash {
             journal.progress[index] = RestoreProgress::PublishingNew;
             self.persist_restore_progress(journal, bytes)?;
-            let new_bytes = self.raw_bytes(new)?;
-            self.write_working_atomic(
-                Path::new(&change.path),
-                &new_bytes,
-                Publication::CreateOnly,
-            )?;
+            self.write_working_raw(Path::new(&change.path), new)?;
         }
         journal.progress[index] = RestoreProgress::Applied;
         self.persist_restore_progress(journal, bytes)?;
@@ -709,18 +729,10 @@ impl Repository {
             ));
         }
         if let Some(old) = &change.old_raw_hash {
-            self.remove_working_atomic(
-                Path::new(&change.path),
-                &self.raw_bytes(old)?,
-                MAX_MANAGED_RESTORE_FILE_BYTES,
-            )?;
+            self.remove_working_raw(Path::new(&change.path), old)?;
         }
         if let Some(new) = &change.new_raw_hash {
-            self.write_working_atomic(
-                Path::new(&change.path),
-                &self.raw_bytes(new)?,
-                Publication::CreateOnly,
-            )?;
+            self.write_working_raw(Path::new(&change.path), new)?;
         }
         Ok(())
     }
@@ -763,12 +775,7 @@ impl Repository {
             // it could be a failed create or a post-crash user deletion.
             journal.progress[index] = RestoreProgress::RestoringOld;
             self.persist_restore_progress(journal, bytes)?;
-            let old_bytes = self.raw_bytes(old)?;
-            self.write_working_atomic(
-                Path::new(&change.path),
-                &old_bytes,
-                Publication::CreateOnly,
-            )?;
+            self.write_working_raw(Path::new(&change.path), old)?;
             journal.progress[index] = RestoreProgress::Pending;
             self.persist_restore_progress(journal, bytes)?;
             return Ok(());
@@ -783,11 +790,7 @@ impl Repository {
                 .ok_or_else(|| restore_incomplete("applied deletion phase has no old raw"))?;
             journal.progress[index] = RestoreProgress::RestoringOld;
             self.persist_restore_progress(journal, bytes)?;
-            self.write_working_atomic(
-                Path::new(&change.path),
-                &self.raw_bytes(old)?,
-                Publication::CreateOnly,
-            )?;
+            self.write_working_raw(Path::new(&change.path), old)?;
             journal.progress[index] = RestoreProgress::Pending;
             self.persist_restore_progress(journal, bytes)?;
             return Ok(());
@@ -810,26 +813,16 @@ impl Repository {
                 .new_raw_hash
                 .as_ref()
                 .expect("current can equal new only when new is present");
-            let new_bytes = self.raw_bytes(new)?;
             journal.progress[index] = RestoreProgress::RollbackRemovingNew;
             self.persist_restore_progress(journal, bytes)?;
-            self.remove_working_atomic(
-                Path::new(&change.path),
-                &new_bytes,
-                MAX_MANAGED_RESTORE_FILE_BYTES,
-            )?;
+            self.remove_working_raw(Path::new(&change.path), new)?;
             journal.progress[index] = RestoreProgress::RollbackNewRemoved;
             self.persist_restore_progress(journal, bytes)?;
         }
         if let Some(old) = &change.old_raw_hash {
             journal.progress[index] = RestoreProgress::RestoringOld;
             self.persist_restore_progress(journal, bytes)?;
-            let old_bytes = self.raw_bytes(old)?;
-            self.write_working_atomic(
-                Path::new(&change.path),
-                &old_bytes,
-                Publication::CreateOnly,
-            )?;
+            self.write_working_raw(Path::new(&change.path), old)?;
         }
         journal.progress[index] = RestoreProgress::Pending;
         self.persist_restore_progress(journal, bytes)?;

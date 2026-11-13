@@ -1,4 +1,10 @@
 #[cfg(test)]
+thread_local! { static SHORT_RAW_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+#[cfg(test)]
+pub(crate) fn short_next_raw_read() {
+    SHORT_RAW_READ.with(|fault| fault.set(true));
+}
+#[cfg(test)]
 thread_local! { static FAIL_RAW_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 
 #[cfg(test)]
@@ -180,6 +186,15 @@ impl BoundObjectDirs {
         reader: &mut R,
         max_bytes: u64,
     ) -> Result<BoundRawStage> {
+        self.stage_raw_from_reader_with_access(reader, max_bytes, &CasReadAccess::Unmetered)
+    }
+
+    pub(super) fn stage_raw_from_reader_with_access<R: Read>(
+        &self,
+        reader: &mut R,
+        max_bytes: u64,
+        reads: &CasReadAccess,
+    ) -> Result<BoundRawStage> {
         ensure_bound_directory(&self.kio, Path::new(".kio"))?;
         let RawStageDirectories {
             stages: directory,
@@ -231,6 +246,7 @@ impl BoundObjectDirs {
                     stage.size_bytes,
                 ));
             }
+            reads.charge(count as u64)?;
             hasher.update(&buffer[..count]);
             #[cfg(test)]
             if FAIL_RAW_WRITE.with(|fault| fault.replace(false)) {
@@ -244,6 +260,10 @@ impl BoundObjectDirs {
                 .as_mut()
                 .expect("live stage")
                 .write_chunk(&buffer[..count])?;
+            #[cfg(test)]
+            if SHORT_RAW_READ.with(|fault| fault.replace(false)) {
+                break;
+            }
         }
         stage.writer.as_ref().expect("live stage").sync()?;
         stage.raw_hash = format!("sha256:{}", lower_hex(&hasher.finalize()));
@@ -256,17 +276,7 @@ impl BoundObjectDirs {
                 "raw stage belongs to another store",
             ));
         }
-        let mut file = stage
-            .directory
-            .open_regular_read(Path::new(&stage.name), u64::MAX)?;
-        stage.identity.verify(&file)?;
-        if file.metadata().kio_io(Path::new(&stage.name))?.len() != stage.size_bytes
-            || bound_hash_open_regular(&CasReadAccess::Unmetered, &mut file, u64::MAX)?
-                != stage.raw_hash
-        {
-            return Err(bound_stage_corrupt("raw stage changed before publication"));
-        }
-        drop(file);
+        stage.verify()?;
         let (parent, leaf) = self.fanout(ObjectKind::Raw, &stage.raw_hash, true)?;
         match bound_read_verified(
             &CasReadAccess::Unmetered,
@@ -447,53 +457,36 @@ impl BoundObjectDirs {
         Ok((second_dir, digest.to_owned()))
     }
 
-    pub(super) fn repair_raw(&self, expected_hash: &str, bytes: &[u8]) -> Result<bool> {
-        if !is_hash(expected_hash) || hash_bytes(bytes) != expected_hash {
+    pub(super) fn repair_raw_stage(&self, stage: BoundRawStage) -> Result<bool> {
+        if !same_bound_directory(&stage.parent, &self.raw)? {
             return Err(KioError::invalid_usage(
-                "raw repair bytes do not match the expected hash",
+                "raw stage belongs to another store",
             ));
         }
-        if bytes.len() as u64 > ObjectKind::Raw.max_bytes() {
-            return Err(object_size_error(
-                ObjectKind::Raw,
-                ObjectKind::Raw.max_bytes(),
-                bytes.len() as u64,
-            ));
-        }
-        let (parent, leaf) = self.fanout(ObjectKind::Raw, expected_hash, true)?;
-        match bound_read_regular(
+        stage.verify()?;
+        let hash = stage.raw_hash.clone();
+        let (parent, leaf) = self.fanout(ObjectKind::Raw, &hash, true)?;
+        let (verified, _) = bound_read_verified_accounted(
             &CasReadAccess::Unmetered,
             &parent,
             &leaf,
-            ObjectKind::Raw.max_bytes(),
-        ) {
-            Ok((_, existing)) if hash_bytes(&existing) == expected_hash => return Ok(false),
-            Ok(_) => {}
+            ObjectKind::Raw,
+            &hash,
+            false,
+        );
+        match verified {
+            Ok(_) => return Ok(false),
             Err(error) if error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => {
-                self.write_object_bytes(ObjectKind::Raw, expected_hash, bytes)?;
+                self.publish_raw_stage(stage)?;
                 return Ok(true);
             }
-            // `bound_read_regular` rejects symlinks, hardlinks, directories,
-            // unstable entries and over-limit bodies before exposing bytes.
-            // Those unsafe representations are never repairable in place.
+            Err(error) if error.error_code() == "KIO-E-STORE-CORRUPT-001" => {}
             Err(error) => return Err(error),
         }
-
-        // Capture an exact safe source handle before linking. The later
-        // quarantine must prove it names this handle, never merely whatever
-        // pathname happened to occupy the leaf after the corrupt read.
         let mut source = bound_open_regular_handle(&parent, &leaf)?;
-        if bound_hash_open_regular(
-            &CasReadAccess::Unmetered,
-            &mut source,
-            ObjectKind::Raw.max_bytes(),
-        )? == expected_hash
-        {
-            return Err(corrupt_object_error(
-                Path::new(&leaf),
+        if bound_hash_open_regular(&CasReadAccess::Unmetered, &mut source, u64::MAX)? == hash {
+            return Err(bound_stage_corrupt(
                 "raw repair observed an unstable CAS slot",
-                expected_hash,
-                Some(expected_hash),
             ));
         }
         let (quarantine, file) = bound_create_temp(&parent)?;
@@ -501,62 +494,29 @@ impl BoundObjectDirs {
         bound_remove(&parent, &quarantine)?;
         cap_primitives::fs::hard_link(&parent, Path::new(&leaf), &parent, Path::new(&quarantine))
             .map_err(|error| KioError::io(error.to_string(), &leaf))?;
-        let result = (|| {
-            if !bound_quarantine_matches(&parent, &quarantine, &source)? {
-                let _ = bound_remove(&parent, &quarantine);
-                return Err(corrupt_object_error(
-                    Path::new(&leaf),
-                    "raw repair leaf changed before quarantine",
-                    expected_hash,
-                    None,
-                ));
-            }
-            bound_remove(&parent, &leaf)?;
-            let (temp, mut replacement) = bound_create_temp(&parent)?;
-            let publish = (|| {
-                replacement.write_all(bytes).kio_io(Path::new(&temp))?;
-                replacement.sync_all().kio_io(Path::new(&temp))?;
-                drop(replacement);
-                bound_publish(
-                    &parent,
-                    &temp,
-                    &leaf,
-                    ObjectKind::Raw,
-                    expected_hash,
-                    bytes.len() as u64,
-                    Some(bytes),
-                )
-            })();
-            if publish.is_err() {
-                let _ = bound_remove(&parent, &temp);
-                return publish;
-            }
-            if let Err(error) = bound_read_verified(
-                &CasReadAccess::Unmetered,
-                &parent,
-                &leaf,
-                ObjectKind::Raw,
-                expected_hash,
-                false,
-            ) {
-                let _ = bound_remove(&parent, &leaf);
-                let _ = cap_primitives::fs::hard_link(
-                    &parent,
-                    Path::new(&quarantine),
-                    &parent,
-                    Path::new(&leaf),
-                );
-                return Err(error);
-            }
-            bound_remove(&parent, &quarantine)?;
-            sync_bound_directory(&parent, Path::new(&leaf))?;
-            Ok(())
-        })();
-        if result.is_err() {
-            // If removal/republication itself failed, leave the quarantined
-            // corrupt evidence intact for a later explicit recovery attempt.
-            return result.map(|()| true);
+        if !bound_quarantine_matches(&parent, &quarantine, &source)? {
+            let _ = bound_remove(&parent, &quarantine);
+            return Err(bound_stage_corrupt(
+                "raw repair leaf changed before quarantine",
+            ));
         }
+        // Retain the verified quarantine across publication, including Windows
+        // where the named source handle must be released before replacement.
+        drop(source);
+        bound_remove(&parent, &leaf)?;
+        if let Err(error) = self.publish_raw_stage(stage) {
+            // Restore only into an absent slot. Never unlink a replacement
+            // introduced by another writer while handling the failure.
+            let _ = cap_primitives::fs::hard_link(
+                &parent,
+                Path::new(&quarantine),
+                &parent,
+                Path::new(&leaf),
+            );
+            return Err(error);
+        }
+        bound_remove(&parent, &quarantine)?;
+        sync_bound_directory(&parent, Path::new(&leaf))?;
         Ok(true)
     }
 
@@ -790,6 +750,15 @@ impl BoundObjectDirs {
         hash: &str,
         bytes: &[u8],
     ) -> Result<()> {
+        if kind == ObjectKind::Raw {
+            if hash_bytes(bytes) != hash {
+                return Err(KioError::invalid_usage(
+                    "raw bytes do not match supplied hash",
+                ));
+            }
+            self.write_raw_reader(&mut std::io::Cursor::new(bytes), bytes.len() as u64)?;
+            return Ok(());
+        }
         if bytes.len() as u64 > kind.max_bytes() {
             return Err(object_size_error(
                 kind,

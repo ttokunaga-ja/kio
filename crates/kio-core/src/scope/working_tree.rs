@@ -310,7 +310,8 @@ impl Repository {
                         .with_context_field("path", json!(candidate.file_name))
                         .with_context_field("saved", json!(false))
                 })?;
-            if source.metadata().kio_io(&candidate.path)?.len() != before.len()
+            if stage.size_bytes() != before.len()
+                || source.metadata().kio_io(&candidate.path)?.len() != stage.size_bytes()
                 || scheduled_source_identity(&source)? != identity
             {
                 return Err(scope_file_changed(&candidate.file_name));

@@ -1750,9 +1750,7 @@ fn ct4_purge_missing_target_attribution_rejects_with_or_without_sqlite_rows() {
                 .contains("cannot restore missing attribution")
         );
         let store = ObjectStore::new(&kio_dir);
-        store
-            .read_object(ObjectKind::Raw, &fixture.raw_hash)
-            .unwrap();
+        read_raw_fixture(&store, &fixture.raw_hash).unwrap();
         store.read_chunk(&fixture.chunk_id).unwrap();
         assert!(!kio_dir.join("purge/in-progress.json").exists());
         assert!(!kio_dir.join("purge/journal-closure").exists());
@@ -1877,7 +1875,7 @@ fn ct4_purge_rejects_false_survivor_authority_before_preparation() {
             before_embedding
         );
         assert_eq!(fs::read(unique_path).unwrap(), before_unique);
-        store.read_object(ObjectKind::Raw, &raw).unwrap();
+        read_raw_fixture(&store, &raw).unwrap();
         assert!(!kio_dir.join("purge/in-progress.json").exists());
         assert!(!kio_dir.join("purge/journal-closure").exists());
         assert!(
@@ -2135,4 +2133,17 @@ fn ct4_purge_partial_cache_cleanup_rejects_links_and_retries_without_cas() {
         fs::read(victim).unwrap(),
         b"outside cache deletion authority"
     );
+}
+
+fn read_raw_fixture(
+    store: &kio_core::cas::ObjectStore,
+    hash: &str,
+) -> kio_core::Result<kio_core::cas::StoredObject> {
+    let mut bytes = Vec::new();
+    store.copy_object_to(kio_core::cas::ObjectKind::Raw, hash, &mut bytes)?;
+    Ok(kio_core::cas::StoredObject {
+        kind: kio_core::cas::ObjectKind::Raw,
+        hash: hash.to_owned(),
+        bytes,
+    })
 }

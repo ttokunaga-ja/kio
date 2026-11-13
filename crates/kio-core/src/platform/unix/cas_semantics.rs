@@ -6,21 +6,6 @@ use std::sync::Arc;
 pub(crate) fn retain_bound_kio(retained: File) -> Result<Arc<File>> {
     Ok(Arc::new(retained))
 }
-pub(crate) struct RepairSource<'a>(&'a File);
-impl RepairSource<'_> {
-    pub(crate) fn file(&self) -> &File {
-        self.0
-    }
-    pub(crate) fn prepare_replace(self) {}
-}
-pub(crate) fn retain_repair_source(source: &mut Option<File>) -> RepairSource<'_> {
-    RepairSource(
-        source
-            .as_ref()
-            .expect("repair source is retained before closure capture"),
-    )
-}
-
 pub(crate) fn validate_bound_directory_native(_directory: &File, _label: &Path) -> Result<()> {
     Ok(())
 }

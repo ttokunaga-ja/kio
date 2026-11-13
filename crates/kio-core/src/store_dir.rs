@@ -423,6 +423,22 @@ impl StoreDirectory {
         atomic::remove(owner, self, relative, expected, max_bytes)
     }
 
+    /// Remove an immutable-content match without materializing its body.
+    pub(crate) fn quarantine_then_remove_hash_with_owner(
+        &self,
+        owner: &StoreDirectory,
+        relative: &Path,
+        hash: &str,
+        length: u64,
+        max_bytes: u64,
+    ) -> Result<()> {
+        let digest = hash
+            .strip_prefix("sha256:")
+            .filter(|_| crate::cas::is_hash(hash))
+            .ok_or_else(|| KioError::invalid_usage("invalid expected removal hash"))?;
+        atomic::remove_hash(owner, self, relative, digest, length, max_bytes)
+    }
+
     pub fn sync(&self) -> Result<()> {
         platform::sync_directory(&self.handle, &self.logical)
     }

@@ -3976,6 +3976,26 @@ mod tests {
     }
 
     #[test]
+    fn st04_review_normal_snapshot_rejects_short_stage_with_restored_source_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let head = fs::read(repo.kio_dir().join("HEAD")).unwrap();
+        fs::write(
+            dir.path().join("long.bin"),
+            vec![0; 2 * crate::cas::CAS_STREAM_BUFFER_BYTES],
+        )
+        .unwrap();
+        crate::cas::short_next_raw_read();
+        assert!(repo.snapshot(None, None).is_err());
+        assert_eq!(
+            fs::metadata(dir.path().join("long.bin")).unwrap().len(),
+            (2 * crate::cas::CAS_STREAM_BUFFER_BYTES) as u64
+        );
+        assert!(repo.object_store().inspect_raw_stages().unwrap().is_empty());
+        assert_eq!(fs::read(repo.kio_dir().join("HEAD")).unwrap(), head);
+    }
+
+    #[test]
     fn st04_storage_exhaustion_preserves_head_and_marks_path_unsaved() {
         let dir = tempfile::tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();

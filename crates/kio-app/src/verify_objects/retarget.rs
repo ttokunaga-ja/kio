@@ -434,7 +434,7 @@ fn read_retarget_target_tree(
 }
 
 fn read_exact_retarget_commit(store: &ObjectStore, at: &str) -> Result<CommitObject> {
-    let object = store.read_by_hash(at).map_err(|error| {
+    let object = store.read_object(ObjectKind::Commit, at).map_err(|error| {
         if is_store_not_found(&error) {
             KioError::invalid_usage("--at does not name a commit object in this scope")
         } else {

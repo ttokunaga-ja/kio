@@ -1789,6 +1789,11 @@ pub(crate) fn read_cas_byte_object(
     hash: &str,
     max_bytes: u64,
 ) -> Result<Option<(PathBuf, Vec<u8>)>> {
+    if subdir == "raw" {
+        return Err(KioError::invalid_usage(
+            "raw objects require streaming expansion",
+        ));
+    }
     let canonical = cas_object_path(kio_dir, subdir, hash)?;
     if path_entry_exists(&canonical)? {
         let bytes = read_bounded_cas_object(&canonical, hash, max_bytes)?;

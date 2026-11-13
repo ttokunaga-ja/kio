@@ -11,7 +11,7 @@ pub use embedding_metadata::{
 
 mod bound;
 #[cfg(test)]
-pub(crate) use bound::fail_next_raw_write;
+pub(crate) use bound::{fail_next_raw_write, short_next_raw_read};
 mod image;
 pub use image::ImageStore;
 use image::write_bound_content_at;
@@ -32,15 +32,14 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::error::{IoResultExt, KioError, Result};
-use crate::purge::sync_directory;
 
 #[cfg(all(test, windows))]
 use crate::platform::cas_identity::windows_file_information;
 #[cfg(all(test, unix))]
 use crate::platform::cas_io::validate_open_regular_nofollow_with_before;
 use crate::platform::cas_io::{
-    bound_metadata_single_link, configure_no_follow, observe_regular_file_stability, replace_file,
-    same_bound_regular_entry, same_open_file, sync_bound_directory,
+    bound_metadata_single_link, observe_regular_file_stability, same_bound_regular_entry,
+    sync_bound_directory,
 };
 use crate::platform::cas_semantics;
 
@@ -604,6 +603,39 @@ pub struct BoundRawStage {
     size_bytes: u64,
 }
 impl BoundRawStage {
+    fn verify(&self) -> Result<()> {
+        let mut file = self
+            .directory
+            .open_regular_read(Path::new(&self.name), u64::MAX)?;
+        self.identity.verify(&file)?;
+        if file.metadata().kio_io(Path::new(&self.name))?.len() != self.size_bytes
+            || bound_hash_open_regular(&CasReadAccess::Unmetered, &mut file, u64::MAX)?
+                != self.raw_hash
+        {
+            return Err(bound_stage_corrupt("raw stage changed before publication"));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn publish_to(
+        mut self,
+        target: &crate::store_dir::StoreDirectory,
+        leaf: &Path,
+        control: &crate::control::ControlHandle,
+    ) -> Result<()> {
+        self.verify()?;
+        self.writer.as_ref().expect("live raw stage").sync()?;
+        control.checkpoint(crate::durability::DurabilityPoint::AtomicWriteStaged)?;
+        self.writer.take().expect("live raw stage").publish(
+            target,
+            leaf,
+            crate::store_dir::Publication::CreateOnly,
+        )?;
+        self.journals.remove_file(Path::new(&self.name))?;
+        self.name.clear();
+        control.checkpoint(crate::durability::DurabilityPoint::AtomicWritePublished)
+    }
+
     #[must_use]
     pub fn raw_hash(&self) -> &str {
         &self.raw_hash
@@ -894,6 +926,10 @@ fn bound_write_semantic(parent: &File, leaf: &str, bytes: &[u8], max: u64) -> Re
     result
 }
 
+fn raw_materialization_error() -> KioError {
+    KioError::invalid_usage("raw objects require streaming inspect/copy APIs")
+}
+
 fn bound_read_verified_accounted(
     reads: &CasReadAccess,
     parent: &File,
@@ -902,6 +938,9 @@ fn bound_read_verified_accounted(
     hash: &str,
     materialize: bool,
 ) -> (Result<(u64, Vec<u8>)>, u64) {
+    if materialize && kind == ObjectKind::Raw {
+        return (Err(raw_materialization_error()), 0);
+    }
     let mut bytes = Vec::new();
     let mut hasher = Sha256::new();
     let (result, consumed) = bound_stream_regular(reads, parent, leaf, kind.max_bytes(), |part| {
@@ -1406,6 +1445,9 @@ fn read_verified_object_accounted(
     expected_hash: &str,
     materialize: bool,
 ) -> (Result<(u64, Vec<u8>)>, u64) {
+    if materialize && kind == ObjectKind::Raw {
+        return (Err(raw_materialization_error()), 0);
+    }
     let mut consumed = 0_u64;
     let result = (|| -> Result<(u64, Vec<u8>)> {
         reads.charge(0)?;
@@ -1710,38 +1752,6 @@ fn publish_temp_object(
     target.sync()?;
     verify_named_cas_directory(source, source_path)?;
     verify_named_cas_directory(&target, destination_path)
-}
-
-fn create_repair_quarantine(path: &Path, opened: &File) -> Result<PathBuf> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| KioError::io("CAS path has no parent", path.display().to_string()))?;
-    for attempt in 0..32_u8 {
-        let candidate = parent.join(format!(
-            ".repair-quarantine-{}-{}-{attempt}",
-            std::process::id(),
-            unix_nanos()
-        ));
-        match fs::hard_link(path, &candidate) {
-            Ok(()) => {
-                let mut options = OpenOptions::new();
-                options.read(true);
-                configure_no_follow(&mut options);
-                let linked = options.open(&candidate).kio_io(&candidate)?;
-                if !same_open_file(opened, &linked)? {
-                    let _ = fs::remove_file(&candidate);
-                    return Err(non_regular_object_error(path));
-                }
-                return Ok(candidate);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(KioError::io(error.to_string(), path.display().to_string())),
-        }
-    }
-    Err(KioError::io(
-        "could not allocate raw repair quarantine",
-        path.display().to_string(),
-    ))
 }
 
 fn verify_existing_matches_file(
@@ -2586,7 +2596,7 @@ mod tests {
             make_cas_object_unsafe(&path, false);
             let before =
                 observe_regular_file_stability(&fs::metadata(&path).unwrap(), &path).unwrap();
-            assert!(store.read_object(ObjectKind::Raw, &hash).is_err());
+            assert!(read_raw_fixture(&store, &hash).is_err());
             assert!(store.inspect_object(ObjectKind::Raw, &hash).is_err());
             assert!(store.write_raw(bytes).is_err());
             assert!(store.remove_raw(&hash).is_err());
@@ -2664,6 +2674,18 @@ mod tests {
             .unwrap()
     }
 
+    fn read_raw_fixture(
+        store: &crate::cas::ObjectStore,
+        hash: &str,
+    ) -> crate::Result<crate::cas::StoredObject> {
+        let mut bytes = Vec::new();
+        store.copy_object_to(crate::cas::ObjectKind::Raw, hash, &mut bytes)?;
+        Ok(crate::cas::StoredObject {
+            kind: crate::cas::ObjectKind::Raw,
+            hash: hash.to_owned(),
+            bytes,
+        })
+    }
     fn object_store() -> (tempfile::TempDir, ObjectStore) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
@@ -3082,6 +3104,69 @@ mod tests {
 
         let error = store.write_raw(expected).unwrap_err();
         assert_eq!(error.error_code(), "KIO-E-STORE-CORRUPT-001");
+    }
+
+    #[test]
+    fn st04_review_materializing_reads_reject_raw_without_consuming_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = crate::scope::Repository::init(dir.path()).unwrap();
+        let hash = hash_bytes(b"sparse mock");
+        let path = fanout_path(repo.kio_dir().join("objects/raw"), &hash).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for p in [
+                path.parent().unwrap(),
+                path.parent().unwrap().parent().unwrap(),
+            ] {
+                fs::set_permissions(p, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        }
+        let file = File::create(&path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        file.set_len(1 << 30).unwrap();
+        drop(file);
+        for store in [repo.object_store(), ObjectStore::new(repo.kio_dir())] {
+            VerifiedCasReadBudget::new()
+                .run(CAS_STREAM_BUFFER_BYTES as u64, |reads| {
+                    let bound = store.with_verified_reads(reads)?;
+                    assert_eq!(
+                        bound
+                            .read_object(ObjectKind::Raw, &hash)
+                            .unwrap_err()
+                            .exit_code(),
+                        crate::ExitCode::InvalidUsage
+                    );
+                    assert_eq!(
+                        bound
+                            .read_object_with_size(ObjectKind::Raw, &hash)
+                            .unwrap_err()
+                            .exit_code(),
+                        crate::ExitCode::InvalidUsage
+                    );
+                    assert_eq!(
+                        bound
+                            .read_object_accounted(ObjectKind::Raw, &hash)
+                            .unwrap_err()
+                            .consumed_bytes,
+                        0
+                    );
+                    assert_eq!(
+                        bound.read_by_hash(&hash).unwrap_err().exit_code(),
+                        crate::ExitCode::InvalidUsage
+                    );
+                    assert!(repo.with_verified_reads(reads)?.read_commit(&hash).is_err());
+                    assert!(repo.with_verified_reads(reads)?.read_tree(&hash).is_err());
+                    Ok(())
+                })
+                .map(|(_, consumed)| assert_eq!(consumed, 0))
+                .unwrap();
+        }
     }
 
     #[test]
@@ -3689,10 +3774,7 @@ mod tests {
             .join(digest);
         assert_eq!(fs::read(retained_leaf).unwrap(), bytes);
         assert!(fs::read_dir(victim.path()).unwrap().next().is_none());
-        assert_eq!(
-            store.read_object(ObjectKind::Raw, &hash).unwrap().bytes,
-            bytes
-        );
+        assert_eq!(read_raw_fixture(&store, &hash).unwrap().bytes, bytes);
     }
 
     #[cfg(unix)]

@@ -187,7 +187,7 @@ impl Repository {
                 ExitCode::PartialFailure,
             ));
         }
-        let stored = self.store.read_by_hash(new_head)?;
+        let stored = self.store.read_object(ObjectKind::Commit, new_head)?;
         if stored.kind != ObjectKind::Commit
             || serde_json::from_slice::<CommitObject>(&stored.bytes)
                 .map_err(|error| KioError::schema(error.to_string()))?

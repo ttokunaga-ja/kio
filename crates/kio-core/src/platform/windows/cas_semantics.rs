@@ -10,27 +10,6 @@ pub(crate) fn retain_bound_kio(retained: File) -> Result<Arc<File>> {
         Path::new(".kio"),
     )?))
 }
-pub(crate) struct RepairSource<'a> {
-    source: File,
-    _borrow: std::marker::PhantomData<&'a mut Option<File>>,
-}
-impl RepairSource<'_> {
-    pub(crate) fn file(&self) -> &File {
-        &self.source
-    }
-    pub(crate) fn prepare_replace(self) {
-        drop(self.source);
-    }
-}
-pub(crate) fn retain_repair_source(source: &mut Option<File>) -> RepairSource<'_> {
-    RepairSource {
-        source: source
-            .take()
-            .expect("repair source is retained before closure capture"),
-        _borrow: std::marker::PhantomData,
-    }
-}
-
 pub(crate) fn validate_bound_directory_native(directory: &File, label: &Path) -> Result<()> {
     if super::cas_identity::directory_handle_identity(directory).is_none() {
         return Err(KioError::io(

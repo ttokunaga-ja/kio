@@ -124,9 +124,19 @@ fn bound_inspection_accounted_reads_and_streaming_copy_follow_retained_namespace
                 .size_bytes,
             bytes.len() as u64
         );
-        let (object, consumed) = store.read_object_accounted(*kind, hash).unwrap();
-        assert_eq!(object.bytes, *bytes);
-        assert_eq!(consumed, bytes.len() as u64);
+        if *kind == ObjectKind::Raw {
+            assert_eq!(
+                store
+                    .read_object_accounted(*kind, hash)
+                    .unwrap_err()
+                    .consumed_bytes,
+                0
+            );
+        } else {
+            let (object, consumed) = store.read_object_accounted(*kind, hash).unwrap();
+            assert_eq!(object.bytes, *bytes);
+            assert_eq!(consumed, bytes.len() as u64);
+        }
         let mut copied = Vec::new();
         assert_eq!(
             store
@@ -188,10 +198,7 @@ fn retained_store_stages_publishes_and_reads_without_a_public_kio_path() {
         (expected.clone(), bytes.len() as u64)
     );
     assert_eq!(
-        store
-            .read_object(ObjectKind::Raw, &expected)
-            .expect("read")
-            .bytes,
+        read_raw_fixture(&store, &expected).expect("read").bytes,
         bytes
     );
 
@@ -237,7 +244,7 @@ fn retained_repairs_removals_and_embedding_inventory_never_follow_public_substit
 
     assert!(store.repair_raw(&raw_hash, raw_bytes).unwrap());
     assert_eq!(
-        store.read_object(ObjectKind::Raw, &raw_hash).unwrap().bytes,
+        read_raw_fixture(&store, &raw_hash).unwrap().bytes,
         raw_bytes
     );
     assert_eq!(
@@ -287,16 +294,9 @@ fn store_owned_kio_clone_survives_moves_after_raw_caller_handle_is_closed() {
     }
     let replacement = ObjectStore::new(&kio);
     let replacement_hash = replacement.write_raw(b"replacement bytes").unwrap();
-    assert!(replacement.read_object(ObjectKind::Raw, &hash).is_err());
-    assert!(
-        store
-            .read_object(ObjectKind::Raw, &replacement_hash)
-            .is_err()
-    );
-    assert_eq!(
-        store.read_object(ObjectKind::Raw, &hash).unwrap().bytes,
-        bytes
-    );
+    assert!(read_raw_fixture(&replacement, &hash).is_err());
+    assert!(read_raw_fixture(&store, &replacement_hash).is_err());
+    assert_eq!(read_raw_fixture(&store, &hash).unwrap().bytes, bytes);
     assert_eq!(
         store
             .read_content_object_bytes(ContentObjectKind::Image, &image_hash, 4096)
@@ -314,16 +314,9 @@ fn store_owned_kio_clone_survives_moves_after_raw_caller_handle_is_closed() {
     }
     let replacement = ObjectStore::new(&kio);
     let replacement_hash = replacement.write_raw(b"replacement root bytes").unwrap();
-    assert!(replacement.read_object(ObjectKind::Raw, &hash).is_err());
-    assert!(
-        store
-            .read_object(ObjectKind::Raw, &replacement_hash)
-            .is_err()
-    );
-    assert_eq!(
-        store.read_object(ObjectKind::Raw, &hash).unwrap().bytes,
-        bytes
-    );
+    assert!(read_raw_fixture(&replacement, &hash).is_err());
+    assert!(read_raw_fixture(&store, &replacement_hash).is_err());
+    assert_eq!(read_raw_fixture(&store, &hash).unwrap().bytes, bytes);
     assert_eq!(
         store
             .read_content_object_bytes(ContentObjectKind::Image, &image_hash, 4096)
@@ -331,8 +324,7 @@ fn store_owned_kio_clone_survives_moves_after_raw_caller_handle_is_closed() {
         image
     );
     assert_eq!(
-        replacement
-            .read_object(ObjectKind::Raw, &replacement_hash)
+        read_raw_fixture(&replacement, &replacement_hash)
             .unwrap()
             .bytes,
         b"replacement root bytes"
@@ -401,4 +393,17 @@ fn retained_store_late_binds_peer_created_semantic_namespaces_without_ambient_fa
     );
     assert!(bound.remove_chunk(&chunk_hash).unwrap());
     assert!(bound.remove_embedding(&embedding_hash).unwrap());
+}
+
+fn read_raw_fixture(
+    store: &kio_core::cas::ObjectStore,
+    hash: &str,
+) -> kio_core::Result<kio_core::cas::StoredObject> {
+    let mut bytes = Vec::new();
+    store.copy_object_to(kio_core::cas::ObjectKind::Raw, hash, &mut bytes)?;
+    Ok(kio_core::cas::StoredObject {
+        kind: kio_core::cas::ObjectKind::Raw,
+        hash: hash.to_owned(),
+        bytes,
+    })
 }

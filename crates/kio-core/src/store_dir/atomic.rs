@@ -573,9 +573,27 @@ pub(super) fn remove(
     expected: &[u8],
     max_bytes: u64,
 ) -> Result<()> {
+    remove_hash(
+        owner,
+        target,
+        relative,
+        &crate::cas::lower_hex(&Sha256::digest(expected)),
+        expected.len() as u64,
+        max_bytes,
+    )
+}
+
+pub(super) fn remove_hash(
+    owner: &StoreDirectory,
+    target: &StoreDirectory,
+    relative: &Path,
+    expected_hash: &str,
+    expected_length: u64,
+    max_bytes: u64,
+) -> Result<()> {
     let relative_text = valid_relative(relative)?;
     validate_target_namespace(owner, target, &relative_text)?;
-    if expected.len() as u64 > max_bytes {
+    if expected_length > max_bytes {
         return Err(failure("atomic expected bytes exceed removal limit"));
     }
     let (preflight_parent, _, _) = parent_chain(target, relative)?;
@@ -589,8 +607,7 @@ pub(super) fn remove(
     crate::platform::atomic_semantics::verify_removal_owner(&source)?;
     let source_id = file_id(&source)?;
     let (sha256, length) = hash_file(&mut source, max_bytes)?;
-    let expected_hash = crate::cas::lower_hex(&Sha256::digest(expected));
-    if sha256 != expected_hash || length != expected.len() as u64 {
+    if sha256 != expected_hash || length != expected_length {
         return Err(failure("atomic source differs from expected bytes"));
     }
     drop(source);

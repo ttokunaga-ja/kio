@@ -187,6 +187,28 @@ impl ObjectStore {
             .stage_raw_from_reader(reader, max_bytes)
     }
 
+    /// Stream a verified raw CAS object into an identity-journaled private stage.
+    pub(crate) fn stage_raw_copy(&self, hash: &str, max_bytes: u64) -> Result<BoundRawStage> {
+        let bound = self
+            .bound
+            .as_ref()
+            .ok_or_else(|| KioError::invalid_usage("raw stage copy requires retained store"))?;
+        let (parent, leaf) = bound.fanout(ObjectKind::Raw, hash, false)?;
+        let mut source = bound_open_regular_handle(&parent, &leaf)?;
+        let expected_size = source.metadata().kio_io(Path::new(&leaf))?.len();
+        if expected_size > max_bytes {
+            return Err(object_size_error(ObjectKind::Raw, max_bytes, expected_size));
+        }
+        let stage = bound.stage_raw_from_reader_with_access(&mut source, max_bytes, &self.reads)?;
+        if stage.raw_hash() != hash
+            || stage.size_bytes() != expected_size
+            || source.metadata().kio_io(Path::new(&leaf))?.len() != expected_size
+        {
+            return Err(bound_stage_corrupt("raw CAS source changed while staging"));
+        }
+        Ok(stage)
+    }
+
     pub fn inspect_raw_stages(&self) -> Result<Vec<RawStageResidue>> {
         if let Some(bound) = &self.bound {
             return bound.inspect_raw_stages(false);
@@ -233,117 +255,36 @@ impl ObjectStore {
     /// noncanonical or conflicting representation remains fail-closed. The caller must
     /// hold the scope store lock for the entire operation.
     pub fn repair_raw(&self, expected_hash: &str, bytes: &[u8]) -> Result<bool> {
-        if let Some(bound) = &self.bound {
-            return bound.repair_raw(expected_hash, bytes);
-        }
         if !is_hash(expected_hash) || hash_bytes(bytes) != expected_hash {
             return Err(KioError::invalid_usage(
                 "raw repair bytes do not match the expected hash",
             ));
         }
-        if bytes.len() as u64 > ObjectKind::Raw.max_bytes() {
-            return Err(object_size_error(
-                ObjectKind::Raw,
-                ObjectKind::Raw.max_bytes(),
-                bytes.len() as u64,
-            ));
+        if self.bound.is_none() {
+            return self.retained_raw_writer()?.repair_raw(expected_hash, bytes);
         }
-        self.ensure_object_parent(ObjectKind::Raw, expected_hash)?;
-        let Some(path) = self.existing_object_path(ObjectKind::Raw, expected_hash)? else {
-            self.write_object_bytes(ObjectKind::Raw, expected_hash, bytes)?;
-            return Ok(true);
-        };
-        let path = path.as_path();
-        if read_verified_object(
-            &CasReadAccess::Unmetered,
-            path,
-            ObjectKind::Raw,
-            expected_hash,
-            false,
-        )
-        .is_ok()
-        {
-            return Ok(false);
-        }
+        let stage =
+            self.stage_raw_from_reader(&mut std::io::Cursor::new(bytes), bytes.len() as u64)?;
+        self.repair_raw_stage(stage)
+    }
 
-        // Re-open through the hardened no-follow/single-link boundary and consume
-        // the complete corrupt body before authorizing replacement. Unsafe links
-        // and path swaps fail before any namespace mutation.
-        let mut corrupt = open_private_cas_file(path)?;
-        let metadata = corrupt.metadata().kio_io(path)?;
-        if metadata.len() > ObjectKind::Raw.max_bytes() {
-            return Err(object_size_error(
-                ObjectKind::Raw,
-                ObjectKind::Raw.max_bytes(),
-                metadata.len(),
-            ));
-        }
-        let mut actual_hasher = Sha256::new();
-        let mut buffer = [0_u8; CAS_STREAM_BUFFER_BYTES];
-        loop {
-            let count = corrupt.read(&mut buffer).kio_io(path)?;
-            if count == 0 {
-                break;
-            }
-            actual_hasher.update(&buffer[..count]);
-        }
-        let actual = format!("sha256:{}", lower_hex(&actual_hasher.finalize()));
-        if actual == expected_hash {
-            return Err(corrupt_object_error(
-                path,
-                "raw repair observed an unstable CAS slot",
-                expected_hash,
-                Some(&actual),
-            ));
-        }
+    /// Publish a recovery candidate whose complete body lives only on disk.
+    pub fn repair_raw_stage(&self, stage: BoundRawStage) -> Result<bool> {
+        self.bound
+            .as_ref()
+            .ok_or_else(|| KioError::invalid_usage("raw repair requires a retained store"))?
+            .repair_raw_stage(stage)
+    }
 
-        let parent = path
-            .parent()
-            .ok_or_else(|| KioError::io("CAS path has no parent", path.display().to_string()))?;
-        let (temp_path, mut temp, temp_parent) = create_private_temp(parent)?;
-        let mut corrupt = Some(corrupt);
-        let source = cas_semantics::retain_repair_source(&mut corrupt);
-        let result = (|| -> Result<()> {
-            temp.write_all(bytes).kio_io(&temp_path)?;
-            temp.sync_all().kio_io(&temp_path)?;
-            drop(temp);
-
-            verify_named_cas_directory(&temp_parent, parent)?;
-            let quarantine = create_repair_quarantine(path, source.file())?;
-            verify_named_cas_directory(&temp_parent, parent)?;
-            // MoveFileEx requires both path operands to be closed on Windows.
-            // The verified quarantine hard link now pins the exact corrupt
-            // object for rollback, so the original read handle can be released
-            // without reopening or trusting its pathname.
-            source.prepare_replace();
-            if let Err(error) = replace_file(&temp_path, path) {
-                let _ = fs::remove_file(&quarantine);
-                return Err(error);
-            }
-            if let Err(error) = read_verified_object(
-                &CasReadAccess::Unmetered,
-                path,
-                ObjectKind::Raw,
-                expected_hash,
-                false,
-            ) {
-                let _ = replace_file(&quarantine, path);
-                return Err(error);
-            }
-            fs::remove_file(&quarantine).kio_io(&quarantine)?;
-            // R23-07: propagate. The rename that published the repaired bytes
-            // and the quarantine unlink above are both only as durable as this
-            // entry, and the unlink already fails the repair loudly — swallowing
-            // the sync that backs it let `repair_raw` answer `true` for a repair
-            // that a crash could still undo. Retry is idempotent: a slot that
-            // already verifies returns `false` before any mutation.
-            sync_directory(parent).kio_io(parent)?;
-            verify_named_cas_directory(&temp_parent, parent)
-        })();
-        if result.is_err() {
-            let _ = remove_private_temp(&temp_parent, &temp_path);
+    fn retained_raw_writer(&self) -> Result<Self> {
+        for kind in [ObjectKind::Raw, ObjectKind::Tree, ObjectKind::Commit] {
+            self.ensure_kind_base(kind)?;
         }
-        result.map(|()| true)
+        let directory = crate::store_dir::StoreDirectory::open_with_control(
+            self.ambient_kio_dir()?,
+            self.control.clone(),
+        )?;
+        Self::from_bound_kio_with_control(&directory.root_handle(), self.control.clone())
     }
 
     pub fn write_json(&self, kind: ObjectKind, value: &Value) -> Result<(String, Vec<u8>)> {
@@ -834,6 +775,15 @@ impl ObjectStore {
         if let Some(bound) = &self.bound {
             return bound.write_object_bytes(kind, hash, bytes);
         }
+        if kind == ObjectKind::Raw {
+            if hash_bytes(bytes) != hash {
+                return Err(KioError::invalid_usage(
+                    "raw bytes do not match supplied hash",
+                ));
+            }
+            self.write_raw_reader(&mut std::io::Cursor::new(bytes), bytes.len() as u64)?;
+            return Ok(());
+        }
         if bytes.len() as u64 > kind.max_bytes() {
             return Err(object_size_error(
                 kind,
@@ -902,6 +852,8 @@ impl ObjectStore {
             .write_raw_reader(reader, max_bytes)
     }
 
+    /// Materialize only bounded structured kinds. A raw hash is rejected;
+    /// use streaming `inspect_by_hash` or exact-kind `copy_object_to` for raw.
     pub fn read_by_hash(&self, hash: &str) -> Result<StoredObject> {
         if let Some(bound) = &self.bound {
             return bound.read_by_hash(&self.reads, hash);
@@ -1088,7 +1040,8 @@ impl ObjectStore {
         read_bounded_regular_file_inner(&path, max_bytes, &self.reads, true)
     }
 
-    /// Read and verify a hash from one required CAS namespace. Unlike
+    /// Read a bounded structured object; raw bytes require `copy_object_to`
+    /// or `inspect_object` and are rejected before payload reads. Unlike
     /// [`Self::read_by_hash`], this never accepts an object with the same digest
     /// from a different kind as a substitute for the requested object.
     pub fn read_object(&self, kind: ObjectKind, hash: &str) -> Result<StoredObject> {

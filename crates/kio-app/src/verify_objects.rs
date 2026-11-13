@@ -1052,7 +1052,7 @@ fn verify_objects_with_limits(
     }
 
     repairs_allowed &= !state.exceeded_bounds;
-    let mut staged_raws = Vec::<(String, Vec<u8>)>::new();
+    let mut staged_raws = Vec::<kio_core::cas::BoundRawStage>::new();
     for (raw_hash, affected) in &raw_affected {
         let affected = affected
             .iter()
@@ -1165,20 +1165,20 @@ fn verify_objects_with_limits(
             let remaining = state
                 .max_verified_bytes
                 .saturating_sub(state.verified_bytes);
-            match recover_raw(path, raw_hash, remaining)? {
+            match recover_raw(&store, path, raw_hash, remaining)? {
                 RawRecovery::Missing(bytes) => {
                     state.add_bytes(bytes);
                     if state.exceeded_bounds {
                         break;
                     }
                 }
-                RawRecovery::Candidate(bytes) => {
-                    state.add_bytes(bytes.len() as u64);
+                RawRecovery::Candidate(stage) => {
+                    state.add_bytes(stage.size_bytes());
                     if state.exceeded_bounds {
                         break;
                     }
                     corrupt_raws.remove(raw_hash);
-                    staged_raws.push((raw_hash.clone(), bytes));
+                    staged_raws.push(*stage);
                     recovered = true;
                     break;
                 }
@@ -1257,8 +1257,9 @@ fn verify_objects_with_limits(
         }
     }
 
-    for (raw_hash, bytes) in &staged_raws {
-        store.repair_raw(raw_hash, bytes)?;
+    let repaired = staged_raws.len() as u64;
+    for stage in staged_raws {
+        store.repair_raw_stage(stage)?;
     }
     // LC27/LC35 backfill: append `retired` to whichever marker was canonical,
     // linking the republication commit found above as `resurrection_commit`.
@@ -1328,7 +1329,6 @@ fn verify_objects_with_limits(
     if any_retired && index_exists {
         recover_index_generation(repo.kio_dir(), repo.control())?;
     }
-    let repaired = staged_raws.len() as u64;
     let repaired_commit_hash = if repaired > 0 && repairs_allowed && !state.exceeded_bounds {
         Some(repo.record_repaired_commit(Some("repair verify-objects recovered raw CAS"))?)
     } else {
@@ -2578,34 +2578,148 @@ fn valid_dead_terminal(
 
 enum RawRecovery {
     Missing(u64),
-    Candidate(Vec<u8>),
+    Candidate(Box<kio_core::cas::BoundRawStage>),
     LimitExceeded,
 }
 
-fn recover_raw(path: &Path, expected_hash: &str, remaining_bytes: u64) -> Result<RawRecovery> {
-    let bytes = match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.len() > remaining_bytes => return Ok(RawRecovery::LimitExceeded),
-        Ok(_) => match read_bounded_regular_file(path, remaining_bytes) {
-            Ok(bytes) => bytes,
-            Err(error) if error.error_code() == "KIO-E-STORE-OBJECT-OVERSIZED-001" => {
-                return Ok(RawRecovery::LimitExceeded);
-            }
-            Err(error) => return Err(error),
-        },
+fn recover_raw(
+    store: &ObjectStore,
+    path: &Path,
+    expected_hash: &str,
+    remaining_bytes: u64,
+) -> Result<RawRecovery> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(RawRecovery::Missing(0));
         }
         Err(error) => return Err(KioError::io(error.to_string(), path.display().to_string())),
     };
-    if hash_bytes(&bytes) != expected_hash {
-        return Ok(RawRecovery::Missing(bytes.len() as u64));
+    if metadata.len() > remaining_bytes {
+        return Ok(RawRecovery::LimitExceeded);
     }
-    Ok(RawRecovery::Candidate(bytes))
+    let parent = kio_core::store_dir::StoreDirectory::open(
+        path.parent()
+            .ok_or_else(|| KioError::invalid_usage("source has no parent"))?,
+    )?;
+    let mut file = parent.open_regular_read(
+        Path::new(
+            path.file_name()
+                .ok_or_else(|| KioError::invalid_usage("source has no leaf"))?,
+        ),
+        remaining_bytes,
+    )?;
+    recover_raw_from_reader(store, &mut file, metadata.len(), expected_hash)
+}
+
+fn recover_raw_from_reader(
+    store: &ObjectStore,
+    reader: &mut impl std::io::Read,
+    expected_size: u64,
+    expected_hash: &str,
+) -> Result<RawRecovery> {
+    let stage = store.stage_raw_from_reader(reader, expected_size)?;
+    if stage.size_bytes() != expected_size {
+        return Err(KioError::new(
+            "KIO-E-STORE-CORRUPT-001",
+            "raw recovery source length changed",
+            json!({"expected_bytes": expected_size, "actual_bytes": stage.size_bytes()}),
+            ExitCode::PermanentFailure,
+        ));
+    }
+    if stage.raw_hash() != expected_hash {
+        return Ok(RawRecovery::Missing(stage.size_bytes()));
+    }
+    Ok(RawRecovery::Candidate(Box::new(stage)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct BoundedSyntheticRaw {
+        remaining: u64,
+    }
+    impl std::io::Read for BoundedSyntheticRaw {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            assert!(
+                bytes.len() <= kio_core::cas::CAS_STREAM_BUFFER_BYTES,
+                "raw recovery requested an input-sized allocation"
+            );
+            let count = self.remaining.min(bytes.len() as u64) as usize;
+            bytes[..count].fill(0);
+            self.remaining -= count as u64;
+            Ok(count)
+        }
+    }
+    #[test]
+    fn st04_review_multiple_recovery_candidates_stay_in_private_stages() {
+        use sha2::{Digest, Sha256};
+        let dir = tempfile::tempdir().unwrap();
+        let store = Repository::init(dir.path()).unwrap().object_store();
+        let mut candidates = Vec::new();
+        let mut expected = Vec::new();
+        for size in [8 * 1024 * 1024, 8 * 1024 * 1024 + 1] {
+            let mut hasher = Sha256::new();
+            let buffer = [0; kio_core::cas::CAS_STREAM_BUFFER_BYTES];
+            let mut remaining = size;
+            while remaining > 0 {
+                let count = remaining.min(buffer.len() as u64) as usize;
+                hasher.update(&buffer[..count]);
+                remaining -= count as u64;
+            }
+            let hash = format!("sha256:{}", kio_core::cas::lower_hex(&hasher.finalize()));
+            let mut reader = BoundedSyntheticRaw { remaining: size };
+            let RawRecovery::Candidate(stage) =
+                recover_raw_from_reader(&store, &mut reader, size, &hash).unwrap()
+            else {
+                panic!("expected private recovery stage");
+            };
+            assert_eq!(stage.size_bytes(), size);
+            assert!(store.inspect_object(ObjectKind::Raw, &hash).is_err());
+            candidates.push(*stage);
+            expected.push((hash, size));
+        }
+        for stage in candidates {
+            assert!(store.repair_raw_stage(stage).unwrap());
+        }
+        for (hash, size) in expected {
+            assert_eq!(
+                store
+                    .copy_object_to(ObjectKind::Raw, &hash, &mut std::io::sink())
+                    .unwrap()
+                    .size_bytes,
+                size
+            );
+        }
+        assert!(store.inspect_raw_stages().unwrap().is_empty());
+    }
+
+    #[test]
+    fn st04_review_recovery_uses_bounded_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Repository::init(dir.path()).unwrap().object_store();
+        let mut reader = BoundedSyntheticRaw {
+            remaining: 8 * 1024 * 1024,
+        };
+        let result = recover_raw_from_reader(
+            &store,
+            &mut reader,
+            8 * 1024 * 1024,
+            &hash_bytes(b"wrong digest"),
+        );
+        assert!(matches!(result.unwrap(), RawRecovery::Missing(_)));
+        assert_eq!(reader.remaining, 0);
+    }
+    #[test]
+    fn st04_review_recovery_rejects_short_source_even_with_matching_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Repository::init(dir.path()).unwrap().object_store();
+        let mut reader = &b"short"[..];
+        assert!(
+            recover_raw_from_reader(&store, &mut reader, 1 << 40, &hash_bytes(b"short")).is_err()
+        );
+    }
 
     #[test]
     fn st04_verify_objects_reports_unidentified_stage_without_removing_it() {

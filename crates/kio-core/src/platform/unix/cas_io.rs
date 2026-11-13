@@ -24,22 +24,6 @@ pub(crate) fn sync_bound_directory(directory: &File, label: &Path) -> Result<()>
     syncable.sync_all().kio_io(label)
 }
 
-pub(crate) fn same_open_file(left: &File, right: &File) -> Result<bool> {
-    Ok(same_file_identity(
-        &left
-            .metadata()
-            .map_err(|error| KioError::io(error.to_string(), "raw repair source"))?,
-        &right
-            .metadata()
-            .map_err(|error| KioError::io(error.to_string(), "raw repair quarantine"))?,
-    ))
-}
-
-pub(crate) fn replace_file(source: &Path, destination: &Path) -> Result<()> {
-    fs::rename(source, destination)
-        .map_err(|error| KioError::io(error.to_string(), destination.display().to_string()))
-}
-
 pub(crate) fn is_single_link_regular_metadata(metadata: &fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
     metadata.is_file() && metadata.nlink() == 1
