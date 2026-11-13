@@ -12,6 +12,8 @@ use std::path::PathBuf;
 
 #[derive(Debug, Serialize)]
 pub struct StatusResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub office_readiness: Option<OfficeReadiness>,
     pub scope_path: PathBuf,
     pub files: Vec<FileStatus>,
     pub head_shallow: bool,
@@ -54,4 +56,24 @@ pub struct BudgetStatusResponse {
     pub warning: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ledger_status: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OfficeReadiness {
+    pub state: &'static str,
+    pub reason: String,
+    pub alternatives: &'static str,
+}
+
+pub(crate) fn office_readiness(
+    control: &kio_core::control::ControlHandle,
+) -> Option<OfficeReadiness> {
+    match kio_adapter::office_convert::resolve_office_converter_with_control(control) {
+        Ok(_) => None,
+        Err(error) => Some(OfficeReadiness {
+            state: error.state,
+            reason: error.reason,
+            alternatives: "Text and Markdown, PDF text layer and direct XLSX extraction remain available; existing content remains searchable.",
+        }),
+    }
 }

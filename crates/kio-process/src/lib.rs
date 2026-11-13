@@ -349,7 +349,11 @@ fn run_bounded_command_inner_impl<M: BoundedProcessMonitor>(
         terminate_process_tree(&mut child);
         let cleanup = monitor.cleanup();
         let reaped = monitor.reap(&mut child);
-        cleanup?;
+        if let Err(cleanup) = cleanup {
+            return Err(BoundedProcessError::RendererCleanup(std::io::Error::other(
+                format!("startup failed: {error}; cleanup failed: {cleanup}"),
+            )));
+        }
         reaped?;
         return Err(error);
     }

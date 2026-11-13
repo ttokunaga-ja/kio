@@ -118,6 +118,8 @@ pub struct ExcludedScopeResponse {
 
 #[derive(Debug, Serialize)]
 pub struct IndexStatusResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub office_readiness: Option<super::status::OfficeReadiness>,
     pub enriched_ratio: f64,
     pub total_enrichment_tasks: u64,
     pub skipped_enrichment_tasks: u64,

@@ -304,6 +304,19 @@ fn print_output(value: Value, json_mode: bool) {
             serde_json::to_string_pretty(&value).expect("serializing command output cannot fail");
         println!("{}", terminal_safe_text(&rendered, true));
     }
+    if let Some(readiness) = value.get("office_readiness").or_else(|| {
+        value
+            .get("index_status")
+            .and_then(|status| status.get("office_readiness"))
+    }) {
+        let rendered = format!(
+            "Office: {} — {}. {}",
+            readiness["state"].as_str().unwrap_or("unavailable"),
+            readiness["reason"].as_str().unwrap_or(""),
+            readiness["alternatives"].as_str().unwrap_or("")
+        );
+        println!("{}", terminal_safe_text(&rendered, false));
+    }
     if let Some(gc) = value.get("gc").and_then(Value::as_object) {
         let status = gc
             .get("status")
