@@ -272,6 +272,9 @@ pub(crate) fn observe_budget(path: &Path, control: &ControlHandle) -> BudgetObse
 
 pub(crate) fn ledger_snapshot_to_kio(path: &str, error: LedgerSnapshotError) -> KioError {
     match error {
+        LedgerSnapshotError::ResourceLimit(limit) => {
+            limit.into_error("insufficient resources for cost ledger snapshot")
+        }
         // A successfully-owned snapshot cannot become Missing while querying.
         // Treat that impossible transition as integrity failure rather than
         // silently switching to the no-ledger/zero-total outcome.

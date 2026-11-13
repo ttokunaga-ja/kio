@@ -499,6 +499,11 @@ pub(crate) fn err(path: &Path, message: impl Into<String>) -> KioError {
     )
 }
 pub(crate) fn ioerr(path: &Path, error: std::io::Error) -> KioError {
+    // Stage creation uses the same directory primitives as atomic writes.
+    // Preserve exhaustion before reducing ordinary I/O to a diagnostic kind.
+    if crate::platform::stage_nonce::storage_exhausted(&error) {
+        return crate::store_dir::stage::stage_io("store directory I/O", error);
+    }
     let kind = match error.kind() {
         std::io::ErrorKind::AlreadyExists => "already_exists",
         std::io::ErrorKind::NotFound => "not_found",
