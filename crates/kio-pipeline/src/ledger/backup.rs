@@ -1,24 +1,84 @@
-//! Create-only authority-bound ledger backups.
+//! Create-only authority-bound ledger backups, held in private disk stages.
+use crate::platform::ledger_snapshot::PrivateStorage;
 use crate::{PipelineError, Result};
 use kio_core::control::ControlHandle;
 use kio_core::store_dir::{
-    ATOMIC_WORKSPACE_DIR, AtomicWorkspaceState, Publication, StoreDirectory,
+    ATOMIC_WORKSPACE_DIR, AtomicWorkspaceState, Publication, StageWriter, StoreDirectory,
 };
+use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::path::Path;
-const MAX_SQLITE: usize = 512 * 1024 * 1024;
+use std::{io::Read, path::Path, sync::Arc};
 const MAX_RECORD: usize = 16 * 1024;
 const MAX_MANIFEST: u64 = 16 * 1024;
+const IMAGE: &str = "ledger.sqlite";
 
 #[derive(Clone, Debug)]
 pub struct LedgerBackup {
     pub(crate) ledger_id: String,
     pub(crate) era: String,
     pub(crate) sequence: u64,
-    pub(crate) sqlite: Vec<u8>,
+    image: Arc<BackupImage>,
     pub(crate) authority: Vec<u8>,
     pub(crate) checkpoint: Vec<u8>,
+}
+struct BackupImage {
+    store: StoreDirectory,
+    _storage: PrivateStorage,
+}
+impl Drop for BackupImage {
+    fn drop(&mut self) {
+        // PrivateStorage's Windows cleanup accepts only SQLite leaves. Retire
+        // our recorded stage and clean atomic workspace before releasing it;
+        // never infer ownership of an unjournaled or mismatched stage.
+        let cleanup = || -> Result<()> {
+            if let Some(bytes) = self
+                .store
+                .read_optional(Path::new("ledger.sqlite.json"), MAX_MANIFEST)
+                .map_err(store_err)?
+            {
+                let identity = serde_json::from_slice(&bytes)
+                    .map_err(|e| err("KIO-E-LEDGER-BACKUP-MANIFEST-001", e.to_string()))?;
+                self.store
+                    .discard_stage(Path::new(IMAGE), &identity)
+                    .map_err(store_err)?;
+                self.store
+                    .remove_file(Path::new("ledger.sqlite.json"))
+                    .map_err(store_err)?;
+            }
+            if self.store.inspect_atomic().map_err(store_err)? == AtomicWorkspaceState::Clean {
+                self.store
+                    .remove_directory_all(Path::new(ATOMIC_WORKSPACE_DIR))
+                    .map_err(store_err)?;
+            }
+            Ok(())
+        };
+        let _ = cleanup();
+    }
+}
+impl std::fmt::Debug for BackupImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BackupImage(private disk stage)")
+    }
+}
+impl BackupImage {
+    fn create() -> Result<Self> {
+        let storage = PrivateStorage::create(
+            #[cfg(test)]
+            None,
+        )
+        .map_err(snapshot_error)?;
+        let store = storage.directory().map_err(snapshot_error)?;
+        Ok(Self {
+            store,
+            _storage: storage,
+        })
+    }
+    fn reader(&self) -> Result<std::fs::File> {
+        self.store
+            .open_regular_read(Path::new(IMAGE), u64::MAX)
+            .map_err(store_err)
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RestoreReadiness {
@@ -47,33 +107,167 @@ impl LedgerBackup {
         ledger_id: String,
         era: String,
         sequence: u64,
-        sqlite: Vec<u8>,
+        source: &Connection,
         authority: Vec<u8>,
         checkpoint: Vec<u8>,
     ) -> Result<Self> {
-        if sqlite.len() > MAX_SQLITE
-            || authority.len() > MAX_RECORD
-            || checkpoint.len() > MAX_RECORD
+        let image = BackupImage::create()?;
+        let stage = new_stage(&image.store, IMAGE)?;
+        let identity = stage.identity().clone();
+        stage.sync().map_err(store_err)?;
+        // SQLite's Windows VFS does not share DELETE access. Close the R1
+        // writer before SQLite opens this private file, then verify its saved
+        // physical identity and nonce once SQLite has closed it again.
+        drop(stage);
         {
-            return Err(err(
-                "KIO-E-LEDGER-BACKUP-SIZE-001",
-                "backup source exceeds size limit",
-            ));
+            let mut target = Connection::open_with_flags(
+                image.store.path().join(IMAGE),
+                OpenFlags::SQLITE_OPEN_READ_WRITE,
+            )
+            .map_err(sqlite_error)?;
+            let copied = (|| {
+                let copy = rusqlite::backup::Backup::new(source, &mut target)?;
+                loop {
+                    match copy.step(128)? {
+                        rusqlite::backup::StepResult::Done => return Ok(()),
+                        rusqlite::backup::StepResult::More => {}
+                        _ => {
+                            return Err(rusqlite::Error::SqliteFailure(
+                                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                                None,
+                            ));
+                        }
+                    }
+                }
+            })();
+            copied.map_err(|e| sqlite_error_at(e, Some(&target)))?;
+            target
+                .pragma_update(None, "journal_mode", "DELETE")
+                .map_err(|e| sqlite_error_at(e, Some(&target)))?;
+            target.close().map_err(|(_, error)| sqlite_error(error))?;
         }
-        Ok(Self {
+        identity.verify(&image.reader()?).map_err(store_err)?;
+        let backup = Self {
             ledger_id,
             era,
             sequence,
-            sqlite,
+            image: Arc::new(image),
             authority,
             checkpoint,
-        })
+        };
+        backup.validate()?;
+        Ok(backup)
+    }
+    #[cfg(test)]
+    pub(crate) fn corrupt_image_for_test(&self) {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(self.image.store.path().join(IMAGE))
+            .unwrap();
+        file.seek(SeekFrom::End(-1)).unwrap();
+        let mut b = [0];
+        file.read_exact(&mut b).unwrap();
+        b[0] ^= 1;
+        file.seek(SeekFrom::End(-1)).unwrap();
+        file.write_all(&b).unwrap();
     }
     pub(crate) fn identity(&self) -> (&str, &str, u64) {
         (&self.ledger_id, &self.era, self.sequence)
     }
-    pub(crate) fn sqlite_digest(&self) -> String {
-        digest(&self.sqlite).sha256
+    pub(crate) fn sqlite_digest(&self) -> Result<String> {
+        Ok(digest_reader(self.image.reader()?, None)?.sha256)
+    }
+    pub(crate) fn validate(&self) -> Result<()> {
+        let conn = Connection::open_with_flags(
+            self.image.store.path().join(IMAGE),
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .map_err(sqlite_error)?;
+        super::lifecycle::validate_backup_image(
+            &conn,
+            self.identity(),
+            &self.authority,
+            &self.checkpoint,
+        )?;
+        let mut check = conn
+            .prepare("PRAGMA integrity_check")
+            .map_err(sqlite_error)?;
+        let mut rows = check.query([]).map_err(sqlite_error)?;
+        let mut count = 0;
+        while let Some(row) = rows.next().map_err(sqlite_error)? {
+            let result: String = row.get(0).map_err(sqlite_error)?;
+            if result != "ok" {
+                return Err(err("KIO-E-LEDGER-BACKUP-INTEGRITY-001", result));
+            }
+            count += 1;
+        }
+        if count != 1 {
+            return Err(err(
+                "KIO-E-LEDGER-BACKUP-INTEGRITY-001",
+                "missing integrity result",
+            ));
+        }
+        Ok(())
+    }
+    /// Stream into a retained private stage, verify the exact bytes written,
+    /// and publish only after the complete image is present.
+    pub(crate) fn copy_database(&self, target: &StoreDirectory, leaf: &Path) -> Result<()> {
+        self.copy_database_with(target, leaf, |input, stage| {
+            digest_reader(input, Some(stage))
+        })
+    }
+    fn copy_database_with(
+        &self,
+        target: &StoreDirectory,
+        leaf: &Path,
+        copy: impl FnOnce(std::fs::File, &mut StageWriter) -> Result<DigestRecord>,
+    ) -> Result<()> {
+        let stage_name = format!("{}.backup-stage", leaf.to_string_lossy());
+        self.retire_copy_stage(target, leaf)?;
+        let mut stage = new_stage(target, &stage_name)?;
+        let actual = copy(self.image.reader()?, &mut stage)?;
+        stage.sync().map_err(store_err)?;
+        let written = digest_reader(
+            target
+                .open_regular_read(Path::new(&stage_name), u64::MAX)
+                .map_err(store_err)?,
+            None,
+        )?;
+        if written != actual || actual.sha256 != self.sqlite_digest()? {
+            return Err(err(
+                "KIO-E-LEDGER-BACKUP-MANIFEST-001",
+                "image changed during copy",
+            ));
+        }
+        stage
+            .publish(target, leaf, Publication::CreateOnly)
+            .map_err(store_err)?;
+        target
+            .remove_file(Path::new(&format!("{stage_name}.json")))
+            .map_err(store_err)?;
+        target.sync().map_err(store_err)
+    }
+    pub(crate) fn retire_copy_stage(&self, target: &StoreDirectory, leaf: &Path) -> Result<()> {
+        let name = format!("{}.backup-stage", leaf.to_string_lossy());
+        let journal = format!("{name}.json");
+        if let Some(bytes) = target
+            .read_optional(Path::new(&journal), MAX_MANIFEST)
+            .map_err(store_err)?
+        {
+            target
+                .ensure_owner_private(Path::new(&journal))
+                .map_err(store_err)?;
+            let identity = serde_json::from_slice(&bytes)
+                .map_err(|e| err("KIO-E-LEDGER-BACKUP-MANIFEST-001", e.to_string()))?;
+            target
+                .discard_stage(Path::new(&name), &identity)
+                .map_err(store_err)?;
+            target.remove_file(Path::new(&journal)).map_err(store_err)?;
+            target.sync().map_err(store_err)?;
+        }
+        Ok(())
     }
     pub fn publish_create_only(&self, destination: &Path) -> Result<()> {
         self.publish_create_only_with_control(destination, &ControlHandle::default())
@@ -83,6 +277,7 @@ impl LedgerBackup {
         destination: &Path,
         control: &ControlHandle,
     ) -> Result<()> {
+        self.validate()?;
         let s = bind_private_backup_destination(destination, control)?;
         if !s.entries(Path::new("")).map_err(store_err)?.is_empty() {
             return Err(err(
@@ -95,11 +290,11 @@ impl LedgerBackup {
             ledger_id: self.ledger_id.clone(),
             era: self.era.clone(),
             sequence: self.sequence,
-            sqlite: digest(&self.sqlite),
+            sqlite: digest_reader(self.image.reader()?, None)?,
             authority: digest(&self.authority),
             checkpoint: digest(&self.checkpoint),
         };
-        put(&s, "ledger.sqlite", &self.sqlite)?;
+        self.copy_database(&s, Path::new("ledger.sqlite"))?;
         put(&s, "authority.json", &self.authority)?;
         put(&s, "checkpoint.json", &self.checkpoint)?;
         let bytes = serde_json::to_vec(&m)
@@ -112,13 +307,7 @@ impl LedgerBackup {
     }
     pub fn load_with_control(destination: &Path, control: ControlHandle) -> Result<Self> {
         let s = bind_private_backup_destination(destination, &control)?;
-        let atomic = s.inspect_atomic().map_err(|_| {
-            err(
-                "KIO-E-LEDGER-BACKUP-MANIFEST-001",
-                "backup atomic workspace is invalid",
-            )
-        })?;
-        if atomic == AtomicWorkspaceState::Pending {
+        if s.inspect_atomic().map_err(store_err)? == AtomicWorkspaceState::Pending {
             return Err(err(
                 "KIO-E-LEDGER-BACKUP-MANIFEST-001",
                 "backup atomic workspace is pending",
@@ -127,7 +316,7 @@ impl LedgerBackup {
         let entries = s.entries(Path::new("")).map_err(store_err)?;
         if entries
             .iter()
-            .filter(|entry| entry.name != ATOMIC_WORKSPACE_DIR)
+            .filter(|e| e.name != ATOMIC_WORKSPACE_DIR)
             .count()
             != 4
         {
@@ -136,9 +325,9 @@ impl LedgerBackup {
                 "backup artifact has missing or unexpected entries",
             ));
         }
-        let read = |n: &str, max: u64| -> Result<Vec<u8>> {
-            s.ensure_owner_private(Path::new(n)).map_err(store_err)?;
-            s.read_optional(Path::new(n), max)
+        let read = |name: &str, max| -> Result<Vec<u8>> {
+            s.ensure_owner_private(Path::new(name)).map_err(store_err)?;
+            s.read_optional(Path::new(name), max)
                 .map_err(store_err)?
                 .ok_or_else(|| {
                     err(
@@ -147,41 +336,56 @@ impl LedgerBackup {
                     )
                 })
         };
-        let bytes = read("manifest.json", MAX_MANIFEST)?;
-        let m: Manifest = serde_json::from_slice(&bytes)
+        let m: Manifest = serde_json::from_slice(&read("manifest.json", MAX_MANIFEST)?)
             .map_err(|e| err("KIO-E-LEDGER-BACKUP-MANIFEST-001", e.to_string()))?;
         if m.version != 1
-            || m.sqlite.bytes > MAX_SQLITE as u64
             || m.authority.bytes > MAX_RECORD as u64
             || m.checkpoint.bytes > MAX_RECORD as u64
         {
             return Err(err(
                 "KIO-E-LEDGER-BACKUP-MANIFEST-001",
-                "manifest declares an oversized backup file",
+                "invalid backup manifest",
             ));
         }
-        let sqlite = read("ledger.sqlite", m.sqlite.bytes)?;
         let authority = read("authority.json", m.authority.bytes)?;
         let checkpoint = read("checkpoint.json", m.checkpoint.bytes)?;
-        if m.version != 1
-            || m.sqlite != digest(&sqlite)
-            || m.authority != digest(&authority)
-            || m.checkpoint != digest(&checkpoint)
+        s.ensure_owner_private(Path::new("ledger.sqlite"))
+            .map_err(store_err)?;
+        let input = s
+            .open_regular_read(Path::new("ledger.sqlite"), m.sqlite.bytes)
+            .map_err(store_err)?;
+        let image = BackupImage::create()?;
+        let mut stage = new_stage(&image.store, IMAGE)?;
+        let actual = digest_reader(input, Some(&mut stage))?;
+        if actual != m.sqlite
+            || digest(&authority) != m.authority
+            || digest(&checkpoint) != m.checkpoint
         {
             return Err(err(
                 "KIO-E-LEDGER-BACKUP-MANIFEST-001",
                 "backup digest mismatch",
             ));
         }
-        Self::new(
-            m.ledger_id,
-            m.era,
-            m.sequence,
-            sqlite,
+        stage.sync().map_err(store_err)?;
+        drop(stage);
+        let backup = Self {
+            ledger_id: m.ledger_id,
+            era: m.era,
+            sequence: m.sequence,
+            image: Arc::new(image),
             authority,
             checkpoint,
-        )
+        };
+        backup.validate()?;
+        Ok(backup)
     }
+}
+fn new_stage(store: &StoreDirectory, name: &str) -> Result<StageWriter> {
+    let stage = StageWriter::create(store, Path::new(name)).map_err(store_err)?;
+    let journal = serde_json::to_vec(stage.identity())
+        .map_err(|e| err("KIO-E-LEDGER-BACKUP-MANIFEST-001", e.to_string()))?;
+    put(store, &format!("{name}.json"), &journal)?;
+    Ok(stage)
 }
 fn put(s: &StoreDirectory, n: &str, b: &[u8]) -> Result<()> {
     s.write_atomic(Path::new(n), b, Publication::CreateOnly)
@@ -213,15 +417,68 @@ fn digest(b: &[u8]) -> DigestRecord {
         bytes: b.len() as u64,
         sha256: Sha256::digest(b)
             .iter()
-            .map(|byte| format!("{byte:02x}"))
+            .map(|b| format!("{b:02x}"))
             .collect(),
     }
+}
+fn digest_reader(
+    mut input: impl Read,
+    mut output: Option<&mut StageWriter>,
+) -> Result<DigestRecord> {
+    let mut hash = Sha256::new();
+    let mut bytes = 0u64;
+    let mut buf = [0; 65536];
+    loop {
+        let n = input.read(&mut buf).map_err(|e| {
+            snapshot_error(super::snapshot::snapshot_io_error("read backup image", e))
+        })?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&buf[..n]);
+        bytes = bytes
+            .checked_add(n as u64)
+            .ok_or_else(|| err("KIO-E-LEDGER-BACKUP-SIZE-001", "image size overflow"))?;
+        if let Some(stage) = output.as_deref_mut() {
+            stage.write_chunk(&buf[..n]).map_err(store_err)?;
+        }
+    }
+    Ok(DigestRecord {
+        bytes,
+        sha256: hash.finalize().iter().map(|b| format!("{b:02x}")).collect(),
+    })
 }
 fn err(c: &'static str, m: impl Into<String>) -> PipelineError {
     PipelineError::contract(c, m)
 }
 fn store_err(e: kio_core::KioError) -> PipelineError {
-    err("KIO-E-LEDGER-BACKUP-PRIVATE-001", e.to_string())
+    if let Some(limit) = e.resource_limit() {
+        PipelineError::ResourceLimit(limit.clone())
+    } else {
+        err("KIO-E-LEDGER-BACKUP-PRIVATE-001", e.to_string())
+    }
+}
+pub(crate) fn snapshot_error(e: super::snapshot::AttemptError) -> PipelineError {
+    match e {
+        super::snapshot::AttemptError::ResourceLimit(mut limit) => {
+            limit.stage = "ledger_backup".into();
+            PipelineError::ResourceLimit(limit)
+        }
+        other => err("KIO-E-LEDGER-BACKUP-INTEGRITY-001", format!("{other:?}")),
+    }
+}
+fn sqlite_error(e: rusqlite::Error) -> PipelineError {
+    sqlite_error_at(e, None)
+}
+fn sqlite_error_at(e: rusqlite::Error, conn: Option<&Connection>) -> PipelineError {
+    let os = super::snapshot::sqlite_system_error(conn);
+    match super::snapshot::sqlite_resource(&e, os.as_ref()) {
+        Some(mut limit) => {
+            limit.stage = "ledger_backup".into();
+            PipelineError::ResourceLimit(limit)
+        }
+        None => e.into(),
+    }
 }
 
 #[cfg(test)]
@@ -231,15 +488,16 @@ mod tests {
     use super::*;
 
     fn backup() -> LedgerBackup {
-        LedgerBackup::new(
-            "ledger".to_owned(),
-            "2026-09".to_owned(),
-            7,
-            b"sqlite".to_vec(),
-            b"authority".to_vec(),
-            b"checkpoint".to_vec(),
+        let temp = tempfile::tempdir().unwrap();
+        super::super::LedgerDb::initialize(
+            temp.path()
+                .canonicalize()
+                .unwrap()
+                .join("device/ledger.sqlite"),
         )
-        .expect("bounded backup")
+        .unwrap()
+        .backup()
+        .unwrap()
     }
 
     struct PrivateTestDirectory {
@@ -329,7 +587,10 @@ mod tests {
         let loaded =
             LedgerBackup::load_with_control(sibling.path(), ControlHandle::default()).unwrap();
         assert_eq!(loaded.identity(), backup.identity());
-        assert_eq!(loaded.sqlite, backup.sqlite);
+        assert_eq!(
+            loaded.sqlite_digest().unwrap(),
+            backup.sqlite_digest().unwrap()
+        );
         assert_eq!(
             LedgerBackup::load(sibling.path()).unwrap().identity(),
             backup.identity()
@@ -364,7 +625,10 @@ mod tests {
             .unwrap();
         let loaded = LedgerBackup::load(copied.path()).expect("four payload backup");
         assert_eq!(loaded.identity(), backup.identity());
-        assert_eq!(loaded.sqlite, backup.sqlite);
+        assert_eq!(
+            loaded.sqlite_digest().unwrap(),
+            backup.sqlite_digest().unwrap()
+        );
         assert_eq!(
             fs::read(published.path().join("ledger.sqlite")).unwrap(),
             fs::read(copied.path().join("ledger.sqlite")).unwrap()
@@ -389,5 +653,93 @@ mod tests {
             before
         );
         assert!(pending.exists());
+    }
+    #[test]
+    fn private_image_releases_its_storage_on_drop() {
+        let backup = backup();
+        let private = backup.image.store.path().to_owned();
+        assert!(private.exists());
+        drop(backup);
+        assert!(!private.exists());
+    }
+
+    #[test]
+    fn corrupt_image_is_rejected_before_any_backup_payload_is_published() {
+        let backup = backup();
+        backup.corrupt_image_for_test();
+        let directory = private_tempdir();
+        assert!(backup.publish_create_only(directory.path()).is_err());
+        assert!(!directory.path().join("manifest.json").exists());
+        assert!(!directory.path().join("ledger.sqlite").exists());
+    }
+
+    #[test]
+    fn load_rejects_corruption_even_when_manifest_hash_is_recomputed() {
+        use std::io::Write;
+        let backup = backup();
+        let directory = private_tempdir();
+        backup.publish_create_only(directory.path()).unwrap();
+        let payload = directory.path().join("ledger.sqlite");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&payload)
+            .unwrap()
+            .write_all(b"broken database!")
+            .unwrap();
+        let manifest = directory.path().join("manifest.json");
+        let mut m: Manifest = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+        m.sqlite = digest_reader(fs::File::open(&payload).unwrap(), None).unwrap();
+        fs::write(manifest, serde_json::to_vec(&m).unwrap()).unwrap();
+        assert!(LedgerBackup::load(directory.path()).is_err());
+    }
+
+    #[test]
+    fn incomplete_or_exhausted_copy_is_not_published_and_its_exact_stage_can_retry() {
+        let backup = backup();
+        for exhausted in [false, true] {
+            let directory = private_tempdir();
+            let store = StoreDirectory::open(directory.path()).unwrap();
+            let error = backup
+                .copy_database_with(&store, Path::new("ledger.sqlite"), |_, stage| {
+                    stage.write_chunk(b"partial image").map_err(store_err)?;
+                    if exhausted {
+                        return Err(snapshot_error(super::super::snapshot::snapshot_io_error(
+                            "write backup",
+                            std::io::Error::from(std::io::ErrorKind::StorageFull),
+                        )));
+                    }
+                    Err(err("TEST-INTERRUPTED", "copy interrupted"))
+                })
+                .unwrap_err();
+            if exhausted {
+                assert!(matches!(
+                    error,
+                    PipelineError::ResourceLimit(kio_core::error::ResourceLimit {
+                        resource: kio_core::error::Resource::Storage,
+                        ..
+                    })
+                ));
+            }
+            assert!(!directory.path().join("ledger.sqlite").exists());
+            assert!(!directory.path().join("manifest.json").exists());
+            assert!(LedgerBackup::load(directory.path()).is_err());
+            assert!(directory.path().join("ledger.sqlite.backup-stage").exists());
+            backup
+                .copy_database(&store, Path::new("ledger.sqlite"))
+                .unwrap();
+            assert!(!directory.path().join("ledger.sqlite.backup-stage").exists());
+            assert!(
+                !directory
+                    .path()
+                    .join("ledger.sqlite.backup-stage.json")
+                    .exists()
+            );
+            let copied = digest_reader(
+                fs::File::open(directory.path().join("ledger.sqlite")).unwrap(),
+                None,
+            )
+            .unwrap();
+            assert_eq!(copied.sha256, backup.sqlite_digest().unwrap());
+        }
     }
 }

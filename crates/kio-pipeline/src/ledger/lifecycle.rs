@@ -327,56 +327,45 @@ impl LedgerDb {
         })
     }
     /// Capture a coherent, authority-bound backup while holding the lifecycle
-    /// lock. The caller must publish these bytes create-only as one manifest
+    /// lock. The caller must publish this image create-only as one manifest
     /// set; this API never overwrites a backup destination.
     pub fn backup(&self) -> Result<LedgerBackup> {
         let fs = FsSession::acquire_with_control(&self.path, false, self.control.clone())?;
         let (authority, checkpoint) = self.expected_authority(&fs)?;
-        let mut bound = fs.open_existing_sqlite(READ_WRITE)?;
-        let result = (|| {
-            let sqlite = {
-                let conn = bound.connection();
-                validate_bound_connection(conn, &authority, &checkpoint)?;
-                let busy: i64 =
-                    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
-                if busy != 0 {
-                    return Err(PipelineError::locked("ledger WAL checkpoint"));
-                }
-                conn.serialize("main")?.to_vec()
-            };
-            bound.revalidate_open()?;
-            let backup = LedgerBackup::new(
-                authority.ledger_id.clone(),
-                authority.era.clone(),
-                checkpoint.seq,
-                sqlite,
-                fs.read_private(&fs.names().authority, MAX_RECORD)?,
-                fs.read_private(&fs.names().checkpoint, MAX_RECORD)?,
-            )?;
-            let proof = BackupProof {
-                version: 1,
-                ledger_id: authority.ledger_id.clone(),
-                era: authority.era.clone(),
-                sequence: checkpoint.seq,
-                sqlite_sha256: backup.sqlite_digest(),
-            };
-            let bytes = encode(&proof)?;
-            if fs.contains_leaf(&fs.names().backup_proof)? {
-                fs.replace_existing(&fs.names().backup_proof, &bytes)?;
-            } else {
-                fs.create_only(&fs.names().backup_proof, &bytes)?;
-            }
-            fs.sync_parent()?;
-            durability_checkpoint(fs.control(), DurabilityPoint::LedgerBackupProof)?;
-            Ok(backup)
-        })();
-        let close = bound.finish();
-        result.and_then(|backup| close.map(|()| backup))
+        let snapshot = super::snapshot::LedgerReadSnapshot::for_backup(&fs)?;
+        validate_bound_connection(snapshot.connection(), &authority, &checkpoint)?;
+        let backup = LedgerBackup::new(
+            authority.ledger_id.clone(),
+            authority.era.clone(),
+            checkpoint.seq,
+            snapshot.connection(),
+            fs.read_private(&fs.names().authority, MAX_RECORD)?,
+            fs.read_private(&fs.names().checkpoint, MAX_RECORD)?,
+        )?;
+        snapshot.revalidate_source()?;
+        fs.revalidate_boundary()?;
+        let proof = BackupProof {
+            version: 1,
+            ledger_id: authority.ledger_id.clone(),
+            era: authority.era.clone(),
+            sequence: checkpoint.seq,
+            sqlite_sha256: backup.sqlite_digest()?,
+        };
+        let bytes = encode(&proof)?;
+        if fs.contains_leaf(&fs.names().backup_proof)? {
+            fs.replace_existing(&fs.names().backup_proof, &bytes)?;
+        } else {
+            fs.create_only(&fs.names().backup_proof, &bytes)?;
+        }
+        fs.sync_parent()?;
+        durability_checkpoint(fs.control(), DurabilityPoint::LedgerBackupProof)?;
+        Ok(backup)
     }
 
     /// Inspect a proposed explicit restore. A backup behind the current
     /// checkpoint is never treated as proof that no later paid request ran.
     pub fn restore_readiness(&self, backup: &LedgerBackup) -> Result<RestoreReadiness> {
+        backup.validate()?;
         let fs = FsSession::acquire_with_control(&self.path, false, self.control.clone())?;
         let (authority, checkpoint) = self.expected_authority(&fs)?;
         let backup_authority: Authority = decode(&backup.authority)?;
@@ -404,7 +393,7 @@ impl LedgerDb {
             || proof.ledger_id != authority.ledger_id
             || proof.era != authority.era
             || proof.sequence != checkpoint.seq
-            || proof.sqlite_sha256 != backup.sqlite_digest()
+            || proof.sqlite_sha256 != backup.sqlite_digest()?
         {
             return Ok(RestoreReadiness::HistoryEvidenceRequired);
         }
@@ -442,19 +431,20 @@ impl LedgerDb {
             || proof.ledger_id != authority.ledger_id
             || proof.era != authority.era
             || proof.sequence != checkpoint.seq
-            || proof.sqlite_sha256 != backup.sqlite_digest()
+            || proof.sqlite_sha256 != backup.sqlite_digest()?
         {
             return Err(contract(
                 "KIO-E-LEDGER-RESTORE-EVIDENCE-001",
                 "live authority does not prove this backup generation",
             ));
         }
+        backup.validate()?;
         let pending = RestorePending {
             version: 1,
             ledger_id: authority.ledger_id.clone(),
             era: authority.era.clone(),
             sequence: checkpoint.seq,
-            backup_digest: backup.sqlite_digest(),
+            backup_digest: backup.sqlite_digest()?,
         };
         let pending_bytes = encode(&pending)?;
         let db_exists = fs.contains_leaf(&fs.names().db)?;
@@ -472,7 +462,9 @@ impl LedgerDb {
         fs.sync_parent()?;
         durability_checkpoint(fs.control(), DurabilityPoint::LedgerRestoreJournal)?;
         if !db_exists {
-            fs.create_only(&fs.names().db, &backup.sqlite)?;
+            fs.revalidate_boundary()?;
+            backup.copy_database(fs.parent(), &fs.names().db)?;
+            fs.revalidate_boundary()?;
         }
         fs.sync_parent()?;
         let mut bound = fs.open_existing_sqlite(READ_WRITE)?;
@@ -482,6 +474,7 @@ impl LedgerDb {
         })();
         let close = bound.finish();
         result.and(close)?;
+        backup.retire_copy_stage(fs.parent(), &fs.names().db)?;
         durability_checkpoint(fs.control(), DurabilityPoint::LedgerRestoreDatabase)?;
         fs.remove_exact(&fs.names().restore_pending, &pending_bytes, MAX_RECORD)?;
         fs.sync_parent()?;
@@ -941,6 +934,38 @@ pub(crate) fn snapshot_artifact_state_from_retained_parent(
         Err(error) => Err(error),
     }
 }
+pub(crate) fn validate_snapshot_with_session(fs: &FsSession, conn: &Connection) -> Result<()> {
+    let (authority, checkpoint) = read_authority(fs)?;
+    validate_bound_connection(conn, &authority, &checkpoint)
+}
+
+pub(crate) fn validate_backup_image(
+    conn: &Connection,
+    identity: (&str, &str, u64),
+    authority_bytes: &[u8],
+    checkpoint_bytes: &[u8],
+) -> Result<()> {
+    let authority: Authority = decode(authority_bytes)?;
+    let checkpoint: Checkpoint = decode(checkpoint_bytes)?;
+    validate_authority(&authority)?;
+    if (
+        authority.ledger_id.as_str(),
+        authority.era.as_str(),
+        checkpoint.seq,
+    ) != identity
+        || checkpoint.version != 2
+        || checkpoint.ledger_id != authority.ledger_id
+        || checkpoint.era != authority.era
+        || !valid_id(&checkpoint.security_token)
+    {
+        return Err(contract(
+            "KIO-E-LEDGER-BACKUP-IDENTITY-001",
+            "backup manifest and authority records disagree",
+        ));
+    }
+    validate_bound_connection(conn, &authority, &checkpoint)
+}
+
 fn validate_bound_connection(
     conn: &Connection,
     authority: &Authority,

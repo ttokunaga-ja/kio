@@ -142,6 +142,50 @@ pub struct LedgerReadSnapshot {
 }
 
 impl LedgerReadSnapshot {
+    /// Reuse the full streaming snapshot validation under an already-held
+    /// lifecycle lease. SQLite only ever opens the private copy.
+    pub(crate) fn for_backup(session: &super::lifecycle_fs::FsSession) -> crate::Result<Self> {
+        let parent = session.parent();
+        let main = session.names().db.to_str().ok_or_else(|| {
+            crate::PipelineError::contract("KIO-E-LEDGER-PATH-001", "ledger name is not UTF-8")
+        })?;
+        attempt_snapshot(
+            &parent.root_handle(),
+            parent.path(),
+            main,
+            None,
+            0,
+            session.control(),
+            Some(session),
+        )
+        .map_err(super::backup::snapshot_error)
+    }
+
+    pub(crate) fn revalidate_source(&self) -> crate::Result<()> {
+        let parent = fresh_parent_binding(
+            &self.source_parent,
+            &self.source_parent_path,
+            &self.source_main,
+            &self.control,
+            #[cfg(test)]
+            None,
+        )
+        .map_err(super::backup::snapshot_error)?;
+        let manifest = manifest_recheck(&parent, &self.source_parent_path, &self.source_main)
+            .map_err(super::backup::snapshot_error)?;
+        if manifest != self.source_manifest {
+            return Err(crate::PipelineError::contract(
+                "KIO-E-LEDGER-BACKUP-INTEGRITY-001",
+                "source changed during backup",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn connection(&self) -> &Connection {
+        &self.conn
+    }
+
     /// Discover existing scoped paid recovery without granting write/send
     /// authority. A changed source or journal is unknown, never an empty queue.
     pub fn has_paid_recovery_work_for_scope(
@@ -231,6 +275,7 @@ impl LedgerReadSnapshot {
                     None,
                     attempt,
                     control,
+                    None,
                 ),
                 // Missing is returned only after two complete nofollow parent
                 // walks observe the same absence.  If a parent appears between
@@ -386,7 +431,7 @@ fn create_private_stage(
     kio_core::store_dir::StageWriter::create(&directory, Path::new(name)).map_err(stage_error)
 }
 
-fn sqlite_resource(
+pub(crate) fn sqlite_resource(
     error: &rusqlite::Error,
     system_error: Option<&std::io::Error>,
 ) -> Option<kio_core::error::ResourceLimit> {
@@ -412,7 +457,7 @@ fn sqlite_resource(
     }
 }
 
-fn sqlite_system_error(conn: Option<&Connection>) -> Option<std::io::Error> {
+pub(crate) fn sqlite_system_error(conn: Option<&Connection>) -> Option<std::io::Error> {
     let conn = conn?;
     // SAFETY: the connection owns a live SQLite handle; this accessor reads
     // its recorded OS error without executing SQL or changing error state.
@@ -919,6 +964,7 @@ fn attempt_snapshot(
     #[cfg(test)] attempt: usize,
     #[cfg(not(test))] _attempt: usize,
     control: &kio_core::control::ControlHandle,
+    held_session: Option<&super::lifecycle_fs::FsSession>,
 ) -> Result<LedgerReadSnapshot, AttemptError> {
     #[cfg(test)]
     let hook = hooks.and_then(|hooks| hooks.phase.as_ref());
@@ -1052,13 +1098,16 @@ fn attempt_snapshot(
             parent_path,
         );
     }
-    let lifecycle_validation = super::lifecycle::validate_read_snapshot_from_retained_parent(
-        &lifecycle_parent,
-        parent_path,
-        main,
-        &conn,
-        control,
-    );
+    let lifecycle_validation = match held_session {
+        Some(session) => super::lifecycle::validate_snapshot_with_session(session, &conn),
+        None => super::lifecycle::validate_read_snapshot_from_retained_parent(
+            &lifecycle_parent,
+            parent_path,
+            main,
+            &conn,
+            control,
+        ),
+    };
     #[cfg(test)]
     if let Some(hook) = hook {
         hook(SnapshotPhase::AfterBoundLifecycleRead, attempt, parent_path);

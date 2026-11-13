@@ -66,7 +66,7 @@ fn backup_binds_wal_safe_image_to_authority_and_checkpoint() {
     let ledger = LedgerDb::initialize(&path).unwrap();
     let backup = ledger.backup().unwrap();
     assert_eq!(backup.sequence, 0);
-    assert!(!backup.sqlite.is_empty());
+    assert!(!backup.sqlite_digest().unwrap().is_empty());
     assert_eq!(
         ledger.restore_readiness(&backup).unwrap(),
         RestoreReadiness::Ready
@@ -120,11 +120,11 @@ fn restore_requires_a_surviving_private_proof_before_any_publication() {
 fn restore_rejects_a_changed_backup_before_creating_database_or_journal() {
     let (_dir, path) = fixture();
     let ledger = LedgerDb::initialize(&path).unwrap();
-    let mut backup = ledger.backup().unwrap();
+    let backup = ledger.backup().unwrap();
     // This models a backup whose manifest was recomputed after its SQLite
     // payload changed. The surviving private proof is the independent trust
     // anchor and must reject it before restore writes anything.
-    *backup.sqlite.last_mut().unwrap() ^= 1;
+    backup.corrupt_image_for_test();
     fs::remove_file(&path).unwrap();
 
     assert_eq!(
@@ -146,7 +146,7 @@ fn restore_resumes_only_the_matching_interrupted_restore_journal() {
         ledger_id: ledger.authority.ledger_id.clone(),
         era: ledger.authority.era.clone(),
         sequence: checkpoint.seq,
-        backup_digest: backup.sqlite_digest(),
+        backup_digest: backup.sqlite_digest().unwrap(),
     };
     fs::remove_file(&path).unwrap();
     let session =
@@ -155,8 +155,8 @@ fn restore_resumes_only_the_matching_interrupted_restore_journal() {
     session
         .create_only(&session.names().restore_pending, &encode(&pending).unwrap())
         .unwrap();
-    session
-        .create_only(&session.names().db, &backup.sqlite)
+    backup
+        .copy_database(session.parent(), &session.names().db)
         .unwrap();
     drop(session);
 
@@ -521,4 +521,78 @@ fn owner_control_default_ledger_and_public_clock_ignore_fixed_environment() {
     let after = crate::ledger::time::now_millis();
     assert!(before <= now && now <= after);
     assert!(now > 946_684_800_000);
+}
+
+#[test]
+fn backup_preserves_live_main_wal_and_shm_bytes_and_permissions() {
+    let (_dir, path) = fixture();
+    let ledger = LedgerDb::initialize(&path).unwrap();
+    let raw = Connection::open(&path).unwrap();
+    raw.execute_batch("PRAGMA wal_autocheckpoint=0; UPDATE ledger_metadata SET sequence=sequence;")
+        .unwrap();
+    ledger.write(|_| Ok(())).unwrap();
+    assert!(fs::metadata(companion(&path, "-wal")).unwrap().len() > 32);
+    let paths = [
+        path.clone(),
+        companion(&path, "-wal"),
+        companion(&path, "-shm"),
+    ];
+    let before: Vec<_> = paths
+        .iter()
+        .map(|p| (fs::read(p).unwrap(), fs::metadata(p).unwrap().permissions()))
+        .collect();
+    let backup = ledger.backup().unwrap();
+    assert_eq!(backup.sequence, 1);
+    for (p, (bytes, permissions)) in paths.iter().zip(before) {
+        assert!(fs::read(p).unwrap() == bytes, "{} changed", p.display());
+        assert_eq!(fs::metadata(p).unwrap().permissions(), permissions);
+    }
+    assert_eq!(
+        ledger.restore_readiness(&backup).unwrap(),
+        RestoreReadiness::Ready
+    );
+}
+
+#[test]
+fn backup_over_512_mib_streams_through_publication_load_and_restore() {
+    let (dir, path) = fixture();
+    let ledger = LedgerDb::initialize(&path).unwrap();
+    let raw = Connection::open(&path).unwrap();
+    raw.execute_batch("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<513)
+        INSERT INTO cost_ledger(scope_id,adapter_kind,input_hash,tool_profile_hash,submission_seq,batch_job_id,usd,estimated,outcome,month,recorded_at)
+        SELECT 'scope','embedding',printf('%d',i),'profile',1,zeroblob(1048576),0,0,'succeeded','2026-11',0 FROM n;").unwrap();
+    drop(raw);
+    assert!(fs::metadata(&path).unwrap().len() > 512 * 1024 * 1024);
+    let backup = ledger.backup().unwrap();
+    let destination = dir.path().join("backup");
+    kio_core::store_dir::StoreDirectory::open(dir.path())
+        .unwrap()
+        .create_directory(Path::new("backup"))
+        .unwrap();
+    backup.publish_create_only(&destination).unwrap();
+    drop(backup);
+    let loaded = LedgerBackup::load(&destination).unwrap();
+    fs::remove_file(&path).unwrap();
+    let restored = LedgerDb::restore_missing_database(&path, &loaded).unwrap();
+    let count: i64 = restored
+        .read(|conn| Ok(conn.query_row("SELECT count(*) FROM cost_ledger", [], |r| r.get(0))?))
+        .unwrap();
+    assert_eq!(count, 513);
+    assert_eq!(restored.integrity_check().unwrap(), "ok");
+}
+
+#[test]
+fn restore_rejects_stale_proof_before_creating_any_restore_artifact() {
+    let (_dir, path) = fixture();
+    let ledger = LedgerDb::initialize(&path).unwrap();
+    let backup = ledger.backup().unwrap();
+    ledger.write(|_| Ok(())).unwrap();
+    fs::remove_file(&path).unwrap();
+    assert_eq!(
+        error_code(LedgerDb::restore_missing_database(&path, &backup).unwrap_err()),
+        "KIO-E-LEDGER-RESTORE-EVIDENCE-001"
+    );
+    assert!(!path.exists());
+    assert!(!companion(&path, ".restore.pending").exists());
+    assert!(!companion(&path, ".backup-stage").exists());
 }
