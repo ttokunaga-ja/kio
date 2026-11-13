@@ -421,7 +421,31 @@ fn ready_intent_for_owner(
     Ok(Some(intent))
 }
 
-/// Read-only workspace validation.  It never creates a directory or gate,
+/// Inspect a deletion proof under the existing workspace gate. It must remain
+/// available until the parent journal has recorded the corresponding phase.
+pub(super) fn pending_removal_matches(
+    owner: &StoreDirectory,
+    target: &StoreDirectory,
+    relative: &Path,
+    hash: &str,
+    length: u64,
+) -> Result<bool> {
+    let Some(workspace) = workspace_existing(owner)? else {
+        return Ok(false);
+    };
+    let _gate = lock_workspace(&workspace)?;
+    let Some(intent) = ready_intent_for_owner(owner, &workspace)? else {
+        return Ok(false);
+    };
+    let (_, _, chain) = parent_chain(target, relative)?;
+    Ok(intent.target_root_id == directory_id(target)?
+        && intent.parent_chain_ids == chain
+        && intent.relative == valid_relative(relative)?
+        && Some(intent.sha256.as_str()) == hash.strip_prefix("sha256:")
+        && intent.length == length)
+}
+
+/// Read-only workspace validation. It never creates a directory or gate,
 /// locks a file, or removes crash residue.
 pub(super) fn inspect(owner: &StoreDirectory) -> Result<AtomicWorkspaceState> {
     let Some(workspace) = workspace_existing(owner)? else {
@@ -590,6 +614,26 @@ pub(super) fn remove_hash(
     expected_length: u64,
     max_bytes: u64,
 ) -> Result<()> {
+    remove_hash_checked(
+        owner,
+        target,
+        relative,
+        expected_hash,
+        expected_length,
+        max_bytes,
+        |_| Ok(()),
+    )
+}
+
+pub(super) fn remove_hash_checked(
+    owner: &StoreDirectory,
+    target: &StoreDirectory,
+    relative: &Path,
+    expected_hash: &str,
+    expected_length: u64,
+    max_bytes: u64,
+    verify: impl FnOnce(&std::fs::File) -> Result<()>,
+) -> Result<()> {
     let relative_text = valid_relative(relative)?;
     validate_target_namespace(owner, target, &relative_text)?;
     if expected_length > max_bytes {
@@ -604,6 +648,7 @@ pub(super) fn remove_hash(
     same_volume(&workspace, &parent)?;
     let mut source = parent.open_regular_for_removal(Path::new(&leaf), max_bytes)?;
     crate::platform::atomic_semantics::verify_removal_owner(&source)?;
+    verify(&source)?;
     let source_id = file_id(&source)?;
     let (sha256, length) = hash_file(&mut source, max_bytes)?;
     if sha256 != expected_hash || length != expected_length {

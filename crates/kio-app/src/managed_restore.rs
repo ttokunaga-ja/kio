@@ -75,14 +75,38 @@ pub(super) fn run(
         });
     }
 
-    let outcome = repo.apply_restore(&plan, || {
-        // Core invokes this after it has acquired the writer lock, before each
-        // working-tree mutation, and immediately before HEAD publication.
-        // Reloading through the evaluator catches management, ignore, and
-        // scope authority changes that occurred after planning.
-        ensure_scope_allowed(&policy)?;
-        ensure_planned_paths_allowed(&policy, &plan)
-    })?;
+    let outcome = repo
+        .apply_restore_with_progress(
+            &plan,
+            || {
+                // Core invokes this after it has acquired the writer lock, before each
+                // working-tree mutation, and immediately before HEAD publication.
+                // Reloading through the evaluator catches management, ignore, and
+                // scope authority changes that occurred after planning.
+                ensure_scope_allowed(&policy)?;
+                ensure_planned_paths_allowed(&policy, &plan)
+            },
+            |progress| {
+                if ctx.interaction.is_interactive() {
+                    ctx.interaction.diagnostic(&format!(
+                        "restore: {} files {}/{} bytes {}/{}",
+                        progress.phase,
+                        progress.files_completed,
+                        progress.files_total,
+                        progress.bytes_completed,
+                        progress.bytes_total
+                    ));
+                }
+                Ok(())
+            },
+        )
+        .map_err(|error| match repo.managed_restore_status() {
+            Ok(Some(progress)) => error.with_context_field(
+                "restore_progress",
+                serde_json::to_value(progress).expect("restore progress"),
+            ),
+            _ => error,
+        })?;
     if let Some(commit_hash) = outcome.commit_hash.as_deref() {
         // A restored HEAD has no guarantee that its historical normalized
         // outputs are current.  Mark the projection unavailable instead of
@@ -304,6 +328,14 @@ fn plan_response(
         new_head: outcome.and_then(|value| value.commit_hash.clone()),
         new_tree_hash: plan.new_tree_hash().to_owned(),
         changes: plan.changes().to_vec(),
+        progress: plan.status(
+            if outcome.is_some() {
+                "published"
+            } else {
+                "planned"
+            },
+            outcome.is_some(),
+        ),
         provenance: RestoreProvenance {
             source_commit: plan.source_commit().to_owned(),
             parent_commit: plan.expected_head().to_owned(),

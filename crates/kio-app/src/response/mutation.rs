@@ -1,5 +1,5 @@
 use kio_core::purge::{PurgePhase, PurgeReason, TombstoneMode};
-use kio_core::scope::{ManagedRestoreChange, ManagedRestoreOutcome};
+use kio_core::scope::{ManagedRestoreChange, ManagedRestoreOutcome, ManagedRestoreStatus};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 // Restore and repair share the same recovery projection and error records.
@@ -56,6 +56,7 @@ pub struct RestoreResponse {
     pub new_head: Option<String>,
     pub new_tree_hash: String,
     pub changes: Vec<ManagedRestoreChange>,
+    pub progress: ManagedRestoreStatus,
     pub provenance: RestoreProvenance,
     pub apply: Option<ManagedRestoreOutcome>,
     pub egress: bool,

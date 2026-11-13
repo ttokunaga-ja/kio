@@ -423,20 +423,32 @@ impl StoreDirectory {
         atomic::remove(owner, self, relative, expected, max_bytes)
     }
 
-    /// Remove an immutable-content match without materializing its body.
-    pub(crate) fn quarantine_then_remove_hash_with_owner(
+    /// Inspect the existing atomic intent without consuming the recovery proof.
+    pub(crate) fn pending_removal_matches(
+        &self,
+        target: &StoreDirectory,
+        relative: &Path,
+        hash: &str,
+        length: u64,
+    ) -> Result<bool> {
+        atomic::pending_removal_matches(self, target, relative, hash, length)
+    }
+
+    /// Bind an additional caller authority to the exact handle captured by the
+    /// durable removal intent, closing the check/open gap for restore stages.
+    pub(crate) fn remove_hash_verified(
         &self,
         owner: &StoreDirectory,
         relative: &Path,
         hash: &str,
         length: u64,
-        max_bytes: u64,
+        verify: impl FnOnce(&File) -> Result<()>,
     ) -> Result<()> {
         let digest = hash
             .strip_prefix("sha256:")
             .filter(|_| crate::cas::is_hash(hash))
             .ok_or_else(|| KioError::invalid_usage("invalid expected removal hash"))?;
-        atomic::remove_hash(owner, self, relative, digest, length, max_bytes)
+        atomic::remove_hash_checked(owner, self, relative, digest, length, length, verify)
     }
 
     pub fn sync(&self) -> Result<()> {

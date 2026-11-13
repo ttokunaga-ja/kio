@@ -90,6 +90,9 @@ fn managed_restore_selected_path_is_a_linear_child_and_preserves_unselected_file
     assert_eq!(output["source_commit"], source);
     assert_eq!(output["expected_head"], head);
     assert_eq!(output["projection_status"], "ready");
+    assert_eq!(output["progress"]["phase"], "published");
+    assert_eq!(output["progress"]["files_completed"], 1);
+    assert_eq!(output["progress"]["bytes_completed"], 24);
 
     let search = ok(&dir, &["search", "orchid", "--mode", "text"]);
     assert!(
@@ -114,6 +117,9 @@ fn managed_restore_preview_and_expected_head_conflict_do_not_mutate() {
     let before = fs::read(dir.path().join("a.md")).unwrap();
     let preview = ok(&dir, &["restore", &source, "--preview"]);
     assert_eq!(preview["status"], "preview");
+    assert_eq!(preview["progress"]["phase"], "planned");
+    assert_eq!(preview["progress"]["files_total"], 1);
+    assert_eq!(preview["progress"]["bytes_total"], 24);
     assert_eq!(preview["expected_head"], head);
     assert_eq!(fs::read(dir.path().join("a.md")).unwrap(), before);
     assert_eq!(
@@ -144,4 +150,254 @@ fn managed_restore_default_is_policy_filtered_and_explicit_denial_fails() {
 
     let error = failure(&dir, &["restore", &source, "--path", "b.md"], 2);
     assert_eq!(error["error_code"], "KIO-E-MANAGED-RESTORE-POLICY-001");
+}
+
+#[cfg(debug_assertions)]
+struct StoppedRestore(std::process::Child);
+#[cfg(debug_assertions)]
+impl Drop for StoppedRestore {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[cfg(debug_assertions)]
+fn paused(dir: &TempDir, args: &[&str], point: &str) -> (StoppedRestore, std::path::PathBuf) {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    let ready = dir.path().join(format!(".test-{point}.ready"));
+    let stderr = dir.path().join(format!(".test-{point}.stderr"));
+    let mut child = StoppedRestore(
+        command(dir, args)
+            .env("KIO_TEST_DURABILITY_POINT", point)
+            .env("KIO_TEST_DURABILITY_READY", &ready)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(fs::File::create(&stderr).unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    let expected = format!("point={point}\npid={}\n", child.0.id());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while fs::read_to_string(&ready).ok().as_deref() != Some(&expected) {
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "{point}: {}",
+            fs::read_to_string(&stderr).unwrap()
+        );
+        assert!(Instant::now() < deadline, "checkpoint timeout: {point}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    (child, ready)
+}
+
+#[cfg(debug_assertions)]
+fn kill_at(dir: &TempDir, args: &[&str], point: &str) {
+    let (mut child, _) = paused(dir, args, point);
+    child.0.kill().unwrap();
+    assert!(!child.0.wait().unwrap().success());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn st06_process_crashes_at_each_apply_and_publication_phase_recover() {
+    for point in [
+        "restore_journal",
+        "restore_removing_old",
+        "atomic_remove_ready",
+        "atomic_remove_quarantined",
+        "atomic_remove_deleted",
+        "restore_old_removed",
+        "restore_publishing_new",
+        "restore_stage_ready",
+        "restore_file_published",
+        "restore_applied",
+        "restore_working_bytes",
+        "publication_journal",
+        "publication_manifest",
+        "publication_head",
+        "restore_head",
+    ]
+    .into_iter()
+    .chain(if cfg!(unix) {
+        Some("stage_captured")
+    } else {
+        None
+    }) {
+        let (dir, source, head) = fixture();
+        kill_at(&dir, &["restore", &source, "--path", "a.md"], point);
+        let recovered = ok(&dir, &["repair", "recover-restore"]);
+        assert_eq!(recovered["recovered"], true, "{point}: {recovered}");
+        let repo = Repository::open(dir.path()).unwrap();
+        let published = matches!(
+            point,
+            "publication_head" | "publication_manifest" | "restore_head"
+        );
+        let current = repo.head_commit_hash().unwrap().unwrap();
+        if published {
+            assert_ne!(current, head, "{point}");
+            assert_eq!(repo.read_commit(&current).unwrap().parent, Some(head));
+        } else {
+            assert_eq!(current, head, "{point}");
+        }
+        let expected: &[u8] = if published {
+            b"old unique orchid phrase"
+        } else {
+            b"new unique tulip phrase"
+        };
+        assert_eq!(
+            fs::read(dir.path().join("a.md")).unwrap(),
+            expected,
+            "{point}"
+        );
+        assert!(!dir.path().join(".kio/managed-restore-v1.json").exists());
+        assert!(!dir.path().join(".kio/managed-restore-stage-0").exists());
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn st06_process_crashes_during_rollback_recover_idempotently() {
+    for point in [
+        "restore_rollback_removing_new",
+        "restore_rollback_new_removed",
+        "restore_restoring_old",
+        "restore_stage_ready",
+        "restore_file_published",
+        "atomic_remove_ready",
+        "atomic_remove_quarantined",
+        "atomic_remove_deleted",
+    ]
+    .into_iter()
+    .chain(if cfg!(unix) {
+        Some("stage_captured")
+    } else {
+        None
+    }) {
+        let (dir, source, head) = fixture();
+        kill_at(
+            &dir,
+            &["restore", &source, "--path", "a.md"],
+            "restore_applied",
+        );
+        kill_at(&dir, &["repair", "recover-restore"], point);
+        let recovered = ok(&dir, &["repair", "recover-restore"]);
+        assert_eq!(recovered["recovered"], true, "{point}");
+        assert_eq!(
+            fs::read(dir.path().join("a.md")).unwrap(),
+            b"new unique tulip phrase",
+            "{point}"
+        );
+        assert_eq!(
+            Repository::open(dir.path())
+                .unwrap()
+                .head_commit_hash()
+                .unwrap()
+                .as_deref(),
+            Some(head.as_str())
+        );
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn st06_projection_failure_preserves_the_published_head_and_reports_unavailable() {
+    use std::io::Read;
+    let (dir, source, head) = fixture();
+    let (mut child, ready) = paused(
+        &dir,
+        &["restore", &source, "--path", "a.md"],
+        "restore_head",
+    );
+    let published = fs::read_to_string(dir.path().join(".kio/HEAD"))
+        .unwrap()
+        .trim()
+        .to_owned();
+    assert_ne!(published, head);
+    // Break only a reproducible projection after authoritative publication.
+    let db = dir.path().join(".kio/index/sqlite.db");
+    fs::rename(&db, dir.path().join(".test-original.sqlite")).unwrap();
+    fs::create_dir(&db).unwrap();
+    fs::write(ready.with_extension("release"), b"continue").unwrap();
+    let mut stdout = String::new();
+    child
+        .0
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    assert_eq!(child.0.wait().unwrap().code(), Some(3));
+    let output: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(output["status"], "applied_projection_failed");
+    assert_eq!(output["projection_status"], "failed");
+    assert_eq!(output["progress"]["phase"], "published");
+    assert_eq!(
+        fs::read_to_string(dir.path().join(".kio/HEAD"))
+            .unwrap()
+            .trim(),
+        published
+    );
+    assert_eq!(
+        fs::read(dir.path().join("a.md")).unwrap(),
+        b"old unique orchid phrase"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn st06_recovery_can_crash_after_carrying_the_lower_removal_proof() {
+    let (dir, source, head) = fixture();
+    kill_at(
+        &dir,
+        &["restore", &source, "--path", "a.md"],
+        "atomic_remove_quarantined",
+    );
+    kill_at(&dir, &["repair", "recover-restore"], "restore_old_removed");
+    assert_eq!(ok(&dir, &["repair", "recover-restore"])["recovered"], true);
+    assert_eq!(
+        fs::read(dir.path().join("a.md")).unwrap(),
+        b"new unique tulip phrase"
+    );
+    assert_eq!(
+        Repository::open(dir.path())
+            .unwrap()
+            .head_commit_hash()
+            .unwrap()
+            .as_deref(),
+        Some(head.as_str())
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn st06_complete_stage_digest_is_checked_before_publication() {
+    let (dir, source, head) = fixture();
+    let (mut child, ready) = paused(
+        &dir,
+        &["restore", &source, "--path", "a.md"],
+        "restore_stage_ready",
+    );
+    fs::write(
+        dir.path().join(".kio/managed-restore-stage-0"),
+        b"tampered stage contents!!",
+    )
+    .unwrap();
+    fs::write(ready.with_extension("release"), b"continue").unwrap();
+    assert_eq!(child.0.wait().unwrap().code(), Some(3));
+    assert!(!dir.path().join("a.md").exists());
+    assert_eq!(ok(&dir, &["repair", "recover-restore"])["recovered"], true);
+    assert_eq!(
+        fs::read(dir.path().join("a.md")).unwrap(),
+        b"new unique tulip phrase"
+    );
+    assert_eq!(
+        Repository::open(dir.path())
+            .unwrap()
+            .head_commit_hash()
+            .unwrap()
+            .as_deref(),
+        Some(head.as_str())
+    );
 }

@@ -617,25 +617,6 @@ impl BoundRawStage {
         Ok(())
     }
 
-    pub(crate) fn publish_to(
-        mut self,
-        target: &crate::store_dir::StoreDirectory,
-        leaf: &Path,
-        control: &crate::control::ControlHandle,
-    ) -> Result<()> {
-        self.verify()?;
-        self.writer.as_ref().expect("live raw stage").sync()?;
-        control.checkpoint(crate::durability::DurabilityPoint::AtomicWriteStaged)?;
-        self.writer.take().expect("live raw stage").publish(
-            target,
-            leaf,
-            crate::store_dir::Publication::CreateOnly,
-        )?;
-        self.journals.remove_file(Path::new(&self.name))?;
-        self.name.clear();
-        control.checkpoint(crate::durability::DurabilityPoint::AtomicWritePublished)
-    }
-
     #[must_use]
     pub fn raw_hash(&self) -> &str {
         &self.raw_hash
