@@ -332,6 +332,8 @@ impl StoreDirectory {
             return Ok(true);
         }
         if !self.contains_entry(leaf)? {
+            // An earlier unlink may still be undurable; sync before reporting absence.
+            self.sync()?;
             return Ok(false);
         }
         self.ensure_owner_private(leaf)?;

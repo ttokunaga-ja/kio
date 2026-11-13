@@ -358,6 +358,35 @@ mod tests {
     }
 
     #[test]
+    fn discard_retry_after_unlink_does_not_report_completion_without_parent_sync() {
+        let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let parent = StoreDirectory::open(temp.path()).unwrap();
+        let writer = crate::store_dir::StageWriter::create(&parent, Path::new("source")).unwrap();
+        let identity = writer.identity().clone();
+        drop(writer);
+        super::super::store::with_failed_directory_sync(&parent.root_handle(), || {
+            // The unlink succeeds but its parent fsync fails.
+            assert!(
+                parent
+                    .discard_stage(Path::new("source"), &identity)
+                    .is_err()
+            );
+            assert!(!temp.path().join("source").exists());
+            // A retry must not report completion while the removal is not durable.
+            assert!(
+                parent
+                    .discard_stage(Path::new("source"), &identity)
+                    .is_err()
+            );
+        });
+        assert!(
+            !parent
+                .discard_stage(Path::new("source"), &identity)
+                .unwrap()
+        );
+    }
+
+    #[test]
     fn missing_and_partial_capture_records_do_not_block_original_stage_cleanup() {
         for record in [None, Some(b"{".as_slice()), Some(b"".as_slice())] {
             let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
