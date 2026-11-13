@@ -50,12 +50,7 @@ jobs:
 
   rust:
     runs-on: ubuntu-24.04
-    # Workspace tests took 38 minutes on a normal hosted runner and more than
-    # 55 on a slow one (2026-11-12). One test, kio-cli's ci2_replay_history,
-    # replays the history corpus with debug binaries and alone took 17 and 31
-    # minutes in those runs. Until that test is made cheap (tasks/v1-plan.md
-    # V2), use the same bound as the macOS and Windows test jobs.
-    timeout-minutes: 90
+    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
