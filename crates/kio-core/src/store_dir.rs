@@ -15,7 +15,7 @@ use serde_json::json;
 use crate::{ExitCode, KioError, Result, platform::store as platform};
 
 pub(crate) mod atomic;
-mod stage;
+pub(crate) mod stage;
 pub(crate) use stage::StageReservation;
 pub use stage::{
     DirectoryStageIdentity, StageEntryState, StageIdentity, StageInspectionEntry, StageWriter,

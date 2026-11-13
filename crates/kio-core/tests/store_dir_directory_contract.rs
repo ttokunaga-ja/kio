@@ -54,11 +54,7 @@ fn assert_same_directory_identity(held: &StoreDirectory, published: &StoreDirect
 #[cfg(windows)]
 #[test]
 fn retained_repository_allows_namespace_moves_but_rejects_named_authority_replacement() {
-    use kio_core::{
-        cas::{ContentObjectKind, ObjectKind},
-        management::ManagementBinding,
-        scope::Repository,
-    };
+    use kio_core::{cas::ContentObjectKind, management::ManagementBinding, scope::Repository};
 
     let fixture = store_root();
     let fixture_path = fs::canonicalize(fixture.path()).unwrap();
