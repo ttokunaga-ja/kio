@@ -4113,7 +4113,7 @@ mod tests {
         fs::create_dir_all(base.join(".cargo")).unwrap();
         fs::write(
             repo.join("Cargo.toml"),
-            "[package]\nname=\"kio-cli\"\nversion=\"0.0.0\"\nedition=\"2024\"\n[[bin]]\nname=\"kio\"\npath=\"src/main.rs\"\n",
+            "[workspace]\n[package]\nname=\"kio-cli\"\nversion=\"0.0.0\"\nedition=\"2024\"\n[[bin]]\nname=\"kio\"\npath=\"src/main.rs\"\n",
         )
         .unwrap();
         fs::write(

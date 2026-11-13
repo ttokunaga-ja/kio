@@ -124,6 +124,7 @@ impl Fixture {
             command.env("SystemRoot", system_root);
         }
         command
+            .envs(support::home_env(&self.home))
             .env("HOME", &self.home)
             .env("USERPROFILE", &self.home)
             .env("XDG_DATA_HOME", self.home.join("data"))

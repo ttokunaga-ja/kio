@@ -59,6 +59,7 @@ fn kio(dir: &Fixture, seam: &str, now: &str) -> Command {
     let home = dir.home();
     command
         .current_dir(dir.scope())
+        .envs(support::home_env(&home))
         .env("HOME", &home)
         .env("USERPROFILE", &home)
         .env("XDG_DATA_HOME", home.join("data"))

@@ -2,6 +2,8 @@
 //! unknown. Their immutable manifests retain each unit's error kind, and only
 //! the manifest planner may requeue retryable units.
 
+mod support;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -68,6 +70,7 @@ impl Fixture {
         }
         command
             .current_dir(&self.scope)
+            .envs(support::home_env(&self.home))
             .env("HOME", &self.home)
             .env("USERPROFILE", &self.home)
             .env("XDG_DATA_HOME", self.home.join("data"))

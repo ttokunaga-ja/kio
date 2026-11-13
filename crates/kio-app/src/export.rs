@@ -30,9 +30,10 @@ use crate::commands::ExportArgs;
 use crate::platform::{
     DestinationIdentity, configure_cap_no_follow, configure_export_temp,
     configure_private_cap_directory, destination_identity_matches_opened,
-    destination_lstat_identity, is_platform_root_alias, sync_export_directory,
-    validate_export_directory_metadata_native, validate_export_directory_native,
-    validate_export_regular_metadata_native, validate_export_regular_native,
+    destination_lstat_identity, export_component_aliases_store, is_platform_root_alias,
+    sync_export_directory, validate_export_directory_metadata_native,
+    validate_export_directory_native, validate_export_regular_metadata_native,
+    validate_export_regular_native,
 };
 use crate::scope_access::ReadBarrierCheckpoint;
 use crate::search::scope::ScopeTarget;
@@ -78,6 +79,7 @@ struct StagedFile {
 struct DestinationDir {
     path: PathBuf,
     handle: File,
+    guards: Vec<DestinationGuard>,
 }
 
 pub(super) fn run(
@@ -122,11 +124,7 @@ pub(super) fn run(
         confirm_force(ctx)?;
     }
 
-    let destination_dir = open_destination_dir(
-        &validated_destination.path,
-        true,
-        validated_destination.identity.as_ref(),
-    )?;
+    let destination_dir = open_validated_destination(validated_destination)?;
     // Capability-directory handles close destination path races but do not
     // serialize source authorization against purge. Export intentionally stays
     // off `.kio/.lock`; instead it shares this narrow publication lock with
@@ -430,6 +428,7 @@ fn preflight(
     force: bool,
     control: &ControlHandle,
 ) -> Result<Vec<PreflightFile>> {
+    reject_managed_collisions(source, destination, control)?;
     validate_source_names(&source.files)?;
     let existing = if destination.exists() {
         scan_destination(destination)?
@@ -540,6 +539,9 @@ fn preflight_in_dir(
     force: bool,
     control: &ControlHandle,
 ) -> Result<Vec<PreflightFile>> {
+    validate_destination_handle(destination)?;
+    reject_managed_collisions(source, &destination.path, control)?;
+    validate_destination_handle(destination)?;
     validate_source_names(&source.files)?;
     let existing = scan_destination_handle(destination)?;
     let store = ObjectStore::new_with_control(&source.target.kio_dir, control.clone());
@@ -689,21 +691,76 @@ fn validate_export_name(path: &str, raw_hash: &str) -> Result<()> {
     })
 }
 
-/// PA16/17 (§D, U25): the canonically-resolved `--to` destination, plus the
-/// `lstat` (dev/inode) identity captured at THIS containment-check moment —
-/// PA18 requires `open_destination_dir` compare against this exact value
-/// (never re-fetched), so a TOCTOU component swap between this check and the
-/// open below is caught rather than silently trusted.
+/// Retain the inspected ancestry and its scope markers through publication.
 struct ValidatedDestination {
     path: PathBuf,
-    /// `None` when the canonical destination does not exist yet (a normal
-    /// case — `effective_destination` canonicalizes only the deepest
-    /// EXISTING ancestor and re-appends the still-missing suffix;
-    /// `open_destination_dir` creates the rest). PA18's containment binding
-    /// only applies once there is a pre-existing entity to bind to; a
-    /// freshly-created leaf has no prior identity to have been swapped away
-    /// from.
-    identity: Option<DestinationIdentity>,
+    anchor: DestinationDir,
+}
+
+#[derive(Debug)]
+struct DestinationGuard {
+    path: PathBuf,
+    handle: File,
+    identity: DestinationIdentity,
+    store: Option<File>,
+}
+
+fn store_marker(handle: &File, path: &Path) -> Result<Option<File>> {
+    match cap_fs::open_dir_nofollow(handle, Path::new(".kio")) {
+        Ok(store) => {
+            let metadata = cap_fs::Metadata::from_file(&store)
+                .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?;
+            validate_export_directory_metadata_native(&path.join(".kio"), &metadata)?;
+            Ok(Some(store))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(KioError::invalid_usage(
+            "export destination has an unsafe .kio marker",
+        )),
+    }
+}
+
+impl DestinationGuard {
+    fn capture(path: &Path, handle: &File) -> Result<Self> {
+        let identity = destination_lstat_identity(path)?;
+        if !destination_identity_matches_opened(&identity, handle) {
+            return Err(KioError::invalid_usage(
+                "export destination ancestry changed",
+            ));
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            handle: handle
+                .try_clone()
+                .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?,
+            identity,
+            store: store_marker(handle, path)?,
+        })
+    }
+
+    fn recheck(&self) -> Result<()> {
+        let identity = destination_lstat_identity(&self.path)?;
+        let store = store_marker(&self.handle, &self.path)?;
+        let same_store = match (&self.store, store) {
+            (None, None) => true,
+            (Some(before), Some(after)) => {
+                let before = cap_fs::Metadata::from_file(before).map_err(|error| {
+                    KioError::io(error.to_string(), self.path.display().to_string())
+                })?;
+                let after = cap_fs::Metadata::from_file(&after).map_err(|error| {
+                    KioError::io(error.to_string(), self.path.display().to_string())
+                })?;
+                same_cap_file_identity(&before, &after)
+            }
+            _ => false,
+        };
+        if identity != self.identity || !same_store {
+            return Err(KioError::invalid_usage(
+                "export destination ancestry or .kio changed",
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn validate_destination(
@@ -712,44 +769,113 @@ fn validate_destination(
     target: &ScopeTarget,
 ) -> Result<ValidatedDestination> {
     let destination = normalize_absolute(ctx, input)?;
+    reject_store_destination(&destination)?;
     verify_destination_input_chain(&destination, target)?;
     let destination = effective_destination(&destination)?;
+    reject_store_destination(&destination)?;
     verify_existing_directory_chain(&destination)?;
-    let scope_root = target
-        .repo_root
-        .canonicalize()
-        .map_err(|error| KioError::io(error.to_string(), target.repo_root.display().to_string()))?;
-    // PA16(d): "scope root 配下" is checked in full — not just the narrower
-    // `.kio` descendant test the prior implementation used — so an ordinary
-    // subdirectory of the scope root (not `.kio` at all) is caught too.
-    // PA16/17: `KIO-E-CONFIG-USAGE-001` (exit 2), not the generic
-    // `KIO-E-COMMIT-EXPORT-UNSAFE-001` (exit 1) `unsafe_export_error`
-    // gives every other structural-safety rejection in this module — the new
-    // rule specifically wants the usage-error family so automation can
-    // recognize "this destination is categorically forbidden" distinctly
-    // from "this destination had a transient/OS-level problem".
-    if destination == scope_root || destination.starts_with(&scope_root) {
-        return Err(KioError::new(
-            "KIO-E-CONFIG-USAGE-001",
-            "export destination must not be the scope root or a scope-root descendant (.kio included)",
-            json!({ "path": destination }),
-            ExitCode::InvalidUsage,
-        ));
+    let mut anchor = destination.clone();
+    while !anchor.exists() {
+        if !anchor.pop() {
+            return Err(unsafe_export_error(
+                &destination,
+                "destination has no existing ancestor",
+            ));
+        }
     }
-    let identity = match fs::symlink_metadata(&destination) {
-        Ok(_) => Some(destination_lstat_identity(&destination)?),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+    let anchor = open_destination_dir(&anchor)?;
+    Ok(ValidatedDestination {
+        path: destination,
+        anchor,
+    })
+}
+
+fn reject_store_destination(path: &Path) -> Result<()> {
+    if path.components().any(|component| {
+        matches!(component, Component::Normal(name) if export_component_aliases_store(name))
+    }) {
+        return Err(KioError::invalid_usage("export destination must not be inside .kio"));
+    }
+    Ok(())
+}
+
+fn open_validated_destination(validated: ValidatedDestination) -> Result<DestinationDir> {
+    let mut destination = validated.anchor;
+    validate_destination_handle(&destination)?;
+    let suffix = validated
+        .path
+        .strip_prefix(&destination.path)
+        .map_err(|_| KioError::invalid_usage("export destination ancestry changed"))?
+        .to_path_buf();
+    for component in suffix.components() {
+        validate_destination_handle(&destination)?;
+        let Component::Normal(name) = component else {
+            return Err(KioError::invalid_usage(
+                "export destination has a non-local component",
+            ));
+        };
+        let mut options = cap_fs::DirOptions::new();
+        configure_private_cap_directory(&mut options);
+        // A previously absent component that appeared is not authorized. In
+        // particular it may be a store renamed out of an ancestor's .kio.
+        cap_fs::create_dir(&destination.handle, Path::new(name), &options).map_err(|error| {
+            KioError::io(error.to_string(), validated.path.display().to_string())
+        })?;
+        destination.handle = cap_fs::open_dir_nofollow(&destination.handle, Path::new(name))
+            .map_err(|error| {
+                KioError::io(error.to_string(), validated.path.display().to_string())
+            })?;
+        destination.path.push(name);
+        let guard = DestinationGuard::capture(&destination.path, &destination.handle)?;
+        if guard.store.is_some() {
+            return Err(KioError::invalid_usage(
+                "export destination acquired a .kio marker",
+            ));
+        }
+        destination.guards.push(guard);
+    }
+    validate_destination_handle(&destination)?;
+    Ok(destination)
+}
+
+/// Scope trees contain direct files only. Thus a managed collision can only
+/// occur when the output directory itself has a scope marker, not merely when
+/// one of its ancestors is a scope.
+fn reject_managed_collisions(
+    source: &ExportSource,
+    destination: &Path,
+    control: &ControlHandle,
+) -> Result<()> {
+    match fs::symlink_metadata(destination.join(".kio")) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => {
             return Err(KioError::io(
                 error.to_string(),
                 destination.display().to_string(),
             ));
         }
-    };
-    Ok(ValidatedDestination {
-        path: destination,
-        identity,
-    })
+        Ok(_) => {}
+    }
+    let repo = Repository::open_read_only_with_control(destination, control.clone())?;
+    if let Some(head) = repo.head_commit_hash()? {
+        let commit = repo.read_commit(&head)?;
+        let tree = repo.read_tree(&commit.tree)?;
+        let tracked = tree
+            .entries
+            .iter()
+            .map(|entry| portable_collision_key(&entry.path))
+            .collect::<BTreeSet<_>>();
+        if source
+            .files
+            .iter()
+            .any(|item| tracked.contains(&portable_collision_key(&item.path_at_commit)))
+        {
+            return Err(KioError::invalid_usage(
+                "export conflicts with a managed working file; use managed restore",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// macOS commonly exposes a canonical scope under `/private/var/...` through
@@ -894,19 +1020,9 @@ fn effective_destination(path: &Path) -> Result<PathBuf> {
     Ok(canonical)
 }
 
-/// `expected_identity`: PA18 (§D, U25) — when set, the identity of the
-/// directory this call actually opens (dev/inode on Unix, volume serial plus
-/// file index on Windows) must match the value
-/// [`destination_lstat_identity`] captured at `validate_destination`'s
-/// containment-check moment (never re-fetched here — re-fetching would defeat
-/// the point, since it would just re-observe whatever a TOCTOU swap left
-/// behind). `None` skips the check (used by call sites, and tests, that never
-/// went through `validate_destination`).
-fn open_destination_dir(
-    path: &Path,
-    create_missing: bool,
-    expected_identity: Option<&DestinationIdentity>,
-) -> Result<DestinationDir> {
+/// Open existing ancestry without following links, retaining each directory
+/// and its scope-marker observation before allowing any destination mutation.
+fn open_destination_dir(path: &Path) -> Result<DestinationDir> {
     let mut root = PathBuf::new();
     let mut descendants = Vec::<OsString>::new();
     let mut saw_root = false;
@@ -933,72 +1049,27 @@ fn open_destination_dir(
             "export destination does not have a stable filesystem root",
         ));
     }
-
     let mut current = cap_fs::open_ambient_dir(&root, cap_primitives::ambient_authority())
         .map_err(|error| KioError::io(error.to_string(), root.display().to_string()))?;
     let mut display = root;
+    let mut guards = vec![DestinationGuard::capture(&display, &current)?];
     for component in descendants {
         display.push(&component);
-        match cap_fs::open_dir_nofollow(&current, Path::new(&component)) {
-            Ok(next) => current = next,
-            Err(error) if create_missing && error.kind() == std::io::ErrorKind::NotFound => {
-                let mut options = cap_fs::DirOptions::new();
-                configure_private_cap_directory(&mut options);
-                match cap_fs::create_dir(&current, Path::new(&component), &options) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                    Err(error) => {
-                        return Err(KioError::io(
-                            error.to_string(),
-                            display.display().to_string(),
-                        ));
-                    }
-                }
-                current =
-                    cap_fs::open_dir_nofollow(&current, Path::new(&component)).map_err(|_| {
-                        unsafe_export_error(
-                            &display,
-                            "destination ancestor is not a real non-reparse directory",
-                        )
-                    })?;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(KioError::io(
-                    error.to_string(),
-                    display.display().to_string(),
-                ));
-            }
-            Err(_) => {
-                return Err(unsafe_export_error(
-                    &display,
-                    "destination ancestor is not a real non-reparse directory",
-                ));
-            }
-        }
+        current = cap_fs::open_dir_nofollow(&current, Path::new(&component)).map_err(|_| {
+            unsafe_export_error(
+                &display,
+                "destination ancestor is not a real non-reparse directory",
+            )
+        })?;
+        guards.push(DestinationGuard::capture(&display, &current)?);
     }
-    let metadata = current
-        .metadata()
-        .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?;
-    if !metadata.is_dir() {
-        return Err(unsafe_export_error(
-            path,
-            "destination ancestor is not a real non-reparse directory",
-        ));
-    }
-    if let Some(expected) = expected_identity
-        && !destination_identity_matches_opened(expected, &current)
-    {
-        return Err(KioError::new(
-            "KIO-E-CONFIG-USAGE-001",
-            "export destination identity changed between validation and open",
-            json!({ "path": path }),
-            ExitCode::InvalidUsage,
-        ));
-    }
-    Ok(DestinationDir {
+    let destination = DestinationDir {
         path: path.to_path_buf(),
         handle: current,
-    })
+        guards,
+    };
+    validate_destination_handle(&destination)?;
+    Ok(destination)
 }
 
 fn validate_real_directory(path: &Path) -> Result<()> {
@@ -1508,6 +1579,7 @@ fn stage_all(
 }
 
 fn create_private_temp(destination: &DestinationDir) -> Result<(OsString, File)> {
+    validate_destination_handle(destination)?;
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     for attempt in 0..32_u8 {
         let nanos = SystemTime::now()
@@ -1555,7 +1627,9 @@ fn publish_all(
         // this file's atomic, irreversible publish (LC57).
         let raw_present =
             raw_present_now(&source.target, &file.preflight.source.raw_hash, ctx.control)?;
-        if let Err(error) = ensure_no_active_sweep_with_control(&source.target.kio_dir, ctx.control)
+        if let Err(error) = validate_destination_handle(destination)
+            .and_then(|()| reject_managed_collisions(source, &destination.path, ctx.control))
+            .and_then(|()| ensure_no_active_sweep_with_control(&source.target.kio_dir, ctx.control))
             .and_then(|()| {
                 check_purge_state(
                     &source.target,
@@ -1602,6 +1676,10 @@ fn publish_all(
                                 post_publish_raw_present,
                                 ctx.control,
                             )
+                        })
+                        .and_then(|()| validate_destination_handle(destination))
+                        .and_then(|()| {
+                            reject_managed_collisions(source, &destination.path, ctx.control)
                         })
                         .and_then(|()| checkpoint.recheck())
                 {
@@ -1684,6 +1762,7 @@ fn publish_one(
     destination: &DestinationDir,
     file: &StagedFile,
 ) -> std::result::Result<PublishSuccess, (KioError, bool)> {
+    validate_destination_handle(destination).map_err(|error| (error, false))?;
     verify_open_file(
         &file.temp_file,
         &destination.path.join(&file.temp),
@@ -1935,6 +2014,9 @@ fn export_evacuated_backup(
 }
 
 fn validate_destination_handle(destination: &DestinationDir) -> Result<()> {
+    for guard in &destination.guards {
+        guard.recheck()?;
+    }
     let metadata = cap_fs::Metadata::from_file(&destination.handle)
         .map_err(|error| KioError::io(error.to_string(), destination.path.display().to_string()))?;
     if !metadata.is_dir() || metadata.is_symlink() {
@@ -2186,8 +2268,7 @@ mod tests {
     #[test]
     fn destination_directory_sync_uses_a_syncable_capability_descriptor() {
         let temp = tempfile::TempDir::new().unwrap();
-        let destination =
-            open_destination_dir(&temp.path().canonicalize().unwrap(), false, None).unwrap();
+        let destination = open_destination_dir(&temp.path().canonicalize().unwrap()).unwrap();
 
         sync_directory_handle(&destination).unwrap();
     }
@@ -2259,18 +2340,14 @@ mod tests {
         fs::create_dir(&decoy_path).unwrap();
         fs::write(decoy_path.join("decoy.md"), b"decoy sentinel").unwrap();
 
-        // Exactly the value `validate_destination` captures at its
-        // containment-check moment and hands to the open below. Reaching it
-        // (and `DestinationIdentity`) is why this lives in the module's own
-        // `mod tests` rather than in `tests/` — both are private.
         let identity = destination_lstat_identity(&destination_path).unwrap();
-
-        // Positive control: an unswapped destination must still open. Without
-        // it, an identity that never compares equal — the lstat here and the
-        // opened handle's fstat there are two different OS queries — would
-        // satisfy the rejection assertion below for the wrong reason, while
-        // rejecting every legitimate export.
-        open_destination_dir(&destination_path, false, Some(&identity)).unwrap();
+        let anchor = open_destination_dir(&destination_path).unwrap();
+        // Positive control: the captured path and opened handle must agree.
+        super::validate_destination_handle(&anchor).unwrap();
+        let validated = super::ValidatedDestination {
+            path: destination_path.clone(),
+            anchor,
+        };
 
         // The swap PA18 exists for: a different REAL directory now answers to
         // the bound name. Two renames rather than one because Windows will
@@ -2286,26 +2363,158 @@ mod tests {
             identity
         );
 
-        // `create_missing: true` gives the call every opportunity to create
-        // before it compares — the rejection must still come first.
-        let error = open_destination_dir(&destination_path, true, Some(&identity)).unwrap_err();
-
-        // Not the generic `unsafe_export_error` family (exit 1) every other
-        // structural rejection in this module uses: PA18 wants the usage
-        // error specifically, so automation can tell "this destination is not
-        // the one that was validated" from a transient OS-level problem. The
-        // message is pinned too, so a future unrelated usage error raised
-        // from this same function cannot quietly satisfy this test.
+        let error = super::open_validated_destination(validated).unwrap_err();
         assert_eq!(error.error_code(), "KIO-E-CONFIG-USAGE-001");
         assert_eq!(error.exit_code(), kio_core::ExitCode::InvalidUsage);
-        assert_eq!(
-            error.message(),
-            "export destination identity changed between validation and open"
-        );
 
         // No mutation before the rejection, on either side of the swap.
         assert_eq!(entry_names(&destination_path), vec!["decoy.md".to_owned()]);
         assert_eq!(entry_names(&moved_path), vec!["original.md".to_owned()]);
+    }
+
+    #[test]
+    fn missing_destination_rejects_replaced_existing_ancestor_before_creation() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let ancestor = root.join("parent");
+        let moved = root.join("moved");
+        let store = root.join(".kio");
+        fs::create_dir(&ancestor).unwrap();
+        fs::create_dir(&store).unwrap();
+        fs::write(store.join("sentinel"), b"store").unwrap();
+        let validated = super::ValidatedDestination {
+            path: ancestor.join("new"),
+            anchor: open_destination_dir(&ancestor).unwrap(),
+        };
+        fs::rename(&ancestor, &moved).unwrap();
+        fs::rename(&store, &ancestor).unwrap();
+
+        let result = super::open_validated_destination(validated);
+        assert!(result.is_err());
+        assert_eq!(entry_names(&ancestor), vec!["sentinel".to_owned()]);
+    }
+
+    #[test]
+    fn store_marker_races_are_rejected_before_destination_creation() {
+        for change in ["create", "remove", "replace", "move_into_destination"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            let store = root.join(".kio");
+            if change != "create" {
+                fs::create_dir(&store).unwrap();
+                fs::write(store.join("sentinel"), b"store").unwrap();
+            }
+            let anchor = open_destination_dir(&root).unwrap();
+            let path = root.join("Recovered").join("deep");
+            let validated = super::ValidatedDestination {
+                path: path.clone(),
+                anchor,
+            };
+            match change {
+                "create" => fs::create_dir(&store).unwrap(),
+                "remove" => fs::rename(&store, root.join("removed-store")).unwrap(),
+                "replace" => {
+                    fs::rename(&store, root.join("removed-store")).unwrap();
+                    fs::create_dir(&store).unwrap();
+                }
+                "move_into_destination" => fs::rename(&store, root.join("Recovered")).unwrap(),
+                _ => unreachable!(),
+            }
+            assert!(
+                super::open_validated_destination(validated).is_err(),
+                "{change}"
+            );
+            assert!(!path.exists(), "{change}");
+            if change == "move_into_destination" {
+                assert_eq!(entry_names(&root.join("Recovered")), vec!["sentinel"]);
+            }
+        }
+    }
+
+    #[test]
+    fn store_marker_races_are_rejected_after_destination_open() {
+        for change in ["create", "remove", "replace"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            let store = root.join(".kio");
+            if change != "create" {
+                fs::create_dir(&store).unwrap();
+                fs::write(store.join("sentinel"), b"store").unwrap();
+            }
+            let destination = open_destination_dir(&root).unwrap();
+            fs::write(root.join("doc.md"), b"managed latest").unwrap();
+            let (temp_name, mut temp_file) = super::create_private_temp(&destination).unwrap();
+            std::io::Write::write_all(&mut temp_file, b"historical").unwrap();
+            let source = super::ExportSource {
+                source_kind: "commit",
+                source_commit: "unused".to_owned(),
+                target: ScopeTarget {
+                    repo_root: root.clone(),
+                    kio_dir: store.clone(),
+                    scope_id: "unused".to_owned(),
+                },
+                files: vec![],
+            };
+            let preflight = super::PreflightFile {
+                source: ExportItem {
+                    path_at_commit: "doc.md".to_owned(),
+                    raw_hash: kio_core::cas::hash_bytes(b"historical"),
+                },
+                destination: root.join("doc.md"),
+                size_bytes: 10,
+                overwritten: true,
+            };
+            let staged = super::StagedFile {
+                preflight: preflight.clone(),
+                temp: temp_name,
+                temp_file,
+            };
+            match change {
+                "create" => fs::create_dir(&store).unwrap(),
+                "remove" => fs::rename(&store, root.join("removed-store")).unwrap(),
+                "replace" => {
+                    fs::rename(&store, root.join("removed-store")).unwrap();
+                    fs::create_dir(&store).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                super::create_private_temp(&destination).is_err(),
+                "{change}"
+            );
+            let control = ControlHandle::default();
+            let before = entry_names(&root);
+            assert!(
+                super::stage_all(&source, vec![preflight], &destination, &control).is_err(),
+                "{change}"
+            );
+            let context = crate::context::test_support::context(&root);
+            let settings =
+                std::sync::Arc::new(kio_adapter::tool_lock::AdapterRuntimeSettings::default());
+            let locks = kio_core::scope::LockSession::default();
+            let invocation = crate::invocation::Invocation {
+                context: &context,
+                settings: &settings,
+                control: &control,
+                locks: &locks,
+            };
+            assert!(
+                super::publish_one(&invocation, &destination, &staged).is_err(),
+                "{change}"
+            );
+            assert_eq!(entry_names(&root), before, "{change}");
+            assert_eq!(
+                fs::read(root.join("doc.md")).unwrap(),
+                b"managed latest",
+                "{change}"
+            );
+            if change != "create" {
+                assert_eq!(
+                    fs::read(root.join("removed-store/sentinel")).unwrap(),
+                    b"store"
+                );
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -2322,7 +2531,8 @@ mod tests {
         fs::create_dir(&outside_path).unwrap();
         fs::write(outside_path.join("doc.md"), b"outside sentinel").unwrap();
 
-        let destination = open_destination_dir(&destination_path, false, None).unwrap();
+        let destination = open_destination_dir(&destination_path).unwrap();
+        let (temp_name, mut staged) = create_private_temp(&destination).unwrap();
         fs::rename(&destination_path, &moved_path).unwrap();
         symlink(&outside_path, &destination_path).unwrap();
 
@@ -2331,7 +2541,6 @@ mod tests {
         // directory for this to succeed, matching real publish's use (the
         // name was either never occupied or just evacuated to a `.kio-
         // export-bak` name by the same primitive).
-        let (temp_name, mut staged) = create_private_temp(&destination).unwrap();
         staged.write_all(b"exported bytes").unwrap();
         staged.sync_all().unwrap();
         no_replace_move(

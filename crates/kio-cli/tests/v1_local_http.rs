@@ -230,6 +230,7 @@ impl Device {
             c.env("SystemRoot", v);
         }
         c.current_dir(root)
+            .envs(support::home_env(&self.home))
             .env("HOME", &self.home)
             .env("USERPROFILE", &self.home)
             .env("XDG_DATA_HOME", &self.data)

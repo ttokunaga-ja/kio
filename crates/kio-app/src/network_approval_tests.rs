@@ -18,16 +18,14 @@ use crate::context::{AppContext, Interaction};
 const TOOL_ID: &str = "mistral_ocr_markdownize";
 
 struct EnvironmentGuard {
+    _home: [kio_core::test_control::TestEnvGuard; 8],
     variables: Vec<(&'static str, Option<OsString>)>,
 }
 
 impl EnvironmentGuard {
     fn enter(data_home: &Path) -> Self {
+        let home = kio_core::test_control::TestEnvGuard::isolated_home(data_home);
         let variables = [
-            "HOME",
-            "XDG_CONFIG_HOME",
-            "XDG_DATA_HOME",
-            "XDG_CACHE_HOME",
             "KIO_TEST_LOCAL_OCR",
             "KIO_TEST_MISTRAL_OCR",
             "KIO_TEST_GEMINI_EMBED",
@@ -40,16 +38,15 @@ impl EnvironmentGuard {
         // mutation in this module; Drop restores all prior values before
         // releasing that lock.
         unsafe {
-            std::env::set_var("HOME", data_home);
-            std::env::set_var("XDG_CONFIG_HOME", data_home.join("config"));
-            std::env::set_var("XDG_DATA_HOME", data_home);
-            std::env::set_var("XDG_CACHE_HOME", data_home.join("cache"));
             std::env::remove_var("KIO_TEST_LOCAL_OCR");
             std::env::remove_var("KIO_TEST_MISTRAL_OCR");
             std::env::remove_var("KIO_TEST_GEMINI_EMBED");
             std::env::remove_var("KIO_EVAL_DETERMINISTIC_EMBED");
         }
-        Self { variables }
+        Self {
+            _home: home,
+            variables,
+        }
     }
 }
 

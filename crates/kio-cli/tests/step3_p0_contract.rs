@@ -79,6 +79,7 @@ fn kio(dir: &TempDir, args: &[&str]) -> Command {
     let mut command = hermetic_kio_command();
     command
         .current_dir(dir.path())
+        .envs(support::home_env(dir.path()))
         .env("XDG_CONFIG_HOME", dir.path().join(".test-config"))
         .env("XDG_DATA_HOME", dir.path().join(".test-data"))
         .env("XDG_STATE_HOME", dir.path().join(".test-state"))
@@ -136,6 +137,7 @@ fn view_slice(viewed: &Value) -> String {
 fn json_success_path(path: &Path, data_home: &Path, args: &[&str]) -> Value {
     let output = hermetic_kio_command()
         .current_dir(path)
+        .envs(support::home_env(data_home))
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
         .env("XDG_STATE_HOME", data_home.join("state"))
@@ -603,6 +605,7 @@ fn approve_embed(dir: &TempDir, embed: &str) {
 fn run_embed_path(path: &Path, data_home: &Path, embed: &str, args: &[&str]) -> Value {
     let output = hermetic_kio_command()
         .current_dir(path)
+        .envs(support::home_env(data_home))
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
         .env("XDG_STATE_HOME", data_home.join("state"))
@@ -2269,6 +2272,7 @@ fn ct3_device_repairs_reject_non_current_scope_before_any_mutation() {
 
         let stderr = hermetic_kio_command()
             .current_dir(parent.path())
+            .envs(support::home_env(&data_home))
             .env("XDG_CONFIG_HOME", data_home.join("config"))
             .env("XDG_DATA_HOME", data_home.join("data"))
             .env("XDG_STATE_HOME", data_home.join("state"))
@@ -2322,6 +2326,7 @@ fn ct3_repair_device_unreachable_registry_scope_is_partial_without_cwd_fallback(
     fs::remove_dir_all(&b).unwrap();
     let stdout = hermetic_kio_command()
         .current_dir(parent.path())
+        .envs(support::home_env(&data_home))
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
         .env("XDG_STATE_HOME", data_home.join("state"))
@@ -2373,6 +2378,7 @@ fn ct3_repair_device_registry_unavailable_never_falls_back_to_cwd() {
 
     let output = hermetic_kio_command()
         .current_dir(&scope)
+        .envs(support::home_env(&data_home))
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
         .env("XDG_STATE_HOME", data_home.join("state"))
@@ -2401,6 +2407,7 @@ fn ct3_repair_device_all_failed_homogeneous_promotes_scope_error() {
 
     let output = hermetic_kio_command()
         .current_dir(parent.path())
+        .envs(support::home_env(&data_home))
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
         .env("XDG_STATE_HOME", data_home.join("state"))
@@ -2466,6 +2473,7 @@ fn ct3_repair_device_active_purge_is_partial_and_leaves_no_stale_replica_rows() 
     assert!(matches!(started, kio_core::purge::BeginOutcome::Started(_)));
     let stdout = hermetic_kio_command()
         .current_dir(parent.path())
+        .envs(support::home_env(&data_home))
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
         .env("XDG_STATE_HOME", data_home.join("state"))
@@ -2703,6 +2711,7 @@ fn ct3_multi_011_a_departed_scope_stops_skewing_corpus_statistics() {
     // so the search returns results AND reports the exclusion.
     let stdout = hermetic_kio_command()
         .current_dir(&a)
+        .envs(support::home_env(&data_home))
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
         .env("XDG_STATE_HOME", data_home.join("state"))
@@ -3098,6 +3107,7 @@ fn ct3_multi_017_a_cursor_replays_against_the_collection_that_ranked_page_1() {
 
     let stderr = hermetic_kio_command()
         .current_dir(&a)
+        .envs(support::home_env(&data_home))
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
         .env("XDG_STATE_HOME", data_home.join("state"))
@@ -3245,6 +3255,7 @@ fn ct3_multi_019_purge_fails_closed_when_the_replica_cannot_be_cleared() {
 
     let stderr = hermetic_kio_command()
         .current_dir(&a)
+        .envs(support::home_env(&data_home))
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
         .env("XDG_STATE_HOME", data_home.join("state"))
@@ -3278,6 +3289,7 @@ fn ct3_multi_019_purge_fails_closed_when_the_replica_cannot_be_cleared() {
     fs::rename(&source, &hidden_source).unwrap();
     let search_assert = hermetic_kio_command()
         .current_dir(&a)
+        .envs(support::home_env(&data_home))
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
         .env("XDG_STATE_HOME", data_home.join("state"))
@@ -3367,6 +3379,7 @@ fn ct3_multi_021_replica_candidates_exclude_an_active_purge_scope() {
 
     let output = hermetic_kio_command()
         .current_dir(&b)
+        .envs(support::home_env(&data_home))
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
         .env("XDG_STATE_HOME", data_home.join("state"))
@@ -3436,6 +3449,7 @@ fn ct3_multi_022_replica_response_boundary_rechecks_a_late_purge() {
     let bin = assert_cmd::cargo::cargo_bin("kio");
     let mut child = hermetic_process_command(&bin)
         .current_dir(&scope)
+        .envs(support::home_env(&data_home))
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
         .env("XDG_STATE_HOME", data_home.join("state"))
@@ -3625,6 +3639,7 @@ fn ct3_multi_005_partial_failure_returns_results_with_exit_3() {
 
     let output = hermetic_kio_command()
         .current_dir(&a)
+        .envs(support::home_env(&data_home))
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
         .env("XDG_STATE_HOME", data_home.join("state"))
@@ -3691,6 +3706,7 @@ fn ct3_multi_006_completion_order_does_not_change_results_or_cursor() {
     let baseline = json_success_path(&a, &data_home, &["search", "orderstable", "--limit", "1"]);
     let delayed_output = hermetic_kio_command()
         .current_dir(&a)
+        .envs(support::home_env(&data_home))
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
         .env("XDG_STATE_HOME", data_home.join("state"))
@@ -3741,6 +3757,7 @@ fn ct3_multi_006_timeout_preserves_fresh_all_failed_and_cursor_contracts() {
     // and uses the established partial-failure exit 3 payload contract.
     let partial_output = hermetic_kio_command()
         .current_dir(&a)
+        .envs(support::home_env(&data_home))
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
         .env("XDG_STATE_HOME", data_home.join("state"))
@@ -3765,6 +3782,7 @@ fn ct3_multi_006_timeout_preserves_fresh_all_failed_and_cursor_contracts() {
     let b_arg = b.display().to_string();
     let all_failed = hermetic_kio_command()
         .current_dir(&a)
+        .envs(support::home_env(&data_home))
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
         .env("XDG_STATE_HOME", data_home.join("state"))
@@ -3793,6 +3811,7 @@ fn ct3_multi_006_timeout_preserves_fresh_all_failed_and_cursor_contracts() {
     let cursor = first["paging"]["next_cursor"].as_str().unwrap();
     let replay = hermetic_kio_command()
         .current_dir(&a)
+        .envs(support::home_env(&data_home))
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
         .env("XDG_STATE_HOME", data_home.join("state"))
@@ -4588,6 +4607,7 @@ fn ct3_replica_003_temporarily_excluded_scope_keeps_its_replica_projection() {
 
     let partial_stdout = hermetic_kio_command()
         .current_dir(&a)
+        .envs(support::home_env(&data_home))
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
         .env("XDG_STATE_HOME", data_home.join("state"))
@@ -4699,6 +4719,7 @@ fn ct3_replica_008_unresolvable_scope_identity_cannot_serve_a_ready_projection()
 
     let output = hermetic_kio_command()
         .current_dir(&b)
+        .envs(support::home_env(&data_home))
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
         .env("XDG_STATE_HOME", data_home.join("state"))
@@ -4996,6 +5017,7 @@ use kio_index::registry::{RegistryDb, RegistryEntry};
 fn run_json(cwd: &Path, data_home: &Path, args: &[&str]) -> (i32, Value) {
     let output = hermetic_kio_command()
         .current_dir(cwd)
+        .envs(support::home_env(data_home))
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
         .env("XDG_STATE_HOME", data_home.join("state"))
@@ -6528,6 +6550,7 @@ fn m4_corrupt_source_sqlite_does_not_exclude_multiscope_replica_search() {
     // A successful replica search still returns both scopes.
     let output = hermetic_kio_command()
         .current_dir(&a)
+        .envs(support::home_env(&data_home))
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
         .env("XDG_STATE_HOME", data_home.join("state"))
@@ -7169,6 +7192,7 @@ fn o2_text_search_never_sends_query_embedding() {
     // --text: the query embedding must NOT be computed/sent.
     hermetic_kio_command()
         .current_dir(dir.path())
+        .envs(support::home_env(dir.path()))
         .env("XDG_CONFIG_HOME", dir.path().join(".test-config"))
         .env("XDG_DATA_HOME", dir.path().join(".test-data"))
         .env("XDG_STATE_HOME", dir.path().join(".test-state"))
@@ -7186,6 +7210,7 @@ fn o2_text_search_never_sends_query_embedding() {
     // auto → hybrid: the same seam DOES send, so the trace appears (discriminator).
     hermetic_kio_command()
         .current_dir(dir.path())
+        .envs(support::home_env(dir.path()))
         .env("XDG_CONFIG_HOME", dir.path().join(".test-config"))
         .env("XDG_DATA_HOME", dir.path().join(".test-data"))
         .env("XDG_STATE_HOME", dir.path().join(".test-state"))
@@ -7539,6 +7564,7 @@ fn p5_concurrent_search_during_rebuild_is_never_silently_empty() {
         hermetic_process_command(&bin)
             .args(args)
             .current_dir(&root)
+            .envs(support::home_env(&data))
             .env("XDG_DATA_HOME", &data)
             .env("XDG_STATE_HOME", data.with_file_name(".test-state"))
             .env("XDG_CONFIG_HOME", &config)
@@ -7565,6 +7591,7 @@ fn p5_concurrent_search_during_rebuild_is_never_silently_empty() {
                 let _ = hermetic_process_command(&bin)
                     .args(["repair", "rebuild-db"])
                     .current_dir(&root)
+                    .envs(support::home_env(&data))
                     .env("XDG_DATA_HOME", &data)
                     .env("XDG_STATE_HOME", data.with_file_name(".test-state"))
                     .env("XDG_CONFIG_HOME", &config)
@@ -7910,6 +7937,7 @@ fn p10_concurrent_search_during_reindex_is_never_silently_empty() {
         hermetic_process_command(&bin)
             .args(args)
             .current_dir(&root)
+            .envs(support::home_env(&data))
             .env("XDG_DATA_HOME", &data)
             .env("XDG_STATE_HOME", data.with_file_name(".test-state"))
             .env("XDG_CONFIG_HOME", &config)
@@ -7939,6 +7967,7 @@ fn p10_concurrent_search_during_reindex_is_never_silently_empty() {
                 let _ = hermetic_process_command(&bin)
                     .args(["reindex", "--regenerate", "--yes"])
                     .current_dir(&root)
+                    .envs(support::home_env(&data))
                     .env("XDG_DATA_HOME", &data)
                     .env("XDG_STATE_HOME", data.with_file_name(".test-state"))
                     .env("XDG_CONFIG_HOME", &config)
@@ -8309,6 +8338,7 @@ fn pc4_multiscope_query_embedding_sent_when_any_target_scope_opts_in() {
     let trace = data_home.path().join("query.trace");
     let output = hermetic_kio_command()
         .current_dir(a.path())
+        .envs(support::home_env(data_home.path()))
         .env("XDG_CONFIG_HOME", data_home.path().join("config"))
         .env("XDG_DATA_HOME", data_home.path().join("data"))
         .env("XDG_STATE_HOME", data_home.path().join("state"))
@@ -9010,6 +9040,7 @@ fn r12_4_multi_scope_partial_records_exclusion_in_errors_jsonl() {
     fs::set_permissions(&b_kio, perms).unwrap();
     hermetic_kio_command()
         .current_dir(&a)
+        .envs(support::home_env(&data_home))
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
         .env("XDG_STATE_HOME", data_home.join("state"))
@@ -11508,6 +11539,7 @@ fn r16_2_one_scope_store_corruption_is_partial_not_all_failed() {
 
     let output = hermetic_kio_command()
         .current_dir(&a)
+        .envs(support::home_env(&data_home))
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
         .env("XDG_STATE_HOME", data_home.join("state"))
@@ -11567,6 +11599,7 @@ fn r16_3_fresh_search_unreceipted_tree_loss_excludes_not_silent_empty() {
 
     let output = hermetic_kio_command()
         .current_dir(&a)
+        .envs(support::home_env(&data_home))
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
         .env("XDG_STATE_HOME", data_home.join("state"))
@@ -12722,6 +12755,7 @@ fn r18_4_partial_store_corruption_entry_carries_recovery_hint() {
 
     let output = hermetic_kio_command()
         .current_dir(&a)
+        .envs(support::home_env(&data_home))
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
         .env("XDG_STATE_HOME", data_home.join("state"))
@@ -13070,6 +13104,7 @@ fn r19_6_corrupt_source_index_does_not_create_a_search_exclusion() {
 
     let output = hermetic_kio_command()
         .current_dir(&a)
+        .envs(support::home_env(&data_home))
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
         .env("XDG_STATE_HOME", data_home.join("state"))

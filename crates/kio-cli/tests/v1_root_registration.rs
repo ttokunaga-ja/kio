@@ -51,6 +51,7 @@ impl Fixture {
         }
         command
             .current_dir(cwd)
+            .envs(support::home_env(&self.device))
             .env("HOME", self.device.join("home"))
             .env("USERPROFILE", self.device.join("home"))
             .env("XDG_DATA_HOME", self.device.join("data"))

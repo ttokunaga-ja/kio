@@ -39,12 +39,8 @@ fn kio(dir: &TempDir, args: &[&str]) -> Command {
     for name in CHILD_ENV_DENYLIST {
         command.env_remove(name);
     }
-    command
-        .current_dir(dir.path())
-        .env("XDG_CONFIG_HOME", dir.path().join(".test-config"))
-        .env("XDG_DATA_HOME", dir.path().join(".test-data"))
-        .env("XDG_CACHE_HOME", dir.path().join(".test-cache"))
-        .args(args);
+    command.envs(support::home_env(dir.path()));
+    command.current_dir(dir.path()).args(args);
     command
 }
 
@@ -698,7 +694,7 @@ fn pa14_pa15_prune_orphans_recovers_purged_raw_and_type_separated_image_cache() 
 // ---------------------------------------------------------------------------
 
 #[test]
-fn pa16_pa17_destination_rejects_scope_root_dot_kio_and_ordinary_subdir_with_config_usage() {
+fn pa16_pa17_destination_allows_subdir_but_rejects_store_and_managed_collisions() {
     let dir = canonical_tempdir();
     init(&dir);
     fs::write(dir.path().join("doc.md"), b"pa16 content").unwrap();
@@ -711,8 +707,6 @@ fn pa16_pa17_destination_rejects_scope_root_dot_kio_and_ordinary_subdir_with_con
         dir.path().to_path_buf(),
         dir.path().join(".kio"),
         dir.path().join(".kio/sub"),
-        // PA16(d): an ordinary scope-root subdirectory that is NOT `.kio`.
-        dir.path().join("subdir"),
     ] {
         let error = json_failure(
             &dir,
@@ -725,8 +719,17 @@ fn pa16_pa17_destination_rejects_scope_root_dot_kio_and_ordinary_subdir_with_con
         );
     }
 
-    // PA17: `--to .` from inside the scope root resolves to the same
-    // canonical path and is rejected identically (no relative-path bypass).
+    // CLI-01 permits ordinary in-scope destinations; store and tracked-file
+    // protections above remain independent of the scope's containment.
+    let destination = dir.path().join("subdir");
+    let output = json_success(&dir, &["export", &commit, "--to", &path_text(&destination)]);
+    assert_eq!(output["status"], "exported");
+    assert_eq!(
+        fs::read(destination.join("doc.md")).unwrap(),
+        b"pa16 content"
+    );
+
+    // A relative destination cannot bypass the tracked doc.md collision.
     let error = kio(&dir, &["export", &commit, "--to", "."])
         .arg("--json")
         .assert()

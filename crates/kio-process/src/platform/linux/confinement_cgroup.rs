@@ -50,6 +50,46 @@ exec "$@""#;
 fn invalid(message: &'static str) -> io::Error {
     io::Error::other(message)
 }
+fn component_error(component: &str, error: io::Error) -> io::Error {
+    let state =
+        if error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ENOSYS) {
+            "missing"
+        } else {
+            "unusable"
+        };
+    io::Error::new(error.kind(), format!("{component} is {state}: {error}"))
+}
+// Fault injection only produces rejection and shares production diagnostics.
+#[cfg(debug_assertions)]
+pub(crate) fn injected_isolation_failure(selector: &str) -> ConfinementError {
+    if selector == "startup" {
+        return ConfinementError::Process(scope_startup_failure());
+    }
+    let Some((component, state)) = selector.split_once(':') else {
+        return ConfinementError::Resource(invalid("unknown isolation fault selector"));
+    };
+    let component = match component {
+        "manager" => "systemd user manager",
+        "cpu" => "cpu controller",
+        "memory" => "memory controller",
+        "pids" => "pids controller",
+        "kill" => "cgroup.kill",
+        "helper" => "sandbox helper /usr/bin/bwrap",
+        "descriptor" => "descriptor resolution",
+        _ => return ConfinementError::Resource(invalid("unknown isolation fault component")),
+    };
+    let error = match state {
+        "missing" => io::Error::from(io::ErrorKind::NotFound),
+        "unusable" => io::Error::from(io::ErrorKind::PermissionDenied),
+        _ => return ConfinementError::Resource(invalid("unknown isolation fault state")),
+    };
+    ConfinementError::Resource(component_error(component, error))
+}
+fn scope_startup_failure() -> Error {
+    isolation(
+        "renderer launcher exited before scope admission; cannot distinguish systemd user manager failure from unavailable cpu/memory/pids controllers or rejected scope properties from exit status alone. Check `systemctl --user show --property=ControlGroup` and `journalctl --user -b`; inspect cgroup.controllers and cgroup.subtree_control in that user manager cgroup and its parents under /sys/fs/cgroup. No renderer was started",
+    )
+}
 fn isolation(message: &'static str) -> Error {
     Error::Isolation(invalid(message))
 }
@@ -92,7 +132,12 @@ where
     let bwrap = trusted_helper("/usr/bin/bwrap")?;
     let uid = unsafe { libc::geteuid() };
     let runtime = PathBuf::from(format!("/run/user/{uid}"));
-    validate_runtime(&runtime, uid)?;
+    validate_runtime(&runtime, uid).map_err(|error| match error {
+        ConfinementError::Resource(error) => {
+            ConfinementError::Resource(component_error("systemd user manager", error))
+        }
+        other => other,
+    })?;
     let bus = runtime.join("bus");
     let manager_environment = vec![
         (OsString::from("XDG_RUNTIME_DIR"), runtime.into_os_string()),
@@ -108,9 +153,10 @@ where
     let gate_script = sandbox.test_fixture.gate_script.as_deref().unwrap_or(GATE);
     #[cfg(not(test))]
     let gate_script = GATE;
-    let cgroup_mount =
-        open_directory(Path::new("/sys/fs/cgroup")).map_err(ConfinementError::Resource)?;
-    verify_cgroup_fs(&cgroup_mount).map_err(ConfinementError::Resource)?;
+    let cgroup_mount = open_directory(Path::new("/sys/fs/cgroup"))
+        .map_err(|error| ConfinementError::Resource(component_error("cgroup v2", error)))?;
+    verify_cgroup_fs(&cgroup_mount)
+        .map_err(|error| ConfinementError::Resource(component_error("cgroup v2", error)))?;
     let scratch_file = open_directory(&sandbox.scratch).map_err(ConfinementError::Resource)?;
     let (keep_read, keep_write) = pipe()?;
     let (ready_read, ready_write) = pipe()?;
@@ -201,7 +247,12 @@ where
     monitor.launched = true;
     let result = crate::run_bounded_command_inner_impl(&mut command, options, None, &mut monitor);
     let cleanup = monitor.cleanup();
-    cleanup?;
+    if let Err(cleanup) = cleanup {
+        return Err(ConfinementError::Resource(io::Error::other(match result {
+            Err(error) => format!("{error}; cleanup failed: {cleanup}"),
+            Ok(_) => format!("cleanup failed: {cleanup}"),
+        })));
+    }
     result.map_err(ConfinementError::from)
 }
 
@@ -289,24 +340,34 @@ fn validate_mounts(sandbox: &NativeRenderSandbox) -> Result<(), ConfinementError
     Ok(())
 }
 fn trusted_helper(path: &str) -> Result<PathBuf, ConfinementError> {
-    let canonical = fs::canonicalize(path).map_err(ConfinementError::Resource)?;
+    trusted_helper_inner(path).map_err(|error| {
+        let absent = matches!(fs::symlink_metadata(path), Err(error) if error.kind() == io::ErrorKind::NotFound);
+        let state = if error.kind() == io::ErrorKind::NotFound && absent {
+            "missing"
+        } else {
+            "unusable"
+        };
+        ConfinementError::Resource(io::Error::new(
+            error.kind(),
+            format!("sandbox helper {path} is {state}: {error}"),
+        ))
+    })
+}
+fn trusted_helper_inner(path: &str) -> io::Result<PathBuf> {
+    let canonical = fs::canonicalize(path)?;
     for ancestor in canonical.ancestors() {
-        let metadata = fs::symlink_metadata(ancestor).map_err(ConfinementError::Resource)?;
+        let metadata = fs::symlink_metadata(ancestor)?;
         if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 || metadata.file_type().is_symlink()
         {
-            return Err(ConfinementError::Resource(invalid(
-                "unsafe trusted renderer helper ancestry",
-            )));
+            return Err(invalid("unsafe trusted renderer helper ancestry"));
         }
     }
-    let metadata = fs::metadata(&canonical).map_err(ConfinementError::Resource)?;
+    let metadata = fs::metadata(&canonical)?;
     if !metadata.is_file() || metadata.mode() & 0o6000 != 0 {
-        return Err(ConfinementError::Resource(invalid(
-            "privileged or nonregular renderer helper",
-        )));
+        return Err(invalid("privileged or nonregular renderer helper"));
     }
     let name = CString::new(canonical.as_os_str().as_encoded_bytes())
-        .map_err(|_| ConfinementError::Resource(invalid("invalid helper path")))?;
+        .map_err(|_| invalid("invalid helper path"))?;
     let result = unsafe {
         libc::getxattr(
             name.as_ptr(),
@@ -316,9 +377,9 @@ fn trusted_helper(path: &str) -> Result<PathBuf, ConfinementError> {
         )
     };
     if result >= 0 || io::Error::last_os_error().raw_os_error() != Some(libc::ENODATA) {
-        return Err(ConfinementError::Resource(invalid(
+        return Err(invalid(
             "renderer helper capabilities are present or unverifiable",
-        )));
+        ));
     }
     Ok(canonical)
 }
@@ -408,7 +469,17 @@ fn open_beneath(root: &File, path: &Path, write: bool, directory: bool) -> io::R
         )
     };
     if fd < 0 {
-        return Err(io::Error::last_os_error());
+        let error = io::Error::last_os_error();
+        return Err(
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::ENOSYS | libc::EINVAL | libc::EPERM)
+            ) {
+                component_error("descriptor resolution", error)
+            } else {
+                error
+            },
+        );
     }
     let file = unsafe { File::from_raw_fd(fd as i32) };
     verify_cgroup_fs(&file)?;
@@ -656,49 +727,46 @@ impl Scope {
             false,
             false,
         )?);
-        controls.kill = Some(open_beneath(
-            &controls.directory,
-            Path::new("cgroup.kill"),
-            true,
-            false,
-        )?);
-        controls.cpu = Some(open_beneath(
-            &controls.directory,
-            Path::new("cpu.stat"),
-            false,
-            false,
-        )?);
-        controls.memory_events = Some(open_beneath(
-            &controls.directory,
-            Path::new("memory.events"),
-            false,
-            false,
-        )?);
-        controls.pids_events = Some(open_beneath(
-            &controls.directory,
-            Path::new("pids.events"),
-            false,
-            false,
-        )?);
-        for (name, expected) in [
-            ("memory.max", self.memory.to_string()),
-            ("memory.swap.max", "0".into()),
-            ("pids.max", TASKS.to_string()),
-            ("cpu.max", "100000 100000".into()),
-            ("memory.oom.group", "1".into()),
-            ("cgroup.type", "domain".into()),
-        ] {
-            if read_control(&open_beneath(
+        controls.kill = Some(
+            open_beneath(&controls.directory, Path::new("cgroup.kill"), true, false)
+                .map_err(|error| component_error("cgroup.kill", error))?,
+        );
+        controls.cpu = Some(
+            open_beneath(&controls.directory, Path::new("cpu.stat"), false, false)
+                .map_err(|error| component_error("cpu controller", error))?,
+        );
+        controls.memory_events = Some(
+            open_beneath(
                 &controls.directory,
-                Path::new(name),
+                Path::new("memory.events"),
                 false,
                 false,
-            )?)?
+            )
+            .map_err(|error| component_error("memory controller", error))?,
+        );
+        controls.pids_events = Some(
+            open_beneath(&controls.directory, Path::new("pids.events"), false, false)
+                .map_err(|error| component_error("pids controller", error))?,
+        );
+        for (name, expected, component) in [
+            ("memory.max", self.memory.to_string(), "memory controller"),
+            ("memory.swap.max", "0".into(), "memory controller"),
+            ("pids.max", TASKS.to_string(), "pids controller"),
+            ("cpu.max", "100000 100000".into(), "cpu controller"),
+            ("memory.oom.group", "1".into(), "memory controller"),
+            ("cgroup.type", "domain".into(), "cgroup v2"),
+        ] {
+            if read_control(
+                &open_beneath(&controls.directory, Path::new(name), false, false)
+                    .map_err(|error| component_error(component, error))?,
+            )
+            .map_err(|error| component_error(component, error))?
             .trim()
                 != expected
             {
-                return Err(invalid(
-                    "actual renderer cgroup limits differ from requested limits",
+                return Err(component_error(
+                    component,
+                    invalid("actual renderer cgroup limits differ from requested limits"),
                 ));
             }
         }
@@ -939,7 +1007,7 @@ impl BoundedProcessMonitor for Scope {
                 return Err(isolation("renderer scope startup deadline expired"));
             }
             if crate::platform::child_has_exited(child).map_err(Error::Wait)? {
-                return Err(isolation("renderer launcher exited before scope admission"));
+                return Err(scope_startup_failure());
             }
             if self.anchor(child).map_err(Error::Isolation)? {
                 break;
@@ -1072,6 +1140,122 @@ pub(super) struct ConfinementFixture {
 mod tests {
     use super::*;
     use crate::confinement::RenderSandbox;
+    #[test]
+    fn early_launcher_exit_does_not_guess_manager_or_controller() {
+        let message = scope_startup_failure().to_string();
+        for expected in [
+            "cannot distinguish",
+            "systemd user manager",
+            "cpu",
+            "memory",
+            "pids",
+            "systemctl --user show",
+            "cgroup.controllers",
+            "cgroup.subtree_control",
+        ] {
+            assert!(message.contains(expected), "missing {expected}: {message}");
+        }
+        assert!(!message.contains("manager is missing"), "{message}");
+    }
+    #[test]
+    fn startup_diagnostic_survives_cleanup_failure() {
+        struct FailingMonitor;
+        impl BoundedProcessMonitor for FailingMonitor {
+            fn observe(&mut self, _: &Child) -> Result<(), Error> {
+                Ok(())
+            }
+            fn on_spawn(&mut self, _: &mut Child) -> Result<(), Error> {
+                Err(isolation("cgroup.kill is missing"))
+            }
+            fn cleanup(&mut self) -> Result<(), Error> {
+                Err(Error::RendererCleanup(invalid("cleanup failed")))
+            }
+        }
+        let error = crate::run_bounded_command_inner_impl(
+            &mut Command::new("/bin/true"),
+            BoundedProcessOptions::default(),
+            None,
+            &mut FailingMonitor,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("cgroup.kill is missing") && error.contains("cleanup failed"),
+            "{error}"
+        );
+    }
+    #[test]
+    fn missing_helper_identifies_the_component() {
+        let error = trusted_helper("/nonexistent-kio-sandbox-helper").unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("sandbox helper"), "{message}");
+        assert!(
+            message.contains("/nonexistent-kio-sandbox-helper"),
+            "{message}"
+        );
+        assert!(message.contains("missing"), "{message}");
+    }
+    #[test]
+    fn detected_helper_with_missing_target_is_unusable() {
+        let directory = tempfile::tempdir().unwrap();
+        let helper = directory.path().join("bwrap");
+        std::os::unix::fs::symlink(directory.path().join("absent"), &helper).unwrap();
+        let message = trusted_helper(helper.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("is unusable"), "{message}");
+        assert!(!message.contains("is missing"), "{message}");
+    }
+    #[test]
+    fn unusable_helper_is_distinguished_from_missing() {
+        let error = trusted_helper("/").unwrap_err().to_string();
+        assert!(error.contains("sandbox helper / is unusable"), "{error}");
+    }
+    #[test]
+    fn isolation_component_errors_name_missing_and_unusable_parts() {
+        for component in [
+            "systemd user manager",
+            "cpu controller",
+            "memory controller",
+            "pids controller",
+            "cgroup.kill",
+            "descriptor resolution",
+        ] {
+            let missing =
+                component_error(component, io::Error::from(io::ErrorKind::NotFound)).to_string();
+            let unusable =
+                component_error(component, io::Error::from(io::ErrorKind::PermissionDenied))
+                    .to_string();
+            assert!(
+                missing.contains(component) && missing.contains("missing"),
+                "{missing}"
+            );
+            assert!(
+                unusable.contains(component) && unusable.contains("unusable"),
+                "{unusable}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_and_unsafe_user_manager_are_distinct() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing =
+            validate_runtime(&directory.path().join("absent"), unsafe { libc::geteuid() })
+                .unwrap_err();
+        let ConfinementError::Resource(missing) = missing else {
+            panic!("unexpected error")
+        };
+        let missing = component_error("systemd user manager", missing).to_string();
+        assert!(missing.contains("missing"), "{missing}");
+        let unsafe_dir =
+            validate_runtime(directory.path(), unsafe { libc::geteuid() }).unwrap_err();
+        let ConfinementError::Resource(unsafe_dir) = unsafe_dir else {
+            panic!("unexpected error")
+        };
+        let unsafe_dir = component_error("systemd user manager", unsafe_dir).to_string();
+        assert!(unsafe_dir.contains("unusable"), "{unsafe_dir}");
+    }
     #[test]
     fn rejects_missing_ambiguous_and_overflowing_controls() {
         assert!(key_values("usage_usec 1\nusage_usec 2\n", ' ').is_err());

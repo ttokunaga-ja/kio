@@ -51,6 +51,7 @@ impl Fixture {
         }
         command
             .current_dir(&self.repo)
+            .envs(support::home_env(&self.home))
             .env("HOME", &self.home)
             .env("USERPROFILE", &self.home)
             .env("XDG_DATA_HOME", self.data_root())

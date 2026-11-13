@@ -126,6 +126,7 @@ pub(super) fn isolated_child_for(test_name: &str) -> bool {
     let output = command
         .args(["--exact", test_name, "--nocapture"])
         .env(CHILD, "1")
+        .envs(crate::test_support::home_env(private.path()))
         .env("HOME", private.path().join("home"))
         .env("USERPROFILE", private.path().join("home"))
         .env("XDG_CONFIG_HOME", private.path().join("config"))

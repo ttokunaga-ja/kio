@@ -71,6 +71,7 @@ fn run_isolated(name: &str) {
         .arg(name)
         .arg("--nocapture")
         .env(GATE, "1")
+        .envs(crate::test_support::home_env(&home))
         .env("HOME", home.join("home"))
         .env("USERPROFILE", home.join("home"))
         .env("XDG_DATA_HOME", home.join("data"))

@@ -1628,6 +1628,7 @@ pub(crate) fn compute_index_status(
     let unsupported_inputs_complete = unsupported_input_errors.is_empty();
     let tasks_complete = task_errors.is_empty();
     Ok(IndexStatusResponse {
+        office_readiness: crate::response::status::office_readiness(control),
         enriched_ratio,
         total_enrichment_tasks,
         skipped_enrichment_tasks,

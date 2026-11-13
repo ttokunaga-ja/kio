@@ -524,7 +524,7 @@ mod owned_root_tests {
         let alias = temp.path().join("parent-alias");
         symlink(&real, &alias).unwrap();
         let data_home = alias.join("new-data");
-        let _data = crate::test_control::TestEnvGuard::set("XDG_DATA_HOME", &data_home);
+        let _home_environment = crate::test_control::TestEnvGuard::isolated_home(&data_home);
         let _config =
             crate::test_control::TestEnvGuard::set("XDG_CONFIG_HOME", real.join("config"));
         assert!(!real.join("new-data").exists());
@@ -559,9 +559,7 @@ mod owned_root_tests {
         let temp = tempfile::tempdir().unwrap();
         let external = temp.path().canonicalize().unwrap();
         fs::set_permissions(&external, fs::Permissions::from_mode(0o777)).unwrap();
-        let _data = crate::test_control::TestEnvGuard::set("XDG_DATA_HOME", &external);
-        let _config =
-            crate::test_control::TestEnvGuard::set("XDG_CONFIG_HOME", external.join("config"));
+        let _home_environment = crate::test_control::TestEnvGuard::isolated_home(&external);
         let control = crate::control::ControlHandle::default();
         control
             .append_event_log("TEST", "first", serde_json::json!({}))
@@ -622,9 +620,7 @@ mod retained_log_root_tests {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&external, fs::Permissions::from_mode(0o777)).unwrap();
         }
-        let _data = crate::test_control::TestEnvGuard::set("XDG_DATA_HOME", &external);
-        let _config =
-            crate::test_control::TestEnvGuard::set("XDG_CONFIG_HOME", external.join("config"));
+        let _home_environment = crate::test_control::TestEnvGuard::isolated_home(&external);
         let control = crate::control::ControlHandle::default();
         control
             .append_event_log("TREE-A", "first", json!({}))

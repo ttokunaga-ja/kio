@@ -54,13 +54,8 @@ fn kio(dir: &TempDir, args: &[&str], env: &[(&str, &str)]) -> Command {
     for name in CHILD_ENV_DENYLIST {
         command.env_remove(name);
     }
-    command
-        .current_dir(dir.path())
-        .env("XDG_CONFIG_HOME", dir.path().join(".test-config"))
-        .env("XDG_DATA_HOME", dir.path().join(".test-data"))
-        .env("XDG_CACHE_HOME", dir.path().join(".test-cache"))
-        .env("XDG_STATE_HOME", dir.path().join(".test-state"))
-        .args(args);
+    command.envs(support::home_env(dir.path()));
+    command.current_dir(dir.path()).args(args);
     for (name, value) in env {
         command.env(name, value);
     }

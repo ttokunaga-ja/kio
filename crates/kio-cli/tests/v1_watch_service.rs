@@ -3,12 +3,16 @@
 //! These tests intentionally inspect help only: lifecycle installation is never
 //! exercised against the developer's real native scheduler in CI.
 
+mod support;
+
 use assert_cmd::Command;
 
 #[test]
 fn watch_service_help_exposes_lifecycle_without_starting_a_native_service() {
+    let home = support::canonical_tempdir();
     let output = Command::cargo_bin("kio")
         .unwrap()
+        .envs(support::home_env(home.path()))
         .args(["watch", "service", "--help"])
         .output()
         .unwrap();
@@ -24,8 +28,10 @@ fn watch_service_help_exposes_lifecycle_without_starting_a_native_service() {
 
 #[test]
 fn watch_service_install_help_exposes_bounded_interval() {
+    let home = support::canonical_tempdir();
     let output = Command::cargo_bin("kio")
         .unwrap()
+        .envs(support::home_env(home.path()))
         .args(["watch", "service", "install", "--help"])
         .output()
         .unwrap();

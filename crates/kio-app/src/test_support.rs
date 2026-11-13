@@ -144,3 +144,17 @@ pub(crate) fn create_private_test_file(path: &Path) -> std::fs::File {
         .create_private_file(Path::new(path.file_name().unwrap()))
         .unwrap()
 }
+
+/// Baseline for subprocess fixtures; explicit fixture paths may override it.
+pub(crate) fn home_env(root: &Path) -> [(&'static str, PathBuf); 8] {
+    [
+        ("HOME", root.to_path_buf()),
+        ("USERPROFILE", root.to_path_buf()),
+        ("APPDATA", root.join("config")),
+        ("LOCALAPPDATA", root.join("data")),
+        ("XDG_CONFIG_HOME", root.join("config")),
+        ("XDG_DATA_HOME", root.join("data")),
+        ("XDG_STATE_HOME", root.join("state")),
+        ("XDG_CACHE_HOME", root.join("cache")),
+    ]
+}

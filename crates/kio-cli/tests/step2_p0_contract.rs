@@ -197,12 +197,8 @@ fn approve_all_adapters(dir: &TempDir) {
 
 fn kio<const N: usize>(dir: &TempDir, args: [&str; N]) -> Command {
     let mut command = hermetic_kio_command();
-    command
-        .current_dir(dir.path())
-        .env("XDG_CONFIG_HOME", dir.path().join(".test-config"))
-        .env("XDG_DATA_HOME", dir.path().join(".test-data"))
-        .env("XDG_CACHE_HOME", dir.path().join(".test-cache"))
-        .args(args);
+    command.envs(support::home_env(dir.path()));
+    command.current_dir(dir.path()).args(args);
     command
 }
 
@@ -2802,6 +2798,7 @@ fn kio_no_base<const N: usize>(work: &Path, home: Option<&str>, args: [&str; N])
     let mut command = hermetic_kio_command();
     command
         .current_dir(work)
+        .envs(support::home_env(work))
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_DATA_HOME")
         .env_remove("XDG_CACHE_HOME")
@@ -2850,6 +2847,7 @@ fn r13_6_absolute_xdg_lets_commands_run_even_without_home() {
     let mut command = hermetic_kio_command();
     command
         .current_dir(work.path())
+        .envs(support::home_env(xdg.path()))
         .env_remove("HOME")
         .env("XDG_CONFIG_HOME", xdg.path().join("config"))
         .env("XDG_DATA_HOME", xdg.path().join("data"))
@@ -3794,6 +3792,7 @@ fn f5_final_index_warning_includes_paid_child_work_from_this_invocation() {
     let run = |cwd: &Path, args: &[&str]| -> Value {
         let output = hermetic_kio_command()
             .current_dir(cwd)
+            .envs(support::home_env(&config))
             .env("XDG_CONFIG_HOME", &config)
             .env("XDG_DATA_HOME", &data)
             .env("XDG_CACHE_HOME", &cache)
@@ -4003,6 +4002,7 @@ fn f5_child_paid_placeholder_finalization_preserves_binding_and_pass_counts() {
             }
             let output = command
                 .current_dir(cwd)
+                .envs(support::home_env(&home))
                 .env("HOME", &home)
                 .env("USERPROFILE", &home)
                 .env("XDG_DATA_HOME", &data)

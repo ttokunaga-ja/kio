@@ -1488,7 +1488,7 @@ pub(crate) fn enqueue_online_placeholder_task(
     // Once a converter resolves (a later `kio index`), fall through to the
     // normal enqueue path below and record the transition back to resolved.
     if is_office_media(&candidate.media_type) {
-        if resolve_office_converter_with_control(repo.control()).is_none() {
+        if resolve_office_converter_with_control(repo.control()).is_err() {
             record_unsupported_if_changed(
                 unsupported_store,
                 unsupported_by_path,

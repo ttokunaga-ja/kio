@@ -64,6 +64,7 @@ impl Fixture {
             cmd.env("SystemRoot", system_root);
         }
         cmd.current_dir(&self.scope)
+            .envs(support::home_env(&self.home))
             .env("HOME", &self.home)
             .env("USERPROFILE", &self.home)
             .env("XDG_DATA_HOME", self.home.join("data"))
@@ -865,6 +866,7 @@ impl LocalQueryFixture {
             command.env("SystemRoot", system_root);
         }
         command
+            .envs(support::home_env(&self.home))
             .env("HOME", &self.home)
             .env("USERPROFILE", &self.home)
             .env("XDG_DATA_HOME", self.home.join("data"))

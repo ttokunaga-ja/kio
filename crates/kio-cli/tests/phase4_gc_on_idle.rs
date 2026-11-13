@@ -37,6 +37,7 @@ fn kio(dir: &TempDir, args: &[&str], now: &str) -> Command {
     }
     command
         .current_dir(dir.path())
+        .envs(support::home_env(dir.path()))
         .env("HOME", dir.path().join("home"))
         .env("XDG_CONFIG_HOME", dir.path().join("config"))
         .env("XDG_DATA_HOME", dir.path().join("data"))
@@ -289,6 +290,7 @@ fn post_publication_index_replacement_fails_closed_without_retiring_stale_tree()
     let ready = control.path().join("post-publication.ready");
     let child = std::process::Command::new(assert_cmd::cargo::cargo_bin("kio"))
         .current_dir(dir.path())
+        .envs(support::home_env(control.path()))
         .env("HOME", control.path().join("home"))
         .env("XDG_CONFIG_HOME", control.path().join("config"))
         .env("XDG_DATA_HOME", control.path().join("data"))
@@ -365,6 +367,7 @@ fn post_publication_snapshot_auto_disable_fails_closed_before_on_idle_sweep() {
     let ready = control.path().join("post-publication.ready");
     let child = std::process::Command::new(assert_cmd::cargo::cargo_bin("kio"))
         .current_dir(dir.path())
+        .envs(support::home_env(control.path()))
         .env("HOME", control.path().join("home"))
         .env("XDG_CONFIG_HOME", control.path().join("config"))
         .env("XDG_DATA_HOME", control.path().join("data"))
@@ -456,6 +459,7 @@ fn parent_on_idle_does_not_consume_child_gc_state_and_child_handles_its_own_tree
     let old_commit = {
         let output = std::process::Command::new(assert_cmd::cargo::cargo_bin("kio"))
             .current_dir(&child_root)
+            .envs(support::home_env(dir.path()))
             .env("HOME", dir.path().join("child-home"))
             .env("XDG_CONFIG_HOME", dir.path().join("child-config"))
             .env("XDG_DATA_HOME", dir.path().join("child-data"))
@@ -496,6 +500,7 @@ fn parent_on_idle_does_not_consume_child_gc_state_and_child_handles_its_own_tree
 
     let child_baseline = std::process::Command::new(assert_cmd::cargo::cargo_bin("kio"))
         .current_dir(&child_root)
+        .envs(support::home_env(dir.path()))
         .env("HOME", dir.path().join("child-home"))
         .env("XDG_CONFIG_HOME", dir.path().join("child-config"))
         .env("XDG_DATA_HOME", dir.path().join("child-data"))
@@ -507,6 +512,7 @@ fn parent_on_idle_does_not_consume_child_gc_state_and_child_handles_its_own_tree
     assert!(child_baseline.status.success());
     let child_done = std::process::Command::new(assert_cmd::cargo::cargo_bin("kio"))
         .current_dir(&child_root)
+        .envs(support::home_env(dir.path()))
         .env("HOME", dir.path().join("child-home"))
         .env("XDG_CONFIG_HOME", dir.path().join("child-config"))
         .env("XDG_DATA_HOME", dir.path().join("child-data"))

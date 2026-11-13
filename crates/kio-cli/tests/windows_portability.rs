@@ -30,6 +30,7 @@ fn command(cwd: &Path, device: &Path) -> Command {
     }
     command
         .current_dir(cwd)
+        .envs(support::home_env(device))
         .env("XDG_CONFIG_HOME", device.join("config"))
         .env("XDG_DATA_HOME", device.join("data"))
         .env("XDG_CACHE_HOME", device.join("cache"));
@@ -68,6 +69,7 @@ fn windows_no_home_command(cwd: &Path, profile: &Path) -> Command {
     }
     command
         .current_dir(cwd)
+        .envs(support::home_env(profile))
         .env_remove("HOME")
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_DATA_HOME")

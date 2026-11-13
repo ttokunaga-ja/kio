@@ -32,11 +32,9 @@ use tempfile::TempDir;
 
 fn kio(dir: &TempDir, args: &[&str]) -> Command {
     let mut command = Command::cargo_bin("kio").unwrap();
+    command.envs(support::home_env(dir.path()));
     command
         .current_dir(dir.path())
-        .env("XDG_CONFIG_HOME", dir.path().join(".test-config"))
-        .env("XDG_DATA_HOME", dir.path().join(".test-data"))
-        .env("XDG_CACHE_HOME", dir.path().join(".test-cache"))
         .env_remove("GEMINI_API_KEY")
         .env_remove("MISTRAL_API_KEY")
         .args(args);
@@ -53,6 +51,7 @@ fn private_kio_process(dir: &TempDir, args: &[&str]) -> std::process::Command {
     command
         .env_clear()
         .current_dir(dir.path())
+        .envs(support::home_env(dir.path()))
         .env("HOME", dir.path().join(".test-home"))
         .env("XDG_CONFIG_HOME", dir.path().join(".test-config"))
         .env("XDG_DATA_HOME", dir.path().join(".test-data"))
