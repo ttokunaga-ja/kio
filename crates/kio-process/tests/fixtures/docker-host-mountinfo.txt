@@ -1,0 +1,39 @@
+410 323 8:48 / / rw,relatime - ext4 /dev/sdd rw,discard,errors=remount-ro,data=ordered
+411 410 0:2 /init /init ro - rootfs rootfs rw,size=32852428k,nr_inodes=8213107
+412 410 0:6 / /dev rw,nosuid,relatime shared:14 - devtmpfs none rw,size=32852428k,nr_inodes=8213107,mode=755
+413 412 0:62 / /dev/pts rw,nosuid,noexec,noatime shared:17 - devpts devpts rw,gid=5,mode=620,ptmxmode=000
+414 412 0:65 / /dev/shm rw,nosuid,nodev,noatime shared:20 - tmpfs none rw
+518 412 0:70 / /dev/hugepages rw,nosuid,nodev,relatime shared:26 - hugetlbfs hugetlbfs rw,pagesize=2M
+519 412 0:39 / /dev/mqueue rw,nosuid,nodev,noexec,relatime shared:27 - mqueue mqueue rw
+520 410 0:24 / /sys rw,nosuid,nodev,noexec,noatime shared:15 - sysfs sysfs rw
+521 520 0:25 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime shared:23 - cgroup2 cgroup2 rw,nsdelegate
+522 520 0:8 / /sys/kernel/debug rw,nosuid,nodev,noexec,relatime shared:28 - debugfs debugfs rw
+523 520 0:13 / /sys/kernel/tracing rw,nosuid,nodev,noexec,relatime shared:29 - tracefs tracefs rw
+524 520 0:71 / /sys/kernel/config rw,nosuid,nodev,noexec,relatime shared:30 - configfs configfs rw
+525 520 0:72 / /sys/fs/fuse/connections rw,nosuid,nodev,noexec,relatime shared:31 - fusectl fusectl rw
+526 410 0:61 / /proc rw,nosuid,nodev,noexec,noatime shared:16 - proc proc rw
+527 526 0:35 / /proc/sys/fs/binfmt_misc rw,relatime shared:22 - binfmt_misc binfmt_misc rw
+528 527 0:63 /wsl/binfmt-status-lock /proc/sys/fs/binfmt_misc/status rw,nosuid,nodev shared:18 - tmpfs none rw,mode=755
+529 410 0:63 / /run rw,nosuid,nodev shared:18 - tmpfs none rw,mode=755
+530 529 0:64 / /run/lock rw,nosuid,nodev,noexec,noatime shared:19 - tmpfs none rw
+531 529 0:65 / /run/shm rw,nosuid,nodev,noatime shared:20 - tmpfs none rw
+532 529 0:66 / /run/user rw,nosuid,nodev,noexec,noatime shared:21 - tmpfs none rw,mode=755
+588 532 0:40 /run/user /run/user rw,relatime shared:2 - tmpfs none rw
+589 588 0:82 / /run/user/1000 rw,nosuid,nodev,relatime shared:328 - tmpfs tmpfs rw,size=6571508k,nr_inodes=1642877,mode=700,uid=1000,gid=1000
+590 410 0:36 / /usr/lib/wsl/drivers ro,nosuid,nodev,noatime - 9p drivers ro,aname=drivers;fmask=222;dmask=222,cache=0x5,access=client,msize=65536,trans=fd,rfd=8,wfd=8
+591 410 0:57 / /usr/lib/wsl/lib rw,nosuid,nodev,noatime - overlay none rw,lowerdir=/gpu_lib_packaged:/gpu_lib_inbox,upperdir=/gpu_lib/rw/upper,workdir=/gpu_lib/rw/work,uuid=on
+592 410 0:34 / /mnt/wsl rw,relatime shared:1 - tmpfs none rw
+593 410 0:40 / /mnt/wslg rw,relatime shared:2 - tmpfs none rw
+594 593 8:48 / /mnt/wslg/distro ro,relatime shared:3 - ext4 /dev/sdd rw,discard,errors=remount-ro,data=ordered
+595 593 0:42 /etc/versions.txt /mnt/wslg/versions.txt rw,relatime shared:24 - overlay none rw,lowerdir=/systemvhd,upperdir=/system/rw/upper,workdir=/system/rw/work,uuid=on
+596 593 0:42 /usr/share/doc /mnt/wslg/doc rw,relatime shared:25 - overlay none rw,lowerdir=/systemvhd,upperdir=/system/rw/upper,workdir=/system/rw/work,uuid=on
+597 593 0:82 / /mnt/wslg/run/user/1000 rw,nosuid,nodev,relatime shared:328 - tmpfs tmpfs rw,size=6571508k,nr_inodes=1642877,mode=700,uid=1000,gid=1000
+598 410 0:40 /.X11-unix /tmp/.X11-unix ro,relatime shared:2 - tmpfs none rw
+599 410 0:31 / /usr/lib/modules/6.18.58.1-microsoft-standard-WSL2 rw,nosuid,nodev,noatime - overlay none rw,lowerdir=/modules/6.18.58.1-microsoft-standard-WSL2/modules,upperdir=/lib/modules/6.18.58.1-microsoft-standard-WSL2/rw/upper,workdir=/lib/modules/6.18.58.1-microsoft-standard-WSL2/rw/work,uuid=on
+600 410 8:16 /6.18.58.1-microsoft-standard-WSL2/linux-headers /usr/src/linux-headers-6.18.58.1-microsoft-standard-WSL2 ro,relatime - ext4 /dev/sdb ro
+602 410 8:48 /var/lib/docker /var/lib/docker rw,relatime shared:294 - ext4 /dev/sdd rw,discard,errors=remount-ro,data=ordered
+601 410 0:84 / /mnt/c rw,noatime - 9p C:\134 rw,aname=drvfs;path=C:\;uid=1000;gid=1000;symlinkroot=/mnt/,cache=0x5,access=client,msize=65536,trans=fd,rfd=13,wfd=13
+551 602 0:81 / /var/lib/docker/rootfs/overlayfs/5e46c8dfc573822361fab63e423bf9294f48951faee28098a66d7f1afc3849d1 rw,relatime shared:237 - overlay overlay rw,lowerdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/1500/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/63/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/62/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/61/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/60/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/59/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/58/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/57/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/56/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/55/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/54/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/53/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/52/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/51/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/50/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/49/fs,upperdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/1501/fs,workdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/1501/work
+666 529 0:4 net:[4026532237] /run/docker/netns/ca03058ea294 rw shared:285 - nsfs nsfs rw
+585 602 0:83 / /var/lib/docker/rootfs/overlayfs/cbba58d7fb91fb446cb4a3b0ff7d472f9491a6ca615f9d321dc86695f3903240 rw,relatime shared:291 - overlay overlay rw,lowerdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/1506/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/63/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/62/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/61/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/60/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/59/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/58/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/57/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/56/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/55/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/54/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/53/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/52/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/51/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/50/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/49/fs,upperdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/1507/fs,workdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/1507/work
+736 529 0:4 net:[4026532306] /run/docker/netns/fc01f839dc49 rw shared:293 - nsfs nsfs rw
