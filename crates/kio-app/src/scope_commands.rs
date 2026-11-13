@@ -134,6 +134,7 @@ pub(crate) fn run_status(ctx: &Invocation<'_>) -> Result<CommandResponse> {
         };
     Ok(CommandResponse {
         body: ResponseBody::Status(Box::new(StatusResponse {
+            office_readiness: crate::response::status::office_readiness(ctx.control),
             scope_path: repo.kio_dir().to_path_buf(),
             files: status.files,
             head_shallow: status.head_shallow,

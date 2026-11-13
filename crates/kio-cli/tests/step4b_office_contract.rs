@@ -50,6 +50,7 @@ const KIO_CHILD_ENV_DENYLIST: &[&str] = &[
     "KIO_TEST_R13_2_FALLBACK",
     "KIO_TEST_WINDOWS_PROFILE",
     "KIO_TEST_OFFICE_CONVERT",
+    "KIO_TEST_OFFICE_ISOLATION_FAILURE",
     "KIO_OFFICE_CONVERTER",
     "KIO_TEST_CAPTURE_SENT_MEDIA",
 ];
@@ -64,6 +65,8 @@ fn kio(dir: &TempDir, args: &[&str]) -> Command {
         .env("XDG_CONFIG_HOME", dir.path().join(".test-config"))
         .env("XDG_DATA_HOME", dir.path().join(".test-data"))
         .env("XDG_CACHE_HOME", dir.path().join(".test-cache"))
+        .env("XDG_STATE_HOME", dir.path().join(".test-state"))
+        .env("HOME", dir.path())
         .args(args);
     command
 }
@@ -529,6 +532,237 @@ fn office_04_converter_absent_no_doomed_task() {
         "the disposition must clear once the converter resolves and the file is \
          re-indexed: {search2}"
     );
+}
+
+#[test]
+fn office_unavailable_reports_reason_and_keeps_text_search() {
+    let dir = canonical_tempdir();
+    write_office_input(&dir, "report.docx");
+    fs::write(dir.path().join("note.txt"), "quartzneedle searchable text").unwrap();
+    init(&dir);
+    let missing = "/nonexistent-kio-office-renderer";
+    kio(&dir, &["index", "--yes"])
+        .env(OFFICE_CONVERTER_ENV, missing)
+        .assert()
+        .success();
+    for args in [
+        &["status"][..],
+        &["search", "quartzneedle", "--mode", "text"][..],
+    ] {
+        let output = kio(&dir, args)
+            .env(OFFICE_CONVERTER_ENV, missing)
+            .arg("--json")
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let value: Value = serde_json::from_slice(&output).unwrap();
+        let readiness = if args[0] == "status" {
+            &value["office_readiness"]
+        } else {
+            &value["index_status"]["office_readiness"]
+        };
+        assert_eq!(readiness["state"], "missing", "{value}");
+        assert!(
+            readiness["alternatives"]
+                .as_str()
+                .unwrap()
+                .contains("search")
+        );
+        if args[0] == "search" {
+            assert!(!value["results"].as_array().unwrap().is_empty(), "{value}");
+        }
+        let output = kio(&dir, args)
+            .env(OFFICE_CONVERTER_ENV, missing)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let text = String::from_utf8(output).unwrap();
+        assert!(
+            text.contains("Office: missing") && text.contains("searchable"),
+            "{text}"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn office_unavailable_never_runs_renderer_without_isolation() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = canonical_tempdir();
+    let script = dir.path().join("renderer");
+    let marker = dir.path().join("executed");
+    fs::write(
+        &script,
+        format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    init(&dir);
+    let output = kio(&dir, &["status"])
+        .env(OFFICE_CONVERTER_ENV, &script)
+        .arg("--json")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let status: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(status["office_readiness"]["state"], "unusable", "{status}");
+    assert!(!marker.exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn office_isolation_component_faults_reach_cli_without_blocking_extraction_or_search() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = canonical_tempdir();
+    write_office_input(&dir, "report.docx");
+    fs::write(dir.path().join("note.txt"), "quartzneedle searchable text").unwrap();
+    fs::write(dir.path().join("note.md"), "quartzneedle markdown text").unwrap();
+    fs::write(
+        dir.path().join("note.pdf"),
+        fake_pdf(&["quartzneedle pdf text"]),
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("table.xlsx"),
+        include_bytes!("../../kio-eval/acceptance-fixtures/v1/office-public/table.xlsx"),
+    )
+    .unwrap();
+    let renderer = dir.path().join("renderer");
+    let marker = dir.path().join("renderer-executed");
+    fs::write(
+        &renderer,
+        format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&renderer, fs::Permissions::from_mode(0o700)).unwrap();
+    init(&dir);
+    for component in [
+        "manager",
+        "cpu",
+        "memory",
+        "pids",
+        "kill",
+        "helper",
+        "descriptor",
+    ] {
+        let expected = match component {
+            "manager" => "systemd user manager",
+            "cpu" => "cpu controller",
+            "memory" => "memory controller",
+            "pids" => "pids controller",
+            "kill" => "cgroup.kill",
+            "helper" => "sandbox helper /usr/bin/bwrap",
+            "descriptor" => "descriptor resolution",
+            _ => unreachable!(),
+        };
+        for state in ["missing", "unusable"] {
+            let fault = format!("{component}:{state}");
+            kio(&dir, &["index", "--yes"])
+                .env(OFFICE_CONVERTER_ENV, &renderer)
+                .env("KIO_TEST_OFFICE_ISOLATION_FAILURE", &fault)
+                .assert()
+                .success();
+            for args in [
+                &["status"][..],
+                &["search", "quartzneedle", "--mode", "text"][..],
+            ] {
+                for json in [true, false] {
+                    let mut command = kio(&dir, args);
+                    command
+                        .env(OFFICE_CONVERTER_ENV, &renderer)
+                        .env("KIO_TEST_OFFICE_ISOLATION_FAILURE", &fault);
+                    if json {
+                        command.arg("--json");
+                    }
+                    let output = command.assert().success().get_output().stdout.clone();
+                    let text = String::from_utf8(output).unwrap();
+                    assert!(
+                        text.contains(&format!("{expected} is {state}")),
+                        "{fault}: {text}"
+                    );
+                    assert!(
+                        text.contains("PDF text layer")
+                            && text.contains("XLSX")
+                            && text.contains("searchable"),
+                        "{text}"
+                    );
+                    if json {
+                        let value: Value = serde_json::from_str(&text).unwrap();
+                        let readiness = if args[0] == "status" {
+                            &value["office_readiness"]
+                        } else {
+                            &value["index_status"]["office_readiness"]
+                        };
+                        // The renderer was found; its required isolation component is unavailable.
+                        assert_eq!(readiness["state"], "unusable", "{value}");
+                        if args[0] == "status" {
+                            assert!(
+                                markdownize_tasks_for(&value, "report.docx").is_empty(),
+                                "{value}"
+                            );
+                            assert!(
+                                markdownize_tasks_for(&value, "table.xlsx")
+                                    .iter()
+                                    .any(|task| task["status"] == "done"),
+                                "{value}"
+                            );
+                        }
+                        if args[0] == "search" {
+                            assert_eq!(
+                                value["index_status"]["office_conversion_unavailable"]["count"], 1,
+                                "{value}"
+                            );
+                            let results = value["results"].as_array().unwrap();
+                            for path in ["note.txt", "note.md", "note.pdf"] {
+                                assert!(
+                                    results
+                                        .iter()
+                                        .any(|result| result.to_string().contains(path)),
+                                    "{path}: {value}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            assert!(!marker.exists(), "renderer ran with {fault}");
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn office_early_scope_exit_explains_uncertainty_and_checks_in_cli() {
+    let dir = canonical_tempdir();
+    init(&dir);
+    for json in [false, true] {
+        let mut command = kio(&dir, &["status"]);
+        command
+            .env(OFFICE_CONVERTER_ENV, "/bin/true")
+            .env("KIO_TEST_OFFICE_ISOLATION_FAILURE", "startup");
+        if json {
+            command.arg("--json");
+        }
+        let text =
+            String::from_utf8(command.assert().success().get_output().stdout.clone()).unwrap();
+        for expected in [
+            "cannot distinguish",
+            "systemd user manager",
+            "cpu/memory/pids",
+            "systemctl --user show",
+            "cgroup.controllers",
+            "cgroup.subtree_control",
+            "searchable",
+        ] {
+            assert!(text.contains(expected), "{expected}: {text}");
+        }
+    }
 }
 
 // ===========================================================================

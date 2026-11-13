@@ -177,49 +177,86 @@ impl OfficeConverter {
     }
 }
 
-/// Resolve an Office converter (07 §5.1). Resolution order:
-/// [`OFFICE_CONVERTER_ENV`] (explicit binary path) → `soffice` on PATH.
-/// [`resolve_office_converter_with_control`] first checks its captured test seam.
-/// The first of these that is
-/// SET wins outright (a set-but-broken explicit override does not fall
-/// through to PATH; that would silently substitute a different converter
-/// than the one named). `None` means unavailable — a probe/version failure
-/// counts as unavailable, NEVER an `Err` (07 §5.1: "renderer が環境に存在しない
-/// 場合...doomed task を作らない" — the caller must be able to silently skip
-/// enqueueing rather than crash).
-#[must_use]
-pub fn resolve_office_converter() -> Option<OfficeConverter> {
+/// An unavailable renderer is either absent or detected but unusable.
+#[derive(Debug)]
+pub struct OfficeUnavailable {
+    pub state: &'static str,
+    pub reason: String,
+}
+
+impl std::fmt::Display for OfficeUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.state, self.reason)
+    }
+}
+
+pub fn resolve_office_converter() -> std::result::Result<OfficeConverter, OfficeUnavailable> {
     resolve_office_converter_with_control(&ControlHandle::default())
 }
 
-/// Resolve a converter using the invocation's immutable debug snapshot.
-#[must_use]
-pub fn resolve_office_converter_with_control(control: &ControlHandle) -> Option<OfficeConverter> {
+pub fn resolve_office_converter_with_control(
+    control: &ControlHandle,
+) -> std::result::Result<OfficeConverter, OfficeUnavailable> {
     #[cfg(debug_assertions)]
     if let Some(fixture_path) = &control.debug().adapters.office_convert {
         if fixture_path.is_empty() {
-            return None;
+            return Err(OfficeUnavailable {
+                state: "missing",
+                reason: "Office renderer is not configured".into(),
+            });
         }
-        return Some(OfficeConverter {
+        return Ok(OfficeConverter {
             control: control.clone(),
             #[cfg(test)]
             native_acceptance_diagnostics: false,
-            #[cfg(debug_assertions)]
             backend: ConverterBackend::Seam {
                 fixture_path: fixture_path.clone(),
             },
             version: "test-converter".to_owned(),
         });
     }
-    if let Ok(explicit) = std::env::var(OFFICE_CONVERTER_ENV) {
-        if explicit.is_empty() {
-            return None;
-        }
-        return resolve_program(PathBuf::from(explicit))
-            .and_then(|program| probe_real_converter(program, control));
+    let requested = std::env::var_os(OFFICE_CONVERTER_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_OFFICE_CONVERTER_PROGRAM));
+    if requested.as_os_str().is_empty() {
+        return Err(OfficeUnavailable {
+            state: "missing",
+            reason: "Office renderer is not configured".into(),
+        });
     }
-    resolve_program(PathBuf::from(DEFAULT_OFFICE_CONVERTER_PROGRAM))
-        .and_then(|program| probe_real_converter(program, control))
+    let program = resolve_program(requested.clone()).ok_or_else(|| OfficeUnavailable {
+        state: if renderer_candidate_exists(&requested) {
+            "unusable"
+        } else {
+            "missing"
+        },
+        reason: format!(
+            "Office renderer {} could not be resolved",
+            requested.display()
+        ),
+    })?;
+    #[cfg(all(debug_assertions, target_os = "linux"))]
+    if let Some(fault) = control.debug().adapters.office_isolation_failure.known() {
+        return Err(OfficeUnavailable {
+            state: "unusable",
+            reason: kio_process::confinement::injected_linux_isolation_failure_for_test(fault)
+                .to_string(),
+        });
+    }
+    probe_real_converter_diagnostic(program, control).map_err(|error| OfficeUnavailable {
+        state: "unusable",
+        reason: error.to_string(),
+    })
+}
+
+fn renderer_candidate_exists(program: &Path) -> bool {
+    let detected = |path: &Path| !matches!(std::fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound);
+    if program.components().count() > 1 || program.is_absolute() {
+        return detected(program);
+    }
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|directory| detected(&directory.join(program)))
+    })
 }
 
 /// Resolve the executable before dropping the ambient environment.  The
@@ -238,17 +275,6 @@ fn resolve_program(program: PathBuf) -> Option<PathBuf> {
         .find_map(canonical_renderer_program)
 }
 
-/// Probe a candidate converter binary via `--version`. ANY failure (spawn
-/// error / missing binary, non-zero exit, empty stdout) resolves to `None`
-/// — never an `Err`, per [`resolve_office_converter`]'s contract.
-fn probe_real_converter(program: PathBuf, control: &ControlHandle) -> Option<OfficeConverter> {
-    probe_real_converter_diagnostic(program, control).ok()
-}
-
-/// Diagnostic variant for native acceptance tests. Production availability
-/// remains optional, but a required real-renderer lane can expose a bounded,
-/// non-secret failure reason rather than silently treating a broken sandbox as
-/// an absent binary.
 fn probe_real_converter_diagnostic(
     program: PathBuf,
     control: &ControlHandle,
@@ -995,35 +1021,53 @@ mod tests {
     }
 
     #[test]
-    fn no_converter_available_resolves_to_none() {
+    fn no_converter_available_reports_missing() {
         let _lock = kio_core::test_control::test_env_lock().lock().unwrap();
         let _clear_seam = kio_core::test_control::TestEnvGuard::remove(TEST_OFFICE_CONVERT_ENV);
         let _clear_explicit = kio_core::test_control::TestEnvGuard::remove(OFFICE_CONVERTER_ENV);
         let _scrub_path =
             kio_core::test_control::TestEnvGuard::set("PATH", "/nonexistent-kio-test-path");
-        assert!(
-            resolve_office_converter_with_control(&ControlHandle::new(
-                kio_core::test_control::DebugTestControl::from_env()
-            ))
-            .is_none()
-        );
+        let error = resolve_office_converter_with_control(&ControlHandle::new(
+            kio_core::test_control::DebugTestControl::from_env(),
+        ))
+        .unwrap_err();
+        assert_eq!(error.state, "missing");
     }
 
     #[test]
-    fn explicit_converter_pointing_at_missing_binary_resolves_to_none() {
+    fn explicit_converter_pointing_at_missing_binary_reports_missing() {
         let _lock = kio_core::test_control::test_env_lock().lock().unwrap();
         let _clear_seam = kio_core::test_control::TestEnvGuard::remove(TEST_OFFICE_CONVERT_ENV);
         let _explicit = kio_core::test_control::TestEnvGuard::set(
             OFFICE_CONVERTER_ENV,
             "/definitely/not/a/real/kio-office-converter-binary",
         );
+        let error = resolve_office_converter_with_control(&ControlHandle::new(
+            kio_core::test_control::DebugTestControl::from_env(),
+        ))
+        .unwrap_err();
+        assert_eq!(error.state, "missing");
         assert!(
-            resolve_office_converter_with_control(&ControlHandle::new(
-                kio_core::test_control::DebugTestControl::from_env()
-            ))
-            .is_none(),
-            "a probe failure on an explicit override must resolve to None, not fall through to PATH"
+            error
+                .reason
+                .contains("/definitely/not/a/real/kio-office-converter-binary"),
+            "{error}"
         );
+    }
+
+    #[test]
+    fn path_candidate_that_exists_but_is_not_a_renderer_is_unusable() {
+        let _lock = kio_core::test_control::test_env_lock().lock().unwrap();
+        let _clear_seam = kio_core::test_control::TestEnvGuard::remove(TEST_OFFICE_CONVERT_ENV);
+        let _clear_explicit = kio_core::test_control::TestEnvGuard::remove(OFFICE_CONVERTER_ENV);
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("soffice")).unwrap();
+        let _path = kio_core::test_control::TestEnvGuard::set("PATH", directory.path());
+        let error = resolve_office_converter_with_control(&ControlHandle::new(
+            kio_core::test_control::DebugTestControl::from_env(),
+        ))
+        .unwrap_err();
+        assert_eq!(error.state, "unusable");
     }
 
     #[cfg(unix)]
