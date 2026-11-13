@@ -33,7 +33,7 @@ struct Mount {
     id: u64,
     parent: u64,
     device: Device,
-    root: PathBuf,
+    root: Option<PathBuf>,
     point: PathBuf,
     kind: Vec<u8>,
 }
@@ -171,7 +171,6 @@ fn parse_table(bytes: &[u8]) -> io::Result<Vec<Mount>> {
             .map_err(|_| invalid("overflowing mountinfo device"))?;
         let minor = u32::try_from(number(device[1])?)
             .map_err(|_| invalid("overflowing mountinfo device"))?;
-        let root = decode_path(fields[3])?;
         let point = decode_path(fields[4])?;
         let kind = fields[separator + 1];
         if !kind
@@ -180,6 +179,20 @@ fn parse_table(bytes: &[u8]) -> io::Result<Vec<Mount>> {
         {
             return Err(invalid("invalid mountinfo filesystem type"));
         }
+        // nsfs exposes namespace handles as individual files, not filesystem
+        // trees. Keep these mounts in the topology, but never bind them as
+        // renderer sources; only the kernel's network namespace spelling is
+        // accepted without an absolute root.
+        let namespace_id = fields[3]
+            .strip_prefix(b"net:[")
+            .and_then(|value| value.strip_suffix(b"]"));
+        let root = if kind == b"nsfs"
+            && namespace_id.is_some_and(|id| !id.is_empty() && id.iter().all(u8::is_ascii_digit))
+        {
+            None
+        } else {
+            Some(decode_path(fields[3])?)
+        };
         mounts.push(Mount {
             id,
             parent,
@@ -279,7 +292,7 @@ fn region(mount: &Mount, path: &Path) -> io::Result<Region> {
         .map_err(|_| invalid("path is outside its mount"))?;
     Ok(Region {
         device: mount.device,
-        path: mount.root.join(relative),
+        path: mount.root.as_ref().ok_or_else(denied)?.join(relative),
     })
 }
 
@@ -298,6 +311,20 @@ fn included_regions(
     }
     for mount in mounts {
         if paths.iter().any(|path| mount.point.starts_with(path)) {
+            // An nsfs handle cannot contain a protected filesystem region.
+            // Its directory may be inaccessible (for example Docker's netns
+            // directory), so do not open it just to enumerate protected paths.
+            // Keep a point shared with another mount: resolving that point is
+            // necessary to identify the visible backing filesystem. Covering
+            // ancestor mounts are themselves enumerated and resolved.
+            if !reject_special
+                && mount.root.is_none()
+                && !mounts
+                    .iter()
+                    .any(|other| other.point == mount.point && other.root.is_some())
+            {
+                continue;
+            }
             points.insert(mount.point.as_path());
         }
     }
@@ -315,6 +342,13 @@ fn included_regions(
             )
         {
             return Err(denied());
+        }
+        if mount.root.is_none() {
+            if reject_special {
+                return Err(denied());
+            }
+            // A namespace handle cannot contain control-plane filesystem paths.
+            continue;
         }
         regions.push(region(mount, path)?);
     }
@@ -460,6 +494,80 @@ mod tests {
             .is_ok()
         );
         assert!(check("6 1 0:6 / /usr/lib/wsl rw - 9p none rw\n", &["/usr"]).is_ok());
+    }
+
+    #[test]
+    fn docker_network_namespace_mount_is_preserved_and_safe() {
+        let extra = concat!(
+            "529 2 0:8 / /run/docker rw - tmpfs tmpfs rw\n",
+            "804 529 0:4 net:[4026532236] /run/docker/netns/39cc8f046cfe rw shared:347 - nsfs nsfs rw\n",
+        );
+        assert!(check(extra, &["/usr"]).is_ok());
+        assert!(check(extra, &["/run/docker/netns/39cc8f046cfe"]).is_err());
+        let alias = "805 1 0:4 net:[4026532236] /opt/runtime/netns rw - nsfs nsfs rw\n";
+        assert!(check(&format!("{extra}{alias}"), &["/opt/runtime"]).is_err());
+    }
+
+    #[test]
+    fn docker_host_mountinfo_with_actual_renderer_sources() {
+        let mounts = parse_table(include_bytes!(
+            "../../../tests/fixtures/docker-host-mountinfo.txt"
+        ))
+        .unwrap();
+        let sources = [
+            "/usr/bin/dash",
+            "/tmp/kio-renderer",
+            "/usr/bin",
+            "/usr/lib",
+            "/usr/share",
+            "/etc/fonts",
+        ]
+        .map(PathBuf::from);
+        let protected = ["/run", "/sys", "/proc"].map(PathBuf::from);
+        let result = validate_table(&mounts, &sources, &protected, |path| {
+            if path.starts_with("/run/docker/netns/") {
+                return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+            }
+            if path == Path::new("/run/user") {
+                return Ok(588);
+            }
+            fixture_resolve(&mounts, path)
+        });
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn namespace_mount_does_not_hide_other_mount_at_same_point() {
+        let extra = concat!(
+            "6 2 0:4 net:[123] /run/netns rw - nsfs nsfs rw\n",
+            "7 2 0:7 / /run/netns rw - tmpfs tmpfs rw\n",
+            "8 1 0:7 / /alias rw - tmpfs tmpfs rw\n",
+        );
+        let mounts = parse_table(format!("{ROOT}{CONTROL}{extra}").as_bytes()).unwrap();
+        let protected = ["/run", "/sys", "/proc"].map(PathBuf::from);
+        let result = validate_table(&mounts, &["/alias".into()], &protected, |path| {
+            if path == Path::new("/run/netns") {
+                Ok(7)
+            } else {
+                fixture_resolve(&mounts, path)
+            }
+        });
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn rejects_invalid_namespace_roots_and_relevant_paths() {
+        for (root, kind, point) in [
+            ("net:[4026532236]", "tmpfs", "/other"),
+            ("net:[]", "nsfs", "/other"),
+            ("net:[123x]", "nsfs", "/other"),
+            ("net:[123]", "nsfs", "/bad/../other"),
+            ("/bad\\041escape", "nsfs", "/other"),
+            ("relative", "ext4", "/other"),
+        ] {
+            let extra = format!("6 1 0:9 {root} {point} rw - {kind} none rw\n");
+            assert!(check(&extra, &["/usr"]).is_err(), "{extra}");
+        }
     }
 
     #[test]
@@ -632,7 +740,7 @@ mod tests {
                         m.parent,
                         m.device.0,
                         m.device.1,
-                        m.root.display(),
+                        m.root.as_ref().unwrap().display(),
                         m.point.display(),
                         String::from_utf8_lossy(&m.kind)
                     )
