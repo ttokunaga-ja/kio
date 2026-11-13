@@ -2633,15 +2633,9 @@ fn cl69_check_violation_reaches_the_caller_as_store_constraint_error() {
 fn cl70_device_global_path_and_wal_busy_timeout() {
     let dir = tempfile::tempdir().unwrap();
     let data_home = std::fs::canonicalize(dir.path()).unwrap();
-    // SAFETY (test-only): scoped to this process's short-lived assertion;
-    // no other thread in this binary reads XDG_DATA_HOME concurrently with it.
-    unsafe {
-        std::env::set_var("XDG_DATA_HOME", &data_home);
-    }
+    let _lock = kio_core::test_control::test_env_lock().lock().unwrap();
+    let _home = kio_core::test_control::TestEnvGuard::isolated_home(&data_home);
     let resolved = kio_pipeline::ledger::default_ledger_path().unwrap();
-    unsafe {
-        std::env::remove_var("XDG_DATA_HOME");
-    }
     assert_eq!(resolved, data_home.join("kio/cost-ledger.sqlite"));
 
     let initialized = LedgerDb::initialize(&resolved).unwrap();
@@ -2909,12 +2903,8 @@ fn kio(dir: &TempDir, args: &[&str]) -> Command {
     for name in CHILD_ENV_DENYLIST {
         command.env_remove(name);
     }
-    command
-        .current_dir(dir.path())
-        .env("XDG_CONFIG_HOME", dir.path().join(".test-config"))
-        .env("XDG_DATA_HOME", dir.path().join(".test-data"))
-        .env("XDG_CACHE_HOME", dir.path().join(".test-cache"))
-        .args(args);
+    command.envs(support::home_env(dir.path()));
+    command.current_dir(dir.path()).args(args);
     command
 }
 

@@ -47,6 +47,7 @@ fn kio(dir: &TempDir) -> Command {
     }
     command
         .current_dir(root(dir))
+        .envs(support::home_env(&home))
         .env("HOME", &home)
         .env("USERPROFILE", &home)
         .env("XDG_DATA_HOME", home.join("data"))

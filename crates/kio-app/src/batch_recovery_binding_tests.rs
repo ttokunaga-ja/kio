@@ -642,7 +642,7 @@ fn reconcile_json_and_inventory_debug_do_not_expose_recovery_scope() {
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     let root = canonical_tempdir();
-    let _data = kio_core::test_control::TestEnvGuard::set("XDG_DATA_HOME", root.path());
+    let _home_environment = kio_core::test_control::TestEnvGuard::isolated_home(root.path());
     let ledger = LedgerDb::initialize(root.path().join("device/ledger.sqlite")).unwrap();
     let inventory = kio_adapter::batch_inventory::ProviderInventory {
         provider_scope_id: "kio-batch-recovery:v1:mistral:private-hmac".into(),

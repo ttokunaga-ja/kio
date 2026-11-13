@@ -37,6 +37,7 @@ fn kio(dir: &TempDir, args: &[&str]) -> Command {
     }
     command
         .current_dir(dir.path())
+        .envs(support::home_env(dir.path()))
         .env("HOME", dir.path().join("home"))
         .env("XDG_CONFIG_HOME", dir.path().join("config"))
         .env("XDG_DATA_HOME", dir.path().join("data"))
@@ -61,6 +62,7 @@ fn kio_at(root: &Path, args: &[&str]) -> Command {
     }
     command
         .current_dir(root)
+        .envs(support::home_env(root))
         .env("HOME", root.join("home"))
         .env("XDG_CONFIG_HOME", root.join("config"))
         .env("XDG_DATA_HOME", root.join("data"))
@@ -90,6 +92,7 @@ fn config_flip_after_publication_cannot_activate_manual_only_gc() {
 
     let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("kio"))
         .current_dir(dir.path())
+        .envs(support::home_env(dir.path()))
         .env("HOME", dir.path().join("home"))
         .env("XDG_CONFIG_HOME", dir.path().join("config"))
         .env("XDG_DATA_HOME", dir.path().join("data"))
@@ -161,6 +164,7 @@ fn scope_replacement_after_publication_cannot_redirect_automatic_gc() {
 
     let child = std::process::Command::new(assert_cmd::cargo::cargo_bin("kio"))
         .current_dir(dir.path())
+        .envs(support::home_env(control.path()))
         .env("HOME", control.path().join("home"))
         .env("XDG_CONFIG_HOME", control.path().join("config"))
         .env("XDG_DATA_HOME", control.path().join("data"))
@@ -733,6 +737,7 @@ fn automatic_hook_resumes_marker_exchange_created_after_its_publication() {
     }
     let child = command
         .current_dir(dir.path())
+        .envs(support::home_env(dir.path()))
         .env("HOME", dir.path().join("home"))
         .env("XDG_CONFIG_HOME", dir.path().join("config"))
         .env("XDG_DATA_HOME", dir.path().join("data"))
@@ -1160,4 +1165,16 @@ fn automatic_sweep_receipts_all_eligible_repaired_sharers_before_one_tree_remova
     assert!(receipt_path(&dir, &repaired[1]).is_file());
     assert!(!tree_path(&dir, &shared_tree).exists());
     assert!(!dir.path().join(".kio/gc/in_progress").exists());
+}
+
+#[test]
+fn fixture_state_home_is_explicit_and_private() {
+    let dir = canonical_tempdir();
+    let command = kio(&dir, &[]);
+    let state = command
+        .get_envs()
+        .find(|(name, _)| *name == std::ffi::OsStr::new("XDG_STATE_HOME"))
+        .and_then(|(_, value)| value)
+        .expect("fixture must override inherited XDG_STATE_HOME");
+    assert!(Path::new(state).starts_with(dir.path()));
 }

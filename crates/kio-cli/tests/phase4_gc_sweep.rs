@@ -46,6 +46,7 @@ fn kio(dir: &TempDir, args: &[&str]) -> Command {
     }
     command
         .current_dir(dir.path())
+        .envs(support::home_env(dir.path()))
         .env("HOME", dir.path().join("home"))
         .env("XDG_CONFIG_HOME", dir.path().join("config"))
         .env("XDG_DATA_HOME", dir.path().join("data"))
@@ -71,6 +72,7 @@ fn kio_process(dir: &TempDir, args: &[&str]) -> ProcessCommand {
     }
     command
         .current_dir(dir.path())
+        .envs(support::home_env(dir.path()))
         .env("HOME", dir.path().join("home"))
         .env("XDG_CONFIG_HOME", dir.path().join("config"))
         .env("XDG_DATA_HOME", dir.path().join("data"))
@@ -409,6 +411,7 @@ fn public_scope_replacement_before_bound_lock_never_touches_victim_lock_or_store
         // The diagnostic logger is outside the Kio scope contract. Keep its
         // process-local paths out of the pathname-replacement target so this
         // test proves precisely that victim `.kio` was untouched.
+        .envs(support::home_env(isolated_runtime.path()))
         .env("HOME", isolated_runtime.path().join("home"))
         .env("XDG_CONFIG_HOME", isolated_runtime.path().join("config"))
         .env("XDG_DATA_HOME", isolated_runtime.path().join("data"))

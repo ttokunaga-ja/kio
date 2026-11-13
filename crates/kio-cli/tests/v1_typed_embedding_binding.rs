@@ -14,12 +14,8 @@ fn run(root: &TempDir, args: &[&str]) -> Output {
         command.env("SystemRoot", system_root);
     }
     command
+        .envs(support::home_env(root.path()))
         .current_dir(root.path())
-        .env("HOME", root.path())
-        .env("USERPROFILE", root.path())
-        .env("XDG_DATA_HOME", root.path().join(".test-data"))
-        .env("XDG_CONFIG_HOME", root.path().join(".test-config"))
-        .env("XDG_CACHE_HOME", root.path().join(".test-cache"))
         .env("KIO_TEST_GEMINI_EMBED", "require_idempotency_token")
         .env("KIO_FIXED_NOW", "2026-09-08T00:00:00Z")
         .args(args)

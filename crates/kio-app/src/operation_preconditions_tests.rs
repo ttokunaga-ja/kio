@@ -37,6 +37,7 @@ pub(super) fn isolated(test: &str) -> bool {
     let output = child
         .args(["--exact", test, "--nocapture"])
         .env(CHILD, test)
+        .envs(crate::test_support::home_env(private.path()))
         .env("HOME", private.path().join("home"))
         .env("USERPROFILE", private.path().join("home"))
         .env("XDG_CONFIG_HOME", private.path().join("config"))

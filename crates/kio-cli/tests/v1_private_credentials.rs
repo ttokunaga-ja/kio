@@ -18,6 +18,7 @@ fn command(root: &Path, home: &Path, args: &[&str]) -> Command {
     }
     command
         .current_dir(root)
+        .envs(support::home_env(home))
         .env("HOME", home)
         .env("USERPROFILE", home)
         .env("XDG_DATA_HOME", home.join("data"))

@@ -3385,7 +3385,7 @@ mod tests {
         let existing_before = snapshot(&existing.root_handle());
         assert!(verify_owner_private_handle(&existing.root_handle()).is_err());
         let device = existing_path.join("device");
-        let _data_home = TestEnvGuard::set("XDG_DATA_HOME", &device);
+        let _home_environment = TestEnvGuard::isolated_home(&device);
         assert!(!device.exists());
 
         super::append_event_log("PRIVATE-PARENT-FIRST", "first log append", json!({})).unwrap();

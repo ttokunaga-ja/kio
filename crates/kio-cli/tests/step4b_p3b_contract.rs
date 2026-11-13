@@ -61,11 +61,9 @@ const TEST_ADOPTED_EMBEDDING_ENV: &str = "KIO_TEST_GEMINI_EMBED";
 
 fn kio(dir: &TempDir, args: &[&str]) -> Command {
     let mut command = Command::cargo_bin("kio").unwrap();
+    command.envs(support::home_env(dir.path()));
     command
         .current_dir(dir.path())
-        .env("XDG_CONFIG_HOME", dir.path().join(".test-config"))
-        .env("XDG_DATA_HOME", dir.path().join(".test-data"))
-        .env("XDG_CACHE_HOME", dir.path().join(".test-cache"))
         .env_remove("GEMINI_API_KEY")
         .env_remove("MISTRAL_API_KEY")
         .env_remove("KIO_FIXED_NOW")
@@ -117,6 +115,7 @@ fn success_in(dir: &TempDir, cwd: &std::path::Path, args: &[&str]) -> Value {
     let output = Command::cargo_bin("kio")
         .unwrap()
         .current_dir(cwd)
+        .envs(support::home_env(dir.path()))
         .env("XDG_CONFIG_HOME", dir.path().join(".test-config"))
         .env("XDG_DATA_HOME", dir.path().join(".test-data"))
         .env("XDG_CACHE_HOME", dir.path().join(".test-cache"))
@@ -644,6 +643,7 @@ fn qb14a_index_registers_only_the_requested_root() {
     Command::cargo_bin("kio")
         .unwrap()
         .current_dir(sibling.path())
+        .envs(support::home_env(sibling.path()))
         .env("XDG_CONFIG_HOME", sibling.path().join("xdg/config"))
         .env("XDG_DATA_HOME", sibling.path().join("xdg/data"))
         .env("XDG_CACHE_HOME", sibling.path().join("xdg/cache"))
@@ -679,6 +679,7 @@ fn qb14b_xdg_data_home_fallback_resolves_under_home() {
     Command::cargo_bin("kio")
         .unwrap()
         .current_dir(scope_dir.path())
+        .envs(support::home_env(home.path()))
         .env("HOME", home.path())
         .env_remove("XDG_DATA_HOME")
         .env("XDG_CONFIG_HOME", home.path().join("config"))
@@ -702,6 +703,7 @@ fn qb14b_xdg_data_home_fallback_resolves_under_home() {
         Command::cargo_bin("kio")
             .unwrap()
             .current_dir(scope_dir.path())
+            .envs(support::home_env(home.path()))
             .env("HOME", home.path())
             .env_remove("XDG_DATA_HOME")
             .env("XDG_CONFIG_HOME", home.path().join("config"))
@@ -719,6 +721,7 @@ fn qb14b_xdg_data_home_fallback_resolves_under_home() {
     Command::cargo_bin("kio")
         .unwrap()
         .current_dir(scope_dir.path())
+        .envs(support::home_env(home.path()))
         .env("HOME", home.path())
         .env_remove("XDG_DATA_HOME")
         .env("XDG_CONFIG_HOME", home.path().join("config"))

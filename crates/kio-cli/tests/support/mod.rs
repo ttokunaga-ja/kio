@@ -115,3 +115,18 @@ pub fn immutable_sqlite(path: impl AsRef<std::path::Path>) -> rusqlite::Connecti
     )
     .unwrap()
 }
+
+/// Configure private home directories for a CLI fixture.
+#[allow(dead_code)]
+pub fn home_env(root: &std::path::Path) -> [(&'static str, std::path::PathBuf); 8] {
+    [
+        ("HOME", root.to_path_buf()),
+        ("USERPROFILE", root.to_path_buf()),
+        ("APPDATA", root.join(".test-config")),
+        ("LOCALAPPDATA", root.join(".test-data")),
+        ("XDG_CONFIG_HOME", root.join(".test-config")),
+        ("XDG_DATA_HOME", root.join(".test-data")),
+        ("XDG_STATE_HOME", root.join(".test-state")),
+        ("XDG_CACHE_HOME", root.join(".test-cache")),
+    ]
+}

@@ -3663,6 +3663,7 @@ mod tests {
     fn apply_removes_only_what_the_plan_listed() {
         let _environment = kio_core::test_control::test_env_lock().lock().unwrap();
         let device = tempfile::tempdir().unwrap();
+        let _home_environment = kio_core::test_control::TestEnvGuard::isolated_home(device.path());
         let _data =
             kio_core::test_control::TestEnvGuard::set("XDG_DATA_HOME", device.path().join("data"));
         let _cache = kio_core::test_control::TestEnvGuard::set(

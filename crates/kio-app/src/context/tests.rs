@@ -65,12 +65,8 @@ fn nested_execute_keeps_outer_repository_and_interaction() {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let temp = tempfile::tempdir().unwrap();
     let base = temp.path().canonicalize().unwrap();
-    let _environment = [
-        TestEnvGuard::set("HOME", &base),
-        TestEnvGuard::set("XDG_CONFIG_HOME", base.join("config")),
-        TestEnvGuard::set("XDG_DATA_HOME", base.join("data")),
-        TestEnvGuard::set("XDG_CACHE_HOME", base.join("cache")),
-    ];
+    let _environment = TestEnvGuard::isolated_home(&base);
+    let _data = TestEnvGuard::set("XDG_DATA_HOME", base.join("data"));
     let outer_root = base.join("outer");
     let inner_root = base.join("inner");
     std::fs::create_dir(&outer_root).unwrap();

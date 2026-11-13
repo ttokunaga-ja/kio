@@ -1264,18 +1264,18 @@ mod tests {
     #[test]
     fn owner_control_registry_reads_xdg_at_resolution_time() {
         use kio_core::control::ControlHandle;
-        use kio_core::test_control::{TestEnvGuard, test_env_lock};
+        use kio_core::test_control::test_env_lock;
         let _lock = test_env_lock().lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let outer = dir.path().join("outer");
         let inner = dir.path().join("inner");
         let control = ControlHandle::default();
-        let _first = TestEnvGuard::set("XDG_DATA_HOME", &outer);
+        let _outer_home = kio_core::test_control::TestEnvGuard::isolated_home(&outer);
         assert_eq!(
             default_registry_path_with_control(&control).unwrap(),
             outer.join("kio/scope-registry.sqlite")
         );
-        let _second = TestEnvGuard::set("XDG_DATA_HOME", &inner);
+        let _inner_home = kio_core::test_control::TestEnvGuard::isolated_home(&inner);
         assert_eq!(
             default_registry_path_with_control(&control).unwrap(),
             inner.join("kio/scope-registry.sqlite")

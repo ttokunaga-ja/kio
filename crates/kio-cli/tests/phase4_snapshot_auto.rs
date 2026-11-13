@@ -52,6 +52,7 @@ fn kio(dir: &TempDir, args: &[&str], now: &str) -> Command {
     }
     command
         .current_dir(dir.path())
+        .envs(support::home_env(dir.path()))
         .env("HOME", dir.path().join("home"))
         .env("XDG_CONFIG_HOME", dir.path().join("config"))
         .env("XDG_DATA_HOME", dir.path().join("data"))
@@ -88,6 +89,7 @@ fn kio_process(dir: &TempDir, args: &[&str], now: &str) -> std::process::Command
     }
     command
         .current_dir(dir.path())
+        .envs(support::home_env(dir.path()))
         .env("HOME", dir.path().join("home"))
         .env("XDG_CONFIG_HOME", dir.path().join("config"))
         .env("XDG_DATA_HOME", dir.path().join("data"))

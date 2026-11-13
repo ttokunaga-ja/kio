@@ -14,12 +14,8 @@ fn kio(dir: &TempDir) -> Command {
         command.env("SystemRoot", system_root);
     }
     command
+        .envs(support::home_env(dir.path()))
         .current_dir(dir.path())
-        .env("HOME", dir.path())
-        .env("USERPROFILE", dir.path())
-        .env("XDG_DATA_HOME", dir.path().join(".test-data"))
-        .env("XDG_CONFIG_HOME", dir.path().join(".test-config"))
-        .env("XDG_CACHE_HOME", dir.path().join(".test-cache"))
         .env("KIO_TEST_MARKDOWNIZE_ADAPTER", "deterministic")
         .env("KIO_TEST_GEMINI_EMBED", "mock");
     command

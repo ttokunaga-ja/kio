@@ -39,6 +39,7 @@ fn kio_at(cwd: &Path, xdg: &Path, args: &[&str]) -> Command {
     let mut command = hermetic_kio_command();
     command
         .current_dir(cwd)
+        .envs(support::home_env(xdg))
         .env("XDG_CONFIG_HOME", xdg.join("config"))
         .env("XDG_DATA_HOME", xdg.join("data"))
         .env("XDG_CACHE_HOME", xdg.join("cache"))

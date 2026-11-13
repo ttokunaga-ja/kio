@@ -19,6 +19,7 @@ fn kio(home: &Path) -> Command {
     let mut command = Command::cargo_bin("kio").unwrap();
     command
         .env_remove("KIO_FIXED_NOW")
+        .envs(support::home_env(home))
         .env("HOME", home)
         .env("XDG_DATA_HOME", home.join("data"))
         .env("XDG_CONFIG_HOME", home.join("config"))

@@ -18,11 +18,9 @@ use tempfile::TempDir;
 
 fn kio(dir: &TempDir, args: &[&str]) -> Command {
     let mut command = Command::cargo_bin("kio").unwrap();
+    command.envs(support::home_env(dir.path()));
     command
         .current_dir(dir.path())
-        .env("XDG_CONFIG_HOME", dir.path().join(".test-config"))
-        .env("XDG_DATA_HOME", dir.path().join(".test-data"))
-        .env("XDG_CACHE_HOME", dir.path().join(".test-cache"))
         .env_remove("GEMINI_API_KEY")
         .env_remove("MISTRAL_API_KEY")
         .args(args);

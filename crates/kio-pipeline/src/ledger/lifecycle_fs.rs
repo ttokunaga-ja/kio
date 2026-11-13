@@ -1778,8 +1778,7 @@ mod tests {
         let alias = fixture.path().join("data-alias");
         symlink(&real, &alias).unwrap();
         let alias_before = fs::symlink_metadata(&alias).unwrap();
-        let _xdg =
-            kio_core::test_control::TestEnvGuard::set("XDG_DATA_HOME", alias.to_str().unwrap());
+        let _home_environment = kio_core::test_control::TestEnvGuard::isolated_home(&alias);
         let control = kio_core::control::ControlHandle::default();
         let path = crate::ledger::schema::default_ledger_path_with_control(&control).unwrap();
         assert_eq!(path, alias.join("kio/cost-ledger.sqlite"));
@@ -1850,8 +1849,7 @@ mod tests {
         let alias = fixture.path().join("parent-alias");
         symlink(&real, &alias).unwrap();
         let xdg_base = alias.join("new-data");
-        let _xdg =
-            kio_core::test_control::TestEnvGuard::set("XDG_DATA_HOME", xdg_base.to_str().unwrap());
+        let _home_environment = kio_core::test_control::TestEnvGuard::isolated_home(&xdg_base);
         let control = kio_core::control::ControlHandle::default();
         let path = crate::ledger::schema::default_ledger_path_with_control(&control).unwrap();
         assert_eq!(path, xdg_base.join("kio/cost-ledger.sqlite"));

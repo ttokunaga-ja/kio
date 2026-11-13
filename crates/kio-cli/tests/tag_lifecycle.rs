@@ -21,6 +21,7 @@ fn kio(home: &Path, scope: &Path, args: &[&str]) -> Command {
     }
     command
         .current_dir(scope)
+        .envs(support::home_env(home))
         .env("HOME", home)
         .env("XDG_DATA_HOME", home.join("data"))
         .env("XDG_CONFIG_HOME", home.join("config"))

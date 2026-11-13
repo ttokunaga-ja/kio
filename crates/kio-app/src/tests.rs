@@ -168,11 +168,7 @@ fn index_reconciles_more_than_legacy_child_cap_and_deep_pages_in_one_run() {
     fs::create_dir(&device).unwrap();
     // Keep device-global SQLite and registry state outside the managed
     // root, and restore these process variables under the shared lock.
-    let _home = kio_core::test_control::TestEnvGuard::set("HOME", &device);
-    let _config =
-        kio_core::test_control::TestEnvGuard::set("XDG_CONFIG_HOME", device.join("config"));
-    let _data = kio_core::test_control::TestEnvGuard::set("XDG_DATA_HOME", &device);
-    let _cache = kio_core::test_control::TestEnvGuard::set("XDG_CACHE_HOME", device.join("cache"));
+    let _home_environment = kio_core::test_control::TestEnvGuard::isolated_home(&device);
     let root = base.join("scope");
     fs::create_dir(&root).unwrap();
     match initialize_explicit_root(&root, &kio_core::control::ControlHandle::default()).unwrap() {
@@ -1856,6 +1852,7 @@ fn search_index_status_uses_preflight_month() {
             .args(["--exact", "tests::search_index_status_uses_preflight_month"])
             .env_clear()
             .env("KIO_TEST_BUDGET_MONTH_CHILD", dir.path())
+            .envs(crate::test_support::home_env(dir.path()))
             .env("HOME", dir.path())
             .env("XDG_CONFIG_HOME", dir.path().join("config"))
             .env("XDG_DATA_HOME", dir.path().join("data"))
@@ -4493,11 +4490,7 @@ fn embedding_admission_rechecks_policy_and_exact_network_grant() {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let device = crate::test_support::PrivateTempDir::new();
-    let _config =
-        kio_core::test_control::TestEnvGuard::set("XDG_CONFIG_HOME", device.path().join("config"));
-    let _data = kio_core::test_control::TestEnvGuard::set("XDG_DATA_HOME", device.path());
-    let _cache =
-        kio_core::test_control::TestEnvGuard::set("XDG_CACHE_HOME", device.path().join("cache"));
+    let _home_environment = kio_core::test_control::TestEnvGuard::isolated_home(device.path());
     let root = tempfile::tempdir().unwrap();
     let repo =
         match initialize_explicit_root(root.path(), &kio_core::control::ControlHandle::default())

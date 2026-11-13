@@ -1,3 +1,5 @@
+mod support;
+
 use std::{fs, path::Path, process::Command};
 
 fn run(scope: &Path, device: &Path, args: &[&str]) -> std::process::Output {
@@ -8,6 +10,7 @@ fn run(scope: &Path, device: &Path, args: &[&str]) -> std::process::Output {
             "SystemRoot",
             std::env::var_os("SystemRoot").unwrap_or_default(),
         )
+        .envs(support::home_env(device))
         .env("HOME", device.join("home"))
         .env("USERPROFILE", device.join("home"))
         .env("APPDATA", device.join("config"))

@@ -18,6 +18,7 @@ fn command(dir: &TempDir, args: &[&str]) -> Command {
     let mut command = Command::new(assert_cmd::cargo::cargo_bin("kio"));
     command
         .current_dir(dir.path())
+        .envs(support::home_env(dir.path()))
         .env("XDG_CONFIG_HOME", dir.path().join("config"))
         .env("XDG_DATA_HOME", dir.path().join("data"))
         .env("XDG_CACHE_HOME", dir.path().join("cache"))

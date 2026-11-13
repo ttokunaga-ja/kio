@@ -245,6 +245,21 @@ impl TestEnvGuard {
         Self { name, previous }
     }
 
+    /// Isolate every home-based storage root while the caller holds `test_env_lock`.
+    /// Keep these guards alive until all fixture operations and children finish.
+    pub fn isolated_home(root: &std::path::Path) -> [Self; 8] {
+        [
+            Self::set("HOME", root),
+            Self::set("USERPROFILE", root),
+            Self::set("APPDATA", root.join("config")),
+            Self::set("LOCALAPPDATA", root),
+            Self::set("XDG_CONFIG_HOME", root.join("config")),
+            Self::set("XDG_DATA_HOME", root),
+            Self::set("XDG_STATE_HOME", root.join("state")),
+            Self::set("XDG_CACHE_HOME", root.join("cache")),
+        ]
+    }
+
     pub fn remove(name: &'static str) -> Self {
         let previous = std::env::var_os(name);
         unsafe { std::env::remove_var(name) };
@@ -350,6 +365,33 @@ impl DebugTestControl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn isolated_home_overrides_and_restores_all_storage_variables() {
+        let _lock = test_env_lock().lock().unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let names = [
+            "HOME",
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+            "XDG_CACHE_HOME",
+        ];
+        let before = names.map(std::env::var_os);
+        {
+            let _home = TestEnvGuard::isolated_home(&root);
+            for name in names {
+                let value = std::env::var_os(name).expect(name);
+                assert!(std::path::Path::new(&value).starts_with(&root), "{name}");
+            }
+            assert_eq!(crate::xdg::home_dir(), Some(root.clone()));
+        }
+        assert_eq!(names.map(std::env::var_os), before);
+    }
 
     #[test]
     fn parses_known_finite_and_path_controls() {

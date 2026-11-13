@@ -91,6 +91,7 @@ fn kio(dir: &TempDir, args: &[&str]) -> Command {
         .env("TMPDIR", dir.path().join(".tmp"))
         .env("TEMP", dir.path().join(".tmp"))
         .env("TMP", dir.path().join(".tmp"))
+        .envs(support::home_env(dir.path()))
         .env("XDG_CONFIG_HOME", dir.path().join(".test-config"))
         .env("XDG_DATA_HOME", dir.path().join(".test-data"))
         .env("XDG_CACHE_HOME", dir.path().join(".test-cache"))

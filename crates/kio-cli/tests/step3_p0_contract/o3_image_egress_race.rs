@@ -90,6 +90,7 @@ fn run_reserved_image(change_policy: bool) {
     let bin = assert_cmd::cargo::cargo_bin("kio");
     let mut child = hermetic_process_command(&bin)
         .current_dir(dir.path())
+        .envs(crate::support::home_env(dir.path()))
         .env("XDG_CONFIG_HOME", dir.path().join(".test-config"))
         .env("XDG_DATA_HOME", dir.path().join(".test-data"))
         .env("XDG_CACHE_HOME", dir.path().join(".test-cache"))

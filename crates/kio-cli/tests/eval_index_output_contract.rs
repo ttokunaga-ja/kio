@@ -11,6 +11,7 @@ fn run(root: &Path, device: &Path, args: &[&str]) -> Vec<u8> {
             "SystemRoot",
             std::env::var_os("SystemRoot").unwrap_or_default(),
         )
+        .envs(support::home_env(device))
         .env("HOME", device.join("home"))
         .env("USERPROFILE", device.join("home"))
         .env("APPDATA", device.join("config"))

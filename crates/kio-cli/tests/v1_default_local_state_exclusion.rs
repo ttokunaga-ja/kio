@@ -47,6 +47,7 @@ fn app01_default_home_local_execution_state_is_never_discovered_as_knowledge() {
     for name in ["data", "config", "cache", "runtime", "tmp"] {
         support::create_private_child_dir(&external, name);
     }
+    let _home_environment = TestEnvGuard::isolated_home(&external);
     let _home = TestEnvGuard::set("HOME", &scope);
     let _profile = TestEnvGuard::set("USERPROFILE", &scope);
     let _data = TestEnvGuard::set("XDG_DATA_HOME", external.join("data"));
@@ -70,7 +71,9 @@ fn app01_default_home_local_execution_state_is_never_discovered_as_knowledge() {
         if let Some(value) = std::env::var_os("SystemRoot") {
             cmd.env("SystemRoot", value);
         }
-        cmd.env("HOME", &scope)
+        cmd.envs(support::home_env(&scope))
+            .env_remove("XDG_STATE_HOME")
+            .env("HOME", &scope)
             .env("USERPROFILE", &scope)
             .env("XDG_DATA_HOME", external.join("data"))
             .env("XDG_CONFIG_HOME", external.join("config"))

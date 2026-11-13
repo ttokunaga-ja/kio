@@ -52,6 +52,7 @@ fn hermetic_process_command(bin: &Path) -> ProcessCommand {
 fn assert_command_with_device_home(home: &Path) -> AssertCommand {
     let mut command = hermetic_assert_command();
     command
+        .envs(support::home_env(home))
         .env("HOME", home)
         .env("XDG_DATA_HOME", home.join("data"))
         .env("XDG_CONFIG_HOME", home.join("config"))
@@ -63,6 +64,7 @@ fn assert_command_with_device_home(home: &Path) -> AssertCommand {
 fn process_command_with_device_home(bin: &Path, home: &Path) -> ProcessCommand {
     let mut command = hermetic_process_command(bin);
     command
+        .envs(support::home_env(home))
         .env("HOME", home)
         .env("XDG_DATA_HOME", home.join("data"))
         .env("XDG_CONFIG_HOME", home.join("config"))
@@ -91,6 +93,7 @@ fn kio() -> AssertCommand {
     let mut command = hermetic_assert_command();
     let home = isolated_home();
     command
+        .envs(support::home_env(&home))
         .env("XDG_DATA_HOME", home.join("data"))
         .env("XDG_CONFIG_HOME", home.join("config"))
         .env("XDG_CACHE_HOME", home.join("cache"));
@@ -740,6 +743,7 @@ fn ct_obs_001_002_events_and_errors_jsonl() {
     kio()
         .args(["snapshot", "create", "-m", "event"])
         .env("KIO_FIXED_NOW", "2026-04-29T12:00:00Z")
+        .envs(support::home_env(data.path()))
         .env("XDG_DATA_HOME", data.path())
         .current_dir(temp.path())
         .assert()
@@ -752,6 +756,7 @@ fn ct_obs_001_002_events_and_errors_jsonl() {
     let missing = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
     kio()
         .args(["inspect", missing])
+        .envs(support::home_env(data.path()))
         .env("XDG_DATA_HOME", data.path())
         .current_dir(temp.path())
         .assert()
