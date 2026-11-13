@@ -1027,7 +1027,11 @@ pub(crate) fn contract(code: &'static str, message: impl Into<String>) -> Pipeli
 }
 
 pub(crate) fn core_private(error: kio_core::KioError) -> PipelineError {
-    contract("KIO-E-LEDGER-PRIVATE-001", error.to_string())
+    if let Some(limit) = error.resource_limit() {
+        PipelineError::ResourceLimit(limit.clone())
+    } else {
+        contract("KIO-E-LEDGER-PRIVATE-001", error.to_string())
+    }
 }
 
 pub(crate) fn boundary_changed(message: impl Into<String>) -> PipelineError {
