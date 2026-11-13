@@ -255,6 +255,7 @@ pub(crate) fn run_batch(ctx: &Invocation<'_>, args: BatchArgs) -> Result<Command
                     // `batch resume` is the release for auth_error too, not just
                     // budget/tier_b.
                     if task.status == TaskStatus::Paused
+                        && task.hold_reason != Some(kio_pipeline::task::HoldReason::ResourceLimit)
                         && (resume.override_budget
                             || resume.recheck_budget
                             || task.fallback_reason.as_deref() != Some("budget_exceeded"))
@@ -290,6 +291,14 @@ pub(crate) fn run_batch(ctx: &Invocation<'_>, args: BatchArgs) -> Result<Command
                 resume.offline,
             )?;
             outcome.add(batch_poll_outcome);
+            let persisted_limit = store
+                .all()
+                .map_err(pipeline_to_kio)?
+                .into_iter()
+                .find_map(|task| task.resource_limit);
+            if let Some(limit) = outcome.resource_limit.clone().or(persisted_limit) {
+                return Err(limit.into_error("task is held until resources change"));
+            }
             let completion = batch_completion(&outcome);
             Ok(CommandResponse {
                 body: ResponseBody::Batch(BatchResponse::Resume(BatchResumeResponse {
@@ -330,6 +339,8 @@ pub(crate) fn run_batch(ctx: &Invocation<'_>, args: BatchArgs) -> Result<Command
             // execute_pending_markdownize_tasks selects it. On full success it
             // becomes Done, ending the silent data gap index_status showed as
             // fully enriched.
+            let resources_reenqueued =
+                reenqueue_resource_limited_tasks(&repo, &store, recheck_resource_limit)?;
             let incomplete_reenqueued = if markdown_ready {
                 reenqueue_incomplete_markdownize_tasks(&store)?
             } else {
@@ -382,12 +393,20 @@ pub(crate) fn run_batch(ctx: &Invocation<'_>, args: BatchArgs) -> Result<Command
                 retry_args.offline,
             )?;
             outcome.add(batch_poll_outcome);
+            let persisted_limit = store
+                .all()
+                .map_err(pipeline_to_kio)?
+                .into_iter()
+                .find_map(|task| task.resource_limit);
+            if let Some(limit) = outcome.resource_limit.clone().or(persisted_limit) {
+                return Err(limit.into_error("task is held until resources change"));
+            }
             let completion = batch_completion(&outcome);
             Ok(CommandResponse {
                 body: ResponseBody::Batch(BatchResponse::Retry(BatchRetryResponse {
                     status: "retry scheduled".to_owned(),
                     counts: BatchCounts {
-                        tasks_updated: changed + incomplete_reenqueued,
+                        tasks_updated: changed + incomplete_reenqueued + resources_reenqueued,
                         tasks_executed: outcome.executed,
                         tasks_attempted: outcome.attempted(),
                         tasks_failed: outcome.failed,
@@ -1091,8 +1110,13 @@ fn run_batch_resend_unknown(
             for task in &tasks {
                 if task.task_type == TaskType::Markdownize
                     && task.input_hash == key.input_hash
-                    && task.status == TaskStatus::Failed
-                    && task.fallback_reason.as_deref() == Some(RESULT_UNKNOWN_REASON)
+                    && (task.status == TaskStatus::Failed
+                        && task.fallback_reason.as_deref() == Some(RESULT_UNKNOWN_REASON)
+                        || task.status == TaskStatus::Paused
+                            && task
+                                .resource_limit
+                                .as_ref()
+                                .is_some_and(recheck_resource_limit))
                     && targets_standard_online_markdownize(
                         store.kio_dir(),
                         task,
@@ -1182,6 +1206,7 @@ fn run_batch_resend_unknown(
                 .to_owned(),
             );
             task.hold_reason = None;
+            task.resource_limit = None;
             task.next_retry_at = None;
             task.heartbeat_at = None;
             task.clear_reservation();
@@ -1280,6 +1305,11 @@ fn current_embedding_unknown_group_task_ids(
             }
             if task.status == TaskStatus::Failed
                 && task.fallback_reason.as_deref() == Some(RESULT_UNKNOWN_REASON)
+                || task.status == TaskStatus::Paused
+                    && task
+                        .resource_limit
+                        .as_ref()
+                        .is_some_and(recheck_resource_limit)
             {
                 group_unknown.push(task.task_id.clone());
             }
@@ -1368,16 +1398,19 @@ fn reenqueue_incomplete_markdownize_tasks(store: &TaskStore) -> Result<usize> {
     let online_ref = online_output_ref(&online_markdownize_profile().adapter_id);
     // Collect each Partial task's retry plan first — this needs manifest I/O, so it
     // is done outside the `update_matching` closure.
-    let mut plan_by_id: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut plan_by_id = BTreeMap::new();
     for task in store.all().map_err(pipeline_to_kio)? {
         if !matches!(task.status, TaskStatus::Partial | TaskStatus::Failed)
             || task.task_type != TaskType::Markdownize
-            || task.fallback_reason.as_deref() != Some("online_adapter_done")
+            || !matches!(
+                task.fallback_reason.as_deref(),
+                Some("online_adapter_done" | "resource_limit")
+            )
             || !targets_standard_online_markdownize(store.kio_dir(), &task, &online_ref)
         {
             continue;
         }
-        let plan = partial_retry_plan_from_instance(store, &task)?;
+        let mut plan = partial_retry_plan_from_instance(store, &task)?;
         // Gate 1 (R10-4): no retryable Failed unit -> leave the task incomplete.
         if plan.retryable_units.is_empty() {
             continue;
@@ -1388,23 +1421,50 @@ fn reenqueue_incomplete_markdownize_tasks(store: &TaskStore) -> Result<usize> {
         if plan.max_attempts.is_some_and(|max| task.attempts >= max) {
             continue;
         }
-        plan_by_id.insert(task.task_id.clone(), plan.retryable_units);
+        // A task-level preflight hold has no independent failed-unit partition.
+        if task.resource_limit.is_some() && plan.resource_hold.is_none() {
+            continue;
+        }
+        if let Some((_, limit)) = plan.resource_hold.as_mut() {
+            if let Some(current) = task.resource_limit.as_ref() {
+                *limit = current.clone();
+            }
+            if crate::task_execution::queued_held_markdownize_retry(store, &task)? {
+                for key in task.unit_keys.iter().flatten() {
+                    if !plan.retryable_units.contains(key) {
+                        plan.retryable_units.push(key.clone());
+                    }
+                }
+            }
+        }
+        plan_by_id.insert(task.task_id.clone(), plan);
     }
     if plan_by_id.is_empty() {
         return Ok(0);
     }
     store
         .update_matching(|task| {
-            let Some(retryable) = plan_by_id.get(&task.task_id) else {
+            let Some(plan) = plan_by_id.get(&task.task_id) else {
                 return false;
             };
-            task.status = TaskStatus::Pending;
-            task.unit_keys = Some(retryable.clone());
+            task.status = plan
+                .resource_hold
+                .as_ref()
+                .map_or(TaskStatus::Pending, |(status, _)| *status);
+            task.unit_keys = Some(plan.retryable_units.clone());
             // Preserve the typed normalized-instance reference. The retry precondition
             // needs its complete manifest to recover every provider-discovered unit;
             // replacing this with the online placeholder made OCR-from-scratch partial
             // tasks impossible to resume.
-            task.fallback_reason = None;
+            task.resource_limit = plan.resource_hold.as_ref().map(|(_, limit)| limit.clone());
+            task.fallback_reason = task
+                .resource_limit
+                .as_ref()
+                .map(|_| "resource_limit".to_owned());
+            task.hold_reason = task
+                .resource_limit
+                .as_ref()
+                .map(|_| kio_pipeline::task::HoldReason::ResourceLimit);
             task.next_retry_at = None;
             // R10-4/R19-5: the re-drive is charged against the retry budget in the
             // executor's result handling (a single accounting point) — on `Err` (full
@@ -1418,6 +1478,7 @@ fn reenqueue_incomplete_markdownize_tasks(store: &TaskStore) -> Result<usize> {
 /// The retryable subset of a Partial normalized instance's Failed units plus the
 /// governing retry budget (R10-4). Used by `reenqueue_incomplete_markdownize_tasks`.
 pub(crate) struct PartialRetryPlan {
+    pub(crate) resource_hold: Option<(TaskStatus, kio_core::error::ResourceLimit)>,
     /// Failed unit_keys whose recorded `error_kind` is retryable (docs/04 §5.2).
     pub(crate) retryable_units: Vec<String>,
     /// The smallest finite `max_attempts` among those units' kinds, or `None` when at
@@ -1434,6 +1495,7 @@ pub(crate) fn partial_retry_plan_from_instance(
     task: &TaskDescriptor,
 ) -> Result<PartialRetryPlan> {
     let empty = PartialRetryPlan {
+        resource_hold: None,
         retryable_units: Vec::new(),
         max_attempts: Some(0),
     };
@@ -1493,7 +1555,219 @@ pub(crate) fn partial_retry_plan_from_manifest(
         finite_max
     };
     PartialRetryPlan {
+        resource_hold: manifest
+            .units
+            .iter()
+            .find_map(|unit| unit.resource_limit.clone())
+            .map(|limit| {
+                (
+                    if manifest
+                        .units
+                        .iter()
+                        .any(|unit| unit.status == UnitStatus::Done)
+                    {
+                        TaskStatus::Partial
+                    } else {
+                        TaskStatus::Paused
+                    },
+                    limit,
+                )
+            }),
         retryable_units,
         max_attempts,
     }
+}
+
+/// Recheck a real allocation using the same fallible reservation as the current
+/// memory producer. Budget-based resources keep their hold until their owning
+/// stage supplies a changed budget; a generic retry cannot invent a larger one.
+pub(crate) fn recheck_resource_limit(limit: &kio_core::error::ResourceLimit) -> bool {
+    if limit.resource != kio_core::error::Resource::Memory {
+        return false;
+    }
+    let Some(bytes) = limit.observed.and_then(|n| usize::try_from(n).ok()) else {
+        return false;
+    };
+    Vec::<u8>::new().try_reserve_exact(bytes).is_ok()
+}
+
+pub(crate) fn reenqueue_resource_limited_tasks(
+    repo: &Repository,
+    store: &TaskStore,
+    mut recheck: impl FnMut(&kio_core::error::ResourceLimit) -> bool,
+) -> Result<usize> {
+    let mut plans = BTreeMap::new();
+    for task in store.all().map_err(pipeline_to_kio)? {
+        if task.hold_reason != Some(kio_pipeline::task::HoldReason::ResourceLimit) {
+            continue;
+        }
+        // Validate identity before interpreting any failure as a resource hold.
+        let identity = validate_task_output_ref(store.kio_dir(), &task).map_err(pipeline_to_kio)?;
+        if !resource_task_input_matches(repo, &task)? {
+            continue;
+        }
+        let mut keys = Vec::new();
+        let mut remaining_hold = None;
+        if let TaskOutputRef::NormalizedInstance {
+            raw_hash,
+            tool_profile_hash,
+            r#gen,
+            ..
+        } = identity
+        {
+            let instance = load_validated_normalized_instance_with_control(
+                store.kio_dir(),
+                &raw_hash,
+                &tool_profile_hash,
+                r#gen,
+                store.control(),
+            )
+            .map_err(pipeline_to_kio)?;
+            for entry in &instance.manifest.units {
+                if entry.status != UnitStatus::Failed {
+                    continue;
+                }
+                if let Some(limit) = &entry.resource_limit {
+                    if recheck(limit) {
+                        keys.push(entry.unit_key.clone());
+                    } else if remaining_hold.is_none() {
+                        remaining_hold = Some((
+                            if instance.units.is_empty() {
+                                TaskStatus::Paused
+                            } else {
+                                TaskStatus::Partial
+                            },
+                            limit.clone(),
+                        ));
+                    }
+                }
+            }
+            if !instance
+                .manifest
+                .units
+                .iter()
+                .any(|entry| entry.resource_limit.is_some())
+                && task.resource_limit.as_ref().is_some_and(&mut recheck)
+            {
+                // Resource exhaustion can interrupt a retry before a new accepted
+                // response exists. Preserve its old done units and retry budget.
+                keys = partial_retry_plan_from_manifest(&instance.manifest, task.attempts)
+                    .retryable_units
+                    .into_iter()
+                    .filter(|key| {
+                        task.unit_keys
+                            .as_ref()
+                            .is_none_or(|requested| requested.contains(key))
+                    })
+                    .collect();
+            }
+            if keys.is_empty() {
+                continue;
+            }
+        } else {
+            // A post-send unknown result still needs the separate resend authority.
+            if !task.resource_limit.as_ref().is_some_and(&mut recheck) {
+                continue;
+            }
+            if task.reservation_id.is_some() {
+                // Batch recovery collects the existing job; it must never create
+                // a fresh call merely because the local collect stage was held.
+                let profile = online_markdownize_profile_for(repo)?;
+                let key = crate::ledger_access::task_ledger_key(
+                    &repo.scope_identity()?.scope_id,
+                    "markdownize",
+                    &task.input_hash,
+                    &profile.tool_profile_hash,
+                );
+                let ledger = open_ledger_db(repo.control())?;
+                let recoverable_batch = get_batch_request(&ledger, &key)
+                    .map_err(pipeline_to_kio)?
+                    .is_some_and(|row| {
+                        row.request_kind == kio_pipeline::ledger::RequestKind::Batch
+                            && row.state.is_inflight()
+                            && row.batch_job_id.is_some()
+                    });
+                if !recoverable_batch {
+                    continue;
+                }
+            }
+        }
+        plans.insert(task.task_id.clone(), (keys, remaining_hold));
+    }
+    store
+        .update_matching(|task| {
+            let Some((keys, remaining_hold)) = plans.get(&task.task_id) else {
+                return false;
+            };
+            if let Some((status, limit)) = remaining_hold {
+                task.status = *status;
+                task.resource_limit = Some(limit.clone());
+                task.hold_reason = Some(kio_pipeline::task::HoldReason::ResourceLimit);
+                task.fallback_reason = Some("resource_limit".to_owned());
+                task.next_retry_at = None;
+            } else if !task.resume_after_resource_change(|_| true) {
+                return false;
+            }
+            if !keys.is_empty() {
+                task.unit_keys = Some(keys.clone());
+            }
+            true
+        })
+        .map_err(pipeline_to_kio)
+}
+
+/// Task inputs have different identities: Markdownize owns raw bytes; a text
+/// embedding owns authenticated retained chunk text and its contextual target.
+fn resource_task_input_matches(repo: &Repository, task: &TaskDescriptor) -> Result<bool> {
+    if task.task_type == TaskType::Markdownize {
+        let max = crate::settings::effective_max_input_bytes(repo)?;
+        let input = crate::index::command::read_repository_scan_input(repo, &task.input_path, max)
+            .map_err(pipeline_to_kio)?;
+        return Ok(input.raw_hash == task.input_hash);
+    }
+    let Some(kio_pipeline::task::EmbeddingTaskTarget::Chunk { profile_hash, .. }) =
+        &task.embedding_target
+    else {
+        // Other target kinds require their own verified source, never raw-hash
+        // guesses or an unconditional resource-hold release.
+        return Ok(false);
+    };
+    let Some(entry) = crate::settings::rebuild_embedding_entry_from_tool_lock(repo.kio_dir())?
+    else {
+        return Ok(false);
+    };
+    if entry.profile_hash != *profile_hash || !sqlite_path(repo.kio_dir()).exists() {
+        return Ok(false);
+    }
+    let Some(head) = repo.head_commit_hash()? else {
+        return Ok(false);
+    };
+    let conn = open_existing_source_index_connection(
+        sqlite_path(repo.kio_dir()),
+        ExistingSourceIndexOpenMode::ReadOnly,
+        &FtsSchemaConfig {
+            tokenizer: FtsTokenizer::Trigram,
+        },
+    )
+    .map_err(index_to_kio)?;
+    let instances = retained_history_instances(repo, &head)?;
+    let chunking = snapshot_chunking_config_hash(repo, &head)?;
+    let policy = current_embedding_policy(repo)?;
+    let retained = retained_history_chunks(&conn, repo, &instances, &chunking, Some(&policy))?;
+    let profile = DeclaredEmbeddingProfile {
+        tool_id: entry.tool_id,
+        dimensions: u64::from(entry.dimensions),
+        distance: entry.distance,
+        modality: entry.modality,
+        profile_hash: entry.profile_hash,
+    };
+    let bound = bind_embedding_work(retained, &profile)?;
+    Ok(bound.iter().any(|chunk| {
+        task.output_ref == chunk.work_key.output_ref()
+            && task.input_hash == chunk.text_hash
+            && task.input_path == chunk.raw_path
+            && task.changed_unit_keys == [chunk.chunk_id.clone()]
+            && task.embedding_target.as_ref()
+                == Some(&crate::embedding::plan::chunk_task_target(chunk, &profile))
+    }))
 }

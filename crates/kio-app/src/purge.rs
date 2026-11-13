@@ -2990,6 +2990,8 @@ mod task_retirement_tests {
         let first_embedding = hash_bytes(b"first profile embedding");
         let second_embedding = hash_bytes(b"second profile embedding");
         let task = |id: &str, chunk: &str, embedding: &str| TaskDescriptor {
+            unit_retry_at: Default::default(),
+            resource_limit: None,
             task_id: id.to_owned(),
             task_type: TaskType::Embedding,
             embedding_target: Some(kio_pipeline::task::EmbeddingTaskTarget::Chunk {

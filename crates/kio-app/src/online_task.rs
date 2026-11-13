@@ -22,7 +22,10 @@ pub(crate) fn targets_standard_online_markdownize(
         Ok(TaskOutputRef::NormalizedInstance { .. }) => {
             task.bbox_annotation_enabled.is_some()
                 && (task.unit_keys.is_some()
-                    || task.fallback_reason.as_deref() == Some("online_adapter_done"))
+                    || matches!(
+                        task.fallback_reason.as_deref(),
+                        Some("online_adapter_done" | "resource_limit")
+                    ))
         }
         // An `offline_api` task is deliberately invisible here. Every caller of
         // this predicate drives the ONLINE lane — the network opt-in, the
@@ -47,6 +50,8 @@ mod tests {
 
     fn online_task(bbox_annotation_enabled: Option<bool>) -> TaskDescriptor {
         TaskDescriptor {
+            unit_retry_at: Default::default(),
+            resource_limit: None,
             task_id: "task_current".to_owned(),
             task_type: TaskType::Markdownize,
             embedding_target: None,

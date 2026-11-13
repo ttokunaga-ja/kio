@@ -865,7 +865,10 @@ done/enriched ratio の分子に含めない。対象総数と skipped 数を併
 明示操作は §5.3 の index / reindex / repair / retry とし、選択 tier の増加または不足資源の
 解消を再検査してから保留を解除する。再検査で条件を満たさなければ元の status / hold_reason を保つ。
 通常 resume / watch は資源保留 unit を再投入しない。partial に別種別の failed unit があれば、
-その unit は従来の種別別 retry 判定に従う。resource_limit unit が残る限り settled としない。
+その unit は従来の種別別 retry 判定に従う。別 unit の待機期限は Task の `unit_retry_at`
+（unit_key → 時刻）に保持し、資源保留自体の `next_retry_at=null` と分離する。
+待機期限は再投入対象の unit にだけ適用し、資源保留 unit の自動再投入には使わない。
+resource_limit unit が残る限り settled としない。
 資源保留が全て解消した後は hold_reason を null に戻し、残る unit に通常の done / partial / failed
 規則を適用する。部分応答でも成功 unit と failed unit の対応を検証できなければこの受理規則を使わない。
 
@@ -955,8 +958,10 @@ resource_limit     paused                max_attempts=0 (自動 retry なし)
 ```
 
 `resource_limit` は Task / manifest `units[]` / Adapter `failed_units[]` の閉 enum
-`error_kind` に含める。CLI error は `error_code="KIO-E-RESOURCE-LIMIT-001"`、exit 3、
-context は `resource`（memory|work|unit_text|raw_bytes|member_bytes|aggregate_bytes|storage）、
+`error_kind` に含める。資源不足の共通記述は `resource`、`stage`（不足した処理段階）、
+`limit`、`observed`、`resource_tier` を持ち、該当する Task / manifest unit / failed unit の
+`resource_limit` に保存する。他の失敗種別や done unit には付けない。CLI error は `error_code="KIO-E-RESOURCE-LIMIT-001"`、exit 3、
+context は `stage` と `resource`（memory|work|unit_text|raw_bytes|member_bytes|aggregate_bytes|storage）、
 `limit`（bytes / work 上限、OS 容量を確定できなければ null）、`observed`（超過予定値、
 不明なら null）、`resource_tier`（standard|large、tier 非適用なら null）を持つ。
 `retry_disposition="explicit_after_resource_change"` とし、自動 retry / backoff を予約せず

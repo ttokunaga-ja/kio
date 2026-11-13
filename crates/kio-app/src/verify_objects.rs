@@ -2859,6 +2859,7 @@ mod tests {
             parent_gen: None,
             run_id: "test-run".to_owned(),
             units: vec![NormalizedUnitManifestEntry {
+                resource_limit: None,
                 order: 0,
                 unit_key: unit.unit_key.clone(),
                 unit_ref: kio_pipeline::prepare::unit_ref(&unit.unit_key),

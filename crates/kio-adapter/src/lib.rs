@@ -33,6 +33,8 @@ pub type Result<T> = std::result::Result<T, AdapterError>;
 
 #[derive(Debug, Error)]
 pub enum AdapterError {
+    #[error("resource limit: {0:?}")]
+    ResourceLimit(kio_core::error::ResourceLimit),
     #[error("adapter contract violation: {0}")]
     ContractViolation(String),
     #[error("adapter auth error: {0}")]
@@ -114,6 +116,7 @@ impl AdapterError {
     #[must_use]
     pub fn error_code(&self) -> &'static str {
         match self {
+            Self::ResourceLimit(_) => "KIO-E-RESOURCE-LIMIT-001",
             Self::Auth(_) => "KIO-E-BATCH-AUTH-001",
             Self::RuntimeConfiguration { .. } => "KIO-E-BATCH-INPUT-001",
             Self::LocalPeerAuth(_) => "KIO-E-LOCAL-PEER-AUTH-001",
@@ -137,6 +140,7 @@ impl AdapterError {
     pub fn error_category(&self) -> crate::types::ErrorCategory {
         use crate::types::ErrorCategory;
         match self {
+            Self::ResourceLimit(_) => ErrorCategory::Permanent,
             Self::RateLimit { .. } => ErrorCategory::RateLimit,
             // Non-retryable in 04 §5.3's table (auth_error has max_attempts=0).
             Self::Auth(_) | Self::RuntimeConfiguration { .. } => ErrorCategory::Permanent,
@@ -172,6 +176,10 @@ impl AdapterError {
     #[must_use]
     pub fn as_adapter_run(&self, task_id: impl Into<String>) -> crate::types::AdapterRun {
         crate::types::AdapterRun {
+            resource_limit: match self {
+                Self::ResourceLimit(limit) => Some(limit.clone()),
+                _ => None,
+            },
             task_id: task_id.into(),
             input_hashes: Vec::new(),
             output_hashes: Vec::new(),
@@ -191,6 +199,25 @@ pub use traits::{EmbeddingAdapter, MarkdownizeAdapter, PrepareAdapter};
 mod adapter_error_tests {
     use super::*;
     use crate::types::{AdapterRunStatus, ErrorCategory};
+
+    #[test]
+    fn resource_limit_adapter_run_keeps_the_common_descriptor() {
+        let limit = kio_core::error::ResourceLimit {
+            resource: kio_core::error::Resource::Work,
+            stage: "extract".to_owned(),
+            limit: Some(10),
+            observed: Some(11),
+            resource_tier: Some(kio_core::error::ResourceTier::Standard),
+        };
+        let error = AdapterError::ResourceLimit(limit.clone());
+        assert_eq!(error.error_code(), "KIO-E-RESOURCE-LIMIT-001");
+        assert!(error.retry_after_ms().is_none());
+        let run = error.as_adapter_run("task");
+        assert_eq!(run.resource_limit, Some(limit));
+        let roundtrip: crate::types::AdapterRun =
+            serde_json::from_value(serde_json::to_value(&run).unwrap()).unwrap();
+        assert_eq!(roundtrip, run);
+    }
 
     /// QA16: every variant's `error_code`/`error_category` pairing matches the
     /// 07 §4 L287 contract (`error_category` is the coarse rollup of the fine

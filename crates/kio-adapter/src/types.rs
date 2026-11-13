@@ -154,6 +154,8 @@ impl AdapterUsage {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AdapterRun {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_limit: Option<kio_core::error::ResourceLimit>,
     pub task_id: String,
     pub input_hashes: Vec<String>,
     pub output_hashes: Vec<String>,
@@ -304,6 +306,8 @@ pub struct MarkdownizeRequest {
 /// dependency on `kio-pipeline`, so the membership check lives there).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FailedUnit {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_limit: Option<kio_core::error::ResourceLimit>,
     pub unit_key: String,
     pub error_kind: String,
 }

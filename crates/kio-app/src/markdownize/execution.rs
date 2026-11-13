@@ -86,6 +86,8 @@ use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub(crate) struct OnlineExecutionOutcome {
+    pub(crate) resource_limit: Option<kio_core::error::ResourceLimit>,
+    pub(crate) consume_attempt: bool,
     pub(crate) output_ref: String,
     pub(crate) status: TaskStatus,
     // R13-1: normalization-run provenance (docs/04:474-479) so the caller records
@@ -110,6 +112,8 @@ impl OnlineExecutionOutcome {
     /// provenance.
     fn full(output_ref: String, status: TaskStatus) -> Self {
         Self {
+            resource_limit: None,
+            consume_attempt: false,
             output_ref,
             status,
             mode: MarkdownizeMode::Full,
@@ -118,6 +122,57 @@ impl OnlineExecutionOutcome {
             changed_unit_keys: Vec::new(),
             usage: None,
         }
+    }
+
+    pub(crate) fn apply_to_task(&self, task: &mut TaskDescriptor) {
+        if let Some(keys) = &task.unit_keys {
+            for key in keys {
+                task.unit_retry_at.remove(key);
+            }
+        } else {
+            task.unit_retry_at.clear();
+        }
+        if self.status == TaskStatus::Done {
+            task.unit_retry_at.clear();
+        }
+        task.unit_keys = None;
+        task.status = self.status;
+        task.output_ref = self.output_ref.clone();
+        task.resource_limit = self.resource_limit.clone();
+        task.hold_reason = self
+            .resource_limit
+            .as_ref()
+            .map(|_| kio_pipeline::task::HoldReason::ResourceLimit);
+        task.fallback_reason = Some(
+            if self.resource_limit.is_some() {
+                "resource_limit"
+            } else {
+                "online_adapter_done"
+            }
+            .to_owned(),
+        );
+        task.next_retry_at = None;
+        if self.consume_attempt {
+            task.attempts = task.attempts.saturating_add(1);
+        }
+    }
+
+    fn with_manifest(
+        mut self,
+        manifest: &NormalizedInstanceManifest,
+        response: &kio_adapter::types::MarkdownizeResponse,
+    ) -> Self {
+        self.resource_limit = manifest.units.iter().find_map(|u| u.resource_limit.clone());
+        if self.resource_limit.is_some()
+            && !manifest.units.iter().any(|u| u.status == UnitStatus::Done)
+        {
+            self.status = TaskStatus::Paused;
+        }
+        self.consume_attempt = response
+            .failed_units
+            .iter()
+            .any(|u| u.error_kind != "resource_limit");
+        self
     }
 
     /// QA17: attach the adapter-reported `usage` this send actually billed.
@@ -129,6 +184,7 @@ impl OnlineExecutionOutcome {
 
 #[derive(Debug, Clone)]
 pub(crate) struct TaskExecutionFailure {
+    pub(crate) resource_limit: Option<kio_core::error::ResourceLimit>,
     pub(crate) retry_kind: RetryErrorKind,
     // QA3 (step4b-contract-tests-p3a.md §A, 04 §5.3): the provider's
     // `Retry-After` in milliseconds, carried from `AdapterError::RateLimit`
@@ -171,6 +227,7 @@ pub(crate) fn prorated_markdownize_cost(
 /// same conditions as defense in depth; this is the loop's pre-charge gate.
 /// R21-3: outcome of the send-time online-markdownize precondition check.
 pub(crate) enum OnlineMarkdownizePrecondition {
+    ResourceLimit(kio_core::error::ResourceLimit),
     /// Consumed source policy is unavailable; preserve task and billing authority.
     PolicyUnavailable(KioError),
     /// File present, unchanged, within the input cap, non-text-native, with locally
@@ -250,8 +307,12 @@ pub(crate) fn classify_online_markdownize_precondition(
         Ok(limit) => limit,
         Err(error) => return OnlineMarkdownizePrecondition::PolicyUnavailable(error),
     };
-    let Ok(verified) = read_repository_scan_input(repo, &task.input_path, max_input_bytes) else {
-        return OnlineMarkdownizePrecondition::Retire;
+    let verified = match read_repository_scan_input(repo, &task.input_path, max_input_bytes) {
+        Ok(input) => input,
+        Err(kio_pipeline::PipelineError::ResourceLimit(limit)) => {
+            return OnlineMarkdownizePrecondition::ResourceLimit(limit);
+        }
+        Err(_) => return OnlineMarkdownizePrecondition::Retire,
     };
     if verified.raw_hash != task.input_hash {
         return OnlineMarkdownizePrecondition::Retire;
@@ -277,6 +338,9 @@ pub(crate) fn classify_online_markdownize_precondition(
         repo.control(),
     ) {
         Ok(prepare) => prepare,
+        Err(kio_pipeline::PipelineError::ResourceLimit(limit)) => {
+            return OnlineMarkdownizePrecondition::ResourceLimit(limit);
+        }
         Err(error) => {
             // 07 §5.1: a runtime Office conversion failure discovered while
             // re-preparing this task's precondition (the SAME converter
@@ -382,10 +446,14 @@ pub(crate) fn execute_pending_offline_markdownize_tasks(
     for task in store.all().map_err(pipeline_to_kio)? {
         if task.task_type != TaskType::Markdownize
             || !(matches!(task.status, TaskStatus::Pending | TaskStatus::Running)
+                || crate::task_execution::queued_held_markdownize_retry(store, &task)?
                 || (allow_auth_revive
                     && task.status == TaskStatus::Paused
                     && task.hold_reason == Some(kio_pipeline::task::HoldReason::Auth)))
-            || task.output_ref != output_ref
+            || !(task.output_ref == output_ref
+                || (task.unit_keys.is_some()
+                    && task.bbox_annotation_enabled.is_none()
+                    && matches!(validate_task_output_ref(store.kio_dir(), &task), Ok(TaskOutputRef::NormalizedInstance { ref tool_profile_hash, .. }) if *tool_profile_hash == profile.tool_profile_hash)))
             || task.reservation_id.is_some()
         {
             continue;
@@ -395,6 +463,15 @@ pub(crate) fn execute_pending_offline_markdownize_tasks(
         // input cap since enqueue. Persisting v2 bytes under v1's raw_hash
         // would break content-addressing identically on either route.
         let prepared_input = match classify_online_markdownize_precondition(repo, &task) {
+            OnlineMarkdownizePrecondition::ResourceLimit(limit) => {
+                crate::task_execution::hold_resource_task(
+                    store,
+                    &task.task_id,
+                    Some(limit.clone()),
+                )?;
+                counts.resource_limit = Some(limit);
+                continue;
+            }
             OnlineMarkdownizePrecondition::Send(prepared_input) => prepared_input,
             OnlineMarkdownizePrecondition::PolicyUnavailable(error) => return Err(error),
             OnlineMarkdownizePrecondition::Retire => {
@@ -461,7 +538,11 @@ pub(crate) fn execute_pending_offline_markdownize_tasks(
                     .ok_or_else(|| KioError::schema("invalid local OCR retry time"))
             })
             .transpose()?;
-        let mut claim = match local.claim(&identity, task.attempts, retry_at, 5, now_ms)? {
+        let mut claim = match local
+            .claim(&identity, task.attempts, retry_at, 5, now_ms)
+            .map_err(|error| {
+                crate::task_execution::persist_resource_error(store, &[&task], error)
+            })? {
             LocalClaim::Busy => {
                 counts.inflight += 1;
                 continue;
@@ -489,21 +570,22 @@ pub(crate) fn execute_pending_offline_markdownize_tasks(
         };
         // The intent is durable before adapter construction. A restarted Running
         // task must reclaim this same identity rather than reset its retry budget.
-        store
-            .update_matching(|candidate| {
-                if candidate.task_id != task.task_id {
-                    return false;
-                }
-                candidate.status = TaskStatus::Running;
-                candidate.hold_reason = None;
-                candidate.fallback_reason = None;
-                candidate.next_retry_at = None;
-                candidate.attempts = claim.attempts();
-                candidate.heartbeat_at = Some(now.clone());
-                true
-            })
-            .map_err(pipeline_to_kio)?;
-        let response = if let Some(bytes) = claim.result()? {
+        crate::task_execution::update_tasks_preserving_resource_holds(store, |candidate| {
+            if candidate.task_id != task.task_id {
+                return false;
+            }
+            candidate.status = TaskStatus::Running;
+            candidate.hold_reason = None;
+            candidate.fallback_reason = None;
+            candidate.next_retry_at = None;
+            candidate.attempts = claim.attempts();
+            candidate.heartbeat_at = Some(now.clone());
+            true
+        })
+        .map_err(pipeline_to_kio)?;
+        let response = if let Some(bytes) = claim.result().map_err(|error| {
+            crate::task_execution::persist_resource_error(store, &[&task], error)
+        })? {
             let response: kio_adapter::types::MarkdownizeResponse = serde_json::from_slice(&bytes)
                 .map_err(|_| KioError::schema("invalid durable local OCR result"))?;
             if serde_json::to_vec(&response)
@@ -548,7 +630,13 @@ pub(crate) fn execute_pending_offline_markdownize_tasks(
             Err(failure) => {
                 // A durable accepted result becoming invalid is corruption; do
                 // not overwrite it with a retry record or send the input again.
-                if claim.result()?.is_some() {
+                if claim
+                    .result()
+                    .map_err(|error| {
+                        crate::task_execution::persist_resource_error(store, &[&task], error)
+                    })?
+                    .is_some()
+                {
                     return Err(KioError::schema(
                         "durable local OCR result failed acceptance",
                     ));
@@ -559,18 +647,26 @@ pub(crate) fn execute_pending_offline_markdownize_tasks(
                 continue;
             }
         };
-        if claim.result()?.is_none() {
+        if claim
+            .result()
+            .map_err(|error| crate::task_execution::persist_resource_error(store, &[&task], error))?
+            .is_none()
+        {
             let bytes = serde_json::to_vec(&response)
                 .map_err(|_| KioError::schema("cannot encode local OCR result"))?;
             claim.stage_result(&bytes)?;
         }
+        let retry_keys = task
+            .unit_keys
+            .as_ref()
+            .map(|keys| keys.iter().cloned().collect());
         let outcome = materialize_online_markdownize_response(
             repo,
             &task,
             prepared_input.prepared_units,
             &prepared_input.media_type,
             &prepared_input.bytes,
-            None,
+            retry_keys.as_ref(),
             profile.tool_profile_hash.clone(),
             response,
             &effective_hints,
@@ -594,24 +690,30 @@ pub(crate) fn execute_pending_offline_markdownize_tasks(
                 },
             },
         );
-        store
-            .update_matching(|candidate| {
-                if candidate.task_id != task.task_id {
-                    return false;
-                }
-                candidate.status = outcome.status;
-                candidate.output_ref = outcome.output_ref.clone();
+        crate::task_execution::update_tasks_preserving_resource_holds(store, |candidate| {
+            if candidate.task_id != task.task_id {
+                return false;
+            }
+            outcome.apply_to_task(candidate);
+            if outcome.resource_limit.is_none() {
                 candidate.fallback_reason = Some("local_adapter_done".to_owned());
-                candidate.heartbeat_at = None;
-                candidate.next_retry_at = None;
-                candidate.hold_reason = None;
-                candidate.mode = Some(outcome.mode);
-                candidate.changed_unit_keys = outcome.changed_unit_keys.clone();
-                candidate.attempts = claim.attempts();
-                true
-            })
-            .map_err(pipeline_to_kio)?;
+            }
+            candidate.heartbeat_at = None;
+            candidate.next_retry_at = None;
+            candidate.mode = Some(outcome.mode);
+            candidate.changed_unit_keys = outcome.changed_unit_keys.clone();
+            candidate.attempts = if outcome.resource_limit.is_some() && !outcome.consume_attempt {
+                task.attempts
+            } else {
+                claim.attempts()
+            };
+            true
+        })
+        .map_err(pipeline_to_kio)?;
         claim.publish()?;
+        if outcome.resource_limit.is_some() {
+            claim.retire()?;
+        }
         counts.add(known_markdownize_completion(store, &task.task_id)?);
     }
     Ok(counts)
@@ -626,29 +728,41 @@ fn mirror_local_ocr_wait(
     kind: Option<RetryErrorKind>,
     terminal: bool,
 ) -> Result<()> {
-    store
-        .update_matching(|task| {
-            if task.task_id != task_id {
-                return false;
-            }
-            task.attempts = attempts;
-            task.heartbeat_at = None;
-            if let Some(kind) = kind {
-                task.fallback_reason = Some(retry_reason(kind).to_owned());
-                task.hold_reason = hold_reason_for_reason(retry_reason(kind));
-            }
-            task.status = if task.hold_reason.is_some() {
-                TaskStatus::Paused
-            } else if terminal {
-                TaskStatus::Failed
-            } else {
-                TaskStatus::Pending
-            };
-            task.next_retry_at = next_retry_at
-                .map(|time| kio_core::scope::format_utc_seconds(time.div_euclid(1000)));
-            true
-        })
-        .map_err(pipeline_to_kio)?;
+    let resource_status = if kind == Some(RetryErrorKind::ResourceLimit) {
+        let task = store
+            .all()
+            .map_err(pipeline_to_kio)?
+            .into_iter()
+            .find(|task| task.task_id == task_id)
+            .ok_or_else(|| KioError::schema("resource-held local OCR task disappeared"))?;
+        Some(crate::task_execution::resource_hold_status(store, &task)?)
+    } else {
+        None
+    };
+    crate::task_execution::update_tasks_preserving_resource_holds(store, |task| {
+        if task.task_id != task_id {
+            return false;
+        }
+        task.attempts = attempts;
+        task.heartbeat_at = None;
+        if let Some(kind) = kind {
+            task.fallback_reason = Some(retry_reason(kind).to_owned());
+            task.hold_reason = hold_reason_for_reason(retry_reason(kind));
+        }
+        task.status = if let Some(status) = resource_status {
+            status
+        } else if task.hold_reason.is_some() {
+            TaskStatus::Paused
+        } else if terminal {
+            TaskStatus::Failed
+        } else {
+            TaskStatus::Pending
+        };
+        task.next_retry_at =
+            next_retry_at.map(|time| kio_core::scope::format_utc_seconds(time.div_euclid(1000)));
+        true
+    })
+    .map_err(pipeline_to_kio)?;
     Ok(())
 }
 
@@ -661,7 +775,10 @@ fn fail_local_ocr_claim(
 ) -> Result<ExecOutcome> {
     let kind = failure.retry_kind;
     let policy = kio_pipeline::task::retry_policy(kind);
-    let consume = kind != RetryErrorKind::RateLimit;
+    let consume = !matches!(
+        kind,
+        RetryErrorKind::RateLimit | RetryErrorKind::ResourceLimit
+    );
     let attempts = claim.attempts().saturating_sub(u32::from(!consume));
     let terminal = !policy.retryable || policy.max_attempts.is_some_and(|max| attempts >= max);
     let retry_at = if terminal || policy.paused {
@@ -678,7 +795,15 @@ fn fail_local_ocr_claim(
                 .saturating_mul(1000),
         )
     };
-    claim.fail(kind, retry_at, consume, terminal)?;
+    claim.fail(
+        kind,
+        retry_at,
+        consume,
+        terminal && kind != RetryErrorKind::ResourceLimit,
+    )?;
+    if let Some(limit) = failure.resource_limit.clone() {
+        crate::task_execution::hold_resource_task(store, &task.task_id, Some(limit))?;
+    }
     mirror_local_ocr_wait(
         store,
         &task.task_id,
@@ -688,6 +813,7 @@ fn fail_local_ocr_claim(
         terminal,
     )?;
     Ok(ExecOutcome {
+        resource_limit: failure.resource_limit,
         failed: 1,
         auth_failed: usize::from(kind == RetryErrorKind::AuthError),
         failed_retryable: usize::from(!terminal && !policy.paused),
@@ -701,7 +827,17 @@ fn validate_local_ocr_result(
     prepared: &PreparedOnlineMarkdownizeInput,
     response: &kio_adapter::types::MarkdownizeResponse,
 ) -> std::result::Result<Vec<PreparedUnitHint>, TaskExecutionFailure> {
-    let hints = prepared_unit_hints(&prepared.prepared_units);
+    let requested = prepared
+        .prepared_units
+        .iter()
+        .filter(|u| {
+            task.unit_keys
+                .as_ref()
+                .is_none_or(|keys| keys.contains(&u.unit_key))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let hints = prepared_unit_hints(&requested);
     let effective = effective_prepared_unit_hints(&hints, &task.input_hash, response)
         .map_err(task_failure_from_adapter)?;
     let units = if prepared.prepared_units.is_empty() {
@@ -713,17 +849,19 @@ fn validate_local_ocr_result(
             &builtin_prepare_profile().tool_profile_hash,
         )
         .map_err(|_| TaskExecutionFailure {
+            resource_limit: None,
             retry_kind: RetryErrorKind::ContractViolation,
             retry_after_ms: None,
         })?
     } else {
-        prepared.prepared_units.clone()
+        requested
     };
     if !matches!(
         validate_markdownize_response(response, &all_changed_hints(&units), &units),
         Ok(kio_pipeline::markdownize::MarkdownizeAcceptance::Accepted)
     ) {
         return Err(TaskExecutionFailure {
+            resource_limit: None,
             retry_kind: RetryErrorKind::ContractViolation,
             retry_after_ms: None,
         });
@@ -808,7 +946,16 @@ fn request_offline_markdownize_task(
     .map_err(|error| {
         LocalOcrRequestFailure::Admission(crate::object_persistence::adapter_to_kio(error))
     })?;
-    let hints = prepared_unit_hints(prepared_units);
+    let requested = prepared_units
+        .iter()
+        .filter(|u| {
+            task.unit_keys
+                .as_ref()
+                .is_none_or(|keys| keys.contains(&u.unit_key))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let hints = prepared_unit_hints(&requested);
     let response = adapter
         .markdownize(MarkdownizeRequest {
             raw: RawInput {
@@ -820,7 +967,7 @@ fn request_offline_markdownize_task(
             mode: AdapterMarkdownizeMode::Full,
             previous: None,
             hints: None,
-            restrict_to_hint_pages: false,
+            restrict_to_hint_pages: task.unit_keys.is_some(),
             // 07 §5.2's bbox_annotation is Mistral's prompt-and-charge feature;
             // the local adapter refuses the flag rather than pretending.
             bbox_annotation_enabled: false,
@@ -865,6 +1012,7 @@ pub(crate) fn execute_online_markdownize_task(
     // CURRENT content itself no longer matches the task, so there is nothing to send.
     if !repository_scan_policy_allows_file(repo, &task.input_path).unwrap_or(false) {
         return Err(TaskExecutionFailure {
+            resource_limit: None,
             retry_kind: RetryErrorKind::InvalidInput,
             retry_after_ms: None,
         });
@@ -875,6 +1023,7 @@ pub(crate) fn execute_online_markdownize_task(
     // billed send.
     if is_text_native_media(&media_type) {
         return Err(TaskExecutionFailure {
+            resource_limit: None,
             retry_kind: RetryErrorKind::InvalidInput,
             retry_after_ms: None,
         });
@@ -884,6 +1033,7 @@ pub(crate) fn execute_online_markdownize_task(
     // poisoned tasks.jsonl). Fail fast as a non-retryable input error, never a billed send.
     if is_local_passthrough_text(&media_type, &prepared_units) {
         return Err(TaskExecutionFailure {
+            resource_limit: None,
             retry_kind: RetryErrorKind::InvalidInput,
             retry_after_ms: None,
         });
@@ -892,6 +1042,7 @@ pub(crate) fn execute_online_markdownize_task(
         .scope_identity()
         .map(|identity| identity.scope_id)
         .map_err(|_| TaskExecutionFailure {
+            resource_limit: None,
             retry_kind: RetryErrorKind::InvalidInput,
             retry_after_ms: None,
         })?;
@@ -1010,6 +1161,7 @@ pub(crate) fn materialize_online_markdownize_response(
     if prepared_units.is_empty() {
         if retry_units.is_some() {
             return Err(TaskExecutionFailure {
+                resource_limit: None,
                 retry_kind: RetryErrorKind::ContractViolation,
                 retry_after_ms: None,
             });
@@ -1022,6 +1174,7 @@ pub(crate) fn materialize_online_markdownize_response(
             &builtin_prepare_profile().tool_profile_hash,
         )
         .map_err(|_| TaskExecutionFailure {
+            resource_limit: None,
             retry_kind: RetryErrorKind::ContractViolation,
             retry_after_ms: None,
         })?;
@@ -1035,6 +1188,7 @@ pub(crate) fn materialize_online_markdownize_response(
             bytes,
         )
         .map_err(|_| TaskExecutionFailure {
+            resource_limit: None,
             retry_kind: persist_failure_retry_kind(),
             retry_after_ms: None,
         })?;
@@ -1063,6 +1217,7 @@ pub(crate) fn materialize_online_markdownize_response(
     );
     if !strict_valid {
         return Err(TaskExecutionFailure {
+            resource_limit: None,
             retry_kind: RetryErrorKind::ContractViolation,
             retry_after_ms: None,
         });
@@ -1073,14 +1228,20 @@ pub(crate) fn materialize_online_markdownize_response(
     // gen 0). Regenerating a done unit under Markdown non-determinism would churn its
     // fingerprint → needless re-embedding + Evidence churn (docs/04 §5.2).
     let previous = if retry_units.is_some() {
-        load_previous_instance_identity(
-            repo.kio_dir(),
-            &task.input_hash,
-            &profile_tool_hash,
-            0,
-            repo.control(),
+        Some(
+            load_previous_instance_identity(
+                repo.kio_dir(),
+                &task.input_hash,
+                &profile_tool_hash,
+                0,
+                repo.control(),
+            )
+            .map_err(|_| TaskExecutionFailure {
+                resource_limit: None,
+                retry_kind: RetryErrorKind::ContractViolation,
+                retry_after_ms: None,
+            })?,
         )
-        .ok()
     } else {
         None
     };
@@ -1131,7 +1292,7 @@ pub(crate) fn materialize_online_markdownize_response(
     let status = task_status_from_unit_counts(done, failed, false);
     let run_id = format!("run_{}", new_ulid(repo.canonical_root()));
     let failed_kinds = merged_failed_unit_retry_kinds(&response, previous.as_ref(), retry_units);
-    let manifest = manifest_from_units_with_failed_kinds(
+    let mut manifest = manifest_from_units_with_failed_kinds(
         &prepared_units,
         &units,
         &task.input_hash,
@@ -1143,16 +1304,15 @@ pub(crate) fn materialize_online_markdownize_response(
         &failed_kinds,
         RetryErrorKind::NetworkError,
     );
+    attach_resource_limits(&mut manifest, &response, previous.as_ref());
     let _stamped_manifest =
         persist_normalized_instance_with_control(repo.kio_dir(), &manifest, &units, repo.control())
-            .map_err(|_| TaskExecutionFailure {
-                retry_kind: persist_failure_retry_kind(),
-                retry_after_ms: None,
-            })?;
+            .map_err(task_failure_from_pipeline)?;
     Ok(OnlineExecutionOutcome::full(
         normalized_output_ref(repo, &task.input_hash, &profile_tool_hash, 0),
         status,
     )
+    .with_manifest(&manifest, &response)
     .with_usage(usage))
 }
 
@@ -1180,6 +1340,7 @@ fn try_online_incremental_markdownize(
     idempotency_token: Option<String>,
 ) -> std::result::Result<Option<OnlineExecutionOutcome>, TaskExecutionFailure> {
     let invalid = || TaskExecutionFailure {
+        resource_limit: None,
         retry_kind: RetryErrorKind::InvalidInput,
         retry_after_ms: None,
     };
@@ -1315,6 +1476,7 @@ fn try_online_incremental_markdownize(
         // an implicit Full re-send.
         if response.fallback_to_full {
             return Err(TaskExecutionFailure {
+                resource_limit: None,
                 retry_kind: RetryErrorKind::ContractViolation,
                 retry_after_ms: None,
             });
@@ -1343,6 +1505,7 @@ fn try_online_incremental_markdownize(
             return Ok(None);
         }
         return Err(TaskExecutionFailure {
+            resource_limit: None,
             retry_kind: RetryErrorKind::ContractViolation,
             retry_after_ms: None,
         });
@@ -1370,7 +1533,7 @@ fn try_online_incremental_markdownize(
     };
     let run_id = format!("run_{}", new_ulid(repo.canonical_root()));
     let failed_kinds = failed_unit_retry_kinds(&response);
-    let manifest = manifest_from_units_with_failed_kinds(
+    let mut manifest = manifest_from_units_with_failed_kinds(
         prepared_units,
         &units,
         &task.input_hash,
@@ -1382,6 +1545,7 @@ fn try_online_incremental_markdownize(
         &failed_kinds,
         RetryErrorKind::NetworkError,
     );
+    attach_resource_limits(&mut manifest, &response, Some(&previous));
     if let Err(_error) =
         persist_normalized_instance_with_control(repo.kio_dir(), &manifest, &units, repo.control())
     {
@@ -1389,6 +1553,7 @@ fn try_online_incremental_markdownize(
             return Ok(None);
         }
         return Err(TaskExecutionFailure {
+            resource_limit: None,
             retry_kind: persist_failure_retry_kind(),
             retry_after_ms: None,
         });
@@ -1398,17 +1563,23 @@ fn try_online_incremental_markdownize(
         prepared_units.len().saturating_sub(units.len()),
         false,
     );
-    Ok(Some(OnlineExecutionOutcome {
-        output_ref: normalized_output_ref(repo, &task.input_hash, &profile_tool_hash, 0),
-        status,
-        mode: MarkdownizeMode::Incremental,
-        previous_raw_hash: Some(previous.manifest.raw_hash.clone()),
-        parent_run_id: Some(previous.manifest.run_id.clone()),
-        changed_unit_keys: incremental_hints.changed_unit_keys.clone(),
-        // QA17: the real send's self-reported usage (`None` for the 0-change
-        // branch above, which never called the adapter).
-        usage: response.usage.clone(),
-    }))
+    Ok(Some(
+        OnlineExecutionOutcome {
+            resource_limit: None,
+            consume_attempt: false,
+
+            output_ref: normalized_output_ref(repo, &task.input_hash, &profile_tool_hash, 0),
+            status,
+            mode: MarkdownizeMode::Incremental,
+            previous_raw_hash: Some(previous.manifest.raw_hash.clone()),
+            parent_run_id: Some(previous.manifest.run_id.clone()),
+            changed_unit_keys: incremental_hints.changed_unit_keys.clone(),
+            // QA17: the real send's self-reported usage (`None` for the 0-change
+            // branch above, which never called the adapter).
+            usage: response.usage.clone(),
+        }
+        .with_manifest(&manifest, &response),
+    ))
 }
 
 /// R13-1: the latest prior online-markdownize instance for `input_path` (the DONE
@@ -1427,7 +1598,10 @@ fn latest_online_instance_for_path(
         .filter(|task| {
             task.input_path == input_path
                 && matches!(task.status, TaskStatus::Done | TaskStatus::Partial)
-                && task.fallback_reason.as_deref() == Some("online_adapter_done")
+                && matches!(
+                    task.fallback_reason.as_deref(),
+                    Some("online_adapter_done" | "resource_limit")
+                )
         })
         .collect::<Vec<_>>();
     tasks.sort_by(|a, b| b.created_at.cmp(&a.created_at));
@@ -1450,7 +1624,10 @@ fn consecutive_online_incremental_count(task_store: &TaskStore, input_path: &str
         .filter(|task| {
             task.input_path == input_path
                 && task.status == TaskStatus::Done
-                && task.fallback_reason.as_deref() == Some("online_adapter_done")
+                && matches!(
+                    task.fallback_reason.as_deref(),
+                    Some("online_adapter_done" | "resource_limit")
+                )
         })
         .collect::<Vec<_>>();
     tasks.sort_by(|a, b| b.created_at.cmp(&a.created_at));
@@ -1481,6 +1658,7 @@ fn image_store_for_task(
     repo.object_store()
         .image_store()
         .map_err(|_| TaskExecutionFailure {
+            resource_limit: None,
             retry_kind: RetryErrorKind::ContractViolation,
             retry_after_ms: None,
         })
@@ -1491,7 +1669,12 @@ pub(crate) fn task_failure_from_adapter(error: kio_adapter::AdapterError) -> Tas
     // `RateLimit` whose provider response carried a parseable `Retry-After`
     // header (kio-adapter's `AdapterError::retry_after_ms`).
     let retry_after_ms = error.retry_after_ms();
+    let resource_limit = match &error {
+        kio_adapter::AdapterError::ResourceLimit(limit) => Some(limit.clone()),
+        _ => None,
+    };
     let retry_kind = match error {
+        kio_adapter::AdapterError::ResourceLimit(_) => RetryErrorKind::ResourceLimit,
         kio_adapter::AdapterError::Auth(_) => RetryErrorKind::AuthError,
         kio_adapter::AdapterError::LocalPeerAuth(_) => RetryErrorKind::LocalPeerAuth,
         kio_adapter::AdapterError::LocalPeerConfig { .. }
@@ -1507,6 +1690,7 @@ pub(crate) fn task_failure_from_adapter(error: kio_adapter::AdapterError) -> Tas
         | kio_adapter::AdapterError::ConfigSchemaCoded { .. } => RetryErrorKind::ContractViolation,
     };
     TaskExecutionFailure {
+        resource_limit,
         retry_kind,
         retry_after_ms,
     }
@@ -1525,6 +1709,8 @@ pub(crate) fn task_descriptor(
     created_at: &str,
 ) -> TaskDescriptor {
     TaskDescriptor {
+        unit_retry_at: Default::default(),
+        resource_limit: None,
         task_id: format!("task_{}", new_ulid(repo.canonical_root())),
         task_type,
         embedding_target: None,
@@ -1818,6 +2004,7 @@ impl NormalizedUnitsError {
             Self::LocalPersistence(_) => persist_failure_retry_kind(),
         };
         TaskExecutionFailure {
+            resource_limit: None,
             retry_kind,
             retry_after_ms: None,
         }
@@ -2055,6 +2242,7 @@ fn manifest_from_units_with_failed_kinds(
         units: prepared_units
             .iter()
             .map(|unit| NormalizedUnitManifestEntry {
+                resource_limit: None,
                 order: unit.order,
                 unit_key: unit.unit_key.clone(),
                 unit_ref: unit_ref(&unit.unit_key),
@@ -2081,5 +2269,174 @@ fn manifest_from_units_with_failed_kinds(
             })
             .collect(),
         generated_at: generated_at.to_owned(),
+    }
+}
+
+fn attach_resource_limits(
+    manifest: &mut NormalizedInstanceManifest,
+    response: &kio_adapter::types::MarkdownizeResponse,
+    previous: Option<&PreviousInstance>,
+) {
+    for entry in &mut manifest.units {
+        if entry.status != UnitStatus::Failed
+            || entry.error_kind.as_deref() != Some("resource_limit")
+        {
+            continue;
+        }
+        entry.resource_limit = response
+            .failed_units
+            .iter()
+            .find(|u| u.unit_key == entry.unit_key)
+            .and_then(|u| u.resource_limit.clone())
+            .or_else(|| {
+                previous
+                    .and_then(|p| {
+                        p.manifest
+                            .units
+                            .iter()
+                            .find(|u| u.unit_key == entry.unit_key)
+                    })
+                    .and_then(|u| u.resource_limit.clone())
+            });
+    }
+}
+
+fn task_failure_from_pipeline(error: kio_pipeline::PipelineError) -> TaskExecutionFailure {
+    match error {
+        kio_pipeline::PipelineError::ResourceLimit(limit) => TaskExecutionFailure {
+            resource_limit: Some(limit),
+            retry_kind: RetryErrorKind::ResourceLimit,
+            retry_after_ms: None,
+        },
+        _ => TaskExecutionFailure {
+            resource_limit: None,
+            retry_kind: persist_failure_retry_kind(),
+            retry_after_ms: None,
+        },
+    }
+}
+
+#[cfg(test)]
+mod resource_failure_tests {
+    use super::*;
+
+    #[test]
+    fn resource_limit_local_ocr_failure_and_mirror_preserve_verified_done_units() {
+        for done in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let repo = Repository::init(root.path()).unwrap();
+            let raw_hash = kio_pipeline::prepare::hash_bytes(b"raw");
+            let profile = kio_pipeline::prepare::hash_bytes(b"profile");
+            let unit: NormalizedUnitObject=serde_json::from_value(serde_json::json!({"unit_key":"page:1","unit_type":"page","raw_hash":raw_hash,"prepared_hash":profile,"preparation_profile_hash":profile,"tool_profile_hash":profile,"gen":0,"mode":"full","markdown":"verified first page\n","owned_image_hashes":[],"metadata":{},"reused_from":null,"generated_at":"2026-07-03T00:00:00Z"})).unwrap();
+            let units = if done { vec![unit] } else { vec![] };
+            let manifest = NormalizedInstanceManifest {
+                raw_hash: raw_hash.clone(),
+                tool_profile_hash: profile.clone(),
+                r#gen: 0,
+                parent_gen: None,
+                run_id: "run_local".into(),
+                generated_at: "2026-07-03T00:00:00Z".into(),
+                units: (1..=2)
+                    .map(|n| NormalizedUnitManifestEntry {
+                        order: n - 1,
+                        unit_key: format!("page:{n}"),
+                        unit_ref: unit_ref(&format!("page:{n}")),
+                        unit_type: UnitType::Page,
+                        status: if done && n == 1 {
+                            UnitStatus::Done
+                        } else {
+                            UnitStatus::Failed
+                        },
+                        prepared_hash: profile.clone(),
+                        preparation_profile_hash: profile.clone(),
+                        unit_object_hash: None,
+                        error_kind: if done && n == 1 {
+                            None
+                        } else {
+                            Some("network_error".into())
+                        },
+                        resource_limit: None,
+                    })
+                    .collect(),
+            };
+            let stamped = persist_normalized_instance_with_control(
+                repo.kio_dir(),
+                &manifest,
+                &units,
+                repo.control(),
+            )
+            .unwrap();
+            let task:TaskDescriptor=serde_json::from_value(serde_json::json!({"task_id":"task_local_resource","type":"markdownize","mode":"full","input_path":"document.pdf","input_hash":raw_hash,"previous_raw_hash":null,"parent_run_id":null,"changed_unit_keys":[],"output_ref":normalized_output_ref(&repo,&raw_hash,&profile,0),"unit_keys":["page:2"],"status":"pending","attempts":2,"next_retry_at":null,"deadline":null,"heartbeat_at":null,"fallback_reason":null,"created_at":"2026-07-03T00:00:00Z","bbox_annotation_enabled":null,"hold_reason":null,"reserved_usd":null,"reserved_month":null,"reservation_id":null})).unwrap();
+            let store = TaskStore::new(repo.kio_dir());
+            store.append(&task).unwrap();
+            let local = LocalExecution::new(
+                root.path().join("local"),
+                root.path().to_path_buf(),
+                repo.control().clone(),
+            )
+            .unwrap();
+            let identity = LocalIdentity {
+                execution: LocalExecutionKind::Loopback,
+                target: LocalTarget::Ocr {
+                    scope_id: repo.scope_identity().unwrap().scope_id,
+                    target: "resource failure".into(),
+                },
+                input_sha256: raw_hash.trim_start_matches("sha256:").into(),
+                profile: profile.clone(),
+                contract: LocalContract::Ocr {
+                    raw_hash: raw_hash.clone(),
+                    tool_profile: profile.clone(),
+                },
+            };
+            let LocalClaim::Claimed(mut claim) =
+                local.claim(&identity, task.attempts, None, 5, 0).unwrap()
+            else {
+                panic!("claim expected")
+            };
+            let limit = kio_core::error::ResourceLimit {
+                resource: kio_core::error::Resource::Memory,
+                stage: "local_ocr".into(),
+                limit: None,
+                observed: Some(1024),
+                resource_tier: None,
+            };
+            let failure =
+                task_failure_from_adapter(kio_adapter::AdapterError::ResourceLimit(limit.clone()));
+            fail_local_ocr_claim(&store, &task, &mut claim, failure, "2026-07-03T00:00:00Z")
+                .unwrap();
+            let expected = if done {
+                TaskStatus::Partial
+            } else {
+                TaskStatus::Paused
+            };
+            let held = store.all().unwrap().remove(0);
+            assert_eq!(held.status, expected);
+            assert_eq!(held.resource_limit, Some(limit));
+            assert_eq!(
+                held.hold_reason,
+                Some(kio_pipeline::task::HoldReason::ResourceLimit)
+            );
+            assert_eq!(held.attempts, 2);
+            mirror_local_ocr_wait(
+                &store,
+                &task.task_id,
+                2,
+                None,
+                Some(RetryErrorKind::ResourceLimit),
+                true,
+            )
+            .unwrap();
+            assert_eq!(store.all().unwrap()[0].status, expected);
+            let retained = load_validated_normalized_instance_with_control(
+                repo.kio_dir(),
+                &raw_hash,
+                &profile,
+                0,
+                repo.control(),
+            )
+            .unwrap();
+            assert_eq!(retained.manifest, stamped);
+            assert_eq!(retained.units, units);
+        }
     }
 }

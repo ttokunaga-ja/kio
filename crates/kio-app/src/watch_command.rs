@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::commands::{CommandRequest, IndexArgs, WatchArgs, WatchCommand};
+use crate::commands::{IndexArgs, WatchArgs, WatchCommand};
 use crate::context::{AppContext, Interaction};
 use crate::management::{binding_for_repo, open_existing_managed_root};
 use crate::platform::open_watch_instance_lock;
@@ -260,16 +260,16 @@ impl Reconcile for LocalReconciler {
             };
             // execute reloads user configuration and runtime TLS settings for
             // every pass; a service never freezes startup consent or profiles.
-            crate::execute(
+            crate::execute_watch_index(
                 &context,
-                CommandRequest::Index(IndexArgs {
+                IndexArgs {
                     preview: false,
                     yes: false,
                     online: false,
                     offline: true,
                     realtime: false,
                     batch: false,
-                }),
+                },
             )
         })();
         let output = result.map_err(|error| WatchError::invariant(error.to_string()))?;

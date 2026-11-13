@@ -1129,6 +1129,7 @@ pub(crate) fn poll_batch_embedding_jobs(
                 EmbeddingMemberResult::Failed { reason } => {
                     let kind = retry_kind_from_reason(Some(reason));
                     let failure = crate::markdownize::execution::TaskExecutionFailure {
+                        resource_limit: None,
                         retry_kind: kind,
                         retry_after_ms: None,
                     };

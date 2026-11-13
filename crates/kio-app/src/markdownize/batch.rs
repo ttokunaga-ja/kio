@@ -312,6 +312,7 @@ pub(crate) fn submit_batch_markdownize_job(
             {
                 let Ok(order) = u32::try_from(unit.order) else {
                     return Ok(Err(TaskExecutionFailure {
+                        resource_limit: None,
                         retry_kind: RetryErrorKind::InvalidInput,
                         retry_after_ms: None,
                     }));
@@ -323,6 +324,7 @@ pub(crate) fn submit_batch_markdownize_job(
                 // the prepared units; an empty projection means the task is
                 // stale — never send an unbounded full-document job for it.
                 return Ok(Err(TaskExecutionFailure {
+                    resource_limit: None,
                     retry_kind: RetryErrorKind::InvalidInput,
                     retry_after_ms: None,
                 }));
@@ -606,10 +608,11 @@ pub(crate) fn poll_one_batch_markdownize_row(
     let task = tasks.iter().find(|task| {
         task.task_type == TaskType::Markdownize
             && task.input_hash == row.key.input_hash
-            && matches!(
+            && (matches!(
                 task.status,
                 TaskStatus::Pending | TaskStatus::Failed | TaskStatus::Running
-            )
+            ) || task.hold_reason == Some(kio_pipeline::task::HoldReason::ResourceLimit)
+                && task.unit_keys.is_some())
             && targets_standard_online_markdownize(store.kio_dir(), task, placeholder_ref)
     });
     let Some(task) = task else {
@@ -754,23 +757,21 @@ fn settle_failed_batch_job(
 /// so `batch retry` does not auto-revive it — resubmission is a deliberate
 /// human step (fresh phase 1 after re-index / explicit re-enqueue).
 fn mark_batch_task_failed_permanent(store: &TaskStore, task_id: &str) -> Result<usize> {
-    store
-        .update_matching(|candidate| {
-            if candidate.task_id == task_id {
-                candidate.status = TaskStatus::Failed;
-                candidate.fallback_reason =
-                    Some(retry_reason(RetryErrorKind::InvalidInput).to_owned());
-                candidate.hold_reason = None;
-                candidate.heartbeat_at = None;
-                candidate.attempts = candidate.attempts.saturating_add(1);
-                candidate.next_retry_at = None;
-                candidate.clear_reservation();
-                true
-            } else {
-                false
-            }
-        })
-        .map_err(pipeline_to_kio)
+    crate::task_execution::update_tasks_preserving_resource_holds(store, |candidate| {
+        if candidate.task_id == task_id {
+            candidate.status = TaskStatus::Failed;
+            candidate.fallback_reason = Some(retry_reason(RetryErrorKind::InvalidInput).to_owned());
+            candidate.hold_reason = None;
+            candidate.heartbeat_at = None;
+            candidate.attempts = candidate.attempts.saturating_add(1);
+            candidate.next_retry_at = None;
+            candidate.clear_reservation();
+            true
+        } else {
+            false
+        }
+    })
+    .map_err(pipeline_to_kio)
 }
 
 /// Extend a Pending batch task's poll schedule by one interval. A Failed task
@@ -782,16 +783,15 @@ fn extend_batch_poll_schedule(
     control: &ControlHandle,
 ) -> Result<()> {
     let poll_at = batch_poll_retry_at(control);
-    store
-        .update_matching(|candidate| {
-            if candidate.task_id == task_id && candidate.status == TaskStatus::Pending {
-                candidate.next_retry_at = Some(poll_at.clone());
-                true
-            } else {
-                false
-            }
-        })
-        .map_err(pipeline_to_kio)?;
+    crate::task_execution::update_tasks_preserving_resource_holds(store, |candidate| {
+        if candidate.task_id == task_id && candidate.status == TaskStatus::Pending {
+            candidate.next_retry_at = Some(poll_at.clone());
+            true
+        } else {
+            false
+        }
+    })
+    .map_err(pipeline_to_kio)?;
     Ok(())
 }
 
@@ -909,6 +909,13 @@ fn collect_batch_markdownize_output(
     // identity (input_hash), so an edited/removed working file retires the
     // task instead of persisting under a stale identity.
     let prepared_input = match classify_online_markdownize_precondition(repo, task) {
+        OnlineMarkdownizePrecondition::ResourceLimit(limit) => {
+            crate::task_execution::hold_resource_task(store, &task.task_id, Some(limit.clone()))?;
+            return Ok(BatchPollDisposition::Collected(ExecOutcome {
+                resource_limit: Some(limit),
+                ..ExecOutcome::default()
+            }));
+        }
         OnlineMarkdownizePrecondition::Send(prepared_input) => prepared_input,
         OnlineMarkdownizePrecondition::PolicyUnavailable(error) => return Err(error),
         OnlineMarkdownizePrecondition::AwaitConversion
@@ -1122,31 +1129,22 @@ fn collect_batch_markdownize_output(
         row.provider_scope_id.as_deref(),
     )?;
     let task_id = task.task_id.clone();
-    store
-        .update_matching(|candidate| {
-            if candidate.task_id == task_id {
-                candidate.status = outcome.status;
-                candidate.output_ref = outcome.output_ref.clone();
-                candidate.fallback_reason = Some("online_adapter_done".to_owned());
-                candidate.hold_reason = None;
-                candidate.heartbeat_at = None;
-                candidate.next_retry_at = None;
-                candidate.clear_reservation();
-                if matches!(outcome.status, TaskStatus::Partial | TaskStatus::Failed) {
-                    // Mirrors the sync Ok arm: every known incomplete response,
-                    // including an all-Failed manifest, consumed one re-drive.
-                    candidate.attempts = candidate.attempts.saturating_add(1);
-                }
-                candidate.mode = Some(outcome.mode);
-                candidate.previous_raw_hash = outcome.previous_raw_hash.clone();
-                candidate.parent_run_id = outcome.parent_run_id.clone();
-                candidate.changed_unit_keys = outcome.changed_unit_keys.clone();
-                true
-            } else {
-                false
-            }
-        })
-        .map_err(pipeline_to_kio)?;
+    crate::task_execution::update_tasks_preserving_resource_holds(store, |candidate| {
+        if candidate.task_id == task_id {
+            outcome.apply_to_task(candidate);
+            candidate.heartbeat_at = None;
+            candidate.next_retry_at = None;
+            candidate.clear_reservation();
+            candidate.mode = Some(outcome.mode);
+            candidate.previous_raw_hash = outcome.previous_raw_hash.clone();
+            candidate.parent_run_id = outcome.parent_run_id.clone();
+            candidate.changed_unit_keys = outcome.changed_unit_keys.clone();
+            true
+        } else {
+            false
+        }
+    })
+    .map_err(pipeline_to_kio)?;
     Ok(BatchPollDisposition::Collected(
         known_markdownize_completion(store, &task_id)?,
     ))
@@ -1205,22 +1203,21 @@ fn settle_batch_contract_reject(
     let reason = retry_reason(RetryErrorKind::ContractViolation).to_owned();
     let task_id = task.task_id.clone();
     let retryable = next_retry_at.is_some();
-    store
-        .update_matching(|candidate| {
-            if candidate.task_id == task_id {
-                candidate.status = TaskStatus::Failed;
-                candidate.fallback_reason = Some(reason.clone());
-                candidate.hold_reason = None;
-                candidate.heartbeat_at = None;
-                candidate.attempts = attempts_after;
-                candidate.next_retry_at = next_retry_at.clone();
-                candidate.clear_reservation();
-                true
-            } else {
-                false
-            }
-        })
-        .map_err(pipeline_to_kio)?;
+    crate::task_execution::update_tasks_preserving_resource_holds(store, |candidate| {
+        if candidate.task_id == task_id {
+            candidate.status = TaskStatus::Failed;
+            candidate.fallback_reason = Some(reason.clone());
+            candidate.hold_reason = None;
+            candidate.heartbeat_at = None;
+            candidate.attempts = attempts_after;
+            candidate.next_retry_at = next_retry_at.clone();
+            candidate.clear_reservation();
+            true
+        } else {
+            false
+        }
+    })
+    .map_err(pipeline_to_kio)?;
     Ok(if retryable {
         BatchPollDisposition::FailedRetryable
     } else {
@@ -1231,17 +1228,16 @@ fn settle_batch_contract_reject(
 /// Retire a batch task whose collect-time precondition failed (superseded /
 /// purged) — same shape as the send-time `Retire` path.
 fn retire_batch_task(store: &TaskStore, task_id: &str) -> Result<usize> {
-    store
-        .update_matching(|candidate| {
-            if candidate.task_id == task_id {
-                retire_online_task(candidate);
-                candidate.attempts = candidate.attempts.saturating_add(1);
-                true
-            } else {
-                false
-            }
-        })
-        .map_err(pipeline_to_kio)
+    crate::task_execution::update_tasks_preserving_resource_holds(store, |candidate| {
+        if candidate.task_id == task_id {
+            retire_online_task(candidate);
+            candidate.attempts = candidate.attempts.saturating_add(1);
+            true
+        } else {
+            false
+        }
+    })
+    .map_err(pipeline_to_kio)
 }
 
 pub(crate) fn retire_online_task(task: &mut TaskDescriptor) {

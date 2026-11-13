@@ -1144,6 +1144,7 @@ mod tests {
             parent_gen: None,
             run_id: "retained-test".to_owned(),
             units: vec![kio_pipeline::markdownize::NormalizedUnitManifestEntry {
+                resource_limit: None,
                 order: 0,
                 unit_key: unit.unit_key.clone(),
                 unit_ref: unit_ref(&unit.unit_key),
@@ -1221,6 +1222,7 @@ mod tests {
             run_id: "partial-test".to_owned(),
             units: vec![
                 kio_pipeline::markdownize::NormalizedUnitManifestEntry {
+                    resource_limit: None,
                     order: 0,
                     unit_key: done.unit_key.clone(),
                     unit_ref: unit_ref(&done.unit_key),
@@ -1232,6 +1234,7 @@ mod tests {
                     error_kind: None,
                 },
                 kio_pipeline::markdownize::NormalizedUnitManifestEntry {
+                    resource_limit: None,
                     order: 1,
                     unit_key: "page:2".to_owned(),
                     unit_ref: unit_ref("page:2"),

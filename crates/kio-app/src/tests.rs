@@ -369,6 +369,8 @@ fn materialized_source_image_cas_failure_is_retryable_not_contract_reject() {
         page_number: None,
     };
     let task = TaskDescriptor {
+        unit_retry_at: Default::default(),
+        resource_limit: None,
         task_id: "task_known_provider_result".to_owned(),
         task_type: TaskType::Markdownize,
         embedding_target: None,
@@ -459,6 +461,8 @@ fn invalid_online_markdown_is_rejected_before_normalized_publication() {
         page_number: None,
     };
     let task = TaskDescriptor {
+        unit_retry_at: Default::default(),
+        resource_limit: None,
         task_id: "task_invalid_known_provider_result".to_owned(),
         task_type: TaskType::Markdownize,
         embedding_target: None,
@@ -583,6 +587,8 @@ fn valid_partial_online_response_is_materialized() {
     };
     let prepared = vec![page(0, "page:1"), page(1, "page:2")];
     let task = TaskDescriptor {
+        unit_retry_at: Default::default(),
+        resource_limit: None,
         task_id: "task_valid_partial".to_owned(),
         task_type: TaskType::Markdownize,
         embedding_target: None,
@@ -620,6 +626,7 @@ fn valid_partial_online_response_is_materialized() {
         added_units: Vec::new(),
         removed_unit_keys: Vec::new(),
         failed_units: vec![FailedUnit {
+            resource_limit: None,
             unit_key: "page:2".to_owned(),
             error_kind: "network_error".to_owned(),
         }],
@@ -640,6 +647,34 @@ fn valid_partial_online_response_is_materialized() {
     )
     .unwrap();
     assert_eq!(outcome.status, TaskStatus::Partial);
+    let mut interrupted = task.clone();
+    interrupted.bbox_annotation_enabled = Some(false);
+    outcome.apply_to_task(&mut interrupted);
+    interrupted.unit_keys = Some(vec!["page:2".to_owned()]);
+    let interrupted_store = kio_pipeline::task::TaskStore::new(repo.kio_dir());
+    interrupted_store.append(&interrupted).unwrap();
+    std::fs::write(repo.canonical_root().join("document.pdf"), raw).unwrap();
+    crate::task_execution::hold_resource_task(
+        &interrupted_store,
+        &interrupted.task_id,
+        Some(test_resource_limit()),
+    )
+    .unwrap();
+    assert_eq!(
+        interrupted_store.all().unwrap()[0].status,
+        TaskStatus::Partial
+    );
+    assert_eq!(
+        crate::batch::command::reenqueue_resource_limited_tasks(&repo, &interrupted_store, |_| {
+            true
+        })
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        interrupted_store.all().unwrap()[0].unit_keys,
+        Some(vec!["page:2".to_owned()])
+    );
     let retry = MarkdownizeResponse {
         mode_used: AdapterMarkdownizeMode::Full,
         updated_units: vec![MarkdownUnit {
@@ -700,10 +735,12 @@ fn valid_partial_online_response_is_materialized() {
         removed_unit_keys: Vec::new(),
         failed_units: vec![
             FailedUnit {
+                resource_limit: None,
                 unit_key: "page:1".to_owned(),
                 error_kind: "network_error".to_owned(),
             },
             FailedUnit {
+                resource_limit: None,
                 unit_key: "page:2".to_owned(),
                 error_kind: "network_error".to_owned(),
             },
@@ -2133,6 +2170,8 @@ fn r23_cand_001_terminal_failure_does_not_spawn_releasable_secret_hold() {
     let output_ref = embedding_task_output_ref(&chunk);
     store
         .append(&TaskDescriptor {
+            unit_retry_at: Default::default(),
+            resource_limit: None,
             task_id: "task_terminal".to_owned(),
             task_type: TaskType::Embedding,
             embedding_target: Some(crate::embedding::plan::chunk_task_target(&chunk, &profile)),
@@ -2220,6 +2259,8 @@ fn r23_cand_001_duplicate_hold_cannot_override_terminal_failure() {
     .remove(0);
     let output_ref = embedding_task_output_ref(&chunk);
     let terminal = TaskDescriptor {
+        unit_retry_at: Default::default(),
+        resource_limit: None,
         task_id: "task_terminal".to_owned(),
         task_type: TaskType::Embedding,
         embedding_target: Some(crate::embedding::plan::chunk_task_target(&chunk, &profile)),
@@ -2319,6 +2360,8 @@ fn r23_secret_classification_preserves_retry_backoff_state() {
     let output_ref = embedding_task_output_ref(&chunk);
     store
         .append(&TaskDescriptor {
+            unit_retry_at: Default::default(),
+            resource_limit: None,
             task_id: "task_retry_backoff".to_owned(),
             task_type: TaskType::Embedding,
             embedding_target: Some(crate::embedding::plan::chunk_task_target(&chunk, &profile)),
@@ -2532,6 +2575,8 @@ fn r23_markdown_charge_and_send_share_one_verified_input() {
     let pdf = b"%PDF-1.4\n1 0 obj << /Type /Pages /Kids [2 0 R] /Count 1 >> endobj\n2 0 obj << /Type /Page /Parent 1 0 R >> stream\nBT (verified billing input) Tj ET\nendstream endobj\n%%EOF\n";
     std::fs::write(root.path().join("doc.pdf"), pdf).unwrap();
     let task = TaskDescriptor {
+        unit_retry_at: Default::default(),
+        resource_limit: None,
         task_id: "task_verified_charge".to_owned(),
         task_type: TaskType::Markdownize,
         embedding_target: None,
@@ -3275,6 +3320,7 @@ fn r11_2_completion_priority_batch_vs_enrichment() {
     // Batch priority: auth (5) > budget-paused (6) > some-retryable (3) >
     // all-permanent (4).
     let all = ExecOutcome {
+        resource_limit: None,
         executed: 1,
         failed: 3,
         paused: 1,
@@ -3287,7 +3333,7 @@ fn r11_2_completion_priority_batch_vs_enrichment() {
     assert_eq!(
         batch_completion(&ExecOutcome {
             auth_failed: 0,
-            ..all
+            ..all.clone()
         }),
         Completion::BudgetBlocked
     );
@@ -3295,7 +3341,7 @@ fn r11_2_completion_priority_batch_vs_enrichment() {
         batch_completion(&ExecOutcome {
             auth_failed: 0,
             paused: 0,
-            ..all
+            ..all.clone()
         }),
         Completion::Partial
     );
@@ -3462,6 +3508,7 @@ fn subset_retry_preserves_unrequested_failed_unit_kind() {
         reason: None,
         usage: None,
         failed_units: vec![FailedUnit {
+            resource_limit: None,
             unit_key: "page:2".to_owned(),
             error_kind: "network_error".to_owned(),
         }],
@@ -4189,6 +4236,8 @@ fn q3_reclaims_orphaned_running_task_to_pending() {
     let dir = crate::test_support::PrivateTempDir::new();
     let store = TaskStore::new(dir.path());
     let task = TaskDescriptor {
+        unit_retry_at: Default::default(),
+        resource_limit: None,
         task_id: "t1".to_owned(),
         task_type: TaskType::Markdownize,
         embedding_target: None,
@@ -4693,3 +4742,452 @@ mod budget_retirement_preconditions_tests;
 
 #[path = "caller_ledger_independence_tests.rs"]
 mod caller_ledger_independence_tests;
+
+#[test]
+fn resource_limit_online_response_is_materialized() {
+    use kio_adapter::types::{
+        FailedUnit, MarkdownUnit, MarkdownizeMode as AdapterMarkdownizeMode, MarkdownizeResponse,
+        UnitKind,
+    };
+    use kio_pipeline::prepare::{PreparedUnit, UnitFingerprint, UnitType, hash_bytes};
+    use kio_pipeline::task::{TaskDescriptor, TaskStatus, TaskType};
+
+    let root = tempfile::tempdir().unwrap();
+    let repo = Repository::init(root.path()).unwrap();
+    let raw = b"already prepared test PDF pages";
+    let raw_hash = hash_bytes(raw);
+    let profile_hash = hash_bytes(b"online profile");
+    let page = |order, key: &str| PreparedUnit {
+        order,
+        unit_key: key.to_owned(),
+        unit_type: UnitType::Page,
+        prepared_hash: hash_bytes(key.as_bytes()),
+        preparation_profile_hash: hash_bytes(b"prepare profile"),
+        fingerprint: UnitFingerprint {
+            perceptual_hash: hash_bytes(b"perceptual"),
+            text_hash: hash_bytes(key.as_bytes()),
+            visual_hash: hash_bytes(b"visual"),
+        },
+        mime: Some("application/pdf".to_owned()),
+        page_number: Some(order + 1),
+    };
+    let prepared = vec![page(0, "page:1"), page(1, "page:2")];
+    let task = TaskDescriptor {
+        unit_retry_at: Default::default(),
+        resource_limit: None,
+        task_id: "task_valid_partial".to_owned(),
+        task_type: TaskType::Markdownize,
+        embedding_target: None,
+        mode: Some(kio_pipeline::markdownize::MarkdownizeMode::Full),
+        input_path: "document.pdf".to_owned(),
+        input_hash: raw_hash.clone(),
+        previous_raw_hash: None,
+        parent_run_id: None,
+        changed_unit_keys: Vec::new(),
+        output_ref: "online:mistral_ocr_markdownize".to_owned(),
+        unit_keys: None,
+        status: TaskStatus::Running,
+        attempts: 1,
+        next_retry_at: None,
+        deadline: None,
+        heartbeat_at: None,
+        fallback_reason: None,
+        created_at: "2026-09-08T00:00:00Z".to_owned(),
+        bbox_annotation_enabled: None,
+        hold_reason: None,
+        reserved_usd: None,
+        reserved_month: None,
+        reservation_id: None,
+    };
+    let preflight_store = kio_pipeline::task::TaskStore::new(root.path().join("preflight/.kio"));
+    let mut preflight = task.clone();
+    preflight.bbox_annotation_enabled = Some(false);
+    preflight.status = TaskStatus::Pending;
+    preflight_store.append(&preflight).unwrap();
+    crate::task_execution::hold_resource_task(
+        &preflight_store,
+        &preflight.task_id,
+        Some(test_resource_limit()),
+    )
+    .unwrap();
+    let typed_error = crate::task_execution::persist_resource_error(
+        &preflight_store,
+        &[&preflight],
+        test_resource_limit().into_error("allocation unavailable"),
+    );
+    assert_eq!(typed_error.exit_code().code(), 3);
+    let held_preflight = preflight_store.all().unwrap().remove(0);
+    assert_eq!(held_preflight.status, TaskStatus::Paused);
+    assert_eq!(held_preflight.attempts, preflight.attempts);
+    assert_eq!(held_preflight.output_ref, preflight.output_ref);
+    assert!(held_preflight.next_retry_at.is_none());
+    assert!(held_preflight.reservation_id.is_none());
+    let unchanged = preflight_store.all().unwrap();
+    let invalid = crate::task_execution::persist_resource_error(
+        &preflight_store,
+        &[&preflight],
+        kio_core::KioError::schema("resource_limit text in corrupt input"),
+    );
+    assert!(invalid.resource_limit().is_none());
+    assert_eq!(preflight_store.all().unwrap(), unchanged);
+    let response = MarkdownizeResponse {
+        mode_used: AdapterMarkdownizeMode::Full,
+        updated_units: vec![MarkdownUnit {
+            unit_key: "page:1".to_owned(),
+            unit_type: UnitKind::Page,
+            markdown: "accepted first page\n".to_owned(),
+            owned_image_hashes: BTreeSet::new(),
+            metadata: BTreeMap::new(),
+        }],
+        unchanged_unit_keys: Vec::new(),
+        added_units: Vec::new(),
+        removed_unit_keys: Vec::new(),
+        failed_units: vec![FailedUnit {
+            resource_limit: Some(test_resource_limit()),
+
+            unit_key: "page:2".to_owned(),
+            error_kind: "resource_limit".to_owned(),
+        }],
+        fallback_to_full: false,
+        reason: None,
+        usage: None,
+    };
+    let outcome = crate::markdownize::execution::materialize_online_markdownize_response(
+        &repo,
+        &task,
+        prepared.clone(),
+        "application/pdf",
+        raw,
+        None,
+        profile_hash.clone(),
+        response,
+        &[],
+    )
+    .unwrap();
+    assert_eq!(outcome.status, TaskStatus::Partial);
+    assert!(!outcome.consume_attempt);
+    assert_eq!(outcome.resource_limit, Some(test_resource_limit()));
+    let mut held = task.clone();
+    outcome.apply_to_task(&mut held);
+    assert_eq!(held.attempts, task.attempts);
+    assert_eq!(
+        held.hold_reason,
+        Some(kio_pipeline::task::HoldReason::ResourceLimit)
+    );
+    assert!(held.next_retry_at.is_none());
+    let instance = kio_pipeline::markdownize::load_validated_normalized_instance(
+        repo.kio_dir(),
+        &raw_hash,
+        &profile_hash,
+        0,
+    )
+    .unwrap();
+    assert_eq!(
+        instance.manifest.units[1].resource_limit,
+        Some(test_resource_limit())
+    );
+    assert!(
+        crate::batch::command::partial_retry_plan_from_manifest(&instance.manifest, 0)
+            .retryable_units
+            .is_empty()
+    );
+    std::fs::write(repo.canonical_root().join("document.pdf"), raw).unwrap();
+    held.bbox_annotation_enabled = Some(false);
+    let promotions = crate::promotion::validated_online_promotions(
+        repo.kio_dir(),
+        &[held.clone()],
+        repo.control(),
+    )
+    .unwrap();
+    assert_eq!(
+        promotions.len(),
+        1,
+        "resource partial must publish its verified done unit"
+    );
+    let store = kio_pipeline::task::TaskStore::new(repo.kio_dir());
+    store.append(&held).unwrap();
+    assert_eq!(
+        crate::batch::command::reenqueue_resource_limited_tasks(&repo, &store, |_| false).unwrap(),
+        0
+    );
+    assert_eq!(store.all().unwrap()[0], held);
+    // Identity mismatch must never run the resource probe or release the hold.
+    std::fs::write(repo.canonical_root().join("document.pdf"), b"changed input").unwrap();
+    assert_eq!(
+        crate::batch::command::reenqueue_resource_limited_tasks(&repo, &store, |_| panic!(
+            "identity must be checked first"
+        ))
+        .unwrap(),
+        0
+    );
+    std::fs::write(repo.canonical_root().join("document.pdf"), raw).unwrap();
+    assert_eq!(
+        crate::batch::command::reenqueue_resource_limited_tasks(&repo, &store, |limit| limit
+            == &test_resource_limit())
+        .unwrap(),
+        1
+    );
+    let released = &store.all().unwrap()[0];
+    assert_eq!(released.status, TaskStatus::Pending);
+    assert_eq!(released.unit_keys, Some(vec!["page:2".to_owned()]));
+    assert_eq!(released.output_ref, held.output_ref);
+    assert_eq!(released.attempts, held.attempts);
+    let retry = MarkdownizeResponse {
+        mode_used: AdapterMarkdownizeMode::Full,
+        updated_units: vec![MarkdownUnit {
+            unit_key: "page:2".to_owned(),
+            unit_type: UnitKind::Page,
+            markdown: "accepted second page\n".to_owned(),
+            owned_image_hashes: BTreeSet::new(),
+            metadata: BTreeMap::new(),
+        }],
+        unchanged_unit_keys: Vec::new(),
+        added_units: Vec::new(),
+        removed_unit_keys: Vec::new(),
+        failed_units: Vec::new(),
+        fallback_to_full: false,
+        reason: None,
+        usage: None,
+    };
+    let retry_keys = BTreeSet::from(["page:2".to_owned()]);
+    let retried = crate::markdownize::execution::materialize_online_markdownize_response(
+        &repo,
+        &task,
+        prepared,
+        "application/pdf",
+        raw,
+        Some(&retry_keys),
+        profile_hash.clone(),
+        retry,
+        &[],
+    )
+    .unwrap();
+    assert_eq!(retried.status, TaskStatus::Done);
+    let retained = kio_pipeline::markdownize::load_validated_normalized_instance(
+        repo.kio_dir(),
+        &raw_hash,
+        &profile_hash,
+        0,
+    )
+    .unwrap();
+    assert_eq!(retained.units.len(), 2);
+    assert_eq!(retained.units[0].markdown, "accepted first page\n");
+    assert_eq!(retained.units[1].markdown, "accepted second page\n");
+    assert!(
+        kio_pipeline::markdownize::normalized_instance_dir(
+            repo.kio_dir(),
+            &raw_hash,
+            &profile_hash,
+            0,
+        )
+        .exists()
+    );
+
+    let all_failed_profile = hash_bytes(b"online profile all failed");
+    let all_failed = MarkdownizeResponse {
+        mode_used: AdapterMarkdownizeMode::Full,
+        updated_units: Vec::new(),
+        unchanged_unit_keys: Vec::new(),
+        added_units: Vec::new(),
+        removed_unit_keys: Vec::new(),
+        failed_units: vec![
+            FailedUnit {
+                resource_limit: Some(test_resource_limit()),
+
+                unit_key: "page:1".to_owned(),
+                error_kind: "resource_limit".to_owned(),
+            },
+            FailedUnit {
+                resource_limit: Some(test_resource_limit()),
+
+                unit_key: "page:2".to_owned(),
+                error_kind: "resource_limit".to_owned(),
+            },
+        ],
+        fallback_to_full: false,
+        reason: None,
+        usage: None,
+    };
+    let all_failed_outcome =
+        crate::markdownize::execution::materialize_online_markdownize_response(
+            &repo,
+            &task,
+            vec![page(0, "page:1"), page(1, "page:2")],
+            "application/pdf",
+            raw,
+            None,
+            all_failed_profile.clone(),
+            all_failed,
+            &[],
+        )
+        .unwrap();
+    assert_eq!(all_failed_outcome.status, TaskStatus::Paused);
+    let all_failed_instance = kio_pipeline::markdownize::load_validated_normalized_instance(
+        repo.kio_dir(),
+        &raw_hash,
+        &all_failed_profile,
+        0,
+    )
+    .unwrap();
+    assert!(all_failed_instance.units.is_empty());
+    assert!(all_failed_instance.manifest.units.iter().all(|unit| {
+        unit.status == kio_pipeline::markdownize::UnitStatus::Failed
+            && unit.error_kind.as_deref() == Some("resource_limit")
+    }));
+    let response = MarkdownizeResponse {
+        mode_used: AdapterMarkdownizeMode::Full,
+        updated_units: Vec::new(),
+        unchanged_unit_keys: Vec::new(),
+        added_units: Vec::new(),
+        removed_unit_keys: Vec::new(),
+        failed_units: vec![
+            FailedUnit {
+                unit_key: "page:1".to_owned(),
+                error_kind: "invalid_input".to_owned(),
+                resource_limit: None,
+            },
+            FailedUnit {
+                unit_key: "page:2".to_owned(),
+                error_kind: "resource_limit".to_owned(),
+                resource_limit: Some(test_resource_limit()),
+            },
+        ],
+        fallback_to_full: false,
+        reason: None,
+        usage: None,
+    };
+    let mixed_outcome = crate::markdownize::execution::materialize_online_markdownize_response(
+        &repo,
+        &task,
+        vec![page(0, "page:1"), page(1, "page:2")],
+        "application/pdf",
+        raw,
+        None,
+        hash_bytes(b"mixed profile"),
+        response,
+        &[],
+    )
+    .unwrap();
+    assert_eq!(mixed_outcome.status, TaskStatus::Paused);
+    assert!(mixed_outcome.consume_attempt);
+    let mut mixed_task = task.clone();
+    mixed_outcome.apply_to_task(&mut mixed_task);
+    assert_eq!(mixed_task.attempts, task.attempts + 1);
+}
+
+fn test_resource_limit() -> kio_core::error::ResourceLimit {
+    kio_core::error::ResourceLimit {
+        resource: kio_core::error::Resource::Memory,
+        stage: "extract".to_owned(),
+        limit: None,
+        observed: Some(1024),
+        resource_tier: None,
+    }
+}
+
+#[test]
+fn resource_error_mappings_preserve_context_and_keep_corruption_distinct() {
+    let limit = test_resource_limit();
+    let adapter = crate::object_persistence::adapter_to_kio(
+        kio_adapter::AdapterError::ResourceLimit(limit.clone()),
+    );
+    let pipeline = crate::object_persistence::pipeline_to_kio(
+        kio_pipeline::PipelineError::ResourceLimit(limit.clone()),
+    );
+    assert_eq!(adapter.exit_code(), kio_core::ExitCode::PartialFailure);
+    assert_eq!(pipeline.context(), adapter.context());
+    assert_eq!(
+        adapter.context()["retry_disposition"],
+        "explicit_after_resource_change"
+    );
+    let failure = crate::markdownize::execution::task_failure_from_adapter(
+        kio_adapter::AdapterError::ResourceLimit(limit.clone()),
+    );
+    assert_eq!(failure.resource_limit, Some(limit));
+    assert_eq!(
+        failure.retry_kind,
+        kio_pipeline::task::RetryErrorKind::ResourceLimit
+    );
+    let corrupt = crate::object_persistence::pipeline_to_kio(kio_pipeline::PipelineError::corrupt(
+        "tasks.jsonl",
+        "bad record",
+    ));
+    assert_eq!(corrupt.error_code(), "KIO-E-STORE-CORRUPT-001");
+    let invalid = crate::markdownize::execution::task_failure_from_adapter(
+        kio_adapter::AdapterError::ContractViolation("bad input identity".to_owned()),
+    );
+    assert!(invalid.resource_limit.is_none());
+    assert_eq!(
+        invalid.retry_kind,
+        kio_pipeline::task::RetryErrorKind::ContractViolation
+    );
+}
+
+#[test]
+fn resource_limit_watch_and_preview_keep_hold_until_explicit_index() {
+    use crate::commands::{CommandRequest, IndexArgs, InitArgs};
+    let root = tempfile::tempdir().unwrap();
+    let context = test_context(root.path());
+    crate::execute(
+        &context,
+        CommandRequest::Init(InitArgs {
+            path: None,
+            independent: false,
+            yes: false,
+        }),
+    )
+    .unwrap();
+    let raw = b"resource test";
+    std::fs::write(root.path().join("document.md"), raw).unwrap();
+    let args = IndexArgs {
+        preview: false,
+        yes: true,
+        online: false,
+        offline: true,
+        realtime: false,
+        batch: false,
+    };
+    crate::execute(&context, CommandRequest::Index(args.clone())).unwrap();
+    let held: kio_pipeline::task::TaskDescriptor = serde_json::from_value(serde_json::json!({
+        "task_id":"task_resource_watch", "type":"markdownize", "mode":"full", "input_path":"document.md",
+        "input_hash":kio_pipeline::prepare::hash_bytes(raw),"previous_raw_hash":null,"parent_run_id":null,"changed_unit_keys":[],
+        "output_ref":format!("online:{}",kio_adapter::catalog::standard_online_markdownize_profile().adapter_id), "unit_keys":null,
+        "status":"paused", "attempts":3,"next_retry_at":null,"deadline":null,"heartbeat_at":null,
+        "fallback_reason":"resource_limit", "resource_limit":test_resource_limit(),"created_at":"2026-07-03T00:00:00Z",
+        "bbox_annotation_enabled":false,"hold_reason":"resource_limit","reserved_usd":null,"reserved_month":null,"reservation_id":null
+    })).unwrap();
+    let store = kio_pipeline::task::TaskStore::new(root.path().join(".kio"));
+    store.replace_all(std::slice::from_ref(&held)).unwrap();
+    crate::execute(
+        &context,
+        CommandRequest::Index(IndexArgs {
+            preview: true,
+            ..args.clone()
+        }),
+    )
+    .unwrap();
+    assert_eq!(store.all().unwrap(), vec![held.clone()]);
+    if let Err(error) = crate::execute_watch_index(&context, args.clone()) {
+        assert_eq!(error.error_code(), "KIO-E-RESOURCE-LIMIT-001");
+    }
+    assert_eq!(
+        store
+            .all()
+            .unwrap()
+            .into_iter()
+            .find(|task| task.task_id == held.task_id)
+            .unwrap(),
+        held
+    );
+    crate::execute(&context, CommandRequest::Index(args)).unwrap();
+    let resumed = store
+        .all()
+        .unwrap()
+        .into_iter()
+        .find(|task| task.task_id == held.task_id)
+        .unwrap();
+    assert_eq!(resumed.status, kio_pipeline::task::TaskStatus::Pending);
+    assert_eq!(resumed.attempts, held.attempts);
+    assert_eq!(resumed.output_ref, held.output_ref);
+    assert!(resumed.resource_limit.is_none());
+}

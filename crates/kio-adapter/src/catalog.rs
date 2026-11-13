@@ -509,6 +509,7 @@ pub fn run_standard_online_markdownize_with_bytes_with_control(
                 && let Some(unit) = response.updated_units.pop()
             {
                 response.failed_units.push(FailedUnit {
+                    resource_limit: None,
                     unit_key: unit.unit_key,
                     error_kind: "network_error".to_owned(),
                 });
@@ -521,6 +522,7 @@ pub fn run_standard_online_markdownize_with_bytes_with_control(
                 response
                     .failed_units
                     .extend(response.updated_units.drain(..).map(|unit| FailedUnit {
+                        resource_limit: None,
                         unit_key: unit.unit_key,
                         error_kind: error_kind.to_owned(),
                     }));

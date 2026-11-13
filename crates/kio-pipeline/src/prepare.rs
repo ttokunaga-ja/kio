@@ -177,9 +177,8 @@ pub fn prepare_units_from_bytes_with_control(
     // extracted Markdown — the same shape the PDF branch uses for page text, so
     // an edit inside one sheet reprepares that sheet alone.
     if is_xlsx {
-        let document = kio_adapter::xlsx_extract::extract_xlsx(bytes).map_err(|err| {
-            crate::PipelineError::contract("KIO-E-PREPARE-XLSX-EXTRACT-001", err.to_string())
-        })?;
+        let document = kio_adapter::xlsx_extract::extract_xlsx(bytes)
+            .map_err(|err| prepare_adapter_error("KIO-E-PREPARE-XLSX-EXTRACT-001", err))?;
         let unit_keys = sheet_unit_keys(
             &document
                 .sheets
@@ -236,10 +235,7 @@ pub fn prepare_units_from_bytes_with_control(
                     &converter.profile_identity(),
                 );
                 Some(converter.convert_to_pdf(bytes, media_type).map_err(|err| {
-                    crate::PipelineError::contract(
-                        "KIO-E-PREPARE-OFFICE-CONVERT-001",
-                        err.to_string(),
-                    )
+                    prepare_adapter_error("KIO-E-PREPARE-OFFICE-CONVERT-001", err)
                 })?)
             }
         }
@@ -604,7 +600,7 @@ pub fn pdf_text_pages_bounded(bytes: &[u8]) -> Result<Vec<String>> {
         bytes,
         kio_adapter::deterministic::MAX_DETERMINISTIC_PDF_PAGES,
     )
-    .map_err(|err| crate::PipelineError::contract("KIO-E-PREPARE-PDF-LIMIT-001", err.to_string()))
+    .map_err(|err| prepare_adapter_error("KIO-E-PREPARE-PDF-LIMIT-001", err))
 }
 
 fn align_changed_interval(
@@ -671,6 +667,18 @@ fn lower_hex(bytes: &[u8]) -> String {
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
+}
+
+fn prepare_adapter_error(
+    code: &'static str,
+    error: kio_adapter::AdapterError,
+) -> crate::PipelineError {
+    match error {
+        kio_adapter::AdapterError::ResourceLimit(limit) => {
+            crate::PipelineError::ResourceLimit(limit)
+        }
+        other => crate::PipelineError::contract(code, other.to_string()),
+    }
 }
 
 #[cfg(test)]

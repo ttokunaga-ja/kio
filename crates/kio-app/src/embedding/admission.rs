@@ -44,6 +44,7 @@ pub(crate) fn validate_embedding_aliases<'a>(
     chunks: impl IntoIterator<Item = &'a EmbeddableChunk>,
 ) -> std::result::Result<(), TaskExecutionFailure> {
     let denied = || TaskExecutionFailure {
+        resource_limit: None,
         retry_kind: RetryErrorKind::AuthError,
         retry_after_ms: None,
     };
@@ -51,11 +52,13 @@ pub(crate) fn validate_embedding_aliases<'a>(
     for chunk in chunks {
         if chunk.work_key.chunk_id() != chunk.chunk_id
             || chunk_embedding_hash(chunk, profile).map_err(|_| TaskExecutionFailure {
+                resource_limit: None,
                 retry_kind: RetryErrorKind::ContractViolation,
                 retry_after_ms: None,
             })? != chunk.work_key.embedding_hash()
         {
             return Err(TaskExecutionFailure {
+                resource_limit: None,
                 retry_kind: RetryErrorKind::ContractViolation,
                 retry_after_ms: None,
             });

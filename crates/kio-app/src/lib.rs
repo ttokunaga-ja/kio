@@ -94,6 +94,21 @@ pub mod context;
 pub mod response;
 
 pub fn execute(ctx: &AppContext, command: Command) -> Result<CommandResponse> {
+    execute_with_index_origin(ctx, command, true)
+}
+
+pub(crate) fn execute_watch_index(
+    ctx: &AppContext,
+    args: commands::IndexArgs,
+) -> Result<CommandResponse> {
+    execute_with_index_origin(ctx, Command::Index(args), false)
+}
+
+fn execute_with_index_origin(
+    ctx: &AppContext,
+    command: Command,
+    explicit_index: bool,
+) -> Result<CommandResponse> {
     #[cfg(debug_assertions)]
     let control = kio_core::control::ControlHandle::new(DebugTestControl::from_env());
     #[cfg(not(debug_assertions))]
@@ -148,15 +163,18 @@ pub fn execute(ctx: &AppContext, command: Command) -> Result<CommandResponse> {
         control,
         settings: Arc::new(settings),
     };
-    let result = execute_dispatch(
-        &Invocation {
-            context: ctx,
-            settings: &runtime.settings,
-            control: &runtime.control,
-            locks: &runtime.locks,
-        },
-        command,
-    );
+    let invocation = Invocation {
+        context: ctx,
+        settings: &runtime.settings,
+        control: &runtime.control,
+        locks: &runtime.locks,
+    };
+    let result = match command {
+        Command::Index(args) if !explicit_index => {
+            index::command::run_watch_index(&invocation, args)
+        }
+        command => execute_dispatch(&invocation, command),
+    };
     if result.is_ok() {
         let reasons = runtime.settings.readiness_reasons();
         for (role, reason) in &reasons {

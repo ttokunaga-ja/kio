@@ -275,8 +275,11 @@ pub(crate) fn validated_online_promotions(
     let mut promotions = Vec::new();
     for task in tasks {
         if task.task_type != kio_pipeline::task::TaskType::Markdownize
-            || task.status != TaskStatus::Done
-            || task.fallback_reason.as_deref() != Some("online_adapter_done")
+            || !(task.status == TaskStatus::Done
+                && task.fallback_reason.as_deref() == Some("online_adapter_done")
+                || task.status == TaskStatus::Partial
+                    && task.bbox_annotation_enabled.is_some()
+                    && task.hold_reason == Some(kio_pipeline::task::HoldReason::ResourceLimit))
         {
             continue;
         }
@@ -301,14 +304,23 @@ pub(crate) fn validated_online_promotions(
             r#gen,
             control,
         )?;
-        let complete = !instance.manifest.units.is_empty()
+        let complete = task.status == TaskStatus::Done
+            && !instance.manifest.units.is_empty()
             && instance
                 .manifest
                 .units
                 .iter()
                 .all(|unit| unit.status == UnitStatus::Done)
             && instance.units.len() == instance.manifest.units.len();
-        if !complete {
+        let resource_partial = task.status == TaskStatus::Partial
+            && task.resource_limit.is_some()
+            && instance
+                .manifest
+                .units
+                .iter()
+                .any(|u| u.resource_limit == task.resource_limit)
+            && !instance.units.is_empty();
+        if !complete && !resource_partial {
             return Err(PipelineError::corrupt(
                 task.output_ref.clone(),
                 "Done online Markdownize task points at an incomplete normalized instance",
@@ -383,8 +395,11 @@ fn plan_online_markdownize_promotion(
     let mut current_tasks = Vec::new();
     for task in tasks {
         if task.task_type != TaskType::Markdownize
-            || task.status != TaskStatus::Done
-            || task.fallback_reason.as_deref() != Some("online_adapter_done")
+            || !(task.status == TaskStatus::Done
+                && task.fallback_reason.as_deref() == Some("online_adapter_done")
+                || task.status == TaskStatus::Partial
+                    && task.bbox_annotation_enabled.is_some()
+                    && task.hold_reason == Some(kio_pipeline::task::HoldReason::ResourceLimit))
         {
             continue;
         }
@@ -566,8 +581,11 @@ fn plan_local_markdownize_promotion(
     let mut normalize_by_path = BTreeMap::new();
     for task in tasks {
         if task.task_type != TaskType::Markdownize
-            || task.status != TaskStatus::Done
-            || task.fallback_reason.as_deref() != Some("local_adapter_done")
+            || !(task.status == TaskStatus::Done
+                && task.fallback_reason.as_deref() == Some("local_adapter_done")
+                || task.status == TaskStatus::Partial
+                    && task.bbox_annotation_enabled.is_none()
+                    && task.resource_limit.is_some())
         {
             continue;
         }
@@ -607,8 +625,11 @@ fn validated_local_normalize_ref(
     profile: &AdapterProfile,
 ) -> kio_core::Result<Option<PendingNormalizeRef>> {
     if task.task_type != TaskType::Markdownize
-        || task.status != TaskStatus::Done
-        || task.fallback_reason.as_deref() != Some("local_adapter_done")
+        || !(task.status == TaskStatus::Done
+            && task.fallback_reason.as_deref() == Some("local_adapter_done")
+            || task.status == TaskStatus::Partial
+                && task.bbox_annotation_enabled.is_none()
+                && task.resource_limit.is_some())
     {
         return Ok(None);
     }
@@ -646,17 +667,25 @@ fn validated_local_normalize_ref(
         repo.control(),
     )
     .map_err(pipeline_to_kio)?;
-    if instance.manifest.units.is_empty()
-        || !instance
+    let complete = !instance.manifest.units.is_empty()
+        && instance
             .manifest
             .units
             .iter()
-            .all(|unit| unit.status == UnitStatus::Done)
-        || instance.units.len() != instance.manifest.units.len()
-    {
+            .all(|u| u.status == UnitStatus::Done)
+        && instance.units.len() == instance.manifest.units.len();
+    let resource_partial = task.status == TaskStatus::Partial
+        && task.resource_limit.is_some()
+        && !instance.units.is_empty()
+        && instance
+            .manifest
+            .units
+            .iter()
+            .any(|u| u.resource_limit == task.resource_limit);
+    if !(task.status == TaskStatus::Done && complete || resource_partial) {
         return Err(pipeline_to_kio(PipelineError::corrupt(
             task.output_ref.clone(),
-            "Done local Markdownize task points at an incomplete normalized instance",
+            "local task status differs from normalized units",
         )));
     }
     let manifest_hash = crate::object_persistence::compute_manifest_hash(
@@ -971,6 +1000,8 @@ mod tests {
 
     fn done_task(output_ref: String, raw_hash: String) -> TaskDescriptor {
         TaskDescriptor {
+            unit_retry_at: Default::default(),
+            resource_limit: None,
             task_id: "task_01TEST".to_owned(),
             task_type: TaskType::Markdownize,
             embedding_target: None,
@@ -1013,6 +1044,7 @@ mod tests {
             parent_gen: None,
             run_id: "run_01TEST".to_owned(),
             units: vec![NormalizedUnitManifestEntry {
+                resource_limit: None,
                 order: 0,
                 unit_key: unit_key.clone(),
                 unit_ref: unit_ref(&unit_key),
@@ -1118,6 +1150,7 @@ mod tests {
             parent_gen: None,
             run_id: "run_current".to_owned(),
             units: vec![NormalizedUnitManifestEntry {
+                resource_limit: None,
                 order: 0,
                 unit_key: "page:1".to_owned(),
                 unit_ref: unit_ref("page:1"),

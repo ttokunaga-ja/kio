@@ -78,12 +78,14 @@ pub enum HoldReason {
     Auth,
     TierBApproval,
     LedgerInitializationRequired,
+    ResourceLimit,
 }
 
 impl HoldReason {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::ResourceLimit => "resource_limit",
             Self::Budget => "budget",
             Self::Auth => "auth",
             Self::TierBApproval => "tier_b_approval",
@@ -99,6 +101,7 @@ impl HoldReason {
 #[must_use]
 pub fn hold_reason_for_reason(reason: &str) -> Option<HoldReason> {
     match reason {
+        "resource_limit" => Some(HoldReason::ResourceLimit),
         BUDGET_EXCEEDED_REASON => Some(HoldReason::Budget),
         SECRETS_TIER_B_HOLD_REASON => Some(HoldReason::TierBApproval),
         "auth_error" => Some(HoldReason::Auth),
@@ -132,6 +135,12 @@ pub enum TaskStatus {
 // dropping it is inert; `PartialEq` (`==` in tests and dedup) is retained.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TaskDescriptor {
+    /// Per-unit waits for an independently queued subset. Resource holds keep
+    /// their task-level next_retry_at null; these deadlines never retry a held unit.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub unit_retry_at: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_limit: Option<kio_core::error::ResourceLimit>,
     pub task_id: String,
     #[serde(rename = "type")]
     pub task_type: TaskType,
@@ -184,6 +193,9 @@ struct RequiredNullable<T>(Option<T>);
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TaskDescriptorWire {
+    #[serde(default)]
+    unit_retry_at: BTreeMap<String, String>,
+    resource_limit: Option<kio_core::error::ResourceLimit>,
     task_id: String,
     #[serde(rename = "type")]
     task_type: TaskType,
@@ -229,6 +241,8 @@ impl<'de> Deserialize<'de> for TaskDescriptor {
             }
         }
         Ok(Self {
+            unit_retry_at: wire.unit_retry_at,
+            resource_limit: wire.resource_limit,
             task_id: wire.task_id,
             task_type: wire.task_type,
             mode: wire.mode.0,
@@ -373,6 +387,7 @@ pub enum RetryErrorKind {
     /// A sync provider result may have been billed but cannot be recovered.
     ResultUnknown,
     BudgetExceeded,
+    ResourceLimit,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -815,6 +830,7 @@ pub fn read_capped_task_input(path: impl AsRef<Path>, max_bytes: u64) -> CappedT
 #[must_use]
 pub fn task_retry_kind(task: &TaskDescriptor) -> RetryErrorKind {
     match task.fallback_reason.as_deref() {
+        Some("resource_limit") => RetryErrorKind::ResourceLimit,
         Some("network_error") => RetryErrorKind::NetworkError,
         Some("rate_limit") => RetryErrorKind::RateLimit,
         Some("auth_error") => RetryErrorKind::AuthError,
@@ -880,6 +896,31 @@ pub fn task_auth_revival_allowed(task: &TaskDescriptor, mode: TaskRecoveryMode) 
 }
 
 impl TaskDescriptor {
+    /// Only an explicit resource-change operation may invoke this after rechecking
+    /// the same input and every resource unit selected for the next attempt.
+    pub fn resume_after_resource_change(
+        &mut self,
+        recheck: impl FnOnce(&kio_core::error::ResourceLimit) -> bool,
+    ) -> bool {
+        if !matches!(self.status, TaskStatus::Paused | TaskStatus::Partial)
+            || self.hold_reason != Some(HoldReason::ResourceLimit)
+        {
+            return false;
+        }
+        let Some(limit) = self.resource_limit.as_ref() else {
+            return false;
+        };
+        if !recheck(limit) {
+            return false;
+        }
+        self.status = TaskStatus::Pending;
+        self.hold_reason = None;
+        self.fallback_reason = None;
+        self.resource_limit = None;
+        self.next_retry_at = None;
+        true
+    }
+
     #[must_use]
     pub fn reservation_claim(&self) -> Option<TaskReservationClaim<'_>> {
         match (
@@ -956,6 +997,18 @@ fn validate_task_descriptor_fields(kio_dir: &Path, descriptor: &TaskDescriptor) 
             "task previous_raw_hash is not a valid hash: {previous}"
         )));
     }
+    if descriptor.unit_retry_at.len() > MAX_TASK_UNIT_KEYS
+        || (!descriptor.unit_retry_at.is_empty() && descriptor.task_type != TaskType::Markdownize)
+        || descriptor.unit_retry_at.iter().any(|(key, time)| {
+            key.is_empty()
+                || key.len() > MAX_TASK_ID_BYTES
+                || has_control(key)
+                || time.len() > MAX_TASK_TIMESTAMP_BYTES
+                || has_control(time)
+        })
+    {
+        return Err(corrupt("invalid per-unit retry deadlines".to_owned()));
+    }
     if descriptor.changed_unit_keys.len() > MAX_TASK_UNIT_KEYS
         || descriptor
             .unit_keys
@@ -1001,7 +1054,19 @@ fn validate_task_descriptor_fields(kio_dir: &Path, descriptor: &TaskDescriptor) 
             "skipped task requires an exclusion reason".to_owned(),
         ));
     }
+    if !kio_core::error::ResourceLimit::matches_kind(
+        descriptor
+            .fallback_reason
+            .as_deref()
+            .filter(|_| descriptor.hold_reason == Some(HoldReason::ResourceLimit)),
+        descriptor.resource_limit.as_ref(),
+    ) || (descriptor.resource_limit.is_some() && descriptor.next_retry_at.is_some())
+    {
+        return Err(corrupt("invalid task resource hold descriptor".to_owned()));
+    }
     match (descriptor.status, descriptor.hold_reason) {
+        (TaskStatus::Partial, Some(HoldReason::ResourceLimit))
+            if descriptor.fallback_reason.as_deref() == Some("resource_limit") => {}
         (TaskStatus::Paused, Some(hold_reason))
             if descriptor
                 .fallback_reason
@@ -1233,6 +1298,14 @@ pub fn retry_policy(error_kind: RetryErrorKind) -> RetryPolicy {
             error_code: "KIO-E-SYNC-RESULT-UNKNOWN-001".to_owned(),
             paused: false,
         },
+        RetryErrorKind::ResourceLimit => RetryPolicy {
+            error_kind,
+            retryable: false,
+            max_attempts: Some(0),
+            backoff: "explicit_after_resource_change".to_owned(),
+            error_code: "KIO-E-RESOURCE-LIMIT-001".to_owned(),
+            paused: true,
+        },
         RetryErrorKind::BudgetExceeded => RetryPolicy {
             error_kind,
             retryable: false,
@@ -1298,6 +1371,8 @@ mod tests {
 
     fn valid_task() -> TaskDescriptor {
         TaskDescriptor {
+            unit_retry_at: Default::default(),
+            resource_limit: None,
             task_id: "task_01H".to_owned(),
             task_type: TaskType::Markdownize,
             mode: Some(MarkdownizeMode::Full),
@@ -1327,6 +1402,8 @@ mod tests {
     #[test]
     fn placeholder_task_type_field_is_named_type() {
         let descriptor = TaskDescriptor {
+            unit_retry_at: Default::default(),
+            resource_limit: None,
             task_id: "task_01H".to_owned(),
             task_type: TaskType::Markdownize,
             mode: Some(MarkdownizeMode::Full),
@@ -1446,6 +1523,8 @@ mod tests {
         let dir = crate::test_support::PrivateTempDir::new();
         let store = TaskStore::new(dir.path());
         let mut task = TaskDescriptor {
+            unit_retry_at: Default::default(),
+            resource_limit: None,
             task_id: "task_01H".to_owned(),
             task_type: TaskType::Markdownize,
             mode: Some(MarkdownizeMode::Full),
@@ -1503,6 +1582,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = TaskStore::new(dir.path());
         let task = TaskDescriptor {
+            unit_retry_at: Default::default(),
+            resource_limit: None,
             task_id: "task_01H".to_owned(),
             task_type: TaskType::Markdownize,
             mode: Some(MarkdownizeMode::Full),
@@ -1603,6 +1684,68 @@ mod tests {
         assert_eq!(value["hold_reason"], "budget");
         let current: TaskDescriptor = serde_json::from_value(value).unwrap();
         assert_eq!(current.hold_reason, Some(HoldReason::Budget));
+    }
+
+    #[test]
+    fn explicit_resource_change_rechecks_without_losing_results_or_attempts() {
+        let mut task = valid_task();
+        task.status = TaskStatus::Partial;
+        task.hold_reason = Some(HoldReason::ResourceLimit);
+        task.fallback_reason = Some("resource_limit".to_owned());
+        task.attempts = 3;
+        task.resource_limit = Some(kio_core::error::ResourceLimit {
+            resource: kio_core::error::Resource::Work,
+            stage: "extract".to_owned(),
+            limit: Some(10),
+            observed: Some(11),
+            resource_tier: Some(kio_core::error::ResourceTier::Standard),
+        });
+        let held = task.clone();
+        assert!(!task.resume_after_resource_change(|_| false));
+        assert_eq!(task, held);
+        assert!(!task_retry_allowed(&task));
+        assert!(task.resume_after_resource_change(|limit| limit.observed == Some(11)));
+        assert_eq!(task.status, TaskStatus::Pending);
+        assert_eq!(task.attempts, 3);
+        assert_eq!(task.output_ref, held.output_ref);
+        assert!(task.hold_reason.is_none());
+        assert!(task.resource_limit.is_none());
+        assert!(!task.resume_after_resource_change(|_| true));
+    }
+
+    #[test]
+    fn resource_limit_is_a_non_retrying_hold() {
+        let kind: RetryErrorKind = serde_json::from_str("\"resource_limit\"").unwrap();
+        let policy = retry_policy(kind);
+        assert!(policy.paused);
+        assert!(!policy.retryable);
+        assert_eq!(policy.max_attempts, Some(0));
+        assert_eq!(policy.error_code, "KIO-E-RESOURCE-LIMIT-001");
+        assert_eq!(
+            hold_reason_for_reason("resource_limit"),
+            Some(HoldReason::ResourceLimit)
+        );
+        let mut task = valid_task();
+        task.status = TaskStatus::Partial;
+        task.fallback_reason = Some("resource_limit".to_owned());
+        task.hold_reason = Some(HoldReason::ResourceLimit);
+        task.resource_limit = Some(kio_core::error::ResourceLimit {
+            resource: kio_core::error::Resource::Memory,
+            stage: "extract".to_owned(),
+            limit: None,
+            observed: Some(1024),
+            resource_tier: None,
+        });
+        assert!(validate_task_descriptor_fields(Path::new("."), &task).is_ok());
+        let held = task.clone();
+        task.resource_limit = None;
+        assert!(matches!(
+            validate_task_descriptor_fields(Path::new("."), &task),
+            Err(PipelineError::Corrupt { .. })
+        ));
+        task = held;
+        assert_eq!(task_retry_kind(&task), kind);
+        assert!(!task_retry_allowed(&task));
     }
 
     #[test]

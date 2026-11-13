@@ -402,6 +402,8 @@ pub(crate) fn run_image_embedding_enrichment(
             });
         task_store
             .append(&TaskDescriptor {
+                unit_retry_at: Default::default(),
+                resource_limit: None,
                 task_id: format!("task_{}", new_ulid(embedding.repo.canonical_root())),
                 task_type: TaskType::Embedding,
                 embedding_target: Some(target.clone()),
@@ -584,13 +586,19 @@ pub(crate) fn run_image_embedding_enrichment(
                     .as_deref()
                     .and_then(kio_core::scope::parse_utc_seconds)
                     .map(|seconds| seconds * 1000);
-                let mut claim = match local_store.as_ref().expect("free image state").claim(
-                    &identity,
-                    task.attempts,
-                    floor_next,
-                    crate::embedding::transport::local_max_attempts(embedding.execution),
-                    invocation.control.now_millis(),
-                )? {
+                let mut claim = match local_store
+                    .as_ref()
+                    .expect("free image state")
+                    .claim(
+                        &identity,
+                        task.attempts,
+                        floor_next,
+                        crate::embedding::transport::local_max_attempts(embedding.execution),
+                        invocation.control.now_millis(),
+                    )
+                    .map_err(|error| {
+                        crate::task_execution::persist_resource_error(task_store, &[task], error)
+                    })? {
                     crate::local_execution::Claim::Claimed(claim) => claim,
                     crate::local_execution::Claim::Busy => {
                         outcome.inflight += 1;
@@ -618,7 +626,9 @@ pub(crate) fn run_image_embedding_enrichment(
                 };
                 // A known result still requires current policy/grant admission.
                 // Its accepted attempt is never refunded or dispatched again.
-                let recovered_bytes = claim.result()?;
+                let recovered_bytes = claim.result().map_err(|error| {
+                    crate::task_execution::persist_resource_error(task_store, &[task], error)
+                })?;
                 let requires_secret = image_authority.requires_secret_approval(image_hash);
                 if let Err(error) = admit_embedding_transport(
                     adapter_settings,
@@ -682,7 +692,12 @@ pub(crate) fn run_image_embedding_enrichment(
                                 claim.attempts(),
                                 next,
                                 failure.retry_kind,
+                                failure.resource_limit.clone(),
                             )?;
+                            outcome.resource_limit = failure
+                                .resource_limit
+                                .clone()
+                                .or_else(|| outcome.resource_limit.clone());
                             count_embedding_failure(&mut outcome, failure.retry_kind, 1);
                             if next.is_some() {
                                 outcome.failed_retryable += 1;
@@ -813,6 +828,7 @@ pub(crate) fn run_image_embedding_enrichment(
                     task_store,
                     &image_output_ref,
                     &TaskExecutionFailure {
+                        resource_limit: None,
                         retry_kind: RetryErrorKind::ResultUnknown,
                         retry_after_ms: None,
                     },
@@ -1344,6 +1360,10 @@ fn apply_image_embedding_failure(
     // Failure transitions preserve any previous claim, matching text tasks.
     outcome.failed_retryable +=
         apply_embedding_transitions(task_store, &transitions, now, &BTreeMap::new())?;
+    outcome.resource_limit = failure
+        .resource_limit
+        .clone()
+        .or_else(|| outcome.resource_limit.clone());
     count_embedding_failure(outcome, failure.retry_kind, 1);
     Ok(())
 }

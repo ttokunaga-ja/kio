@@ -243,6 +243,8 @@ fn mistral_client(row: &BatchRequestRow) -> MistralClient {
 
 fn markdown_task(row: &BatchRequestRow) -> TaskDescriptor {
     TaskDescriptor {
+        unit_retry_at: Default::default(),
+        resource_limit: None,
         task_id: "task_recovery".into(),
         task_type: TaskType::Markdownize,
         embedding_target: None,

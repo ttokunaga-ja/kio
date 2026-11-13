@@ -116,6 +116,13 @@ pub(crate) fn known_markdownize_completion(
         .into_iter()
         .find(|task| task.task_id == task_id)
         .ok_or_else(|| KioError::schema("completed markdownize task disappeared"))?;
+    if let Some(limit) = task.resource_limit.clone() {
+        return Ok(ExecOutcome {
+            resource_limit: Some(limit),
+            failed: 1,
+            ..ExecOutcome::default()
+        });
+    }
     if task.status == TaskStatus::Done {
         return Ok(ExecOutcome {
             executed: 1,
@@ -143,8 +150,9 @@ pub(crate) fn known_markdownize_completion(
 /// keeps its meaning (tasks completed OK == `tasks_executed`); `failed` is tasks
 /// that transitioned to Failed this pass; `attempted()` = executed + failed
 /// (budget-paused / held tasks that issued no adapter call are excluded).
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct ExecOutcome {
+    pub(crate) resource_limit: Option<kio_core::error::ResourceLimit>,
     pub(crate) executed: usize,
     pub(crate) failed: usize,
     /// R11-2: tasks whose online send this pass was halted by the budget cap
@@ -180,11 +188,14 @@ pub(crate) struct ExecOutcome {
 }
 
 impl ExecOutcome {
-    pub(crate) fn attempted(self) -> usize {
+    pub(crate) fn attempted(&self) -> usize {
         self.executed + self.failed
     }
 
     pub(crate) fn add(&mut self, other: ExecOutcome) {
+        if self.resource_limit.is_none() {
+            self.resource_limit = other.resource_limit;
+        }
         self.executed += other.executed;
         self.failed += other.failed;
         self.paused += other.paused;
@@ -197,7 +208,9 @@ impl ExecOutcome {
 
 pub(crate) fn batch_completion(outcome: &ExecOutcome) -> crate::response::Completion {
     use crate::response::Completion;
-    if outcome.auth_failed > 0 {
+    if outcome.resource_limit.is_some() {
+        Completion::Partial
+    } else if outcome.auth_failed > 0 {
         Completion::AuthRequired
     } else if outcome.paused > 0 {
         Completion::BudgetBlocked
@@ -219,7 +232,9 @@ pub(crate) fn batch_error_code(completion: crate::response::Completion) -> Optio
 }
 pub(crate) fn enrichment_completion(outcome: &ExecOutcome) -> crate::response::Completion {
     use crate::response::Completion;
-    if outcome.auth_failed > 0 {
+    if outcome.resource_limit.is_some() {
+        Completion::Partial
+    } else if outcome.auth_failed > 0 {
         Completion::AuthRequired
     } else if outcome.paused > 0 {
         Completion::BudgetBlocked
@@ -377,12 +392,18 @@ fn execute_pending_markdownize_tasks(
             }
         }
     }
+    let mut queued_held = BTreeSet::new();
+    for task in store.all().map_err(pipeline_to_kio)? {
+        if queued_held_markdownize_retry(store, &task)? {
+            queued_held.insert(task.task_id);
+        }
+    }
     let has_paid_work = store.all().map_err(pipeline_to_kio)?.iter().any(|task| {
         task.task_type == TaskType::Markdownize
             && targets_standard_online_markdownize(store.kio_dir(), task, &output_ref)
             && (task.reservation_id.is_some()
                 || auth_revivable.contains(&task.task_id)
-                || (task.status == TaskStatus::Pending
+                || ((task.status == TaskStatus::Pending || queued_held.contains(&task.task_id))
                     && task_retry_due(task, ctx.control)
                     && (secrets_approved || classify_secret(&task.input_path).is_none())))
     });
@@ -411,28 +432,27 @@ fn execute_pending_markdownize_tasks(
                 release_task_charge_if_open(&ledger, &key)?;
             }
         }
-        store
-            .update_matching(|task| {
-                if !auth_revivable.contains(&task.task_id) {
-                    return false;
-                }
-                task.clear_reservation();
-                task.status = TaskStatus::Pending;
-                task.fallback_reason = Some("ready_for_online_adapter".to_owned());
-                task.hold_reason = None;
-                task.attempts = 0;
-                task.next_retry_at = None;
-                task.heartbeat_at = None;
-                true
-            })
-            .map_err(pipeline_to_kio)?;
+        update_tasks_preserving_resource_holds(store, |task| {
+            if !auth_revivable.contains(&task.task_id) {
+                return false;
+            }
+            task.clear_reservation();
+            task.status = TaskStatus::Pending;
+            task.fallback_reason = Some("ready_for_online_adapter".to_owned());
+            task.hold_reason = None;
+            task.attempts = 0;
+            task.next_retry_at = None;
+            task.heartbeat_at = None;
+            true
+        })
+        .map_err(pipeline_to_kio)?;
     }
     let tasks = store
         .all()
         .map_err(pipeline_to_kio)?
         .into_iter()
         .filter(|task| {
-            task.status == TaskStatus::Pending
+            (task.status == TaskStatus::Pending || queued_held.contains(&task.task_id))
                 && task.task_type == TaskType::Markdownize
                 && targets_standard_online_markdownize(store.kio_dir(), task, &output_ref)
                 // Honor an unelapsed retry backoff even for a Pending task
@@ -468,6 +488,11 @@ fn execute_pending_markdownize_tasks(
         // + entering the executor. This mirrors the executor's own R14-2/R9-2 guards,
         // hoisted ahead of the charge.
         let prepared_input = match classify_online_markdownize_precondition(repo, &task) {
+            OnlineMarkdownizePrecondition::ResourceLimit(limit) => {
+                hold_resource_task(store, &task_id, Some(limit.clone()))?;
+                counts.resource_limit = Some(limit);
+                continue;
+            }
             OnlineMarkdownizePrecondition::Send(prepared_input) => prepared_input,
             OnlineMarkdownizePrecondition::PolicyUnavailable(error) => return Err(error),
             OnlineMarkdownizePrecondition::AwaitConversion => {
@@ -483,17 +508,16 @@ fn execute_pending_markdownize_tasks(
                 // retirement below; no NEW charge is reserved this pass (the
                 // precondition failed before the charge).
                 release_task_charge_if_open(&ledger, &key)?;
-                store
-                    .update_matching(|candidate| {
-                        if candidate.task_id == task_id {
-                            retire_online_task(candidate);
-                            candidate.attempts = candidate.attempts.saturating_add(1);
-                            true
-                        } else {
-                            false
-                        }
-                    })
-                    .map_err(pipeline_to_kio)?;
+                update_tasks_preserving_resource_holds(store, |candidate| {
+                    if candidate.task_id == task_id {
+                        retire_online_task(candidate);
+                        candidate.attempts = candidate.attempts.saturating_add(1);
+                        true
+                    } else {
+                        false
+                    }
+                })
+                .map_err(pipeline_to_kio)?;
                 counts.failed += 1;
                 continue;
             }
@@ -521,22 +545,21 @@ fn execute_pending_markdownize_tasks(
                     )
                 });
                 let reason = retry_reason(RetryErrorKind::ContractViolation).to_owned();
-                store
-                    .update_matching(|candidate| {
-                        if candidate.task_id == task_id {
-                            candidate.status = TaskStatus::Failed;
-                            candidate.fallback_reason = Some(reason.clone());
-                            candidate.hold_reason = None;
-                            candidate.heartbeat_at = None;
-                            candidate.attempts = attempts_after;
-                            candidate.next_retry_at = next_retry_at.clone();
-                            candidate.clear_reservation();
-                            true
-                        } else {
-                            false
-                        }
-                    })
-                    .map_err(pipeline_to_kio)?;
+                update_tasks_preserving_resource_holds(store, |candidate| {
+                    if candidate.task_id == task_id {
+                        candidate.status = TaskStatus::Failed;
+                        candidate.fallback_reason = Some(reason.clone());
+                        candidate.hold_reason = None;
+                        candidate.heartbeat_at = None;
+                        candidate.attempts = attempts_after;
+                        candidate.next_retry_at = next_retry_at.clone();
+                        candidate.clear_reservation();
+                        true
+                    } else {
+                        false
+                    }
+                })
+                .map_err(pipeline_to_kio)?;
                 counts.failed += 1;
                 if next_retry_at.is_some() {
                     counts.failed_retryable += 1;
@@ -605,21 +628,20 @@ fn execute_pending_markdownize_tasks(
             && !sync_markdownize_credential_available(adapter_settings, ctx.control)?
         {
             let reason = retry_reason(RetryErrorKind::AuthError).to_owned();
-            store
-                .update_matching(|candidate| {
-                    if candidate.task_id == task_id {
-                        candidate.status = TaskStatus::Paused;
-                        candidate.hold_reason = Some(HoldReason::Auth);
-                        candidate.fallback_reason = Some(reason.clone());
-                        candidate.heartbeat_at = None;
-                        candidate.next_retry_at = None;
-                        candidate.clear_reservation();
-                        true
-                    } else {
-                        false
-                    }
-                })
-                .map_err(pipeline_to_kio)?;
+            update_tasks_preserving_resource_holds(store, |candidate| {
+                if candidate.task_id == task_id {
+                    candidate.status = TaskStatus::Paused;
+                    candidate.hold_reason = Some(HoldReason::Auth);
+                    candidate.fallback_reason = Some(reason.clone());
+                    candidate.heartbeat_at = None;
+                    candidate.next_retry_at = None;
+                    candidate.clear_reservation();
+                    true
+                } else {
+                    false
+                }
+            })
+            .map_err(pipeline_to_kio)?;
             counts.failed += 1;
             counts.auth_failed += 1;
             continue;
@@ -640,18 +662,17 @@ fn execute_pending_markdownize_tasks(
         )?;
         let (intent_token, reserved_usd) = match charge {
             TaskChargeOutcome::BudgetExceeded => {
-                store
-                    .update_matching(|candidate| {
-                        if candidate.task_id == task_id {
-                            candidate.status = TaskStatus::Paused;
-                            candidate.fallback_reason = Some("budget_exceeded".to_owned());
-                            candidate.hold_reason = Some(HoldReason::Budget);
-                            true
-                        } else {
-                            false
-                        }
-                    })
-                    .map_err(pipeline_to_kio)?;
+                update_tasks_preserving_resource_holds(store, |candidate| {
+                    if candidate.task_id == task_id {
+                        candidate.status = TaskStatus::Paused;
+                        candidate.fallback_reason = Some("budget_exceeded".to_owned());
+                        candidate.hold_reason = Some(HoldReason::Budget);
+                        true
+                    } else {
+                        false
+                    }
+                })
+                .map_err(pipeline_to_kio)?;
                 // R11-2: a Pending task budget-paused THIS pass → docs/04 §5.6 exit 6.
                 counts.paused += 1;
                 continue;
@@ -685,23 +706,22 @@ fn execute_pending_markdownize_tasks(
                     // reservation stamps mirror the sync Running flip so purge
                     // and diagnostics can find the live ledger row.
                     let poll_at = batch_poll_retry_at(ctx.control);
-                    store
-                        .update_matching(|candidate| {
-                            if candidate.task_id == task_id {
-                                candidate.status = TaskStatus::Pending;
-                                candidate.fallback_reason = Some(BATCH_SUBMITTED_REASON.to_owned());
-                                candidate.hold_reason = None;
-                                candidate.heartbeat_at = None;
-                                candidate.next_retry_at = Some(poll_at.clone());
-                                candidate.reservation_id = Some(intent_token.clone());
-                                candidate.reserved_usd = Some(reserved_usd);
-                                candidate.reserved_month = Some(month.clone());
-                                true
-                            } else {
-                                false
-                            }
-                        })
-                        .map_err(pipeline_to_kio)?;
+                    update_tasks_preserving_resource_holds(store, |candidate| {
+                        if candidate.task_id == task_id {
+                            candidate.status = TaskStatus::Pending;
+                            candidate.fallback_reason = Some(BATCH_SUBMITTED_REASON.to_owned());
+                            candidate.hold_reason = None;
+                            candidate.heartbeat_at = None;
+                            candidate.next_retry_at = Some(poll_at.clone());
+                            candidate.reservation_id = Some(intent_token.clone());
+                            candidate.reserved_usd = Some(reserved_usd);
+                            candidate.reserved_month = Some(month.clone());
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                    .map_err(pipeline_to_kio)?;
                     counts.inflight += 1;
                 }
                 Err(error) => {
@@ -724,29 +744,28 @@ fn execute_pending_markdownize_tasks(
             }
             continue;
         }
-        store
-            .update_matching(|candidate| {
-                if candidate.task_id == task_id {
-                    candidate.status = TaskStatus::Running;
-                    candidate.heartbeat_at = Some(ctx.control.now_utc_seconds());
-                    candidate.fallback_reason = None;
-                    // Stamp the live reservation's ledger selector (purge and any
-                    // future diagnostics look it up by `intent_token`, not by
-                    // reconstructing the ledger key from possibly-since-changed
-                    // config — see `purge.rs`'s `delete_target_tasks`). `reserved_usd`/
-                    // `reserved_month` accompany it only because
-                    // `task::validate_task_descriptor` requires all three stamps
-                    // present together or all absent; the ledger's own
-                    // `batch_requests.estimated_usd` is the actual source of truth.
-                    candidate.reservation_id = Some(intent_token.clone());
-                    candidate.reserved_usd = Some(reserved_usd);
-                    candidate.reserved_month = Some(month.clone());
-                    true
-                } else {
-                    false
-                }
-            })
-            .map_err(pipeline_to_kio)?;
+        update_tasks_preserving_resource_holds(store, |candidate| {
+            if candidate.task_id == task_id {
+                candidate.status = TaskStatus::Running;
+                candidate.heartbeat_at = Some(ctx.control.now_utc_seconds());
+                candidate.fallback_reason = None;
+                // Stamp the live reservation's ledger selector (purge and any
+                // future diagnostics look it up by `intent_token`, not by
+                // reconstructing the ledger key from possibly-since-changed
+                // config — see `purge.rs`'s `delete_target_tasks`). `reserved_usd`/
+                // `reserved_month` accompany it only because
+                // `task::validate_task_descriptor` requires all three stamps
+                // present together or all absent; the ledger's own
+                // `batch_requests.estimated_usd` is the actual source of truth.
+                candidate.reservation_id = Some(intent_token.clone());
+                candidate.reserved_usd = Some(reserved_usd);
+                candidate.reserved_month = Some(month.clone());
+                true
+            } else {
+                false
+            }
+        })
+        .map_err(pipeline_to_kio)?;
         // QA13 (step4b-contract-tests-p3a.md §E, 04 §5.5 L880): thread this
         // send's ledger `intent_token` (stable across a crash-window resend —
         // see `MarkdownizeRequest::idempotency_token`'s doc) into the adapter
@@ -786,37 +805,25 @@ fn execute_pending_markdownize_tasks(
                     ctx.locks,
                 );
                 settle_task_charge_success(&ledger, &key, &intent_token, billed)?;
-                store
-                    .update_matching(|candidate| {
-                        if candidate.task_id == task_id {
-                            candidate.status = outcome.status;
-                            candidate.output_ref = outcome.output_ref.clone();
-                            candidate.fallback_reason = Some("online_adapter_done".to_owned());
-                            candidate.heartbeat_at = None;
-                            candidate.clear_reservation();
-                            // R19-5: a unit-scoped retry that still returns Partial (units
-                            // missing) consumed one re-drive of the retry budget — advance
-                            // `attempts` HERE, the single accounting point, so it converges
-                            // on `max_attempts` (the Err arm below does the same). Pre-R19-5
-                            // this lived in the incomplete-manifest reenqueue path and
-                            // double-counted with the Err arm.
-                            if matches!(outcome.status, TaskStatus::Partial | TaskStatus::Failed) {
-                                candidate.attempts = candidate.attempts.saturating_add(1);
-                            }
-                            // R13-1: record the normalization-run provenance
-                            // (docs/04:474-479) so `status` and the next incremental
-                            // decision (consecutive count) can see mode / previous /
-                            // changed units. `Full` clears any prior incremental mark.
-                            candidate.mode = Some(outcome.mode);
-                            candidate.previous_raw_hash = outcome.previous_raw_hash.clone();
-                            candidate.parent_run_id = outcome.parent_run_id.clone();
-                            candidate.changed_unit_keys = outcome.changed_unit_keys.clone();
-                            true
-                        } else {
-                            false
-                        }
-                    })
-                    .map_err(pipeline_to_kio)?;
+                update_tasks_preserving_resource_holds(store, |candidate| {
+                    if candidate.task_id == task_id {
+                        outcome.apply_to_task(candidate);
+                        candidate.heartbeat_at = None;
+                        candidate.clear_reservation();
+                        // R13-1: record the normalization-run provenance
+                        // (docs/04:474-479) so `status` and the next incremental
+                        // decision (consecutive count) can see mode / previous /
+                        // changed units. `Full` clears any prior incremental mark.
+                        candidate.mode = Some(outcome.mode);
+                        candidate.previous_raw_hash = outcome.previous_raw_hash.clone();
+                        candidate.parent_run_id = outcome.parent_run_id.clone();
+                        candidate.changed_unit_keys = outcome.changed_unit_keys.clone();
+                        true
+                    } else {
+                        false
+                    }
+                })
+                .map_err(pipeline_to_kio)?;
                 counts.add(known_markdownize_completion(store, &task_id)?);
             }
             Err(error) => {
@@ -893,6 +900,12 @@ fn record_sync_markdownize_failure(
     counts: &mut ExecOutcome,
 ) -> Result<()> {
     match error.retry_kind {
+        RetryErrorKind::ResourceLimit => {
+            settle_task_charge_unknown(ledger, key, intent_token, reserved_usd)?;
+            hold_resource_task(store, task_id, error.resource_limit.clone())?;
+            counts.resource_limit = error.resource_limit.clone();
+            counts.failed += 1;
+        }
         RetryErrorKind::AuthError | RetryErrorKind::RateLimit | RetryErrorKind::QuotaExceeded => {
             settle_sync_definitive_rejection(ledger, key, intent_token, error.retry_kind)?;
             let policy = retry_policy(error.retry_kind);
@@ -910,38 +923,37 @@ fn record_sync_markdownize_failure(
                 )
             });
             let reason = retry_reason(error.retry_kind).to_owned();
-            store
-                .update_matching(|task| {
-                    if task.task_id != task_id {
-                        return false;
+            update_tasks_preserving_resource_holds(store, |task| {
+                if task.task_id != task_id {
+                    return false;
+                }
+                task.clear_reservation();
+                task.heartbeat_at = None;
+                task.hold_reason = None;
+                task.fallback_reason = Some(reason.clone());
+                match error.retry_kind {
+                    RetryErrorKind::AuthError => {
+                        task.status = TaskStatus::Paused;
+                        task.hold_reason = Some(HoldReason::Auth);
+                        task.next_retry_at = None;
                     }
-                    task.clear_reservation();
-                    task.heartbeat_at = None;
-                    task.hold_reason = None;
-                    task.fallback_reason = Some(reason.clone());
-                    match error.retry_kind {
-                        RetryErrorKind::AuthError => {
-                            task.status = TaskStatus::Paused;
-                            task.hold_reason = Some(HoldReason::Auth);
-                            task.next_retry_at = None;
-                        }
-                        RetryErrorKind::RateLimit => {
-                            task.status = TaskStatus::Pending;
-                            task.next_retry_at = Some(rate_limit_retry_at(
-                                &ledger.control().now_utc_seconds(),
-                                error.retry_after_ms,
-                            ));
-                        }
-                        RetryErrorKind::QuotaExceeded => {
-                            task.status = TaskStatus::Failed;
-                            task.attempts = attempts_after;
-                            task.next_retry_at = next_retry_at.clone();
-                        }
-                        _ => unreachable!("definitive sync rejection was matched above"),
+                    RetryErrorKind::RateLimit => {
+                        task.status = TaskStatus::Pending;
+                        task.next_retry_at = Some(rate_limit_retry_at(
+                            &ledger.control().now_utc_seconds(),
+                            error.retry_after_ms,
+                        ));
                     }
-                    true
-                })
-                .map_err(pipeline_to_kio)?;
+                    RetryErrorKind::QuotaExceeded => {
+                        task.status = TaskStatus::Failed;
+                        task.attempts = attempts_after;
+                        task.next_retry_at = next_retry_at.clone();
+                    }
+                    _ => unreachable!("definitive sync rejection was matched above"),
+                }
+                true
+            })
+            .map_err(pipeline_to_kio)?;
             counts.failed += 1;
             match error.retry_kind {
                 RetryErrorKind::AuthError => counts.auth_failed += 1,
@@ -989,6 +1001,11 @@ fn record_online_send_failure(
     settle_on_terminal: bool,
 ) -> Result<()> {
     match error.retry_kind {
+        RetryErrorKind::ResourceLimit => {
+            hold_resource_task(store, task_id, error.resource_limit.clone())?;
+            counts.resource_limit = error.resource_limit.clone();
+            counts.failed += 1;
+        }
         RetryErrorKind::RateLimit => {
             // QA3 (04 §5.2 L682-683): "paused ではなく pending +
             // next_retry_at" — stays Pending, never Failed. `attempts`
@@ -999,20 +1016,19 @@ fn record_online_send_failure(
             let next_retry_at =
                 rate_limit_retry_at(&ledger.control().now_utc_seconds(), error.retry_after_ms);
             let reason = retry_reason(RetryErrorKind::RateLimit).to_owned();
-            store
-                .update_matching(|candidate| {
-                    if candidate.task_id == task_id {
-                        candidate.status = TaskStatus::Pending;
-                        candidate.fallback_reason = Some(reason.clone());
-                        candidate.hold_reason = None;
-                        candidate.heartbeat_at = None;
-                        candidate.next_retry_at = Some(next_retry_at.clone());
-                        true
-                    } else {
-                        false
-                    }
-                })
-                .map_err(pipeline_to_kio)?;
+            update_tasks_preserving_resource_holds(store, |candidate| {
+                if candidate.task_id == task_id {
+                    candidate.status = TaskStatus::Pending;
+                    candidate.fallback_reason = Some(reason.clone());
+                    candidate.hold_reason = None;
+                    candidate.heartbeat_at = None;
+                    candidate.next_retry_at = Some(next_retry_at.clone());
+                    true
+                } else {
+                    false
+                }
+            })
+            .map_err(pipeline_to_kio)?;
             // R9-7: a driven task that failed still attempted an online
             // send — count it so `batch` JSON surfaces the attempt.
             counts.failed += 1;
@@ -1033,21 +1049,20 @@ fn record_online_send_failure(
                 settle_task_charge_unknown(ledger, key, intent_token, reserved_usd)?;
             }
             let reason = retry_reason(RetryErrorKind::AuthError).to_owned();
-            store
-                .update_matching(|candidate| {
-                    if candidate.task_id == task_id {
-                        candidate.status = TaskStatus::Paused;
-                        candidate.hold_reason = Some(HoldReason::Auth);
-                        candidate.fallback_reason = Some(reason.clone());
-                        candidate.heartbeat_at = None;
-                        candidate.next_retry_at = None;
-                        candidate.clear_reservation();
-                        true
-                    } else {
-                        false
-                    }
-                })
-                .map_err(pipeline_to_kio)?;
+            update_tasks_preserving_resource_holds(store, |candidate| {
+                if candidate.task_id == task_id {
+                    candidate.status = TaskStatus::Paused;
+                    candidate.hold_reason = Some(HoldReason::Auth);
+                    candidate.fallback_reason = Some(reason.clone());
+                    candidate.heartbeat_at = None;
+                    candidate.next_retry_at = None;
+                    candidate.clear_reservation();
+                    true
+                } else {
+                    false
+                }
+            })
+            .map_err(pipeline_to_kio)?;
             counts.failed += 1;
             // R11-2/04 §5.6 exit 5: auth_error needs user action.
             counts.auth_failed += 1;
@@ -1080,25 +1095,24 @@ fn record_online_send_failure(
                 settle_task_charge_unknown(ledger, key, intent_token, reserved_usd)?;
             }
             let reason = retry_reason(error.retry_kind).to_owned();
-            store
-                .update_matching(|candidate| {
-                    if candidate.task_id == task_id {
-                        candidate.status = TaskStatus::Failed;
-                        candidate.fallback_reason = Some(reason.clone());
-                        // A Failed task is not a hold.
-                        candidate.hold_reason = None;
-                        candidate.heartbeat_at = None;
-                        candidate.attempts = candidate.attempts.saturating_add(1);
-                        candidate.next_retry_at = next_retry_at.clone();
-                        if settles_now {
-                            candidate.clear_reservation();
-                        }
-                        true
-                    } else {
-                        false
+            update_tasks_preserving_resource_holds(store, |candidate| {
+                if candidate.task_id == task_id {
+                    candidate.status = TaskStatus::Failed;
+                    candidate.fallback_reason = Some(reason.clone());
+                    // A Failed task is not a hold.
+                    candidate.hold_reason = None;
+                    candidate.heartbeat_at = None;
+                    candidate.attempts = candidate.attempts.saturating_add(1);
+                    candidate.next_retry_at = next_retry_at.clone();
+                    if settles_now {
+                        candidate.clear_reservation();
                     }
-                })
-                .map_err(pipeline_to_kio)?;
+                    true
+                } else {
+                    false
+                }
+            })
+            .map_err(pipeline_to_kio)?;
             // R9-7: a driven task that failed still attempted an online send
             // (charge consumed) — count it so `batch` JSON surfaces the
             // attempt instead of reporting only successes.
@@ -1121,6 +1135,7 @@ fn record_online_send_failure(
 
 pub(crate) fn retry_reason(kind: RetryErrorKind) -> &'static str {
     match kind {
+        RetryErrorKind::ResourceLimit => "resource_limit",
         RetryErrorKind::NetworkError => "network_error",
         RetryErrorKind::RateLimit => "rate_limit",
         RetryErrorKind::AuthError => "auth_error",
@@ -1136,6 +1151,7 @@ pub(crate) fn retry_reason(kind: RetryErrorKind) -> &'static str {
 
 pub(crate) fn retry_kind_from_reason(reason: Option<&str>) -> RetryErrorKind {
     match reason {
+        Some("resource_limit") => RetryErrorKind::ResourceLimit,
         Some("network_error") => RetryErrorKind::NetworkError,
         Some("rate_limit") => RetryErrorKind::RateLimit,
         Some("auth_error") => RetryErrorKind::AuthError,
@@ -1186,10 +1202,15 @@ pub(crate) fn is_reservation_bearing_send_failure(task: &TaskDescriptor) -> bool
 }
 
 pub(crate) fn task_retry_due(task: &TaskDescriptor, control: &ControlHandle) -> bool {
+    let now = control.now_utc_seconds();
     task.next_retry_at
         .as_deref()
-        .map(|retry_at| retry_at <= control.now_utc_seconds().as_str())
-        .unwrap_or(true)
+        .is_none_or(|retry_at| retry_at <= now.as_str())
+        && task
+            .unit_keys
+            .iter()
+            .flatten()
+            .all(|key| task.unit_retry_at.get(key).is_none_or(|time| time <= &now))
 }
 
 /// Absolute time a failed task becomes eligible for retry: `now` plus the
@@ -1334,6 +1355,7 @@ pub(crate) fn media_type_for_cli_path(path: &Path) -> &'static str {
 /// so the three named buckets always appear (even at 0) and there is no
 /// compatibility/unknown bucket.
 pub(crate) fn paused_tasks_by_hold_reason(tasks: &[TaskDescriptor]) -> PausedTasksByHoldReason {
+    let mut resource_limit = 0u64;
     let mut budget = 0u64;
     let mut auth = 0u64;
     let mut tier_b_approval = 0u64;
@@ -1343,6 +1365,7 @@ pub(crate) fn paused_tasks_by_hold_reason(tasks: &[TaskDescriptor]) -> PausedTas
             continue;
         }
         match task.hold_reason {
+            Some(HoldReason::ResourceLimit) => resource_limit += 1,
             Some(HoldReason::Budget) => budget += 1,
             Some(HoldReason::Auth) => auth += 1,
             Some(HoldReason::TierBApproval) => tier_b_approval += 1,
@@ -1351,6 +1374,7 @@ pub(crate) fn paused_tasks_by_hold_reason(tasks: &[TaskDescriptor]) -> PausedTas
         }
     }
     PausedTasksByHoldReason {
+        resource_limit,
         budget,
         auth,
         tier_b_approval,
@@ -1613,7 +1637,10 @@ pub(crate) fn enqueue_online_placeholder_task(
                     tool_profile_hash,
                     ..
                 }) => {
-                    task.fallback_reason.as_deref() == Some("local_adapter_done")
+                    (matches!(
+                        task.fallback_reason.as_deref(),
+                        Some("local_adapter_done" | "resource_limit")
+                    ) || task.unit_keys.is_some())
                         && tool_profile_hash == profile.tool_profile_hash
                 }
                 _ => false,
@@ -1639,7 +1666,10 @@ pub(crate) fn enqueue_online_placeholder_task(
                     if local_ocr.is_some() {
                         targets_selected(task)
                     } else {
-                        task.fallback_reason.as_deref() == Some("online_adapter_done")
+                        matches!(
+                            task.fallback_reason.as_deref(),
+                            Some("online_adapter_done" | "resource_limit")
+                        )
                     }
                 }
                 // R19-3: a `retired_non_live` Failed task must NOT block a fresh enqueue
@@ -1654,6 +1684,9 @@ pub(crate) fn enqueue_online_placeholder_task(
             }
         })
     {
+        if existing.resource_limit.is_some() {
+            result.resource_limit = existing.resource_limit.clone();
+        }
         match existing.status {
             TaskStatus::Paused => result.paused_tasks += 1,
             TaskStatus::Pending => result.pending_online_tasks += 1,
@@ -1747,4 +1780,247 @@ pub(crate) fn budget_remaining_from_totals(
         .folder_monthly_usd_cap
         .map(|cap| cap - folder_spent);
     (device_remaining, folder_remaining)
+}
+
+pub(crate) fn resource_hold_status(store: &TaskStore, task: &TaskDescriptor) -> Result<TaskStatus> {
+    match kio_pipeline::task::validate_task_output_ref(store.kio_dir(), task)
+        .map_err(pipeline_to_kio)?
+    {
+        kio_pipeline::task::TaskOutputRef::NormalizedInstance {
+            raw_hash,
+            tool_profile_hash,
+            r#gen,
+            ..
+        } => {
+            let instance =
+                kio_pipeline::markdownize::load_validated_normalized_instance_with_control(
+                    store.kio_dir(),
+                    &raw_hash,
+                    &tool_profile_hash,
+                    r#gen,
+                    store.control(),
+                )
+                .map_err(pipeline_to_kio)?;
+            Ok(if instance.units.is_empty() {
+                TaskStatus::Paused
+            } else {
+                TaskStatus::Partial
+            })
+        }
+        _ => Ok(TaskStatus::Paused),
+    }
+}
+
+pub(crate) fn hold_resource_task(
+    store: &TaskStore,
+    task_id: &str,
+    limit: Option<kio_core::error::ResourceLimit>,
+) -> Result<()> {
+    let limit =
+        limit.ok_or_else(|| KioError::schema("resource failure is missing its descriptor"))?;
+    let tasks = store.all().map_err(pipeline_to_kio)?;
+    let task = tasks
+        .iter()
+        .find(|task| task.task_id == task_id)
+        .ok_or_else(|| KioError::schema("resource-held task disappeared"))?;
+    let status = resource_hold_status(store, task)?;
+    store
+        .update_matching(|task| {
+            if task.task_id != task_id {
+                return false;
+            }
+            task.status = status;
+            task.hold_reason = Some(HoldReason::ResourceLimit);
+            task.resource_limit = Some(limit.clone());
+            task.fallback_reason = Some("resource_limit".to_owned());
+            task.next_retry_at = None;
+            task.heartbeat_at = None;
+            true
+        })
+        .map_err(pipeline_to_kio)?;
+    Ok(())
+}
+
+/// Preserve typed local exhaustion without interpreting corrupt/unsafe records
+/// by their message or error code. The original task owns retry accounting.
+pub(crate) fn persist_resource_error(
+    store: &TaskStore,
+    prior_tasks: &[&TaskDescriptor],
+    error: KioError,
+) -> KioError {
+    let Some(limit) = error.resource_limit().cloned() else {
+        return error;
+    };
+    let mut statuses = BTreeMap::new();
+    for task in prior_tasks {
+        match resource_hold_status(store, task) {
+            Ok(status) => {
+                statuses.insert(task.task_id.clone(), status);
+            }
+            Err(failure) => return failure,
+        }
+    }
+    let result = store.update_matching(|task| {
+        let Some(prior) = prior_tasks
+            .iter()
+            .find(|prior| prior.task_id == task.task_id)
+        else {
+            return false;
+        };
+        if task.status == TaskStatus::Done {
+            return false;
+        }
+        task.status = statuses[&task.task_id];
+        task.hold_reason = Some(HoldReason::ResourceLimit);
+        task.fallback_reason = Some("resource_limit".to_owned());
+        task.resource_limit = Some(limit.clone());
+        task.attempts = prior.attempts;
+        task.next_retry_at = None;
+        task.heartbeat_at = None;
+        true
+    });
+    match result {
+        Ok(_) => error,
+        Err(failure) => pipeline_to_kio(failure),
+    }
+}
+
+/// A queued subset may run while sibling resource units stay held. Resource
+/// units in that explicit queue must still pass their own current recheck.
+/// The immutable manifest, not a task-level retry kind, authorizes that subset.
+pub(crate) fn queued_held_markdownize_retry(
+    store: &TaskStore,
+    task: &TaskDescriptor,
+) -> Result<bool> {
+    if task.task_type != TaskType::Markdownize
+        || task.hold_reason != Some(HoldReason::ResourceLimit)
+        || !matches!(task.status, TaskStatus::Partial | TaskStatus::Paused)
+    {
+        return Ok(false);
+    }
+    let Some(keys) = task.unit_keys.as_ref().filter(|keys| !keys.is_empty()) else {
+        return Ok(false);
+    };
+    let plan = partial_retry_plan_from_instance(store, task)?;
+    if plan.resource_hold.is_none() {
+        return Ok(false);
+    }
+    if keys.iter().all(|key| plan.retryable_units.contains(key)) {
+        return Ok(true);
+    }
+    let kio_pipeline::task::TaskOutputRef::NormalizedInstance {
+        raw_hash,
+        tool_profile_hash,
+        r#gen,
+        ..
+    } = kio_pipeline::task::validate_task_output_ref(store.kio_dir(), task)
+        .map_err(pipeline_to_kio)?
+    else {
+        return Ok(false);
+    };
+    let instance = kio_pipeline::markdownize::load_validated_normalized_instance_with_control(
+        store.kio_dir(),
+        &raw_hash,
+        &tool_profile_hash,
+        r#gen,
+        store.control(),
+    )
+    .map_err(pipeline_to_kio)?;
+    Ok(keys.iter().all(|key| {
+        plan.retryable_units.contains(key)
+            || instance.manifest.units.iter().any(|unit| {
+                unit.unit_key == *key
+                    && unit.status == kio_pipeline::markdownize::UnitStatus::Failed
+                    && unit
+                        .resource_limit
+                        .as_ref()
+                        .is_some_and(crate::batch::command::recheck_resource_limit)
+            })
+    }))
+}
+
+/// Executing an independent unit never erases a sibling's resource hold. Reads
+/// the current accepted manifest, so publishing the last resolved resource unit
+/// still clears the hold normally. Provider/billing transitions remain intact.
+pub(crate) fn update_tasks_preserving_resource_holds(
+    store: &TaskStore,
+    mut update: impl FnMut(&mut TaskDescriptor) -> bool,
+) -> kio_pipeline::Result<usize> {
+    let mut holds = BTreeMap::new();
+    for task in store.all()? {
+        if task.task_type != TaskType::Markdownize || task.resource_limit.is_none() {
+            continue;
+        }
+        let kio_pipeline::task::TaskOutputRef::NormalizedInstance {
+            raw_hash,
+            tool_profile_hash,
+            r#gen,
+            ..
+        } = kio_pipeline::task::validate_task_output_ref(store.kio_dir(), &task)?
+        else {
+            continue;
+        };
+        let instance = kio_pipeline::markdownize::load_validated_normalized_instance_with_control(
+            store.kio_dir(),
+            &raw_hash,
+            &tool_profile_hash,
+            r#gen,
+            store.control(),
+        )?;
+        if let Some(limit) = task
+            .resource_limit
+            .as_ref()
+            .filter(|limit| {
+                instance
+                    .manifest
+                    .units
+                    .iter()
+                    .any(|unit| unit.resource_limit.as_ref() == Some(limit))
+            })
+            .cloned()
+            .or_else(|| {
+                instance
+                    .manifest
+                    .units
+                    .iter()
+                    .find_map(|unit| unit.resource_limit.clone())
+            })
+        {
+            holds.insert(
+                task.task_id,
+                (
+                    if instance.units.is_empty() {
+                        TaskStatus::Paused
+                    } else {
+                        TaskStatus::Partial
+                    },
+                    limit,
+                ),
+            );
+        }
+    }
+    store.update_matching(|task| {
+        if !update(task) {
+            return false;
+        }
+        if let Some((status, limit)) = holds.get(&task.task_id) {
+            if let Some(deadline) = task.next_retry_at.take() {
+                for key in task.unit_keys.iter().flatten() {
+                    task.unit_retry_at.insert(key.clone(), deadline.clone());
+                }
+            }
+            if !matches!(
+                task.status,
+                TaskStatus::Pending | TaskStatus::Running | TaskStatus::Partial
+            ) {
+                task.unit_keys = None;
+            }
+            task.status = *status;
+            task.hold_reason = Some(HoldReason::ResourceLimit);
+            task.fallback_reason = Some("resource_limit".to_owned());
+            task.resource_limit = Some(limit.clone());
+            task.next_retry_at = None;
+        }
+        true
+    })
 }

@@ -25,3 +25,23 @@ fn c4_completion_maps_to_existing_numeric_process_exits() {
         }
     }
 }
+
+#[test]
+fn resource_limit_cli_contract_keeps_exit_three_and_exact_context() {
+    let error = kio_core::error::ResourceLimit {
+        resource: kio_core::error::Resource::Storage,
+        stage: "raw_publish".to_owned(),
+        limit: None,
+        observed: Some(42),
+        resource_tier: None,
+    }
+    .into_error("storage exhausted");
+    assert_eq!(error.exit_code().code(), 3);
+    assert_eq!(
+        error.to_error_json(),
+        serde_json::json!({
+            "error_code":"KIO-E-RESOURCE-LIMIT-001", "message":"storage exhausted",
+            "context":{"resource":"storage","stage":"raw_publish","limit":null,"observed":42,"resource_tier":null,"retry_disposition":"explicit_after_resource_change"}
+        })
+    );
+}

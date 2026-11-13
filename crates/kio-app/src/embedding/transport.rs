@@ -540,6 +540,9 @@ fn run_query_embedding_job(
         Err(EmbeddingRunFailure::Failure(failure)) => {
             settle_task_charge_unknown(&ledger, &key, &job.intent_token, candidate_usd)?;
             finish_embedding_publication(&ledger, &job).map_err(pipeline_to_kio)?;
+            if let Some(limit) = failure.resource_limit {
+                return Err(limit.into_error("query embedding resource exhausted"));
+            }
             if failure.retry_kind == RetryErrorKind::ContractViolation {
                 Ok(Some(QueryEmbeddingOutcome::ContractViolation))
             } else {
@@ -740,11 +743,16 @@ fn run_free_query_embedding_job(
                         .map(|seconds| seconds * 1000),
                     !matches!(
                         failure.retry_kind,
-                        RetryErrorKind::RateLimit | RetryErrorKind::AuthError
+                        RetryErrorKind::RateLimit
+                            | RetryErrorKind::AuthError
+                            | RetryErrorKind::ResourceLimit
                     ),
                     failure.retry_kind != RetryErrorKind::AuthError
                         && (!policy.retryable || next.is_none()),
                 )?;
+                if let Some(limit) = failure.resource_limit {
+                    return Err(limit.into_error("query embedding resource exhausted"));
+                }
                 return if failure.retry_kind == RetryErrorKind::ContractViolation {
                     Ok(Some(QueryEmbeddingOutcome::ContractViolation))
                 } else {
@@ -922,6 +930,7 @@ mod local_failure_tests {
         assert!(matches!(
             classify_local_embedding_failure(io(), false),
             LocalEmbeddingRunFailure::Classified(TaskExecutionFailure {
+                resource_limit: None,
                 retry_kind: RetryErrorKind::NetworkError,
                 ..
             })

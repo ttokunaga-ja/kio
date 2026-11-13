@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use kio_core::control::ControlHandle;
 use kio_core::store_dir::{Publication, StoreDirectory};
-use kio_core::{ExitCode, KioError, Result};
+use kio_core::{KioError, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -870,18 +870,14 @@ fn read_digest_exact(
 }
 
 fn resource_limit(observed: usize) -> KioError {
-    KioError::new(
-        "KIO-E-RESOURCE-LIMIT-001",
-        "local result cannot fit in process memory",
-        serde_json::json!({
-            "resource": "memory",
-            "limit": null,
-            "observed": observed,
-            "resource_tier": null,
-            "retry_disposition": "explicit_after_resource_change",
-        }),
-        ExitCode::PartialFailure,
-    )
+    kio_core::error::ResourceLimit {
+        resource: kio_core::error::Resource::Memory,
+        stage: "local_result".to_owned(),
+        limit: None,
+        observed: u64::try_from(observed).ok(),
+        resource_tier: None,
+    }
+    .into_error("local result cannot fit in process memory")
 }
 
 fn new_token() -> Result<String> {

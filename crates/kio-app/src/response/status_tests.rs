@@ -56,6 +56,7 @@ fn empty_status(quarantine: Vec<Value>) -> StatusResponse {
             auth: 0,
             tier_b_approval: 0,
             ledger_initialization_required: 0,
+            resource_limit: 0,
         },
         tasks: Vec::new(),
         quarantine,
@@ -70,7 +71,7 @@ fn empty_status(quarantine: Vec<Value>) -> StatusResponse {
 
 fn legacy_empty_status(quarantine: Vec<Value>) -> Value {
     json!({"scope_path":PathBuf::from("scope/日本語/.kio"),"files":[],"head_shallow":false,
-        "paused_by_hold_reason":{"budget":0,"auth":0,"tier_b_approval":0,"ledger_initialization_required":0},
+        "paused_by_hold_reason":{"budget":0,"auth":0,"tier_b_approval":0,"ledger_initialization_required":0,"resource_limit":0},
         "tasks":[],"quarantine":quarantine,"unsupported_inputs":[],"unsupported_inputs_complete":true,
         "budget":legacy_uninitialized_budget(),"stalled_batch":[],"active_purge_journal":null,"active_gc_sweep":null})
 }
@@ -220,11 +221,11 @@ fn status_complete_projection_keeps_shallow_and_paused_inspection_successful() {
             auth: 2,
             tier_b_approval: 3,
             ledger_initialization_required: 4,
+            resource_limit: 0,
         };
         legacy["head_shallow"] = json!(shallow);
         legacy["unsupported_inputs_complete"] = json!(!shallow);
-        legacy["paused_by_hold_reason"] =
-            json!({"budget":1,"auth":2,"tier_b_approval":3,"ledger_initialization_required":4});
+        legacy["paused_by_hold_reason"] = json!({"budget":1,"auth":2,"tier_b_approval":3,"ledger_initialization_required":4,"resource_limit":0});
         let response = CommandResponse {
             body: ResponseBody::Status(Box::new(dto)),
             completion: Completion::Complete,
@@ -246,6 +247,8 @@ fn status_projection_preserves_existing_task_nullable_fields_and_empty_unit_arra
     let mut dto = empty_status(Vec::new());
     let mut legacy = legacy_empty_status(Vec::new());
     dto.tasks = vec![TaskDescriptor {
+        unit_retry_at: Default::default(),
+        resource_limit: None,
         task_id: "task".to_owned(),
         task_type: TaskType::Embedding,
         embedding_target: Some(kio_pipeline::task::EmbeddingTaskTarget::Chunk {

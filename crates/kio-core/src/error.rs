@@ -3,11 +3,75 @@ use thiserror::Error;
 
 use crate::ExitCode;
 
+/// Resource exhaustion with enough information to report and recheck it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceLimit {
+    pub resource: Resource,
+    pub stage: String,
+    pub limit: Option<u64>,
+    pub observed: Option<u64>,
+    pub resource_tier: Option<ResourceTier>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Resource {
+    Memory,
+    Work,
+    UnitText,
+    RawBytes,
+    MemberBytes,
+    AggregateBytes,
+    Storage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceTier {
+    Standard,
+    Large,
+}
+
+impl ResourceLimit {
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        !self.stage.is_empty()
+            && self.stage.len() <= 256
+            && !self.stage.chars().any(char::is_control)
+    }
+
+    #[must_use]
+    pub fn matches_kind(kind: Option<&str>, limit: Option<&Self>) -> bool {
+        match (kind, limit) {
+            (Some("resource_limit"), Some(limit)) => limit.is_valid(),
+            (Some("resource_limit"), None) => false,
+            (_, None) => true,
+            (_, Some(_)) => false,
+        }
+    }
+
+    #[must_use]
+    pub fn into_error(self, message: impl Into<String>) -> KioError {
+        let mut context = serde_json::to_value(&self).expect("resource descriptor is serializable");
+        context["retry_disposition"] = json!("explicit_after_resource_change");
+        let mut error = KioError::new(
+            "KIO-E-RESOURCE-LIMIT-001",
+            message,
+            context,
+            ExitCode::PartialFailure,
+        );
+        error.resource_limit = Some(Box::new(self));
+        error
+    }
+}
+
 pub type Result<T> = std::result::Result<T, KioError>;
 
 #[derive(Debug, Error)]
 #[error("{error_code}: {message}")]
 pub struct KioError {
+    resource_limit: Option<Box<ResourceLimit>>,
     error_code: String,
     message: String,
     context: Value,
@@ -23,6 +87,7 @@ impl KioError {
         exit_code: ExitCode,
     ) -> Self {
         Self {
+            resource_limit: None,
             error_code: error_code.into(),
             message: message.into(),
             context,
@@ -163,6 +228,11 @@ impl KioError {
     }
 
     #[must_use]
+    pub fn resource_limit(&self) -> Option<&ResourceLimit> {
+        self.resource_limit.as_deref()
+    }
+
+    #[must_use]
     pub fn context(&self) -> &Value {
         &self.context
     }
@@ -184,5 +254,33 @@ pub trait IoResultExt<T> {
 impl<T> IoResultExt<T> for std::io::Result<T> {
     fn kio_io(self, path: &std::path::Path) -> Result<T> {
         self.map_err(|err| KioError::io(err.to_string(), path.display().to_string()))
+    }
+}
+
+#[cfg(test)]
+mod resource_limit_tests {
+    use super::*;
+
+    #[test]
+    fn resource_limit_error_preserves_descriptor() {
+        let descriptor = ResourceLimit {
+            resource: Resource::Memory,
+            stage: "local_result".to_owned(),
+            limit: None,
+            observed: Some(42),
+            resource_tier: None,
+        };
+        let error = descriptor.into_error("insufficient memory");
+        assert_eq!(error.resource_limit().unwrap().resource, Resource::Memory);
+        assert_eq!(error.error_code(), "KIO-E-RESOURCE-LIMIT-001");
+        assert_eq!(error.exit_code(), ExitCode::PartialFailure);
+        assert_eq!(
+            error.context(),
+            &json!({
+                "resource": "memory", "stage": "local_result", "limit": null,
+                "observed": 42, "resource_tier": null,
+                "retry_disposition": "explicit_after_resource_change"
+            })
+        );
     }
 }

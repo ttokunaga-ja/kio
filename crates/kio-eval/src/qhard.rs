@@ -6726,6 +6726,8 @@ mod tests {
         kio_core::private_fs::verify_private_directory_handle(&output).unwrap();
         TaskStore::new(&source_kio)
             .replace_all(&[TaskDescriptor {
+                unit_retry_at: Default::default(),
+                resource_limit: None,
                 task_id: "task_01H".into(),
                 task_type: TaskType::Markdownize,
                 embedding_target: None,
@@ -6812,6 +6814,8 @@ mod tests {
         kio_core::private_fs::verify_private_directory_handle(&output).unwrap();
         TaskStore::new(&p01_kio)
             .replace_all(&[TaskDescriptor {
+                unit_retry_at: Default::default(),
+                resource_limit: None,
                 task_id: "task_01H".into(),
                 task_type: TaskType::Markdownize,
                 embedding_target: None,

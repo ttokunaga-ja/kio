@@ -690,6 +690,7 @@ mod tests {
             parent_gen: None,
             run_id: "embedding-owner-test".to_owned(),
             units: vec![kio_pipeline::markdownize::NormalizedUnitManifestEntry {
+                resource_limit: None,
                 order: 0,
                 unit_key: unit_key.to_owned(),
                 unit_ref: kio_pipeline::prepare::unit_ref(unit_key),

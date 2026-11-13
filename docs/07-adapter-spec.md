@@ -420,9 +420,9 @@ output:
   # updated / added の各 unit は owned_image_hashes を必須とする。
   # 実際に取得・検証した画像バイトの hash だけを格納し、画像なしは []。
   # Markdown の URI や provider の自由記述 metadata から所有関係を推測しない。
-  failed_units                 [{ unit_key, error_kind }] — 部分失敗の unit (error_kind は
+  failed_units                 [{ unit_key, error_kind, resource_limit? }] — 部分失敗の unit (error_kind は
                                [04-pipeline.md §5.3](04-pipeline.md) の閉 enum。04 §3.2 V1 の被覆に
-                               含める (full は V6 の被覆)。persist されず manifest 側で failed へ遷移
+                               含める (full は V6 の被覆)。resource_limit の共通記述は 04 §5.3。persist されず manifest 側で failed へ遷移
                                — partial の表現手段)
   fallback_to_full             bool
   reason

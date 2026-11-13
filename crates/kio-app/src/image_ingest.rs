@@ -338,6 +338,7 @@ pub(crate) fn ingest_standalone_image(
         parent_gen: None,
         run_id: format!("run_{}", new_ulid(repo.canonical_root())),
         units: vec![NormalizedUnitManifestEntry {
+            resource_limit: None,
             order: 0,
             unit_key: unit_key.clone(),
             unit_ref: unit_ref(&unit_key),

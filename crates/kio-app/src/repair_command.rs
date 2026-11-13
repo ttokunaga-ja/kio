@@ -356,6 +356,11 @@ fn run_rebuild_db_locked(
     // `rebuild_sqlite_index` drops and rebuilds chunks/FTS/tree_entries in place
     // while preserving the `embeddings` rows and re-deriving `chunk_vec` from them
     // (04 §4.3). It is not pre-deleted here so vector search survives the rebuild.
+    crate::batch::command::reenqueue_resource_limited_tasks(
+        repo,
+        &store,
+        crate::batch::command::recheck_resource_limit,
+    )?;
     let report = rebuild_step3_index(ctx, repo)?;
     // LC42-LC44 (item 2), same ordering rationale as `run_index`'s call.
     recover_index_generation(repo.kio_dir(), repo.control())?;
@@ -412,6 +417,14 @@ fn run_rebuild_db_locked(
         paused_tasks: enrichment.paused,
         skipped: skipped_disclosure(&report, repo.kio_dir()),
     };
+    if let Some(limit) = store
+        .all()
+        .map_err(pipeline_to_kio)?
+        .into_iter()
+        .find_map(|task| task.resource_limit)
+    {
+        return Err(limit.into_error("task is held until resources change"));
+    }
     Ok((output, enrichment_completion(&enrichment)))
 }
 

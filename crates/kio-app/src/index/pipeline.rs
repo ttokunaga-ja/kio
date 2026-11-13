@@ -186,6 +186,7 @@ pub(crate) fn index_preview_response(root: &Path, preview: &ScanPreview) -> Inde
 
 #[derive(Debug, Default)]
 pub(crate) struct IndexPipelineResult {
+    pub(crate) resource_limit: Option<kio_core::error::ResourceLimit>,
     pub(crate) normalize_by_path: BTreeMap<String, PendingNormalizeRef>,
     pub(crate) network_allowed: bool,
     pub(crate) pending_online_tasks: usize,
@@ -1381,6 +1382,7 @@ pub(crate) fn run_index_pipeline(
             network_allowed,
             true,
         )?;
+        result.resource_limit = outcome.resource_limit;
         result.pending_online_tasks = result.pending_online_tasks.saturating_sub(outcome.executed);
     }
     Ok(result)

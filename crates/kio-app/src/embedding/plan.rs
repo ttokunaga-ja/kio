@@ -186,6 +186,7 @@ pub(crate) fn plan_embed_batch<'a>(
     for chunk in batch {
         let embedding_hash =
             chunk_embedding_hash(chunk, profile).map_err(|_| TaskExecutionFailure {
+                resource_limit: None,
                 retry_kind: RetryErrorKind::ContractViolation,
                 retry_after_ms: None,
             })?;
@@ -194,6 +195,7 @@ pub(crate) fn plan_embed_batch<'a>(
             Ok(None) => missing.entry(embedding_hash).or_default().push(chunk),
             Err(_) => {
                 return Err(TaskExecutionFailure {
+                    resource_limit: None,
                     retry_kind: RetryErrorKind::ContractViolation,
                     retry_after_ms: None,
                 });
@@ -626,6 +628,8 @@ pub(crate) fn hold_secret_embedding_tasks(
             continue;
         }
         let task = TaskDescriptor {
+            unit_retry_at: Default::default(),
+            resource_limit: None,
             task_id: format!("task_{}", new_ulid(repo.canonical_root())),
             task_type: TaskType::Embedding,
             embedding_target: Some(chunk_task_target(chunk, profile)),
@@ -803,6 +807,8 @@ pub(crate) fn enqueue_embedding_tasks(
             continue;
         }
         let task = TaskDescriptor {
+            unit_retry_at: Default::default(),
+            resource_limit: None,
             task_id: format!("task_{}", new_ulid(repo.canonical_root())),
             task_type: TaskType::Embedding,
             embedding_target: Some(chunk_task_target(chunk, profile)),

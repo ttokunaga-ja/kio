@@ -302,6 +302,9 @@ pub(crate) fn hash_and_write_manifest_object(
 
 pub(crate) fn adapter_to_kio(error: kio_adapter::AdapterError) -> KioError {
     match error {
+        kio_adapter::AdapterError::ResourceLimit(limit) => {
+            limit.into_error("adapter resource exhausted")
+        }
         kio_adapter::AdapterError::RuntimeConfiguration { role, error } => {
             let mut context = if error.context().is_object() {
                 error.context().clone()
@@ -359,6 +362,9 @@ pub(crate) fn adapter_to_kio(error: kio_adapter::AdapterError) -> KioError {
 
 pub(crate) fn pipeline_to_kio(error: kio_pipeline::PipelineError) -> KioError {
     match error {
+        kio_pipeline::PipelineError::ResourceLimit(limit) => {
+            limit.into_error("pipeline resource exhausted")
+        }
         // M1(c): a corrupt persisted store file is exit 4 (KIO-E-STORE-CORRUPT-001),
         // not a schema/config error (exit 2). The path is preserved in context.
         kio_pipeline::PipelineError::Corrupt { path, message } => KioError::new(

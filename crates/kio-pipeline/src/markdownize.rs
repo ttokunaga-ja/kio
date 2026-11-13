@@ -104,6 +104,8 @@ pub struct NormalizedUnitObject {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct NormalizedUnitManifestEntry {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_limit: Option<kio_core::error::ResourceLimit>,
     pub order: u64,
     pub unit_key: String,
     pub unit_ref: String,
@@ -121,6 +123,7 @@ pub struct NormalizedUnitManifestEntry {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UncheckedNormalizedUnitManifestEntry {
+    resource_limit: Option<kio_core::error::ResourceLimit>,
     order: u64,
     unit_key: String,
     unit_ref: String,
@@ -139,6 +142,24 @@ impl<'de> Deserialize<'de> for NormalizedUnitManifestEntry {
         D: serde::Deserializer<'de>,
     {
         let entry = UncheckedNormalizedUnitManifestEntry::deserialize(deserializer)?;
+        if !kio_core::error::ResourceLimit::matches_kind(
+            entry.error_kind.as_deref(),
+            entry.resource_limit.as_ref(),
+        ) {
+            return Err(serde::de::Error::custom(
+                "invalid manifest resource descriptor",
+            ));
+        }
+        if entry.error_kind.as_ref().is_some_and(|kind| {
+            serde_json::from_value::<crate::task::RetryErrorKind>(Value::String(kind.clone()))
+                .is_err()
+        }) || (entry.status == UnitStatus::Done
+            && (entry.error_kind.is_some() || entry.resource_limit.is_some()))
+        {
+            return Err(serde::de::Error::custom(
+                "invalid manifest unit failure kind",
+            ));
+        }
         let expected = prepared_unit_ref(&entry.unit_key);
         let canonical_shape = entry.unit_ref.len() == 16
             && entry
@@ -171,6 +192,7 @@ impl<'de> Deserialize<'de> for NormalizedUnitManifestEntry {
             ));
         }
         Ok(Self {
+            resource_limit: entry.resource_limit,
             order: entry.order,
             unit_key: entry.unit_key,
             unit_ref: entry.unit_ref,
@@ -340,6 +362,7 @@ pub fn markdownize_units_with_control(
         parent_gen: None,
         run_id: format!("run_{}", new_ulid(Path::new("."))),
         units: vec![NormalizedUnitManifestEntry {
+            resource_limit: None,
             order: 0,
             unit_key,
             unit_ref,
@@ -587,7 +610,12 @@ fn validate_failed_unit_error_kinds(failed_units: &[adapter_types::FailedUnit]) 
             unit.error_kind.clone(),
         ))
         .is_ok();
-        if !is_known {
+        if !is_known
+            || !kio_core::error::ResourceLimit::matches_kind(
+                Some(&unit.error_kind),
+                unit.resource_limit.as_ref(),
+            )
+        {
             return Err(contract_violation(&format!(
                 "failed_units[].error_kind `{}` is not a member of the closed retry-kind enum",
                 unit.error_kind
@@ -1807,6 +1835,28 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[test]
+    fn resource_limit_descriptor_must_match_a_validated_failure_kind() {
+        for value in [
+            serde_json::json!({"unit_key":"page:1", "error_kind":"resource_limit"}),
+            serde_json::json!({"unit_key":"page:1", "error_kind":"invalid_input", "resource_limit":{"resource":"work", "stage":"extract", "limit":10, "observed":11, "resource_tier":"standard"}}),
+            serde_json::json!({"unit_key":"page:1", "error_kind":"resource_limit", "resource_limit":{"resource":"work", "stage":"", "limit":10, "observed":11, "resource_tier":"standard"}}),
+        ] {
+            let unit: adapter_types::FailedUnit = serde_json::from_value(value).unwrap();
+            assert!(validate_failed_unit_error_kinds(&[unit]).is_err());
+        }
+    }
+
+    #[test]
+    fn resource_limit_failed_unit_roundtrip_is_lossless() {
+        let value = serde_json::json!({"unit_key":"page:1", "error_kind":"resource_limit",
+            "resource_limit":{"resource":"work", "stage":"extract", "limit":10,
+                "observed":11, "resource_tier":"standard"}});
+        let unit: adapter_types::FailedUnit = serde_json::from_value(value.clone()).unwrap();
+        validate_failed_unit_error_kinds(std::slice::from_ref(&unit)).unwrap();
+        assert_eq!(serde_json::to_value(unit).unwrap(), value);
+    }
+
+    #[test]
     fn owner_control_markdownize_timestamps_stay_with_entry_snapshot() {
         use kio_core::control::ControlHandle;
         use kio_core::test_control::{DebugTestControl, Selector};
@@ -1946,6 +1996,7 @@ mod tests {
             parent_gen: Some(6),
             run_id: "run_test".to_owned(),
             units: vec![NormalizedUnitManifestEntry {
+                resource_limit: None,
                 order: 0,
                 unit_key: unit_key.clone(),
                 unit_ref: prepared_unit_ref(&unit_key),
@@ -2116,6 +2167,7 @@ mod tests {
             run_id: "run_layout_test".to_owned(),
             units: vec![
                 NormalizedUnitManifestEntry {
+                    resource_limit: None,
                     order: 0,
                     unit_key: "page:1".to_owned(),
                     unit_ref: prepared_unit_ref("page:1"),
@@ -2127,6 +2179,7 @@ mod tests {
                     error_kind: None,
                 },
                 NormalizedUnitManifestEntry {
+                    resource_limit: None,
                     order: 1,
                     unit_key: "page:2".to_owned(),
                     unit_ref: prepared_unit_ref("page:2"),
@@ -2138,6 +2191,7 @@ mod tests {
                     error_kind: Some("invalid_input".to_owned()),
                 },
                 NormalizedUnitManifestEntry {
+                    resource_limit: None,
                     order: 2,
                     unit_key: "page:3".to_owned(),
                     unit_ref: prepared_unit_ref("page:3"),
@@ -2364,6 +2418,7 @@ mod tests {
 
     fn failed(key: &str, error_kind: &str) -> adapter_types::FailedUnit {
         adapter_types::FailedUnit {
+            resource_limit: None,
             unit_key: key.to_owned(),
             error_kind: error_kind.to_owned(),
         }

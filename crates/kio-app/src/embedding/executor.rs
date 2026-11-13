@@ -746,13 +746,19 @@ fn run_embedding_enrichment_for_instances(
                     .filter_map(kio_core::scope::parse_utc_seconds)
                     .max()
                     .map(|seconds| seconds * 1000);
-                let mut claim = match local_store.as_ref().expect("free execution state").claim(
-                    &identity,
-                    floor_attempts,
-                    floor_next,
-                    crate::embedding::transport::local_max_attempts(execution),
-                    invocation.control.now_millis(),
-                )? {
+                let mut claim = match local_store
+                    .as_ref()
+                    .expect("free execution state")
+                    .claim(
+                        &identity,
+                        floor_attempts,
+                        floor_next,
+                        crate::embedding::transport::local_max_attempts(execution),
+                        invocation.control.now_millis(),
+                    )
+                    .map_err(|error| {
+                        crate::task_execution::persist_resource_error(&task_store, &tasks, error)
+                    })? {
                     crate::local_execution::Claim::Claimed(claim) => claim,
                     crate::local_execution::Claim::Busy => {
                         outcome.inflight += group.members.len();
@@ -787,7 +793,9 @@ fn run_embedding_enrichment_for_instances(
                         continue;
                     }
                 };
-                let recovered_bytes = claim.result()?;
+                let recovered_bytes = claim.result().map_err(|error| {
+                    crate::task_execution::persist_resource_error(&task_store, &tasks, error)
+                })?;
                 let refs = tasks.iter().map(|task| task.output_ref.clone()).collect();
                 mirror_local_embedding_start(&task_store, &refs, claim.attempts(), &now)?;
                 let completed = if let Some(bytes) = recovered_bytes {
@@ -849,7 +857,10 @@ fn run_embedding_enrichment_for_instances(
                                 claim.attempts(),
                                 next,
                                 failure.retry_kind,
+                                failure.resource_limit.clone(),
                             )?;
+                            outcome.resource_limit =
+                                failure.resource_limit.clone().or(outcome.resource_limit);
                             if next.is_some() {
                                 outcome.failed_retryable += group.members.len();
                             }
@@ -1142,7 +1153,8 @@ fn run_embedding_enrichment_for_instances(
                         settle_task_charge_unknown(ledger, &key, &intent_token, reserved_usd)?;
                     }
 
-                    let result_unknown = !known_rejection;
+                    let result_unknown =
+                        !known_rejection && failure.retry_kind != RetryErrorKind::ResourceLimit;
                     let kind = if result_unknown {
                         RetryErrorKind::ResultUnknown
                     } else {
@@ -1157,6 +1169,8 @@ fn run_embedding_enrichment_for_instances(
                             embedding_failure_transition(&failure)
                         },
                     );
+                    outcome.resource_limit =
+                        failure.resource_limit.clone().or(outcome.resource_limit);
                     count_embedding_failure(&mut outcome, kind, group.members.len());
                     break 'embedding_batches;
                 }
@@ -1193,8 +1207,9 @@ fn run_embedding_enrichment_for_instances(
 }
 
 /// One deferred task-store transition for an embedding chunk.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct EmbeddingTransition {
+    resource_limit: Option<kio_core::error::ResourceLimit>,
     status: TaskStatus,
     reason: &'static str,
     failure_kind: Option<RetryErrorKind>,
@@ -1206,6 +1221,7 @@ pub(crate) struct EmbeddingTransition {
 
 pub(crate) fn embedding_done_transition() -> EmbeddingTransition {
     EmbeddingTransition {
+        resource_limit: None,
         status: TaskStatus::Done,
         reason: "embedding_adapter_done",
         failure_kind: None,
@@ -1215,6 +1231,7 @@ pub(crate) fn embedding_done_transition() -> EmbeddingTransition {
 
 pub(crate) fn embedding_pause_transition() -> EmbeddingTransition {
     EmbeddingTransition {
+        resource_limit: None,
         status: TaskStatus::Paused,
         reason: "budget_exceeded",
         failure_kind: None,
@@ -1224,6 +1241,7 @@ pub(crate) fn embedding_pause_transition() -> EmbeddingTransition {
 
 fn embedding_ledger_pause_transition() -> EmbeddingTransition {
     EmbeddingTransition {
+        resource_limit: None,
         status: TaskStatus::Paused,
         reason: kio_pipeline::task::LEDGER_INITIALIZATION_REQUIRED_REASON,
         failure_kind: None,
@@ -1233,6 +1251,7 @@ fn embedding_ledger_pause_transition() -> EmbeddingTransition {
 
 pub(crate) fn embedding_fail_transition(kind: RetryErrorKind) -> EmbeddingTransition {
     EmbeddingTransition {
+        resource_limit: None,
         status: TaskStatus::Failed,
         reason: retry_reason(kind),
         failure_kind: Some(kind),
@@ -1249,6 +1268,13 @@ pub(crate) fn embedding_fail_transition(kind: RetryErrorKind) -> EmbeddingTransi
 /// cannot drift apart.
 pub(crate) fn embedding_failure_transition(failure: &TaskExecutionFailure) -> EmbeddingTransition {
     match failure.retry_kind {
+        RetryErrorKind::ResourceLimit => EmbeddingTransition {
+            resource_limit: failure.resource_limit.clone(),
+            status: TaskStatus::Paused,
+            reason: "resource_limit",
+            failure_kind: None,
+            retry_after_ms: None,
+        },
         RetryErrorKind::RateLimit => embedding_rate_limit_transition(failure.retry_after_ms),
         RetryErrorKind::AuthError => embedding_auth_pause_transition(),
         _ => embedding_fail_transition(failure.retry_kind),
@@ -1262,6 +1288,7 @@ pub(crate) fn embedding_failure_transition(failure: &TaskExecutionFailure) -> Em
 /// the synthetic +2s fallback), and does not bump `attempts`.
 fn embedding_rate_limit_transition(retry_after_ms: Option<u64>) -> EmbeddingTransition {
     EmbeddingTransition {
+        resource_limit: None,
         status: TaskStatus::Pending,
         reason: "rate_limit",
         failure_kind: None,
@@ -1276,6 +1303,7 @@ fn embedding_rate_limit_transition(retry_after_ms: Option<u64>) -> EmbeddingTran
 /// auto-stamped by the existing QA1 `hold_reason_for_reason` block.
 fn embedding_auth_pause_transition() -> EmbeddingTransition {
     EmbeddingTransition {
+        resource_limit: None,
         status: TaskStatus::Paused,
         reason: "auth_error",
         failure_kind: None,
@@ -1288,6 +1316,7 @@ fn embedding_auth_pause_transition() -> EmbeddingTransition {
 /// guard re-creates a fresh task if the exact chunk_id reappears (revert/restore).
 pub(crate) fn embedding_retired_non_live_transition() -> EmbeddingTransition {
     EmbeddingTransition {
+        resource_limit: None,
         status: TaskStatus::Failed,
         reason: RETIRED_NON_LIVE,
         failure_kind: None,
@@ -1315,7 +1344,7 @@ pub(crate) fn record_embedding_transitions<'a>(
     transition: EmbeddingTransition,
 ) {
     for chunk in chunks {
-        transitions.insert(embedding_task_output_ref(chunk), transition);
+        transitions.insert(embedding_task_output_ref(chunk), transition.clone());
     }
 }
 
@@ -1346,6 +1375,7 @@ pub(crate) fn apply_embedding_transitions(
             let Some(transition) = transitions.get(&task.output_ref) else {
                 return false;
             };
+            task.resource_limit = transition.resource_limit.clone();
             task.status = transition.status;
             task.fallback_reason = Some(transition.reason.to_owned());
             // QA1 (step4b-contract-tests-p3a.md §A): the closed hold_reason
@@ -1379,7 +1409,7 @@ pub(crate) fn apply_embedding_transitions(
                 // synthetic +2s fallback when absent).
                 task.next_retry_at = Some(rate_limit_retry_at(now, transition.retry_after_ms));
                 failed_retryable += 1;
-            } else if transition.reason == "auth_error" {
+            } else if matches!(transition.reason, "auth_error" | "resource_limit") {
                 // QA2: a pause is not a retry-budget event — `attempts` is NOT
                 // consumed. `hold_reason` is already auto-stamped above via
                 // `hold_reason_for_reason`.
@@ -1557,12 +1587,14 @@ pub(crate) fn link_reused_chunks(
             continue;
         }
         invalidate_embedding_projection_once(projection).map_err(|_| TaskExecutionFailure {
+            resource_limit: None,
             retry_kind: RetryErrorKind::ContractViolation,
             retry_after_ms: None,
         })?;
         let linked =
             embedding_store::link_chunk_vec(conn, &chunk.chunk_id, bytes, profile.dimensions)
                 .map_err(|_| TaskExecutionFailure {
+                    resource_limit: None,
                     retry_kind: RetryErrorKind::ContractViolation,
                     retry_after_ms: None,
                 })?;
@@ -1626,6 +1658,7 @@ pub(crate) fn send_embed_group(
         .find(|member| member.id == group.embedding_hash)
     else {
         return Err(TaskExecutionFailure {
+            resource_limit: None,
             retry_kind: RetryErrorKind::ContractViolation,
             retry_after_ms: None,
         }
@@ -1633,6 +1666,7 @@ pub(crate) fn send_embed_group(
     };
     let EmbeddingMemberResult::Vector { vector } = &member.result else {
         return Err(TaskExecutionFailure {
+            resource_limit: None,
             retry_kind: RetryErrorKind::ContractViolation,
             retry_after_ms: None,
         }
@@ -1787,12 +1821,14 @@ pub(crate) fn persist_group_vector(
     let repo = projection.repo;
     let chunk = group.representative;
     if chunk_embedding_hash(chunk, profile).map_err(|_| TaskExecutionFailure {
+        resource_limit: None,
         retry_kind: RetryErrorKind::ContractViolation,
         retry_after_ms: None,
     })? != group.embedding_hash
         || chunk.work_key.embedding_hash() != group.embedding_hash
     {
         return Err(TaskExecutionFailure {
+            resource_limit: None,
             retry_kind: RetryErrorKind::ContractViolation,
             retry_after_ms: None,
         });
@@ -1813,6 +1849,7 @@ pub(crate) fn persist_group_vector(
         projection.execution,
     )
     .map_err(|_| TaskExecutionFailure {
+        resource_limit: None,
         retry_kind: RetryErrorKind::ContractViolation,
         retry_after_ms: None,
     })?;
@@ -1820,10 +1857,12 @@ pub(crate) fn persist_group_vector(
         .policy
         .revalidate()
         .map_err(|_| TaskExecutionFailure {
+            resource_limit: None,
             retry_kind: RetryErrorKind::AuthError,
             retry_after_ms: None,
         })?;
     invalidate_embedding_projection_once(projection).map_err(|_| TaskExecutionFailure {
+        resource_limit: None,
         retry_kind: RetryErrorKind::ContractViolation,
         retry_after_ms: None,
     })?;
@@ -1837,6 +1876,7 @@ pub(crate) fn persist_group_vector(
         == Some(&EmbeddingPublicationFault::BeforeSourceWrite)
     {
         return Err(TaskExecutionFailure {
+            resource_limit: None,
             retry_kind: RetryErrorKind::ContractViolation,
             retry_after_ms: None,
         });
@@ -1853,6 +1893,7 @@ pub(crate) fn persist_group_vector(
         context_key.as_deref(),
     )
     .map_err(|_| TaskExecutionFailure {
+        resource_limit: None,
         retry_kind: RetryErrorKind::ContractViolation,
         retry_after_ms: None,
     })?;
@@ -1868,6 +1909,7 @@ pub(crate) fn persist_group_vector(
         held,
     )
     .map_err(|_| TaskExecutionFailure {
+        resource_limit: None,
         retry_kind: RetryErrorKind::ContractViolation,
         retry_after_ms: None,
     })?;
@@ -2074,9 +2116,12 @@ pub(crate) fn fail_local_embedding_claim(
         next_ms,
         !matches!(
             failure.retry_kind,
-            RetryErrorKind::RateLimit | RetryErrorKind::AuthError
+            RetryErrorKind::RateLimit | RetryErrorKind::AuthError | RetryErrorKind::ResourceLimit
         ),
-        failure.retry_kind != RetryErrorKind::AuthError && (!policy.retryable || next.is_none()),
+        !matches!(
+            failure.retry_kind,
+            RetryErrorKind::AuthError | RetryErrorKind::ResourceLimit
+        ) && (!policy.retryable || next.is_none()),
     )?;
     Ok(next_ms)
 }
@@ -2088,6 +2133,7 @@ pub(crate) fn mirror_local_embedding_failure(
     attempts: u32,
     next_retry_at: Option<i64>,
     kind: RetryErrorKind,
+    resource_limit: Option<kio_core::error::ResourceLimit>,
 ) -> Result<()> {
     let next = next_retry_at.map(|ms| kio_core::scope::format_utc_seconds(ms / 1000));
     store
@@ -2099,10 +2145,15 @@ pub(crate) fn mirror_local_embedding_failure(
                 return false;
             }
             task.status = match kind {
-                RetryErrorKind::AuthError => TaskStatus::Paused,
+                RetryErrorKind::AuthError | RetryErrorKind::ResourceLimit => TaskStatus::Paused,
                 RetryErrorKind::RateLimit => TaskStatus::Pending,
                 _ => TaskStatus::Failed,
             };
+            if kind == RetryErrorKind::ResourceLimit {
+                task.resource_limit = resource_limit
+                    .clone()
+                    .or_else(|| task.resource_limit.clone());
+            }
             task.attempts = attempts;
             task.next_retry_at = next.clone();
             task.fallback_reason = Some(retry_reason(kind).to_owned());
@@ -2192,7 +2243,7 @@ pub(crate) fn mirror_local_embedding_wait(
     exhausted: bool,
 ) -> Result<()> {
     if let Some(kind) = kind {
-        mirror_local_embedding_failure(store, refs, attempts, next, kind)
+        mirror_local_embedding_failure(store, refs, attempts, next, kind, None)
     } else {
         mirror_local_interruption(store, refs, attempts, exhausted, next)
     }

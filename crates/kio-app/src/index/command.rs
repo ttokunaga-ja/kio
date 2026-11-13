@@ -128,6 +128,18 @@ use std::sync::Arc;
 pub(crate) const OFFICE_CONVERSION_UNAVAILABLE_REASON: &str = "office_conversion_unavailable";
 
 pub(crate) fn run_index(ctx: &Invocation<'_>, args: IndexArgs) -> Result<CommandResponse> {
+    run_index_with_resource_recheck(ctx, args, true)
+}
+
+pub(crate) fn run_watch_index(ctx: &Invocation<'_>, args: IndexArgs) -> Result<CommandResponse> {
+    run_index_with_resource_recheck(ctx, args, false)
+}
+
+fn run_index_with_resource_recheck(
+    ctx: &Invocation<'_>,
+    args: IndexArgs,
+    recheck_resources: bool,
+) -> Result<CommandResponse> {
     // `index --preview` is read-only all the way through opening the repository:
     // the ordinary open path may repair a missing HEAD, which would violate the
     // preview no-state-creation contract before scanning.
@@ -135,6 +147,7 @@ pub(crate) fn run_index(ctx: &Invocation<'_>, args: IndexArgs) -> Result<Command
     let mut state = IndexInvocationState {
         root: repo.clone(),
         deferred: Vec::new(),
+        recheck_resources,
     };
     let execution = run_index_for_repo(ctx, args, &repo, true, &mut state)?;
     let response = match execution.response {
@@ -247,6 +260,7 @@ impl IndexWorkResponse {
 }
 
 struct IndexInvocationState {
+    recheck_resources: bool,
     root: Repository,
     deferred: Vec<DeferredScopeBudget>,
 }
@@ -758,6 +772,14 @@ fn run_index_for_repo_inner(
     // LC39/LC40 (see `ensure_purge_epoch_initialized`'s doc comment).
     ensure_purge_epoch_initialized(repo.kio_dir(), repo.control())?;
     materialize_tool_lock(adapter_settings, repo)?;
+    if invocation_state.recheck_resources {
+        let store = TaskStore::new_with_control(repo.kio_dir(), repo.control().clone());
+        crate::batch::command::reenqueue_resource_limited_tasks(
+            repo,
+            &store,
+            crate::batch::command::recheck_resource_limit,
+        )?;
+    }
     let mut index_result =
         run_index_pipeline(adapter_settings, repo, &preview, &args, ledger.as_ref())?;
     invocation_state.defer(repo, std::mem::take(&mut index_result.deferred_budget))?;
@@ -812,6 +834,19 @@ fn run_index_for_repo_inner(
     // The scope now has a search index; register it as indexed so it participates
     // in default multi-scope search (05 §1.8, K3). Cache write, never fatal.
     register_scope(ctx, repo, true);
+    let persisted_limit = TaskStore::new_with_control(repo.kio_dir(), repo.control().clone())
+        .all()
+        .map_err(pipeline_to_kio)?
+        .into_iter()
+        .find_map(|task| task.resource_limit);
+    if let Some(limit) = index_result
+        .resource_limit
+        .clone()
+        .or(enrichment.resource_limit.clone())
+        .or(persisted_limit)
+    {
+        return Err(limit.into_error("index preserved completed units and is held for resources"));
+    }
     let mut output = IndexPublishedWork {
         status: if outcome.noop { "noop" } else { "indexed" }.to_owned(),
         approval_method: if args.yes { "yes" } else { "existing" }.to_owned(),
@@ -1749,6 +1784,11 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
     // LC39/LC40 (see `ensure_purge_epoch_initialized`'s doc comment).
     ensure_purge_epoch_initialized(repo.kio_dir(), repo.control())?;
     if let Some(at) = parsed.at.as_deref() {
+        crate::batch::command::reenqueue_resource_limited_tasks(
+            &repo,
+            &store,
+            crate::batch::command::recheck_resource_limit,
+        )?;
         return historical_reindex::run(ctx, &repo, at, parsed.online, parsed.offline);
     }
     if !parsed.force {
@@ -1774,6 +1814,11 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
     // missing-commit and missing-tree cases (the same conversion the shared
     // `rebuild_step3_index` below applies, so reindex's two tree reads stay symmetric).
     let tree = read_head_tree_for_rebuild(&repo, &head)?;
+    crate::batch::command::reenqueue_resource_limited_tasks(
+        &repo,
+        &store,
+        crate::batch::command::recheck_resource_limit,
+    )?;
     // Validate the complete selected identity set before copying any normalized
     // generation. A post-barrier reindex must not partially republish derived
     // state for entries encountered before the purged target.
@@ -1926,6 +1971,17 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
         paused_tasks: enrichment.paused,
         skipped: skipped_disclosure(&report, repo.kio_dir()),
     };
+    if let Some(limit) = enrichment.resource_limit.clone() {
+        return Err(limit.into_error("embedding resource exhausted"));
+    }
+    if let Some(limit) = store
+        .all()
+        .map_err(pipeline_to_kio)?
+        .into_iter()
+        .find_map(|task| task.resource_limit)
+    {
+        return Err(limit.into_error("task is held until resources change"));
+    }
     let completion = enrichment_completion(&enrichment);
     Ok(ReindexExecution {
         response: ReindexResponse::Head(response),

@@ -29,6 +29,7 @@ pub struct StatusResponse {
 
 #[derive(Debug, Serialize)]
 pub struct PausedTasksByHoldReason {
+    pub resource_limit: u64,
     pub budget: u64,
     pub auth: u64,
     pub tier_b_approval: u64,

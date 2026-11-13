@@ -338,22 +338,21 @@ pub(crate) const SYNC_RESEND_AUTHORIZED_REASON: &str = "unknown_resend_authorize
 /// The ledger remains the crash-safe authority: if this JSONL update is
 /// interrupted, `sync_result_unknown_fenced` repeats it before any send.
 pub(crate) fn mark_sync_result_unknown_task(store: &TaskStore, task_id: &str) -> Result<bool> {
-    store
-        .update_matching(|task| {
-            if task.task_id != task_id {
-                return false;
-            }
-            task.status = TaskStatus::Failed;
-            task.fallback_reason = Some(RESULT_UNKNOWN_REASON.to_owned());
-            task.hold_reason = None;
-            task.heartbeat_at = None;
-            task.next_retry_at = None;
-            task.attempts = task.attempts.saturating_add(1);
-            task.clear_reservation();
-            true
-        })
-        .map_err(pipeline_to_kio)
-        .map(|changed| changed > 0)
+    crate::task_execution::update_tasks_preserving_resource_holds(store, |task| {
+        if task.task_id != task_id {
+            return false;
+        }
+        task.status = TaskStatus::Failed;
+        task.fallback_reason = Some(RESULT_UNKNOWN_REASON.to_owned());
+        task.hold_reason = None;
+        task.heartbeat_at = None;
+        task.next_retry_at = None;
+        task.attempts = task.attempts.saturating_add(1);
+        task.clear_reservation();
+        true
+    })
+    .map_err(pipeline_to_kio)
+    .map(|changed| changed > 0)
 }
 
 /// A terminal sync `unknown_settled` row is a durable no-resend fence. The
