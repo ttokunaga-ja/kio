@@ -3780,7 +3780,12 @@ fn serial_task_charges_reread_and_enforce_the_cap() {
     use kio_pipeline::ledger::RequestKind;
     use std::collections::BTreeMap;
 
+    let _lock = kio_core::test_control::test_env_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let tmp = crate::test_support::PrivateTempDir::new();
+    // The charge path resolves the scope registry from the home directories.
+    let _home = kio_core::test_control::TestEnvGuard::isolated_home(&tmp.path().join("home"));
     let ledger =
         kio_pipeline::ledger::LedgerDb::initialize(tmp.path().join("device/cost-ledger.sqlite"))
             .unwrap();
