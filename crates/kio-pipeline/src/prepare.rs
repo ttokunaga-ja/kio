@@ -30,7 +30,15 @@ pub struct UnitFingerprint {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RendererIdentity {
+    pub name: String,
+    pub version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreparedUnit {
+    /// Renderer actually used to produce these bytes; absent on direct extraction.
+    pub renderer: Option<RendererIdentity>,
     pub order: u64,
     pub unit_key: String,
     pub unit_type: UnitType,
@@ -191,6 +199,7 @@ pub fn prepare_units_from_bytes_with_control(
             let unit_key = unit_keys[index].clone();
             let markdown = sheet.markdown.as_bytes();
             prepared_units.push(PreparedUnit {
+                renderer: None,
                 order: index as u64,
                 unit_key,
                 unit_type: UnitType::Sheet,
@@ -226,10 +235,15 @@ pub fn prepare_units_from_bytes_with_control(
     // KIO-E-PREPARE-* code the task-retry classifier does not specifically
     // recognize falls through to the `ContractViolation` bucket already,
     // `kio_pipeline::task::task_retry_kind`'s catch-all arm).
+    let mut renderer = None;
     let office_converted_pdf = if is_office {
         match kio_adapter::office_convert::resolve_office_converter_with_control(control) {
             Err(_) => return Ok(empty_prepare_output()),
             Ok(converter) => {
+                renderer = Some(RendererIdentity {
+                    name: "LibreOffice".to_owned(),
+                    version: converter.version().to_owned(),
+                });
                 preparation_profile_hash = office_preparation_profile_hash(
                     request.tool_profile_hash,
                     &converter.profile_identity(),
@@ -310,6 +324,7 @@ pub fn prepare_units_from_bytes_with_control(
             fingerprint_for_bytes(bytes, unit_prepared_hash.as_bytes())
         };
         prepared_units.push(PreparedUnit {
+            renderer: renderer.clone(),
             order: index as u64,
             unit_key,
             unit_type,
@@ -687,6 +702,7 @@ mod tests {
 
     fn prepared_page(order: u64, key: &str, fp: &str) -> PreparedUnit {
         PreparedUnit {
+            renderer: None,
             order,
             unit_key: key.to_owned(),
             unit_type: UnitType::Page,

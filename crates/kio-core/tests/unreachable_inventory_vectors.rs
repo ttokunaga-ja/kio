@@ -160,7 +160,7 @@ impl Fixture {
             "raw_hash": raw,
             "tool_profile_hash": profile,
             "gen": 0,
-            "parent_gen": null,
+            "parent_gen": null, "preparation_provenance": {"renderer_name":null,"renderer_version":null,"producer_os":"linux","producer_arch":"x86_64"},
             "run_id": format!("run-{discriminator}"),
             "units": [{
                 "order": 0,

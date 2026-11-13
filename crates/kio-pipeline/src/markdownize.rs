@@ -218,9 +218,12 @@ where
     Option::<String>::deserialize(deserializer)
 }
 
+pub use kio_core::preparation_provenance::PreparationProvenance;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NormalizedInstanceManifest {
+    pub preparation_provenance: PreparationProvenance,
     pub raw_hash: String,
     pub tool_profile_hash: String,
     pub r#gen: u64,
@@ -356,6 +359,7 @@ pub fn markdownize_units_with_control(
         generated_at: generated_at.clone(),
     };
     let manifest = NormalizedInstanceManifest {
+        preparation_provenance: PreparationProvenance::local(),
         raw_hash: request.new_raw.raw_hash.clone(),
         tool_profile_hash: request.tool_profile_hash.clone(),
         r#gen: 0,
@@ -1067,6 +1071,12 @@ pub fn validate_normalized_manifest(
 ) -> Result<()> {
     let source_path = source_path.as_ref();
     validate_manifest_identity(source_path, identity, manifest)?;
+    if !manifest.preparation_provenance.is_valid() {
+        return Err(normalized_corrupt(
+            source_path,
+            "invalid preparation provenance",
+        ));
+    }
 
     let mut manifest_keys = BTreeSet::new();
     let mut manifest_refs = BTreeSet::new();
@@ -1833,6 +1843,60 @@ fn contract_violation(message: &str) -> PipelineError {
 mod tests {
     use super::*;
 
+    #[test]
+    fn preparation_provenance_is_required_and_complete() {
+        let local = PreparationProvenance::local();
+        assert_eq!(local.renderer_name, None);
+        assert_eq!(local.renderer_version, None);
+        let (os, arch) = kio_core::platform::producer_platform();
+        assert_eq!(local.producer_os, os);
+        assert_eq!(local.producer_arch, arch);
+        let valid = serde_json::json!({
+            "raw_hash": "raw", "tool_profile_hash": "tool", "gen": 0,
+            "parent_gen": null, "run_id": "run", "units": [], "generated_at": "now",
+            "preparation_provenance": {
+                "renderer_name": null, "renderer_version": null,
+                "producer_os": "linux", "producer_arch": "x86_64"
+            }
+        });
+        assert!(serde_json::from_value::<NormalizedInstanceManifest>(valid.clone()).is_ok());
+        let mut missing = valid.clone();
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove("preparation_provenance");
+        assert!(serde_json::from_value::<NormalizedInstanceManifest>(missing).is_err());
+        for field in [
+            "renderer_name",
+            "renderer_version",
+            "producer_os",
+            "producer_arch",
+        ] {
+            let mut missing = valid.clone();
+            missing["preparation_provenance"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert!(
+                serde_json::from_value::<NormalizedInstanceManifest>(missing).is_err(),
+                "{field}"
+            );
+        }
+        for (field, invalid) in [
+            ("producer_os", serde_json::json!("")),
+            ("producer_arch", serde_json::json!("")),
+            ("renderer_name", serde_json::json!("LibreOffice")),
+            ("renderer_version", serde_json::json!("1.0")),
+        ] {
+            let mut bad = valid.clone();
+            bad["preparation_provenance"][field] = invalid;
+            assert!(
+                serde_json::from_value::<NormalizedInstanceManifest>(bad).is_err(),
+                "{field}"
+            );
+        }
+    }
+
     #[cfg(debug_assertions)]
     #[test]
     fn resource_limit_descriptor_must_match_a_validated_failure_kind() {
@@ -1990,6 +2054,7 @@ mod tests {
             r#gen: 7,
         };
         let mut manifest = NormalizedInstanceManifest {
+            preparation_provenance: PreparationProvenance::local(),
             raw_hash: raw_hash.clone(),
             tool_profile_hash: tool_profile_hash.clone(),
             r#gen: 7,
@@ -2160,6 +2225,7 @@ mod tests {
         let tool_profile_hash = format!("sha256:{}", "b".repeat(64));
         let prepared_hash = format!("sha256:{}", "c".repeat(64));
         let manifest = NormalizedInstanceManifest {
+            preparation_provenance: PreparationProvenance::local(),
             raw_hash: raw_hash.clone(),
             tool_profile_hash: tool_profile_hash.clone(),
             r#gen: 3,
@@ -2315,6 +2381,7 @@ mod tests {
     fn acceptance_validation_rejects_bad_incremental_shapes() {
         let prepared = vec![
             PreparedUnit {
+                renderer: None,
                 order: 0,
                 unit_key: "page:1".to_owned(),
                 unit_type: UnitType::Page,
@@ -2331,6 +2398,7 @@ mod tests {
                 page_number: Some(1),
             },
             PreparedUnit {
+                renderer: None,
                 order: 1,
                 unit_key: "page:2".to_owned(),
                 unit_type: UnitType::Page,
@@ -2383,6 +2451,7 @@ mod tests {
     /// `page:1`/`page:2` are hint-changed, `page:3` is hint-added.
     fn qa_fixture() -> (Vec<PreparedUnit>, IncrementalHints) {
         let unit = |order: u64, key: &str| PreparedUnit {
+            renderer: None,
             order,
             unit_key: key.to_owned(),
             unit_type: UnitType::Page,
@@ -2532,6 +2601,7 @@ mod tests {
     #[test]
     fn qa38b_unchanged_unit_keys_must_match_the_kio_computed_candidate_set() {
         let unit = |order: u64, key: &str| PreparedUnit {
+            renderer: None,
             order,
             unit_key: key.to_owned(),
             unit_type: UnitType::Page,
@@ -3023,6 +3093,7 @@ mod tests {
     #[test]
     fn provider_markdown_or_metadata_cannot_claim_image_ownership() {
         let prepared = vec![PreparedUnit {
+            renderer: None,
             order: 0,
             unit_key: "page:1".to_owned(),
             unit_type: UnitType::Page,

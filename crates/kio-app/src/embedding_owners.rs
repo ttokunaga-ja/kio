@@ -684,6 +684,7 @@ mod tests {
             generated_at: "2026-09-26T00:00:00Z".to_owned(),
         };
         let manifest = kio_pipeline::markdownize::NormalizedInstanceManifest {
+            preparation_provenance: kio_pipeline::markdownize::PreparationProvenance::local(),
             raw_hash: raw.clone(),
             tool_profile_hash: profile.clone(),
             r#gen: 0,

@@ -13,6 +13,7 @@ pub mod identity_serde;
 pub mod management;
 pub mod platform;
 pub mod portable;
+pub mod preparation_provenance;
 pub mod private_fs;
 pub mod purge;
 pub mod schema;

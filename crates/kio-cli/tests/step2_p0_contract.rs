@@ -110,6 +110,7 @@ fn first_online_task(status: &Value) -> &Value {
 
 fn prepared_page(order: u64, key: &str, fp: &str) -> PreparedUnit {
     PreparedUnit {
+        renderer: None,
         order,
         unit_key: key.to_owned(),
         unit_type: UnitType::Page,
@@ -457,6 +458,7 @@ fn ct2_unit_002_normalized_instance_layout() {
 #[test]
 fn ct2_unit_003_manifest_schema_and_status() {
     let manifest = NormalizedInstanceManifest {
+        preparation_provenance: kio_pipeline::markdownize::PreparationProvenance::local(),
         raw_hash: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             .to_owned(),
         tool_profile_hash:
@@ -4356,6 +4358,7 @@ fn exercise_resource_mixed_retry(resource_sibling: bool, initial_attempts: u32) 
         };
         let unit: NormalizedUnitObject = serde_json::from_value(json!({"unit_key":"page:1","unit_type":"page","raw_hash":raw_hash,"prepared_hash":preparation,"preparation_profile_hash":preparation_profile,"tool_profile_hash":profile_hash,"gen":0,"mode":"full","markdown":"verified first page\n","owned_image_hashes":[],"metadata":{},"reused_from":null,"generated_at":"2026-07-03T00:00:00Z"})).unwrap();
         let manifest = NormalizedInstanceManifest {
+            preparation_provenance: kio_pipeline::markdownize::PreparationProvenance::local(),
             raw_hash: raw_hash.clone(),
             tool_profile_hash: profile_hash.clone(),
             r#gen: 0,

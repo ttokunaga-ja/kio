@@ -62,6 +62,7 @@ pub(crate) fn prepared_units_from_ocr_discovery(
                 ));
             }
             Ok(PreparedUnit {
+                renderer: None,
                 order: hint.order,
                 unit_key: hint.unit_key.clone(),
                 unit_type,

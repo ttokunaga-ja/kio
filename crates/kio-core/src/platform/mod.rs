@@ -272,3 +272,9 @@ pub(crate) mod stage_operations;
 #[cfg(windows)]
 #[path = "windows/stage_operations.rs"]
 pub(crate) mod stage_operations;
+
+/// Build target identity recorded by immutable preparation manifests.
+#[must_use]
+pub fn producer_platform() -> (&'static str, &'static str) {
+    (std::env::consts::OS, std::env::consts::ARCH)
+}
