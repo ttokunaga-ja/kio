@@ -2316,18 +2316,22 @@ mod tests {
         assert!(!error.context().to_string().contains("receipt"));
     }
 
-    // PA18 (§D, U25), `tasks/step4b-contract-tests-p2a.md` "PA18 dirfd
-    // containment": when a `--to` whose identity was bound at
-    // `validate_destination`'s containment check is swapped for a different
-    // real directory before the open, the mismatch is rejected with
-    // `KIO-E-CONFIG-USAGE-001` (exit 2) and nothing is written first.
-    //
-    // Deliberately not `#[cfg(unix)]`: `matches_opened`/
-    // `destination_lstat_identity` have separate Windows bodies comparing a
-    // different field pair (volume serial + file index) sourced from two
-    // distinct OS queries, and `windows-security-r23` runs the workspace
-    // suite. Swapping by rename rather than by symlink is what keeps the case
-    // expressible on both — Windows symlink creation needs privileges.
+    // Windows holds directory handles without delete sharing, so an attempted
+    // rename is blocked before the identity can be swapped.
+    fn rename_for_swap(from: &std::path::Path, to: &std::path::Path) -> bool {
+        #[cfg(windows)]
+        {
+            let error = fs::rename(from, to).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(32)); // ERROR_SHARING_VIOLATION
+            false
+        }
+        #[cfg(not(windows))]
+        {
+            fs::rename(from, to).unwrap();
+            true
+        }
+    }
+
     #[test]
     fn swapped_destination_identity_is_rejected_before_the_open_mutates_anything() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -2349,10 +2353,25 @@ mod tests {
             anchor,
         };
 
-        // The swap PA18 exists for: a different REAL directory now answers to
-        // the bound name. Two renames rather than one because Windows will
-        // not rename onto an existing directory.
-        fs::rename(&destination_path, &moved_path).unwrap();
+        if !rename_for_swap(&destination_path, &moved_path) {
+            assert_eq!(
+                destination_lstat_identity(&destination_path).unwrap(),
+                identity
+            );
+            super::validate_destination_handle(&validated.anchor).unwrap();
+            assert_eq!(entry_names(&destination_path), vec!["original.md"]);
+            assert_eq!(entry_names(&decoy_path), vec!["decoy.md"]);
+            assert_eq!(
+                fs::read(destination_path.join("original.md")).unwrap(),
+                b"original"
+            );
+            assert_eq!(
+                fs::read(decoy_path.join("decoy.md")).unwrap(),
+                b"decoy sentinel"
+            );
+            assert!(!moved_path.exists());
+            return;
+        }
         fs::rename(&decoy_path, &destination_path).unwrap();
 
         // The swap really did change the identity behind the name, so the
@@ -2386,7 +2405,14 @@ mod tests {
             path: ancestor.join("new"),
             anchor: open_destination_dir(&ancestor).unwrap(),
         };
-        fs::rename(&ancestor, &moved).unwrap();
+        if !rename_for_swap(&ancestor, &moved) {
+            super::validate_destination_handle(&validated.anchor).unwrap();
+            assert!(!ancestor.join("new").exists());
+            assert!(!moved.exists());
+            assert!(entry_names(&ancestor).is_empty());
+            assert_eq!(fs::read(store.join("sentinel")).unwrap(), b"store");
+            return;
+        }
         fs::rename(&store, &ancestor).unwrap();
 
         let result = super::open_validated_destination(validated);
@@ -2410,14 +2436,25 @@ mod tests {
                 path: path.clone(),
                 anchor,
             };
+            if change != "create" {
+                let moved = if change == "move_into_destination" {
+                    root.join("Recovered")
+                } else {
+                    root.join("removed-store")
+                };
+                if !rename_for_swap(&store, &moved) {
+                    super::validate_destination_handle(&validated.anchor).unwrap();
+                    assert!(!path.exists(), "{change}");
+                    assert!(!moved.exists(), "{change}");
+                    assert_eq!(entry_names(&store), vec!["sentinel"]);
+                    assert_eq!(fs::read(store.join("sentinel")).unwrap(), b"store");
+                    continue;
+                }
+            }
             match change {
                 "create" => fs::create_dir(&store).unwrap(),
-                "remove" => fs::rename(&store, root.join("removed-store")).unwrap(),
-                "replace" => {
-                    fs::rename(&store, root.join("removed-store")).unwrap();
-                    fs::create_dir(&store).unwrap();
-                }
-                "move_into_destination" => fs::rename(&store, root.join("Recovered")).unwrap(),
+                "remove" | "move_into_destination" => {}
+                "replace" => fs::create_dir(&store).unwrap(),
                 _ => unreachable!(),
             }
             assert!(
@@ -2469,13 +2506,23 @@ mod tests {
                 temp: temp_name,
                 temp_file,
             };
+            if change != "create" {
+                let moved = root.join("removed-store");
+                let before = entry_names(&root);
+                if !rename_for_swap(&store, &moved) {
+                    super::validate_destination_handle(&destination).unwrap();
+                    assert_eq!(entry_names(&root), before, "{change}");
+                    assert!(!moved.exists(), "{change}");
+                    assert_eq!(entry_names(&store), vec!["sentinel"]);
+                    assert_eq!(fs::read(store.join("sentinel")).unwrap(), b"store");
+                    assert_eq!(fs::read(root.join("doc.md")).unwrap(), b"managed latest");
+                    continue;
+                }
+            }
             match change {
                 "create" => fs::create_dir(&store).unwrap(),
-                "remove" => fs::rename(&store, root.join("removed-store")).unwrap(),
-                "replace" => {
-                    fs::rename(&store, root.join("removed-store")).unwrap();
-                    fs::create_dir(&store).unwrap();
-                }
+                "remove" => {}
+                "replace" => fs::create_dir(&store).unwrap(),
                 _ => unreachable!(),
             }
             assert!(
