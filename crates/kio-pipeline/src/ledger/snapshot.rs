@@ -183,7 +183,7 @@ impl LedgerReadSnapshot {
             scope_id,
             &self.control,
         )
-        .map_err(snapshot_query_error)?;
+        .map_err(|error| snapshot_query_error(error, Some(&self.conn)))?;
         recheck().map_err(classify)?;
         Ok(found)
     }
@@ -306,22 +306,30 @@ impl LedgerReadSnapshot {
         adapter_kind: Option<&str>,
         month: &str,
     ) -> Result<f64, LedgerSnapshotError> {
-        ledger_month_total(&self.conn, scope_id, adapter_kind, month).map_err(snapshot_query_error)
+        ledger_month_total(&self.conn, scope_id, adapter_kind, month)
+            .map_err(|error| snapshot_query_error(error, Some(&self.conn)))
     }
 
     /// CL37/CL68 stalled batch rows from the owned private snapshot. The
     /// source SQLite connection remains private, so status cannot create source
     /// sidecars or acquire a source write lock.
     pub fn stalled_rows(&self) -> Result<Vec<BatchRequestRow>, LedgerSnapshotError> {
-        stalled_rows(&self.conn).map_err(snapshot_query_error)
+        stalled_rows(&self.conn).map_err(|error| snapshot_query_error(error, Some(&self.conn)))
     }
 }
 
-fn snapshot_query_error(error: crate::PipelineError) -> LedgerSnapshotError {
+fn snapshot_query_error(
+    error: crate::PipelineError,
+    conn: Option<&Connection>,
+) -> LedgerSnapshotError {
     match error {
         crate::PipelineError::ResourceLimit(limit) => LedgerSnapshotError::ResourceLimit(limit),
-        crate::PipelineError::Sqlite(ref sql) if sqlite_resource(sql).is_some() => {
-            LedgerSnapshotError::ResourceLimit(sqlite_resource(sql).unwrap())
+        crate::PipelineError::Sqlite(ref sql)
+            if sqlite_resource(sql, sqlite_system_error(conn).as_ref()).is_some() =>
+        {
+            LedgerSnapshotError::ResourceLimit(
+                sqlite_resource(sql, sqlite_system_error(conn).as_ref()).unwrap(),
+            )
         }
         crate::PipelineError::Contract { .. }
         | crate::PipelineError::Corrupt { .. }
@@ -378,20 +386,46 @@ fn create_private_stage(
     kio_core::store_dir::StageWriter::create(&directory, Path::new(name)).map_err(stage_error)
 }
 
-fn sqlite_resource(error: &rusqlite::Error) -> Option<kio_core::error::ResourceLimit> {
+fn sqlite_resource(
+    error: &rusqlite::Error,
+    system_error: Option<&std::io::Error>,
+) -> Option<kio_core::error::ResourceLimit> {
     use kio_core::error::Resource;
     match error {
         rusqlite::Error::SqliteFailure(code, _) => match code.code {
             rusqlite::ErrorCode::DiskFull => Some(resource_limit(Resource::Storage)),
             rusqlite::ErrorCode::OutOfMemory => Some(resource_limit(Resource::Memory)),
+            rusqlite::ErrorCode::SystemIoFailure => {
+                if code.extended_code == rusqlite::ffi::SQLITE_IOERR_NOMEM {
+                    return Some(resource_limit(Resource::Memory));
+                }
+                // SHMSIZE can mean failed fstat or a non-capacity write error
+                // as well as ENOSPC. Classify I/O only with SQLite's recorded
+                // OS error, before any manifest recheck can overwrite it.
+                system_error
+                    .and_then(crate::platform::ledger_snapshot::io_resource)
+                    .map(resource_limit)
+            }
             _ => None,
         },
         _ => None,
     }
 }
 
-fn private_sqlite_error(operation: &str, error: rusqlite::Error) -> AttemptError {
-    match sqlite_resource(&error) {
+fn sqlite_system_error(conn: Option<&Connection>) -> Option<std::io::Error> {
+    let conn = conn?;
+    // SAFETY: the connection owns a live SQLite handle; this accessor reads
+    // its recorded OS error without executing SQL or changing error state.
+    let code = unsafe { rusqlite::ffi::sqlite3_system_errno(conn.handle()) };
+    (code != 0).then(|| std::io::Error::from_raw_os_error(code))
+}
+
+fn private_sqlite_error(
+    operation: &str,
+    error: rusqlite::Error,
+    conn: Option<&Connection>,
+) -> AttemptError {
+    match sqlite_resource(&error, sqlite_system_error(conn).as_ref()) {
         Some(limit) => AttemptError::ResourceLimit(limit),
         None => AttemptError::Unstable(format!("{operation}: {error}")),
     }
@@ -809,6 +843,7 @@ fn classify_lifecycle_failure(
     main: &str,
     initial: &Manifest,
     error: crate::PipelineError,
+    conn: &Connection,
 ) -> AttemptError {
     match error {
         crate::PipelineError::ResourceLimit(limit) => AttemptError::ResourceLimit(limit),
@@ -832,6 +867,7 @@ fn classify_lifecycle_failure(
             initial,
             error,
             "validate private ledger snapshot",
+            conn,
         ),
         error => AttemptError::Unstable(format!("validate private ledger snapshot: {error}")),
     }
@@ -844,8 +880,9 @@ fn classify_sqlite_failure(
     initial: &Manifest,
     error: rusqlite::Error,
     operation: &str,
+    conn: &Connection,
 ) -> AttemptError {
-    if let Some(limit) = sqlite_resource(&error) {
+    if let Some(limit) = sqlite_resource(&error, sqlite_system_error(Some(conn)).as_ref()) {
         return AttemptError::ResourceLimit(limit);
     }
     match manifest_recheck(parent, parent_path, main) {
@@ -987,11 +1024,12 @@ fn attempt_snapshot(
     verify_private_storage(&storage, &initial)?;
     let snapshot = storage.path().join(SNAPSHOT_MAIN);
     let conn = Connection::open_with_flags(&snapshot, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(|e| private_sqlite_error("open private ledger snapshot", e))?;
+        .map_err(|e| private_sqlite_error("open private ledger snapshot", e, None))?;
     conn.busy_timeout(Duration::from_secs(5))
-        .map_err(|e| private_sqlite_error("configure private ledger snapshot", e))?;
-    conn.pragma_update(None, "query_only", "ON")
-        .map_err(|e| private_sqlite_error("make private ledger snapshot query only", e))?;
+        .map_err(|e| private_sqlite_error("configure private ledger snapshot", e, Some(&conn)))?;
+    conn.pragma_update(None, "query_only", "ON").map_err(|e| {
+        private_sqlite_error("make private ledger snapshot query only", e, Some(&conn))
+    })?;
     // Preserve the canonical parent binding before consulting lifecycle
     // sidecars by pathname. This keeps a detached/replaced parent from being
     // mistaken for a stable authority validation failure.
@@ -1025,8 +1063,9 @@ fn attempt_snapshot(
     if let Some(hook) = hook {
         hook(SnapshotPhase::AfterBoundLifecycleRead, attempt, parent_path);
     }
-    lifecycle_validation
-        .map_err(|error| classify_lifecycle_failure(parent, parent_path, main, &initial, error))?;
+    lifecycle_validation.map_err(|error| {
+        classify_lifecycle_failure(parent, parent_path, main, &initial, error, &conn)
+    })?;
     let check: String = conn
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
         .map_err(|e| {
@@ -1037,6 +1076,7 @@ fn attempt_snapshot(
                 &initial,
                 e,
                 "check private ledger snapshot",
+                &conn,
             )
         })?;
     if check != "ok" {
@@ -1046,6 +1086,7 @@ fn attempt_snapshot(
             main,
             &initial,
             crate::PipelineError::corrupt("ledger snapshot", check),
+            &conn,
         ));
     }
     // The real table probe then proves committed WAL visibility before source recheck.
@@ -1067,6 +1108,7 @@ fn attempt_snapshot(
             &initial,
             e,
             "query private ledger snapshot",
+            &conn,
         )
     })?;
     #[cfg(test)]
@@ -1847,6 +1889,53 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_extended_resource_codes_require_evidence_of_exhaustion() {
+        use kio_core::error::Resource;
+        use rusqlite::ffi;
+        let error = |code| rusqlite::Error::SqliteFailure(ffi::Error::new(code), None);
+        for code in [
+            ffi::SQLITE_IOERR_SHMSIZE,
+            ffi::SQLITE_IOERR_SHMOPEN,
+            ffi::SQLITE_IOERR_WRITE,
+        ] {
+            for kind in [
+                std::io::ErrorKind::StorageFull,
+                std::io::ErrorKind::QuotaExceeded,
+            ] {
+                let system_error = std::io::Error::from(kind);
+                let limit = sqlite_resource(&error(code), Some(&system_error))
+                    .expect("SQLite I/O with storage exhaustion must be resource_limit");
+                assert_eq!(limit.resource, Resource::Storage);
+                assert_eq!(limit.stage, "ledger_snapshot");
+            }
+            // SHMSIZE also reports failed fstat and non-capacity write errors.
+            // Its extended code alone is not evidence of a full disk.
+            assert!(sqlite_resource(&error(code), None).is_none());
+            for kind in [
+                std::io::ErrorKind::PermissionDenied,
+                std::io::ErrorKind::InvalidData,
+                std::io::ErrorKind::Other,
+            ] {
+                assert!(sqlite_resource(&error(code), Some(&kind.into())).is_none());
+            }
+        }
+        assert_eq!(
+            sqlite_resource(&error(ffi::SQLITE_IOERR_NOMEM), None)
+                .unwrap()
+                .resource,
+            Resource::Memory
+        );
+        // An unrelated stored OS error cannot turn corruption into exhaustion.
+        assert!(
+            sqlite_resource(
+                &error(ffi::SQLITE_CORRUPT),
+                Some(&std::io::ErrorKind::StorageFull.into())
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
     fn snapshot_resource_failures_are_typed_and_not_retried() {
         use kio_core::error::Resource;
         for kind in [
@@ -1898,7 +1987,7 @@ mod tests {
         ] {
             let sql = rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None);
             let LedgerSnapshotError::ResourceLimit(limit) =
-                snapshot_query_error(crate::PipelineError::Sqlite(sql))
+                snapshot_query_error(crate::PipelineError::Sqlite(sql), None)
             else {
                 panic!("SQLite resource failures must remain typed");
             };
