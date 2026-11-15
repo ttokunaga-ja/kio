@@ -674,14 +674,14 @@ impl Repository {
             excluded_paths,
             explicitly_allowed_tier_a_paths,
             true,
-            ArchiveLimits::default(),
+            self.archive_limits,
         )?;
         let working = {
             let _archive_lock = self.lock_store_in_session(&self.lock_session)?;
             self.archive_staged_working_tree(
                 working_candidates,
                 normalize_by_path,
-                ArchiveLimits::default(),
+                self.archive_limits,
                 &purge_self_targets,
                 expected_raw_by_path,
                 expected_direct_entries,

@@ -25,19 +25,6 @@ pub(crate) fn validate_commit_ref_links(listed: &Metadata, path: &Path) -> Resul
     }
     Ok(())
 }
-pub(crate) fn validate_orphan_file_native(path: &Path, listed: &Metadata) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
-    if listed.nlink() != 1 {
-        return Err(crate::scope::orphan_raw_ingest_error(
-            path,
-            "raw-ingest orphan has an unexpected hard-link count",
-        ));
-    }
-    Ok(())
-}
-pub(crate) fn validate_ingest_directory_native(_path: &Path) -> Result<()> {
-    Ok(())
-}
 pub(crate) fn prepare_path_lock_lease(native: PathLock) -> (PathLockLease, Option<Rc<PathLock>>) {
     (native, None)
 }

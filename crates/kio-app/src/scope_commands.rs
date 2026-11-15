@@ -137,6 +137,7 @@ pub(crate) fn run_status(ctx: &Invocation<'_>) -> Result<CommandResponse> {
             office_readiness: crate::response::status::office_readiness(ctx.control),
             scope_path: repo.kio_dir().to_path_buf(),
             files: status.files,
+            stage_residues: status.stage_residues,
             head_shallow: status.head_shallow,
             // QA4 (step4b-contract-tests-p3a.md §A, 10 §1 L117): the
             // paused-task count broken down by hold_reason (budget/auth/

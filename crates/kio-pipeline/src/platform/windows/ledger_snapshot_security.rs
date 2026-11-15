@@ -33,12 +33,12 @@ use windows_sys::Win32::{
         TOKEN_QUERY, TOKEN_USER, TokenUser,
     },
     Storage::FileSystem::{
-        CREATE_NEW, CreateDirectoryW, CreateFileW, DELETE, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL,
+        CreateDirectoryW, CreateFileW, DELETE, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL,
         FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
         FILE_DISPOSITION_INFO_EX, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
         FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_DATA, FileDispositionInfoEx, OPEN_EXISTING,
-        READ_CONTROL, SetFileInformationByHandle,
+        FILE_SHARE_WRITE, FILE_TRAVERSE, FileDispositionInfoEx, OPEN_EXISTING, READ_CONTROL,
+        SetFileInformationByHandle,
     },
     System::Threading::{GetCurrentProcess, OpenProcessToken},
 };
@@ -109,40 +109,6 @@ impl LedgerSnapshotPrivateDir {
             .as_ref()
             .expect("private ledger directory remains pinned")
     }
-    pub(crate) fn create_file(&self, basename: &str) -> io::Result<fs::File> {
-        validate_basename(basename)?;
-        let owner = CurrentUserSid::current()?;
-        let path = self.path.join(basename);
-        let mut descriptor = OwnerOnlyDescriptor::new(&owner, false)?;
-        let attributes = descriptor.security_attributes();
-        let wide = wide_path(&path)?;
-        // SAFETY: path and descriptor stay live for the call; raw is owned on success.
-        let raw = unsafe {
-            CreateFileW(
-                wide.as_ptr(),
-                FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                &attributes,
-                CREATE_NEW,
-                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
-                ptr::null_mut(),
-            )
-        };
-        if raw == INVALID_HANDLE_VALUE {
-            return Err(context(
-                last_error(),
-                "create owner-private ledger snapshot leaf",
-            ));
-        }
-        // SAFETY: CreateFileW returned an owned valid handle.
-        let file = unsafe { fs::File::from_raw_handle(raw as _) };
-        if let Err(error) = verify_file_handle(&file, &path, &owner) {
-            drop(file);
-            return Err(error);
-        }
-        Ok(file)
-    }
-
     /// Check the exact private shape immediately before SQLite receives the
     /// private main path.  A source WAL is copied only when it was present;
     /// SHM must still be absent here because SQLite, not the source, may
@@ -718,11 +684,24 @@ fn context(error: io::Error, operation: &str) -> io::Error {
 mod tests {
     use super::*;
 
+    fn create_stage(private: &LedgerSnapshotPrivateDir, name: &str) -> fs::File {
+        let directory = kio_core::store_dir::StoreDirectory::from_retained(
+            private.handle().try_clone().unwrap(),
+            private.path().to_owned(),
+        )
+        .unwrap();
+        let writer = kio_core::store_dir::StageWriter::create(&directory, Path::new(name)).unwrap();
+        writer.sync().unwrap();
+        drop(writer);
+        open_private_leaf_for_verify(private.path(), name, &CurrentUserSid::current().unwrap())
+            .unwrap()
+    }
+
     #[test]
     fn private_directory_and_fixed_leaf_are_owner_only() {
         let private = LedgerSnapshotPrivateDir::create().expect("private directory");
         let path = private.path().to_owned();
-        let child = private.create_file("ledger.sqlite").expect("private leaf");
+        let child = create_stage(&private, "ledger.sqlite");
         let owner = CurrentUserSid::current().expect("token user");
         verify_directory_handle(private.handle(), private.path(), &owner)
             .expect("directory remains owner-only");
@@ -737,9 +716,7 @@ mod tests {
     fn unexpected_private_leaf_blocks_cleanup() {
         let private = LedgerSnapshotPrivateDir::create().expect("private directory");
         let path = private.path().to_owned();
-        let unexpected = private
-            .create_file("unexpected.sqlite")
-            .expect("unexpected private leaf");
+        let unexpected = create_stage(&private, "unexpected.sqlite");
         drop(unexpected);
         assert!(cleanup_pinned_private_dir(private.handle(), &path).is_err());
         assert!(path.exists(), "unknown leaf leaves directory intact");

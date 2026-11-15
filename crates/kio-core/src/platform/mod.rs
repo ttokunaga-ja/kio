@@ -141,7 +141,7 @@ pub use windows::store::{move_verified_regular_handle_to_raw, open_gc_mutation, 
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) use unix::scope_io::{
-    BoundMetadataObservation, ScheduledSourceIdentity, configure_private_stage,
+    BoundMetadataObservation, ScheduledSourceIdentity,
     open_scope_file_nofollow as scope_open_nofollow, scheduled_source_identity,
     set_scope_directory_permissions, validate_scope_path_private, validate_scope_store_private,
 };
@@ -149,7 +149,7 @@ pub(crate) use unix::scope_io::{
 pub(crate) use windows::scope_io::same_scope_file_identity as scope_same_file_identity;
 #[cfg(target_os = "windows")]
 pub(crate) use windows::scope_io::{
-    BoundMetadataObservation, ScheduledSourceIdentity, configure_private_stage,
+    BoundMetadataObservation, ScheduledSourceIdentity,
     open_scope_file_nofollow as scope_open_nofollow, scheduled_source_identity,
     set_scope_directory_permissions, validate_scope_path_private, validate_scope_store_private,
 };

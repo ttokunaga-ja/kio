@@ -77,6 +77,8 @@ fn replace_private_bytes(path: &Path, bytes: &[u8]) {
 
 fn index(online: bool) -> CommandRequest {
     CommandRequest::Index(IndexArgs {
+        max_file_bytes: None,
+        max_total_bytes: None,
         preview: false,
         yes: true,
         online,
@@ -779,6 +781,8 @@ fn configured_https_ca_failure_does_not_block_no_work_index_or_text() {
     // Ordinary index mode, with no new content or OCR work, rather than the
     // explicit --offline bypass. Declaring a HTTPS role is not a selected send.
     let request = CommandRequest::Index(IndexArgs {
+        max_file_bytes: None,
+        max_total_bytes: None,
         preview: false,
         yes: true,
         online: false,
@@ -981,6 +985,8 @@ fn snapshot_ignores_unconsumed_adapter_configuration_and_credentials() {
             CommandRequest::Snapshot(crate::commands::SnapshotArgs {
                 action: crate::commands::SnapshotAction::Create(
                     crate::commands::SnapshotCreateArgs {
+                        max_file_bytes: None,
+                        max_total_bytes: None,
                         message: Some(format!("local snapshot {dependency:?}")),
                     },
                 ),
@@ -1027,6 +1033,8 @@ fn snapshot_ignores_unconsumed_adapter_configuration_and_credentials() {
         root.path(),
         CommandRequest::Snapshot(crate::commands::SnapshotArgs {
             action: crate::commands::SnapshotAction::Create(crate::commands::SnapshotCreateArgs {
+                max_file_bytes: None,
+                max_total_bytes: None,
                 message: Some("snapshot without credential consumption".into()),
             }),
         }),
@@ -1053,6 +1061,8 @@ fn snapshot_ignores_unconsumed_adapter_configuration_and_credentials() {
         root.path(),
         CommandRequest::Snapshot(crate::commands::SnapshotArgs {
             action: crate::commands::SnapshotAction::Create(crate::commands::SnapshotCreateArgs {
+                max_file_bytes: None,
+                max_total_bytes: None,
                 message: Some("unused device budget must not block content".into()),
             }),
         }),
@@ -1069,6 +1079,8 @@ fn snapshot_ignores_unconsumed_adapter_configuration_and_credentials() {
         &context(root.path()),
         CommandRequest::Snapshot(crate::commands::SnapshotArgs {
             action: crate::commands::SnapshotAction::Create(crate::commands::SnapshotCreateArgs {
+                max_file_bytes: None,
+                max_total_bytes: None,
                 message: None,
             }),
         }),
@@ -1139,6 +1151,8 @@ fn configured_https_embedding_metadata_does_not_acquire_unused_ca() {
     fs::write(trust.join(snapshot), altered.as_bytes()).unwrap();
     let before = tree(&trust);
     let request = CommandRequest::Index(IndexArgs {
+        max_file_bytes: None,
+        max_total_bytes: None,
         preview: false,
         yes: true,
         online: false,
@@ -1170,6 +1184,8 @@ fn configured_https_embedding_metadata_does_not_acquire_unused_ca() {
         interaction: interaction.clone(),
     };
     let request = CommandRequest::Index(IndexArgs {
+        max_file_bytes: None,
+        max_total_bytes: None,
         preview: false,
         yes: true,
         online: false,
@@ -1223,6 +1239,8 @@ fn default_local_index_keeps_baseline_and_native_work_with_unavailable_markdown(
     let output = local_result(
         root.path(),
         CommandRequest::Index(IndexArgs {
+            max_file_bytes: None,
+            max_total_bytes: None,
             preview: false,
             yes: true,
             online: false,
@@ -1502,4 +1520,57 @@ fn invalid_consumed_budget_never_dispatches_authorized_paid_query() {
             "invalid cost policy mutated billing authority"
         );
     }
+}
+
+#[test]
+fn st04_index_and_manual_snapshot_honor_invocation_budget_before_raw_publication() {
+    if !isolated(
+        "operation_preconditions_tests::st04_index_and_manual_snapshot_honor_invocation_budget_before_raw_publication",
+    ) {
+        return;
+    }
+    let root = fixture();
+    let repo = kio_core::scope::Repository::open(root.path()).unwrap();
+    let head = fs::read(repo.kio_dir().join("HEAD")).unwrap();
+    fs::write(root.path().join("note.md"), b"five!").unwrap();
+    for command in [
+        CommandRequest::Index(IndexArgs {
+            max_file_bytes: Some(4),
+            max_total_bytes: None,
+            preview: false,
+            yes: true,
+            online: false,
+            offline: true,
+            realtime: false,
+            batch: false,
+        }),
+        CommandRequest::Snapshot(crate::commands::SnapshotArgs {
+            action: crate::commands::SnapshotAction::Create(crate::commands::SnapshotCreateArgs {
+                message: None,
+                max_file_bytes: None,
+                max_total_bytes: Some(4),
+            }),
+        }),
+    ] {
+        let error = crate::execute(&context(root.path()), command).unwrap_err();
+        assert!(error.resource_limit().is_some());
+        assert_eq!(error.context()["path"], "note.md");
+        assert_eq!(error.context()["saved"], false);
+        assert_eq!(fs::read(repo.kio_dir().join("HEAD")).unwrap(), head);
+        let new_hash = kio_core::cas::hash_bytes(b"five!");
+        assert!(
+            repo.object_store()
+                .inspect_object(kio_core::cas::ObjectKind::Raw, &new_hash)
+                .is_err()
+        );
+    }
+    let command = CommandRequest::Snapshot(crate::commands::SnapshotArgs {
+        action: crate::commands::SnapshotAction::Create(crate::commands::SnapshotCreateArgs {
+            message: None,
+            max_file_bytes: Some(5),
+            max_total_bytes: Some(5),
+        }),
+    });
+    crate::execute(&context(root.path()), command).unwrap();
+    assert_ne!(fs::read(repo.kio_dir().join("HEAD")).unwrap(), head);
 }

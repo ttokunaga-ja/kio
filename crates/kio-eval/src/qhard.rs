@@ -26,7 +26,7 @@ use std::{
 
 use cap_primitives::{ambient_authority, fs as cap_fs};
 use kio_core::{cas::hash_bytes, store_dir::StoreDirectory};
-use kio_pipeline::task::{MAX_TASK_STORE_BYTES, TaskStore};
+use kio_pipeline::task::TaskStore;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1232,8 +1232,8 @@ fn validate_snapshot_task_journals(
         let snapshot_kio = snapshot_root.join(&relative).join(".kio");
         let source_journal = source_kio.join("tasks.jsonl");
         let snapshot_journal = snapshot_kio.join("tasks.jsonl");
-        let source_bytes = read_snapshot_task_journal(&source_journal)?;
-        let snapshot_bytes = read_snapshot_task_journal(&snapshot_journal)?;
+        let source_bytes = digest_snapshot_task_journal(&source_journal)?;
+        let snapshot_bytes = digest_snapshot_task_journal(&snapshot_journal)?;
         if source_bytes != snapshot_bytes {
             return Err(QhardError::Input(format!(
                 "private fixture task journal was not copied byte-identically for {}",
@@ -1250,7 +1250,9 @@ fn validate_snapshot_task_journals(
     Ok(())
 }
 
-fn read_snapshot_task_journal(path: &Path) -> Result<Option<Vec<u8>>, QhardError> {
+fn digest_snapshot_task_journal(path: &Path) -> Result<Option<(u64, [u8; 32])>, QhardError> {
+    use sha2::{Digest as _, Sha256};
+    use std::io::Read as _;
     let parent = path
         .parent()
         .filter(|parent| parent.is_absolute())
@@ -1266,14 +1268,45 @@ fn read_snapshot_task_journal(path: &Path) -> Result<Option<Vec<u8>>, QhardError
             parent.display()
         ))
     })?;
-    directory
-        .read_optional(Path::new("tasks.jsonl"), MAX_TASK_STORE_BYTES)
-        .map_err(|error| {
-            QhardError::Input(format!(
-                "cannot read private fixture task journal {}: {error}",
-                path.display()
-            ))
-        })
+    let read = || -> kio_core::Result<Option<(u64, [u8; 32])>> {
+        let leaf = Path::new("tasks.jsonl");
+        if !directory.contains_entry(leaf)? {
+            return Ok(None);
+        }
+        let mut file = directory.open_regular_read(leaf, u64::MAX)?;
+        kio_core::private_fs::verify_private_regular_file_handle(&file)?;
+        let mut hash = Sha256::new();
+        let mut count = 0_u64;
+        let mut buffer = [0; 64 * 1024];
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .map_err(|e| kio_core::KioError::schema(e.to_string()))?;
+            if read == 0 {
+                break;
+            }
+            count = count.saturating_add(read as u64);
+            hash.update(&buffer[..read]);
+        }
+        kio_core::private_fs::verify_private_regular_file_handle(&file)?;
+        if file
+            .metadata()
+            .map_err(|e| kio_core::KioError::schema(e.to_string()))?
+            .len()
+            != count
+        {
+            return Err(kio_core::KioError::schema(
+                "task journal changed while reading",
+            ));
+        }
+        Ok(Some((count, hash.finalize().into())))
+    };
+    read().map_err(|error| {
+        QhardError::Input(format!(
+            "cannot read private fixture task journal {}: {error}",
+            path.display()
+        ))
+    })
 }
 
 fn snapshot_fixture(fixture: &Fixture) -> Result<FixtureSnapshot, QhardError> {

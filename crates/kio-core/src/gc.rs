@@ -54,7 +54,7 @@ use serde_json::json;
 
 use crate::ExitCode;
 use crate::cas::{
-    CasReadAccess, MAX_COMMIT_OBJECT_BYTES, MAX_RAW_OBJECT_BYTES, MAX_TREE_OBJECT_BYTES,
+    CasReadAccess, MAX_COMMIT_OBJECT_BYTES, MAX_CONTENT_OBJECT_BYTES, MAX_TREE_OBJECT_BYTES,
     canonical_json_bytes, hash_bytes, is_hash,
 };
 use crate::dag::{CommitObject, CommitType, MAX_TREE_ENTRIES, TreeObject};
@@ -1608,7 +1608,7 @@ pub(crate) fn validated_snapshot_auto_direct_entries(
             crate::platform::validate_gc_direct_directory_metadata(&before)?;
             continue;
         }
-        valid_file(&before, MAX_RAW_OBJECT_BYTES).map_err(|_| {
+        valid_file(&before, u64::MAX).map_err(|_| {
             snapshot_auto_unsafe_entry("direct entry is not a safe single-link regular file")
         })?;
         let mut options = cap_fs::OpenOptions::new();
@@ -1618,8 +1618,8 @@ pub(crate) fn validated_snapshot_auto_direct_entries(
         let opened = cap_fs::Metadata::from_file(&file).map_err(|error| ioerr(error, &name))?;
         let after = cap_fs::stat(scope, path, cap_fs::FollowSymlinks::No)
             .map_err(|error| ioerr(error, &name))?;
-        if valid_file(&opened, MAX_RAW_OBJECT_BYTES).is_err()
-            || valid_file(&after, MAX_RAW_OBJECT_BYTES).is_err()
+        if valid_file(&opened, u64::MAX).is_err()
+            || valid_file(&after, u64::MAX).is_err()
             || id_meta(&before)? != id_meta(&opened)?
             || id_meta(&before)? != id_meta(&after)?
         {

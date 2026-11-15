@@ -1,7 +1,7 @@
 pub(crate) use super::unix_ledger_snapshot::{
-    Identity, PrivateStorage, filesystem_root, identity, same_identity, validate_file_links,
-    validate_test_barrier_parent, verify_directory_binding, verify_private_storage,
-    verify_regular_binding,
+    Identity, PrivateStorage, filesystem_root, identity, io_resource, same_identity,
+    validate_file_links, validate_test_barrier_parent, verify_directory_binding,
+    verify_private_storage, verify_regular_binding,
 };
 use crate::ledger::snapshot::LedgerSnapshotError;
 use std::path::{Component, Path, PathBuf};

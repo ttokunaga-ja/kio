@@ -15,7 +15,8 @@ use serde_json::json;
 use crate::{ExitCode, KioError, Result, platform::store as platform};
 
 pub(crate) mod atomic;
-mod stage;
+pub(crate) mod stage;
+pub(crate) use stage::StageReservation;
 pub use stage::{
     DirectoryStageIdentity, StageEntryState, StageIdentity, StageInspectionEntry, StageWriter,
 };
@@ -423,6 +424,58 @@ impl StoreDirectory {
         atomic::remove(owner, self, relative, expected, max_bytes)
     }
 
+    /// Resume an exact parent-owned deletion while retaining its quarantine.
+    pub(crate) fn resume_parent_removal(
+        &self,
+        target: &StoreDirectory,
+        relative: &Path,
+        hash: &str,
+        length: u64,
+    ) -> Result<bool> {
+        atomic::parent_removal(self, target, relative, hash, length, false)
+    }
+
+    /// Retire the lower-level proof only after the parent phase is durable.
+    pub(crate) fn acknowledge_parent_removal(
+        &self,
+        target: &StoreDirectory,
+        relative: &Path,
+        hash: &str,
+        length: u64,
+    ) -> Result<bool> {
+        atomic::parent_removal(self, target, relative, hash, length, true)
+    }
+
+    /// Bind the verification to the captured handle and retain the quarantine
+    /// until the caller durably records completion and acknowledges it.
+    pub(crate) fn remove_hash_verified(
+        &self,
+        owner: &StoreDirectory,
+        relative: &Path,
+        content: (&str, u64),
+        stage_identity: Option<&StageIdentity>,
+        verify: impl FnOnce(&File) -> Result<()>,
+    ) -> Result<()> {
+        let (hash, length) = content;
+        let digest = hash
+            .strip_prefix("sha256:")
+            .filter(|_| crate::cas::is_hash(hash))
+            .ok_or_else(|| KioError::invalid_usage("invalid expected removal hash"))?;
+        atomic::remove_hash_checked(
+            owner,
+            self,
+            relative,
+            atomic::RemovalRequest {
+                expected_hash: digest,
+                expected_length: length,
+                max_bytes: length,
+                parent_owned: true,
+                stage_identity: stage_identity.cloned(),
+            },
+            verify,
+        )
+    }
+
     pub fn sync(&self) -> Result<()> {
         platform::sync_directory(&self.handle, &self.logical)
     }
@@ -498,23 +551,12 @@ pub(crate) fn err(path: &Path, message: impl Into<String>) -> KioError {
         ExitCode::PermanentFailure,
     )
 }
-pub(crate) fn storage_limit(
-    error: &std::io::Error,
-    stage: &str,
-) -> Option<crate::error::ResourceLimit> {
-    crate::platform::stage_nonce::storage_exhausted(error).then(|| crate::error::ResourceLimit {
-        resource: crate::error::Resource::Storage,
-        stage: stage.into(),
-        limit: None,
-        observed: None,
-        resource_tier: None,
-    })
-}
-
 pub(crate) fn ioerr(path: &Path, error: std::io::Error) -> KioError {
-    if let Some(limit) = storage_limit(&error, "private_store") {
-        return limit.into_error(format!("{}: {error}", path.display()));
+    if crate::platform::stage_nonce::storage_exhausted(&error) {
+        return stage::stage_io("private storage exhausted", error)
+            .with_context_field("path", json!(path));
     }
+
     let kind = match error.kind() {
         std::io::ErrorKind::AlreadyExists => "already_exists",
         std::io::ErrorKind::NotFound => "not_found",
@@ -556,42 +598,18 @@ pub(crate) fn relative_components<'a>(
 }
 
 #[cfg(test)]
-mod resource_tests {
-    use super::*;
-
+mod journal_resource_tests {
     #[test]
-    fn small_private_writes_report_storage_exhaustion_with_the_shared_descriptor() {
+    fn j1_storage_exhaustion_stays_distinct_from_corruption() {
+        let make_error = || std::io::Error::from(std::io::ErrorKind::StorageFull);
         for error in [
-            ioerr(
-                Path::new("manifest.json"),
-                std::io::ErrorKind::StorageFull.into(),
-            ),
-            atomic::io_failure(
-                "cannot write replacement intent",
-                std::io::ErrorKind::StorageFull.into(),
-            ),
+            super::ioerr(std::path::Path::new("tasks.jsonl"), make_error()),
+            super::atomic::io_failure("cannot publish compaction", make_error()),
         ] {
             assert_eq!(
                 error.resource_limit().unwrap().resource,
                 crate::error::Resource::Storage
             );
-            assert_eq!(error.exit_code(), ExitCode::PartialFailure);
         }
-        assert!(
-            ioerr(
-                Path::new("manifest.json"),
-                std::io::ErrorKind::PermissionDenied.into()
-            )
-            .resource_limit()
-            .is_none()
-        );
-        assert!(
-            atomic::io_failure(
-                "cannot write replacement intent",
-                std::io::ErrorKind::PermissionDenied.into()
-            )
-            .resource_limit()
-            .is_none()
-        );
     }
 }

@@ -92,6 +92,13 @@ fn restore(status: &str, noop: bool, applied: bool) -> RestoreResponse {
                 new_raw_hash: Some("raw".into()),
             }]
         },
+        progress: kio_core::scope::ManagedRestoreStatus {
+            files_total: usize::from(!noop),
+            files_completed: usize::from(applied && !noop),
+            bytes_total: 3 * u64::from(!noop),
+            bytes_completed: 3 * u64::from(applied && !noop),
+            phase: if applied { "published" } else { "planned" }.into(),
+        },
         provenance: RestoreProvenance {
             source_commit: "source".into(),
             parent_commit: "parent".into(),
@@ -113,6 +120,9 @@ fn expected_restore(status: &str, noop: bool, applied: bool) -> Value {
     json!({"operation":"managed_restore","status":status,"source_commit":"source","expected_head":"parent",
         "new_commit_hash":if noop {None} else {Some("new")},"new_head":if applied && !noop {Some("new")} else {None},
         "new_tree_hash":"tree","changes":if noop {vec![]} else {vec![json!({"path":"file.md","old_raw_hash":null,"new_raw_hash":"raw"})]},
+        "progress":{"files_total":usize::from(!noop),"files_completed":usize::from(applied && !noop),
+            "bytes_total":3 * u64::from(!noop),"bytes_completed":3 * u64::from(applied && !noop),
+            "phase":if applied {"published"} else {"planned"}},
         "provenance":{"source_commit":"source","parent_commit":"parent","commit_type":"restored"},
         "apply":if applied {Some(json!({"noop":noop,"commit_hash":if noop {None} else {Some("new")},
             "tree_hash":"tree","restored_paths":if noop {vec![]} else {vec!["file.md"]}}))} else {None},"egress":false})

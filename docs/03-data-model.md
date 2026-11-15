@@ -975,6 +975,10 @@ raw bytes は file ごとに有界 buffer で stage / hash / verify し、内容
 file を途中まで保存して成功扱いせず、未保存 file を削除扱いする snapshot を公開しない。
 `status` の metadata 列挙は ingest の byte 予算と分離し、これらの容量だけでは停止しない。
 不正 object、digest 不一致、identity replacement は引き続き拒否する。
+原本の private stage (`internal/raw-stages/`) は、本文を書き始める前に物理 ID と nonce を
+`internal/raw-stage-identities/` の journal に永続化する。
+回復時は保存した identity が一致する stage だけを回収し、確定できない残骸は削除しない。
+`status` の `stage_residues` と `repair verify-objects` の finding に、その path と理由を表示する。
 
 ## chunk
 

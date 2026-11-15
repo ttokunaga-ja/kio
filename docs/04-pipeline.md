@@ -766,6 +766,8 @@ local crash は 0 USD で終端記録し、§5.3 の attempt 上限内で再計�
 タスクストアは `.kio/tasks.jsonl` (喪失許容 — §5.7)。task / unsupported の再構築可能 projection は、
 累積 append bytes の寿命上限で利用不能にしない。保持量の整理後も未終端 task の現在状態、
 attempt / next_retry_at / ownership と unsupported の現在理由を失わない。
+現在状態の key は task が `task_id`、unsupported が scope 内の `path` であり、それぞれ最後の
+検証済み record の全フィールドを保持する。別の task ID や完了・保留・解決済みの状態を整理だけで捨てない。
 中断・回復後も検証済みの現在状態を一意に採用し、成功や新規入力へ巻き戻さない。
 canonical path、no-follow、record schema、identity と不正 record の拒否を維持する。
 課金／秘密／送信承認の正本はこの整理の対象にしない。容量不足は §5.3 の `resource_limit` として

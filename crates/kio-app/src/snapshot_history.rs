@@ -72,7 +72,11 @@ pub(crate) fn run_snapshot_create(
     // and only then perform that write. This keeps even the open path
     // behind the active-sweep barrier without following a replaced
     // public `.kio` pathname.
-    let repo = Repository::open_recovery_in_session(ctx.cwd(), ctx.control.clone(), ctx.locks)?;
+    let repo = Repository::open_recovery_in_session(ctx.cwd(), ctx.control.clone(), ctx.locks)?
+        .with_archive_limits(kio_core::scope::ArchiveLimits::from_options(
+            args.max_file_bytes,
+            args.max_total_bytes,
+        )?);
     let (recovered_before_publication, gc_binding) =
         match gc::preflight_automatic(&repo, "snapshot")? {
             gc::AutomaticGcPreflight::Proceed { recovered, binding } => (recovered, binding),

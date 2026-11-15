@@ -24,7 +24,7 @@ pub(crate) fn create_file(directory: &StoreDirectory, leaf: &Path) -> Result<Fil
         parts[0],
         super::private_fs::NewPrivateObjectKind::StageFile,
     )
-    .map_err(|e| io_failure("cannot create private stage", e))
+    .map_err(|e| crate::store_dir::stage::stage_io("cannot create private stage", e))
 }
 pub(crate) fn open_file(directory: &StoreDirectory, leaf: &Path) -> Result<File> {
     let mut options = cap_fs::OpenOptions::new();

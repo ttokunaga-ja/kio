@@ -18,12 +18,9 @@ use crate::markdownize::MarkdownizeMode;
 use crate::store_path::{StorePathKind, resolve_existing_store_path};
 use crate::{IoResultExt, PipelineError, Result};
 
-/// Hard limits for persisted task state. They are deliberately above the normal
-/// batch sizes, but finite so an adopted `tasks.jsonl` cannot make Kio allocate
-/// attacker-selected amounts before it reaches semantic validation.
-pub const MAX_TASK_STORE_BYTES: u64 = 64 * 1024 * 1024;
+/// A compaction trigger, never a limit on journal or current projection size.
+const TASK_COMPACTION_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_TASK_RECORD_BYTES: u64 = 256 * 1024;
-pub const MAX_TASK_RECORDS: usize = 100_000;
 pub const MAX_TASK_UNIT_KEYS: usize = 4_096;
 const MAX_TASK_ID_BYTES: usize = 256;
 const MAX_TASK_PATH_BYTES: usize = 4_096;
@@ -436,7 +433,7 @@ impl TaskStore {
             .map_err(|error| self.private_error(error))?
         {
             let file = retained
-                .open_regular_read(leaf, MAX_TASK_STORE_BYTES)
+                .open_regular_read(leaf, u64::MAX)
                 .map_err(|error| self.private_error(error))?;
             kio_core::private_fs::verify_private_regular_file_handle(&file)
                 .map_err(|error| self.private_error(error))?;
@@ -444,11 +441,12 @@ impl TaskStore {
         } else {
             0
         };
-        if existing_len.saturating_add(line.len() as u64) > MAX_TASK_STORE_BYTES {
-            return Err(PipelineError::corrupt(
-                self.path.display().to_string(),
-                format!("tasks.jsonl exceeds {MAX_TASK_STORE_BYTES} byte limit"),
-            ));
+        crate::journal::recover(&retained, leaf)?;
+        if existing_len.saturating_add(line.len() as u64) > TASK_COMPACTION_BYTES {
+            let mut current = self.all_bound(&retained)?;
+            current.retain(|task| task.task_id != descriptor.task_id);
+            current.push(descriptor.clone());
+            return self.replace_bound(&retained, &current);
         }
         retained
             .append_private(leaf, &line)
@@ -456,7 +454,7 @@ impl TaskStore {
     }
 
     fn private_error(&self, error: kio_core::KioError) -> PipelineError {
-        PipelineError::corrupt(self.path.display().to_string(), error.to_string())
+        crate::journal::error(&self.path, error)
     }
 
     fn private_root(&self) -> Result<kio_core::store_dir::StoreDirectory> {
@@ -502,7 +500,7 @@ impl TaskStore {
             return Ok(Vec::new());
         }
         let file = retained
-            .open_regular_read(leaf, MAX_TASK_STORE_BYTES)
+            .open_regular_read(leaf, u64::MAX)
             .map_err(|error| {
                 PipelineError::corrupt(self.path.display().to_string(), error.to_string())
             })?;
@@ -518,18 +516,9 @@ impl TaskStore {
         file: fs::File,
         mut validate: impl FnMut(&TaskDescriptor) -> Result<()>,
     ) -> Result<Vec<TaskDescriptor>> {
-        let file_len = file.metadata().pipeline_io(&self.path)?.len();
-        if file_len > MAX_TASK_STORE_BYTES {
-            return Err(PipelineError::corrupt(
-                self.path.display().to_string(),
-                format!("tasks.jsonl exceeds {MAX_TASK_STORE_BYTES} byte limit: {file_len}"),
-            ));
-        }
         let mut by_id = BTreeMap::new();
         let mut reader = std::io::BufReader::new(file);
         let mut line = Vec::new();
-        let mut record_count = 0usize;
-        let mut total_read = 0u64;
         loop {
             line.clear();
             let read = reader
@@ -540,28 +529,20 @@ impl TaskStore {
             if read == 0 {
                 break;
             }
-            total_read = total_read.saturating_add(read as u64);
-            if total_read > MAX_TASK_STORE_BYTES {
-                return Err(PipelineError::corrupt(
-                    self.path.display().to_string(),
-                    format!("tasks.jsonl exceeds {MAX_TASK_STORE_BYTES} byte limit"),
-                ));
-            }
             if read as u64 > MAX_TASK_RECORD_BYTES {
                 return Err(PipelineError::corrupt(
                     self.path.display().to_string(),
                     format!("task record exceeds {MAX_TASK_RECORD_BYTES} byte limit"),
                 ));
             }
-            if line.iter().all(u8::is_ascii_whitespace) {
-                continue;
-            }
-            record_count = record_count.saturating_add(1);
-            if record_count > MAX_TASK_RECORDS {
+            if !line.ends_with(b"\n") {
                 return Err(PipelineError::corrupt(
                     self.path.display().to_string(),
-                    format!("tasks.jsonl exceeds {MAX_TASK_RECORDS} record limit"),
+                    "unterminated task record",
                 ));
+            }
+            if line.iter().all(u8::is_ascii_whitespace) {
+                continue;
             }
             // M1(c): a malformed line is a corrupt store file, not a schema/config
             // error — classify it as KIO-E-STORE-CORRUPT-001 with the file path.
@@ -575,42 +556,26 @@ impl TaskStore {
     }
 
     pub fn replace_all(&self, descriptors: &[TaskDescriptor]) -> Result<()> {
-        if descriptors.len() > MAX_TASK_RECORDS {
-            return Err(PipelineError::corrupt(
-                self.path.display().to_string(),
-                format!("tasks.jsonl exceeds {MAX_TASK_RECORDS} record limit"),
-            ));
-        }
+        self.replace_bound(&self.private_root()?, descriptors)
+    }
+
+    fn replace_bound(
+        &self,
+        retained: &kio_core::store_dir::StoreDirectory,
+        descriptors: &[TaskDescriptor],
+    ) -> Result<()> {
+        // Validate before creating any stage; replacement is also used by resume,
+        // retirement and recovery, and must retain every complete descriptor.
         for descriptor in descriptors {
-            validate_task_descriptor(self.kio_dir(), descriptor)?;
+            self.framed_record(descriptor)?;
         }
-        let retained = self.private_root()?;
-        let mut bytes = Vec::new();
-        for descriptor in descriptors {
-            let line = self.framed_record(descriptor)?;
-            if (bytes.len() as u64).saturating_add(line.len() as u64) > MAX_TASK_STORE_BYTES {
-                return Err(PipelineError::corrupt(
-                    self.path.display().to_string(),
-                    format!("tasks.jsonl exceeds {MAX_TASK_STORE_BYTES} byte limit"),
-                ));
-            }
-            bytes.extend_from_slice(&line);
-        }
-        retained
-            .write_atomic_checked(
-                Path::new("tasks.jsonl"),
-                &bytes,
-                kio_core::store_dir::Publication::Upsert,
-                |parent, leaf| {
-                    kio_core::private_fs::verify_private_directory_handle(parent)?;
-                    if parent.contains_entry(leaf)? {
-                        let file = parent.open_regular_read(leaf, MAX_TASK_STORE_BYTES)?;
-                        kio_core::private_fs::verify_private_regular_file_handle(&file)?;
-                    }
-                    Ok(())
-                },
-            )
-            .map_err(|error| self.private_error(error))
+        crate::journal::replace(
+            retained,
+            Path::new("tasks.jsonl"),
+            descriptors
+                .iter()
+                .map(|descriptor| self.framed_record(descriptor)),
+        )
     }
 
     fn framed_record(&self, descriptor: &TaskDescriptor) -> Result<Vec<u8>> {
@@ -1874,14 +1839,88 @@ mod tests {
     }
 
     #[test]
-    fn cand_050_task_store_rejects_oversized_file_before_reading() {
+    fn j1_current_task_projection_can_exceed_old_byte_and_record_limits() {
+        let dir = crate::test_support::PrivateTempDir::new();
+        let store = TaskStore::new(dir.path());
+        let tasks: Vec<_> = (0..100_001)
+            .map(|i| {
+                let mut task = valid_task();
+                task.task_id = format!("task_{i:06}");
+                task.changed_unit_keys = (0..32).map(|page| format!("page:{page}")).collect();
+                task
+            })
+            .collect();
+        store.replace_all(&tasks).unwrap();
+        assert!(fs::metadata(dir.path().join("tasks.jsonl")).unwrap().len() > 64 * 1024 * 1024);
+        assert_eq!(store.all().unwrap(), tasks);
+        let mut update = tasks[0].clone();
+        update.attempts = 3;
+        update.status = TaskStatus::Failed;
+        update.fallback_reason = Some("network_error".into());
+        store.append(&update).unwrap();
+        let current = store.all().unwrap();
+        assert_eq!(current.len(), tasks.len());
+        assert_eq!(current[0], update);
+        assert_eq!(&current[1..], &tasks[1..]);
+    }
+
+    #[test]
+    fn j1_task_reader_rejects_unterminated_frame() {
+        let dir = crate::test_support::PrivateTempDir::new();
+        crate::test_support::write_private_file(
+            &dir.path().join("tasks.jsonl"),
+            &serde_json::to_vec(&valid_task()).unwrap(),
+        );
+        assert!(TaskStore::new(dir.path()).all().is_err());
+    }
+
+    #[test]
+    fn j1_compaction_does_not_hide_a_corrupt_task_record() {
         let dir = crate::test_support::PrivateTempDir::new();
         let path = dir.path().join("tasks.jsonl");
-        let file = crate::test_support::create_private_file(&path);
-        file.set_len(MAX_TASK_STORE_BYTES + 1).unwrap();
-        let err = TaskStore::new(dir.path()).all().unwrap_err();
-        assert!(matches!(err, PipelineError::Corrupt { .. }));
-        assert!(err.to_string().contains("exceeds"));
+        let mut file = crate::test_support::create_private_file(&path);
+        file.write_all(b"{broken}\n").unwrap();
+        file.set_len(64 * 1024 * 1024 + 1).unwrap();
+        let store = TaskStore::new(dir.path());
+        assert!(matches!(
+            store.append(&valid_task()),
+            Err(PipelineError::Corrupt { .. })
+        ));
+        assert_eq!(file.metadata().unwrap().len(), 64 * 1024 * 1024 + 1);
+    }
+
+    #[test]
+    fn j1_task_journal_outlives_cumulative_limits_and_preserves_current_state() {
+        let dir = crate::test_support::PrivateTempDir::new();
+        let store = TaskStore::new(dir.path());
+        let mut task = valid_task();
+        task.status = TaskStatus::Running;
+        task.attempts = 2;
+        task.heartbeat_at = Some("2026-11-13T00:00:00Z".into());
+        task.next_retry_at = Some("2026-11-14T00:00:00Z".into());
+        task.reserved_usd = Some(1.25);
+        task.reserved_month = Some("2026-11".into());
+        task.reservation_id = Some("018f47a4-3bb5-7cc0-8d6a-8b02452a5f7e".into());
+        let mut writer = std::io::BufWriter::new(crate::test_support::create_private_file(
+            &dir.path().join("tasks.jsonl"),
+        ));
+        let line = store.framed_record(&task).unwrap();
+        let count = (64 * 1024 * 1024 / line.len() + 1).max(100_001);
+        for _ in 0..count {
+            writer.write_all(&line).unwrap();
+        }
+        drop(writer);
+        assert_eq!(store.all().unwrap(), vec![task.clone()]);
+        let mut other = task.clone();
+        other.task_id = "independent-task".into();
+        store.append(&other).unwrap();
+        let before = store.all().unwrap();
+        assert_eq!(before.len(), 2);
+        assert!(before.contains(&task));
+        assert!(before.contains(&other));
+        assert!(fs::metadata(dir.path().join("tasks.jsonl")).unwrap().len() < 64 * 1024 * 1024);
+        store.replace_all(&before).unwrap();
+        assert_eq!(store.all().unwrap(), before);
     }
 
     #[test]
@@ -2178,6 +2217,7 @@ mod tests {
         kio_core::store_dir::StoreDirectory::open_or_create_directories(&source_instance).unwrap();
         let store = TaskStore::new(&source);
         store.append(&normalized).unwrap();
+        store.replace_all(&store.all().unwrap()).unwrap();
         let bytes = fs::read(source.join("tasks.jsonl")).unwrap();
         fs::rename(&source, &destination).unwrap();
         let moved = TaskStore::new(&destination).all().unwrap();

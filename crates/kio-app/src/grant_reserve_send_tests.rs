@@ -21,6 +21,8 @@ enum Change {
 
 fn index_args(online: bool) -> IndexArgs {
     IndexArgs {
+        max_file_bytes: None,
+        max_total_bytes: None,
         preview: false,
         yes: true,
         online,

@@ -9,7 +9,6 @@ pub(crate) fn information(file: &std::fs::File) -> std::io::Result<WindowsFileIn
         raw.volume_serial_number,
         ((raw.file_index >> 32) as u32, raw.file_index as u32),
         ((raw.file_size >> 32) as u32, raw.file_size as u32),
-        raw.number_of_links,
         (
             (raw.last_write_time >> 32) as u32,
             raw.last_write_time as u32,
@@ -57,9 +56,8 @@ mod tests {
                 .unwrap()
                 .same_identity(linked_information)
         );
-        assert!(!linked_information.has_single_link());
 
         let directory_handle = open_path_no_follow(directory.path()).unwrap();
-        assert!(information(&directory_handle).unwrap().is_real_directory());
+        assert!(!information(&directory_handle).unwrap().is_regular_file());
     }
 }

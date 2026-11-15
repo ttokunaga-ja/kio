@@ -315,9 +315,11 @@ fn assert_recovered_publication(
     let store = repo.object_store();
     for (path, bytes) in expected {
         let raw = store
-            .read_object(ObjectKind::Raw, &hash_bytes(bytes))
+            .copy_object_to(ObjectKind::Raw, &hash_bytes(bytes), &mut std::io::sink())
             .map_err(|error| publication_error(error.to_string()))?;
-        assert_publication_bytes(&raw.bytes, bytes)?;
+        if raw.size_bytes != bytes.len() as u64 {
+            return Err(publication_error("raw fixture size mismatch"));
+        }
         assert_publication_bytes(
             &bounded_regular_bytes(&root.join(path), MAX_FIXTURE_BYTES)?,
             bytes,

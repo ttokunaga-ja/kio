@@ -186,11 +186,6 @@ fn same_scope_file_identity(opened: &fs::Metadata, path: &fs::Metadata) -> bool 
     opened.dev() == path.dev() && opened.ino() == path.ino()
 }
 
-pub(crate) fn configure_private_stage(options: &mut OpenOptions) {
-    use std::os::unix::fs::OpenOptionsExt;
-    options.mode(0o600);
-}
-
 pub(crate) fn set_scope_directory_permissions(dir: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).kio_io(dir)?;

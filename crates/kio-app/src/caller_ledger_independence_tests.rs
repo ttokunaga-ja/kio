@@ -65,6 +65,8 @@ fn fixture() -> PrivateTempDir {
     crate::execute(
         &context(root.path()),
         CommandRequest::Index(IndexArgs {
+            max_file_bytes: None,
+            max_total_bytes: None,
             preview: false,
             yes: true,
             online: false,

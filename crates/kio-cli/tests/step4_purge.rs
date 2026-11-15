@@ -1220,7 +1220,7 @@ fn ct4_purge_acquires_publication_lock_before_publishing_barrier() {
 }
 
 #[test]
-fn ct4_purge_cleans_tombstoned_ingest_orphan_before_live_copy_warning() {
+fn ct4_purge_cleans_owned_raw_stage_before_live_copy_warning() {
     // Step4b P2-A §R ruling #1: this is a RE-purge of an already-active
     // tombstone (`BeginOutcome::AlreadyComplete` — LC59), which short-circuits
     // before any phase-machine execution, so it is idempotent success with a
@@ -1244,11 +1244,37 @@ fn ct4_purge_cleans_tombstoned_ingest_orphan_before_live_copy_warning() {
     // Model a killed post-purge ingest: the working bytes were reintroduced and
     // a complete private staging leaf survived before its tombstone check.
     fs::write(fixture.dir.path().join("doc.md"), raw_bytes).unwrap();
-    let orphan = fixture
-        .dir
-        .path()
-        .join(".kio/objects/raw/.ingest-killed-after-purge");
-    fs::write(&orphan, raw_bytes).unwrap();
+    use kio_core::store_dir::{Publication, StageWriter, StoreDirectory};
+    let stages_path = fixture.dir.path().join(".kio/internal/raw-stages");
+    let stages = StoreDirectory::open_or_create_directories(&stages_path).unwrap();
+    let journals = StoreDirectory::open_or_create_directories(
+        &fixture
+            .dir
+            .path()
+            .join(".kio/internal/raw-stage-identities"),
+    )
+    .unwrap();
+    let leaf = std::path::Path::new("raw-killed-after-purge");
+    let mut stage = StageWriter::create(&stages, leaf).unwrap();
+    journals
+        .write_atomic(
+            leaf,
+            &serde_json::to_vec(stage.identity()).unwrap(),
+            Publication::CreateOnly,
+        )
+        .unwrap();
+    stage.write_chunk(raw_bytes).unwrap();
+    stage.sync().unwrap();
+    drop(stage);
+    let orphan = stages_path.join(leaf);
+    // Neither a familiar name nor identical bytes grant deletion authority.
+    let unknown = stages_path.join("unidentified");
+    fs::write(&unknown, raw_bytes).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&unknown, fs::Permissions::from_mode(0o600)).unwrap();
+    }
     let output = json_success(
         &fixture.dir,
         &[
@@ -1263,6 +1289,7 @@ fn ct4_purge_cleans_tombstoned_ingest_orphan_before_live_copy_warning() {
     assert_eq!(output["status"], "purged");
     assert_eq!(output["working_tree_warning"]["live_alias_count"], 1);
     assert!(!orphan.exists());
+    assert_eq!(fs::read(&unknown).unwrap(), raw_bytes);
     assert!(tombstone_path(&fixture.dir.path().join(".kio"), &fixture.raw_hash).exists());
 }
 
@@ -1723,9 +1750,7 @@ fn ct4_purge_missing_target_attribution_rejects_with_or_without_sqlite_rows() {
                 .contains("cannot restore missing attribution")
         );
         let store = ObjectStore::new(&kio_dir);
-        store
-            .read_object(ObjectKind::Raw, &fixture.raw_hash)
-            .unwrap();
+        read_raw_fixture(&store, &fixture.raw_hash).unwrap();
         store.read_chunk(&fixture.chunk_id).unwrap();
         assert!(!kio_dir.join("purge/in-progress.json").exists());
         assert!(!kio_dir.join("purge/journal-closure").exists());
@@ -1850,7 +1875,7 @@ fn ct4_purge_rejects_false_survivor_authority_before_preparation() {
             before_embedding
         );
         assert_eq!(fs::read(unique_path).unwrap(), before_unique);
-        store.read_object(ObjectKind::Raw, &raw).unwrap();
+        read_raw_fixture(&store, &raw).unwrap();
         assert!(!kio_dir.join("purge/in-progress.json").exists());
         assert!(!kio_dir.join("purge/journal-closure").exists());
         assert!(
@@ -2108,4 +2133,17 @@ fn ct4_purge_partial_cache_cleanup_rejects_links_and_retries_without_cas() {
         fs::read(victim).unwrap(),
         b"outside cache deletion authority"
     );
+}
+
+fn read_raw_fixture(
+    store: &kio_core::cas::ObjectStore,
+    hash: &str,
+) -> kio_core::Result<kio_core::cas::StoredObject> {
+    let mut bytes = Vec::new();
+    store.copy_object_to(kio_core::cas::ObjectKind::Raw, hash, &mut bytes)?;
+    Ok(kio_core::cas::StoredObject {
+        kind: kio_core::cas::ObjectKind::Raw,
+        hash: hash.to_owned(),
+        bytes,
+    })
 }

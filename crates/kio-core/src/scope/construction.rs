@@ -268,6 +268,7 @@ impl Repository {
         )?;
         let repo = Self {
             lock_session: LockSession::default(),
+            archive_limits: ArchiveLimits::default(),
             root: canonical_root.clone(),
             kio_dir: canonical_root.join(".kio"),
             canonical_root,

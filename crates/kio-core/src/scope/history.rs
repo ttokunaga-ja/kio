@@ -422,7 +422,7 @@ impl Repository {
     }
 
     pub fn read_commit(&self, hash: &str) -> Result<CommitObject> {
-        let object = self.store.read_by_hash(hash)?;
+        let object = self.store.read_object(ObjectKind::Commit, hash)?;
         if object.kind != ObjectKind::Commit {
             return Err(KioError::schema("hash does not identify a commit"));
         }
@@ -433,7 +433,7 @@ impl Repository {
     }
 
     pub fn read_tree(&self, hash: &str) -> Result<TreeObject> {
-        let object = self.store.read_by_hash(hash)?;
+        let object = self.store.read_object(ObjectKind::Tree, hash)?;
         if object.kind != ObjectKind::Tree {
             return Err(KioError::schema("hash does not identify a tree"));
         }

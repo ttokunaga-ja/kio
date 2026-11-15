@@ -1590,7 +1590,7 @@ pub fn verify_marker_binding_bounded_with_control(
         return Ok(());
     }
     let object = crate::cas::ObjectStore::new_with_control(kio_dir, control.clone())
-        .read_by_hash(&event.in_commit)
+        .read_object(crate::cas::ObjectKind::Commit, &event.in_commit)
         .map_err(|_| {
             corrupt_state("lifecycle event in_commit does not resolve to a verified commit object")
         })?;
@@ -1624,7 +1624,7 @@ pub fn verify_marker_binding_in_directory(
         root.as_ref(),
         directory.control().clone(),
     )
-    .and_then(|store| store.read_by_hash(&event.in_commit))
+    .and_then(|store| store.read_object(crate::cas::ObjectKind::Commit, &event.in_commit))
     .map_err(|_| {
         corrupt_state("lifecycle event in_commit does not resolve to a verified commit object")
     })?;
