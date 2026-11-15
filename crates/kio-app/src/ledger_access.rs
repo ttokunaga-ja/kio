@@ -96,8 +96,9 @@ pub(crate) fn run_ledger_lifecycle(
                 ));
             }
             kio_core::private_fs::verify_private_directory_with_control(&args.to, control)?;
-            let ledger = open_ledger_db(control)?;
-            let backup = ledger.backup().map_err(pipeline_to_kio)?;
+            let backup =
+                LedgerDb::backup_existing_with_control(ledger_db_path(control), control.clone())
+                    .map_err(pipeline_to_kio)?;
             backup
                 .publish_create_only_with_control(&args.to, control)
                 .map_err(pipeline_to_kio)?;

@@ -18,10 +18,11 @@ use crate::dag::{build_tree_with_chunking_config, is_materializable_direct_child
 use crate::error::{IoResultExt, KioError, Result};
 use crate::store_dir::{Publication, StoreDirectory};
 
+mod stage;
+use stage::{RestoreStage, RestoreStageCreation};
+
 const MANAGED_RESTORE_JOURNAL_LEAF: &str = "managed-restore-v1.json";
 const MAX_MANAGED_RESTORE_JOURNAL_BYTES: u64 = 8 * 1024 * 1024;
-const MAX_MANAGED_RESTORE_FILE_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_MANAGED_RESTORE_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Immutable request inputs for [`Repository::plan_restore`].  The request is
 /// intentionally constructed through [`Self::new`] so callers cannot omit the
@@ -77,7 +78,10 @@ pub struct ManagedRestorePlan {
     /// whose historical raw is already equal to HEAD.  This prevents a no-op
     /// restore preview from silently accepting dirty selected working bytes.
     selected_working_hashes: Vec<(String, Option<String>)>,
+    #[serde(skip)]
+    selected_working_identities: BTreeMap<String, Option<crate::platform::ScheduledSourceIdentity>>,
     changes: Vec<ManagedRestoreChange>,
+    new_lengths: Vec<u64>,
 }
 
 impl ManagedRestorePlan {
@@ -107,9 +111,42 @@ impl ManagedRestorePlan {
     }
 
     #[must_use]
+    pub fn status(&self, phase: &str, complete: bool) -> ManagedRestoreStatus {
+        ManagedRestoreStatus {
+            files_total: self.changes.len(),
+            files_completed: if complete { self.changes.len() } else { 0 },
+            bytes_total: self
+                .new_lengths
+                .iter()
+                .copied()
+                .fold(0, u64::saturating_add),
+            bytes_completed: if complete {
+                self.new_lengths
+                    .iter()
+                    .copied()
+                    .fold(0, u64::saturating_add)
+            } else {
+                0
+            },
+            phase: phase.to_owned(),
+        }
+    }
+
+    #[must_use]
     pub fn is_noop(&self) -> bool {
         self.changes.is_empty()
     }
+}
+
+/// File and byte counts refer to changed destinations (deletions have zero
+/// output bytes). Phase names are the durable journal states, not estimates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ManagedRestoreStatus {
+    pub files_total: usize,
+    pub files_completed: usize,
+    pub bytes_total: u64,
+    pub bytes_completed: u64,
+    pub phase: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -130,6 +167,10 @@ struct ManagedRestoreJournal {
     new_commit: String,
     changes: Vec<ManagedRestoreChange>,
     progress: Vec<RestoreProgress>,
+    new_lengths: Vec<u64>,
+    active: usize,
+    stages: Vec<Option<RestoreStage>>,
+    stage_creation: Option<RestoreStageCreation>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -155,6 +196,10 @@ impl ManagedRestoreJournal {
             new_commit: plan.new_commit_hash.clone(),
             changes: plan.changes.clone(),
             progress: vec![RestoreProgress::Pending; plan.changes.len()],
+            new_lengths: plan.new_lengths.clone(),
+            active: 0,
+            stages: vec![None; plan.changes.len()],
+            stage_creation: None,
         }
     }
 
@@ -166,8 +211,19 @@ impl ManagedRestoreJournal {
             || !crate::cas::is_hash(&self.new_commit)
             || self.changes.is_empty()
             || self.progress.len() != self.changes.len()
+            || self.new_lengths.len() != self.changes.len()
+            || self.active >= self.changes.len()
+            || self.stages.len() != self.changes.len()
         {
             return Err(restore_incomplete("managed restore journal is malformed"));
+        }
+        if let Some(creation) = &self.stage_creation {
+            creation.validate(&self.changes)?;
+        }
+        for (index, stage) in self.stages.iter().enumerate() {
+            if let Some(stage) = stage {
+                stage.validate(std::slice::from_ref(&self.changes[index]))?;
+            }
         }
         let mut previous: Option<&str> = None;
         for change in &self.changes {
@@ -195,6 +251,31 @@ impl ManagedRestoreJournal {
             previous = Some(&change.path);
         }
         Ok(())
+    }
+
+    fn status(&self) -> ManagedRestoreStatus {
+        let mut status = ManagedRestoreStatus {
+            files_total: self.changes.len(),
+            files_completed: 0,
+            bytes_total: self
+                .new_lengths
+                .iter()
+                .copied()
+                .fold(0, u64::saturating_add),
+            bytes_completed: 0,
+            phase: serde_json::to_value(self.progress[self.active])
+                .expect("phase enum")
+                .as_str()
+                .expect("phase name")
+                .to_owned(),
+        };
+        for (phase, length) in self.progress.iter().zip(&self.new_lengths) {
+            if *phase == RestoreProgress::Applied {
+                status.files_completed += 1;
+                status.bytes_completed = status.bytes_completed.saturating_add(*length);
+            }
+        }
+        status
     }
 
     fn bytes(&self) -> Result<Vec<u8>> {
@@ -279,7 +360,11 @@ impl Repository {
                 )
             })
             .collect::<Vec<_>>();
-        let mut restored_bytes = 0_u64;
+        let selected_working_identities = selected_working_hashes
+            .iter()
+            .map(|(path, _)| Ok((path.clone(), self.working_identity(path)?)))
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let mut new_lengths = Vec::new();
         for path in requested_paths.union(&delete_missing) {
             let old = head_entries.get(path).cloned();
             let new = if delete_missing.contains(path) {
@@ -303,17 +388,11 @@ impl Repository {
             match &new {
                 Some(entry) => {
                     let bytes = ensure_raw_present(self, &entry.raw_hash)?;
-                    restored_bytes = restored_bytes.checked_add(bytes).ok_or_else(|| {
-                        restore_incomplete("managed restore source bytes overflow")
-                    })?;
-                    if restored_bytes > MAX_MANAGED_RESTORE_TOTAL_BYTES {
-                        return Err(restore_incomplete(
-                            "managed restore source bytes exceed the aggregate limit",
-                        ));
-                    }
+                    new_lengths.push(bytes);
                     target_entries.insert(path.clone(), entry.clone());
                 }
                 None => {
+                    new_lengths.push(0);
                     target_entries.remove(path);
                 }
             }
@@ -333,7 +412,9 @@ impl Repository {
                 new_commit: head_commit,
                 new_commit_hash: String::new(),
                 selected_working_hashes,
+                selected_working_identities,
                 changes,
+                new_lengths,
             });
         }
         let new_tree = build_tree_with_chunking_config(
@@ -367,7 +448,9 @@ impl Repository {
             new_commit,
             new_commit_hash,
             selected_working_hashes,
+            selected_working_identities,
             changes,
+            new_lengths,
         })
     }
 
@@ -381,6 +464,22 @@ impl Repository {
     ) -> Result<ManagedRestoreOutcome>
     where
         F: FnMut() -> Result<()>,
+    {
+        self.apply_restore_with_progress(plan, &mut validate_current_authority, |_| Ok(()))
+    }
+
+    /// Observe durable phases without collecting payloads or progress history.
+    /// Before publication, observer errors leave the journal available for
+    /// explicit recovery. The final `published` notification follows cleanup.
+    pub fn apply_restore_with_progress<F, P>(
+        &self,
+        plan: &ManagedRestorePlan,
+        mut validate_current_authority: F,
+        mut observe: P,
+    ) -> Result<ManagedRestoreOutcome>
+    where
+        F: FnMut() -> Result<()>,
+        P: FnMut(&ManagedRestoreStatus) -> Result<()>,
     {
         let _lock = self.lock_store_in_session(self.lock_session())?;
         self.ensure_no_pending_publication()?;
@@ -427,18 +526,21 @@ impl Repository {
         self.control()
             .checkpoint(crate::durability::DurabilityPoint::RestoreJournal)?;
 
+        observe(&journal.status())?;
         for index in 0..plan.changes.len() {
             validate_current_authority()?;
+            journal.active = index;
             self.apply_restore_change_with_progress(
                 &plan.changes[index],
-                index,
                 &mut journal,
                 &mut journal_bytes,
+                &mut observe,
+                plan.selected_working_identities[&plan.changes[index].path],
             )?;
         }
         self.control()
             .checkpoint(crate::durability::DurabilityPoint::RestoreWorkingBytes)?;
-        self.revalidate_final_restore_working_hashes(plan)?;
+        self.revalidate_final_restore_working_hashes(plan, &journal)?;
         validate_current_authority()?;
         let head = self.read_commit(&plan.expected_head)?;
         let manifest = self.manifest_value(&plan.new_tree, Some(&self.read_tree(&head.tree)?))?;
@@ -450,7 +552,9 @@ impl Repository {
         )?;
         self.control()
             .checkpoint(crate::durability::DurabilityPoint::RestoreHead)?;
+        self.discard_restore_stage(&journal)?;
         self.remove_managed_restore_journal(&journal_bytes)?;
+        observe(&plan.status("published", true))?;
         Ok(ManagedRestoreOutcome {
             noop: false,
             commit_hash: Some(plan.new_commit_hash.clone()),
@@ -467,10 +571,61 @@ impl Repository {
     /// from the publication journal while rolling working bytes back.
     pub fn recover_managed_restore(&self) -> Result<bool> {
         let _lock = self.lock_store_in_session(self.lock_session())?;
-        let atomic_recovered = self.recover_atomic_storage()?;
+        if let Some(owner) = self.restore_journal_owner(false)? {
+            owner.recover_atomic(&[&self.store_directory()?])?;
+        }
         let Some((mut journal, mut journal_bytes)) = self.managed_restore_journal()? else {
-            return Ok(atomic_recovered);
+            return self.recover_atomic_storage();
         };
+        self.validate_restore_journal_authority(&journal)?;
+        self.recover_restore_stage_creation(&mut journal, &mut journal_bytes)?;
+        // Resume deletion only against its retained source/quarantine. Keep the
+        // quarantine until the corresponding parent phase has been synced.
+        for index in 0..journal.changes.len() {
+            let (raw, next, incomplete) = match journal.progress[index] {
+                RestoreProgress::RemovingOld => (
+                    journal.changes[index].old_raw_hash.clone(),
+                    RestoreProgress::OldRemoved,
+                    true,
+                ),
+                RestoreProgress::RollbackRemovingNew => (
+                    journal.changes[index].new_raw_hash.clone(),
+                    RestoreProgress::RollbackNewRemoved,
+                    true,
+                ),
+                RestoreProgress::OldRemoved => (
+                    journal.changes[index].old_raw_hash.clone(),
+                    RestoreProgress::OldRemoved,
+                    false,
+                ),
+                RestoreProgress::RollbackNewRemoved => (
+                    journal.changes[index].new_raw_hash.clone(),
+                    RestoreProgress::RollbackNewRemoved,
+                    false,
+                ),
+                _ => continue,
+            };
+            if let Some(raw) = raw {
+                let length = self.store.inspect_object(ObjectKind::Raw, &raw)?.size_bytes;
+                let owner = self.store_directory()?;
+                let root = self.root_directory()?;
+                let path = Path::new(&journal.changes[index].path);
+                if incomplete && owner.resume_parent_removal(&root, path, &raw, length)? {
+                    journal.active = index;
+                    journal.progress[index] = next;
+                    self.persist_restore_progress(&journal, &mut journal_bytes)?;
+                }
+                if journal.progress[index] == next {
+                    owner.acknowledge_parent_removal(
+                        &root,
+                        Path::new(&journal.changes[index].path),
+                        &raw,
+                        length,
+                    )?;
+                }
+            }
+        }
+        self.recover_atomic_storage()?;
         let current_head = self.head_commit_hash()?;
         self.validate_restore_journal_authority(&journal)?;
         if current_head.as_deref() == Some(journal.new_commit.as_str()) {
@@ -478,6 +633,7 @@ impl Repository {
             if self.publication_journal()?.is_some() {
                 self.finish_exact_restore_publication(&journal)?;
             }
+            self.discard_restore_stage(&journal)?;
             self.remove_managed_restore_journal(&journal_bytes)?;
             return Ok(true);
         }
@@ -491,6 +647,7 @@ impl Repository {
         }
         for index in (0..journal.changes.len()).rev() {
             let change = journal.changes[index].clone();
+            journal.active = index;
             self.rollback_restore_change_with_progress(
                 &change,
                 index,
@@ -498,6 +655,7 @@ impl Repository {
                 &mut journal_bytes,
             )?;
         }
+        self.discard_restore_stage(&journal)?;
         self.remove_managed_restore_journal(&journal_bytes)?;
         Ok(true)
     }
@@ -507,6 +665,12 @@ impl Repository {
     /// must invoke [`Self::recover_managed_restore`] explicitly.
     pub fn ensure_no_pending_managed_restore(&self) -> Result<()> {
         reject_pending_managed_restore(&self.store_directory()?)
+    }
+
+    pub fn managed_restore_status(&self) -> Result<Option<ManagedRestoreStatus>> {
+        Ok(self
+            .managed_restore_journal()?
+            .map(|(journal, _)| journal.status()))
     }
 
     fn managed_restore_journal(&self) -> Result<Option<(ManagedRestoreJournal, Vec<u8>)>> {
@@ -557,7 +721,7 @@ impl Repository {
             &self.store_directory()?,
             relative,
             expected,
-            max_bytes,
+            max_bytes.min(expected.len() as u64),
         )
     }
 
@@ -588,7 +752,9 @@ impl Repository {
             return Err(restore_conflict("HEAD changed after restore planning"));
         }
         for (path, expected) in &plan.selected_working_hashes {
-            if self.working_raw_hash(path)? != *expected {
+            if self.working_raw_hash(path)? != *expected
+                || self.working_identity(path)? != plan.selected_working_identities[path]
+            {
                 return Err(restore_conflict(
                     "working file changed after restore planning",
                 ));
@@ -604,18 +770,37 @@ impl Repository {
         Ok(())
     }
 
-    fn revalidate_final_restore_working_hashes(&self, plan: &ManagedRestorePlan) -> Result<()> {
+    fn revalidate_final_restore_working_hashes(
+        &self,
+        plan: &ManagedRestorePlan,
+        journal: &ManagedRestoreJournal,
+    ) -> Result<()> {
         if self.head_commit_hash()?.as_deref() != Some(plan.expected_head.as_str()) {
             return Err(restore_conflict("HEAD changed before restore publication"));
         }
-        for change in &plan.changes {
+        for (index, change) in plan.changes.iter().enumerate() {
             if self.working_raw_hash(&change.path)? != change.new_raw_hash {
                 return Err(restore_incomplete(
                     "working file changed during managed restore before publication",
                 ));
             }
+            if change.new_raw_hash.is_some() {
+                self.verify_restore_destination(journal, index, &change.path)?;
+            }
         }
         Ok(())
+    }
+
+    fn working_identity(
+        &self,
+        path: &str,
+    ) -> Result<Option<crate::platform::ScheduledSourceIdentity>> {
+        let directory = self.root_directory()?;
+        if !directory.contains_entry(Path::new(path))? {
+            return Ok(None);
+        }
+        let file = directory.open_regular_read(Path::new(path), u64::MAX)?;
+        scheduled_source_identity(&file).map(Some)
     }
 
     fn working_raw_hash(&self, path: &str) -> Result<Option<String>> {
@@ -624,19 +809,15 @@ impl Repository {
         if !directory.contains_entry(Path::new(path))? {
             return Ok(None);
         }
-        let mut file =
-            directory.open_regular_read(Path::new(path), MAX_MANAGED_RESTORE_FILE_BYTES)?;
+        let mut file = directory.open_regular_read(Path::new(path), u64::MAX)?;
         let metadata = file.metadata().kio_io(Path::new(path))?;
         let identity = scheduled_source_identity(&file)?;
         let (hash, size) = hash_scope_file(
             &mut file,
             Path::new(path),
             path,
-            MAX_MANAGED_RESTORE_FILE_BYTES,
-            ArchiveLimits::new(
-                MAX_MANAGED_RESTORE_FILE_BYTES,
-                MAX_MANAGED_RESTORE_FILE_BYTES,
-            ),
+            u64::MAX,
+            ArchiveLimits::new(u64::MAX, u64::MAX),
         )?;
         if size != metadata.len()
             || file.metadata().kio_io(Path::new(path))?.len() != size
@@ -647,22 +828,10 @@ impl Repository {
         Ok(Some(hash))
     }
 
+    #[cfg(test)]
     fn remove_working_raw(&self, relative: &Path, raw_hash: &str) -> Result<()> {
-        let metadata = self.store.inspect_object(ObjectKind::Raw, raw_hash)?;
-        self.root_directory()?
-            .quarantine_then_remove_hash_with_owner(
-                &self.store_directory()?,
-                relative,
-                raw_hash,
-                metadata.size_bytes,
-                MAX_MANAGED_RESTORE_FILE_BYTES,
-            )
-    }
-
-    fn write_working_raw(&self, relative: &Path, raw_hash: &str) -> Result<()> {
-        self.store
-            .stage_raw_copy(raw_hash, MAX_MANAGED_RESTORE_FILE_BYTES)?
-            .publish_to(&self.root_directory()?, relative, self.control())
+        let bytes = self.raw_bytes(raw_hash)?;
+        self.remove_working_atomic(relative, &bytes, bytes.len() as u64)
     }
 
     #[cfg(test)]
@@ -674,29 +843,78 @@ impl Repository {
         Ok(bytes)
     }
 
+    fn acknowledge_restore_removal(&self, change: &ManagedRestoreChange, raw: &str) -> Result<()> {
+        let length = self.store.inspect_object(ObjectKind::Raw, raw)?.size_bytes;
+        self.store_directory()?.acknowledge_parent_removal(
+            &self.root_directory()?,
+            Path::new(&change.path),
+            raw,
+            length,
+        )?;
+        Ok(())
+    }
+
+    // Keep parent-journal writes independent of the working-file removal
+    // workspace, so a deletion intent can be carried durably into this journal
+    // before the lower-level recovery proof is retired.
+    fn restore_journal_owner(&self, create: bool) -> Result<Option<StoreDirectory>> {
+        let owner = self.store_directory()?;
+        let leaf = Path::new("managed-restore-journal-owner");
+        if !owner.contains_entry(leaf)? {
+            if !create {
+                return Ok(None);
+            }
+            owner.create_directory(leaf)?;
+            owner.sync()?;
+        }
+        let directory = StoreDirectory::from_retained_with_control(
+            owner.open_directory(leaf)?,
+            owner.path().join(leaf),
+            self.control().clone(),
+        )?;
+        crate::private_fs::verify_private_directory_handle(&directory)?;
+        Ok(Some(directory))
+    }
+
     fn persist_restore_progress(
         &self,
         journal: &ManagedRestoreJournal,
         bytes: &mut Vec<u8>,
     ) -> Result<()> {
         let next = journal.bytes()?;
-        self.store_directory()?.write_atomic(
+        self.store_directory()?.write_atomic_with_owner(
+            &self
+                .restore_journal_owner(true)?
+                .expect("created journal owner"),
             Path::new(MANAGED_RESTORE_JOURNAL_LEAF),
             &next,
             Publication::Replace,
         )?;
         self.store_directory()?.sync()?;
         *bytes = next;
-        Ok(())
+        use crate::durability::DurabilityPoint as Point;
+        let point = match journal.progress[journal.active] {
+            RestoreProgress::Pending => return Ok(()),
+            RestoreProgress::RemovingOld => Point::RestoreRemovingOld,
+            RestoreProgress::OldRemoved => Point::RestoreOldRemoved,
+            RestoreProgress::PublishingNew => Point::RestorePublishingNew,
+            RestoreProgress::Applied => Point::RestoreApplied,
+            RestoreProgress::RollbackRemovingNew => Point::RestoreRollbackRemovingNew,
+            RestoreProgress::RollbackNewRemoved => Point::RestoreRollbackNewRemoved,
+            RestoreProgress::RestoringOld => Point::RestoreRestoringOld,
+        };
+        self.control().checkpoint(point)
     }
 
-    fn apply_restore_change_with_progress(
+    fn apply_restore_change_with_progress<P: FnMut(&ManagedRestoreStatus) -> Result<()>>(
         &self,
         change: &ManagedRestoreChange,
-        index: usize,
         journal: &mut ManagedRestoreJournal,
         bytes: &mut Vec<u8>,
+        observe: &mut P,
+        expected_identity: Option<crate::platform::ScheduledSourceIdentity>,
     ) -> Result<()> {
+        let index = journal.active;
         if self.working_raw_hash(&change.path)? != change.old_raw_hash {
             return Err(restore_conflict(
                 "working file changed before restore mutation",
@@ -705,34 +923,49 @@ impl Repository {
         if let Some(old) = &change.old_raw_hash {
             journal.progress[index] = RestoreProgress::RemovingOld;
             self.persist_restore_progress(journal, bytes)?;
-            self.remove_working_raw(Path::new(&change.path), old)?;
+            observe(&journal.status())?;
+            let length = self.store.inspect_object(ObjectKind::Raw, old)?.size_bytes;
+            self.root_directory()?.remove_hash_verified(
+                &self.store_directory()?,
+                Path::new(&change.path),
+                (old, length),
+                None,
+                |file| {
+                    if Some(scheduled_source_identity(file)?) != expected_identity {
+                        return Err(restore_conflict(
+                            "working file identity changed before restore mutation",
+                        ));
+                    }
+                    Ok(())
+                },
+            )?;
+            self.control()
+                .checkpoint(crate::durability::DurabilityPoint::RestoreRemovalCompleted)?;
             journal.progress[index] = RestoreProgress::OldRemoved;
             self.persist_restore_progress(journal, bytes)?;
+            observe(&journal.status())?;
+            self.acknowledge_restore_removal(change, old)?;
         }
         if let Some(new) = &change.new_raw_hash {
-            journal.progress[index] = RestoreProgress::PublishingNew;
-            self.persist_restore_progress(journal, bytes)?;
-            self.write_working_raw(Path::new(&change.path), new)?;
+            self.write_restore_stage(change, new, journal, bytes, observe)?;
         }
         journal.progress[index] = RestoreProgress::Applied;
         self.persist_restore_progress(journal, bytes)?;
+        observe(&journal.status())?;
         Ok(())
     }
 
     #[cfg(test)]
     fn apply_restore_change(&self, change: &ManagedRestoreChange) -> Result<()> {
-        if self.working_raw_hash(&change.path)? != change.old_raw_hash {
-            return Err(restore_conflict(
-                "working file changed before restore mutation",
-            ));
-        }
+        let (mut journal, mut bytes) = self.managed_restore_journal()?.expect("test journal");
         if let Some(old) = &change.old_raw_hash {
             self.remove_working_raw(Path::new(&change.path), old)?;
         }
         if let Some(new) = &change.new_raw_hash {
-            self.write_working_raw(Path::new(&change.path), new)?;
+            self.write_restore_stage(change, new, &mut journal, &mut bytes, &mut |_| Ok(()))?;
         }
-        Ok(())
+        journal.progress[0] = RestoreProgress::Applied;
+        self.persist_restore_progress(&journal, &mut bytes)
     }
 
     fn rollback_restore_change_with_progress(
@@ -744,13 +977,29 @@ impl Repository {
     ) -> Result<()> {
         let current = self.working_raw_hash(&change.path)?;
         if current == change.old_raw_hash {
+            if current.is_some() && journal.progress[index] == RestoreProgress::RestoringOld {
+                self.verify_restore_destination(journal, index, &change.path)?;
+            }
             if journal.progress[index] != RestoreProgress::Pending {
                 journal.progress[index] = RestoreProgress::Pending;
                 self.persist_restore_progress(journal, bytes)?;
             }
             return Ok(());
         }
-        let phase = journal.progress[index];
+        let mut phase = journal.progress[index];
+        if current.is_none()
+            && matches!(
+                phase,
+                RestoreProgress::PublishingNew | RestoreProgress::RestoringOld
+            )
+            && self.restore_stage_present(journal)?
+        {
+            // This owned unpublished stage proves the operation-owned gap.
+            // Persist that proof before a retry can discard this stage.
+            phase = RestoreProgress::OldRemoved;
+            journal.progress[index] = phase;
+            self.persist_restore_progress(journal, bytes)?;
+        }
         if matches!(
             phase,
             RestoreProgress::OldRemoved | RestoreProgress::RollbackNewRemoved
@@ -768,12 +1017,9 @@ impl Repository {
                     restore_incomplete("old-removed phase has no old raw")
                 }
             })?;
-            // This intent must be stable before creation.  A later crash with
-            // `restoring_old` and an absent path is deliberately ambiguous:
-            // it could be a failed create or a post-crash user deletion.
-            journal.progress[index] = RestoreProgress::RestoringOld;
-            self.persist_restore_progress(journal, bytes)?;
-            self.write_working_raw(Path::new(&change.path), old)?;
+            // The stage helper records identity before payload and publication.
+            // An absent stage and destination after publication remain ambiguous.
+            self.write_restore_stage(change, old, journal, bytes, &mut |_| Ok(()))?;
             journal.progress[index] = RestoreProgress::Pending;
             self.persist_restore_progress(journal, bytes)?;
             return Ok(());
@@ -786,9 +1032,7 @@ impl Repository {
                 .old_raw_hash
                 .as_ref()
                 .ok_or_else(|| restore_incomplete("applied deletion phase has no old raw"))?;
-            journal.progress[index] = RestoreProgress::RestoringOld;
-            self.persist_restore_progress(journal, bytes)?;
-            self.write_working_raw(Path::new(&change.path), old)?;
+            self.write_restore_stage(change, old, journal, bytes, &mut |_| Ok(()))?;
             journal.progress[index] = RestoreProgress::Pending;
             self.persist_restore_progress(journal, bytes)?;
             return Ok(());
@@ -807,20 +1051,22 @@ impl Repository {
         }
         debug_assert!(change.new_raw_hash.is_some());
         if current == change.new_raw_hash {
+            self.verify_restore_destination(journal, index, &change.path)?;
             let new = change
                 .new_raw_hash
                 .as_ref()
                 .expect("current can equal new only when new is present");
             journal.progress[index] = RestoreProgress::RollbackRemovingNew;
             self.persist_restore_progress(journal, bytes)?;
-            self.remove_working_raw(Path::new(&change.path), new)?;
+            self.remove_restore_destination(journal, change, new)?;
+            self.control()
+                .checkpoint(crate::durability::DurabilityPoint::RestoreRemovalCompleted)?;
             journal.progress[index] = RestoreProgress::RollbackNewRemoved;
             self.persist_restore_progress(journal, bytes)?;
+            self.acknowledge_restore_removal(change, new)?;
         }
         if let Some(old) = &change.old_raw_hash {
-            journal.progress[index] = RestoreProgress::RestoringOld;
-            self.persist_restore_progress(journal, bytes)?;
-            self.write_working_raw(Path::new(&change.path), old)?;
+            self.write_restore_stage(change, old, journal, bytes, &mut |_| Ok(()))?;
         }
         journal.progress[index] = RestoreProgress::Pending;
         self.persist_restore_progress(journal, bytes)?;
@@ -940,11 +1186,9 @@ impl Repository {
             &mut super::repository::publication_json_reader(&publication)?,
         )?;
         let directory = self.store_directory()?;
-        directory.quarantine_then_remove_hash_with_owner(
-            &directory,
+        directory.quarantine_then_remove_hash(
             Path::new(super::PUBLICATION_JOURNAL_LEAF),
             &hash,
-            size,
             size,
         )
     }
@@ -1111,11 +1355,6 @@ fn ensure_raw_present(repo: &Repository, raw_hash: &str) -> Result<u64> {
                 error
             }
         })?;
-    if object.size_bytes > MAX_MANAGED_RESTORE_FILE_BYTES {
-        return Err(restore_incomplete(
-            "restore source file exceeds the managed restore byte limit",
-        ));
-    }
     Ok(object.size_bytes)
 }
 
@@ -1213,6 +1452,263 @@ mod tests {
                 Publication::CreateOnly,
             )
             .unwrap();
+    }
+
+    fn restore_fixture() -> (tempfile::TempDir, Repository, super::ManagedRestorePlan) {
+        let directory = tempfile::tempdir().unwrap();
+        write_working_file(directory.path().join("a.txt"), b"one").unwrap();
+        write_working_file(directory.path().join("b.txt"), b"first").unwrap();
+        let repo = Repository::init(directory.path()).unwrap();
+        let source = snapshot(&repo, "2026-01-01T00:00:00Z");
+        write_working_file(directory.path().join("a.txt"), b"two").unwrap();
+        write_working_file(directory.path().join("b.txt"), b"second").unwrap();
+        snapshot(&repo, "2026-01-02T00:00:00Z");
+        let plan = repo
+            .plan_restore(ManagedRestoreRequest::new(
+                source,
+                None,
+                Vec::new(),
+                "restore",
+                "2026-01-03T00:00:00Z",
+            ))
+            .unwrap();
+        (directory, repo, plan)
+    }
+
+    #[test]
+    fn st06_each_durable_apply_phase_recovers_with_file_byte_progress() {
+        for phase in [
+            "pending",
+            "removing_old",
+            "old_removed",
+            "publishing_new",
+            "applied",
+        ] {
+            let (directory, repo, plan) = restore_fixture();
+            let error = repo
+                .apply_restore_with_progress(
+                    &plan,
+                    || Ok(()),
+                    |status| {
+                        assert_eq!(status.files_total, 2);
+                        assert_eq!(status.bytes_total, 8);
+                        if status.phase == phase {
+                            return Err(super::restore_incomplete("simulated interruption"));
+                        }
+                        Ok(())
+                    },
+                )
+                .unwrap_err();
+            assert!(
+                error.message().contains("simulated interruption"),
+                "{phase}: {error:?}"
+            );
+            assert!(repo.managed_restore_status().unwrap().is_some());
+            assert!(repo.recover_managed_restore().unwrap(), "{phase}");
+            assert_eq!(
+                repo.head_commit_hash().unwrap().as_deref(),
+                Some(plan.expected_head())
+            );
+            assert_eq!(fs::read(directory.path().join("a.txt")).unwrap(), b"two");
+            assert_eq!(fs::read(directory.path().join("b.txt")).unwrap(), b"second");
+            assert!(!repo.recover_managed_restore().unwrap());
+        }
+    }
+
+    #[test]
+    fn st06_multiple_published_files_keep_individual_recovery_identities() {
+        let (directory, repo, plan) = restore_fixture();
+        repo.apply_restore_with_progress(
+            &plan,
+            || Ok(()),
+            |status| {
+                if status.files_completed == 2 {
+                    assert_eq!(status.bytes_completed, 8);
+                    return Err(super::restore_incomplete("interrupt after both files"));
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        repo.recover_managed_restore().unwrap();
+        assert_eq!(fs::read(directory.path().join("a.txt")).unwrap(), b"two");
+        assert_eq!(fs::read(directory.path().join("b.txt")).unwrap(), b"second");
+    }
+
+    #[test]
+    fn st06_same_bytes_replacement_is_preserved_before_apply_and_during_rollback() {
+        let (directory, repo, plan) = restore_fixture();
+        fs::rename(
+            directory.path().join("a.txt"),
+            directory.path().join("original"),
+        )
+        .unwrap();
+        write_working_file(directory.path().join("a.txt"), b"two").unwrap();
+        assert!(repo.apply_restore(&plan, || Ok(())).is_err());
+        assert!(!repo.kio_dir().join(MANAGED_RESTORE_JOURNAL_LEAF).exists());
+        assert_eq!(fs::read(directory.path().join("a.txt")).unwrap(), b"two");
+
+        let (directory, repo, plan) = restore_fixture();
+        let result = repo.apply_restore_with_progress(
+            &plan,
+            || Ok(()),
+            |status| {
+                if status.phase == "removing_old" {
+                    fs::rename(
+                        directory.path().join("a.txt"),
+                        directory.path().join("original"),
+                    )
+                    .unwrap();
+                    write_working_file(directory.path().join("a.txt"), b"two").unwrap();
+                }
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(fs::read(directory.path().join("a.txt")).unwrap(), b"two");
+        repo.recover_managed_restore().unwrap();
+        assert_eq!(fs::read(directory.path().join("a.txt")).unwrap(), b"two");
+
+        let (directory, repo, plan) = restore_fixture();
+        repo.apply_restore_with_progress(
+            &plan,
+            || Ok(()),
+            |status| {
+                if status.phase == "applied" {
+                    return Err(super::restore_incomplete("interrupt"));
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        fs::rename(
+            directory.path().join("a.txt"),
+            directory.path().join("original"),
+        )
+        .unwrap();
+        write_working_file(directory.path().join("a.txt"), b"one").unwrap();
+        assert!(repo.recover_managed_restore().is_err());
+        assert_eq!(fs::read(directory.path().join("a.txt")).unwrap(), b"one");
+        assert!(repo.kio_dir().join(MANAGED_RESTORE_JOURNAL_LEAF).exists());
+    }
+
+    #[test]
+    fn st06_same_bytes_replacement_before_head_publication_is_refused() {
+        let (directory, repo, plan) = restore_fixture();
+        let result = repo.apply_restore_with_progress(
+            &plan,
+            || Ok(()),
+            |status| {
+                if status.files_completed == 2 && status.phase == "applied" {
+                    fs::rename(
+                        directory.path().join("a.txt"),
+                        directory.path().join("displaced"),
+                    )
+                    .unwrap();
+                    write_working_file(directory.path().join("a.txt"), b"one").unwrap();
+                }
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            repo.head_commit_hash().unwrap().as_deref(),
+            Some(plan.expected_head())
+        );
+        assert_eq!(fs::read(directory.path().join("a.txt")).unwrap(), b"one");
+    }
+
+    #[test]
+    fn st06_stage_replacement_is_preserved_and_corrupt_payload_is_not_published() {
+        for replace in [true, false] {
+            let (directory, repo, plan) = restore_fixture();
+            let mut stage = std::path::PathBuf::new();
+            let result = repo.apply_restore_with_progress(
+                &plan,
+                || Ok(()),
+                |status| {
+                    if status.phase == "publishing_new" {
+                        let value: serde_json::Value = serde_json::from_slice(
+                            &fs::read(repo.kio_dir().join(MANAGED_RESTORE_JOURNAL_LEAF)).unwrap(),
+                        )
+                        .unwrap();
+                        stage = repo
+                            .kio_dir()
+                            .join(value["stages"][0]["leaf"].as_str().unwrap());
+                        if replace {
+                            fs::rename(&stage, repo.kio_dir().join("displaced-stage")).unwrap();
+                        }
+                        // Retaining a mismatching tail also detects in-place stage tampering.
+                        fs::write(&stage, b"foreign payload with a long tail").unwrap();
+                    }
+                    Ok(())
+                },
+            );
+            assert!(result.is_err());
+            assert!(!directory.path().join("a.txt").exists());
+            assert_eq!(
+                repo.head_commit_hash().unwrap().as_deref(),
+                Some(plan.expected_head())
+            );
+            if replace {
+                assert!(repo.recover_managed_restore().is_err());
+                assert_eq!(
+                    fs::read(&stage).unwrap(),
+                    b"foreign payload with a long tail"
+                );
+            } else {
+                repo.recover_managed_restore().unwrap();
+                assert_eq!(fs::read(directory.path().join("a.txt")).unwrap(), b"two");
+                assert!(!stage.exists());
+            }
+        }
+    }
+
+    #[test]
+    fn st06_restores_above_former_file_and_operation_limits() {
+        let directory = tempfile::tempdir().unwrap();
+        let length = 64 * 1024 * 1024 + 1;
+        for index in 0..8 {
+            let path = directory.path().join(format!("large-{index}.bin"));
+            write_working_file(&path, b"").unwrap();
+            fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_len(length)
+                .unwrap();
+        }
+        let repo = Repository::init(directory.path()).unwrap();
+        let source = snapshot(&repo, "2026-01-01T00:00:00Z");
+        for index in 0..8 {
+            write_working_file(directory.path().join(format!("large-{index}.bin")), b"head")
+                .unwrap();
+        }
+        let head = snapshot(&repo, "2026-01-02T00:00:00Z");
+        let plan = repo
+            .plan_restore(ManagedRestoreRequest::new(
+                source,
+                None,
+                Vec::new(),
+                "large restore",
+                "2026-01-03T00:00:00Z",
+            ))
+            .unwrap();
+        let outcome = repo.apply_restore(&plan, || Ok(())).unwrap();
+        assert_eq!(outcome.restored_paths.len(), 8);
+        for index in 0..8 {
+            assert_eq!(
+                fs::metadata(directory.path().join(format!("large-{index}.bin")))
+                    .unwrap()
+                    .len(),
+                length
+            );
+        }
+        let commit = repo
+            .read_commit(outcome.commit_hash.as_deref().unwrap())
+            .unwrap();
+        assert_eq!(commit.parent.as_deref(), Some(head.as_str()));
+        assert!(!repo.kio_dir().join(MANAGED_RESTORE_JOURNAL_LEAF).exists());
     }
 
     #[test]
@@ -1413,12 +1909,8 @@ mod tests {
         let old = repo
             .raw_bytes(plan.changes[0].old_raw_hash.as_deref().unwrap())
             .unwrap();
-        repo.remove_working_atomic(
-            Path::new("a.txt"),
-            &old,
-            super::MAX_MANAGED_RESTORE_FILE_BYTES,
-        )
-        .unwrap();
+        repo.remove_working_atomic(Path::new("a.txt"), &old, u64::MAX)
+            .unwrap();
         assert!(!directory.path().join("a.txt").exists());
 
         assert!(repo.recover_managed_restore().unwrap());
@@ -1447,12 +1939,8 @@ mod tests {
         let old = repo
             .raw_bytes(plan.changes[0].old_raw_hash.as_deref().unwrap())
             .unwrap();
-        repo.remove_working_atomic(
-            Path::new("a.txt"),
-            &old,
-            super::MAX_MANAGED_RESTORE_FILE_BYTES,
-        )
-        .unwrap();
+        repo.remove_working_atomic(Path::new("a.txt"), &old, u64::MAX)
+            .unwrap();
 
         assert_eq!(
             repo.recover_managed_restore().unwrap_err().error_code(),
@@ -1483,23 +1971,15 @@ mod tests {
         let old = repo
             .raw_bytes(plan.changes[0].old_raw_hash.as_deref().unwrap())
             .unwrap();
-        repo.remove_working_atomic(
-            Path::new("a.txt"),
-            &old,
-            super::MAX_MANAGED_RESTORE_FILE_BYTES,
-        )
-        .unwrap();
+        repo.remove_working_atomic(Path::new("a.txt"), &old, u64::MAX)
+            .unwrap();
         let new = repo
             .raw_bytes(plan.changes[0].new_raw_hash.as_deref().unwrap())
             .unwrap();
         repo.write_working_atomic(Path::new("a.txt"), &new, Publication::CreateOnly)
             .unwrap();
-        repo.remove_working_atomic(
-            Path::new("a.txt"),
-            &new,
-            super::MAX_MANAGED_RESTORE_FILE_BYTES,
-        )
-        .unwrap();
+        repo.remove_working_atomic(Path::new("a.txt"), &new, u64::MAX)
+            .unwrap();
 
         assert_eq!(
             repo.recover_managed_restore().unwrap_err().error_code(),
@@ -1530,23 +2010,15 @@ mod tests {
         let old = repo
             .raw_bytes(plan.changes[0].old_raw_hash.as_deref().unwrap())
             .unwrap();
-        repo.remove_working_atomic(
-            Path::new("a.txt"),
-            &old,
-            super::MAX_MANAGED_RESTORE_FILE_BYTES,
-        )
-        .unwrap();
+        repo.remove_working_atomic(Path::new("a.txt"), &old, u64::MAX)
+            .unwrap();
         let new = repo
             .raw_bytes(plan.changes[0].new_raw_hash.as_deref().unwrap())
             .unwrap();
         repo.write_working_atomic(Path::new("a.txt"), &new, Publication::CreateOnly)
             .unwrap();
-        repo.remove_working_atomic(
-            Path::new("a.txt"),
-            &new,
-            super::MAX_MANAGED_RESTORE_FILE_BYTES,
-        )
-        .unwrap();
+        repo.remove_working_atomic(Path::new("a.txt"), &new, u64::MAX)
+            .unwrap();
 
         assert!(repo.recover_managed_restore().unwrap());
         assert_eq!(fs::read(directory.path().join("a.txt")).unwrap(), b"two");
@@ -1574,23 +2046,15 @@ mod tests {
         let old = repo
             .raw_bytes(plan.changes[0].old_raw_hash.as_deref().unwrap())
             .unwrap();
-        repo.remove_working_atomic(
-            Path::new("a.txt"),
-            &old,
-            super::MAX_MANAGED_RESTORE_FILE_BYTES,
-        )
-        .unwrap();
+        repo.remove_working_atomic(Path::new("a.txt"), &old, u64::MAX)
+            .unwrap();
         let new = repo
             .raw_bytes(plan.changes[0].new_raw_hash.as_deref().unwrap())
             .unwrap();
         repo.write_working_atomic(Path::new("a.txt"), &new, Publication::CreateOnly)
             .unwrap();
-        repo.remove_working_atomic(
-            Path::new("a.txt"),
-            &new,
-            super::MAX_MANAGED_RESTORE_FILE_BYTES,
-        )
-        .unwrap();
+        repo.remove_working_atomic(Path::new("a.txt"), &new, u64::MAX)
+            .unwrap();
 
         assert_eq!(
             repo.recover_managed_restore().unwrap_err().error_code(),
@@ -1653,6 +2117,7 @@ mod tests {
                 Publication::CreateOnly,
             )
             .unwrap();
+        let managed_bytes = fs::read(repo.kio_dir().join(MANAGED_RESTORE_JOURNAL_LEAF)).unwrap();
         let before_head = fs::read(repo.kio_dir().join("HEAD")).unwrap();
         let before_working = fs::read(directory.path().join("a.txt")).unwrap();
         assert_eq!(

@@ -373,6 +373,9 @@ fn print_output(value: Value, json_mode: bool) {
         let rendered =
             serde_json::to_string_pretty(&value).expect("serializing command output cannot fail");
         println!("{}", terminal_safe_text(&rendered, true));
+    } else if value.get("operation").and_then(Value::as_str) == Some("managed_restore") {
+        let rendered = serde_json::to_string_pretty(&value).expect("restore response");
+        println!("{}", terminal_safe_text(&rendered, true));
     } else if let Some(status) = value.get("status").and_then(Value::as_str) {
         println!("{}", terminal_safe_text(status, false));
     } else if let Some(commits) = value.get("commits").and_then(Value::as_array) {

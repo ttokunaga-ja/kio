@@ -74,6 +74,9 @@ pub(crate) fn finish_remove_retirement(
 ) -> Result<bool> {
     match (source, removed) {
         (Some(mut source), false) => {
+            if let Some(identity) = &intent.stage_identity {
+                identity.verify(&source)?;
+            }
             if file_id(&source)? != intent.source_id
                 || hash_file(&mut source, intent.max_bytes)?
                     != (intent.sha256.clone(), intent.length)
@@ -87,12 +90,19 @@ pub(crate) fn finish_remove_retirement(
                 Path::new(REMOVED),
                 Publication::CreateOnly,
             )?;
+            parent.sync()?;
+            workspace.sync()?;
             workspace
                 .control()
                 .checkpoint(crate::durability::DurabilityPoint::AtomicRemoveQuarantined)?;
         }
         (None, true) => {}
         (None, false) => {
+            if intent.retain_quarantine {
+                return Err(failure(
+                    "deletion intent has neither source nor quarantine; external deletion is ambiguous",
+                ));
+            }
             remove_if_present(workspace, REMOVE_READY)?;
             return Ok(true);
         }
@@ -101,12 +111,20 @@ pub(crate) fn finish_remove_retirement(
     {
         let mut quarantined =
             workspace.open_regular_for_removal(Path::new(REMOVED), intent.max_bytes)?;
+        if let Some(identity) = &intent.stage_identity {
+            identity.verify(&quarantined)?;
+        }
         if file_id(&quarantined)? != intent.source_id
             || hash_file(&mut quarantined, intent.max_bytes)? != (intent.sha256, intent.length)
         {
             return Err(failure(
                 "removal quarantine does not match its ready intent",
             ));
+        }
+        parent.sync()?;
+        workspace.sync()?;
+        if intent.retain_quarantine {
+            return Ok(true);
         }
         drop(quarantined);
         remove_if_present(workspace, REMOVED)?;

@@ -194,28 +194,6 @@ impl ObjectStore {
             .stage_raw_from_reader(reader, max_bytes)
     }
 
-    /// Stream a verified raw CAS object into an identity-journaled private stage.
-    pub(crate) fn stage_raw_copy(&self, hash: &str, max_bytes: u64) -> Result<BoundRawStage> {
-        let bound = self
-            .bound
-            .as_ref()
-            .ok_or_else(|| KioError::invalid_usage("raw stage copy requires retained store"))?;
-        let (parent, leaf) = bound.fanout(ObjectKind::Raw, hash, false)?;
-        let mut source = bound_open_regular_handle(&parent, &leaf)?;
-        let expected_size = source.metadata().kio_io(Path::new(&leaf))?.len();
-        if expected_size > max_bytes {
-            return Err(object_size_error(ObjectKind::Raw, max_bytes, expected_size));
-        }
-        let stage = bound.stage_raw_from_reader_with_access(&mut source, max_bytes, &self.reads)?;
-        if stage.raw_hash() != hash
-            || stage.size_bytes() != expected_size
-            || source.metadata().kio_io(Path::new(&leaf))?.len() != expected_size
-        {
-            return Err(bound_stage_corrupt("raw CAS source changed while staging"));
-        }
-        Ok(stage)
-    }
-
     pub fn inspect_raw_stages(&self) -> Result<Vec<RawStageResidue>> {
         if let Some(bound) = &self.bound {
             return bound.inspect_raw_stages(false);

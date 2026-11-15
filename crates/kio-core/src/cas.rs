@@ -668,20 +668,6 @@ impl BoundRawStage {
         Ok(())
     }
 
-    pub(crate) fn publish_to(
-        mut self,
-        target: &crate::store_dir::StoreDirectory,
-        leaf: &Path,
-        control: &crate::control::ControlHandle,
-    ) -> Result<()> {
-        self.verify()?;
-        control.checkpoint(crate::durability::DurabilityPoint::AtomicWriteStaged)?;
-        self.publish_saved_to(target, leaf)?;
-        self.journals.remove_file(Path::new(&self.name))?;
-        self.name.clear();
-        control.checkpoint(crate::durability::DurabilityPoint::AtomicWritePublished)
-    }
-
     pub(crate) fn publish_metadata_to(
         mut self,
         target: &crate::store_dir::StoreDirectory,

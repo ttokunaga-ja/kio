@@ -1020,7 +1020,9 @@ mod tests {
             "source_id": identity,
             "sha256": "0".repeat(64),
             "length": 0,
-            "max_bytes": 0
+            "max_bytes": 0,
+            "parent_owned": false,
+            "stage_identity": null
         });
         drop(atomic.lock_private_gate(Path::new("remove.json")).unwrap());
         fs::write(
