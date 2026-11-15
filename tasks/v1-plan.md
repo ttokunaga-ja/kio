@@ -56,6 +56,13 @@ V1（テストが実際のホームに書き込まない）と V2（Linux の全
 6. **抽出の資源の段階と、既存の入力サイズの制限の関係**。原本のサイズで飛ばす現在の経路が、段階を上げても手前で止める恐れがある。原本の保存、ローカルの抽出の予算、外部の Adapter への入力の制限を分けて整理する。
 7. **Office の対応範囲**。検証できる runtime の配置だけを受け入れ、分からない配置は理由を示して使えないものとする。systemd と cgroup を必須とすること、段階の数値は仕様書で決まっており、決め直さない。
 
+### 3.2b 利用者の決定による変更（2026-11-15）
+
+| 番号 | 作業 | 受入条件 | 作業量 | 3 OS |
+|---|---|---|---|---|
+| NC | ソースコードのファイルを扱わない（D-20261115-01）。仕様書から同梱 Adapter・unit の対象としての code を外し、既知のソースコードの拡張子を unsupported として理由付きで飛ばす。`text/x-code` とコード用の整形を削除する | 既知のソースコードの拡張子は索引されず、unsupported として理由が表示される。Markdown 内のコードブロックは変わらない。仕様書・実装・テスト・fixture に code の対象が残らない | 中 | まとめて |
+| PX | kio-eval の persona 系のコマンド、CI の `persona-w0-integration`、`persona-corpus/`、`tasks/persona-skill-corpus/` とその参照を削除する（D-20261115-02） | 削除後に workspace のビルド・テストと CI の残りの job が通る。資料に壊れた参照が残らない | 小 | まとめて |
+
 ### 3.3 ローカル接続の汎用化
 
 | 番号 | 作業 | 受入条件 |
@@ -107,7 +114,7 @@ ls -d ~/.local/share/kio ~/.local/state/kio ~/.config/kio ~/.cache/kio   # 何�
 - `CARGO_PROFILE_TEST_OPT_LEVEL=1` は CI の 3 つの OS のテストの手順と同じ設定である（debug_assertions は有効のまま）。
 - Windows の型と lint の誤りは、C の依存を持たない crate だけローカルで確かめられる：`rustup +1.98.0 target add x86_64-pc-windows-msvc` の上で `CARGO_TARGET_DIR=scratch/target-win cargo +1.98.0 clippy -p kio-core -p kio-process --all-targets --locked --target x86_64-pc-windows-msvc -- -D warnings`。ほかの crate（ring・libsqlite3-sys・sqlite-vec に依存）は CI でしか確かめられない。
 - 作業中は、変更した crate のテストだけを回す。全テストは、作業の区切りと push の前に回す。
-- persona W0 と synthetic-history は、`kio-eval`・検索・索引・履歴に触れた変更の push の前に回す。手順は `.github/workflows/ci.yml` の該当 job のとおり。
+- synthetic-history は、`kio-eval`・検索・索引・履歴に触れた変更の push の前に回す（persona W0 は PX で削除するまで同じ）。手順は `.github/workflows/ci.yml` の該当 job のとおり。
 - 最後の `ls` は、テストが実際のホームに書き込んでいないことの確認である。V1 の後は、HOME と XDG を差し替えずに全テストを回しても何も作られない（2026-11-13 に確認）。
 
 ### 4.2 CI

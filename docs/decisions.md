@@ -179,7 +179,7 @@
 ### D-20261113-12 `tasks/` の旧資料を削除する
 
 - **内容**：`tasks/` の旧資料 109 ファイルを削除し、計画の入口を `tasks/v1-plan.md` の 1 本にした。残したのは、計画、制約の一覧、任意の高コスト検証の手順、v1 後の設計 2 本、正式な受入の経路の資料、履歴扱いの Phase 4 契約、テストが節番号で引用している試験仕様 6 本（`step4b-contract-tests-*.md`）、スクリプトとテストの説明が参照する `artifacts/` の一部、repo の `persona-corpus/` が参照する `persona-skill-corpus/` である。削除した資料を理由の出典として引用しているコメントは、`tasks/<名前>.md (git 56a6831)` と書き換え、その commit で読めるようにした。
-- **理由**：D-20261113-06。試験仕様は約 190 か所のテストとコードから引用されており、削除すると引用先がなくなる。`persona-corpus/` と `persona-skill-corpus/` は personaCorpus の見直しで扱う。
+- **理由**：D-20261113-06。試験仕様は約 190 か所のテストとコードから引用されており、削除すると引用先がなくなる。`persona-corpus/` と `persona-skill-corpus/` は personaCorpus の見直しで扱う。（D-20261115-02 で変更）
 - **関係する資料**：`tasks/`、`docs/README.md`。
 
 ### D-20261113-13 見直しのセッションは実装しない
@@ -205,3 +205,23 @@
 - **内容**：D-20261031-01 の識別方式（物理的な ID と 256 bit の乱数、Unix は拡張属性、Windows は EA）は、中断後に再開・回収する大きな一時領域（原本・tree・復元・抽出の保存、台帳の backup、journal の整理。計画の S1〜S3、P0、L2、J1）だけに使う。store の小さな atomic 書き込みは、物理的な ID による今の方式のままとする。拡張属性・EA に対応しないファイルシステムでは、その大きな操作だけが理由を示して失敗する。
 - **理由**：R1 の最初の実装は store のほぼすべての atomic 書き込みを乱数付きの一時領域に通し、拡張属性・EA に対応しないファイルシステム（FAT・exFAT、一部のネットワーク共有など）上の scope では kio が何も書けなくなった。2026-11-13 に利用者が範囲を大きな書き込みに限ると決めた。
 - **関係する資料**：D-20261031-01、`tasks/v1-plan.md` §3.2 の R1、`docs/04-pipeline.md` §1.1。
+
+## 2026-11-15
+
+### D-20261115-01 Kio はソースコードのファイルを扱わない
+
+- **内容**：Kio はソースコードのファイルを索引・抽出の対象にしない。既知のソースコードの拡張子のファイルは、unsupported として理由を示して飛ばす。同梱 Adapter の対象からコードを外し、コード用の MIME の判定と整形をなくす。Markdown の中のコードブロックやインラインコードは、Markdown の一部としてこれまでどおり扱う。
+- **理由**：利用者が仕様を変えた。拡張子の判定を消すだけでは、中身がテキストのファイルは plain text として索引され続けるため、利用者が「非対応として飛ばす」を選んだ。
+- **関係する資料**：`docs/07-adapter-spec.md`（同梱 Adapter の対象）、`docs/04-pipeline.md`（unit の表）、`tasks/v1-plan.md` §3.2 の NC。
+
+### D-20261115-02 kio-eval の persona 系のコマンドと persona の資料を削除する
+
+- **内容**：`kio-eval persona`（plan・schedule・render・materialize・scaffold・lease・attest と関連の module）、CI の `persona-w0-integration` の job、`persona-corpus/`、`tasks/persona-skill-corpus/` と、それらへの参照を削除する。
+- **理由**：personaCorpus がこれらを使わなくなり、利用者が残すかどうかを Kio 側で決めるとした。v1 の受入（51 件）、benchmark・scale・qhard、kio-cli はこれらに依存しない（2026-11-13 の調査）。KISS・YAGNI により残さない。`persona-corpus/` は Git では骨組みだけを管理し、確定済みの成果物を含まない。
+- **関係する資料**：D-20261113-12 の「`persona-corpus/` と `persona-skill-corpus/` は personaCorpus の見直しで扱う」はこの決定で変更。`tasks/v1-plan.md` §3.2 の PX。
+
+### D-20261115-03 Kio は personaCorpus の corpus を読むだけにする
+
+- **内容**：Kio は personaCorpus の corpus を評価の入力として読むだけで、personaCorpus への要望は出さない。
+- **理由**：利用者の決定。
+- **関係する資料**：`tasks/v1-plan.md` §6（評価用の corpus の扱い）。
