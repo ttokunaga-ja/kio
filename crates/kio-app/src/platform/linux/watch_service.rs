@@ -32,109 +32,159 @@ pub(crate) fn native_registration_absent(manifest: &ServiceManifest) -> Result<b
     Ok(false)
 }
 
-pub(crate) fn native_loaded_definition_matches(manifest: &ServiceManifest) -> Result<bool> {
+fn complete_source(manifest: &ServiceManifest) -> Result<String> {
     let output = run_native_output(
         systemctl_path()?,
         [
             "--user".into(),
-            "show".into(),
-            "--property=FragmentPath,ExecStart,Environment".into(),
+            "cat".into(),
+            "--no-pager".into(),
             manifest.id.clone(),
         ],
     )?;
     if !output.status.success() {
         return Err(service_error(
-            "systemd could not inspect native watch registration",
+            "systemd could not read the complete service definition",
         ));
     }
-    let environment = service_environment_pairs(&manifest.environment)?;
-    Ok(output
+    Ok(output.stdout)
+}
+
+pub(crate) fn native_loaded_definition_matches(manifest: &ServiceManifest) -> Result<bool> {
+    loaded_definition_matches_with_query(manifest, |query| {
+        if query == "cat" {
+            return complete_source(manifest);
+        }
+        let output = run_native_output(
+            systemctl_path()?,
+            [
+                "--user".into(),
+                "show".into(),
+                "--property=NeedDaemonReload".into(),
+                "--value".into(),
+                manifest.id.clone(),
+            ],
+        )?;
+        if !output.status.success() {
+            return Err(service_error(
+                "systemd could not verify its loaded definition",
+            ));
+        }
+        Ok(output.stdout)
+    })
+}
+
+fn loaded_definition_matches_with_query(
+    manifest: &ServiceManifest,
+    mut query: impl FnMut(&str) -> Result<String>,
+) -> Result<bool> {
+    if !super::watch_unit_model::unit_definition_matches(
+        &query("cat")?,
+        &manifest.native_path,
+        &manifest.definition,
+    ) {
+        return Ok(false);
+    }
+    // Matching backing files do not authorize commands in a stale manager.
+    Ok(query("dirty")?.trim() == "no")
+}
+
+pub(crate) fn native_prepare_replacement(manifest: &ServiceManifest) -> Result<()> {
+    if native_loaded_definition_matches(manifest)? {
+        return Ok(());
+    }
+    // Called only for a durable, approved replacement whose private target
+    // file has already been published. Do not execute any cached stop action.
+    if !super::watch_unit_model::unit_definition_matches(
+        &complete_source(manifest)?,
+        &manifest.native_path,
+        &manifest.definition,
+    ) || native_state(manifest)?.active
+    {
+        return Err(service_error(
+            "foreign or active service during replacement publication recovery",
+        ));
+    }
+    native_after_remove()?;
+    if !native_loaded_definition_matches(manifest)? {
+        return Err(service_error("service changed during replacement reload"));
+    }
+    Ok(())
+}
+
+pub(crate) fn native_manifest_anchor(_manifest: &ServiceManifest) -> Result<Option<PathBuf>> {
+    Ok(None)
+}
+
+pub(crate) fn native_manifest_locator(id: &str) -> Result<Option<PathBuf>> {
+    let output = run_native_output(
+        systemctl_path()?,
+        [
+            "--user".into(),
+            "show".into(),
+            "--property=LoadState,Environment".into(),
+            id.into(),
+        ],
+    )?;
+    if output
         .stdout
         .lines()
-        .any(|line| line == format!("FragmentPath={}", manifest.native_path.display()))
-        && execution_matches(
-            &output.stdout,
-            &manifest.binary,
-            &manifest.root,
-            manifest.reconcile_interval_seconds,
-        )
-        && environment_matches(&output.stdout, &environment))
-}
-
-fn execution_matches(output: &str, binary: &Path, root: &Path, interval: u64) -> bool {
-    let Some(exec) = output.lines().find(|line| line.starts_with("ExecStart=")) else {
-        return false;
-    };
-    let expected = format!(
-        "{} watch --root {} run --reconcile-interval-seconds {interval}",
-        binary.display(),
-        root.display()
-    );
-    exec.matches("argv[]=").count() == 1
-        && exec.contains(&format!("path={} ;", binary.display()))
-        && exec
-            .split_once("argv[]=")
-            .and_then(|(_, argv)| argv.strip_prefix(&expected))
-            .is_some_and(|suffix| suffix.starts_with(" ;"))
-        && interval_matches(output, interval)
-}
-
-fn environment_matches(output: &str, expected: &[(&str, String)]) -> bool {
-    let Some(environment) = output
+        .any(|line| line == "LoadState=not-found")
+    {
+        return Ok(None);
+    }
+    if !output.status.success() {
+        return Err(service_error(
+            "systemd could not locate its registered manifest",
+        ));
+    }
+    let environment = output
+        .stdout
         .lines()
         .find_map(|line| line.strip_prefix("Environment="))
-    else {
-        return false;
-    };
-    // systemctl quotes strv entries containing whitespace and escapes literal
-    // quotes/backslashes. Compare whole entries, never path prefixes.
-    let mut entries = Vec::new();
-    let mut entry = String::new();
+        .ok_or_else(|| service_error("systemd did not expose the service environment"))?;
+    let words = systemd_words(environment)?;
+    let values = words
+        .iter()
+        .filter_map(|word| word.strip_prefix("XDG_DATA_HOME="))
+        .collect::<Vec<_>>();
+    if values.len() != 1 {
+        return Err(service_error("ambiguous registered service data directory"));
+    }
+    let path = Path::new(values[0])
+        .join("kio/watch-services")
+        .join(format!("{id}.json"));
+    crate::watch_service::validate_argument_path(&path)?;
+    Ok(Some(path))
+}
+
+fn systemd_words(value: &str) -> Result<Vec<String>> {
+    let mut words = Vec::new();
+    let mut word = String::new();
     let mut quoted = false;
-    let mut chars = environment.chars();
+    let mut chars = value.chars();
     while let Some(ch) = chars.next() {
         match ch {
             '\"' => quoted = !quoted,
             '\\' => match chars.next() {
-                Some(ch @ ('\\' | '\"')) => entry.push(ch),
-                _ => return false,
+                Some(ch @ ('\\' | '\"')) => word.push(ch),
+                _ => return Err(service_error("ambiguous systemd environment escape")),
             },
             ch if ch.is_whitespace() && !quoted => {
-                if !entry.is_empty() {
-                    entries.push(std::mem::take(&mut entry));
+                if !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
                 }
             }
-            ch => entry.push(ch),
+            ch => word.push(ch),
         }
     }
     if quoted {
-        return false;
+        return Err(service_error("unclosed systemd environment quote"));
     }
-    if !entry.is_empty() {
-        entries.push(entry);
+    if !word.is_empty() {
+        words.push(word);
     }
-    entries.len() == expected.len()
-        && expected
-            .iter()
-            .all(|(name, value)| entries.contains(&format!("{name}={value}")))
-}
-
-fn interval_matches(output: &str, interval: u64) -> bool {
-    let Some(exec) = output.lines().find(|line| line.starts_with("ExecStart=")) else {
-        return false;
-    };
-    let expected = interval.to_string();
-    let mut words = exec.split_whitespace();
-    let mut matched = false;
-    while let Some(word) = words.next() {
-        if word == "--reconcile-interval-seconds" {
-            if matched || words.next() != Some(expected.as_str()) {
-                return false;
-            }
-            matched = true;
-        }
-    }
-    matched
+    Ok(words)
 }
 
 pub(crate) fn native_definition_path(
@@ -181,6 +231,11 @@ pub(crate) fn render_definition(
 
 pub(crate) fn native_enable(manifest: &ServiceManifest) -> Result<()> {
     run_systemctl(["daemon-reload".into()])?;
+    if !native_loaded_definition_matches(manifest)? {
+        return Err(service_error(
+            "refusing to enable a foreign composed service definition",
+        ));
+    }
     run_systemctl(["enable".into(), manifest.id.clone()]).map(|_| ())
 }
 
@@ -265,52 +320,47 @@ fn systemd_escape(value: &str) -> Result<String> {
 mod tests {
     use super::*;
     #[test]
-    fn loaded_execution_and_environment_reject_foreign_prefixes_and_extra_values() {
-        let valid = "ExecStart={ path=/bin/kio ; argv[]=/bin/kio watch --root /root run --reconcile-interval-seconds 300 ; ignore_errors=no ; }\nEnvironment=HOME=/home/user XDG_CACHE_HOME=\"/home/user/cache space\"";
-        let expected = [
-            ("HOME", "/home/user".into()),
-            ("XDG_CACHE_HOME", "/home/user/cache space".into()),
-        ];
-        assert!(execution_matches(
-            valid,
-            Path::new("/bin/kio"),
-            Path::new("/root"),
-            300
-        ));
-        assert!(environment_matches(valid, &expected));
-        for foreign in [
-            valid.replace("/bin/kio", "/bin/kio-foreign"),
-            valid.replace("--root /root", "--root /root-foreign"),
-            valid.replace("300 ;", "300 foreign ;"),
-        ] {
-            assert!(!execution_matches(
-                &foreign,
-                Path::new("/bin/kio"),
-                Path::new("/root"),
-                300
-            ));
-        }
-        for foreign in [
-            valid.replace("HOME=/home/user", "HOME=/home/user-foreign"),
-            format!("{valid} EVIL=1"),
-        ] {
-            assert!(!environment_matches(&foreign, &expected));
-        }
-    }
-
-    #[test]
-    fn loaded_interval_requires_the_exact_argument() {
-        assert!(interval_matches(
-            "ExecStart={ argv[]=/bin/kio watch --root /root run --reconcile-interval-seconds 300 ; }",
-            300
-        ));
-        assert!(!interval_matches(
-            "ExecStart={ argv[]=/bin/kio watch --root /root run --reconcile-interval-seconds 3000 ; }",
-            300
-        ));
-        assert!(!interval_matches(
-            "ExecStart=foreign\nEnvironment=--reconcile-interval-seconds 300",
-            300
-        ));
+    fn review2_drop_in_exec_stop_is_foreign_before_any_lifecycle_command() {
+        let value = serde_json::json!({
+            "version":2,"id":"io.kio.watch.test","scope_id":"scope","root":"/root","binary":"/bin/kio",
+            "reconcile_interval_seconds":300,"native_path":"/config/systemd/user/watch.service","definition":"[Service]\nExecStart=/bin/kio\n",
+            "environment":{"home":"/home/user","userprofile":"/home/user","xdg_config_home":"/config","xdg_data_home":"/data","xdg_cache_home":"/cache"},"phase":"installed"
+        });
+        let manifest: ServiceManifest = serde_json::from_value(value).unwrap();
+        let show = "FragmentPath=/config/systemd/user/watch.service\nExecStart={ path=/bin/kio ; argv[]=/bin/kio watch --root /root run --reconcile-interval-seconds 300 ; }\nEnvironment=HOME=/home/user USERPROFILE=/home/user XDG_CONFIG_HOME=/config XDG_DATA_HOME=/data XDG_CACHE_HOME=/cache";
+        let cat = format!(
+            "# {}\n{}\n# /config/systemd/user/watch.service.d/foreign.conf\n[Service]\nExecStop=/bin/foreign\n",
+            manifest.native_path.display(),
+            manifest.definition
+        );
+        let own = format!(
+            "# {}\n{}",
+            manifest.native_path.display(),
+            manifest.definition
+        );
+        assert!(
+            loaded_definition_matches_with_query(&manifest, |query| Ok(if query == "dirty" {
+                "no".into()
+            } else {
+                own.clone()
+            }))
+            .unwrap()
+        );
+        assert!(
+            !loaded_definition_matches_with_query(&manifest, |query| Ok(if query == "dirty" {
+                "yes".into()
+            } else {
+                own.clone()
+            }))
+            .unwrap()
+        );
+        assert!(
+            !loaded_definition_matches_with_query(&manifest, |query| Ok(if query == "cat" {
+                cat.clone()
+            } else {
+                show.into()
+            }))
+            .unwrap()
+        );
     }
 }

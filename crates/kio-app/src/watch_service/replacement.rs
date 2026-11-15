@@ -137,7 +137,9 @@ fn recover_replacement<S: Scheduler>(
     mut intent: ReplacementIntent,
     scheduler: &S,
 ) -> Result<WatchResponse> {
+    ensure_installation_locator(&intent.old, &intent.new, store, leaf)?;
     if intent.phase == ReplacementPhase::Removing {
+        scheduler.recover_replacement_definition(&intent.old, &intent.new)?;
         match scheduler.inspect(&intent.old)? {
             NativeRegistration::Owned => {
                 scheduler.stop(&intent.old)?;
@@ -146,14 +148,18 @@ fn recover_replacement<S: Scheduler>(
                 if scheduler.inspect(&intent.old)? != NativeRegistration::Owned {
                     return Err(service_error("native service changed while stopping"));
                 }
-                scheduler.uninstall(&intent.old)?;
+                scheduler.replace_definition(&intent.old, &intent.new)?;
             }
             NativeRegistration::Absent => {}
             NativeRegistration::Foreign => {
-                return Err(service_error("foreign native service during replacement"));
+                if scheduler.inspect(&intent.new)? != NativeRegistration::Owned {
+                    return Err(service_error("foreign native service during replacement"));
+                }
             }
         }
-        if scheduler.inspect(&intent.old)? != NativeRegistration::Absent {
+        if scheduler.inspect(&intent.old)? != NativeRegistration::Absent
+            && scheduler.inspect(&intent.new)? != NativeRegistration::Owned
+        {
             return Err(service_error("old watch service was not removed"));
         }
         intent.phase = ReplacementPhase::Installing;
@@ -182,7 +188,22 @@ fn recover_replacement<S: Scheduler>(
             "replacement watch service no longer matches its intent",
         ));
     }
-    if intent.restart && !scheduler.running(&intent.new)? {
+    if !intent.restart && scheduler.running(&intent.new)? {
+        // Preserve a login/start that arrived after the original confirmation.
+        // Save this before stopping it, so another interruption cannot lose the
+        // user's newly active service.
+        intent.restart = true;
+        save_intent(store, leaf, &intent, Publication::Replace)?;
+    }
+    // A login can have launched a runner from the previous manifest while
+    // registration was being published. Liveness alone proves no settings.
+    // After publishing the target manifest, stop every such instance and only
+    // then launch from that manifest. Repeating this approved restart is safe.
+    scheduler.stop(&intent.new)?;
+    // Stop disables automatic activation. Re-enable only after the target
+    // manifest is durable; future logins must retain install's registration.
+    scheduler.install(&intent.new)?;
+    if intent.restart {
         scheduler.start(&intent.new)?;
     }
     if scheduler.inspect(&intent.new)? != NativeRegistration::Owned {
@@ -222,27 +243,60 @@ mod tests {
         cached: RefCell<Option<String>>,
         loaded: RefCell<Option<String>>,
         active: Cell<bool>,
+        enabled: Cell<bool>,
         calls: Cell<usize>,
         fail_after: Cell<Option<usize>>,
+        runner_manifest: PathBuf,
+        child: RefCell<Option<ServiceManifest>>,
+        drop_ins: RefCell<String>,
     }
 
     impl SchedulerFixture {
-        fn new(old: &ServiceManifest, active: bool) -> Self {
-            Self::for_kind(old, active, SchedulerKind::Systemd)
+        fn new(old: &ServiceManifest, active: bool, manifest: &Path) -> Self {
+            Self::for_kind(old, active, SchedulerKind::Systemd, manifest)
         }
-        fn for_kind(old: &ServiceManifest, active: bool, kind: SchedulerKind) -> Self {
+        fn for_kind(
+            old: &ServiceManifest,
+            active: bool,
+            kind: SchedulerKind,
+            manifest: &Path,
+        ) -> Self {
             Self {
                 kind,
                 cached: RefCell::new(Some(old.definition.clone())),
                 loaded: RefCell::new(if kind == SchedulerKind::Launchd && !active {
                     None
                 } else {
-                    Some(old.definition.clone())
+                    Some(Self::native_definition_for(kind, old, manifest))
                 }),
                 active: Cell::new(active),
+                enabled: Cell::new(true),
                 calls: Cell::new(0),
                 fail_after: Cell::new(None),
+                runner_manifest: manifest.to_path_buf(),
+                child: RefCell::new(active.then(|| old.clone())),
+                drop_ins: RefCell::new(String::new()),
             }
+        }
+        fn native_definition_for(
+            kind: SchedulerKind,
+            m: &ServiceManifest,
+            manifest: &Path,
+        ) -> String {
+            if kind == SchedulerKind::TaskScheduler {
+                // The OS task points to a runner and an immutable manifest
+                // locator. Interval and watcher environment live in that file.
+                format!(
+                    "<Task><Principals><UserId>fixture-current-user</UserId></Principals><Triggers><LogonTrigger/></Triggers><Actions><Exec><Command>{}</Command><Arguments>{}</Arguments></Exec></Actions><Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy></Settings></Task>",
+                    m.binary.display(),
+                    manifest.display()
+                )
+            } else {
+                m.definition.clone()
+            }
+        }
+        fn native_definition(&self, m: &ServiceManifest) -> String {
+            Self::native_definition_for(self.kind, m, &self.runner_manifest)
         }
         fn checkpoint(&self) -> Result<()> {
             self.calls.set(self.calls.get() + 1);
@@ -260,7 +314,27 @@ mod tests {
             if cache.is_none() && loaded.is_none() {
                 Ok(NativeRegistration::Absent)
             } else if cache.as_deref().is_none_or(|d| d == m.definition)
-                && loaded.as_deref().is_none_or(|d| d == m.definition)
+                && loaded.as_deref().is_none_or(|actual| {
+                    let expected = self.native_definition(m);
+                    if self.kind == SchedulerKind::TaskScheduler {
+                        crate::platform::watch_service_model::task_definition_matches(
+                            actual, &expected,
+                        )
+                    } else {
+                        actual == expected
+                    }
+                })
+                && (self.kind != SchedulerKind::Systemd
+                    || crate::platform::watch_unit_model::unit_definition_matches(
+                        &format!(
+                            "# {}\n{}{}",
+                            m.native_path.display(),
+                            cache.as_deref().unwrap_or(&m.definition),
+                            self.drop_ins.borrow()
+                        ),
+                        &m.native_path,
+                        &m.definition,
+                    ))
             {
                 Ok(NativeRegistration::Owned)
             } else {
@@ -272,14 +346,53 @@ mod tests {
             *self.cached.borrow_mut() = Some(m.definition.clone());
             self.checkpoint()?;
             if self.kind != SchedulerKind::Launchd {
-                *self.loaded.borrow_mut() = Some(m.definition.clone());
+                *self.loaded.borrow_mut() = Some(self.native_definition(m));
             }
+            self.enabled.set(true);
             self.checkpoint()
         }
         fn stop(&self, _: &ServiceManifest) -> Result<()> {
             self.active.set(false);
+            if self.kind != SchedulerKind::Launchd {
+                self.enabled.set(false);
+            }
+            *self.child.borrow_mut() = None;
             if self.kind == SchedulerKind::Launchd {
                 *self.loaded.borrow_mut() = None;
+            }
+            self.checkpoint()
+        }
+        fn recover_replacement_definition(
+            &self,
+            old: &ServiceManifest,
+            new: &ServiceManifest,
+        ) -> Result<()> {
+            if self.kind == SchedulerKind::Systemd
+                && old.definition != new.definition
+                && self.cached.borrow().as_deref() == Some(new.definition.as_str())
+            {
+                if !self.drop_ins.borrow().is_empty() || self.active.get() {
+                    return Err(service_error(
+                        "foreign or active definition during publication recovery",
+                    ));
+                }
+                *self.loaded.borrow_mut() = Some(self.native_definition(new));
+                self.checkpoint()?;
+            }
+            Ok(())
+        }
+        fn replace_definition(&self, old: &ServiceManifest, new: &ServiceManifest) -> Result<()> {
+            assert_eq!(self.inspect(old)?, NativeRegistration::Owned);
+            if self.kind != SchedulerKind::Systemd {
+                *self.loaded.borrow_mut() = None;
+            }
+            self.checkpoint()?;
+            // Native replacement retains the cache until an atomic publication
+            // replaces it, rather than creating a missing-fragment interval.
+            *self.cached.borrow_mut() = Some(new.definition.clone());
+            self.checkpoint()?;
+            if self.kind == SchedulerKind::Systemd {
+                *self.loaded.borrow_mut() = Some(self.native_definition(new));
             }
             self.checkpoint()
         }
@@ -296,10 +409,39 @@ mod tests {
             self.checkpoint()
         }
         fn start(&self, m: &ServiceManifest) -> Result<()> {
-            *self.loaded.borrow_mut() = Some(m.definition.clone());
+            if self.inspect(m)? != NativeRegistration::Owned {
+                return Err(service_error("foreign native definition before activation"));
+            }
+            self.enabled.set(true);
+            let child = if self.kind == SchedulerKind::TaskScheduler {
+                let observed: ServiceManifest = serde_json::from_slice(
+                    &fs::read(&self.runner_manifest).map_err(service_error)?,
+                )
+                .map_err(service_error)?;
+                validate_manifest(&observed)?;
+                if observed.id != m.id
+                    || observed.root != m.root
+                    || observed.scope_id != m.scope_id
+                    || observed.binary != m.binary
+                {
+                    return Err(service_error(
+                        "runner manifest does not bind its native task",
+                    ));
+                }
+                observed
+            } else {
+                // systemd and launchd execute the complete owned native argv /
+                // environment directly; they do not consult a runner manifest.
+                m.clone()
+            };
+            *self.child.borrow_mut() = Some(child);
+            if self.loaded.borrow().is_none() {
+                *self.loaded.borrow_mut() = Some(self.native_definition(m));
+            }
             self.active.set(true);
             self.checkpoint()
         }
+
         fn state(&self, _: &ServiceManifest, r: NativeRegistration) -> Result<NativeServiceState> {
             Ok(NativeServiceState {
                 registered: r == NativeRegistration::Owned,
@@ -340,10 +482,267 @@ mod tests {
             &new.root,
             new.reconcile_interval_seconds,
             &new.environment,
-            &manifest_locator(&new.id, &new.environment).unwrap(),
+            &registered_manifest_locator(&new).unwrap(),
         )
         .unwrap();
         (old, new)
+    }
+
+    #[test]
+    fn atomic_publication_recovers_before_manager_reload_and_preserves_new_dropins() {
+        for foreign in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = StoreDirectory::open(&temp.path().canonicalize().unwrap()).unwrap();
+            let leaf = Path::new("service.json");
+            let (old, new) = definitions(&temp.path().canonicalize().unwrap());
+            write_manifest(&store, leaf, &old, Publication::CreateOnly).unwrap();
+            let scheduler = SchedulerFixture::new(&old, false, &temp.path().join(leaf));
+            *scheduler.cached.borrow_mut() = Some(new.definition.clone());
+            if foreign {
+                *scheduler.drop_ins.borrow_mut() =
+                    "\n# foreign.conf\n[Service]\nExecStop=foreign\n".into();
+            }
+            let intent = ReplacementIntent {
+                old: old.clone(),
+                new: new.clone(),
+                phase: ReplacementPhase::Removing,
+                restart: true,
+            };
+            save_intent(&store, leaf, &intent, Publication::CreateOnly).unwrap();
+            let native_before = scheduler.loaded.borrow().clone();
+            let result = replace_existing(
+                &store,
+                leaf,
+                old,
+                &new,
+                true,
+                |_| panic!("already approved"),
+                &scheduler,
+            );
+            if foreign {
+                assert!(result.is_err());
+                assert_eq!(scheduler.calls.get(), 0);
+                assert_eq!(*scheduler.loaded.borrow(), native_before);
+            } else {
+                result.unwrap();
+                assert_eq!(scheduler.inspect(&new).unwrap(), NativeRegistration::Owned);
+                assert!(scheduler.active.get());
+            }
+        }
+    }
+
+    #[test]
+    fn review2_3_os_only_definition_changes_never_confirm_or_mutate() {
+        for kind in [SchedulerKind::Systemd, SchedulerKind::TaskScheduler] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = StoreDirectory::open(&temp.path().canonicalize().unwrap()).unwrap();
+            let leaf = Path::new("service.json");
+            let (old, new) = definitions(&temp.path().canonicalize().unwrap());
+            write_manifest(&store, leaf, &old, Publication::CreateOnly).unwrap();
+            let scheduler = SchedulerFixture::for_kind(&old, true, kind, &temp.path().join(leaf));
+            if kind == SchedulerKind::Systemd {
+                *scheduler.drop_ins.borrow_mut() = "\n# /run/systemd/user.control/foreign.conf\n[Service]\nExecStop=/bin/foreign\n".into();
+            } else {
+                let os_only = scheduler.loaded.borrow().as_ref().unwrap().replace(
+                    "</Exec>",
+                    "<WorkingDirectory>foreign</WorkingDirectory></Exec>",
+                );
+                *scheduler.loaded.borrow_mut() = Some(os_only);
+            }
+            let before = fs::read(temp.path().join(leaf)).unwrap();
+            let native_before = scheduler.loaded.borrow().clone();
+            assert!(
+                replace_existing(
+                    &store,
+                    leaf,
+                    old,
+                    &new,
+                    true,
+                    |_| panic!("foreign definition must not reach confirmation"),
+                    &scheduler
+                )
+                .is_err()
+            );
+            assert_eq!(scheduler.calls.get(), 0);
+            assert_eq!(fs::read(temp.path().join(leaf)).unwrap(), before);
+            assert_eq!(*scheduler.loaded.borrow(), native_before);
+            assert!(
+                store
+                    .read_optional(&intent_leaf(leaf), MAX_INTENT_BYTES)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn review4_data_home_change_keeps_a_single_anchor_through_registration_absence() {
+        for kind in [
+            SchedulerKind::Systemd,
+            SchedulerKind::Launchd,
+            SchedulerKind::TaskScheduler,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let base = temp.path().canonicalize().unwrap();
+            let (mut old, _) = definitions(&base);
+            old.environment.xdg_data_home = base.join("old-data");
+            old.definition = render_definition(
+                &old.id,
+                &old.binary,
+                &old.root,
+                old.reconcile_interval_seconds,
+                &old.environment,
+                &registered_manifest_locator(&old).unwrap(),
+            )
+            .unwrap();
+            let anchor = registered_manifest_locator(&old).unwrap();
+            fs::create_dir_all(anchor.parent().unwrap()).unwrap();
+            let store = StoreDirectory::open(anchor.parent().unwrap().parent().unwrap()).unwrap();
+            let leaf = manifest_leaf(&old.id).unwrap();
+            write_manifest(&store, &leaf, &old, Publication::CreateOnly).unwrap();
+            let mut new = old.clone();
+            new.environment.xdg_data_home = base.join("new-data");
+            new.definition = render_definition(
+                &new.id,
+                &new.binary,
+                &new.root,
+                new.reconcile_interval_seconds,
+                &new.environment,
+                &anchor,
+            )
+            .unwrap();
+            let scheduler = SchedulerFixture::for_kind(&old, true, kind, &anchor);
+            assert!(
+                replace_existing(
+                    &store,
+                    &leaf,
+                    old.clone(),
+                    &new,
+                    true,
+                    |_| Ok(false),
+                    &scheduler
+                )
+                .is_err()
+            );
+            assert!(!new.environment.xdg_data_home.exists());
+            scheduler.fail_after.set(Some(2));
+            assert!(
+                replace_existing(&store, &leaf, old, &new, true, |_| Ok(true), &scheduler).is_err()
+            );
+            let located = installation_locator(&new.id, &new.environment, |_| {
+                Ok(
+                    if kind == SchedulerKind::TaskScheduler && scheduler.loaded.borrow().is_none() {
+                        None
+                    } else {
+                        Some(anchor.clone())
+                    },
+                )
+            })
+            .unwrap()
+            .unwrap();
+            assert_eq!(located, anchor);
+            let (canonical, leaf, current) =
+                load_installation(&located, &ControlHandle::default()).unwrap();
+            scheduler.fail_after.set(None);
+            replace_existing(
+                &canonical,
+                &leaf,
+                current,
+                &new,
+                true,
+                |_| panic!("already approved"),
+                &scheduler,
+            )
+            .unwrap();
+            assert!(same_installation(
+                scheduler.child.borrow().as_ref().unwrap(),
+                &new
+            ));
+            let mut later = new.environment.clone();
+            later.xdg_data_home = base.join("third-data");
+            assert_eq!(
+                installation_locator(&new.id, &later, |_| {
+                    if kind == SchedulerKind::TaskScheduler {
+                        Ok(Some(anchor.clone()))
+                    } else {
+                        manifest_locator(&new.id, &new.environment).map(Some)
+                    }
+                })
+                .unwrap(),
+                Some(anchor)
+            );
+        }
+    }
+
+    #[test]
+    fn review1_login_between_registration_and_manifest_publication_restarts_old_configuration() {
+        for restart in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = StoreDirectory::open(&temp.path().canonicalize().unwrap()).unwrap();
+            let leaf = Path::new("service.json");
+            let (old, mut new) = definitions(&temp.path().canonicalize().unwrap());
+            new.binary = old.binary.clone();
+            new.definition = render_definition(
+                &new.id,
+                &new.binary,
+                &new.root,
+                new.reconcile_interval_seconds,
+                &new.environment,
+                &registered_manifest_locator(&new).unwrap(),
+            )
+            .unwrap();
+            write_manifest(&store, leaf, &old, Publication::CreateOnly).unwrap();
+            assert_eq!(
+                SchedulerFixture::native_definition_for(
+                    SchedulerKind::TaskScheduler,
+                    &old,
+                    &temp.path().join(leaf)
+                ),
+                SchedulerFixture::native_definition_for(
+                    SchedulerKind::TaskScheduler,
+                    &new,
+                    &temp.path().join(leaf)
+                )
+            );
+            let scheduler = SchedulerFixture::for_kind(
+                &new,
+                false,
+                SchedulerKind::TaskScheduler,
+                &temp.path().join(leaf),
+            );
+            // Registration has committed. A subsequent login runs the actual
+            // runner protocol: read the still-old private manifest from disk.
+            let login: ServiceManifest =
+                serde_json::from_slice(&fs::read(temp.path().join(leaf)).unwrap()).unwrap();
+            *scheduler.child.borrow_mut() = Some(login);
+            scheduler.active.set(true);
+            let intent = ReplacementIntent {
+                old: old.clone(),
+                new: new.clone(),
+                phase: ReplacementPhase::Installing,
+                restart,
+            };
+            save_intent(&store, leaf, &intent, Publication::CreateOnly).unwrap();
+            replace_existing(
+                &store,
+                leaf,
+                old,
+                &new,
+                true,
+                |_| panic!("already confirmed"),
+                &scheduler,
+            )
+            .unwrap();
+            assert!(
+                scheduler.active.get(),
+                "login-started watcher was left stopped"
+            );
+            let child = scheduler.child.borrow();
+            assert!(
+                same_installation(child.as_ref().unwrap(), &new),
+                "old runner settings survived recovery"
+            );
+        }
     }
 
     #[test]
@@ -354,7 +753,7 @@ mod tests {
         let (old, mut new) = definitions(&temp.path().canonicalize().unwrap());
         write_manifest(&store, leaf, &old, Publication::CreateOnly).unwrap();
         new.definition = "x".repeat(MAX_MANIFEST_BYTES as usize + 1);
-        let scheduler = SchedulerFixture::new(&old, true);
+        let scheduler = SchedulerFixture::new(&old, true, &temp.path().join(leaf));
         assert!(
             replace_existing(
                 &store,
@@ -378,7 +777,7 @@ mod tests {
         let (old, _) = definitions(&temp.path().canonicalize().unwrap());
         write_manifest(&store, leaf, &old, Publication::CreateOnly).unwrap();
         let before = fs::read(temp.path().join(leaf)).unwrap();
-        let scheduler = SchedulerFixture::new(&old, true);
+        let scheduler = SchedulerFixture::new(&old, true, &temp.path().join(leaf));
         for replace in [false, true] {
             replace_existing(
                 &store,
@@ -426,7 +825,7 @@ mod tests {
             } else {
                 &new
             };
-            let scheduler = SchedulerFixture::new(native, false);
+            let scheduler = SchedulerFixture::new(native, false, &temp.path().join(leaf));
             if !cached {
                 *scheduler.cached.borrow_mut() = None;
             }
@@ -499,7 +898,7 @@ mod tests {
         let leaf = Path::new("service.json");
         let (old, new) = definitions(&temp.path().canonicalize().unwrap());
         write_manifest(&store, leaf, &old, Publication::CreateOnly).unwrap();
-        let scheduler = SchedulerFixture::new(&old, true);
+        let scheduler = SchedulerFixture::new(&old, true, &temp.path().join(leaf));
         assert!(
             replace_existing(
                 &store,
@@ -534,7 +933,7 @@ mod tests {
             write_manifest(&store, leaf, &old, Publication::CreateOnly).unwrap();
             let before = fs::read(temp.path().join(leaf)).unwrap();
             let entry_count = fs::read_dir(temp.path()).unwrap().count();
-            let scheduler = SchedulerFixture::new(&old, true);
+            let scheduler = SchedulerFixture::new(&old, true, &temp.path().join(leaf));
             let confirmed = Cell::new(false);
             let result = replace_existing(
                 &store,
@@ -573,14 +972,15 @@ mod tests {
             SchedulerKind::TaskScheduler,
         ] {
             for active in [false, true] {
-                for failure in 0..=6 {
+                for failure in 0..=10 {
                     let temp = tempfile::tempdir().unwrap();
                     let store = StoreDirectory::open(&temp.path().canonicalize().unwrap()).unwrap();
                     let leaf = Path::new("service.json");
                     let (old, new) = definitions(&temp.path().canonicalize().unwrap());
                     write_manifest(&store, leaf, &old, Publication::CreateOnly).unwrap();
                     let entry_count = fs::read_dir(temp.path()).unwrap().count();
-                    let scheduler = SchedulerFixture::for_kind(&old, active, kind);
+                    let scheduler =
+                        SchedulerFixture::for_kind(&old, active, kind, &temp.path().join(leaf));
                     scheduler.fail_after.set(Some(failure));
                     let first = replace_existing(
                         &store,
@@ -610,15 +1010,20 @@ mod tests {
                         .unwrap();
                     }
                     assert_eq!(scheduler.inspect(&new).unwrap(), NativeRegistration::Owned);
+                    let native = scheduler.native_definition(&new);
                     assert_eq!(
                         scheduler.loaded.borrow().as_deref(),
                         if kind == SchedulerKind::Launchd && !active {
                             None
                         } else {
-                            Some(new.definition.as_str())
+                            Some(native.as_str())
                         }
                     );
                     assert_eq!(scheduler.active.get(), active);
+                    assert!(
+                        scheduler.enabled.get(),
+                        "replacement must remain registered for login"
+                    );
                     let stored: ServiceManifest =
                         serde_json::from_slice(&fs::read(temp.path().join(leaf)).unwrap()).unwrap();
                     assert!(same_installation(&stored, &new));
@@ -637,7 +1042,7 @@ mod tests {
             let leaf = Path::new("service.json");
             let (old, new) = definitions(&temp.path().canonicalize().unwrap());
             write_manifest(&store, leaf, &old, Publication::CreateOnly).unwrap();
-            let scheduler = SchedulerFixture::new(&old, true);
+            let scheduler = SchedulerFixture::new(&old, true, &temp.path().join(leaf));
             if interrupted {
                 scheduler.fail_after.set(Some(1));
                 assert!(

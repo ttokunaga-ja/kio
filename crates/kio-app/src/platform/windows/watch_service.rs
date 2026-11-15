@@ -1,83 +1,44 @@
 use crate::platform::{runner_argv, xml_escape};
 use crate::response::watch::NativeServiceState;
 use crate::watch_service::{
-    ServiceEnvironment, ServiceManifest, invalid, manifest_locator, run_native, run_native_output,
-    service_error, validate_argument_path,
+    ServiceEnvironment, ServiceManifest, invalid, service_error, validate_argument_path,
 };
 use kio_core::Result;
-use std::env;
 use std::path::{Path, PathBuf};
 
 pub(crate) fn native_registration_absent(manifest: &ServiceManifest) -> Result<bool> {
-    let output = run_native_output(
-        schtasks_path()?,
-        [
-            "/query".into(),
-            "/tn".into(),
-            manifest.id.clone(),
-            "/xml".into(),
-        ],
-    )?;
-    if output.status.success() {
-        return Ok(false);
-    }
-    if output.stderr.contains("cannot find") || output.stderr.contains("not exist") {
-        return Ok(true);
-    }
-    Err(service_error(
-        "Task Scheduler could not inspect native watch registration",
-    ))
+    Ok(!super::watch_task::query(&manifest.id, None)?.present)
 }
 
 pub(crate) fn native_loaded_definition_matches(manifest: &ServiceManifest) -> Result<bool> {
-    native_windows_task_definition_matches(manifest, true)
+    super::watch_task::matches(manifest, true)
 }
 
 pub(crate) fn native_windows_task_definition_matches(
     manifest: &ServiceManifest,
     allow_absent_for_recovery: bool,
 ) -> Result<bool> {
-    let output = run_native_output(
-        schtasks_path()?,
-        [
-            "/query".into(),
-            "/tn".into(),
-            manifest.id.clone(),
-            "/xml".into(),
-        ],
-    )?;
-    if !output.status.success() {
-        // A crash after Task Scheduler deleted the task but before the owned
-        // XML cache was removed is recoverable: the exact private cache still
-        // binds this name and uninstall may finish removing it.
-        if output.stderr.contains("cannot find") || output.stderr.contains("not exist") {
-            return Ok(allow_absent_for_recovery);
-        }
-        return Err(service_error(
-            "Task Scheduler could not inspect native watch registration",
-        ));
+    super::watch_task::matches(manifest, allow_absent_for_recovery)
+}
+
+pub(crate) fn native_prepare_replacement(_manifest: &ServiceManifest) -> Result<()> {
+    Ok(())
+}
+
+pub(crate) fn native_manifest_anchor(manifest: &ServiceManifest) -> Result<Option<PathBuf>> {
+    super::watch_service_model::manifest_anchor_from_cache(&manifest.id, &manifest.native_path)
+        .map(Some)
+}
+
+pub(crate) fn native_manifest_locator(id: &str) -> Result<Option<PathBuf>> {
+    let task = super::watch_task::query(id, None)?;
+    if !task.present {
+        return Ok(None);
     }
-    let manifest_path = manifest_locator(&manifest.id, &manifest.environment)?;
-    let manifest_path = manifest_path
-        .to_str()
-        .ok_or_else(|| service_error("non-UTF-8 watch service manifest path"))?;
-    let runner_args = runner_argv(Path::new(manifest_path))?;
-    let expected_arguments =
-        windows_arguments(&runner_args.iter().map(String::as_str).collect::<Vec<_>>())?;
-    Ok(output
-        .stdout
-        .contains(&format!("<URI>\\{}</URI>", manifest.id))
-        && output
-            .stdout
-            .contains("<LogonType>InteractiveToken</LogonType>")
-        && output
-            .stdout
-            .contains("<RunLevel>LeastPrivilege</RunLevel>")
-        && crate::platform::watch_service_model::task_action_matches(
-            &output.stdout,
-            &manifest.binary.to_string_lossy(),
-            &expected_arguments,
-        )?)
+    let args = task
+        .arguments
+        .ok_or_else(|| service_error("foreign native task actions"))?;
+    super::watch_service_model::manifest_from_arguments(&args).map(Some)
 }
 
 pub(crate) fn native_definition_path(
@@ -112,148 +73,29 @@ pub(crate) fn render_definition(
 }
 
 pub(crate) fn native_enable(manifest: &ServiceManifest) -> Result<()> {
-    if !native_registration_absent(manifest)? {
-        return if native_windows_task_definition_matches(manifest, false)? {
-            run_native(
-                schtasks_path()?,
-                [
-                    "/change".into(),
-                    "/tn".into(),
-                    manifest.id.clone(),
-                    "/enable".into(),
-                ],
-            )
-            .map(|_| ())
-        } else {
-            Err(service_error(
-                "refusing to replace a foreign Task Scheduler registration",
-            ))
-        };
-    }
-    run_native(
-        schtasks_path()?,
-        [
-            "/create".into(),
-            "/tn".into(),
-            manifest.id.clone(),
-            "/xml".into(),
-            manifest.native_path.display().to_string(),
-        ],
-    )
-    .map(|_| ())
+    super::watch_task::enable(manifest)
 }
-
 pub(crate) fn native_start(manifest: &ServiceManifest) -> Result<()> {
-    run_native(
-        schtasks_path()?,
-        [
-            "/change".into(),
-            "/tn".into(),
-            manifest.id.clone(),
-            "/enable".into(),
-        ],
-    )?;
-    run_native(
-        schtasks_path()?,
-        ["/run".into(), "/tn".into(), manifest.id.clone()],
-    )
-    .map(|_| ())
+    super::watch_task::start(manifest)
 }
-
 pub(crate) fn native_stop(manifest: &ServiceManifest) -> Result<()> {
-    if native_registration_absent(manifest)? {
-        return Ok(());
-    }
-    if !native_windows_task_definition_matches(manifest, false)? {
-        return Err(service_error(
-            "Task Scheduler registration changed before stop",
-        ));
-    }
-    run_native(
-        schtasks_path()?,
-        [
-            "/change".into(),
-            "/tn".into(),
-            manifest.id.clone(),
-            "/disable".into(),
-        ],
-    )?;
-    run_native(
-        schtasks_path()?,
-        ["/end".into(), "/tn".into(), manifest.id.clone()],
-    )?;
-    Ok(())
+    super::watch_task::stop(manifest)
 }
-
 pub(crate) fn native_uninstall(manifest: &ServiceManifest) -> Result<()> {
-    let query = run_native_output(
-        schtasks_path()?,
-        ["/query".into(), "/tn".into(), manifest.id.clone()],
-    )?;
-    if !query.status.success()
-        && (query.stderr.contains("cannot find") || query.stderr.contains("not exist"))
-    {
-        return Ok(());
-    }
-    if !native_loaded_definition_matches(manifest)? {
-        return Err(service_error(
-            "Task Scheduler registration changed before uninstall",
-        ));
-    }
-    native_stop(manifest)?;
-    if !native_windows_task_definition_matches(manifest, false)? {
-        return Err(service_error(
-            "Task Scheduler registration changed before deletion",
-        ));
-    }
-    run_native(
-        schtasks_path()?,
-        [
-            "/delete".into(),
-            "/tn".into(),
-            manifest.id.clone(),
-            "/f".into(),
-        ],
-    )
-    .map(|_| ())
+    super::watch_task::uninstall(manifest)
 }
-
 pub(crate) fn native_after_remove() -> Result<()> {
     Ok(())
 }
-
 pub(crate) fn native_state(manifest: &ServiceManifest) -> Result<NativeServiceState> {
-    let output = run_native_output(
-        schtasks_path()?,
-        [
-            "/query".into(),
-            "/tn".into(),
-            manifest.id.clone(),
-            "/fo".into(),
-            "list".into(),
-        ],
-    )?;
-    if !output.status.success() {
-        return Err(service_error(
-            "Task Scheduler could not report native watch registration",
-        ));
+    let task = super::watch_task::query(&manifest.id, Some(manifest))?;
+    if !task.present || !super::watch_task::matches(manifest, false)? {
+        return Err(service_error("absent or foreign native task"));
     }
     Ok(NativeServiceState {
         registered: true,
-        active: output.stdout.contains("Running"),
+        active: matches!(task.state, 2 | 4),
     })
-}
-
-fn schtasks_path() -> Result<PathBuf> {
-    let root = env::var_os("SystemRoot")
-        .map(PathBuf::from)
-        .ok_or_else(|| service_error("SystemRoot is unavailable"))?;
-    let path = root.join("System32/schtasks.exe");
-    if path.is_file() {
-        Ok(path)
-    } else {
-        Err(service_error("schtasks.exe is unavailable"))
-    }
 }
 
 fn windows_arguments(values: &[&str]) -> Result<String> {

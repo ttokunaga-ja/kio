@@ -47,6 +47,7 @@ mod watch_service;
 mod watch_service;
 pub(crate) use watch_service::{
     native_after_remove, native_definition_path, native_enable, native_loaded_definition_matches,
+    native_manifest_anchor, native_manifest_locator, native_prepare_replacement,
     native_registration_absent, native_start, native_state, native_stop, native_uninstall,
     render_definition,
 };
@@ -57,22 +58,38 @@ mod watch_runner;
 #[cfg(windows)]
 #[path = "windows/watch_runner.rs"]
 mod watch_runner;
+// Compile the portable automation transport and backend on Linux tests too;
+// only Windows actually invokes the native COM process.
+#[cfg(all(test, not(windows)))]
+#[allow(dead_code)]
+#[path = "windows/watch_service.rs"]
+mod watch_service_windows_test;
+#[cfg(any(windows, test))]
+#[cfg_attr(not(windows), allow(dead_code))]
+#[path = "windows/watch_task.rs"]
+mod watch_task;
 pub(crate) use watch_runner::run_watch_service_runner;
 
 #[cfg(any(windows, test))]
 #[path = "windows/watch_runner_model.rs"]
 mod watch_runner_model;
+#[cfg(all(test, unix, not(target_os = "macos")))]
+#[allow(dead_code)]
+#[path = "macos/watch_service.rs"]
+mod watch_service_macos_test;
 #[cfg(any(windows, test))]
 pub(crate) use watch_runner_model::{runner_argv, validate_runner_manifest_locator};
 
 #[cfg(any(windows, test))]
 #[path = "windows/watch_service_model.rs"]
-mod watch_service_model;
+pub(crate) mod watch_service_model;
+#[cfg(any(target_os = "linux", test))]
+pub(crate) mod watch_unit_model;
 #[cfg(any(windows, test))]
 pub(crate) use watch_service_model::xml_escape;
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", test))]
 #[path = "windows/watch_service_argv.rs"]
 mod watch_service_argv;
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", test))]
 pub(crate) use watch_service_argv::watch_argv;

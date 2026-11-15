@@ -482,13 +482,21 @@ fn direct_leaf<'a>(name: &'a Path, label: &Path) -> Result<&'a std::ffi::OsStr> 
 }
 
 pub(crate) fn verify_trusted_executable(path: &Path) -> Result<()> {
+    verify_executable(path, false)
+}
+
+pub(crate) fn verify_trusted_system_tool(path: &Path) -> Result<()> {
+    verify_executable(path, true)
+}
+
+fn verify_executable(path: &Path, system_tool: bool) -> Result<()> {
     let (root_path, components) = windows_absolute_components(path)?;
     let current = CurrentUserSid::current()
         .map_err(|_| unsafe_file("cannot determine current Windows user", Some(path)))?;
     let root = cap_fs::open_ambient_dir(&root_path, ambient_authority())
         .map_err(|_| unsafe_file("cannot open scheduler executable root", Some(path)))?;
     verify_real_directory(&root, path)?;
-    verify_trusted_acl(&root, &current, path, true)?;
+    verify_trusted_acl(&root, &current, path, true, false)?;
     let mut parent = root;
     for component in &components[..components.len() - 1] {
         let next = cap_fs::open_dir_nofollow(&parent, Path::new(component)).map_err(|_| {
@@ -498,7 +506,7 @@ pub(crate) fn verify_trusted_executable(path: &Path) -> Result<()> {
             )
         })?;
         verify_real_directory(&next, path)?;
-        verify_trusted_acl(&next, &current, path, true)?;
+        verify_trusted_acl(&next, &current, path, true, false)?;
         parent = next;
     }
     let mut options = cap_fs::OpenOptions::new();
@@ -511,13 +519,26 @@ pub(crate) fn verify_trusted_executable(path: &Path) -> Result<()> {
         &options,
     )
     .map_err(|_| unsafe_file("cannot open scheduler executable", Some(path)))?;
-    if crate::platform::regular_file_handle_identity(&file).is_none() {
+    let safe_kind = if system_tool {
+        let info = super::primitives::file_information(&file)
+            .map_err(|_| unsafe_file("cannot inspect OS scheduler tool", Some(path)))?;
+        super::identity_logic::WindowsFileInformation::new(
+            info.volume_serial_number,
+            info.file_index,
+            info.number_of_links,
+            info.file_attributes,
+        )
+        .is_system_tool_file()
+    } else {
+        crate::platform::regular_file_handle_identity(&file).is_some()
+    };
+    if !safe_kind {
         return Err(unsafe_file(
-            "scheduler executable is reparse, nonregular, or hardlinked",
+            "scheduler executable has an unsafe file kind",
             Some(path),
         ));
     }
-    verify_trusted_acl(&file, &current, path, false)
+    verify_trusted_acl(&file, &current, path, false, system_tool)
 }
 
 fn windows_absolute_components(path: &Path) -> Result<(PathBuf, Vec<&std::ffi::OsStr>)> {
@@ -766,6 +787,7 @@ fn verify_trusted_acl(
     current: &CurrentUserSid,
     path: &Path,
     directory: bool,
+    system_owner: bool,
 ) -> Result<()> {
     let mut descriptor = ptr::null_mut();
     let status = unsafe {
@@ -811,6 +833,7 @@ fn verify_trusted_acl(
             || dacl_defaulted != 0
             || unsafe { IsValidSid(owner) } == 0
             || !trusted_sid(owner, current)
+            || (system_owner && !trusted_system_sid(owner))
         {
             return Err(());
         }
@@ -898,8 +921,11 @@ fn untrusted_effective_mutation(ace_flags: u8, mask: u32, directory: bool) -> bo
 }
 
 fn trusted_sid(sid: PSID, current: &CurrentUserSid) -> bool {
-    if unsafe { EqualSid(sid, current.as_psid()) } != 0
-        || unsafe { IsWellKnownSid(sid, WinLocalSystemSid) } != 0
+    (unsafe { EqualSid(sid, current.as_psid()) != 0 }) || trusted_system_sid(sid)
+}
+
+fn trusted_system_sid(sid: PSID) -> bool {
+    if unsafe { IsWellKnownSid(sid, WinLocalSystemSid) } != 0
         || unsafe { IsWellKnownSid(sid, WinBuiltinAdministratorsSid) } != 0
     {
         return true;
