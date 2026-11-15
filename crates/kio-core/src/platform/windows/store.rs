@@ -1041,16 +1041,25 @@ pub(crate) fn entries(root: &File, relative: &Path, label: &Path) -> Result<Vec<
         let name = entry.file_name();
         let child_label = full(label, relative).join(&name);
         let mut o = cap_fs::OpenOptions::new();
-        // Windows requires directory-open semantics even when an entry
-        // may also be a regular file. Keep the same retained parent and
-        // no-follow policy for both kinds of entry.
+        // Inspect either kind of entry through the retained parent. Do not use
+        // maybe_dir: cap-primitives removes FILE_SHARE_DELETE for that option,
+        // conflicting with the writer's live DELETE-capable .lock handle (and
+        // stage/publication handles).
+        // BACKUP_SEMANTICS permits directories without changing sharing. Only
+        // metadata is needed; the handle checks below still reject reparse
+        // points and hardlinked/nonregular leaves.
         o.read(true)
-            ._cap_fs_ext_maybe_dir(true)
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
             ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
-        let child = cap_fs::open(&d, Path::new(&name), &o).map_err(|_| {
+        let child = cap_fs::open(&d, Path::new(&name), &o).map_err(|error| {
             err(
                 &child_label,
-                "store entry cannot be opened without following links",
+                format!(
+                    "store entry cannot be opened without following links at {}: {error}",
+                    child_label.display()
+                ),
             )
         })?;
         let meta = child.metadata().map_err(|e| ioerr(&child_label, e))?;
@@ -1105,6 +1114,69 @@ mod tests {
     fn directory(path: &Path) -> StoreDirectory {
         fs::create_dir(path).expect("directory fixture");
         StoreDirectory::open(path).expect("retained directory")
+    }
+
+    #[test]
+    fn entries_and_journal_replacement_accept_a_retained_writer_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let store = directory(&root.path().join("store"));
+        let leaf = Path::new("tasks.jsonl");
+        store.append_private(leaf, b"before\n").unwrap();
+        // Match the real repository writer: READ/WRITE/DELETE access, with
+        // FILE_SHARE_READ only. J1 recovery lists this sibling of tasks.jsonl.
+        let held = super::super::private_fs::create_new_private_at(
+            &store.root_handle(),
+            std::ffi::OsStr::new(".lock"),
+            super::super::private_fs::NewPrivateObjectKind::LockFile,
+        )
+        .unwrap();
+        let expected = crate::platform::regular_file_handle_identity(&held).unwrap();
+        let listed = store.entries(Path::new("")).unwrap();
+        assert_eq!(listed.len(), 2);
+        for entry in &listed {
+            assert!(entry.is_regular_file);
+            assert!(!entry.is_directory);
+        }
+        assert!(listed.iter().any(|entry| entry.name == leaf.as_os_str()));
+        assert_eq!(
+            crate::platform::regular_file_handle_identity(&held),
+            Some(expected)
+        );
+        store
+            .write_atomic(leaf, b"compacted\n", Publication::Upsert)
+            .unwrap();
+        store.append_private(leaf, b"after\n").unwrap();
+        assert_eq!(
+            store.read_optional(leaf, 100).unwrap().unwrap(),
+            b"compacted\nafter\n"
+        );
+        assert!(fs::remove_file(store.path().join(".lock")).is_err());
+        assert_eq!(
+            crate::platform::regular_file_handle_identity(&held),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn entries_accepts_directories_but_rejects_hardlinks_and_reparse_points() {
+        let root = tempfile::tempdir().unwrap();
+        let store = directory(&root.path().join("store"));
+        fs::create_dir(store.path().join("child")).unwrap();
+        let listed = store.entries(Path::new("")).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].is_directory);
+        assert!(!listed[0].is_regular_file);
+
+        let outside = root.path().join("outside");
+        fs::write(&outside, b"outside").unwrap();
+        let unsafe_leaf = store.path().join("unsafe");
+        fs::hard_link(&outside, &unsafe_leaf).unwrap();
+        assert!(store.entries(Path::new("")).is_err());
+        fs::remove_file(&unsafe_leaf).unwrap();
+        std::os::windows::fs::symlink_file(&outside, &unsafe_leaf)
+            .expect("native store acceptance requires symlink creation capability");
+        assert!(store.entries(Path::new("")).is_err());
+        assert_eq!(fs::read(outside).unwrap(), b"outside");
     }
 
     #[test]
