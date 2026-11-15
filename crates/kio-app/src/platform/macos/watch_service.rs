@@ -46,15 +46,19 @@ pub(crate) fn native_manifest_locator(id: &str) -> Result<Option<PathBuf>> {
         ],
     )?;
     let data = if output.status.success() {
-        let values = output
-            .stdout
-            .lines()
-            .filter_map(|line| line.trim().strip_prefix("XDG_DATA_HOME => "))
-            .collect::<Vec<_>>();
-        if values.len() != 1 {
-            return Err(service_error("ambiguous registered service data directory"));
-        }
-        Some(PathBuf::from(values[0]))
+        Some(loaded_agent_data_home_with(&output.stdout, id, |path| {
+            // Inspect both the loaded registration's source and the actual OS
+            // login directory. A second plist is a conflict, even if it points
+            // to the same manifest.
+            let canonical = agent_definition_path(id, &account_home()?)?;
+            let paths = if path == canonical {
+                vec![canonical]
+            } else {
+                vec![path.to_path_buf(), canonical]
+            };
+            registered_agent_data_home_with(&paths, id, decode_agent_data_home)?
+                .ok_or_else(|| service_error("loaded LaunchAgent source disappeared"))
+        })?)
     } else if output.status.code() == Some(113) {
         unloaded_agent_data_home(id)?
     } else {
@@ -68,6 +72,28 @@ pub(crate) fn native_manifest_locator(id: &str) -> Result<Option<PathBuf>> {
     let path = data.join("kio/watch-services").join(format!("{id}.json"));
     crate::watch_service::validate_argument_path(&path)?;
     Ok(Some(path))
+}
+
+fn loaded_agent_data_home_with(
+    printed: &str,
+    id: &str,
+    read: impl FnOnce(&Path) -> Result<PathBuf>,
+) -> Result<PathBuf> {
+    let values = printed
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("path = "))
+        .collect::<Vec<_>>();
+    if values.len() != 1 {
+        return Err(service_error("ambiguous loaded LaunchAgent source"));
+    }
+    let path = Path::new(values[0]);
+    crate::watch_service::validate_argument_path(path)?;
+    if path.file_name() != Some(std::ffi::OsStr::new(&format!("{id}.plist"))) {
+        return Err(service_error(
+            "loaded LaunchAgent source has a foreign identity",
+        ));
+    }
+    read(path)
 }
 
 fn account_home() -> Result<PathBuf> {
@@ -116,78 +142,84 @@ fn account_home() -> Result<PathBuf> {
 }
 
 fn unloaded_agent_data_home(id: &str) -> Result<Option<PathBuf>> {
-    // A stopped LaunchAgent is absent from launchctl but its login registration
-    // remains in the account's LaunchAgents directory. Read that owned plist.
-    let mut homes = vec![account_home()?];
-    if let Some(home) = std::env::var_os("HOME") {
-        let home = PathBuf::from(home);
-        if !homes.contains(&home) {
-            homes.push(home);
-        }
+    // launchd loads this account directory at login. Captured watcher HOME is
+    // child configuration and must never select another registration directory.
+    unloaded_agent_data_home_with(&[account_home()?], id, decode_agent_data_home)
+}
+
+fn decode_agent_data_home(bytes: Vec<u8>) -> Result<PathBuf> {
+    let mut command = std::process::Command::new("/usr/bin/plutil");
+    command
+        .args([
+            "-extract",
+            "EnvironmentVariables.XDG_DATA_HOME",
+            "raw",
+            "-o",
+            "-",
+            "-",
+        ])
+        .env_clear()
+        .env("LC_ALL", "C");
+    let output = kio_process::run_bounded_command(
+        &mut command,
+        kio_process::BoundedProcessOptions {
+            timeout: std::time::Duration::from_secs(10),
+            max_stdout_bytes: 32 * 1024,
+            max_stderr_bytes: 4096,
+        },
+        Some(kio_process::BoundedStdin::new(bytes, 64 * 1024)),
+    )
+    .map_err(service_error)?;
+    if !output.status.success() {
+        return Err(service_error(
+            "cannot read registered LaunchAgent environment",
+        ));
     }
-    unloaded_agent_data_home_with(&homes, id, |bytes| {
-        let mut command = std::process::Command::new("/usr/bin/plutil");
-        command
-            .args([
-                "-extract",
-                "EnvironmentVariables.XDG_DATA_HOME",
-                "raw",
-                "-o",
-                "-",
-                "-",
-            ])
-            .env_clear()
-            .env("LC_ALL", "C");
-        let output = kio_process::run_bounded_command(
-            &mut command,
-            kio_process::BoundedProcessOptions {
-                timeout: std::time::Duration::from_secs(10),
-                max_stdout_bytes: 32 * 1024,
-                max_stderr_bytes: 4096,
-            },
-            Some(kio_process::BoundedStdin::new(bytes, 64 * 1024)),
-        )
-        .map_err(service_error)?;
-        if !output.status.success() {
-            return Err(service_error(
-                "cannot read registered LaunchAgent environment",
-            ));
-        }
-        let data = PathBuf::from(output.stdout.trim_end_matches('\n'));
-        crate::watch_service::validate_argument_path(&data)?;
-        Ok(data)
-    })
+    let data = PathBuf::from(output.stdout.trim_end_matches('\n'));
+    crate::watch_service::validate_argument_path(&data)?;
+    Ok(data)
 }
 
 fn unloaded_agent_data_home_with(
-    homes: &[PathBuf],
+    accounts: &[PathBuf],
+    id: &str,
+    decode: impl FnMut(Vec<u8>) -> Result<PathBuf>,
+) -> Result<Option<PathBuf>> {
+    let paths = accounts
+        .iter()
+        .map(|home| agent_definition_path(id, home))
+        .collect::<Result<Vec<_>>>()?;
+    registered_agent_data_home_with(&paths, id, decode)
+}
+
+fn registered_agent_data_home_with(
+    paths: &[PathBuf],
     id: &str,
     mut decode: impl FnMut(Vec<u8>) -> Result<PathBuf>,
 ) -> Result<Option<PathBuf>> {
-    let mut found = Vec::new();
-    for home in homes {
-        let parent = home.join("Library/LaunchAgents");
+    let mut found = None;
+    for path in paths {
+        let parent = path
+            .parent()
+            .ok_or_else(|| service_error("invalid LaunchAgent source"))?;
         if !parent.exists() {
             continue;
         }
-        let directory = kio_core::private_fs::verify_private_creation_parent(&parent)?;
+        let directory = kio_core::private_fs::verify_private_creation_parent(parent)?;
         let name = format!("{id}.plist");
+        if path.file_name() != Some(std::ffi::OsStr::new(&name)) {
+            return Err(service_error("foreign LaunchAgent source identity"));
+        }
         if !directory.contains_entry(Path::new(&name))? {
             continue;
         }
-        let bytes = kio_core::private_fs::read_private_file_at(&directory, &name, 64 * 1024)?;
-        let data = decode(bytes)?;
-        if !found.contains(&data) {
-            found.push(data);
+        if found.is_some() {
+            return Err(service_error("duplicate LaunchAgent registrations"));
         }
+        let bytes = kio_core::private_fs::read_private_file_at(&directory, &name, 64 * 1024)?;
+        found = Some(decode(bytes)?);
     }
-    match found.len() {
-        0 => Ok(None),
-        1 => Ok(found.pop()),
-        _ => Err(service_error(
-            "ambiguous LaunchAgent registration locations",
-        )),
-    }
+    Ok(found)
 }
 
 pub(crate) fn native_loaded_definition_matches(manifest: &ServiceManifest) -> Result<bool> {
@@ -256,12 +288,18 @@ pub(crate) fn native_loaded_definition_matches(manifest: &ServiceManifest) -> Re
 
 pub(crate) fn native_definition_path(
     id: &str,
-    environment: &ServiceEnvironment,
+    _environment: &ServiceEnvironment,
 ) -> Result<PathBuf> {
-    Ok(environment
-        .home
+    agent_definition_path(id, &account_home()?)
+}
+
+fn agent_definition_path(id: &str, account: &Path) -> Result<PathBuf> {
+    crate::watch_service::manifest_leaf(id)?;
+    let path = account
         .join("Library/LaunchAgents")
-        .join(format!("{id}.plist")))
+        .join(format!("{id}.plist"));
+    crate::watch_service::validate_argument_path(&path)?;
+    Ok(path)
 }
 
 pub(crate) fn render_definition(
@@ -398,6 +436,147 @@ fn xml_escape(value: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn environment(base: &Path, name: &str) -> ServiceEnvironment {
+        ServiceEnvironment {
+            home: base.join(format!("{name}-home")),
+            userprofile: base.join(format!("{name}-profile")),
+            xdg_config_home: base.join(format!("{name}-config")),
+            xdg_data_home: base.join(format!("{name}-data")),
+            xdg_cache_home: base.join(format!("{name}-cache")),
+        }
+    }
+
+    #[test]
+    fn stopped_agent_home_and_data_update_discovers_registration_and_cannot_duplicate_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let account = base.join("os-account");
+        let old = environment(&base, "old");
+        let new = environment(&base, "new");
+        let id = "io.kio.watch.fixture";
+        let registered = agent_definition_path(id, &account).unwrap();
+        let definition = render_definition(
+            id,
+            &base.join("kio"),
+            &base.join("root"),
+            300,
+            &old,
+            &old.xdg_data_home
+                .join("kio/watch-services")
+                .join(format!("{id}.json")),
+        )
+        .unwrap();
+        std::fs::create_dir_all(registered.parent().unwrap()).unwrap();
+        let store =
+            kio_core::store_dir::StoreDirectory::open(registered.parent().unwrap()).unwrap();
+        store
+            .write_atomic(
+                Path::new(registered.file_name().unwrap()),
+                definition.as_bytes(),
+                kio_core::store_dir::Publication::CreateOnly,
+            )
+            .unwrap();
+        // bootout has removed the loaded service. Only the OS login plist
+        // remains; neither old captured HOME nor data home is an input.
+        let found = unloaded_agent_data_home_with(std::slice::from_ref(&account), id, |bytes| {
+            assert_eq!(bytes, definition.as_bytes());
+            Ok(old.xdg_data_home.clone())
+        })
+        .unwrap();
+        assert_eq!(
+            found,
+            Some(old.xdg_data_home.clone()),
+            "stopped registration must survive simultaneous HOME and XDG_DATA_HOME changes"
+        );
+        assert_eq!(
+            agent_definition_path(id, &account).unwrap(),
+            registered,
+            "one service ID must keep one OS login registration"
+        );
+        let updated = render_definition(
+            id,
+            &base.join("kio"),
+            &base.join("root"),
+            600,
+            &new,
+            &old.xdg_data_home
+                .join("kio/watch-services")
+                .join(format!("{id}.json")),
+        )
+        .unwrap();
+        // A second installation into the canonical OS slot cannot overwrite
+        // this ID; replacement must use the existing registration.
+        assert!(
+            store
+                .write_atomic(
+                    Path::new(registered.file_name().unwrap()),
+                    updated.as_bytes(),
+                    kio_core::store_dir::Publication::CreateOnly
+                )
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&registered).unwrap(), definition.as_bytes());
+        assert!(!new.home.join("Library/LaunchAgents").exists());
+    }
+
+    #[test]
+    fn loaded_agent_uses_the_registered_plist_path_instead_of_environment_values() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let id = "io.kio.watch.fixture";
+        let registered = base
+            .join("old-home/Library/LaunchAgents")
+            .join(format!("{id}.plist"));
+        let data = base.join("private-original");
+        let printed = format!(
+            "gui/501/{id} = {{\n path = {}\n XDG_DATA_HOME => /misleading-child-environment\n}}",
+            registered.display()
+        );
+        let found = loaded_agent_data_home_with(&printed, id, |path| {
+            assert_eq!(path, registered);
+            Ok(data.clone())
+        })
+        .unwrap();
+        assert_eq!(found, data);
+        assert!(
+            loaded_agent_data_home_with("path = /tmp/foreign.plist", id, |_| panic!(
+                "foreign path"
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn duplicate_agent_paths_are_rejected_even_when_their_data_home_is_identical() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let homes = [base.join("account"), base.join("other")];
+        let id = "io.kio.watch.fixture";
+        for home in &homes {
+            let directory = home.join("Library/LaunchAgents");
+            std::fs::create_dir_all(&directory).unwrap();
+            let store = kio_core::store_dir::StoreDirectory::open(&directory).unwrap();
+            store
+                .write_atomic(
+                    Path::new(&format!("{id}.plist")),
+                    b"duplicate",
+                    kio_core::store_dir::Publication::CreateOnly,
+                )
+                .unwrap();
+        }
+        let paths = homes
+            .iter()
+            .map(|home| agent_definition_path(id, home).unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            registered_agent_data_home_with(&paths, id, |_| Ok(base.join("same-data"))).is_err(),
+            "same data home does not make duplicate OS registrations safe"
+        );
+        for path in paths {
+            assert_eq!(std::fs::read(path).unwrap(), b"duplicate");
+        }
+    }
+
     #[test]
     fn stopped_agent_discovers_its_saved_data_home_without_launchctl_registration() {
         let temp = tempfile::tempdir().unwrap();
