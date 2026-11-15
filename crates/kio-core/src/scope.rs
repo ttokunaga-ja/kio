@@ -4380,6 +4380,53 @@ mod tests {
     }
 
     #[test]
+    fn publication_recovery_manifest_stage_failure_preserves_head_and_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        fs::write(dir.path().join("doc.txt"), "v1").unwrap();
+        let c1 = repo.snapshot(None, None).unwrap().commit_hash.unwrap();
+        let old_head = fs::read(repo.kio_dir().join("HEAD")).unwrap();
+        let old_manifest = fs::read(repo.kio_dir().join("manifest.json")).unwrap();
+        fs::write(dir.path().join("doc.txt"), "v2").unwrap();
+        let c2 = repo.snapshot(None, None).unwrap().commit_hash.unwrap();
+        let new_manifest = fs::read(repo.kio_dir().join("manifest.json")).unwrap();
+        let journal = super::PublicationJournal {
+            version: 1,
+            expected_head: Some(c1),
+            new_head: c2.clone(),
+            manifest: serde_json::from_slice(&new_manifest).unwrap(),
+        };
+        let journal_path = repo.kio_dir().join(super::PUBLICATION_JOURNAL_LEAF);
+        fs::write(
+            &journal_path,
+            canonical_json_bytes(&serde_json::to_value(journal).unwrap()).unwrap(),
+        )
+        .unwrap();
+        fs::write(repo.kio_dir().join("HEAD"), &old_head).unwrap();
+        fs::write(repo.kio_dir().join("manifest.json"), &old_manifest).unwrap();
+        let recover = Repository::open_for_recovery(dir.path()).unwrap();
+        crate::cas::fail_next_raw_write();
+        let error = recover.recover_publication().unwrap_err();
+        assert_eq!(
+            error.resource_limit().unwrap().resource,
+            crate::error::Resource::Storage
+        );
+        assert_eq!(fs::read(repo.kio_dir().join("HEAD")).unwrap(), old_head);
+        assert_eq!(
+            fs::read(repo.kio_dir().join("manifest.json")).unwrap(),
+            old_manifest
+        );
+        assert!(journal_path.exists());
+        assert!(recover.recover_publication().unwrap());
+        assert_eq!(recover.head_commit_hash().unwrap(), Some(c2));
+        assert_eq!(
+            fs::read(repo.kio_dir().join("manifest.json")).unwrap(),
+            new_manifest
+        );
+        assert!(!journal_path.exists());
+    }
+
+    #[test]
     fn publication_journal_recovers_only_the_expected_head_child() {
         let dir = tempfile::tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();

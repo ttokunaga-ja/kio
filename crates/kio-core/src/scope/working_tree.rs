@@ -509,6 +509,7 @@ impl Repository {
     }
 
     pub fn status(&self) -> Result<StatusReport> {
+        let _inspection = crate::disk_records::StageInspection::begin();
         self.validate()?;
         let current = self.build_working_tree(false)?.tree;
         let current_map = tree_map(&current)?;

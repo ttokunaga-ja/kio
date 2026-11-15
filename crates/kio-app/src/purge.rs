@@ -1559,6 +1559,7 @@ fn extend_inventory_from_reachable_refs(
     let graph = HistoryReader::new_with_control(repo.kio_dir(), repo.control().clone())
         .walk_for_roots(&roots)?;
     for binding in graph.bindings()? {
+        let binding = binding?;
         let Some(normalize) = binding.binding.normalize.as_ref() else {
             continue;
         };
@@ -2777,26 +2778,29 @@ fn resolve_plan(repo: &Repository, args: &PurgeArgs) -> Result<PurgePlan> {
             // deleted historical operand through host filesystem canonicalization.
             TreeEntry::raw_file(logical_path, VALIDATION_HASH)?;
             let roots = crate::index::rebuild::durable_history_roots(repo)?;
-            let bindings = if roots.is_empty() {
-                Vec::new()
-            } else {
-                HistoryReader::new_with_control(repo.kio_dir(), repo.control().clone())
-                    .walk_for_roots(&roots)?
-                    .bindings()?
-            };
-            let targets = bindings
-                .iter()
-                .filter(|binding| binding.binding.path == logical_path)
-                .map(|binding| binding.binding.raw_hash.clone())
-                .collect::<BTreeSet<_>>();
+            let mut targets = BTreeSet::new();
+            let mut paths = BTreeSet::new();
+            if !roots.is_empty() {
+                let bindings =
+                    HistoryReader::new_with_control(repo.kio_dir(), repo.control().clone())
+                        .walk_for_roots(&roots)?
+                        .bindings()?;
+                for binding in &bindings {
+                    let binding = binding?;
+                    if binding.binding.path == logical_path {
+                        targets.insert(binding.binding.raw_hash);
+                    }
+                }
+                for binding in &bindings {
+                    let binding = binding?;
+                    if targets.contains(&binding.binding.raw_hash) {
+                        paths.insert(binding.binding.path);
+                    }
+                }
+            }
             if targets.is_empty() {
                 return Err(purge_not_found());
             }
-            let paths = bindings
-                .iter()
-                .filter(|binding| targets.contains(&binding.binding.raw_hash))
-                .map(|binding| binding.binding.path.clone())
-                .collect::<BTreeSet<_>>();
             (targets.into_iter().collect(), paths.into_iter().collect())
         }
         (None, Some(raw_hash)) => {
@@ -2808,18 +2812,19 @@ fn resolve_plan(repo: &Repository, args: &PurgeArgs) -> Result<PurgePlan> {
             // Raw identity remains authoritative even when history is shallow or
             // beyond traversal bounds. A successful best-effort walk only
             // enriches the conservative log/quarantine alias scrub.
-            let paths = HistoryReader::new_with_control(repo.kio_dir(), repo.control().clone())
-                .walk(&head_commit)
-                .ok()
-                .map(|graph| graph.bindings())
-                .transpose()?
-                .into_iter()
-                .flatten()
-                .filter(|binding| binding.binding.raw_hash == *raw_hash)
-                .map(|binding| binding.binding.path)
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect();
+            let mut paths = BTreeSet::new();
+            if let Ok(graph) =
+                HistoryReader::new_with_control(repo.kio_dir(), repo.control().clone())
+                    .walk(&head_commit)
+            {
+                for binding in graph.bindings()? {
+                    let binding = binding?;
+                    if binding.binding.raw_hash == *raw_hash {
+                        paths.insert(binding.binding.path);
+                    }
+                }
+            }
+            let paths = paths.into_iter().collect();
             (vec![raw_hash.clone()], paths)
         }
         _ => {

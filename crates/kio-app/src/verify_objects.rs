@@ -332,6 +332,7 @@ fn verify_objects_with_limits(
     repo: &Repository,
     limits: VerifyLimits,
 ) -> Result<VerifyObjectsReport> {
+    let _inspection = kio_core::disk_records::StageInspection::begin();
     if repo.object_store().verified_reads()?.is_none() {
         return kio_core::cas::VerifiedCasReadBudget::new()
             .run(u64::MAX, |reads| {

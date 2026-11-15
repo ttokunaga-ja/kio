@@ -272,18 +272,17 @@ fn retained_history_instances_from_graph(
     control: &ControlHandle,
 ) -> Result<Vec<RetainedNormalizedInstance>> {
     let mut all_paths_by_raw = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut exact_bindings = BTreeSet::<TreeBinding>::new();
     for appearance in graph.bindings()? {
+        let binding = appearance?.binding;
         all_paths_by_raw
-            .entry(appearance.binding.raw_hash)
+            .entry(binding.raw_hash.clone())
             .or_default()
-            .insert(appearance.binding.path);
+            .insert(binding.path.clone());
+        if binding.normalize.is_some() {
+            exact_bindings.insert(binding);
+        }
     }
-    let exact_bindings = graph
-        .bindings()?
-        .into_iter()
-        .map(|appearance| appearance.binding)
-        .filter(|binding| binding.normalize.is_some())
-        .collect::<BTreeSet<TreeBinding>>();
     // PC37/PC41/PC43 (05 §1.6 L265-266): collect EVERY ancestor-most
     // introduction per exact binding (not just its own byte-min winner via
     // `canonical_introduction`) so a content identity reachable through

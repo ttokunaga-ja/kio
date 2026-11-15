@@ -281,12 +281,13 @@ fn plan_all_history(graph: &LinearHistory) -> Result<Vec<SearchHistoryBinding>> 
     // TreeBinding equality includes path, raw identity, and the exact persisted
     // normalize value.  Repeated appearances in later commits therefore collapse
     // before choosing the canonical ancestor-most introduction.
-    let distinct = graph
-        .bindings()?
-        .into_iter()
-        .map(|appearance| appearance.binding)
-        .filter(|binding| binding.normalize.is_some())
-        .collect::<BTreeSet<_>>();
+    let mut distinct = BTreeSet::new();
+    for appearance in graph.bindings()? {
+        let binding = appearance?.binding;
+        if binding.normalize.is_some() {
+            distinct.insert(binding);
+        }
+    }
     let snapshot = graph
         .node(graph.start_commit())
         .ok_or_else(|| KioError::schema("history graph is missing its snapshot commit"))?;

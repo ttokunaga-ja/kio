@@ -156,11 +156,20 @@ impl Repository {
         }
         let tree = self.read_tree(&commit.tree)?;
         validate_manifest_matches_tree(&journal.manifest, &tree)?;
+        // Prepare the manifest before advancing HEAD, as in normal publication.
+        let manifest_stage = {
+            let mut reader = ManifestJsonReader::new(&journal.manifest)?;
+            self.store.stage_raw_from_reader(&mut reader, u64::MAX)?
+        };
         if current.as_deref() != Some(journal.new_head.as_str()) {
             let head_bytes = format!("{}\n", journal.new_head);
             self.replace_metadata("HEAD", head_bytes.as_bytes())?;
         }
-        self.write_manifest_value(&journal.manifest)?;
+        manifest_stage.publish_metadata_to(
+            &self.store_directory()?,
+            Path::new("manifest.json"),
+            crate::store_dir::Publication::Replace,
+        )?;
         self.remove_publication_journal()?;
         Ok(true)
     }

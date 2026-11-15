@@ -21,56 +21,56 @@ pub const SORT_BUFFER_RECORDS: usize = 256;
 pub const MERGE_SLOTS: usize = usize::BITS as usize;
 const RECORD_BYTES: usize = 64 * 1024;
 
-struct RunDirectory {
-    parent: StoreDirectory,
-    directory: StoreDirectory,
-    identity: crate::store_dir::DirectoryStageIdentity,
-    leaf: PathBuf,
+mod stages;
+use stages::RunDirectory;
+
+thread_local! {
+    static PRESERVE_STAGES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
-impl RunDirectory {
-    fn create() -> Result<Self> {
-        let root = std::env::temp_dir()
-            .canonicalize()
-            .map_err(|error| crate::store_dir::ioerr(Path::new("record stage root"), error))?;
-        let parent = StoreDirectory::open(&root)?;
-        let mut nonce = [0u8; 32];
-        getrandom::fill(&mut nonce)
-            .map_err(|error| KioError::io(error.to_string(), root.display().to_string()))?;
-        let leaf = PathBuf::from(format!("kio-records-{}", crate::cas::lower_hex(&nonce)));
-        let (directory, identity) = parent.create_stage_directory(&leaf)?;
-        Ok(Self {
-            parent,
-            directory,
-            identity,
-            leaf,
-        })
+/// Keep abandoned record stages visible while an inspection builds its report.
+pub struct StageInspection(PhantomData<std::rc::Rc<()>>);
+impl StageInspection {
+    pub fn begin() -> Self {
+        PRESERVE_STAGES.with(|depth| depth.set(depth.get() + 1));
+        Self(PhantomData)
     }
 }
-impl Drop for RunDirectory {
+impl Drop for StageInspection {
     fn drop(&mut self) {
-        if self.identity.verify(&self.directory).is_ok() {
-            let _ = crate::platform::stage_operations::discard_empty_directory(
-                &self.parent,
-                &self.leaf,
-                &self.directory.root_handle(),
-            );
-        }
+        PRESERVE_STAGES.with(|depth| depth.set(depth.get() - 1));
     }
+}
+fn stage_root() -> Result<PathBuf> {
+    #[cfg(debug_assertions)]
+    if let Some(path) = crate::test_control::DebugTestControl::from_env()
+        .core
+        .record_stage_root
+    {
+        if !path.is_absolute() {
+            return Err(KioError::invalid_usage(
+                "record stage root must be absolute",
+            ));
+        }
+        return Ok(path);
+    }
+    crate::xdg::xdg_dir("XDG_CACHE_HOME")
+        .or_else(|| crate::xdg::home_dir().map(|path| path.join(".cache")))
+        .map(|path| path.join("kio/record-stages"))
+        .ok_or_else(|| KioError::invalid_usage("record stages require an absolute cache directory"))
+}
+pub(crate) fn inspect_stage_residues() -> Result<Vec<crate::cas::RawStageResidue>> {
+    Ok(stages::inspect(&stage_root()?, false)?
+        .into_iter()
+        .map(|entry| crate::cas::RawStageResidue {
+            path: entry.path,
+            reason: entry.reason,
+        })
+        .collect())
 }
 struct RunFile {
     directory: StoreDirectory,
     identity: StageIdentity,
     _location: RunDirectory,
-}
-impl Drop for RunFile {
-    fn drop(&mut self) {
-        // Never fall back to recursive pathname cleanup after identity failure.
-        if self._location.identity.verify(&self.directory).is_ok() {
-            let _ = self
-                .directory
-                .discard_stage(Path::new("records"), &self.identity);
-        }
-    }
 }
 fn changed_records() -> KioError {
     KioError::schema("private record stage changed after sealing")
@@ -243,9 +243,12 @@ pub struct RecordWriter<T> {
 }
 impl<T: Serialize> RecordWriter<T> {
     pub fn new() -> Result<Self> {
-        let location = RunDirectory::create()?;
+        let reclaim = PRESERVE_STAGES.with(|depth| depth.get() == 0);
+        Self::new_at(&stage_root()?, reclaim)
+    }
+    fn new_at(root: &Path, reclaim: bool) -> Result<Self> {
+        let (location, writer) = RunDirectory::create(root, reclaim)?;
         let directory = location.directory.clone();
-        let writer = StageWriter::create(&directory, Path::new("records"))?;
         let identity = writer.identity().clone();
         Ok(Self {
             run: Arc::new(RunFile {
@@ -658,7 +661,9 @@ mod tests {
     #[test]
     fn cleanup_preserves_replaced_record_file() {
         let fixture = tempfile::tempdir().unwrap();
-        let records = DiskRecords::from_records([11u64]).unwrap();
+        let mut writer = RecordWriter::new_at(&fixture.path().join("registry"), true).unwrap();
+        writer.push(&11u64).unwrap();
+        let records = writer.finish().unwrap();
         let directory = records.run.directory.path().to_owned();
         let path = directory.join("records");
         std::fs::rename(&path, fixture.path().join("original-records")).unwrap();
@@ -670,14 +675,15 @@ mod tests {
         assert!(records.first().is_err());
         drop(records);
         assert_eq!(std::fs::read(&path).unwrap(), b"foreign replacement");
-        std::fs::remove_file(path).unwrap();
-        std::fs::remove_dir(directory).unwrap();
+        // The fixture owns the replacement and the preserved lease/journal.
     }
 
     #[test]
     fn cleanup_preserves_replaced_directory_and_its_contents() {
         let fixture = tempfile::tempdir().unwrap();
-        let records = DiskRecords::from_records([11u64]).unwrap();
+        let mut writer = RecordWriter::new_at(&fixture.path().join("registry"), true).unwrap();
+        writer.push(&11u64).unwrap();
+        let records = writer.finish().unwrap();
         let path = records.run.directory.path().to_owned();
         std::fs::rename(&path, fixture.path().join("original-directory")).unwrap();
         std::fs::create_dir(&path).unwrap();

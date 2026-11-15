@@ -87,6 +87,7 @@ impl Repository {
     }
 
     pub(super) fn validate_manifest(&self) -> Result<()> {
+        let _inspection = crate::disk_records::StageInspection::begin();
         let file = self
             .store_directory()?
             .open_regular_read(Path::new("manifest.json"), u64::MAX)?;

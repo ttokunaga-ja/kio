@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::ExitCode;
@@ -58,7 +59,7 @@ pub struct HistoryStats {
 /// The immutable tree identity used to join a persisted tree entry to indexed
 /// chunks. `normalize = None` is an exact value and is never supplemented from a
 /// later commit or mutable cache.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct TreeBinding {
     pub path: String,
     pub raw_hash: String,
@@ -76,7 +77,7 @@ impl From<&TreeEntry> for TreeBinding {
 }
 
 /// One exact binding appearance, including the commit and tree that attest it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryBinding {
     pub commit_hash: String,
     pub tree_hash: String,
@@ -149,15 +150,14 @@ impl LinearHistory {
     }
 
     /// Every binding appearance, sorted by exact identity and then commit hash.
-    pub fn bindings(&self) -> Result<Vec<HistoryBinding>> {
-        let mut bindings = Vec::new();
+    pub fn bindings(&self) -> Result<crate::disk_records::DiskRecords<HistoryBinding>> {
+        let mut bindings = crate::disk_records::RecordSorter::new(compare_bindings);
         for node in self.nodes.values() {
             for entry in node.tree.entries.iter() {
-                bindings.push(node.binding(&entry?));
+                bindings.push(node.binding(&entry?))?;
             }
         }
-        sort_bindings(&mut bindings);
-        Ok(bindings)
+        bindings.finish()
     }
 
     /// Test reachability within the complete graph. A commit is its own ancestor.
@@ -925,13 +925,11 @@ fn ensure_acyclic_edges(edges: &BTreeMap<String, Option<String>>) -> Result<()> 
     Ok(())
 }
 
-fn sort_bindings(bindings: &mut [HistoryBinding]) {
-    bindings.sort_by(|a, b| {
-        a.binding
-            .cmp(&b.binding)
-            .then_with(|| a.commit_hash.as_bytes().cmp(b.commit_hash.as_bytes()))
-            .then_with(|| a.tree_hash.as_bytes().cmp(b.tree_hash.as_bytes()))
-    });
+fn compare_bindings(a: &HistoryBinding, b: &HistoryBinding) -> std::cmp::Ordering {
+    a.binding
+        .cmp(&b.binding)
+        .then_with(|| a.commit_hash.as_bytes().cmp(b.commit_hash.as_bytes()))
+        .then_with(|| a.tree_hash.as_bytes().cmp(b.tree_hash.as_bytes()))
 }
 
 fn checked_total(current: u64, increment: u64) -> u64 {
@@ -1168,6 +1166,29 @@ mod tests {
         assert!(super::ensure_acyclic_edges(&edges).is_err());
         edges.remove(&names[1]);
         assert!(super::linear_tip(&edges, &roots).is_err());
+    }
+
+    #[test]
+    fn bindings_are_disk_backed_and_sorted_across_commits() {
+        let fixture = Fixture::new();
+        let entries = (0..1200)
+            .rev()
+            .map(|i| entry(&format!("file-{i:04}"), b"same", None))
+            .collect();
+        let tree = fixture.tree(entries);
+        let root = fixture.commit("root", &tree, Vec::new());
+        let head = fixture.commit("head", &tree, vec![root.clone()]);
+        let graph = HistoryReader::new(&fixture.kio_dir).walk(&head).unwrap();
+        let records: crate::disk_records::DiskRecords<super::HistoryBinding> =
+            graph.bindings().unwrap();
+        assert_eq!(records.len(), 2400);
+        let mut commits = [root, head];
+        commits.sort();
+        for (i, record) in records.iter().enumerate() {
+            let record = record.unwrap();
+            assert_eq!(record.binding.path, format!("file-{:04}", i / 2));
+            assert_eq!(record.commit_hash, commits[i % 2]);
+        }
     }
 
     #[test]

@@ -205,6 +205,7 @@ impl BoundObjectDirs {
                 });
             }
         }
+        residues.extend(crate::disk_records::inspect_stage_residues()?);
         Ok(residues)
     }
 
