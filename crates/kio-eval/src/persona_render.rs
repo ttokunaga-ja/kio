@@ -15,7 +15,7 @@ pub const RENDERER_ID: &str = "kio-persona-renderer";
 pub const RENDERER_SCHEMA: &str = "kio.persona.renderer/v2";
 pub const MAX_RENDERED_BYTES: usize = 100 * 1024 * 1024;
 pub const FROZEN_RENDER_VECTOR: &str =
-    "sha256:0574de1f893e742fda18e3f033aa79dfdb6743c478641776d28b6930a7e18635";
+    "sha256:ffbf3c2b96d557f7f3c42cbdcf7ecb741f34ff417dad3681b4ac131733831150";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum RenderError {
@@ -176,15 +176,12 @@ pub struct TransformWitness {
     pub parent_pixel_len: u8,
 }
 
-pub const ALL_VARIANTS: [FormatVariant; 25] = [
+pub const ALL_VARIANTS: [FormatVariant; 22] = [
     FormatVariant::Md,
     FormatVariant::Markdown,
     FormatVariant::Txt,
     FormatVariant::Log,
     FormatVariant::Jsonl,
-    FormatVariant::Py,
-    FormatVariant::Rs,
-    FormatVariant::Ts,
     FormatVariant::Json,
     FormatVariant::Yaml,
     FormatVariant::Xml,
@@ -236,9 +233,6 @@ pub fn variant_contract(variant: FormatVariant) -> (&'static str, &'static str) 
             },
             "application/octet-stream",
         ),
-        FormatVariant::Py => ("py", "text/x-code"),
-        FormatVariant::Rs => ("rs", "text/x-code"),
-        FormatVariant::Ts => ("ts", "text/x-code"),
         FormatVariant::PdfText | FormatVariant::PdfScan => ("pdf", "application/pdf"),
         FormatVariant::Docx => (
             "docx",
@@ -706,12 +700,9 @@ fn validate_plan(plan: &SourceRenderPlan) -> Result<(), RenderError> {
 
 fn variant_policy(variant: FormatVariant) -> (GateRole, Disposition) {
     match variant {
-        FormatVariant::Md
-        | FormatVariant::Markdown
-        | FormatVariant::Txt
-        | FormatVariant::Py
-        | FormatVariant::Rs
-        | FormatVariant::Ts => (GateRole::ContractContributor, Disposition::LocalText),
+        FormatVariant::Md | FormatVariant::Markdown | FormatVariant::Txt => {
+            (GateRole::ContractContributor, Disposition::LocalText)
+        }
         FormatVariant::PdfText => (GateRole::ContractContributor, Disposition::LocalPdfText),
         FormatVariant::Log
         | FormatVariant::Jsonl
@@ -866,9 +857,6 @@ fn render_body(plan: &SourceRenderPlan, id: &str) -> Result<Vec<u8>, RenderError
         FormatVariant::Txt => plain.into_bytes(),
         FormatVariant::Log => format!("2026-07-13T00:00:00Z INFO {plain}").into_bytes(),
         FormatVariant::Jsonl => format!("{{\"source\":\"{}\",\"id\":\"{}\"}}\n", plan.source_id, id).into_bytes(),
-        FormatVariant::Py => format!("# {id}\ndef kio_record():\n    return \"{}\"\n", plan.source_id).into_bytes(),
-        FormatVariant::Rs => format!("// {id}\npub fn kio_record() -> &'static str {{ \"{}\" }}\n", plan.source_id).into_bytes(),
-        FormatVariant::Ts => format!("// {id}\nexport const kioRecord = () => \"{}\";\n", plan.source_id).into_bytes(),
         FormatVariant::Json => format!("{{\"id\":\"{}\",\"source\":\"{}\"}}\n", id, plan.source_id).into_bytes(),
         FormatVariant::Yaml => format!("id: {id}\nsource: {}\n", plan.source_id).into_bytes(),
         FormatVariant::Xml => format!("<?xml version=\"1.0\"?><record id=\"{id}\"><source>{}</source></record>\n", plan.source_id).into_bytes(),
@@ -2178,6 +2166,14 @@ mod tests {
             "http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties"
         ));
     }
+    #[test]
+    fn source_code_files_are_not_searchable_fixture_variants() {
+        for variant in ALL_VARIANTS {
+            let (extension, _) = variant_contract(variant);
+            assert!(!["rs", "py", "js", "ts", "go", "java", "c", "h", "cpp"].contains(&extension));
+        }
+    }
+
     #[test]
     fn frozen_contract_vector() {
         let mut material = Vec::new();

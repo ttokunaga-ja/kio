@@ -50,7 +50,7 @@ opt-in の単位・寿命・revoke の正本は [07-adapter-spec.md §3](07-adap
 最初のターゲットは明確に絞る。
 
 ```text
-- 大量の PDF・Markdown・コード・画像・研究資料を扱う
+- 大量の PDF・Markdown・画像・研究資料を扱う
 - 開発者・研究者・技術者
 - Git や CLI に抵抗がない
 - ローカルファイルが散らかっている
@@ -245,7 +245,7 @@ Kio が同じ轍を踏まないための行動原則:
 
 | 領域 | 重なる相手 | Kio のスタンス |
 | --- | --- | --- |
-| 個人ノート vault | Obsidian | **置き換えない**。vault を含む親フォルダに `.kio`。vault 内検索は Smart Connections に任せ、Kio は vault + Documents + Downloads + コードを横断 |
+| 個人ノート vault | Obsidian | **置き換えない**。vault を含む親フォルダに `.kio`。vault 内検索は Smart Connections に任せ、Kio は vault + Documents + Downloads を横断 |
 | AI チャット UX | Khoj, AnythingLLM | **chat UI自体は競わない**。ローカル文書検索は第一代替として比較しつつ、Kioは履歴・EvidenceをCLIの構造化JSONで提供する |
 | 大容量ファイル管理 | git-annex | **対象が違う**。git-annex は同期・バックアップ。Kio は知識検索と Evidence。両立可能 |
 | 画面履歴 | Microsoft Recall, Rewind | **競合しない**。レイヤーが違う (画面 vs ファイル) |
@@ -332,8 +332,8 @@ Kio は既存ツールを置き換えない。**横断する**外部アーカイ
 
 | 既存ワークフロー | Kio の関係 |
 | --- | --- |
-| Obsidian vault | vault を含む親フォルダに `.kio`。vault 内検索は Smart Connections に任せ、Kio は vault + Documents + Downloads + コードを横断。 |
-| Git リポジトリ | リポジトリ自体には `.kio` を置かない (Git に管理される)。`kio index` は VCS repo root 配下に既定で子 `.kio` を作らないため、**リポジトリ内のコードは既定では検索対象外** — コードも対象にするには `[scope] index_vcs_repos = true` の明示 opt-in ([03-data-model.md §3](03-data-model.md))。検索が横断するのは repo 外のファイルと他 scope である (横断検索は scope_registry 経由の全 scope 検索であり、親 `.kio` 自体は直下のみ管理 — 03 §3)。 |
+| Obsidian vault | vault を含む親フォルダに `.kio`。vault 内検索は Smart Connections に任せ、Kio は vault + Documents + Downloads を横断。 |
+| Git リポジトリ | リポジトリ自体には `.kio` を置かない (Git に管理される)。`kio index` は VCS repo root 配下に既定で子 `.kio` を作らないため、**リポジトリ内の文書は既定では検索対象外** — 文書も対象にするには `[scope] index_vcs_repos = true` の明示 opt-in ([03-data-model.md §3](03-data-model.md))。検索が横断するのは repo 外のファイルと他 scope である (横断検索は scope_registry 経由の全 scope 検索であり、親 `.kio` 自体は直下のみ管理 — 03 §3)。 |
 | 既存ファイル整理 | Documents / Downloads など散らかった領域を整理せず、横断検索と Evidence で「整理しなくても見つかる」体験を提供。 |
 | Khoj / AnythingLLM | ローカル文書検索では第一代替だが、chat UXは彼らに任せる。Kioの履歴・Evidenceを構造化APIから呼ぶ相互運用も狙う。 |
 

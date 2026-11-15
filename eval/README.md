@@ -433,6 +433,8 @@ cargo test -p kio-eval --all-targets --locked
 
 ## 20人の独立 persona-PC fixture（Rust-only contract）
 
+D-20261115-01 に合わせ、Rust persona fixture のソースコード形式を削除し、そのファイル配分を Markdown に振り替えた。総ファイル数と chunk の検証条件を維持し、plan と renderer の golden digest はこの母集団で再生成した。`fixtures/normalized-corpus/` と日付付き results は過去の結果の説明用アーカイブであり、現行の索引対象を定めない。
+
 persona-PC suite の唯一の semantic authority は Rust の canonical artifacts である。
 `plan` は persona、Rust scope ID、home path、allocation、source identity を固定し、
 `schedule` と `render` は同一 plan に束縛された deterministic projection である。Python

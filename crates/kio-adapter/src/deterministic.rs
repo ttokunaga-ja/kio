@@ -374,9 +374,6 @@ fn markdown_unit_from_hint(
         Some(SourceDocument::Text(text)) if request.media_type == "text/markdown" => {
             text.to_owned()
         }
-        Some(SourceDocument::Text(text)) if request.media_type == "text/x-code" => {
-            fence_code(text, request.raw.path.as_deref())
-        }
         Some(SourceDocument::PdfPages(pages)) => {
             let page_index =
                 page_index_from_unit_key(&hint.unit_key).unwrap_or(hint.order as usize);
@@ -393,7 +390,7 @@ fn markdown_unit_from_hint(
             format!("{}\n", sheet.trim())
         }
         // text/plain and sniffed octet-stream TEXT (R20-6 passthrough:
-        // .xml/.html/.eml/.csv/...) — fence it exactly like code. Raw
+        // .xml/.html/.eml/.csv/...) — preserve it as literal text. Raw
         // passthrough put markup-bearing files (XML/HTML) in violation of
         // Normalized Markdown v1's "raw HTML and autolinks are forbidden"
         // acceptance check (04 §3.2 V5), which failed every such file's
@@ -401,7 +398,7 @@ fn markdown_unit_from_hint(
         // fixture registration: 48/48 failures were exactly the .xml and
         // .html corpus files). A fence is the V5-safe literal carrier for
         // ALL non-markdown text, independent of content.
-        Some(SourceDocument::Text(text)) => fence_code(text, request.raw.path.as_deref()),
+        Some(SourceDocument::Text(text)) => fence_literal_text(text, request.raw.path.as_deref()),
         None => baseline_placeholder(&hint.unit_key, &hint.prepared_hash),
     };
     let markdown = if markdown.trim().is_empty() {
@@ -507,7 +504,7 @@ fn is_probably_real_text(text: &str) -> bool {
     printable * 100 >= total * 85
 }
 
-fn fence_code(text: &str, path: Option<&str>) -> String {
+fn fence_literal_text(text: &str, path: Option<&str>) -> String {
     let lang = path
         .and_then(|path| std::path::Path::new(path).extension())
         .and_then(|extension| extension.to_str())
@@ -854,7 +851,7 @@ mod tests {
     #[test]
     fn octet_text_markdownize_is_fenced() {
         let text = "<record><title>x</title></record>";
-        let fenced = fence_code(text, Some("a/record-037.xml"));
+        let fenced = fence_literal_text(text, Some("a/record-037.xml"));
         assert!(fenced.starts_with("```xml\n<record>"), "{fenced}");
         assert!(fenced.trim_end().ends_with("```"), "{fenced}");
     }
@@ -865,7 +862,7 @@ mod tests {
     #[test]
     fn fence_grows_past_embedded_backtick_runs() {
         let text = "line\n````\ninner\n````";
-        let fenced = fence_code(text, None);
+        let fenced = fence_literal_text(text, None);
         assert!(fenced.starts_with("`````\n"), "{fenced}");
         assert!(fenced.trim_end().ends_with("`````"), "{fenced}");
     }

@@ -91,7 +91,6 @@ DOCX          | page (prepare の変換 PDF 経由 — [07-adapter-spec.md §5.2
 XLSX          | sheet
 画像          | doc:1 (単一 unit — 画像 1 ファイル = 1 unit)
 Markdown      | doc:1 (heading 分割は chunk の責務)
-code          | doc:1 (symbol 分割は chunk の責務)
 ```
 
 物理配置は [03-data-model.md §2 / §2.1](03-data-model.md) を正とする:
@@ -146,7 +145,7 @@ sheet        : シート名 (NFC 正規化のみ。空白・大小文字は保�
                escape** してから、同名重複の 2 つ目以降に "#2", "#3" を付す (可逆・決定的 —
                sheet:Sheet1, sheet:Sheet1#2 — 出現順。実名 "A#2" は sheet:A##2 となり
                "A" の 2 枚目 sheet:A#2 と衝突しない)
-doc          : text-native ファイル (Markdown / コード / plain text) は単一 unit "doc:1"。
+doc          : text-native ファイル (Markdown / plain text) は単一 unit "doc:1"。
                heading 単位の分割は chunk (Step 3) の責務であり unit では行わない
 ```
 
@@ -772,6 +771,8 @@ attempt / next_retry_at / ownership と unsupported の現在理由を失わな�
 canonical path、no-follow、record schema、identity と不正 record の拒否を維持する。
 課金／秘密／送信承認の正本はこの整理の対象にしない。容量不足は §5.3 の `resource_limit` として
 破損から区別し、部分成功や必要な状態の黙った切捨てにしない。
+
+ソースコードのファイル（拡張子 `rs` / `py` / `js` / `ts` / `go` / `java` / `c` / `h` / `cpp`、大文字小文字を区別しない）は索引・抽出の対象外とし、unsupported に理由 `source_code_is_not_supported` を記録・表示する。中身がテキストでも plain text として処理しない。Markdown 内のコードブロック・インラインコードは引き続き Markdown の一部として扱う。
 
 ```json
 {

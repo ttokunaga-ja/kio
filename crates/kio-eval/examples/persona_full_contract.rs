@@ -36,11 +36,11 @@ fn main() {
     assert_eq!(render.artifact_digest, FULL_ARTIFACT_HASH);
     assert_eq!(
         schedule.suite_digest,
-        "sha256:028a26df50a8aa94b33ed9a8edd306dac8baf588950e70b4857c0b2e617a4529"
+        "sha256:940afd1bbead576b8be7a088fcefe7a84c20047bb10ff0117094b69165dd8581"
     );
     assert_eq!(
         schedule.people[0].schedule_digest,
-        "sha256:0bb6ad9c9b95c318a2d938192e8663cd5ad5ccde9e156cb163bc8875e27ce56f"
+        "sha256:01038cf9825f0dda315b4f4e31411f3b112cfeba7ad94b0b15cf4039b4da872b"
     );
     assert!(schedule_bytes.len() <= MAX_SCHEDULE_BYTES);
     assert!(render_bytes.len() <= MAX_CANONICAL_BYTES);

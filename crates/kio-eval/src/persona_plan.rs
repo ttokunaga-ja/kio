@@ -12,11 +12,11 @@ pub const SCOPES_PER_PERSON: usize = 20;
 /// Frozen plans are below this bound; it limits untrusted CLI plan input.
 pub const MAX_CANONICAL_BYTES: usize = 4 * 1024 * 1024;
 pub const TINY_PLAN_HASH: &str =
-    "sha256:48cfa9f79e30dece121e58190e99994cfe03e1cd838d558e230d6d7100d864c9";
+    "sha256:984633624c1a65e7873827937f9af0351bc14c9bca9b66f5032b3e3fe790e809";
 pub const PILOT_PLAN_HASH: &str =
-    "sha256:8d0fb5aaa278c3f14aa4e16177ff95a69cafcc695efa790cf5fed57c7900fbeb";
+    "sha256:82bf41b163e36f7698ba78266f366d640fc8fd7967445a2b684e39aad2bfb480";
 pub const FULL_PLAN_HASH: &str =
-    "sha256:f4e84efd49a98760733d628aaa44342dc7039cc845aced936e8a158eada95236";
+    "sha256:eeb6ccb6c7964b8885217aa87ad22728a238ff216d3553b85cffe78411e19cdb";
 const WEIGHTS: [u32; 20] = [10, 9, 8, 8, 7, 6, 6, 5, 5, 4, 4, 3, 5, 4, 4, 3, 3, 2, 2, 2];
 const SECONDARY: [&str; 8] = [
     "desktop/working",
@@ -140,7 +140,6 @@ impl PersonaId {
 pub enum FormatFamily {
     Md,
     TxtLog,
-    Code,
     StructuredText,
     CsvTsv,
     HtmlEml,
@@ -162,9 +161,6 @@ pub enum FormatVariant {
     Txt,
     Log,
     Jsonl,
-    Py,
-    Rs,
-    Ts,
     Json,
     Yaml,
     Xml,
@@ -217,10 +213,9 @@ pub enum Boundary {
     None,
 }
 impl FormatFamily {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 14] = [
         Self::Md,
         Self::TxtLog,
-        Self::Code,
         Self::StructuredText,
         Self::CsvTsv,
         Self::HtmlEml,
@@ -314,9 +309,9 @@ pub struct PersonPlan {
     pub role: String,
     pub raw_files: u32,
     pub current_chunks: u32,
-    #[serde(deserialize_with = "bounded_15")]
+    #[serde(deserialize_with = "bounded_14")]
     pub formats: Vec<FamilyPlan>,
-    #[serde(deserialize_with = "bounded_25")]
+    #[serde(deserialize_with = "bounded_22")]
     pub variants: Vec<VariantPlan>,
     #[serde(deserialize_with = "bounded_20")]
     pub scopes: Vec<ScopePlan>,
@@ -406,7 +401,7 @@ struct Row {
     id: PersonaId,
     role: &'static str,
     full: u32,
-    ratios: [u8; 15],
+    ratios: [u8; 14],
 }
 
 fn primary_paths(id: PersonaId) -> &'static [&'static str; 12] {
@@ -698,124 +693,124 @@ const ROWS: [Row; 20] = [
         id: PersonaId::P01,
         role: "software-engineer",
         full: 12000,
-        ratios: [22, 8, 28, 12, 3, 5, 1, 7, 1, 3, 2, 2, 3, 0, 3],
+        ratios: [50, 8, 12, 3, 5, 1, 7, 1, 3, 2, 2, 3, 0, 3],
     },
     Row {
         id: PersonaId::P02,
         role: "site-reliability-engineer",
         full: 15000,
-        ratios: [20, 22, 15, 20, 5, 3, 0, 4, 0, 2, 1, 1, 2, 0, 5],
+        ratios: [35, 22, 20, 5, 3, 0, 4, 0, 2, 1, 1, 2, 0, 5],
     },
     Row {
         id: PersonaId::P03,
         role: "security-grc-analyst",
         full: 10000,
-        ratios: [10, 12, 8, 15, 10, 8, 0, 15, 5, 5, 4, 2, 3, 0, 3],
+        ratios: [18, 12, 15, 10, 8, 0, 15, 5, 5, 4, 2, 3, 0, 3],
     },
     Row {
         id: PersonaId::P04,
         role: "ml-research-engineer",
         full: 10000,
-        ratios: [12, 7, 18, 10, 12, 2, 12, 12, 1, 2, 3, 3, 5, 0, 1],
+        ratios: [30, 7, 10, 12, 2, 12, 12, 1, 2, 3, 3, 5, 0, 1],
     },
     Row {
         id: PersonaId::P05,
         role: "bi-data-analyst",
         full: 12000,
-        ratios: [8, 5, 6, 14, 20, 5, 5, 5, 1, 3, 15, 4, 3, 0, 6],
+        ratios: [14, 5, 14, 20, 5, 5, 5, 1, 3, 15, 4, 3, 0, 6],
     },
     Row {
         id: PersonaId::P06,
         role: "life-science-researcher",
         full: 8000,
-        ratios: [6, 6, 3, 5, 15, 2, 3, 18, 8, 8, 8, 5, 9, 0, 4],
+        ratios: [9, 6, 5, 15, 2, 3, 18, 8, 8, 8, 5, 9, 0, 4],
     },
     Row {
         id: PersonaId::P07,
         role: "humanities-researcher",
         full: 7000,
-        ratios: [12, 10, 0, 4, 3, 5, 0, 25, 20, 10, 1, 2, 6, 1, 1],
+        ratios: [12, 10, 4, 3, 5, 0, 25, 20, 10, 1, 2, 6, 1, 1],
     },
     Row {
         id: PersonaId::P08,
         role: "product-manager",
         full: 8000,
-        ratios: [10, 4, 1, 5, 8, 8, 0, 13, 3, 15, 8, 15, 7, 1, 2],
+        ratios: [11, 4, 5, 8, 8, 0, 13, 3, 15, 8, 15, 7, 1, 2],
     },
     Row {
         id: PersonaId::P09,
         role: "ux-researcher",
         full: 9000,
-        ratios: [8, 15, 0, 4, 8, 3, 0, 10, 4, 12, 4, 8, 15, 7, 2],
+        ratios: [8, 15, 4, 8, 3, 0, 10, 4, 12, 4, 8, 15, 7, 2],
     },
     Row {
         id: PersonaId::P10,
         role: "management-consultant",
         full: 7000,
-        ratios: [4, 4, 0, 2, 8, 6, 0, 18, 5, 12, 18, 18, 3, 0, 2],
+        ratios: [4, 4, 2, 8, 6, 0, 18, 5, 12, 18, 18, 3, 0, 2],
     },
     Row {
         id: PersonaId::P11,
         role: "account-executive",
         full: 10000,
-        ratios: [3, 4, 0, 2, 5, 25, 0, 16, 4, 14, 7, 10, 5, 3, 2],
+        ratios: [3, 4, 2, 5, 25, 0, 16, 4, 14, 7, 10, 5, 3, 2],
     },
     Row {
         id: PersonaId::P12,
         role: "support-success-lead",
         full: 16000,
-        ratios: [15, 20, 4, 15, 12, 12, 0, 5, 1, 3, 2, 1, 7, 1, 2],
+        ratios: [19, 20, 15, 12, 12, 0, 5, 1, 3, 2, 1, 7, 1, 2],
     },
     Row {
         id: PersonaId::P13,
         role: "corporate-privacy-counsel",
         full: 7000,
-        ratios: [3, 4, 0, 1, 2, 14, 0, 28, 15, 22, 3, 2, 3, 0, 3],
+        ratios: [3, 4, 1, 2, 14, 0, 28, 15, 22, 3, 2, 3, 0, 3],
     },
     Row {
         id: PersonaId::P14,
         role: "finance-controller",
         full: 9000,
-        ratios: [3, 3, 1, 4, 15, 5, 0, 13, 8, 8, 27, 7, 3, 0, 3],
+        ratios: [4, 3, 4, 15, 5, 0, 13, 8, 8, 27, 7, 3, 0, 3],
     },
     Row {
         id: PersonaId::P15,
         role: "recruiter-people-ops",
         full: 8000,
-        ratios: [4, 5, 0, 2, 7, 15, 0, 20, 8, 20, 8, 3, 5, 1, 2],
+        ratios: [4, 5, 2, 7, 15, 0, 20, 8, 20, 8, 3, 5, 1, 2],
     },
     Row {
         id: PersonaId::P16,
         role: "clinical-researcher",
         full: 8000,
-        ratios: [5, 6, 1, 4, 10, 4, 1, 24, 12, 10, 8, 5, 6, 1, 3],
+        ratios: [6, 6, 4, 10, 4, 1, 24, 12, 10, 8, 5, 6, 1, 3],
     },
     Row {
         id: PersonaId::P17,
         role: "construction-project-manager",
         full: 8000,
-        ratios: [3, 4, 0, 2, 5, 4, 0, 20, 12, 8, 10, 4, 12, 1, 15],
+        ratios: [3, 4, 2, 5, 4, 0, 20, 12, 8, 10, 4, 12, 1, 15],
     },
     Row {
         id: PersonaId::P18,
         role: "manufacturing-quality-engineer",
         full: 12000,
-        ratios: [6, 12, 2, 6, 15, 3, 0, 18, 6, 8, 10, 3, 5, 0, 6],
+        ratios: [8, 12, 6, 15, 3, 0, 18, 6, 8, 10, 3, 5, 0, 6],
     },
     Row {
         id: PersonaId::P19,
         role: "educator-instructional-designer",
         full: 9000,
-        ratios: [8, 5, 0, 2, 5, 5, 0, 20, 8, 15, 7, 12, 8, 3, 2],
+        ratios: [8, 5, 2, 5, 5, 0, 20, 8, 15, 7, 12, 8, 3, 2],
     },
     Row {
         id: PersonaId::P20,
         role: "investigative-journalist",
         full: 10000,
-        ratios: [8, 18, 1, 3, 8, 10, 0, 16, 10, 8, 2, 2, 8, 4, 2],
+        ratios: [9, 18, 3, 8, 10, 0, 16, 10, 8, 2, 2, 8, 4, 2],
     },
 ];
-const VS: [(FormatVariant, FormatFamily, u8, GateRole, Disposition); 25] = [
+const VS: [(FormatVariant, FormatFamily, u8, GateRole, Disposition); 22] = [
     (
         FormatVariant::Md,
         FormatFamily::Md,
@@ -850,27 +845,6 @@ const VS: [(FormatVariant, FormatFamily, u8, GateRole, Disposition); 25] = [
         10,
         GateRole::IncidentalSearchable,
         Disposition::IncidentalSniff,
-    ),
-    (
-        FormatVariant::Py,
-        FormatFamily::Code,
-        34,
-        GateRole::ContractContributor,
-        Disposition::LocalText,
-    ),
-    (
-        FormatVariant::Rs,
-        FormatFamily::Code,
-        33,
-        GateRole::ContractContributor,
-        Disposition::LocalText,
-    ),
-    (
-        FormatVariant::Ts,
-        FormatFamily::Code,
-        33,
-        GateRole::ContractContributor,
-        Disposition::LocalText,
     ),
     (
         FormatVariant::Json,
@@ -1009,7 +983,7 @@ fn plan(r: &Row, profile: PersonaProfile) -> PersonPlan {
         raw,
         &r.ratios.iter().map(|v| u32::from(*v)).collect::<Vec<_>>(),
     );
-    let mut vf = [0; 25];
+    let mut vf = [0; 22];
     for (i, f) in FormatFamily::ALL.into_iter().enumerate() {
         let ix: Vec<_> = VS.iter().enumerate().filter(|(_, v)| v.1 == f).collect();
         for ((j, _), n) in ix.into_iter().zip(h(
@@ -2205,8 +2179,8 @@ impl PersonaPlan {
         };
         for p in &self.personas {
             if !ids.insert(p.id)
-                || p.formats.len() != 15
-                || p.variants.len() != 25
+                || p.formats.len() != 14
+                || p.variants.len() != 22
                 || p.scopes.len() != 20
                 || p.cohorts.len() != 5
                 || p.structural.len() != structural_count
@@ -2310,8 +2284,8 @@ fn bounded_5<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Vec
 fn bounded_6<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Vec<T>, D::Error> {
     bounded_vec::<D, T, 6>(d)
 }
-fn bounded_15<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Vec<T>, D::Error> {
-    bounded_vec::<D, T, 15>(d)
+fn bounded_14<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Vec<T>, D::Error> {
+    bounded_vec::<D, T, 14>(d)
 }
 fn bounded_16<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Vec<T>, D::Error> {
     bounded_vec::<D, T, 16>(d)
@@ -2319,8 +2293,8 @@ fn bounded_16<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Ve
 fn bounded_20<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Vec<T>, D::Error> {
     bounded_vec::<D, T, 20>(d)
 }
-fn bounded_25<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Vec<T>, D::Error> {
-    bounded_vec::<D, T, 25>(d)
+fn bounded_22<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Vec<T>, D::Error> {
+    bounded_vec::<D, T, 22>(d)
 }
 fn bounded_30<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Vec<T>, D::Error> {
     bounded_vec::<D, T, 30>(d)

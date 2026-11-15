@@ -1309,14 +1309,14 @@ mod tests {
         let b = build_suite_schedule(&plan).unwrap();
         assert_eq!(
             a.suite_digest,
-            "sha256:12e08f8b382fd33a8f5f2425cb2389358f98c678615edb550b8fb063137b721f"
+            "sha256:acfa8f6a9c2640b336aab14265810da3e8ef41b099cd4a7758ed0b315b7f5acd"
         );
         assert_eq!(
             build_person_schedule(&plan, &plan.personas[0])
                 .unwrap()
                 .digest()
                 .unwrap(),
-            "sha256:21fabb658f9fa6c11860617dff86401640473412b32021cc62ba7cb04fd6a0e8"
+            "sha256:ef06750dcd0e7c6601753c8c54613e029aa518b8d0fe49aaea25ac03ce9659a5"
         );
         assert_eq!(a.canonical_bytes().unwrap(), b.canonical_bytes().unwrap());
         assert_eq!(a.people.len(), 20);
@@ -1342,12 +1342,12 @@ mod tests {
             let suite_second = build_suite_schedule(&plan).unwrap();
             let expected = match profile {
                 PersonaProfile::Tiny => (
-                    "sha256:21fabb658f9fa6c11860617dff86401640473412b32021cc62ba7cb04fd6a0e8",
-                    "sha256:12e08f8b382fd33a8f5f2425cb2389358f98c678615edb550b8fb063137b721f",
+                    "sha256:ef06750dcd0e7c6601753c8c54613e029aa518b8d0fe49aaea25ac03ce9659a5",
+                    "sha256:acfa8f6a9c2640b336aab14265810da3e8ef41b099cd4a7758ed0b315b7f5acd",
                 ),
                 PersonaProfile::Pilot => (
-                    "sha256:b573b50aa2d1bcddd9268ae319520cea96d82d2fa5841bd5e8f07d33b4d28c66",
-                    "sha256:eea316e469a060d67b131bc6350e156d93b1a0d2a8bf86fe9671742ebe2accee",
+                    "sha256:ec9e1191bf8803a1b3a685d3802c2758e4e35910a12eb9b427b2670be16d4cb6",
+                    "sha256:3c47897876570fea17b1d4b6dbd0a0ea9548781126034fe3ab4e649bfd75b1a3",
                 ),
                 PersonaProfile::Full => unreachable!("Full is manual-only"),
             };

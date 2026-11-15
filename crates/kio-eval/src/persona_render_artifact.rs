@@ -17,11 +17,11 @@ use thiserror::Error;
 
 pub const SCHEMA: &str = "kio.persona.render-artifact/v2";
 pub const TINY_ARTIFACT_HASH: &str =
-    "sha256:b3882318ee9619e2179a778e46177cb7e30221ca44402e8079afff8cf15196ff";
+    "sha256:6e44303e351ccb8c92c29a675050742d8b8e265628a7923f8aeac2327f2ea5db";
 pub const PILOT_ARTIFACT_HASH: &str =
-    "sha256:5ef49a309ef9380697225c91412af6f05bba02581ab33a939b949f47a41233a9";
+    "sha256:d2910a32e1204e7cd758bb686d30b814dde4b3c2607d89c068b51a4c43a0d9ea";
 pub const FULL_ARTIFACT_HASH: &str =
-    "sha256:b99f0d937f1476868c3e3121841ec258ff332bce7c57f92fa6193bcb3b84b2a8";
+    "sha256:5d529e8a00deea2e37162fb8c479e18baee23fa22bbadf4154cf76a3c396d856";
 pub const MAX_SOURCES: usize = 200_000;
 pub const MAX_CANONICAL_BYTES: usize = 160 * 1024 * 1024;
 const MAX_JSON_DEPTH: usize = 128;

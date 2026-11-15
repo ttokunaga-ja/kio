@@ -1381,7 +1381,7 @@ mod tests {
         );
         assert_eq!(
             a.digest().unwrap(),
-            "sha256:6b8f5703ab511f096fe1ce3d493fa4cc65171f84c41968c80cff37c853b20694"
+            "sha256:5aa40dc97d9f30dad0219d3d1e2882719d4dfc515fe2cb410ceb6e459baec57f"
         );
         assert!(a.physical_raw.len() < 200);
         assert!(a.canonical_jsonl().unwrap().len() < plan.canonical_bytes().unwrap().len());
@@ -1551,7 +1551,7 @@ mod tests {
         SuiteManifest::parse_canonical(&suite.canonical_bytes().unwrap(), &plan).unwrap();
         assert_eq!(
             suite.digest().unwrap(),
-            "sha256:d542894682d35b11dc082732cf4a45f87469122e112790e5b8771e4763ddd7a3"
+            "sha256:f4b2fcddcb9092a721d1d8119438b2ab4a1ded6946c9ed91b0d097bd211deaa7"
         );
 
         let mut fabricated = suite;

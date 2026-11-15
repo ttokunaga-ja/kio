@@ -658,7 +658,10 @@ pub(crate) fn run_index_pipeline(
         .collect::<BTreeMap<_, _>>();
     let mut unsupported_paths = unsupported_by_path
         .values()
-        .filter(|entry| entry.reason == UNSUPPORTED_REASON_UNRECOGNIZED_BINARY)
+        .filter(|entry| {
+            entry.reason == UNSUPPORTED_REASON_UNRECOGNIZED_BINARY
+                || entry.reason == kio_pipeline::unsupported::UNSUPPORTED_REASON_SOURCE_CODE
+        })
         .map(|entry| entry.path.clone())
         .collect::<BTreeSet<_>>();
     // 07 §5.1: mirrors `unsupported_paths` above, scoped to the
@@ -697,7 +700,9 @@ pub(crate) fn run_index_pipeline(
         .iter()
         .filter(|candidate| !candidate.ignored && candidate.media_type != "inode/directory")
     {
-        if candidate.size_bytes > max_input_bytes {
+        if candidate.size_bytes > max_input_bytes
+            && !kio_pipeline::unsupported::is_source_code_path(Path::new(&candidate.input_path))
+        {
             result.skipped_oversized_files += 1;
             repo.control().append_event_log_in_session(
                 repo.lock_session(),
@@ -721,6 +726,33 @@ pub(crate) fn run_index_pipeline(
                 json!({ "input_path": candidate.input_path }),
             )?;
             result.failed_files += 1;
+            continue;
+        }
+        if kio_pipeline::unsupported::is_source_code_path(Path::new(&candidate.input_path)) {
+            let root = repo.bound_root_handle().ok_or_else(|| {
+                pipeline_to_kio(kio_pipeline::PipelineError::contract(
+                    "KIO-E-SCOPE-BOUND-STATE-001",
+                    "managed index is missing its retained scope handle",
+                ))
+            })?;
+            let identity = kio_pipeline::scan::hash_bound_verified_scan_input(
+                root,
+                &candidate.input_path,
+                candidate.size_bytes,
+            )
+            .map_err(pipeline_to_kio)?;
+            record_unsupported_if_changed(
+                &unsupported_store,
+                &mut unsupported_by_path,
+                UnsupportedInputDisposition {
+                    path: candidate.input_path.clone(),
+                    raw_hash: identity.raw_hash,
+                    media_type: candidate.media_type.clone(),
+                    size_bytes: identity.size_bytes,
+                    reason: kio_pipeline::unsupported::UNSUPPORTED_REASON_SOURCE_CODE.to_owned(),
+                },
+            )?;
+            unsupported_paths.insert(candidate.input_path.clone());
             continue;
         }
         let verified =
