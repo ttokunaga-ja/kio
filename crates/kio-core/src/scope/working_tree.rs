@@ -33,7 +33,7 @@ struct ArchiveBatch<'a> {
 }
 impl Drop for ArchiveBatch<'_> {
     fn drop(&mut self) {
-        for record in self.records.snapshot().iter() {
+        for record in self.records.iter() {
             let Ok(record) = record else {
                 break;
             };
@@ -285,9 +285,8 @@ impl Repository {
                 "scheduled snapshot direct entries changed before CAS publication",
             ));
         }
-        let records = batch.records.snapshot();
         if scheduled_bound {
-            for record in records.iter() {
+            for record in batch.records.iter() {
                 let record = record?;
                 let candidate = WorkingFileCandidate {
                     path: self.canonical_root.join(&record.name),
@@ -329,7 +328,7 @@ impl Repository {
         } else {
             Some(self.purge_state()?)
         };
-        for record in records.iter() {
+        for record in batch.records.iter() {
             let record = record?;
             let mut stage = self.store.reopen_saved_stage(&record.stage)?;
             if !purge_self_targets.contains(stage.raw_hash()) {
@@ -345,7 +344,7 @@ impl Repository {
             stage.detach();
         }
         let mut entries = TreeBuilder::new(&record_stages, chunking_config_hash.to_owned());
-        for record in records.iter() {
+        for record in batch.records.iter() {
             let record = record?;
             let mut stage = self.store.reopen_saved_stage(&record.stage)?;
             if purge_self_targets.contains(stage.raw_hash()) {
