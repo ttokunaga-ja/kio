@@ -198,19 +198,21 @@ pub(crate) fn restrict_renderer_state_directory(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OfficeRuntime;
 impl OfficeRuntime {
-    pub(crate) fn new(_program: &Path) -> Result<Self> {
+    pub(crate) fn new(_program: &Path, _deadline: std::time::Instant) -> Result<Self> {
         Ok(Self)
     }
     pub(crate) fn catalog_digest(&self) -> Option<&str> {
         None
     }
-    pub(crate) fn validate_probe(&self, _stdout: &str) -> Result<()> {
-        Ok(())
+    pub(crate) fn package_roots(&self, program: &Path) -> Result<Vec<PathBuf>> {
+        let program_files = program_files_directory()?;
+        Ok(vec![installed_package(&program_files, program)?])
     }
     pub(crate) fn configure_services(
         &self,
         _scratch: &Path,
         _environment: &mut Vec<(OsString, OsString)>,
+        _deadline: std::time::Instant,
     ) -> Result<()> {
         Ok(())
     }
@@ -229,6 +231,57 @@ impl OfficeRuntime {
         Ok(roots)
     }
 }
+fn program_files_directory() -> Result<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::{
+        Foundation::MAX_PATH,
+        UI::Shell::{CSIDL_PROGRAM_FILES, SHGFP_TYPE_CURRENT, SHGetFolderPathW},
+    };
+
+    let mut path = [0; MAX_PATH as usize];
+    // The API writes a NUL-terminated path into a caller-provided MAX_PATH buffer.
+    let result = unsafe {
+        SHGetFolderPathW(
+            std::ptr::null_mut(),
+            CSIDL_PROGRAM_FILES as i32,
+            std::ptr::null_mut(),
+            SHGFP_TYPE_CURRENT as u32,
+            path.as_mut_ptr(),
+        )
+    };
+    let end = path
+        .iter()
+        .position(|unit| *unit == 0)
+        .filter(|end| result >= 0 && *end > 0)
+        .ok_or_else(|| {
+            AdapterError::ContractViolation(
+            "cannot determine the Windows Program Files directory for Office runtime verification"
+                .to_owned(),
+        )
+        })?;
+    Ok(PathBuf::from(OsString::from_wide(&path[..end])))
+}
+
+fn installed_package(program_files: &Path, program: &Path) -> Result<PathBuf> {
+    let package = program_files.join("LibreOffice");
+    let invalid = || {
+        AdapterError::ContractViolation(format!(
+            "unsupported Windows Office runtime placement for {}",
+            program.display()
+        ))
+    };
+    if !kio_core::platform::directory_is_real(&package).map_err(|_| invalid())? {
+        return Err(invalid());
+    }
+    let package = std::fs::canonicalize(package).map_err(|_| invalid())?;
+    if package.join("program").join("soffice.exe") != program
+        || !kio_core::platform::regular_file_is_safe(program).map_err(|_| invalid())?
+    {
+        return Err(invalid());
+    }
+    Ok(package)
+}
+
 pub(crate) fn file_url(path: &Path) -> Result<String> {
     let text = path.to_str().ok_or_else(|| {
         AdapterError::ContractViolation("office scratch path is not valid Unicode".to_owned())
@@ -275,4 +328,34 @@ pub(crate) fn scratch_recovery_note(scratch: PrivateOfficeScratch) -> String {
 }
 pub(crate) fn finish_scratch(scratch: PrivateOfficeScratch) -> Result<()> {
     scratch.close()
+}
+
+#[cfg(all(test, debug_assertions))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn records_only_the_known_installation_as_package_runtime() {
+        let directory = tempfile::tempdir().unwrap();
+        let package = directory.path().join("LibreOffice");
+        std::fs::create_dir(&package).unwrap();
+        let package = std::fs::canonicalize(package).unwrap();
+        let program = package.join("program").join("soffice.exe");
+        assert!(installed_package(directory.path(), &program).is_err());
+        std::fs::create_dir(program.parent().unwrap()).unwrap();
+        std::fs::write(&program, b"fixture").unwrap();
+        assert_eq!(
+            installed_package(directory.path(), &program).unwrap(),
+            package
+        );
+        assert!(
+            installed_package(
+                directory.path(),
+                &directory.path().join("other/program/soffice.exe")
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported Windows Office runtime placement")
+        );
+    }
 }

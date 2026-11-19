@@ -65,7 +65,7 @@ use windows_sys::Win32::{
     },
 };
 
-use crate::confinement::{ConfinementError, RenderResourceLimits, canonical_paths};
+use crate::confinement::{ConfinementError, RenderResourceLimits, RenderSources, RendererStart};
 use crate::{BoundedProcessError, BoundedProcessOptions, BoundedProcessOutput};
 use std::collections::BTreeSet;
 
@@ -85,38 +85,38 @@ pub(crate) struct NativeRenderSandbox {
 
 impl NativeRenderSandbox {
     pub(crate) fn new(
-        program: &Path,
-        scratch: &Path,
-        runtime_roots: impl IntoIterator<Item = PathBuf>,
+        sources: &RenderSources,
+        scratch: PathBuf,
         limits: RenderResourceLimits,
-    ) -> Result<Self, ConfinementError> {
-        let paths = canonical_paths(program, scratch, runtime_roots)?;
-        let mut roots = BTreeSet::new();
-        for (_, source) in paths.roots {
-            roots.insert(source);
-        }
+    ) -> Self {
+        let mut roots: BTreeSet<_> = sources
+            .roots
+            .iter()
+            .map(|(_, source)| source.clone())
+            .collect();
         // Selecting an executable authorizes that file, not its siblings.
         // A standalone renderer may live next to private source documents or
         // credentials; package directories must be supplied explicitly.
-        roots.insert(paths.program.clone());
-        Ok(Self {
-            program: paths.program,
-            scratch: paths.scratch,
+        roots.insert(sources.program.clone());
+        Self {
+            program: sources.program.clone(),
+            scratch,
             runtime_roots: roots.into_iter().collect(),
             limits,
-        })
+        }
     }
     pub(crate) fn run<I, S>(
         &self,
         args: I,
         environment: &[(OsString, OsString)],
         options: BoundedProcessOptions,
+        start: RendererStart<'_>,
     ) -> Result<BoundedProcessOutput, ConfinementError>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<std::ffi::OsStr>,
     {
-        run_windows_renderer(self, args, environment, options)
+        run_windows_renderer(self, args, environment, options, start)
     }
 
     pub(crate) fn limits(&self) -> RenderResourceLimits {
@@ -277,11 +277,18 @@ pub(crate) fn run_windows_renderer<I, S>(
     args: I,
     environment: &[(OsString, OsString)],
     options: BoundedProcessOptions,
+    start: RendererStart<'_>,
 ) -> Result<BoundedProcessOutput, ConfinementError>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    let timing = RendererTiming {
+        started: Instant::now(),
+        deadline: start.deadline,
+    };
+    let deadline = timing.deadline;
+    start.remaining()?;
     let profile = AppContainerProfile::create()?;
     let mut grant = grant_scratch_access(sandbox.scratch(), profile.sid)?;
     let result = (|| {
@@ -299,12 +306,6 @@ where
         let mut command_line = windows_command_line(sandbox.program().as_os_str(), args);
         let environment = environment_block(environment)?;
         let cwd = renderer_current_directory(sandbox.scratch());
-        let started = Instant::now();
-        let deadline = started
-            .checked_add(options.timeout)
-            .ok_or(ConfinementError::Process(
-                BoundedProcessError::InvalidLifetime,
-            ))?;
         let mut startup = STARTUPINFOEXW::default();
         startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
         startup.StartupInfo.dwFlags = 0x0000_0100; // STARTF_USESTDHANDLES
@@ -313,6 +314,7 @@ where
         startup.StartupInfo.hStdError = pipes.stderr_write;
         startup.lpAttributeList = attributes.list;
         let mut process = PROCESS_INFORMATION::default();
+        start.verify()?;
         grant.stopped = false;
         let created = unsafe {
             CreateProcessW(
@@ -357,6 +359,7 @@ where
         let result = (|| {
             child_token::prepare_suspended_renderer_token(primary.0, profile.sid)
                 .map_err(ConfinementError::Profile)?;
+            start.verify()?;
             resume(thread.0).map_err(ConfinementError::Resource)?;
             drop(thread);
             let stdout = pipes.take_stdout()?;
@@ -408,7 +411,7 @@ where
                     if let Some(status) = status {
                         grant.stopped = true;
                         return finish_renderer_output(
-                            sandbox, options, started, status, &receiver, output,
+                            sandbox, options, timing, status, &receiver, output,
                         );
                     }
                 }
@@ -484,21 +487,23 @@ fn observe_scratch_until(
 }
 
 // Called only after the entire Job is empty and the primary status is known.
+#[derive(Clone, Copy)]
+struct RendererTiming {
+    started: Instant,
+    deadline: Instant,
+}
+
 // Complete pipes do not skip the final scan, and a final scan never gets a new
 // command timeout. Once empty, no renderer process can race this observation.
 fn finish_renderer_output(
     sandbox: &NativeRenderSandbox,
     options: BoundedProcessOptions,
-    started: Instant,
+    timing: RendererTiming,
     status: std::process::ExitStatus,
     receiver: &mpsc::Receiver<RendererPipeResult>,
     mut output: [Option<String>; 2],
 ) -> Result<BoundedProcessOutput, ConfinementError> {
-    let deadline = started
-        .checked_add(options.timeout)
-        .ok_or(ConfinementError::Process(
-            BoundedProcessError::InvalidLifetime,
-        ))?;
+    let RendererTiming { started, deadline } = timing;
     observe_scratch_until(sandbox, deadline, options)?;
     while output.iter().any(Option::is_none) {
         check_renderer_deadline(deadline, options)?;
@@ -1282,7 +1287,10 @@ mod scratch_scan_tests {
         let error = finish_renderer_output(
             &sandbox,
             BoundedProcessOptions::default(),
-            Instant::now(),
+            RendererTiming {
+                started: Instant::now(),
+                deadline: Instant::now() + Duration::from_secs(2),
+            },
             std::os::windows::process::ExitStatusExt::from_raw(0),
             &receiver,
             [Some(String::new()), Some(String::new())],
@@ -1298,15 +1306,20 @@ mod scratch_scan_tests {
         let sandbox = final_scan_sandbox(root.path(), 4);
         std::fs::write(root.path().join("output"), b"1234").unwrap();
         let (_sender, receiver) = mpsc::channel();
+        let started = Instant::now() - Duration::from_millis(250);
         let result = finish_renderer_output(
             &sandbox,
             BoundedProcessOptions::default(),
-            Instant::now(),
+            RendererTiming {
+                started,
+                deadline: Instant::now() + Duration::from_secs(2),
+            },
             std::os::windows::process::ExitStatusExt::from_raw(7),
             &receiver,
             [Some("stdout".to_owned()), Some("stderr".to_owned())],
         )
         .unwrap();
+        assert!(result.duration >= Duration::from_millis(250));
         assert_eq!(result.status.code(), Some(7));
         assert_eq!(result.stdout, "stdout");
         assert_eq!(result.stderr, "stderr");
@@ -1317,14 +1330,14 @@ mod scratch_scan_tests {
         let root = tempfile::tempdir().unwrap();
         let sandbox = final_scan_sandbox(root.path(), 0);
         let (_sender, receiver) = mpsc::channel();
-        let options = BoundedProcessOptions {
-            timeout: Duration::ZERO,
-            ..Default::default()
-        };
+        let options = BoundedProcessOptions::default();
         let error = finish_renderer_output(
             &sandbox,
             options,
-            Instant::now(),
+            RendererTiming {
+                started: Instant::now(),
+                deadline: Instant::now(),
+            },
             std::os::windows::process::ExitStatusExt::from_raw(0),
             &receiver,
             [Some(String::new()), Some(String::new())],

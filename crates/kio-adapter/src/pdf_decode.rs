@@ -32,6 +32,8 @@ use crate::deterministic::{
 };
 use crate::{AdapterError, Result};
 
+mod xref;
+
 /// Per-stream inflate ceiling. A legitimate text content stream or ToUnicode
 /// CMap is kilobytes; 16 MiB leaves three orders of magnitude of headroom
 /// while keeping a hostile deflate bomb from ballooning memory.
@@ -50,6 +52,8 @@ const MAX_MATERIALIZED_OBJECT_BYTES: usize = 128 * 1024 * 1024;
 /// per-stream ceiling alone permits an attacker to supply thousands of small
 /// streams whose aggregate work and allocation are unbounded.
 const MAX_DECODED_STREAM_BYTES: usize = 64 * 1024 * 1024;
+const MAX_PROBE_DECODED_BYTES: usize = 8 * 1024 * 1024;
+const MAX_PROBE_TEXT_BYTES: usize = 1024 * 1024;
 
 /// A page may reference many streams, but their concatenated decoded content
 /// is bounded before it is copied into the tokenizer buffer.
@@ -81,11 +85,29 @@ const TJ_WORD_GAP_THRESHOLD: f64 = 100.0;
 
 struct PdfObject {
     body: Vec<u8>,
+    generation: Option<u16>,
+    stream: Option<std::ops::Range<usize>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct PdfRef {
+    number: u32,
+    generation: u16,
+}
+
+fn referenced_object(objects: &HashMap<u32, PdfObject>, reference: PdfRef) -> Option<&PdfObject> {
+    objects.get(&reference.number).filter(|object| {
+        object
+            .generation
+            .is_none_or(|generation| generation == reference.generation)
+    })
 }
 
 /// Per-decode admission accounting. Every allocation based on untrusted PDF
 /// structure is checked here before reserving or copying its bytes.
+#[derive(Default)]
 struct PdfDecodeBudget {
+    deadline: Option<std::time::Instant>,
     materialized_object_bytes: usize,
     decoded_stream_bytes: usize,
     emitted_text_bytes: usize,
@@ -94,6 +116,13 @@ struct PdfDecodeBudget {
 }
 
 impl PdfDecodeBudget {
+    fn check_deadline(&self) -> Result<()> {
+        if let Some(deadline) = self.deadline {
+            crate::office_convert::check_renderer_deadline(deadline)?;
+        }
+        Ok(())
+    }
+
     fn reserve(counter: &mut usize, amount: usize, limit: usize, label: &str) -> Result<()> {
         let next = counter.checked_add(amount).ok_or_else(|| {
             AdapterError::ContractViolation(format!("PDF {label} byte accounting overflow"))
@@ -107,6 +136,13 @@ impl PdfDecodeBudget {
         Ok(())
     }
 
+    fn reserve_decoded_step(output: &mut Vec<u8>, bytes: &[u8], limit: usize) -> Result<()> {
+        let mut length = output.len();
+        Self::reserve(&mut length, bytes.len(), limit, "probe inflated stream")?;
+        output.extend_from_slice(bytes);
+        Ok(())
+    }
+
     fn reserve_materialized_object(&mut self, amount: usize) -> Result<()> {
         Self::reserve(
             &mut self.materialized_object_bytes,
@@ -116,30 +152,43 @@ impl PdfDecodeBudget {
         )
     }
 
+    fn decoded_stream_limit(&self) -> usize {
+        if self.deadline.is_some() {
+            MAX_PROBE_DECODED_BYTES
+        } else {
+            MAX_DECODED_STREAM_BYTES
+        }
+    }
+
+    fn emitted_text_limit(&self) -> usize {
+        if self.deadline.is_some() {
+            MAX_PROBE_TEXT_BYTES
+        } else {
+            MAX_EMITTED_TEXT_BYTES
+        }
+    }
+
     fn remaining_decoded_stream_bytes(&self) -> usize {
-        MAX_DECODED_STREAM_BYTES - self.decoded_stream_bytes
+        self.decoded_stream_limit() - self.decoded_stream_bytes
     }
 
     fn reserve_decoded_stream(&mut self, amount: usize) -> Result<()> {
+        let limit = self.decoded_stream_limit();
         Self::reserve(
             &mut self.decoded_stream_bytes,
             amount,
-            MAX_DECODED_STREAM_BYTES,
+            limit,
             "decoded stream work",
         )
     }
 
     fn reserve_emitted_text(&mut self, amount: usize) -> Result<()> {
-        Self::reserve(
-            &mut self.emitted_text_bytes,
-            amount,
-            MAX_EMITTED_TEXT_BYTES,
-            "emitted text",
-        )
+        let limit = self.emitted_text_limit();
+        Self::reserve(&mut self.emitted_text_bytes, amount, limit, "emitted text")
     }
 
     fn remaining_emitted_text_bytes(&self) -> usize {
-        MAX_EMITTED_TEXT_BYTES - self.emitted_text_bytes
+        self.emitted_text_limit() - self.emitted_text_bytes
     }
 
     fn remaining_cmap_bytes(&self) -> usize {
@@ -181,13 +230,7 @@ enum FontMap {
 /// means "no confident decode" — caller may use its bounded conservative
 /// scanner. `Ok(Some(pages))` always contains at least one non-empty page.
 pub(crate) fn decode_pdf_pages(bytes: &[u8], max_pages: usize) -> Result<Option<Vec<String>>> {
-    let mut budget = PdfDecodeBudget {
-        materialized_object_bytes: 0,
-        decoded_stream_bytes: 0,
-        emitted_text_bytes: 0,
-        materialized_cmap_bytes: 0,
-        materialized_cmap_entries: 0,
-    };
+    let mut budget = PdfDecodeBudget::default();
     let Some(objects) = collect_objects(bytes, &mut budget)? else {
         return Ok(None);
     };
@@ -195,7 +238,7 @@ pub(crate) fn decode_pdf_pages(bytes: &[u8], max_pages: usize) -> Result<Option<
     if pages.is_empty() || pages.len() > max_pages {
         return Ok(None);
     }
-    let fonts = global_font_maps(&objects, &mut budget)?;
+    let fonts = global_font_maps(&objects, &pages, &mut budget)?;
     let mut out = Vec::with_capacity(pages.len());
     let mut any_text = false;
     for page_obj in &pages {
@@ -204,6 +247,141 @@ pub(crate) fn decode_pdf_pages(bytes: &[u8], max_pages: usize) -> Result<Option<
         out.push(text);
     }
     Ok(any_text.then_some(out))
+}
+
+/// Decode the page reached from the active trailer's catalog in a one-page
+/// renderer probe PDF, using the same budgets as the offline PDF decoder.
+pub(crate) fn office_probe_page_text(
+    bytes: &[u8],
+    deadline: std::time::Instant,
+) -> Result<Option<String>> {
+    if bytes.len() > crate::office_convert::MAX_OFFICE_PROBE_PDF_BYTES {
+        return Err(AdapterError::ContractViolation(
+            "Office probe PDF exceeds its byte limit".to_owned(),
+        ));
+    }
+    let mut budget = PdfDecodeBudget {
+        deadline: Some(deadline),
+        ..PdfDecodeBudget::default()
+    };
+    budget.check_deadline()?;
+    let (root, objects) = xref::probe_objects(bytes, &mut budget)?;
+    let Some(page) = probe_page_reference(&objects, root, &budget)? else {
+        return Ok(None);
+    };
+    let fonts = global_font_maps(&objects, &[page], &mut budget)?;
+    let text = decode_page(&objects, page, &fonts, &mut budget)?;
+    budget.check_deadline()?;
+    Ok(Some(text))
+}
+
+fn probe_page_reference(
+    objects: &HashMap<u32, PdfObject>,
+    root: PdfRef,
+    budget: &PdfDecodeBudget,
+) -> Result<Option<u32>> {
+    let dict = |reference| {
+        referenced_object(objects, reference).and_then(|object| dict_span(&object.body))
+    };
+    let Some(catalog) = dict(root).filter(|dict| probe_dict_type(dict, b"Catalog")) else {
+        return Ok(None);
+    };
+    let Some(pages) = probe_dict_ref(catalog, b"Pages") else {
+        return Ok(None);
+    };
+    if !dict(pages).is_some_and(|dict| probe_dict_type(dict, b"Pages")) {
+        return Ok(None);
+    }
+    let mut pending = vec![pages];
+    let mut visited = std::collections::HashSet::new();
+    let mut page = None;
+    while let Some(id) = pending.pop() {
+        budget.check_deadline()?;
+        if !visited.insert(id) {
+            return Ok(None);
+        }
+        let Some(node) = dict(id) else {
+            return Ok(None);
+        };
+        if probe_dict_type(node, b"Page") {
+            if page.replace(id.number).is_some() {
+                return Ok(None);
+            }
+            continue;
+        }
+        if !probe_dict_type(node, b"Pages") {
+            return Ok(None);
+        }
+        let Some(node) = probe_dict_value(node, b"Kids") else {
+            return Ok(None);
+        };
+        if node.first() != Some(&b'[') {
+            return Ok(None);
+        }
+        let mut child = skip_pdf_space_and_comments(node, 1);
+        while node.get(child) != Some(&b']') {
+            budget.check_deadline()?;
+            if pending.len() + visited.len() >= objects.len() {
+                return Ok(None);
+            }
+            let Some((reference, after)) = parse_ref(node, child) else {
+                return Ok(None);
+            };
+            pending.push(reference);
+            child = skip_pdf_space_and_comments(node, after);
+        }
+    }
+    Ok(page)
+}
+
+fn probe_dict_type(dict: &[u8], name: &[u8]) -> bool {
+    probe_dict_value(dict, b"Type").is_some_and(|value| pdf_name_at(value, 0, name))
+}
+
+fn probe_dict_ref(dict: &[u8], key: &[u8]) -> Option<PdfRef> {
+    parse_ref(probe_dict_value(dict, key)?, 0).map(|(number, _)| number)
+}
+
+/// Locate a field on the dictionary itself. Names inside nested values,
+/// literals and comments do not name fields of the enclosing dictionary.
+fn probe_dict_value<'a>(dict: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
+    dict.strip_prefix(b"<<")?;
+    let mut index = 2;
+    let mut depth = 1usize;
+    while index < dict.len() {
+        match dict[index] {
+            b'%' => index = skip_pdf_comment(dict, index),
+            b'(' => index = skip_pdf_literal_string(dict, index),
+            b'<' if dict.get(index + 1) == Some(&b'<') => {
+                depth += 1;
+                index += 2;
+            }
+            b'<' => {
+                index += dict[index + 1..].iter().position(|byte| *byte == b'>')? + 2;
+            }
+            b'>' if dict.get(index + 1) == Some(&b'>') => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    break;
+                }
+                index += 2;
+            }
+            b'[' => {
+                depth += 1;
+                index += 1;
+            }
+            b']' => {
+                depth = depth.checked_sub(1)?;
+                index += 1;
+            }
+            b'/' if depth == 1 && pdf_name_at(dict, index, key) => {
+                let start = skip_pdf_space_and_comments(dict, index + 1 + key.len());
+                return Some(&dict[start..]);
+            }
+            _ => index += 1,
+        }
+    }
+    None
 }
 
 /// Whether a compressed (FlateDecode) PDF decodes to real text through the
@@ -237,7 +415,12 @@ fn collect_objects(
 ) -> Result<Option<HashMap<u32, PdfObject>>> {
     let mut objects: HashMap<u32, PdfObject> = HashMap::new();
     let mut index = 0_usize;
+    let mut next_check = 0;
     while index < bytes.len() {
+        if index >= next_check {
+            budget.check_deadline()?;
+            next_check = index + 4096;
+        }
         match bytes[index] {
             b'%' => index = skip_pdf_comment(bytes, index),
             b'(' => index = skip_pdf_literal_string(bytes, index),
@@ -268,6 +451,8 @@ fn collect_objects(
                     number,
                     PdfObject {
                         body: body.to_vec(),
+                        generation: None,
+                        stream: None,
                     },
                 );
                 index = body_end + b"endobj".len();
@@ -279,6 +464,7 @@ fn collect_objects(
         return Ok(None);
     }
     expand_object_streams(&mut objects, budget)?;
+    budget.check_deadline()?;
     Ok(Some(objects))
 }
 
@@ -419,7 +605,7 @@ fn dict_has_name(dict: &[u8], key: &[u8]) -> bool {
 }
 
 /// Parse `… /Key N G R …` — the indirect reference following a name key.
-fn dict_ref(dict: &[u8], key: &[u8]) -> Option<u32> {
+fn dict_ref(dict: &[u8], key: &[u8]) -> Option<PdfRef> {
     let mut index = 0_usize;
     while index < dict.len() {
         if dict[index] == b'/' && pdf_name_at(dict, index, key) {
@@ -448,7 +634,7 @@ fn dict_int(dict: &[u8], key: &[u8]) -> Option<usize> {
 }
 
 /// Parse an `N G R` reference at `index`; returns (object number, end index).
-fn parse_ref(bytes: &[u8], index: usize) -> Option<(u32, usize)> {
+fn parse_ref(bytes: &[u8], index: usize) -> Option<(PdfRef, usize)> {
     let mut end = index;
     while bytes.get(end).is_some_and(u8::is_ascii_digit) {
         end += 1;
@@ -465,13 +651,17 @@ fn parse_ref(bytes: &[u8], index: usize) -> Option<(u32, usize)> {
     if gen_end == gen_start {
         return None;
     }
+    let generation = std::str::from_utf8(&bytes[gen_start..gen_end])
+        .ok()?
+        .parse()
+        .ok()?;
     let r_at = skip_pdf_space_and_comments(bytes, gen_end);
     if bytes.get(r_at) == Some(&b'R')
         && bytes
             .get(r_at + 1)
             .is_none_or(|byte| is_pdf_delimiter(*byte))
     {
-        Some((number, r_at + 1))
+        Some((PdfRef { number, generation }, r_at + 1))
     } else {
         None
     }
@@ -534,6 +724,36 @@ fn inflate_bounded(data: &[u8], output_limit: usize) -> Result<Option<Vec<u8>>> 
     }
 }
 
+fn inflate_probe_stream(
+    payload: &[u8],
+    limit: usize,
+    budget: &PdfDecodeBudget,
+) -> Result<Option<Vec<u8>>> {
+    use miniz_oxide::{
+        DataFormat, MZFlush, MZStatus,
+        inflate::stream::{InflateState, inflate},
+    };
+
+    let mut state = InflateState::new_boxed(DataFormat::Zlib);
+    let mut remaining = payload;
+    let mut output = Vec::new();
+    let mut chunk = [0; 16 * 1024];
+    loop {
+        budget.check_deadline()?;
+        let input = &remaining[..remaining.len().min(chunk.len())];
+        let step = inflate(&mut state, input, &mut chunk, MZFlush::None);
+        remaining = &remaining[step.bytes_consumed..];
+        PdfDecodeBudget::reserve_decoded_step(&mut output, &chunk[..step.bytes_written], limit)?;
+        if step.status == Ok(MZStatus::StreamEnd) {
+            budget.check_deadline()?;
+            return Ok(remaining.is_empty().then_some(output));
+        }
+        if step.status.is_err() || (step.bytes_consumed == 0 && step.bytes_written == 0) {
+            return Ok(None);
+        }
+    }
+}
+
 /// Effective (post-filter) bytes of an object's stream: raw when unfiltered,
 /// inflated when FlateDecode, `None` for any other filter or corrupt data.
 fn effective_stream(
@@ -541,19 +761,30 @@ fn effective_stream(
     budget: &mut PdfDecodeBudget,
     max_output_bytes: usize,
 ) -> Result<Option<Vec<u8>>> {
-    let Some(payload) = stream_payload(&object.body) else {
+    budget.check_deadline()?;
+    let payload = if object.generation.is_some() {
+        object
+            .stream
+            .clone()
+            .and_then(|range| object.body.get(range))
+    } else {
+        stream_payload(&object.body)
+    };
+    let Some(payload) = payload else {
         return Ok(None);
     };
     let Some(dict) = dict_span(&object.body) else {
         return Ok(None);
     };
     if is_flate_filtered(dict) {
-        let data = inflate_bounded(
-            payload,
-            budget
-                .remaining_decoded_stream_bytes()
-                .min(max_output_bytes),
-        )?;
+        let limit = budget
+            .remaining_decoded_stream_bytes()
+            .min(max_output_bytes);
+        let data = if budget.deadline.is_some() {
+            inflate_probe_stream(payload, limit, budget)?
+        } else {
+            inflate_bounded(payload, limit)?
+        };
         if let Some(ref data) = data {
             budget.reserve_decoded_stream(data.len())?;
         }
@@ -599,55 +830,7 @@ fn expand_object_streams(
             };
             (count, first, data)
         };
-        if count > MAX_PDF_OBJECTS {
-            return Err(AdapterError::ContractViolation(format!(
-                "PDF object stream declares {count} objects, exceeding the {MAX_PDF_OBJECTS} object ceiling"
-            )));
-        }
-        if first > data.len() || count > first / 3 {
-            return Err(AdapterError::ContractViolation(
-                "PDF object stream has an impossible object header size".to_owned(),
-            ));
-        }
-        // Header: `objnum offset` pairs (ascii ints) before `first`.
-        let header = &data[..first];
-        let mut numbers_offsets = Vec::with_capacity(count);
-        let mut cursor = 0_usize;
-        for _ in 0..count {
-            let Some((objnum, next)) = parse_ascii_u32(header, cursor) else {
-                return Err(AdapterError::ContractViolation(
-                    "PDF object stream has fewer object-header pairs than /N declares".to_owned(),
-                ));
-            };
-            let Some((offset, after)) = parse_ascii_usize(header, next) else {
-                return Err(AdapterError::ContractViolation(
-                    "PDF object stream has fewer object-header pairs than /N declares".to_owned(),
-                ));
-            };
-            numbers_offsets.push((objnum, offset));
-            cursor = after;
-        }
-        if !header[cursor..].iter().all(u8::is_ascii_whitespace) {
-            return Err(AdapterError::ContractViolation(
-                "PDF object stream header contains data beyond its declared /N pairs".to_owned(),
-            ));
-        }
-        let body_len = data.len() - first;
-        let mut seen_numbers = HashSet::with_capacity(count);
-        let mut previous_offset = None;
-        for (objnum, offset) in &numbers_offsets {
-            if !seen_numbers.insert(*objnum) {
-                return Err(AdapterError::ContractViolation(
-                    "PDF object stream repeats an expanded object number".to_owned(),
-                ));
-            }
-            if *offset >= body_len || previous_offset.is_some_and(|previous| *offset <= previous) {
-                return Err(AdapterError::ContractViolation(
-                    "PDF object stream offsets must be strictly increasing and in range".to_owned(),
-                ));
-            }
-            previous_offset = Some(*offset);
-        }
+        let numbers_offsets = object_stream_offsets(&data, count, first, budget)?;
         let new_objects = numbers_offsets
             .iter()
             .filter(|(objnum, _)| !objects.contains_key(objnum))
@@ -681,11 +864,73 @@ fn expand_object_streams(
                 *objnum,
                 PdfObject {
                     body: body.to_vec(),
+                    generation: None,
+                    stream: None,
                 },
             );
         }
     }
     Ok(())
+}
+
+fn object_stream_offsets(
+    data: &[u8],
+    count: usize,
+    first: usize,
+    budget: &PdfDecodeBudget,
+) -> Result<Vec<(u32, usize)>> {
+    if count > MAX_PDF_OBJECTS {
+        return Err(AdapterError::ContractViolation(format!(
+            "PDF object stream declares {count} objects, exceeding the {MAX_PDF_OBJECTS} object ceiling"
+        )));
+    }
+    if first > data.len() || count > first / 3 {
+        return Err(AdapterError::ContractViolation(
+            "PDF object stream has an impossible object header size".to_owned(),
+        ));
+    }
+    // Header: `objnum offset` pairs (ascii ints) before `first`.
+    let header = &data[..first];
+    let mut numbers_offsets = Vec::with_capacity(count);
+    let mut cursor = 0_usize;
+    for _ in 0..count {
+        budget.check_deadline()?;
+        let Some((objnum, next)) = parse_ascii_u32(header, cursor) else {
+            return Err(AdapterError::ContractViolation(
+                "PDF object stream has fewer object-header pairs than /N declares".to_owned(),
+            ));
+        };
+        let Some((offset, after)) = parse_ascii_usize(header, next) else {
+            return Err(AdapterError::ContractViolation(
+                "PDF object stream has fewer object-header pairs than /N declares".to_owned(),
+            ));
+        };
+        numbers_offsets.push((objnum, offset));
+        cursor = after;
+    }
+    if !header[cursor..].iter().all(u8::is_ascii_whitespace) {
+        return Err(AdapterError::ContractViolation(
+            "PDF object stream header contains data beyond its declared /N pairs".to_owned(),
+        ));
+    }
+    let body_len = data.len() - first;
+    let mut seen_numbers = HashSet::with_capacity(count);
+    let mut previous_offset = None;
+    for (objnum, offset) in &numbers_offsets {
+        budget.check_deadline()?;
+        if !seen_numbers.insert(*objnum) {
+            return Err(AdapterError::ContractViolation(
+                "PDF object stream repeats an expanded object number".to_owned(),
+            ));
+        }
+        if *offset >= body_len || previous_offset.is_some_and(|previous| *offset <= previous) {
+            return Err(AdapterError::ContractViolation(
+                "PDF object stream offsets must be strictly increasing and in range".to_owned(),
+            ));
+        }
+        previous_offset = Some(*offset);
+    }
+    Ok(numbers_offsets)
 }
 
 fn parse_ascii_usize(bytes: &[u8], from: usize) -> Option<(usize, usize)> {
@@ -737,11 +982,13 @@ fn collect_page_numbers(objects: &HashMap<u32, PdfObject>) -> Vec<u32> {
 /// anywhere in the document is ambiguous and dropped (correct-or-empty).
 fn global_font_maps(
     objects: &HashMap<u32, PdfObject>,
+    pages: &[u32],
     budget: &mut PdfDecodeBudget,
 ) -> Result<HashMap<String, FontMap>> {
-    let mut name_to_font_obj: HashMap<String, Option<u32>> = HashMap::new();
-    for page_obj in collect_page_numbers(objects) {
-        let Some(page) = objects.get(&page_obj) else {
+    let mut name_to_font_obj: HashMap<String, Option<PdfRef>> = HashMap::new();
+    for page_obj in pages {
+        budget.check_deadline()?;
+        let Some(page) = objects.get(page_obj) else {
             continue;
         };
         let Some(page_dict) = dict_span(&page.body) else {
@@ -749,7 +996,7 @@ fn global_font_maps(
         };
         let resources_owned;
         let resources: &[u8] = if let Some(reference) = dict_ref(page_dict, b"Resources") {
-            let Some(resource_obj) = objects.get(&reference) else {
+            let Some(resource_obj) = referenced_object(objects, reference) else {
                 continue;
             };
             let Some(dict) = dict_span(&resource_obj.body) else {
@@ -762,7 +1009,7 @@ fn global_font_maps(
         };
         let font_dict_owned;
         let font_dict: &[u8] = if let Some(reference) = dict_ref(resources, b"Font") {
-            let Some(font_obj) = objects.get(&reference) else {
+            let Some(font_obj) = referenced_object(objects, reference) else {
                 continue;
             };
             let Some(dict) = dict_span(&font_obj.body) else {
@@ -786,6 +1033,7 @@ fn global_font_maps(
     }
     let mut fonts = HashMap::new();
     for (name, number) in name_to_font_obj {
+        budget.check_deadline()?;
         let Some(number) = number else { continue };
         let map = match font_tounicode_cmap(objects, number, budget)? {
             Some(cmap) => FontMap::Decoded(cmap),
@@ -797,7 +1045,7 @@ fn global_font_maps(
 }
 
 /// `/Fname N G R` entries of a font-resource dictionary.
-fn font_entries(dict: &[u8]) -> Vec<(String, u32)> {
+fn font_entries(dict: &[u8]) -> Vec<(String, PdfRef)> {
     let mut entries = Vec::new();
     let mut index = 0_usize;
     while index < dict.len() {
@@ -835,10 +1083,10 @@ fn pdf_name_end(bytes: &[u8], mut index: usize) -> usize {
 
 fn font_tounicode_cmap(
     objects: &HashMap<u32, PdfObject>,
-    font_obj: u32,
+    font_obj: PdfRef,
     budget: &mut PdfDecodeBudget,
 ) -> Result<Option<CMap>> {
-    let Some(font) = objects.get(&font_obj) else {
+    let Some(font) = referenced_object(objects, font_obj) else {
         return Ok(None);
     };
     let Some(dict) = dict_span(&font.body) else {
@@ -847,7 +1095,7 @@ fn font_tounicode_cmap(
     let Some(reference) = dict_ref(dict, b"ToUnicode") else {
         return Ok(None);
     };
-    let Some(cmap_obj) = objects.get(&reference) else {
+    let Some(cmap_obj) = referenced_object(objects, reference) else {
         return Ok(None);
     };
     let Some(data) = effective_stream(cmap_obj, budget, MAX_INFLATED_STREAM_BYTES)? else {
@@ -882,6 +1130,7 @@ fn parse_tounicode_cmap(data: &[u8], budget: &mut PdfDecodeBudget) -> Result<Opt
             .unwrap_or(text.len());
         let mut rest = &text[start..end];
         while let Some((src, after_src)) = next_hex_token(rest) {
+            budget.check_deadline()?;
             let Some((dst, after_dst)) = next_hex_token(after_src) else {
                 break;
             };
@@ -912,6 +1161,7 @@ fn parse_tounicode_cmap(data: &[u8], budget: &mut PdfDecodeBudget) -> Result<Opt
             .unwrap_or(text.len());
         let mut rest = &text[start..end];
         while let Some((low_hex, after_low)) = next_hex_token(rest) {
+            budget.check_deadline()?;
             let Some((high_hex, after_high)) = next_hex_token(after_low) else {
                 break;
             };
@@ -932,6 +1182,7 @@ fn parse_tounicode_cmap(data: &[u8], budget: &mut PdfDecodeBudget) -> Result<Opt
                 let mut inner = array_rest;
                 let mut code = low;
                 while code <= high {
+                    budget.check_deadline()?;
                     let Some((dst, after_dst)) = next_hex_token(inner) else {
                         break;
                     };
@@ -964,6 +1215,7 @@ fn parse_tounicode_cmap(data: &[u8], budget: &mut PdfDecodeBudget) -> Result<Opt
                 };
                 let span = high - low;
                 for step in 0..=span {
+                    budget.check_deadline()?;
                     if map.len() >= MAX_CMAP_ENTRIES {
                         return Err(AdapterError::ContractViolation(format!(
                             "PDF CMap exceeds the {MAX_CMAP_ENTRIES} entry ceiling"
@@ -1074,8 +1326,19 @@ fn decode_page(
     };
     let mut content = Vec::new();
     let mut page_content_bytes = 0_usize;
-    for reference in contents_refs(dict)? {
-        let Some(object) = objects.get(&reference) else {
+    let references = if budget.deadline.is_some() {
+        xref::content_references(dict, budget)?
+    } else {
+        contents_refs(dict)?
+    };
+    for reference in references {
+        budget.check_deadline()?;
+        let Some(object) = referenced_object(objects, reference) else {
+            if budget.deadline.is_some() {
+                return Err(AdapterError::ContractViolation(
+                    "probe PDF content reference is absent from the active xref".to_owned(),
+                ));
+            }
             continue;
         };
         let page_remaining = MAX_PAGE_CONTENT_BYTES
@@ -1107,6 +1370,10 @@ fn decode_page(
             })?;
             content.extend_from_slice(&data);
             content.push(b'\n');
+        } else if budget.deadline.is_some() {
+            return Err(AdapterError::ContractViolation(
+                "probe PDF content reference is not a decodable stream".to_owned(),
+            ));
         }
     }
     if content.is_empty() {
@@ -1116,7 +1383,7 @@ fn decode_page(
 }
 
 /// `/Contents N G R` or `/Contents [N G R M G R …]`.
-fn contents_refs(dict: &[u8]) -> Result<Vec<u32>> {
+fn contents_refs(dict: &[u8]) -> Result<Vec<PdfRef>> {
     let mut refs = Vec::new();
     let mut index = 0_usize;
     while index < dict.len() {
@@ -1222,7 +1489,12 @@ fn decode_content_ops_with_limits(
     let mut last_string: Option<ShowString> = None;
     let mut array_items: Option<Vec<ArrayItem>> = None;
 
+    let mut next_deadline_check = 0;
     while index < content.len() {
+        if index >= next_deadline_check {
+            budget.check_deadline()?;
+            next_deadline_check = index + 4096;
+        }
         let byte = content[index];
         match byte {
             b'%' => index = skip_pdf_comment(content, index),
@@ -1333,6 +1605,7 @@ fn decode_content_ops_with_limits(
                         if let Some(items) = array_items.take() {
                             let mut assembled = String::new();
                             for item in items {
+                                budget.check_deadline()?;
                                 match item {
                                     ArrayItem::Text(string) => {
                                         if let Some(text) =
@@ -1432,7 +1705,10 @@ fn decode_show_string(
     match font {
         Some(FontMap::Decoded(cmap)) => {
             let mut out = String::new();
-            for chunk in bytes.chunks(cmap.code_bytes) {
+            for (index, chunk) in bytes.chunks(cmap.code_bytes).enumerate() {
+                if index % 1024 == 0 {
+                    budget.check_deadline()?;
+                }
                 let mut code = 0_u32;
                 for byte in chunk {
                     code = (code << 8) | u32::from(*byte);
@@ -1856,13 +2132,7 @@ mod tests {
     }
 
     fn test_budget() -> PdfDecodeBudget {
-        PdfDecodeBudget {
-            materialized_object_bytes: 0,
-            decoded_stream_bytes: 0,
-            emitted_text_bytes: 0,
-            materialized_cmap_bytes: 0,
-            materialized_cmap_entries: 0,
-        }
+        PdfDecodeBudget::default()
     }
 
     #[test]

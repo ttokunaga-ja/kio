@@ -65,6 +65,23 @@ pub(crate) fn scratch_recovery_note(scratch: tempfile::TempDir) -> String {
     String::new()
 }
 pub(crate) fn finish_scratch(scratch: tempfile::TempDir) -> Result<()> {
-    drop(scratch);
-    Ok(())
+    scratch.close().map_err(|error| {
+        AdapterError::ContractViolation(format!("failed to remove private Office scratch: {error}"))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn finishing_office_scratch_reports_removal_failure() {
+        let outer = tempfile::tempdir().unwrap();
+        let parent = outer.path().join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        let scratch = tempfile::tempdir_in(&parent).unwrap();
+        std::fs::rename(&parent, outer.path().join("moved")).unwrap();
+        std::fs::write(&parent, b"replacement").unwrap();
+
+        assert!(finish_scratch(scratch).is_err());
+    }
 }

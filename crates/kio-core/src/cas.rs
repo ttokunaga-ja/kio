@@ -1780,7 +1780,8 @@ fn read_embedding_path(
     path: &Path,
     expected_hash: &str,
 ) -> Result<EmbeddingObject> {
-    let bytes = read_bounded_regular_file_inner(path, MAX_EMBEDDING_OBJECT_BYTES, reads, true)?;
+    let bytes =
+        read_bounded_regular_file_inner(path, MAX_EMBEDDING_OBJECT_BYTES, reads, true, None)?;
     decode_embedding(&bytes, expected_hash, path)
 }
 
@@ -2182,7 +2183,22 @@ pub fn fanout_path(base: impl AsRef<Path>, hash: &str) -> Result<PathBuf> {
 /// Read a non-CAS metadata record through the same no-follow/single-link boundary
 /// as CAS objects while enforcing a caller-selected byte limit.
 pub fn read_bounded_regular_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
-    read_bounded_regular_file_inner(path, max_bytes, &CasReadAccess::Unmetered, false)
+    read_bounded_regular_file_inner(path, max_bytes, &CasReadAccess::Unmetered, false, None)
+}
+
+/// Read bounded metadata with deadline checks between physical reads.
+pub fn read_bounded_regular_file_until(
+    path: &Path,
+    max_bytes: u64,
+    deadline: std::time::Instant,
+) -> Result<Vec<u8>> {
+    read_bounded_regular_file_inner(
+        path,
+        max_bytes,
+        &CasReadAccess::Unmetered,
+        false,
+        Some(deadline),
+    )
 }
 
 /// Shared implementation for bounded metadata records and bounded CAS content
@@ -2193,7 +2209,10 @@ fn read_bounded_regular_file_inner(
     max_bytes: u64,
     reads: &CasReadAccess,
     private_cas: bool,
+    deadline: Option<std::time::Instant>,
 ) -> Result<Vec<u8>> {
+    let check_deadline = || crate::private_fs::check_read_deadline(deadline).kio_io(path);
+    check_deadline()?;
     reads.charge(0)?;
     let mut file = if private_cas {
         open_private_cas_file(path)?
@@ -2217,6 +2236,7 @@ fn read_bounded_regular_file_inner(
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     let mut buffer = [0_u8; CAS_STREAM_BUFFER_BYTES];
     loop {
+        check_deadline()?;
         let remaining = max_bytes
             .saturating_add(1)
             .saturating_sub(bytes.len() as u64);
@@ -2225,6 +2245,7 @@ fn read_bounded_regular_file_inner(
         }
         let read_cap = remaining.min(CAS_STREAM_BUFFER_BYTES as u64) as usize;
         let count = file.read(&mut buffer[..read_cap]).kio_io(path)?;
+        check_deadline()?;
         if count == 0 {
             break;
         }

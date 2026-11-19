@@ -22,8 +22,8 @@ pub(crate) use macos::office::{OfficeRuntime, canonical_renderer_program, privat
 pub(crate) use macos::office::{
     PrivateUnoCatalog, is_macos_office_passthrough_wrapper, macos_office_bundle_candidate,
     macos_spell_component_range, office_bundle_path_snapshot, private_uno_catalog_for_program,
-    renderer_environment, renderer_runtime_roots, validate_macos_office_version,
-    verify_macos_office_bundle, write_private_uno_catalog,
+    renderer_environment, renderer_runtime_roots, verify_macos_office_bundle,
+    write_private_uno_catalog,
 };
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) use unix::office_fs::{

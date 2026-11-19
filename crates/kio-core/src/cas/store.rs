@@ -1015,7 +1015,7 @@ impl ObjectStore {
         let Some(path) = self.existing_content_path(kind, hash)? else {
             return Err(KioError::not_found(hash));
         };
-        read_bounded_regular_file_inner(&path, max_bytes, &self.reads, true)
+        read_bounded_regular_file_inner(&path, max_bytes, &self.reads, true, None)
     }
 
     /// Read a bounded structured object; raw bytes require `copy_object_to`
