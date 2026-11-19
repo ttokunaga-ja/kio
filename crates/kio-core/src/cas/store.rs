@@ -207,11 +207,15 @@ impl ObjectStore {
         Ok(crate::disk_records::RecordStageRoot::in_store(directory))
     }
 
-    pub fn inspect_raw_stages(&self) -> Result<Vec<RawStageResidue>> {
+    pub fn inspect_raw_stages(&self) -> Result<crate::disk_records::DiskRecords<RawStageResidue>> {
         if let Some(bound) = &self.bound {
-            let mut residues = bound.inspect_raw_stages(false)?;
-            residues.extend(self.record_stages()?.inspect()?);
-            return Ok(residues);
+            let scratch = crate::disk_records::RecordStageRoot::temporary()?;
+            let mut residues = crate::disk_records::RecordWriter::new_lazy(&scratch);
+            bound.visit_raw_stages(&scratch, false, |row| residues.push(&row))?;
+            for row in self.record_stages()?.inspect()? {
+                residues.push(&row)?;
+            }
+            return residues.finish();
         }
         let directory = crate::store_dir::StoreDirectory::open_with_control(
             self.ambient_kio_dir()?,
@@ -227,7 +231,7 @@ impl ObjectStore {
             .ok_or_else(|| {
                 KioError::invalid_usage("bound raw cleanup requires a retained ObjectStore")
             })?
-            .cleanup_raw_ingest_orphans()
+            .visit_raw_stages(&self.record_stages()?, true, |_| Ok(()))
     }
 
     pub fn validate_bound_layout(&self) -> Result<()> {

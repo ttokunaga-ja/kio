@@ -12,8 +12,8 @@ use std::path::PathBuf;
 
 #[derive(Debug, Serialize)]
 pub struct StatusResponse {
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub stage_residues: Vec<kio_core::cas::RawStageResidue>,
+    #[serde(skip_serializing_if = "kio_core::disk_records::DiskRecords::is_empty")]
+    pub stage_residues: kio_core::disk_records::DiskRecords<kio_core::cas::RawStageResidue>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub office_readiness: Option<OfficeReadiness>,
     pub scope_path: PathBuf,

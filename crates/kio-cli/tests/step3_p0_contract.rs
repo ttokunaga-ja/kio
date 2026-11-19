@@ -15168,6 +15168,10 @@ fn nc2_reindex_aborts_when_classified_bytes_change_before_snapshot() {
     let head = head_commit(&kio_dir);
 
     fs::write(&path, b"\xff").unwrap();
+    // Put the raced path after more than one run of classified inputs.
+    for n in 0..=kio_core::disk_records::SORT_BUFFER_RECORDS {
+        fs::write(dir.path().join(format!("{n:05}.rs")), "source fixture").unwrap();
+    }
     let markers = canonical_tempdir();
     let ready = markers.path().join("ready");
     let child = pause_nc2_reindex(&dir, &ready);
@@ -15177,6 +15181,20 @@ fn nc2_reindex_aborts_when_classified_bytes_change_before_snapshot() {
     assert!(
         !output.status.success(),
         "raced reindex published: {output:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let error: Value = stderr
+        .lines()
+        .rev()
+        .find_map(|line| serde_json::from_str(line).ok())
+        .unwrap_or_else(|| panic!("missing reindex error: {stderr}"));
+    assert_eq!(
+        error["error_code"], "KIO-E-SCAN-INPUT-CHANGED-001",
+        "{error}"
+    );
+    assert!(
+        error["message"].as_str().unwrap().contains("document.cfg"),
+        "{error}"
     );
     assert_eq!(head_commit(&kio_dir), head);
     let search = json_success(&dir, &["search", "racedneedle", "--mode", "text"]);

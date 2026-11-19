@@ -349,6 +349,7 @@ fn verify_objects_with_limits(
         ..State::default()
     };
     for residue in store.inspect_raw_stages()? {
+        let residue = residue?;
         state.finding(
             "raw_stage_residue",
             "",

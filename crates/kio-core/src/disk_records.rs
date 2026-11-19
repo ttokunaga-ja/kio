@@ -20,6 +20,7 @@ use std::{
 pub const SORT_BUFFER_RECORDS: usize = 256;
 pub const MERGE_SLOTS: usize = usize::BITS as usize;
 const RECORD_BYTES: usize = 64 * 1024;
+const FRAME_TAG_BYTES: usize = 32;
 
 mod stages;
 use stages::RunDirectory;
@@ -125,8 +126,55 @@ impl RecordStageRoot {
 struct RunFile {
     directory: StoreDirectory,
     identity: StageIdentity,
+    frames: FrameAuthenticator,
     _location: RunDirectory,
 }
+// HMAC-SHA256 states for a per-run key that never goes to disk.
+struct FrameAuthenticator {
+    inner: Sha256,
+    outer: Sha256,
+}
+
+impl FrameAuthenticator {
+    fn new(key: &[u8; 32]) -> Self {
+        let mut inner_pad = [0x36; 64];
+        let mut outer_pad = [0x5c; 64];
+        for (index, byte) in key.iter().enumerate() {
+            inner_pad[index] ^= byte;
+            outer_pad[index] ^= byte;
+        }
+        Self {
+            inner: Sha256::new().chain_update(inner_pad),
+            outer: Sha256::new().chain_update(outer_pad),
+        }
+    }
+
+    fn tag(&self, ordinal: usize, frame: &[u8]) -> [u8; FRAME_TAG_BYTES] {
+        // Binding the ordinal prevents replay at a different position.
+        let inner = self
+            .inner
+            .clone()
+            .chain_update(ordinal.to_le_bytes())
+            .chain_update(frame)
+            .finalize();
+        self.outer.clone().chain_update(inner).finalize().into()
+    }
+
+    fn verify(&self, ordinal: usize, frame: &[u8], tag: [u8; FRAME_TAG_BYTES]) -> Result<()> {
+        let difference = self
+            .tag(ordinal, frame)
+            .into_iter()
+            .zip(tag)
+            .fold(0, |difference, (expected, actual)| {
+                difference | (expected ^ actual)
+            });
+        if difference != 0 {
+            return Err(changed_records());
+        }
+        Ok(())
+    }
+}
+
 fn changed_records() -> KioError {
     KioError::schema("private record stage changed after sealing")
 }
@@ -229,17 +277,19 @@ impl<T> DiskRecords<T> {
             .transpose();
         match opened {
             Ok(file) => RecordIter {
-                _run: self.run.clone(),
+                run: self.run.clone(),
                 reader: file.map(|file| BufReader::with_capacity(64 * 1024, file)),
                 remaining: self.count,
+                ordinal: 0,
                 error: None,
                 buffer: Vec::new(),
                 _value: PhantomData,
             },
             Err(error) => RecordIter {
-                _run: self.run.clone(),
+                run: self.run.clone(),
                 reader: None,
                 remaining: self.count,
+                ordinal: 0,
                 error: Some(error),
                 buffer: Vec::new(),
                 _value: PhantomData,
@@ -337,6 +387,9 @@ impl<T: Serialize> RecordWriter<T> {
         if self.writer.is_some() {
             return Ok(());
         }
+        let mut key = [0; 32];
+        getrandom::fill(&mut key)
+            .map_err(|error| KioError::io(error.to_string(), "record stage key"))?;
         let reclaim = PRESERVE_STAGES.with(|depth| depth.get() == 0);
         let created = RunDirectory::create(&self.root, reclaim);
         if created.is_err() {
@@ -346,6 +399,7 @@ impl<T: Serialize> RecordWriter<T> {
         self.run = Some(Arc::new(RunFile {
             directory: location.directory.clone(),
             identity: writer.identity().clone(),
+            frames: FrameAuthenticator::new(&key),
             _location: location,
         }));
         self.writer = Some(writer);
@@ -373,7 +427,7 @@ impl<T: Serialize> RecordWriter<T> {
         }
         impl std::io::Write for Buffer {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                let observed = self.bytes.len().saturating_add(bytes.len());
+                let observed = (self.bytes.len() - FRAME_TAG_BYTES).saturating_add(bytes.len());
                 if observed > RECORD_BYTES {
                     self.exceeded = Some(observed);
                     return Err(std::io::Error::other("record buffer exhausted"));
@@ -386,7 +440,7 @@ impl<T: Serialize> RecordWriter<T> {
             }
         }
         let mut buffer = Buffer {
-            bytes: Vec::new(),
+            bytes: vec![0; FRAME_TAG_BYTES],
             exceeded: None,
         };
         let encoded = serde_json::to_writer(&mut buffer, value);
@@ -397,6 +451,9 @@ impl<T: Serialize> RecordWriter<T> {
         let mut bytes = buffer.bytes;
         bytes.push(b'\n');
         self.open()?;
+        let frames = &self.run.as_ref().expect("open run").frames;
+        let tag = frames.tag(self.count, &bytes[FRAME_TAG_BYTES..]);
+        bytes[..FRAME_TAG_BYTES].copy_from_slice(&tag);
         self.writer
             .as_mut()
             .expect("record writer")
@@ -436,9 +493,10 @@ fn record_limit(observed: usize) -> KioError {
     .into_error("tree metadata record exceeds the streaming buffer")
 }
 pub struct RecordIter<T> {
-    _run: Option<Arc<RunFile>>,
+    run: Option<Arc<RunFile>>,
     reader: Option<BufReader<File>>,
     remaining: usize,
+    ordinal: usize,
     error: Option<KioError>,
     buffer: Vec<u8>,
     _value: PhantomData<T>,
@@ -457,6 +515,10 @@ impl<T: DeserializeOwned> Iterator for RecordIter<T> {
         self.buffer.clear();
         let result = (|| {
             let reader = self.reader.as_mut().expect("opened record reader");
+            let mut tag = [0; FRAME_TAG_BYTES];
+            reader
+                .read_exact(&mut tag)
+                .map_err(|e| crate::store_dir::ioerr(Path::new("records"), e))?;
             // Do not let a damaged private run grow a read_line allocation.
             loop {
                 let bytes = reader
@@ -476,6 +538,9 @@ impl<T: DeserializeOwned> Iterator for RecordIter<T> {
                     break;
                 }
             }
+            let frames = &self.run.as_ref().expect("opened record run").frames;
+            frames.verify(self.ordinal, &self.buffer, tag)?;
+            self.ordinal += 1;
             serde_json::from_slice(&self.buffer).map_err(|e| KioError::schema(e.to_string()))
         })();
         if result.is_err() {
@@ -815,7 +880,9 @@ mod tests {
             .directory
             .path()
             .join("records");
-        std::fs::write(&path, b"33\n22\n").unwrap();
+        let mut same_length = std::fs::read(&path).unwrap();
+        same_length[FRAME_TAG_BYTES..FRAME_TAG_BYTES + 2].copy_from_slice(b"33");
+        std::fs::write(&path, same_length).unwrap();
         assert!(
             records.first().is_err(),
             "valid JSON cannot replace sealed authority"
@@ -824,6 +891,31 @@ mod tests {
         assert!(
             records.first().is_err(),
             "trailing records cannot be ignored"
+        );
+    }
+
+    #[test]
+    fn cursor_rejects_an_edit_after_opening_a_verified_run() {
+        let records =
+            DiskRecords::from_records(&RecordStageRoot::temporary().unwrap(), [11u64, 22]).unwrap();
+        let path = records
+            .run
+            .as_ref()
+            .unwrap()
+            .directory
+            .path()
+            .join("records");
+        let mut cursor = SortedRecordCursor::new(records.iter(), |_: &u64| "path");
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        file.seek(SeekFrom::Start(FRAME_TAG_BYTES as u64)).unwrap();
+        std::io::Write::write_all(&mut file, b"33").unwrap();
+        assert!(
+            cursor.at("path").is_err(),
+            "the cursor used bytes changed after open"
         );
     }
 

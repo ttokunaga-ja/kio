@@ -402,7 +402,7 @@ impl UnsupportedInputStore {
         directory: &kio_core::store_dir::StoreDirectory,
         records: impl IntoIterator<Item = Result<Vec<u8>>>,
     ) -> Result<()> {
-        crate::journal::replace(directory, Path::new(UNSUPPORTED_INPUTS_FILE), records)
+        crate::journal::replace_streamed(directory, Path::new(UNSUPPORTED_INPUTS_FILE), records)
     }
 
     fn encode_record(&self, row: &UnsupportedInputDisposition) -> Result<Vec<u8>> {

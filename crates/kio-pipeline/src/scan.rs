@@ -2539,7 +2539,6 @@ mod tests {
     #[cfg(unix)]
     use crate::platform::scan::verify_opened_regular_file;
 
-    #[cfg(unix)]
     #[test]
     fn working_scan_buffers_the_same_number_of_candidates_as_the_scope_grows() {
         let limit = kio_core::disk_records::SORT_BUFFER_RECORDS;
@@ -2566,6 +2565,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn bound_scan_uses_retained_handles_after_public_scope_replacement() {
         use std::os::unix::fs::symlink;

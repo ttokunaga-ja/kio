@@ -1,5 +1,7 @@
 mod args;
 mod release_binding;
+#[cfg(debug_assertions)]
+mod scan_heap;
 
 use std::io::{BufRead, IsTerminal, Read, Write};
 use std::process;
@@ -14,6 +16,8 @@ use kio_core::{ExitCode, KioError, Result};
 use serde_json::{Value, json};
 
 fn main() {
+    #[cfg(debug_assertions)]
+    scan_heap::start();
     release_binding::retain();
     kio_index::vec::ensure_registered();
     let cli = match Cli::try_parse() {
@@ -30,6 +34,8 @@ fn main() {
         interaction: Arc::new(TerminalInteraction { json_mode }),
     };
     let exit_code = match kio_app::execute(&context, cli.command.into()).and_then(|response| {
+        #[cfg(debug_assertions)]
+        scan_heap::output_started();
         let code = completion_exit_code(response.completion);
         let output = match response.body {
             ResponseBody::Inspect(kio_app::response::history::InspectResponse::Tree(tree)) => {
@@ -89,6 +95,8 @@ fn main() {
             error.exit_code()
         }
     };
+    #[cfg(debug_assertions)]
+    scan_heap::report();
     process::exit(exit_code.code());
 }
 
@@ -201,6 +209,16 @@ struct TerminalInteraction {
 }
 
 impl Interaction for TerminalInteraction {
+    #[cfg(debug_assertions)]
+    fn working_scan_started(&self) {
+        scan_heap::scan_started();
+    }
+
+    #[cfg(debug_assertions)]
+    fn working_scan_published(&self) {
+        scan_heap::scan_published();
+    }
+
     fn confirm(&self, summary: &str) -> Result<bool> {
         if !self.is_interactive() {
             return Ok(false);

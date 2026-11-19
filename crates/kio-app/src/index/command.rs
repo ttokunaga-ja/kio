@@ -483,6 +483,8 @@ fn run_index_for_repo_inner(
     discover_children: bool,
     invocation_state: &mut IndexInvocationState,
 ) -> Result<IndexExecution> {
+    #[cfg(debug_assertions)]
+    ctx.interaction.working_scan_started();
     let archive_repo =
         repo.clone()
             .with_archive_limits(kio_core::scope::ArchiveLimits::from_options(
@@ -817,6 +819,8 @@ fn run_index_for_repo_inner(
             )
         },
     )?;
+    #[cfg(debug_assertions)]
+    ctx.interaction.working_scan_published();
     if let Some(commit_hash) = &outcome.commit_hash {
         maybe_inject_replica_after_head_fault("index_before_marker", ctx.control)?;
         // HEAD now names content the old source index and replica projection do
@@ -2100,6 +2104,8 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
             )
         },
     )?;
+    #[cfg(debug_assertions)]
+    ctx.interaction.working_scan_published();
     if let Some(commit_hash) = &outcome.commit_hash {
         maybe_inject_replica_after_head_fault("reindex_before_marker", ctx.control)?;
         // `--regenerate` has the same HEAD-before-rebuild window as `kio index`.

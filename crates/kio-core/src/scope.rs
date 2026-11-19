@@ -252,7 +252,7 @@ pub struct FileStatus {
 /// scope stays inspectable instead of bricking on a raw `KIO-E-STORE-NOT-FOUND-001`.
 #[derive(Debug, Clone, Serialize)]
 pub struct StatusReport {
-    pub stage_residues: Vec<crate::cas::RawStageResidue>,
+    pub stage_residues: crate::disk_records::DiskRecords<crate::cas::RawStageResidue>,
     pub files: crate::disk_records::DiskRecords<FileStatus>,
     pub head_shallow: bool,
 }
@@ -4095,8 +4095,8 @@ mod tests {
         assert!(
             status
                 .stage_residues
-                .iter()
                 .any(|entry| entry.path.ends_with(".ingest-unknown"))
+                .unwrap()
         );
     }
 

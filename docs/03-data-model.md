@@ -981,12 +981,14 @@ file を途中まで保存して成功扱いせず、未保存 file を削除扱
 原本の private stage (`internal/raw-stages/`) は、本文を書き始める前に物理 ID と nonce を
 `internal/raw-stage-identities/` の journal に永続化する。
 回復時は保存した identity が一致する stage だけを回収し、確定できない残骸は削除しない。
+回収と残骸の報告は、有界 buffer で列挙・照合し、結果を逐次処理する。
 `status` の `stage_residues` と `repair verify-objects` の finding に、その path と理由を表示する。
 
 tree の外部 sort や逐次 reader の一時記録は、操作対象の store の private 領域
 `internal/record-stages/` に置く。store を変更しない GC の読取や manifest の検証、評価ツールでは、
 呼出し側が用意した private な作業ディレクトリを使う。
 記録を書き始める前に、run directory・記録・lease の identity を journal に保存する。
+逐次 reader は、実際に読み取った各フレームを認証してから照合や出力に渡す。
 生存中の lease は回収せず、再試行時に保存した identity が一致する非稼働の記録だけを回収する。
 確定できない記録は保持する。store 内の残骸は同じ `stage_residues` と finding に表示する。
 
