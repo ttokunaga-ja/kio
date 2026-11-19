@@ -8,7 +8,7 @@ pub(crate) struct NativeRenderSandbox {
     pub(super) program: PathBuf,
     pub(super) scratch: PathBuf,
     pub(super) runtime_mounts: Vec<(PathBuf, PathBuf)>,
-    masked_runtime_directory: Option<PathBuf>,
+    masked_runtime_directories: Vec<PathBuf>,
     pub(super) limits: RenderResourceLimits,
     #[cfg(test)]
     pub(super) test_fixture: super::confinement_cgroup::ConfinementFixture,
@@ -37,7 +37,7 @@ impl NativeRenderSandbox {
                 .into_iter()
                 .map(|(destination, source)| (source, destination))
                 .collect(),
-            masked_runtime_directory: sources.masked_runtime_directory.clone(),
+            masked_runtime_directories: sources.runtime_mask_destinations(),
             limits,
             #[cfg(test)]
             test_fixture: Default::default(),
@@ -79,7 +79,7 @@ impl NativeRenderSandbox {
         for (source, destination) in &self.runtime_mounts {
             command.arg("--ro-bind").arg(source).arg(destination);
         }
-        if let Some(directory) = &self.masked_runtime_directory {
+        for directory in &self.masked_runtime_directories {
             command
                 .arg("--tmpfs")
                 .arg(directory)
@@ -119,11 +119,13 @@ mod tests {
     fn runtime_mask_covers_a_leaf_of_the_read_only_mount() {
         let scratch = tempfile::tempdir().unwrap();
         let root = scratch.path().canonicalize().unwrap();
-        let runtime = root.join("runtime");
-        let cache = runtime.join("generated");
+        let runtime = root.join("usr/lib");
+        let cache = runtime.join("libreoffice/program/__pycache__");
         fs::create_dir_all(&cache).unwrap();
         let program = std::env::current_exe().unwrap();
-        let sources = RenderSources::resolve(&program, [runtime.clone()]).unwrap();
+        let alias = root.join("lib");
+        std::os::unix::fs::symlink("usr/lib", &alias).unwrap();
+        let sources = RenderSources::resolve(&program, [runtime.clone(), alias.clone()]).unwrap();
         assert!(
             sources
                 .clone()
@@ -157,5 +159,22 @@ mod tests {
             })
             .unwrap();
         assert!(mount < mask);
+        let alias_mount = args
+            .windows(3)
+            .position(|part| part == ["--ro-bind".as_ref(), runtime.as_os_str(), alias.as_os_str()])
+            .unwrap();
+        let alias_cache = alias.join("libreoffice/program/__pycache__");
+        let alias_mask = args
+            .windows(4)
+            .position(|part| {
+                part == [
+                    "--tmpfs".as_ref(),
+                    alias_cache.as_os_str(),
+                    "--remount-ro".as_ref(),
+                    alias_cache.as_os_str(),
+                ]
+            })
+            .expect("the same backing directory must be masked at the alias");
+        assert!(alias_mount < alias_mask);
     }
 }
