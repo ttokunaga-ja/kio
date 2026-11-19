@@ -12,6 +12,7 @@ use crate::index::rebuild::AuthenticatedNormalizedUnits;
 use crate::index::rebuild::NormalizedUnitKey;
 use crate::index::rebuild::PinnedUnitReader;
 use crate::index::rebuild::PublicationAuthenticationCache;
+use crate::index::rebuild::RebuildAuthorities;
 use crate::index::rebuild::append_pinned_unit_authorities;
 use crate::index::rebuild::authenticate_chunk_row;
 use crate::index::rebuild::authenticate_publication_event_cached;
@@ -293,10 +294,31 @@ pub(super) fn collect_retained_embedding_chunks(
     chunking_config_hash: Option<&str>,
     current_policy: Option<&CurrentPolicyEvaluator>,
 ) -> Result<Vec<RetainedEmbeddingChunk>> {
+    collect_retained_embedding_chunks_with_replay(
+        repo,
+        conn,
+        retained_instances,
+        chunking_config_hash,
+        current_policy,
+        None,
+    )
+}
+
+pub(super) fn collect_retained_embedding_chunks_with_replay(
+    repo: &Repository,
+    conn: &Connection,
+    retained_instances: &[RetainedNormalizedInstance],
+    chunking_config_hash: Option<&str>,
+    current_policy: Option<&CurrentPolicyEvaluator>,
+    replay: Option<&mut RebuildAuthorities>,
+) -> Result<Vec<RetainedEmbeddingChunk>> {
     let Some(head) = repo.head_commit_hash()? else {
         return Ok(Vec::new());
     };
-    let roots = durable_history_roots(repo)?;
+    let roots = match &replay {
+        Some(replay) => replay.roots.clone(),
+        None => durable_history_roots(repo)?,
+    };
     let (graph, _) = HistoryReader::new_with_store(repo.kio_dir(), repo.object_store())
         .walk_for_roots_allow_shallowed(&roots)?;
     let mut bindings = OwnerBindings::default();
@@ -333,25 +355,32 @@ pub(super) fn collect_retained_embedding_chunks(
         if let Some(owner) = owners.get_mut(&key) {
             owner.paths.extend(paths);
         } else {
-            let units = match exact_unit_authorities(
-                repo,
-                &instance.raw_hash,
-                &instance.normalize,
-                &unit_reader,
-            ) {
-                Ok(units) => units,
-                Err(error) => {
-                    if crate::verify_objects::purge_explains_missing_retained_instance(
-                        repo,
-                        &instance.raw_hash,
-                        &instance.normalize,
-                    )? {
-                        // Only this exact old owner's removed closure is
-                        // explained. Raw-wide alias taint was already gathered
-                        // from every retained tree and must remain in force.
-                        continue;
+            let units = if let Some(replay) = &replay {
+                let Some(units) = replay.exact_units(instance) else {
+                    continue;
+                };
+                units
+            } else {
+                match exact_unit_authorities(
+                    repo,
+                    &instance.raw_hash,
+                    &instance.normalize,
+                    &unit_reader,
+                ) {
+                    Ok(units) => units,
+                    Err(error) => {
+                        if crate::verify_objects::purge_explains_missing_retained_instance(
+                            repo,
+                            &instance.raw_hash,
+                            &instance.normalize,
+                        )? {
+                            // Only this exact old owner's removed closure is
+                            // explained. Raw-wide alias taint was already gathered
+                            // from every retained tree and must remain in force.
+                            continue;
+                        }
+                        return Err(error);
                     }
-                    return Err(error);
                 }
             };
             owners.insert(
@@ -386,7 +415,8 @@ pub(super) fn collect_retained_embedding_chunks(
         }
         Ok(())
     })?;
-    let mut publication_cache = PublicationAuthenticationCache::default();
+    let mut ordinary_cache = PublicationAuthenticationCache::default();
+    let publication_cache = replay.map_or(&mut ordinary_cache, |replay| &mut replay.publication);
     let mut publications = BTreeSet::new();
     for event in read_chunk_publication_events(repo.kio_dir())? {
         if chunking_config_hash.is_some_and(|config| event.chunking_config_hash != config)
@@ -404,7 +434,7 @@ pub(super) fn collect_retained_embedding_chunks(
             repo.kio_dir(),
             &event,
             creation,
-            &mut publication_cache,
+            publication_cache,
         )? {
             publications.insert((
                 event.chunk_id,

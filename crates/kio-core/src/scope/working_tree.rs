@@ -4,6 +4,7 @@ use crate::disk_records::{DiskRecords, RecordSorter, RecordWriter};
 
 pub(super) struct WorkingCandidates {
     names: DiskRecords<String>,
+    selected: Option<DiskRecords<RetriedExtraction>>,
     root: PathBuf,
     bound_root: Option<Arc<File>>,
 }
@@ -25,6 +26,7 @@ struct ArchivedFile {
     name: String,
     size: u64,
     source: crate::platform::ScheduledSourceIdentity,
+    retried_normalize: Option<NormalizeRef>,
     stage: crate::cas::SavedRawStage,
 }
 struct ArchiveBatch<'a> {
@@ -57,7 +59,6 @@ impl Repository {
             explicitly_allowed_tier_a_paths,
             true,
             self.archive_limits,
-            None,
         )
         .map(|_| ())
     }
@@ -134,7 +135,6 @@ impl Repository {
             explicitly_allowed_tier_a_paths,
             store_raw,
             limits,
-            None,
         )?;
         if store_raw {
             // Raw publication and erase-receipt retirement are one store-locked
@@ -226,6 +226,7 @@ impl Repository {
             records: RecordWriter::new(&record_stages)?,
             store: &self.store,
         };
+        let mut selected = candidates.selected.as_ref().map(DiskRecords::iter);
         let mut consumed = 0u64;
         for candidate in candidates.iter() {
             let candidate = candidate?;
@@ -267,10 +268,24 @@ impl Repository {
                     "scheduled snapshot inputs changed before publication",
                 ));
             }
+            let retried_normalize = match &mut selected {
+                Some(selected) => {
+                    let retry = selected
+                        .next()
+                        .transpose()?
+                        .ok_or_else(retried_input_changed)?;
+                    if retry.path != candidate.file_name || retry.raw_hash != stage.raw_hash() {
+                        return Err(retried_input_changed());
+                    }
+                    retry.normalize
+                }
+                None => None,
+            };
             batch.records.push(&ArchivedFile {
                 name: candidate.file_name,
                 size: stage.size_bytes(),
                 source: identity,
+                retried_normalize,
                 stage: stage.saved(),
             })?;
             stage.detach();
@@ -359,11 +374,41 @@ impl Repository {
                     .with_context_field("saved", json!(false))
             })?;
             let mut entry = TreeEntry::raw_file(record.name.clone(), hash)?;
-            attach_pending_normalize(&mut entry, &record.name, normalize_by_path);
+            if candidates.selected.is_some() {
+                entry.normalize = record.retried_normalize;
+            } else {
+                attach_pending_normalize(&mut entry, &record.name, normalize_by_path);
+            }
             entries.push(entry)?;
         }
         Ok(WorkingTree {
             tree: entries.finish()?,
+        })
+    }
+
+    pub(super) fn retried_working_file_candidates(
+        &self,
+        selected: &DiskRecords<RetriedExtraction>,
+    ) -> Result<WorkingCandidates> {
+        let mut names = RecordWriter::new(&self.store.record_stages()?)?;
+        let mut previous: Option<String> = None;
+        for retry in selected {
+            let retry = retry?;
+            if !is_materializable_direct_child(&retry.path)
+                || retry.path == ".kio"
+                || previous.as_ref().is_some_and(|path| path >= &retry.path)
+                || (retry.raw_only && retry.normalize.is_some())
+            {
+                return Err(retried_input_changed());
+            }
+            names.push(&retry.path)?;
+            previous = Some(retry.path);
+        }
+        Ok(WorkingCandidates {
+            names: names.finish()?,
+            selected: Some(selected.clone()),
+            root: self.canonical_root.clone(),
+            bound_root: self.bound_root.clone(),
         })
     }
 
@@ -373,7 +418,6 @@ impl Repository {
         explicitly_allowed_tier_a_paths: &BTreeSet<String>,
         enforce_tier_a: bool,
         limits: ArchiveLimits,
-        selected: Option<&BTreeMap<String, String>>,
     ) -> Result<WorkingCandidates> {
         let mut candidates = RecordSorter::<String>::new(&self.store.record_stages()?, |a, b| {
             a.as_bytes().cmp(b.as_bytes())
@@ -415,9 +459,7 @@ impl Repository {
                     eprintln!("warning: skipping non-regular file: {}", path.display());
                     continue;
                 }
-                if excluded_paths.contains(&file_name)
-                    || selected.is_some_and(|paths| !paths.contains_key(&file_name))
-                {
+                if excluded_paths.contains(&file_name) {
                     continue;
                 }
                 if enforce_tier_a
@@ -452,6 +494,7 @@ impl Repository {
             }
             return Ok(WorkingCandidates {
                 names: candidates.finish()?,
+                selected: None,
                 root: self.canonical_root.clone(),
                 bound_root: self.bound_root.clone(),
             });
@@ -477,9 +520,7 @@ impl Repository {
                     continue;
                 }
             };
-            if excluded_paths.contains(&file_name)
-                || selected.is_some_and(|paths| !paths.contains_key(&file_name))
-            {
+            if excluded_paths.contains(&file_name) {
                 continue;
             }
             if enforce_tier_a
@@ -514,6 +555,7 @@ impl Repository {
         }
         Ok(WorkingCandidates {
             names: candidates.finish()?,
+            selected: None,
             root: self.root.clone(),
             bound_root: None,
         })
@@ -574,4 +616,13 @@ impl Repository {
             head_shallow,
         })
     }
+}
+
+fn retried_input_changed() -> KioError {
+    KioError::new(
+        "KIO-E-SNAPSHOT-AUTHORITY-CHANGED-001",
+        "retried extraction inputs changed before publication",
+        json!({}),
+        ExitCode::PartialFailure,
+    )
 }

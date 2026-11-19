@@ -3,7 +3,7 @@ use super::*;
 type ExtractionRetirementHook<'a> = dyn Fn(&str, &TreeObject) -> Result<()> + 'a;
 
 pub(super) struct ExtractionPublication<'a> {
-    selected: Option<(&'a BTreeMap<String, String>, &'a BTreeSet<String>)>,
+    selected: Option<&'a crate::disk_records::DiskRecords<RetriedExtraction>>,
     hook: &'a ExtractionRetirementHook<'a>,
 }
 type SnapshotPublicationGuard<'a> = &'a dyn Fn(&TreeObject) -> Result<()>;
@@ -138,20 +138,17 @@ impl Repository {
     /// Archive just the explicitly retried sources and retain unrelated HEAD entries.
     pub fn snapshot_retried_extractions(
         &self,
-        expected_raw_by_path: &BTreeMap<String, String>,
-        normalize_by_path: &BTreeMap<String, PendingNormalizeRef>,
-        raw_only: &BTreeSet<String>,
+        selected: &crate::disk_records::DiskRecords<RetriedExtraction>,
         before_head: &ExtractionRetirementHook<'_>,
         publication_guard: SnapshotPublicationGuard<'_>,
     ) -> Result<SnapshotOutcome> {
-        let explicitly_allowed_tier_a_paths = expected_raw_by_path.keys().cloned().collect();
         self.snapshot_with_type(
             Some("kio resume local extraction"),
             None,
             CommitType::Auto,
             &BTreeSet::new(),
-            normalize_by_path,
-            &explicitly_allowed_tier_a_paths,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
             false,
             &[],
             true,
@@ -162,7 +159,7 @@ impl Repository {
             None,
             Some(publication_guard),
             Some(ExtractionPublication {
-                selected: Some((expected_raw_by_path, raw_only)),
+                selected: Some(selected),
                 hook: before_head,
             }),
         )
@@ -756,13 +753,15 @@ impl Repository {
         let selected = extraction
             .as_ref()
             .and_then(|extraction| extraction.selected);
-        let working_candidates = self.working_file_candidates(
-            excluded_paths,
-            explicitly_allowed_tier_a_paths,
-            true,
-            self.archive_limits,
-            selected.map(|(paths, _)| paths),
-        )?;
+        let working_candidates = match selected {
+            Some(selected) => self.retried_working_file_candidates(selected)?,
+            None => self.working_file_candidates(
+                excluded_paths,
+                explicitly_allowed_tier_a_paths,
+                true,
+                self.archive_limits,
+            )?,
+        };
         let mut working = {
             let _archive_lock = self.lock_store_in_session(&self.lock_session)?;
             self.archive_staged_working_tree(
@@ -778,57 +777,45 @@ impl Repository {
         }
         .tree;
 
-        if let Some((selected, raw_only)) = selected {
-            let mut matched = 0;
-            for entry in &working.entries {
-                let entry = entry?;
-                if selected.get(&entry.path) != Some(&entry.raw_hash) {
-                    break;
+        if let (Some(selected), Some(prior)) = (selected, &prior_tree) {
+            let mut builder = crate::dag::TreeBuilder::new(
+                &self.store.record_stages()?,
+                prior.chunking_config_hash.clone(),
+            );
+            let mut retries = working
+                .entries
+                .iter()
+                .zip(selected.iter())
+                .map(|(entry, retry)| Ok::<_, KioError>((entry?, retry?.raw_only)));
+            let mut next = retries.next().transpose()?;
+            for old in &prior.entries {
+                let old = old?;
+                while next
+                    .as_ref()
+                    .is_some_and(|(entry, _)| entry.path < old.path)
+                {
+                    builder.push(next.take().expect("retry entry was compared").0)?;
+                    next = retries.next().transpose()?;
                 }
-                matched += 1;
-            }
-            if matched != selected.len() || matched != working.entries.len() {
-                return Err(KioError::new(
-                    "KIO-E-SNAPSHOT-AUTHORITY-CHANGED-001",
-                    "retried extraction inputs changed before publication",
-                    json!({}),
-                    ExitCode::PartialFailure,
-                ));
-            }
-            if let Some(prior) = &prior_tree {
-                let mut builder = crate::dag::TreeBuilder::new(
-                    &self.store.record_stages()?,
-                    prior.chunking_config_hash.clone(),
-                );
-                let mut retries = working.entries.iter();
-                let mut next = retries.next().transpose()?;
-                for old in &prior.entries {
-                    let old = old?;
-                    while next.as_ref().is_some_and(|entry| entry.path < old.path) {
-                        builder.push(next.take().expect("retry entry was compared"))?;
-                        next = retries.next().transpose()?;
+                if let Some((mut entry, raw_only)) =
+                    next.take_if(|(entry, _)| entry.path == old.path)
+                {
+                    if entry.normalize.is_none() && entry.raw_hash == old.raw_hash && !raw_only {
+                        entry.normalize = old.normalize;
                     }
-                    if let Some(mut entry) = next.take_if(|entry| entry.path == old.path) {
-                        if entry.normalize.is_none()
-                            && entry.raw_hash == old.raw_hash
-                            && !raw_only.contains(&entry.path)
-                        {
-                            entry.normalize = old.normalize;
-                        }
-                        builder.push(entry)?;
-                        next = retries.next().transpose()?;
-                    } else {
-                        builder.push(old)?;
-                    }
-                }
-                if let Some(entry) = next {
                     builder.push(entry)?;
+                    next = retries.next().transpose()?;
+                } else {
+                    builder.push(old)?;
                 }
-                for entry in retries {
-                    builder.push(entry?)?;
-                }
-                working = builder.finish()?;
             }
+            if let Some((entry, _)) = next {
+                builder.push(entry)?;
+            }
+            for entry in retries {
+                builder.push(entry?.0)?;
+            }
+            working = builder.finish()?;
         }
 
         // U19/LC22-LC26: a raw_hash that is both (a) present in the tree we are

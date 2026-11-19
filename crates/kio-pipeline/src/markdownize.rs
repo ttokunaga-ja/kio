@@ -1837,6 +1837,7 @@ struct SavedNormalizedDirectory {
     identity: DirectoryStageIdentity,
     profile: String,
     generation: u64,
+    discarding: bool,
 }
 
 /// Validate an existing generation before exposing it through a new reference.
@@ -1893,7 +1894,10 @@ fn adopt_normalized_directory(
             else {
                 return Ok(());
             };
-            if saved.profile != identity.tool_profile_hash || saved.generation != identity.r#gen {
+            if saved.discarding
+                || saved.profile != identity.tool_profile_hash
+                || saved.generation != identity.r#gen
+            {
                 return Ok(());
             }
             if !workspace
@@ -1934,7 +1938,9 @@ fn staged_normalized_instance(
                 "normalized stage target does not match",
             ));
         }
-        if workspace
+        if saved.discarding {
+            remove_normalized_stage_directory(workspace, &saved)?;
+        } else if workspace
             .contains_entry(&saved.leaf)
             .map_err(|error| stage_error(workspace, error))?
         {
@@ -1956,6 +1962,7 @@ fn staged_normalized_instance(
         identity,
         profile: target.tool_profile_hash.clone(),
         generation: target.r#gen,
+        discarding: false,
     };
     write_record(workspace, record, &saved, Publication::CreateOnly)?;
     Ok((directory, saved))
@@ -1994,19 +2001,41 @@ fn open_staged_normalized_directory(
     Ok(directory)
 }
 
+fn remove_normalized_stage_directory(
+    workspace: &StoreDirectory,
+    saved: &SavedNormalizedDirectory,
+) -> Result<()> {
+    if !workspace
+        .contains_entry(&saved.leaf)
+        .map_err(|error| stage_error(workspace, error))?
+    {
+        return Ok(());
+    }
+    open_staged_normalized_directory(workspace, saved)?;
+    workspace
+        .remove_directory_all(&saved.leaf)
+        .map_err(|error| stage_error(workspace, error))?;
+    workspace
+        .control()
+        .checkpoint(kio_core::durability::DurabilityPoint::AfterNormalizedStageRemoval)
+        .map_err(|error| stage_error(workspace, error))
+}
+
 /// Discard the journaled private normalization payloads of a purged raw.
 pub fn discard_normalized_stages(root: &StoreDirectory, raw_hash: &str) -> Result<()> {
     crate::extraction_stage::visit_raw_workspaces(root, "views", raw_hash, |workspace| {
         let record = Path::new("instance.json");
-        if let Some(saved) = read_record::<SavedNormalizedDirectory>(workspace, record, 4096)? {
-            if workspace
+        if let Some(mut saved) = read_record::<SavedNormalizedDirectory>(workspace, record, 4096)? {
+            if saved.discarding {
+                remove_normalized_stage_directory(workspace, &saved)?;
+            } else if workspace
                 .contains_entry(&saved.leaf)
                 .map_err(|error| stage_error(workspace, error))?
             {
                 open_staged_normalized_directory(workspace, &saved)?;
-                workspace
-                    .remove_directory_all(&saved.leaf)
-                    .map_err(|error| stage_error(workspace, error))?;
+                saved.discarding = true;
+                write_record(workspace, record, &saved, Publication::Upsert)?;
+                remove_normalized_stage_directory(workspace, &saved)?;
             } else {
                 if !kio_core::cas::is_hash(&saved.profile) {
                     return Err(normalized_corrupt(

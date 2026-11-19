@@ -407,6 +407,16 @@ pub struct TaskStore {
     control: kio_core::control::ControlHandle,
 }
 
+pub struct SortedTasks {
+    bodies: kio_core::disk_records::RecordPayloads<TaskDescriptor>,
+    ordered: kio_core::disk_records::DiskRecords<kio_core::disk_records::PayloadRef>,
+}
+impl SortedTasks {
+    pub fn iter(&self) -> impl Iterator<Item = kio_core::Result<TaskDescriptor>> + '_ {
+        self.ordered.iter().map(|record| self.bodies.read(record?))
+    }
+}
+
 impl TaskStore {
     #[must_use]
     pub fn new(kio_dir: impl AsRef<Path>) -> Self {
@@ -508,45 +518,50 @@ impl TaskStore {
         &self,
         retained: &kio_core::store_dir::StoreDirectory,
         stages: &kio_core::disk_records::RecordStageRoot,
-    ) -> Result<kio_core::disk_records::DiskRecords<TaskDescriptor>> {
-        use kio_core::disk_records::{RecordSorter, RecordWriter};
+    ) -> Result<SortedTasks> {
+        use kio_core::disk_records::{PayloadRef, PayloadWriter, RecordSorter, RecordWriter};
         let error = |error| crate::journal::error(&self.path, error);
-        let mut sorter = RecordSorter::<(u64, TaskDescriptor)>::new(stages, |a, b| {
-            a.1.task_id.cmp(&b.1.task_id).then_with(|| a.0.cmp(&b.0))
+        let mut bodies = PayloadWriter::new(stages).map_err(error)?;
+        let mut sorter = RecordSorter::<(String, u64, PayloadRef)>::new(stages, |a, b| {
+            a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1))
         });
         let mut sequence = 0u64;
         self.visit_bound(retained, |descriptor| {
-            sorter.push((sequence, descriptor)).map_err(error)?;
+            let body = bodies.push(&descriptor).map_err(error)?;
+            sorter
+                .push((descriptor.task_id, sequence, body))
+                .map_err(error)?;
             sequence += 1;
             Ok(())
         })?;
         let mut output = RecordWriter::new(stages).map_err(error)?;
-        let mut previous: Option<TaskDescriptor> = None;
+        let mut current = None;
         for row in sorter.finish().map_err(error)?.iter() {
-            let (_, descriptor) = row.map_err(error)?;
-            if let Some(old) = previous.replace(descriptor)
-                && previous
-                    .as_ref()
-                    .is_some_and(|next| next.task_id != old.task_id)
+            let row = row.map_err(error)?;
+            if let Some((id, _, body)) = current.replace(row)
+                && current.as_ref().is_some_and(|next| next.0 != id)
             {
-                output.push(&old).map_err(error)?;
+                output.push(&body).map_err(error)?;
             }
         }
-        if let Some(old) = previous {
-            output.push(&old).map_err(error)?;
+        if let Some((_, _, body)) = current {
+            output.push(&body).map_err(error)?;
         }
-        output.finish().map_err(error)
+        Ok(SortedTasks {
+            bodies: bodies.finish().map_err(error)?,
+            ordered: output.finish().map_err(error)?,
+        })
     }
 
     pub fn replace_sorted_bound(
         &self,
         retained: &kio_core::store_dir::StoreDirectory,
-        descriptors: &kio_core::disk_records::DiskRecords<TaskDescriptor>,
+        descriptors: impl Iterator<Item = kio_core::Result<TaskDescriptor>>,
     ) -> Result<()> {
         crate::journal::replace(
             retained,
             Path::new("tasks.jsonl"),
-            descriptors.iter().map(|descriptor| {
+            descriptors.map(|descriptor| {
                 let descriptor =
                     descriptor.map_err(|error| crate::journal::error(&self.path, error))?;
                 self.framed_record(&descriptor)
@@ -2053,6 +2068,18 @@ mod tests {
         let append_dir = crate::test_support::PrivateTempDir::new();
         let append_store = TaskStore::new(append_dir.path());
         append_store.append(&task).unwrap();
+        assert_eq!(append_store.all().unwrap(), vec![task.clone()]);
+        let root = append_store.private_root().unwrap();
+        let stages = kio_core::disk_records::RecordStageRoot::temporary().unwrap();
+        let sorted = append_store.sorted_bound(&root, &stages).unwrap();
+        assert_eq!(
+            sorted.iter().collect::<kio_core::Result<Vec<_>>>().unwrap(),
+            vec![task.clone()]
+        );
+
+        append_store
+            .replace_sorted_bound(&root, sorted.iter())
+            .unwrap();
         assert_eq!(append_store.all().unwrap(), vec![task.clone()]);
 
         let replace_dir = crate::test_support::PrivateTempDir::new();

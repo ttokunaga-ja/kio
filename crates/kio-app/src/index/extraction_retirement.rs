@@ -181,14 +181,11 @@ fn retire(
     let holds = holds.finish()?;
     let mut hold_iter = holds.iter();
     let mut hold = hold_iter.next().transpose()?;
-    let mut updated = (!holds.is_empty())
-        .then(|| RecordWriter::new(&stages))
-        .transpose()?;
     let mut held_raws = RecordSorter::new(&stages, String::cmp);
-    for task in &store
+    let tasks = store
         .sorted_bound(directory, &stages)
-        .map_err(pipeline_to_kio)?
-    {
+        .map_err(pipeline_to_kio)?;
+    let updated = tasks.iter().map(|task| -> Result<_> {
         let mut task = task?;
         while hold
             .as_ref()
@@ -223,13 +220,15 @@ fn retire(
                 held_raws.push(task.input_hash.clone())?;
             }
         }
-        if let Some(updated) = &mut updated {
-            updated.push(&task)?;
+        Ok(task)
+    });
+    if holds.is_empty() {
+        for task in updated {
+            task?;
         }
-    }
-    if let Some(updated) = updated {
+    } else {
         store
-            .replace_sorted_bound(directory, &updated.finish()?)
+            .replace_sorted_bound(directory, updated)
             .map_err(pipeline_to_kio)?;
     }
     repo.control()

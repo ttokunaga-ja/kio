@@ -163,7 +163,15 @@ impl UnsupportedInputStore {
         &self,
         observations: impl IntoIterator<Item = UnsupportedInputDisposition>,
     ) -> Result<()> {
-        let mut observations = observations.into_iter().peekable();
+        self.record_observations_from(observations.into_iter().map(Ok))
+    }
+
+    /// Persist observations read from a verified record stream.
+    pub fn record_observations_from(
+        &self,
+        observations: impl Iterator<Item = Result<UnsupportedInputDisposition>>,
+    ) -> Result<()> {
+        let mut observations = observations.peekable();
         if observations.peek().is_none() {
             return Ok(());
         }
@@ -171,6 +179,7 @@ impl UnsupportedInputStore {
         let mut projection = self.read_bound(&directory)?;
         let mut changed = false;
         for observation in observations {
+            let observation = observation?;
             if projection.latest.get(&observation.path) != Some(&observation) {
                 self.add_record(&mut projection, observation);
                 changed = true;

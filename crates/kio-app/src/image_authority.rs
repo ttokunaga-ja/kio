@@ -95,17 +95,7 @@ pub(crate) fn retained_image_authority(
     retained_instances: &[RetainedNormalizedInstance],
     policy: &CurrentPolicyEvaluator,
 ) -> Result<ImageAuthorityMap> {
-    let mut authority = ImageAuthorityMap::default();
-    for instance in retained_instances {
-        // Evaluate every retained name. A current public name may make bytes
-        // available, but cannot erase a historical/current secret alias.
-        let mut policy_allowed = false;
-        let mut requires_secret_approval = false;
-        for path in &instance.policy_paths {
-            policy_allowed |= policy.allows_path(path).map_err(pipeline_to_kio)?;
-            requires_secret_approval |= classify_secret(path).is_some();
-        }
-
+    retained_image_authority_with(retained_instances, policy, |instance| {
         let mut owned_by_unit = Vec::new();
         let verified =
             visit_pinned_done_units(repo, &instance.raw_hash, &instance.normalize, |unit| {
@@ -115,7 +105,7 @@ pub(crate) fn retained_image_authority(
                 Ok(())
             });
         match verified {
-            Ok(()) => {}
+            Ok(()) => Ok(Some(owned_by_unit)),
             Err(error) => {
                 // Unit absence may be wrapped as a pipeline corruption error.
                 // The verifier independently proves actual CAS absence and
@@ -129,10 +119,34 @@ pub(crate) fn retained_image_authority(
                     // reference after re-ingest retires its marker. Omit that
                     // verified old closure entirely: absent bytes establish
                     // no image ownership, even when some bodies survived.
-                    continue;
+                    return Ok(None);
                 }
-                return Err(error);
+                Err(error)
             }
+        }
+    })
+}
+
+pub(crate) type OwnedUnitImages = Vec<(String, BTreeSet<String>)>;
+
+pub(crate) fn retained_image_authority_with(
+    retained_instances: &[RetainedNormalizedInstance],
+    policy: &CurrentPolicyEvaluator,
+    mut load: impl FnMut(&RetainedNormalizedInstance) -> Result<Option<OwnedUnitImages>>,
+) -> Result<ImageAuthorityMap> {
+    let mut authority = ImageAuthorityMap::default();
+    for instance in retained_instances {
+        // Evaluate every retained name. A current public name may make bytes
+        // available, but cannot erase a historical/current secret alias.
+        let mut policy_allowed = false;
+        let mut requires_secret_approval = false;
+        for path in &instance.policy_paths {
+            policy_allowed |= policy.allows_path(path).map_err(pipeline_to_kio)?;
+            requires_secret_approval |= classify_secret(path).is_some();
+        }
+
+        let Some(owned_by_unit) = load(instance)? else {
+            continue;
         };
         for (unit_key, hashes) in owned_by_unit {
             if policy_allowed {

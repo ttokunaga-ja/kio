@@ -1794,11 +1794,26 @@ pub(crate) fn retry_local_extractions(
     let markdown_profile = builtin_offline_markdownize_adapter()
         .profile()
         .tool_profile_hash;
-    let mut ready = BTreeMap::new();
-    let mut completed = kio_core::disk_records::RecordWriter::new(&stages)?;
-    let mut unsupported = BTreeMap::new();
-    let mut reused = BTreeMap::<(String, &str), Option<NormalizeRef>>::new();
-    for task in &tasks {
+    use kio_core::{
+        disk_records::{RecordSorter, RecordWriter},
+        scope::RetriedExtraction,
+    };
+    let mut completed = RecordWriter::new(&stages)?;
+    let mut sorter = RecordSorter::new(&stages, |a: &RetriedExtraction, b| a.path.cmp(&b.path));
+    let mut unsupported = RecordSorter::new(&stages, |a: &UnsupportedInputDisposition, b| {
+        a.path.cmp(&b.path)
+    });
+    let mut complete =
+        |task: &TaskDescriptor, normalize: Option<NormalizeRef>, raw_only: bool| -> Result<()> {
+            sorter.push(RetriedExtraction {
+                path: task.input_path.clone(),
+                raw_hash: task.input_hash.clone(),
+                normalize: normalize.clone(),
+                raw_only,
+            })?;
+            completed.push(&retry_retirement(task, normalize))
+        };
+    for task in tasks.iter() {
         let task = task?;
         if task.output_ref != EXTRACTION_HOLD_OUTPUT_REF || task.resource_limit.is_none() {
             continue;
@@ -1842,22 +1857,8 @@ pub(crate) fn retry_local_extractions(
         if let Some(disposition) =
             classify_verified_unsupported(&task.input_path, media_type, &verified)
         {
-            unsupported.insert(task.input_path.clone(), disposition);
-            completed.push(&retry_retirement(task, None))?;
-            continue;
-        }
-        let key = (task.input_hash.clone(), media_type);
-        if let Some(normalize) = reused.get(&key) {
-            if let Some(normalize) = normalize {
-                ready.insert(
-                    task.input_path.clone(),
-                    PendingNormalizeRef {
-                        expected_raw_hash: task.input_hash.clone(),
-                        normalize: normalize.clone(),
-                    },
-                );
-            }
-            completed.push(&retry_retirement(task, normalize.clone()))?;
+            unsupported.push(disposition)?;
+            complete(task, None, true)?;
             continue;
         }
         let result = (|| {
@@ -1940,19 +1941,7 @@ pub(crate) fn retry_local_extractions(
             }))
         })();
         match result {
-            Ok(normalize) => {
-                if let Some(normalize) = &normalize {
-                    ready.insert(
-                        task.input_path.clone(),
-                        PendingNormalizeRef {
-                            expected_raw_hash: task.input_hash.clone(),
-                            normalize: normalize.clone(),
-                        },
-                    );
-                }
-                reused.insert(key, normalize.clone());
-                completed.push(&retry_retirement(task, normalize))?;
-            }
+            Ok(normalize) => complete(task, normalize, false)?,
             Err(error) => {
                 let Some(limit) = error.resource_limit() else {
                     return Err(error);
@@ -1969,15 +1958,26 @@ pub(crate) fn retry_local_extractions(
         return Ok((0, recovered));
     }
     let completed = completed.finish()?;
-    let expected = completed
-        .iter()
-        .map(|item| {
-            let item = item?;
-            Ok((item.path, item.raw))
-        })
-        .collect::<Result<_>>()?;
+    let unsupported = unsupported.finish()?;
+    let mut selected = RecordWriter::new(&stages)?;
+    let mut previous: Option<RetriedExtraction> = None;
+    for item in &sorter.finish()? {
+        let item = item?;
+        if let Some(prior) = &previous
+            && prior.path == item.path
+        {
+            if prior != &item {
+                return Err(kio_core::KioError::schema(
+                    "conflicting completed retries for one path",
+                ));
+            }
+            continue;
+        }
+        selected.push(&item)?;
+        previous = Some(item);
+    }
+    let selected = selected.finish()?;
     let policy = crate::search::scope::current_embedding_policy(repo)?;
-    let raw_only = unsupported.keys().cloned().collect();
     let prior = repo
         .head_commit_hash()?
         .map(|head| read_head_tree_for_rebuild(repo, &head))
@@ -1985,34 +1985,46 @@ pub(crate) fn retry_local_extractions(
     let unsupported_store = UnsupportedInputStore::new(repo.kio_dir())
         .with_published_tree(prior.as_ref())
         .map_err(pipeline_to_kio)?;
+    repo.control()
+        .checkpoint(kio_core::durability::DurabilityPoint::BeforeIndexSnapshot)?;
     let outcome = repo.snapshot_retried_extractions(
-        &expected,
-        &ready,
-        &raw_only,
+        &selected,
         &|head, tree| {
             unsupported_store
-                .record_observations(unsupported.values().cloned())
+                .record_observations_from(unsupported.iter().map(|item| {
+                    item.map_err(|error| {
+                        kio_pipeline::PipelineError::corrupt(
+                            unsupported_store.path().display().to_string(),
+                            error.to_string(),
+                        )
+                    })
+                }))
                 .map_err(pipeline_to_kio)?;
             extraction_retirement::record(repo, head, tree, &completed)
         },
         &|tree| {
             policy.revalidate().map_err(pipeline_to_kio)?;
-            let mut matched = 0;
-            for entry in &tree.entries {
-                let entry = entry?;
-                if let Some(observation) = unsupported.get(&entry.path) {
-                    if entry.raw_hash != observation.raw_hash || entry.normalize.is_some() {
+            if !unsupported.is_empty() {
+                let mut entries = tree.entries.iter();
+                let mut entry = entries.next().transpose()?;
+                for observation in &unsupported {
+                    let observation = observation?;
+                    while entry
+                        .as_ref()
+                        .is_some_and(|entry| entry.path < observation.path)
+                    {
+                        entry = entries.next().transpose()?;
+                    }
+                    if !entry.as_ref().is_some_and(|entry| {
+                        entry.path == observation.path
+                            && entry.raw_hash == observation.raw_hash
+                            && entry.normalize.is_none()
+                    }) {
                         return Err(kio_core::KioError::schema(
                             "unsupported retry does not match captured raw-only tree entry",
                         ));
                     }
-                    matched += 1;
                 }
-            }
-            if matched != unsupported.len() {
-                return Err(kio_core::KioError::schema(
-                    "unsupported retry is missing from captured tree",
-                ));
             }
             Ok(())
         },

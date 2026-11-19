@@ -16483,3 +16483,255 @@ fn p0_third_retirement_preserves_journal_when_record_stages_are_unavailable() {
     json_success(&dir, &["batch", "retry", "--offline"]);
     assert!(!journal.exists());
 }
+
+#[test]
+fn p0_fourth_index_rebuild_preserves_large_chunk() {
+    let dir = canonical_tempdir();
+    json_success(&dir, &["init"]);
+    fs::write(
+        dir.path().join(".kio/config.toml"),
+        "[chunking]\nstrategy = \"heading\"\nmax_chars = 100000\n",
+    )
+    .unwrap();
+    let body = "largechunkneedle ".repeat(5000);
+    fs::write(dir.path().join("large.txt"), &body).unwrap();
+    json_success(&dir, &["index", "--offline"]);
+    let conn = Connection::open(dir.path().join(".kio/index/sqlite.db")).unwrap();
+    let largest: i64 = conn
+        .query_row("SELECT max(length(text)) FROM chunks", [], |row| row.get(0))
+        .unwrap();
+    assert!(largest > 64 * 1024, "{largest}");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn p0_fourth_rebuild_uses_verified_units_after_document_staging() {
+    let dir = canonical_tempdir();
+    json_success(&dir, &["init"]);
+    fs::write(dir.path().join("a.md"), "# stagedbodyneedle").unwrap();
+    fs::write(dir.path().join("z.md"), "# nextbodyneedle").unwrap();
+    let marker = canonical_tempdir();
+    let ready = marker.path().join("ready");
+    let child = pause_nc2_command(
+        &dir,
+        &ready,
+        "after_chunk_document_staging",
+        &["index", "--offline"],
+    );
+    let repo = Repository::open(dir.path()).unwrap();
+    let commit = repo
+        .read_commit(&repo.head_commit_hash().unwrap().unwrap())
+        .unwrap();
+    let tree = repo.read_tree(&commit.tree).unwrap();
+    let entry = tree.entries.iter().next().unwrap().unwrap();
+    let normalize = entry.normalize.unwrap();
+    let (manifest, _) = kio_pipeline::markdownize::read_normalized_instance_manifest(
+        repo.kio_dir(),
+        &entry.raw_hash,
+        &normalize.tool_profile_hash,
+        normalize.r#gen,
+    )
+    .unwrap();
+    let hash = manifest.units[0].unit_object_hash.as_ref().unwrap();
+    fs::remove_file(
+        kio_core::cas::fanout_path(repo.kio_dir().join("objects/normalized_unit_objects"), hash)
+            .unwrap(),
+    )
+    .unwrap();
+    fs::write(ready.with_extension("release"), b"release").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let conn = Connection::open(repo.kio_dir().join("index/sqlite.db")).unwrap();
+    for needle in ["stagedbodyneedle", "nextbodyneedle"] {
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM chunks WHERE instr(text, ?1) > 0",
+                [needle],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "{needle}");
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn p0_fourth_retry_rejects_changed_raw_before_cas_publication() {
+    let dir = canonical_tempdir();
+    json_success(&dir, &["init"]);
+    let source = dir.path().join("held.md");
+    fs::write(&source, "# pausedretryneedle").unwrap();
+    kio(&dir, &["index", "--offline"])
+        .env("KIO_TEST_EXTRACTION_WRITE_FAULT_BEFORE_HEAD", "1")
+        .assert()
+        .code(3);
+    let marker = canonical_tempdir();
+    let ready = marker.path().join("ready");
+    let child = pause_nc2_command(
+        &dir,
+        &ready,
+        "before_index_snapshot",
+        &["batch", "retry", "--offline"],
+    );
+    let changed = b"# changed after classification";
+    fs::write(&source, changed).unwrap();
+    fs::write(ready.with_extension("release"), b"release").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    let hash = kio_core::cas::hash_bytes(changed);
+    assert!(
+        !kio_core::cas::fanout_path(dir.path().join(".kio/objects/raw"), &hash)
+            .unwrap()
+            .exists()
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn p0_fourth_discarded_stage_does_not_claim_another_images_generation() {
+    use base64::Engine as _;
+    let dir = canonical_tempdir();
+    json_success(&dir, &["init"]);
+    let image = base64::engine::general_purpose::STANDARD
+        .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGP4DwQACfsD/fteaysAAAAASUVORK5CYII=").unwrap();
+    let old = dir.path().join("old.png");
+    fs::write(&old, image).unwrap();
+    interrupt_extraction(&dir, "extraction_before_manifest");
+    fs::remove_file(dir.path().join(".test-data/extraction.ready")).unwrap();
+    let new = dir.path().join("new.png");
+    fs::rename(old, &new).unwrap();
+    interrupt_extraction(&dir, "after_normalized_stage_removal");
+    json_success(&dir, &["index", "--offline"]);
+    assert!(new.is_file());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn p0_fourth_failed_manifest_keeps_same_generation_history() {
+    use kio_core::dag::{CommitStats, CommitType, build_tree};
+    use kio_pipeline::markdownize::{NormalizedInstanceManifest, NormalizedUnitObject};
+    let dir = canonical_tempdir();
+    json_success(&dir, &["init"]);
+    fs::write(
+        dir.path().join("a.pdf"),
+        fake_pdf(&["historicalfirstneedle"]),
+    )
+    .unwrap();
+    let old = json_success(&dir, &["index", "--offline"]);
+    let old_head = old["commit_hash"].as_str().unwrap();
+    let repo = Repository::open(dir.path()).unwrap();
+    let old_commit = repo.read_commit(old_head).unwrap();
+    let old_tree = repo.read_tree(&old_commit.tree).unwrap();
+    let mut entries = old_tree.entries.to_vec().unwrap();
+    let normalize = entries[0].normalize.as_mut().unwrap();
+    let store = ObjectStore::new(repo.kio_dir());
+    let mut manifest: NormalizedInstanceManifest = serde_json::from_slice(
+        &store
+            .read_content_object_bytes(
+                ContentObjectKind::Manifest,
+                &normalize.manifest_hash,
+                1024 * 1024,
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    let mut entry = manifest.units[0].clone();
+    let mut unit: NormalizedUnitObject = serde_json::from_slice(
+        &store
+            .read_content_object_bytes(
+                ContentObjectKind::NormalizedUnit,
+                entry.unit_object_hash.as_ref().unwrap(),
+                1024 * 1024,
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    unit.unit_key = "page:2".into();
+    unit.markdown = "unavailable second page".into();
+    let hash = store
+        .write_content_object(
+            ContentObjectKind::NormalizedUnit,
+            &serde_jcs::to_vec(&unit).unwrap(),
+        )
+        .unwrap();
+    entry.order += 1;
+    entry.unit_key = unit.unit_key;
+    entry.unit_ref = kio_pipeline::prepare::unit_ref(&entry.unit_key);
+    entry.unit_object_hash = Some(hash.clone());
+    manifest.units.push(entry);
+    normalize.manifest_hash = store
+        .write_content_object(
+            ContentObjectKind::Manifest,
+            &serde_jcs::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+    let tree = build_tree(
+        &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+        entries,
+    )
+    .unwrap();
+    let (tree_hash, _) = store
+        .write_json(ObjectKind::Tree, &serde_json::to_value(tree).unwrap())
+        .unwrap();
+    let commit = CommitObject::new(
+        tree_hash,
+        Some(old_head.to_owned()),
+        "2026-11-20T00:00:00Z".into(),
+        "same-generation retry".into(),
+        old_commit.tool_lock_hash,
+        CommitStats {
+            files_added: 0,
+            files_deleted: 0,
+            files_modified: 1,
+        },
+        CommitType::Manual,
+    )
+    .unwrap();
+    let (head, _) = store
+        .write_json(ObjectKind::Commit, &serde_json::to_value(commit).unwrap())
+        .unwrap();
+    fs::write(
+        repo.kio_dir().join("HEAD"),
+        format!(
+            "{head}
+"
+        ),
+    )
+    .unwrap();
+
+    let marker = canonical_tempdir();
+    let ready = marker.path().join("ready");
+    let child = pause_nc2_command(
+        &dir,
+        &ready,
+        "before_chunk_unit_read",
+        &["repair", "rebuild-db", "--offline"],
+    );
+    fs::remove_file(
+        store
+            .content_path(ContentObjectKind::NormalizedUnit, &hash)
+            .unwrap(),
+    )
+    .unwrap();
+    fs::write(ready.with_extension("release"), b"release").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let conn = Connection::open(repo.kio_dir().join("index/sqlite.db")).unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM chunks JOIN chunk_publications USING (chunk_id)
+         WHERE instr(text, 'historicalfirstneedle') > 0 AND introduction_commit = ?1",
+            [old_head],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+    let unavailable: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM chunk_publications WHERE introduction_commit = ?1",
+            [&head],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(unavailable, 0);
+}
