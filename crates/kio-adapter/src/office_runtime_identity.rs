@@ -87,26 +87,43 @@ pub(crate) struct RuntimeSnapshot {
     roots: Vec<PathBuf>,
     entries: BTreeMap<PathBuf, EntryIdentity>,
     mounts: Vec<EntryIdentity>,
+    excluded: Option<PathBuf>,
 }
 
+type EntryCheck<'a> = dyn Fn(&Path, &Metadata) -> Result<()> + 'a;
+
 impl RuntimeSnapshot {
+    #[cfg(any(test, not(target_os = "linux")))]
     pub(crate) fn new(
         roots: Vec<PathBuf>,
         sources: &RenderSources,
         deadline: Instant,
     ) -> Result<Self> {
-        let entries = Self::read(&roots, sources, deadline)?;
+        Self::new_checked(roots, sources, None, &|_, _| Ok(()), deadline)
+    }
+
+    pub(crate) fn new_checked(
+        roots: Vec<PathBuf>,
+        sources: &RenderSources,
+        excluded: Option<PathBuf>,
+        check_entry: &EntryCheck<'_>,
+        deadline: Instant,
+    ) -> Result<Self> {
         let mounts = mount_identities(sources, deadline)?;
+        let entries = Self::read(&roots, sources, excluded.as_deref(), check_entry, deadline)?;
         Ok(Self {
             roots,
             entries,
             mounts,
+            excluded,
         })
     }
 
     fn read(
         roots: &[PathBuf],
         sources: &RenderSources,
+        excluded: Option<&Path>,
+        check_entry: &EntryCheck<'_>,
         deadline: Instant,
     ) -> Result<BTreeMap<PathBuf, EntryIdentity>> {
         const MAX_PACKAGE_ENTRIES: usize = 32_768;
@@ -133,9 +150,16 @@ impl RuntimeSnapshot {
                 )));
             }
             let identity = entry_identity(&path, &metadata).map_err(error)?;
+            check_entry(&path, &metadata)?;
             entries.insert(path.clone(), identity);
             if metadata.is_symlink() {
-                let target = runtime_link_target(&path, sources, deadline, &mut entries)?;
+                let target =
+                    runtime_link_target(&path, sources, check_entry, deadline, &mut entries)?;
+                if excluded.is_some_and(|excluded| target.starts_with(excluded)) {
+                    return Err(error(io::Error::other(
+                        "link points outside the verified Office runtime",
+                    )));
+                }
                 pending.push(target);
             } else if metadata.is_dir() {
                 for child in fs::read_dir(&path).map_err(error)? {
@@ -143,7 +167,13 @@ impl RuntimeSnapshot {
                     if entries.len() + pending.len() >= MAX_PACKAGE_ENTRIES {
                         return Err(error(io::Error::other("too many Office runtime entries")));
                     }
-                    pending.push(child.map_err(error)?.path());
+                    let child = child.map_err(error)?;
+                    if excluded == Some(child.path().as_path())
+                        && child.file_type().map_err(error)?.is_dir()
+                    {
+                        continue;
+                    }
+                    pending.push(child.path());
                 }
             }
             if entries.len() + pending.len() > MAX_PACKAGE_ENTRIES {
@@ -159,12 +189,31 @@ impl RuntimeSnapshot {
         stage: &str,
         deadline: Instant,
     ) -> Result<()> {
-        if mount_identities(sources, deadline)? != self.mounts
-            || Self::read(&self.roots, sources, deadline)? != self.entries
-        {
-            return Err(io::Error::other(format!(
+        let changed = || {
+            io::Error::other(format!(
                 "Office runtime changed {stage}; resolve a fresh converter before retrying"
-            )));
+            ))
+        };
+        let check_entry = |path: &Path, metadata: &Metadata| {
+            if self.entries.get(path) != Some(&entry_identity(path, metadata)?) {
+                return Err(changed());
+            }
+            Ok(())
+        };
+        #[cfg(target_os = "linux")]
+        if sources.masked_runtime_directory() != self.excluded.as_deref() {
+            return Err(changed());
+        }
+        if mount_identities(sources, deadline)? != self.mounts
+            || Self::read(
+                &self.roots,
+                sources,
+                self.excluded.as_deref(),
+                &check_entry,
+                deadline,
+            )? != self.entries
+        {
+            return Err(changed());
         }
         check_verification_deadline(deadline)
     }
@@ -208,9 +257,117 @@ fn in_runtime_sources(path: &Path, sources: &RenderSources) -> bool {
             .any(|(_, source)| path.starts_with(source))
 }
 
+#[cfg(target_os = "linux")]
 fn runtime_link_target(
     path: &Path,
     sources: &RenderSources,
+    check_entry: &EntryCheck<'_>,
+    deadline: Instant,
+    entries: &mut BTreeMap<PathBuf, EntryIdentity>,
+) -> Result<PathBuf> {
+    use std::{collections::VecDeque, ffi::OsString, path::Component};
+
+    let outside = |target: &Path| {
+        path_error(
+            path,
+            io::Error::other(format!(
+                "runtime link target is outside the renderer sandbox and outside the verified Office runtime: {}",
+                target.display()
+            )),
+        )
+    };
+    let components = |target: &Path| -> VecDeque<OsString> {
+        target
+            .components()
+            .map(|part| part.as_os_str().to_owned())
+            .collect()
+    };
+    let mounted = |named: &Path| {
+        if named == sources.program() {
+            return Some(named.to_path_buf());
+        }
+        sources
+            .roots()
+            .iter()
+            .filter_map(|(destination, source)| {
+                named
+                    .strip_prefix(destination)
+                    .ok()
+                    .map(|suffix| (destination, source, suffix))
+            })
+            .max_by_key(|(destination, _, _)| destination.as_os_str().len())
+            .map(|(_, source, suffix)| {
+                if suffix.as_os_str().is_empty() {
+                    source.clone()
+                } else {
+                    source.join(suffix)
+                }
+            })
+    };
+
+    let mut named = path
+        .parent()
+        .expect("runtime link has a parent")
+        .to_path_buf();
+    let mut pending = components(&fs::read_link(path).map_err(|error| path_error(path, error))?);
+    let mut hops = 0;
+    while let Some(part) = pending.pop_front() {
+        check_verification_deadline(deadline)?;
+        match Path::new(&part).components().next() {
+            Some(Component::RootDir) => named = PathBuf::from("/"),
+            Some(Component::ParentDir) => {
+                named.pop();
+            }
+            Some(Component::Normal(_)) => {
+                named.push(&part);
+                let Some(physical) = mounted(&named) else {
+                    // Bubblewrap creates these ancestors for file and directory mounts.
+                    if sources.program().starts_with(&named)
+                        || sources
+                            .roots()
+                            .iter()
+                            .any(|(destination, _)| destination.starts_with(&named))
+                    {
+                        continue;
+                    }
+                    return Err(outside(&named));
+                };
+                let metadata = fs::symlink_metadata(&physical)
+                    .map_err(|error| path_error(&physical, error))?;
+                if metadata.is_symlink() {
+                    hops += 1;
+                    if hops >= 40 {
+                        return Err(path_error(
+                            path,
+                            io::Error::other("too many Office runtime link hops"),
+                        ));
+                    }
+                    check_entry(&physical, &metadata)?;
+                    entries.insert(physical.clone(), entry_identity(&physical, &metadata)?);
+                    let mut target = components(
+                        &fs::read_link(&physical).map_err(|error| path_error(&physical, error))?,
+                    );
+                    target.append(&mut pending);
+                    pending = target;
+                    named.pop();
+                } else if !metadata.is_dir() && !pending.is_empty() {
+                    return Err(path_error(
+                        &physical,
+                        io::Error::other("expected an Office runtime directory"),
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    verify_link_target(path, mounted(&named).ok_or_else(|| outside(&named))?)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn runtime_link_target(
+    path: &Path,
+    sources: &RenderSources,
+    check_entry: &EntryCheck<'_>,
     deadline: Instant,
     entries: &mut BTreeMap<PathBuf, EntryIdentity>,
 ) -> Result<PathBuf> {
@@ -227,14 +384,7 @@ fn runtime_link_target(
         let mount = sources
             .roots()
             .iter()
-            .filter_map(|(destination, source)| {
-                let visible = if cfg!(target_os = "linux") {
-                    destination
-                } else {
-                    source
-                };
-                named.starts_with(visible).then_some((visible, source))
-            })
+            .filter_map(|(_, source)| named.starts_with(source).then_some((source, source)))
             .max_by_key(|(visible, _)| visible.as_os_str().len());
         let Some((visible, source)) = mount else {
             return Err(path_error(
@@ -256,6 +406,7 @@ fn runtime_link_target(
             let metadata =
                 fs::symlink_metadata(&physical).map_err(|error| path_error(&physical, error))?;
             if metadata.is_symlink() {
+                check_entry(&physical, &metadata)?;
                 let identity = entry_identity(&physical, &metadata)
                     .map_err(|error| path_error(&physical, error))?;
                 entries.insert(physical.clone(), identity);
@@ -288,6 +439,7 @@ fn verify_link_target(path: &Path, physical: PathBuf) -> Result<PathBuf> {
     Ok(physical)
 }
 
+#[cfg(not(target_os = "linux"))]
 fn normalize_link_path(path: &Path) -> PathBuf {
     use std::path::Component;
     let mut normalized = PathBuf::new();

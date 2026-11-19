@@ -187,6 +187,8 @@ impl RendererStart<'_> {
 pub struct RenderSources {
     pub(crate) program: PathBuf,
     pub(crate) roots: Vec<(PathBuf, PathBuf)>,
+    #[cfg(target_os = "linux")]
+    pub(crate) masked_runtime_directory: Option<PathBuf>,
 }
 
 impl RenderSources {
@@ -208,7 +210,39 @@ impl RenderSources {
             }
             roots.push((root, source));
         }
-        Ok(Self { program, roots })
+        Ok(Self {
+            program,
+            roots,
+            #[cfg(target_os = "linux")]
+            masked_runtime_directory: None,
+        })
+    }
+
+    /// Overlay an empty read-only directory inside an existing Linux runtime bind.
+    #[cfg(target_os = "linux")]
+    pub fn with_masked_runtime_directory(mut self, path: &Path) -> Result<Self, ConfinementError> {
+        if !is_normal_absolute_path(path)
+            || canonical_directory(path).as_deref() != Some(path)
+            || self.program.starts_with(path)
+            || self
+                .roots
+                .iter()
+                .any(|(destination, _)| destination.starts_with(path))
+            || !self
+                .roots
+                .iter()
+                .any(|(destination, source)| destination == source && path.starts_with(destination))
+        {
+            return Err(ConfinementError::Runtime(path.into()));
+        }
+        self.masked_runtime_directory = Some(path.into());
+        Ok(self)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn masked_runtime_directory(&self) -> Option<&Path> {
+        self.masked_runtime_directory.as_deref()
     }
 
     #[must_use]
