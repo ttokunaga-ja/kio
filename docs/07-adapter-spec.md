@@ -314,6 +314,15 @@ Linux の distro / TDF / portable の配置は実際に必要な read-only runti
 固定 `/opt/libreoffice<major>.<minor>` と sibling 名だけで決めない。runtime 内の symlink は
 解決した対象を同じ許可済み runtime closure に固定できる場合だけ許可し、任意の host path へ
 読み取り権限を広げない。network / unrelated private files / write の隔離を弱めて probe を通さない。
+Debian・Ubuntu のパッケージと標準の `/opt/libreoffice<major>.<minor>` に配置された TDF の DEB は、
+構成済みの dpkg 台帳で所属と内容を照合する。この配置では `SHA256SUMS` があっても dpkg の照合を必須とする。
+portable では、信頼できる配布物のファイル一覧を展開先直下の `SHA256SUMS` として用意する。
+各行は SHA-256、空白 2 字、展開先からの相対パスとする。symlink は SHA-256 に `link:` を付け、
+リンク先のパス文字列（末尾改行なし）をハッシュする。空ディレクトリは `dir`、空白 2 字、相対パスで指定できる。
+対象は `program`、`share`、`presets` の中で、一覧にないファイルが混在する配置は拒否する。
+相対パスは最大 1,024 バイト・32 要素、暗黙の親を含めて最大 32,768 エントリとする。
+一覧は信頼できる配布物から作成し、現在の展開ツリーを自動的に承認するためには使わない。
+
 renderer scratch は [14 の storage 契約](14-v1-runtime-contracts.md#protection-of-kio-created-objects) に従う。
 
 **Office package preflight (DOCX / PPTX)**: LibreOffice に渡す前に raw ZIP を最大 100 MiB、central-directory を最大 4,096 entry、各 member を最大 32 MiB、全 member の declared aggregate を最大 256 MiB として検証する。必要な `[Content_Types].xml`、`_rels/.rels`、main XML の読取り合計は 6 MiB に制限し、CRC を検証して読む。encrypted / split ZIP、ZIP64、重複・非 UTF-8・unsafe part name、非 Stored/Deflated member は拒否する。XML は UTF-8、nesting 256、attribute 1,024 を上限とし、DTD/entity declaration を受けない。DOCX / PPTX ごとに genuine な MIME override、内部 root relationship、main part と namespace を検証する。preflight failure は renderer を起動せず contract violation とする。

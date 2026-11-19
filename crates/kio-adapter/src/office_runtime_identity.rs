@@ -81,6 +81,8 @@ fn executable_error(error: &dyn std::fmt::Display) -> io::Error {
     ))
 }
 
+pub(crate) const MAX_PACKAGE_ENTRIES: usize = 32_768;
+
 /// Identity of the package and the parts of the mounted runtime it links to.
 #[derive(Debug, Clone)]
 pub(crate) struct RuntimeSnapshot {
@@ -88,6 +90,45 @@ pub(crate) struct RuntimeSnapshot {
     entries: BTreeMap<PathBuf, EntryIdentity>,
     mounts: Vec<EntryIdentity>,
     excluded: Option<PathBuf>,
+    #[cfg(target_os = "linux")]
+    records: RecordSnapshot,
+}
+
+/// Metadata for the package evidence and its database directories, including
+/// optional records whose appearance would change the meaning of the evidence.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RecordSnapshot(BTreeMap<PathBuf, Option<EntryIdentity>>);
+
+#[cfg(target_os = "linux")]
+impl RecordSnapshot {
+    pub(crate) fn observe(&mut self, path: &Path) -> Result<()> {
+        if !self.0.contains_key(path) {
+            self.0.insert(path.to_path_buf(), Self::identity(path)?);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn verify(&self, deadline: Instant) -> Result<()> {
+        for (path, before) in &self.0 {
+            check_verification_deadline(deadline)?;
+            if Self::identity(path)? != *before {
+                return Err(path_error(
+                    path,
+                    io::Error::other("Office package records changed"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn identity(path: &Path) -> Result<Option<EntryIdentity>> {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => entry_identity(path, &metadata).map(Some),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 type EntryCheck<'a> = dyn Fn(&Path, &Metadata) -> Result<()> + 'a;
@@ -116,7 +157,25 @@ impl RuntimeSnapshot {
             entries,
             mounts,
             excluded,
+            #[cfg(target_os = "linux")]
+            records: RecordSnapshot::default(),
         })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn with_records(
+        mut self,
+        records: RecordSnapshot,
+        deadline: Instant,
+    ) -> Result<Self> {
+        records.verify(deadline)?;
+        self.records = records;
+        Ok(self)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn contains_entry(&self, path: &Path) -> bool {
+        self.entries.contains_key(path)
     }
 
     fn read(
@@ -126,7 +185,6 @@ impl RuntimeSnapshot {
         check_entry: &EntryCheck<'_>,
         deadline: Instant,
     ) -> Result<BTreeMap<PathBuf, EntryIdentity>> {
-        const MAX_PACKAGE_ENTRIES: usize = 32_768;
         if roots.is_empty() {
             return Err(io::Error::other(format!(
                 "unsupported Office runtime placement for {}: cannot identify its package",
@@ -229,6 +287,8 @@ impl RuntimeSnapshot {
         {
             return Err(changed());
         }
+        #[cfg(target_os = "linux")]
+        self.records.verify(deadline)?;
         check_verification_deadline(deadline)
     }
 

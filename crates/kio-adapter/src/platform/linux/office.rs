@@ -1,4 +1,7 @@
-use super::dpkg::DpkgCatalog;
+use super::{
+    dpkg::{DpkgCatalog, office_package},
+    portable::{MANIFEST, PortableCatalog},
+};
 use crate::{
     AdapterError, Result,
     office_runtime_identity::{RuntimeSnapshot, check_verification_deadline},
@@ -34,7 +37,40 @@ pub(crate) struct OfficeRuntime {
     roots: Vec<PathBuf>,
     system: PathBuf,
     trust: RuntimeTrust,
-    distro: bool,
+    evidence: PackageEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PackageEvidence {
+    Distro,
+    Tdf(String),
+    Portable(PathBuf),
+    #[cfg(test)]
+    Fixture,
+}
+
+impl PackageEvidence {
+    fn package_filter(&self, name: &str) -> bool {
+        match self {
+            Self::Distro => office_package(name),
+            Self::Tdf(version) => ["libobasis", "libreoffice"].iter().any(|prefix| {
+                name.strip_prefix(prefix)
+                    .and_then(|name| name.strip_prefix(version))
+                    .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('-'))
+            }),
+            _ => false,
+        }
+    }
+}
+
+fn tdf_version<'a>(bundle: &'a Path, system: &Path) -> Option<&'a str> {
+    let name = bundle.strip_prefix(system.join("opt")).ok()?.to_str()?;
+    let version = name.strip_prefix("libreoffice")?;
+    let (major, minor) = version.split_once('.')?;
+    [major, minor]
+        .into_iter()
+        .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+        .then_some(version)
 }
 
 impl OfficeRuntime {
@@ -60,7 +96,7 @@ impl OfficeRuntime {
             system_uid,
             owner: system_uid,
         };
-        let roots = if distro {
+        let (roots, evidence) = if distro {
             let mut roots = vec![distro_root];
             for path in [
                 "usr/share/libreoffice",
@@ -73,7 +109,7 @@ impl OfficeRuntime {
                     roots.push(root);
                 }
             }
-            roots
+            (roots, PackageEvidence::Distro)
         } else {
             let Some(bundle) = program.parent().and_then(Path::parent).filter(|bundle| {
                 soffice
@@ -101,13 +137,32 @@ impl OfficeRuntime {
             {
                 roots.push(presets);
             }
-            roots
+            let evidence = if let Some(version) = tdf_version(bundle, system) {
+                // A manifest cannot override package-manager state at the TDF path.
+                if trust.owner != system_uid {
+                    return Err(contract_error(
+                        "installed TDF Office package must be system-owned",
+                    ));
+                }
+                PackageEvidence::Tdf(version.into())
+            } else if optional_metadata(&bundle.join(MANIFEST))
+                .map_err(contract_error)?
+                .is_some()
+            {
+                PackageEvidence::Portable(bundle.into())
+            } else {
+                return Err(contract_error(format_args!(
+                    "cannot verify portable Office runtime without {MANIFEST}: {}",
+                    bundle.display()
+                )));
+            };
+            (roots, evidence)
         };
         let runtime = Self {
             roots,
             system: system.into(),
             trust,
-            distro,
+            evidence,
         };
         runtime.verify_roots(deadline).map_err(contract_error)?;
         Ok(runtime)
@@ -133,7 +188,7 @@ impl OfficeRuntime {
         // dpkg's post-install Python bytecode has no package checksum. Cover the
         // generated directory in the existing OS library bind with an empty one.
         let cache = self.system.join("usr/lib/libreoffice/program/__pycache__");
-        if self.distro
+        if self.evidence == PackageEvidence::Distro
             && optional_metadata(&cache)
                 .map_err(contract_error)?
                 .is_some_and(|metadata| metadata.is_dir())
@@ -151,16 +206,32 @@ impl OfficeRuntime {
         sources: &RenderSources,
         deadline: Instant,
     ) -> io::Result<RuntimeSnapshot> {
-        let catalog = self
-            .distro
-            .then(|| DpkgCatalog::read(&self.system, self.trust, deadline))
-            .transpose()?;
+        let dpkg = matches!(
+            self.evidence,
+            PackageEvidence::Distro | PackageEvidence::Tdf(_)
+        )
+        .then(|| {
+            DpkgCatalog::read(
+                &self.system,
+                self.trust,
+                |name| self.evidence.package_filter(name),
+                deadline,
+            )
+        })
+        .transpose()?;
+        let portable = match &self.evidence {
+            PackageEvidence::Portable(bundle) => {
+                Some(PortableCatalog::read(bundle, self.trust, deadline)?)
+            }
+            _ => None,
+        };
         let check = |path: &Path, metadata: &Metadata| {
             self.trust.verify_entry(path, metadata)?;
             let in_package = self.roots.iter().any(|root| path.starts_with(root));
-            if let Some(catalog) = &catalog {
+            if let Some(catalog) = &dpkg {
                 let relative = path.strip_prefix(&self.system).unwrap_or(path);
-                let external = !metadata.is_dir()
+                let external = self.evidence == PackageEvidence::Distro
+                    && !metadata.is_dir()
                     && (relative.starts_with("usr/share/java")
                         || relative
                             .strip_prefix("usr/share/doc")
@@ -181,7 +252,13 @@ impl OfficeRuntime {
                     return catalog.verify(path, metadata, deadline);
                 }
             } else if in_package {
-                return Ok(());
+                if let Some(catalog) = &portable {
+                    return catalog.verify(path, metadata, deadline);
+                }
+                #[cfg(test)]
+                if self.evidence == PackageEvidence::Fixture {
+                    return Ok(());
+                }
             }
             Err(io::Error::other(format!(
                 "outside the verified Office runtime: {}",
@@ -189,7 +266,15 @@ impl OfficeRuntime {
             )))
         };
         let excluded = sources.masked_runtime_directory().map(Path::to_path_buf);
-        RuntimeSnapshot::new_checked(roots, sources, excluded, &check, deadline)
+        let snapshot = RuntimeSnapshot::new_checked(roots, sources, excluded, &check, deadline)?;
+        if let Some(catalog) = portable {
+            catalog.verify_complete(&snapshot, deadline)?;
+            return snapshot.with_records(catalog.records, deadline);
+        }
+        if let Some(catalog) = dpkg {
+            return snapshot.with_records(catalog.records, deadline);
+        }
+        Ok(snapshot)
     }
 
     pub(crate) fn configure_services(
@@ -225,6 +310,17 @@ impl OfficeRuntime {
         .map(|path| self.system.join(path))
         .filter(|path| path.exists())
         .collect();
+        if let PackageEvidence::Portable(bundle) = &self.evidence {
+            for root in &system_roots {
+                let canonical = fs::canonicalize(root).map_err(contract_error)?;
+                if bundle.starts_with(&canonical) || canonical.starts_with(bundle) {
+                    return Err(contract_error(format_args!(
+                        "portable Office bundle overlaps the system runtime bind {}",
+                        root.display()
+                    )));
+                }
+            }
+        }
         let extra = self
             .roots
             .iter()
@@ -243,7 +339,7 @@ impl OfficeRuntime {
                 system_uid: fs::metadata("/").unwrap().uid(),
                 owner,
             },
-            distro: false,
+            evidence: PackageEvidence::Fixture,
         }
     }
 }
@@ -255,6 +351,15 @@ pub(super) struct RuntimeTrust {
 }
 
 impl RuntimeTrust {
+    #[cfg(test)]
+    pub(super) fn fixture(root: &Path) -> Self {
+        let owner = fs::metadata(root).unwrap().uid();
+        Self {
+            system_uid: owner,
+            owner,
+        }
+    }
+
     pub(super) fn verify_entry(self, path: &Path, metadata: &Metadata) -> io::Result<()> {
         let mode = metadata.mode();
         let safe_mode = metadata.is_symlink()
@@ -328,17 +433,81 @@ mod tests {
         path
     }
 
-    fn verify(program: &Path, system: &Path) -> Result<Vec<PathBuf>> {
+    fn snapshot(program: &Path, system: &Path) -> Result<(RuntimeSnapshot, RenderSources)> {
         let uid = fs::metadata(system).unwrap().uid();
         let runtime = OfficeRuntime::discover(program, system, uid, uid, deadline())?;
         let package = runtime.package_roots(program)?;
         let mounts = runtime.runtime_roots(program)?;
-        let sources =
-            runtime.bind_runtime(RenderSources::resolve(program, mounts.clone()).unwrap())?;
-        runtime
+        let sources = runtime.bind_runtime(RenderSources::resolve(program, mounts).unwrap())?;
+        let snapshot = runtime
             .snapshot(package, &sources, deadline())
-            .map_err(|error| AdapterError::ContractViolation(error.to_string()))?;
-        Ok(mounts)
+            .map_err(contract_error)?;
+        Ok((snapshot, sources))
+    }
+
+    fn verify(program: &Path, system: &Path) -> Result<Vec<PathBuf>> {
+        let (_, sources) = snapshot(program, system)?;
+        Ok(sources
+            .roots()
+            .iter()
+            .map(|(destination, _)| destination.clone())
+            .collect())
+    }
+
+    fn portable_records(
+        bundle: &Path,
+        files: &[&str],
+        directories: &[&str],
+        links: &[(&str, &str)],
+    ) {
+        use crate::office_convert::hex_digest;
+        use sha2::{Digest, Sha256};
+        let mut text = String::new();
+        for relative in files {
+            let hash = hex_digest(&Sha256::digest(fs::read(bundle.join(relative)).unwrap()));
+            text.push_str(&format!("{hash}  {relative}\n"));
+        }
+        for relative in directories {
+            text.push_str(&format!("dir  {relative}\n"));
+        }
+        for (relative, target) in links {
+            let hash = hex_digest(&Sha256::digest(target.as_bytes()));
+            text.push_str(&format!("link:{hash}  {relative}\n"));
+        }
+        file(bundle, MANIFEST, text.as_bytes());
+    }
+
+    fn tdf_records(system: &Path, bundle: &Path, files: &[&str], other: &[&str]) {
+        use crate::office_convert::hex_digest;
+        use md5::{Digest, Md5};
+        let package = "libobasis26.2-core";
+        let base = bundle.strip_prefix(system).unwrap().display();
+        let mut list = String::new();
+        let mut sums = String::new();
+        for relative in files.iter().chain(other) {
+            list.push_str(&format!("/{base}/{relative}\n"));
+        }
+        for relative in files {
+            let hash = hex_digest(&Md5::digest(fs::read(bundle.join(relative)).unwrap()));
+            sums.push_str(&format!("{hash}  {base}/{relative}\n"));
+        }
+        file(
+            system,
+            &format!("var/lib/dpkg/info/{package}.list"),
+            list.as_bytes(),
+        );
+        file(
+            system,
+            &format!("var/lib/dpkg/info/{package}.md5sums"),
+            sums.as_bytes(),
+        );
+        file(
+            system,
+            "var/lib/dpkg/status",
+            format!("Package: {package}\nStatus: install ok installed\nArchitecture: amd64\n")
+                .as_bytes(),
+        );
+        fs::create_dir_all(system.join("var/lib/dpkg/updates")).unwrap();
     }
 
     #[test]
@@ -356,10 +525,47 @@ mod tests {
             fs::create_dir(bundle.join("share/subdir")).unwrap();
             symlink("../share/subdir", bundle.join("program/inside")).unwrap();
             symlink("inside/../data", bundle.join("program/via_parent")).unwrap();
+            let files = [
+                "program/soffice",
+                "program/soffice.bin",
+                "program/bootstraprc",
+                "share/data",
+            ];
+            let links = [
+                ("program/resource", "../share/data"),
+                ("program/inside", "../share/subdir"),
+                ("program/via_parent", "inside/../data"),
+            ];
+            if name.starts_with("opt/") {
+                tdf_records(
+                    &system,
+                    &bundle,
+                    &files,
+                    &[
+                        "program",
+                        "share",
+                        "share/subdir",
+                        "presets",
+                        "program/resource",
+                        "program/inside",
+                        "program/via_parent",
+                    ],
+                );
+            } else {
+                portable_records(&bundle, &files, &["share/subdir", "presets"], &links);
+            }
             let mounts = verify(&program, &system).unwrap();
             assert!(mounts.contains(&bundle.join("share")));
             assert!(!mounts.contains(&bundle));
             assert!(verify(&bundle.join("program/soffice.bin"), &system).is_ok());
+
+            let private = file(&bundle, "share/private.txt", b"private");
+            let error = verify(&program, &system).unwrap_err().to_string();
+            assert!(
+                error.contains("unlisted") && error.contains("private.txt"),
+                "{error}"
+            );
+            fs::remove_file(private).unwrap();
 
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(bundle.join("share/data"), fs::Permissions::from_mode(0o666))
@@ -380,11 +586,78 @@ mod tests {
         let data = file(&bundle, "share/data", b"runtime");
         symlink(&data, system.join("outside")).unwrap();
         symlink(system.join("outside"), bundle.join("program/resource")).unwrap();
+        portable_records(
+            &bundle,
+            &[
+                "program/soffice",
+                "program/soffice.bin",
+                "program/bootstraprc",
+                "share/data",
+            ],
+            &[],
+            &[("program/resource", system.join("outside").to_str().unwrap())],
+        );
         let error = verify(&program, &system).unwrap_err().to_string();
         assert!(
             error.contains("outside the verified Office runtime"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn linux_closure_requires_tdf_dpkg_even_with_matching_portable_manifest() {
+        let scratch = tempfile::tempdir().unwrap();
+        let system = scratch.path().canonicalize().unwrap();
+        let bundle = system.join("opt/libreoffice26.2");
+        let files = [
+            "program/soffice",
+            "program/soffice.bin",
+            "program/bootstraprc",
+            "share/data",
+        ];
+        for path in files {
+            file(&bundle, path, b"abc");
+        }
+        let program = bundle.join("program/soffice");
+        tdf_records(&system, &bundle, &files, &["program", "share"]);
+        portable_records(&bundle, &files, &[], &[]);
+        assert!(verify(&program, &system).is_ok());
+        let update = file(&system, "var/lib/dpkg/updates/0000", b"pending");
+        let pending = verify(&program, &system);
+        fs::remove_file(update).unwrap();
+        file(
+            &system,
+            "var/lib/dpkg/status",
+            b"Package: libobasis26.2-core\nStatus: install ok unpacked\nArchitecture: amd64\n",
+        );
+        let unpacked = verify(&program, &system);
+        assert!(pending.unwrap_err().to_string().contains("pending updates"));
+        assert!(unpacked.unwrap_err().to_string().contains("not configured"));
+    }
+
+    #[test]
+    fn linux_closure_rejects_private_file_mixed_into_portable_runtime() {
+        let scratch = tempfile::tempdir().unwrap();
+        let system = scratch.path().canonicalize().unwrap();
+        let bundle = system.join("extracted");
+        let program = file(&bundle, "program/soffice", b"abc");
+        file(&bundle, "program/soffice.bin", b"abc");
+        file(&bundle, "program/bootstraprc", b"abc");
+        file(&bundle, "share/component", b"abc");
+        let hash = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let evidence = [
+            "program/soffice",
+            "program/soffice.bin",
+            "program/bootstraprc",
+            "share/component",
+        ]
+        .map(|path| format!("{hash}  {path}\n"))
+        .concat();
+        file(&bundle, "SHA256SUMS", evidence.as_bytes());
+        assert!(verify(&program, &system).is_ok());
+        file(&bundle, "share/private.txt", b"private");
+        let error = verify(&program, &system).unwrap_err().to_string();
+        assert!(error.contains("private.txt"), "{error}");
     }
 
     #[test]
@@ -400,6 +673,7 @@ mod tests {
     fn linux_closure_verifies_dpkg_membership_and_content() {
         let scratch = tempfile::tempdir().unwrap();
         let system = scratch.path().canonicalize().unwrap();
+        fs::create_dir_all(system.join("var/lib/dpkg/updates")).unwrap();
         let program = file(&system, "usr/lib/libreoffice/program/soffice", b"abc");
         let config = file(&system, "etc/libreoffice/registry/main.xcd", b"abc");
         let conffile = file(&system, "etc/libreoffice/sofficerc", b"abc");
@@ -482,8 +756,20 @@ mod tests {
             "{error}"
         );
         fs::write(&config, b"abc").unwrap();
-        file(&system, "etc/libreoffice/unlisted", b"unverified");
+        let unlisted = file(&system, "etc/libreoffice/unlisted", b"unverified");
         let error = verify(&program, &system).unwrap_err().to_string();
         assert!(error.contains("unlisted"), "{error}");
+        fs::remove_file(unlisted).unwrap();
+
+        let (verified, sources) = snapshot(&program, &system).unwrap();
+        verified.verify(&sources, "control", deadline()).unwrap();
+        file(&system, "var/lib/dpkg/updates/0000", b"pending record");
+        let error = verified
+            .verify(&sources, "before launch", deadline())
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("Office package records changed"),
+            "{error}"
+        );
     }
 }

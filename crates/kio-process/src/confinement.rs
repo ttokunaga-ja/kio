@@ -218,7 +218,7 @@ impl RenderSources {
         })
     }
 
-    /// Overlay an empty read-only directory inside an existing Linux runtime bind.
+    /// Overlay an empty read-only directory at each Linux bind of the backing path.
     #[cfg(target_os = "linux")]
     pub fn with_masked_runtime_directory(mut self, path: &Path) -> Result<Self, ConfinementError> {
         if !is_normal_absolute_path(path)
@@ -227,16 +227,46 @@ impl RenderSources {
             || self
                 .roots
                 .iter()
-                .any(|(destination, _)| destination.starts_with(path))
-            || !self
-                .roots
-                .iter()
-                .any(|(destination, source)| destination == source && path.starts_with(destination))
+                .any(|(_, source)| source != path && source.starts_with(path))
         {
             return Err(ConfinementError::Runtime(path.into()));
         }
+
         self.masked_runtime_directory = Some(path.into());
+        let destinations = self.runtime_mask_destinations();
+        if destinations.is_empty()
+            || destinations.iter().any(|mask| {
+                self.program.starts_with(mask)
+                    || self.roots.iter().any(|(destination, source)| {
+                        destination.starts_with(mask) && (destination != mask || source != path)
+                    })
+            })
+        {
+            return Err(ConfinementError::Runtime(path.into()));
+        }
         Ok(self)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn runtime_mask_destinations(&self) -> Vec<PathBuf> {
+        let Some(path) = &self.masked_runtime_directory else {
+            return Vec::new();
+        };
+        let mut destinations: Vec<_> = self
+            .roots
+            .iter()
+            .filter_map(|(destination, source)| {
+                let relative = path.strip_prefix(source).ok()?;
+                if relative.as_os_str().is_empty() {
+                    Some(destination.clone())
+                } else {
+                    Some(destination.join(relative))
+                }
+            })
+            .collect();
+        destinations.sort_unstable();
+        destinations.dedup();
+        destinations
     }
 
     #[cfg(target_os = "linux")]
