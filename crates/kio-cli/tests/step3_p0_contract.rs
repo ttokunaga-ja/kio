@@ -16608,6 +16608,23 @@ fn p0_fourth_discarded_stage_does_not_claim_another_images_generation() {
 #[cfg(debug_assertions)]
 #[test]
 fn p0_fourth_failed_manifest_keeps_same_generation_history() {
+    check_failed_manifest_keeps_same_generation_history(None);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn p0_fifth_missing_second_page_preserves_healthy_history_from_rebuild_start() {
+    check_failed_manifest_keeps_same_generation_history(Some(false));
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn p0_fifth_existing_publication_cannot_retain_an_unreadable_manifest() {
+    check_failed_manifest_keeps_same_generation_history(Some(true));
+}
+
+#[cfg(debug_assertions)]
+fn check_failed_manifest_keeps_same_generation_history(missing_at_start: Option<bool>) {
     use kio_core::dag::{CommitStats, CommitType, build_tree};
     use kio_pipeline::markdownize::{NormalizedInstanceManifest, NormalizedUnitObject};
     let dir = canonical_tempdir();
@@ -16699,23 +16716,39 @@ fn p0_fourth_failed_manifest_keeps_same_generation_history() {
     )
     .unwrap();
 
-    let marker = canonical_tempdir();
-    let ready = marker.path().join("ready");
-    let child = pause_nc2_command(
-        &dir,
-        &ready,
-        "before_chunk_unit_read",
-        &["repair", "rebuild-db", "--offline"],
-    );
-    fs::remove_file(
-        store
-            .content_path(ContentObjectKind::NormalizedUnit, &hash)
-            .unwrap(),
-    )
-    .unwrap();
-    fs::write(ready.with_extension("release"), b"release").unwrap();
-    let output = child.wait_with_output().unwrap();
-    assert!(output.status.success(), "{output:?}");
+    let second_page = store
+        .content_path(ContentObjectKind::NormalizedUnit, &hash)
+        .unwrap();
+    if let Some(has_publication) = missing_at_start {
+        if has_publication {
+            json_success(&dir, &["repair", "rebuild-db", "--offline"]);
+            let conn = Connection::open(repo.kio_dir().join("index/sqlite.db")).unwrap();
+            let count: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM chunk_publications WHERE introduction_commit = ?1",
+                    [&head],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(count > 0);
+        }
+        fs::remove_file(second_page).unwrap();
+        let out = json_success(&dir, &["repair", "rebuild-db", "--offline"]);
+        assert_eq!(out["skipped_units"].as_array().unwrap().len(), 1, "{out}");
+    } else {
+        let marker = canonical_tempdir();
+        let ready = marker.path().join("ready");
+        let child = pause_nc2_command(
+            &dir,
+            &ready,
+            "before_chunk_unit_read",
+            &["repair", "rebuild-db", "--offline"],
+        );
+        fs::remove_file(second_page).unwrap();
+        fs::write(ready.with_extension("release"), b"release").unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
     let conn = Connection::open(repo.kio_dir().join("index/sqlite.db")).unwrap();
     let count: i64 = conn
         .query_row(

@@ -1939,7 +1939,7 @@ fn staged_normalized_instance(
             ));
         }
         if saved.discarding {
-            remove_normalized_stage_directory(workspace, &saved)?;
+            resume_normalized_stage_removal(workspace, &saved)?;
         } else if workspace
             .contains_entry(&saved.leaf)
             .map_err(|error| stage_error(workspace, error))?
@@ -2001,6 +2001,20 @@ fn open_staged_normalized_directory(
     Ok(directory)
 }
 
+fn resume_normalized_stage_removal(
+    workspace: &StoreDirectory,
+    saved: &SavedNormalizedDirectory,
+) -> Result<()> {
+    // A visible replacement may be the result of a rename whose parent
+    // sync failed. Make the deletion intent durable before removing the stage.
+    workspace
+        .control()
+        .checkpoint(kio_core::durability::DurabilityPoint::ExtractionBeforeDestinationSync)
+        .and_then(|()| workspace.sync())
+        .map_err(|error| stage_error(workspace, error))?;
+    remove_normalized_stage_directory(workspace, saved)
+}
+
 fn remove_normalized_stage_directory(
     workspace: &StoreDirectory,
     saved: &SavedNormalizedDirectory,
@@ -2027,7 +2041,7 @@ pub fn discard_normalized_stages(root: &StoreDirectory, raw_hash: &str) -> Resul
         let record = Path::new("instance.json");
         if let Some(mut saved) = read_record::<SavedNormalizedDirectory>(workspace, record, 4096)? {
             if saved.discarding {
-                remove_normalized_stage_directory(workspace, &saved)?;
+                resume_normalized_stage_removal(workspace, &saved)?;
             } else if workspace
                 .contains_entry(&saved.leaf)
                 .map_err(|error| stage_error(workspace, error))?
@@ -3998,6 +4012,48 @@ mod tests {
         .unwrap();
         assert_eq!(current, original);
         assert_eq!(fs::read(view).unwrap(), before);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn p0_fifth_resumed_discard_syncs_the_visible_marker_before_deleting() {
+        use kio_core::durability::DurabilityPoint;
+        use kio_core::test_control::{DebugTestControl, Selector};
+        let dir = canonical_tempdir();
+        let (identity, _, _) = normalized_fixture();
+        let root = StoreDirectory::open(dir.path()).unwrap();
+        let path = Path::new("extraction-stages/views")
+            .join(identity.raw_hash.trim_start_matches("sha256:"))
+            .join("a".repeat(64));
+        let workspace = child_directory(&root, &path).unwrap();
+        let (_, saved) = staged_normalized_instance(&workspace, &identity).unwrap();
+        let record = Path::new("instance.json");
+        let with_fault = |point| {
+            let mut debug = DebugTestControl::default();
+            debug.core.durability_point = Selector::Known(point);
+            debug.core.durability_storage_fault = true;
+            StoreDirectory::open_with_control(dir.path(), ControlHandle::new(debug)).unwrap()
+        };
+
+        let unsynced = with_fault(DurabilityPoint::AtomicWriteBeforeDirectorySync);
+        assert!(discard_normalized_stages(&unsynced, &identity.raw_hash).is_err());
+        assert!(
+            read_record::<SavedNormalizedDirectory>(&workspace, record, 4096)
+                .unwrap()
+                .unwrap()
+                .discarding
+        );
+
+        let retry = with_fault(DurabilityPoint::ExtractionBeforeDestinationSync);
+        assert!(discard_normalized_stages(&retry, &identity.raw_hash).is_err());
+        assert!(workspace.contains_entry(&saved.leaf).unwrap());
+        let retry_workspace = child_directory(&retry, &path).unwrap();
+        assert!(staged_normalized_instance(&retry_workspace, &identity).is_err());
+        assert!(workspace.contains_entry(&saved.leaf).unwrap());
+
+        discard_normalized_stages(&root, &identity.raw_hash).unwrap();
+        assert!(!workspace.contains_entry(&saved.leaf).unwrap());
+        assert!(!workspace.contains_entry(record).unwrap());
     }
 
     #[test]

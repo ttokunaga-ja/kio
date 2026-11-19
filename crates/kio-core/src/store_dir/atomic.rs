@@ -632,6 +632,9 @@ fn write_with_readonly(
         return Err(error);
     }
     workspace.sync()?;
+    owner
+        .control()
+        .checkpoint(crate::durability::DurabilityPoint::AtomicWriteBeforeDirectorySync)?;
     parent.sync()?;
     owner
         .control()

@@ -7,6 +7,7 @@ use crate::grants;
 use crate::historical_reindex::RetainedNormalizedInstance;
 use crate::historical_reindex::pinned_manifest;
 use crate::historical_reindex::retained_history_instances_for_roots;
+use crate::image_authority::{ImageAuthorityMap, image_owner_policy};
 use crate::index::chunk_ledger::ChunkPublicationEvent;
 use crate::index::chunk_ledger::StoredChunk;
 use crate::index::chunk_ledger::append_chunk_publication_events;
@@ -31,7 +32,9 @@ use crate::search::projection::write_through_projection_or_log_for_repo;
 use crate::search::scope::current_embedding_policy;
 use crate::settings::embedding_profile_summary;
 use crate::settings::persisted_embedding_is_deterministic;
-use crate::settings::rebuild_embedding_entry_from_tool_lock;
+use crate::settings::{
+    rebuild_embedding_entry_from_tool_lock, rebuild_embedding_profile_from_tool_lock,
+};
 use crate::verify_objects;
 use cap_primitives::fs as cap_fs;
 use kio_core::ExitCode;
@@ -61,7 +64,8 @@ use kio_index::fts::FtsTokenizer;
 use kio_index::fts::SqliteFtsIndex;
 use kio_pipeline::markdownize::{
     NormalizedInstanceIdentity, NormalizedInstanceManifest, NormalizedUnitManifestEntry,
-    UnitStatus, read_validated_normalized_unit, visit_validated_normalized_units,
+    UnitStatus, read_validated_normalized_unit, validate_normalized_manifest,
+    visit_validated_normalized_units,
 };
 use kio_pipeline::task::EmbeddingWorkKey;
 use kio_pipeline::task::TaskStatus;
@@ -231,11 +235,12 @@ pub(crate) fn retained_unit_introductions(
 /// those bodies are shared across the exact manifest pins that attest them.
 pub(crate) struct RebuildAuthorities {
     pub(crate) roots: BTreeSet<String>,
-    image_units: BTreeMap<NormalizedInstanceCacheKey, PayloadRef>,
-    image_payloads: Option<RecordPayloads<crate::image_authority::OwnedUnitImages>>,
+    image_units: Option<StagedImageOwnership>,
     units: AuthenticatedNormalizedUnits,
     pub(crate) publication: PublicationAuthenticationCache,
 }
+
+type StagedImageOwnership = DiskRecords<(NormalizedInstanceCacheKey, String)>;
 
 fn manifest_pin(raw: &str, normalize: &NormalizeRef) -> NormalizedInstanceCacheKey {
     (
@@ -250,63 +255,19 @@ fn stage_rebuild_authorities(
     repo: &Repository,
     instances: &[RetainedNormalizedInstance],
     roots: BTreeSet<String>,
-) -> Result<RebuildAuthorities> {
+    image_targets: &BTreeSet<String>,
+) -> Result<(RebuildAuthorities, Vec<SkippedUnit>)> {
     let store = repo.object_store();
     let stages = store.record_stages()?;
     let mut payloads = PayloadWriter::new(&stages)?;
-    let mut image_payloads = None;
+    let mut image_stage = None;
     let mut references = BTreeMap::new();
-    let mut image_units = BTreeMap::new();
     let mut publication = PublicationAuthenticationCache::default();
+    let mut unreadable = Vec::new();
     for instance in instances {
         let pin = manifest_pin(&instance.raw_hash, &instance.normalize);
-        let mut stage_error = None;
-        let mut images = Vec::new();
-        let loaded = (|| {
-            let manifest = pinned_manifest(repo, &instance.raw_hash, &instance.normalize)?;
-            let mut closure = BTreeSet::new();
-            visit_validated_normalized_units(&store, &manifest, |unit| {
-                if !unit.owned_image_hashes.is_empty() {
-                    images.push((unit.unit_key.clone(), unit.owned_image_hashes));
-                }
-                let hash = kio_core::cas::hash_bytes(unit.markdown.as_bytes());
-                let key = (
-                    pin.0.clone(),
-                    pin.1.clone(),
-                    pin.2,
-                    unit.unit_key.clone(),
-                    hash.clone(),
-                );
-                if let std::collections::btree_map::Entry::Vacant(entry) = references.entry(key) {
-                    entry.insert(payloads.push(&unit.markdown).map_err(|error| {
-                        let message = error.to_string();
-                        stage_error = Some(error);
-                        kio_pipeline::PipelineError::Schema(message)
-                    })?);
-                }
-                closure.insert((unit.unit_key, hash));
-                Ok(())
-            })
-            .map_err(pipeline_to_kio)?;
-            Ok(closure)
-        })();
-        if let Some(error) = stage_error {
-            return Err(error);
-        }
-        match loaded {
-            Ok(closure) => {
-                if !images.is_empty() {
-                    if image_payloads.is_none() {
-                        image_payloads = Some(PayloadWriter::new(&stages)?);
-                    }
-                    let reference = image_payloads
-                        .as_mut()
-                        .expect("created image stage")
-                        .push(&images)?;
-                    image_units.insert(pin.clone(), reference);
-                }
-                publication.pinned_unit_closures.insert(pin, closure);
-            }
+        let manifest = match pinned_manifest(repo, &instance.raw_hash, &instance.normalize) {
+            Ok(manifest) => manifest,
             Err(error) => {
                 if verify_objects::purge_explains_missing_retained_instance(
                     repo,
@@ -317,8 +278,97 @@ fn stage_rebuild_authorities(
                 }
                 return Err(error);
             }
+        };
+        let identity = NormalizedInstanceIdentity {
+            raw_hash: pin.0.clone(),
+            tool_profile_hash: pin.1.clone(),
+            r#gen: pin.2,
+        };
+        validate_normalized_manifest(Path::new("normalized manifest"), &identity, &manifest)
+            .map_err(pipeline_to_kio)?;
+        let mut closure = BTreeSet::new();
+        let mut read_error = None;
+        let entries = manifest
+            .units
+            .iter()
+            .filter(|entry| entry.status == UnitStatus::Done);
+        for entry in entries.clone() {
+            let unit = match read_validated_normalized_unit(&store, &identity, entry) {
+                Ok(unit) => unit,
+                Err(error) => {
+                    read_error = Some(pipeline_to_kio(error));
+                    break;
+                }
+            };
+            for hash in unit
+                .owned_image_hashes
+                .into_iter()
+                .filter(|hash| image_targets.contains(hash))
+            {
+                if image_stage.is_none() {
+                    image_stage = Some(RecordWriter::new(&stages)?);
+                }
+                image_stage
+                    .as_mut()
+                    .expect("created image stage")
+                    .push(&(pin.clone(), hash))?;
+            }
+            let hash = kio_core::cas::hash_bytes(unit.markdown.as_bytes());
+            let key = (
+                pin.0.clone(),
+                pin.1.clone(),
+                pin.2,
+                unit.unit_key.clone(),
+                hash.clone(),
+            );
+            if let std::collections::btree_map::Entry::Vacant(entry) = references.entry(key) {
+                entry.insert(payloads.push(&unit.markdown)?);
+            }
+            closure.insert((unit.unit_key, hash));
+        }
+        if let Some(error) = read_error {
+            if verify_objects::purge_explains_missing_retained_instance(
+                repo,
+                &instance.raw_hash,
+                &instance.normalize,
+            )? {
+                continue;
+            }
+            if !is_rebuild_skippable_unit_error(&error) {
+                return Err(error);
+            }
+            publication.unreadable_unit_keys.insert(
+                pin.clone(),
+                entries.map(|entry| entry.unit_key.clone()).collect(),
+            );
+            publication.unavailable_pins.insert(pin.clone());
+            unreadable.push((pin, instance, error));
+        } else {
+            publication.pinned_unit_closures.insert(pin, closure);
         }
     }
+    let mut skipped = Vec::new();
+    for (pin, instance, error) in unreadable {
+        // Preserve the existing fail-closed rebuild for a missing pinned unit
+        // without any verified same-generation history to recover.
+        let has_healthy_pin = publication
+            .pinned_unit_closures
+            .range((pin.0.clone(), pin.1.clone(), pin.2, String::new())..)
+            .next()
+            .is_some_and(|(healthy, _)| {
+                (&healthy.0, &healthy.1, healthy.2) == (&pin.0, &pin.1, pin.2)
+            });
+        if !has_healthy_pin {
+            return Err(error);
+        }
+        skipped.push(SkippedUnit {
+            raw_hash: instance.raw_hash.clone(),
+            path: instance.raw_path.clone(),
+            r#gen: instance.normalize.r#gen,
+            reason: error.error_code().to_owned(),
+        });
+    }
+    let image_units = image_stage.map(RecordWriter::finish).transpose()?;
     let reader = Arc::new(StagedUnitReader {
         bodies: payloads.finish()?,
         cached: Mutex::new(None),
@@ -350,13 +400,15 @@ fn stage_rebuild_authorities(
             }
         }
     }
-    Ok(RebuildAuthorities {
-        roots,
-        image_units,
-        image_payloads: image_payloads.map(PayloadWriter::finish).transpose()?,
-        units,
-        publication,
-    })
+    Ok((
+        RebuildAuthorities {
+            roots,
+            image_units,
+            units,
+            publication,
+        },
+        skipped,
+    ))
 }
 
 impl RebuildAuthorities {
@@ -388,25 +440,42 @@ impl RebuildAuthorities {
             })
     }
 
-    fn owned_unit_images(
+    fn replay_image_authority(
         &self,
-        instance: &RetainedNormalizedInstance,
-    ) -> Result<Option<crate::image_authority::OwnedUnitImages>> {
-        let pin = manifest_pin(&instance.raw_hash, &instance.normalize);
-        if self.publication.unavailable_pins.contains(&pin)
-            || !self.publication.pinned_unit_closures.contains_key(&pin)
-        {
-            return Ok(None);
-        }
-        let images = match self.image_units.get(&pin) {
-            Some(reference) => self
-                .image_payloads
-                .as_ref()
-                .expect("image stage")
-                .read(*reference)?,
-            None => Vec::new(),
+        instances: &[RetainedNormalizedInstance],
+        policy: &kio_pipeline::policy::CurrentPolicyEvaluator,
+    ) -> Result<ImageAuthorityMap> {
+        let mut authority = ImageAuthorityMap::default();
+        let Some(stage) = &self.image_units else {
+            return Ok(authority);
         };
-        Ok(Some(images))
+        let mut rows = stage.iter().peekable();
+        // Rows were written in the same order as the retained instances.
+        for instance in instances {
+            let pin = manifest_pin(&instance.raw_hash, &instance.normalize);
+            let verified = self.publication.pinned_unit_closures.contains_key(&pin)
+                && !self.publication.unavailable_pins.contains(&pin);
+            let mut owner = None;
+            while rows
+                .peek()
+                .is_some_and(|row| row.as_ref().map_or(true, |(key, _)| *key == pin))
+            {
+                let (_, hash) = rows.next().expect("peeked ownership record")?;
+                if verified {
+                    if owner.is_none() {
+                        owner = Some(image_owner_policy(instance, policy)?);
+                    }
+                    authority
+                        .record_owned_hash(hash, owner.as_ref().expect("evaluated image owner"))?;
+                }
+            }
+        }
+        if rows.next().transpose()?.is_some() {
+            return Err(KioError::schema(
+                "staged image owner has no retained manifest",
+            ));
+        }
+        Ok(authority)
     }
 
     fn retain_available_introductions(&mut self, instances: &[RetainedNormalizedInstance]) {
@@ -589,8 +658,18 @@ fn read_creation_metadata(kio_dir: &Path) -> Result<Vec<StoredChunk>> {
 }
 
 pub(crate) fn durable_history_roots(repo: &Repository) -> Result<BTreeSet<String>> {
-    let ref_roots = repo.current_ref_targets()?;
-    let mut roots = ref_roots.clone();
+    durable_history_roots_with(
+        repo,
+        repo.current_ref_targets()?,
+        &mut PublicationAuthenticationCache::default(),
+    )
+}
+
+fn durable_history_roots_with(
+    repo: &Repository,
+    mut roots: BTreeSet<String>,
+    authentication_cache: &mut PublicationAuthenticationCache,
+) -> Result<BTreeSet<String>> {
     let final_shallow_commits = final_shallow_commit_set(repo)?;
     let creations = read_creation_metadata(repo.kio_dir())?;
     let events = read_chunk_publication_events(repo.kio_dir())?;
@@ -606,8 +685,6 @@ pub(crate) fn durable_history_roots(repo: &Repository) -> Result<BTreeSet<String
             ))
             .or_insert(creation);
     }
-    let mut authentication_cache = PublicationAuthenticationCache::default();
-
     // Publication events authenticate associations, but cannot introduce a
     // different history. Prove their membership in the HEAD chain below.
     for event in &events {
@@ -623,7 +700,7 @@ pub(crate) fn durable_history_roots(repo: &Repository) -> Result<BTreeSet<String
             repo.kio_dir(),
             event,
             creation,
-            &mut authentication_cache,
+            authentication_cache,
         )? {
             roots.insert(event.introduction_commit.clone());
         }
@@ -780,8 +857,20 @@ pub(crate) fn rebuild_step3_index(
         .transpose()?;
     let existing = read_creation_metadata(repo.kio_dir())
         .map_err(|error| annotate_index_stage(error, "read chunk ledger"))?;
-    let rebuild_roots = durable_history_roots(repo)
-        .map_err(|error| annotate_index_stage(error, "authenticate history roots"))?;
+    let ref_roots = repo.current_ref_targets()?;
+    // Publication events can only keep ancestors of the published HEAD.
+    // Inspect the pins in that ref graph before authenticating those events,
+    // so root selection and replay agree on which exact pins can attest them.
+    let retained_instances = retained_history_instances_for_roots(repo, &ref_roots)
+        .map_err(|error| annotate_index_stage(error, "load retained instances"))?;
+    let image_targets = rebuild_image_targets(repo)?;
+    let (mut authorities, mut skipped_units) =
+        stage_rebuild_authorities(repo, &retained_instances, ref_roots.clone(), &image_targets)
+            .map_err(|error| annotate_index_stage(error, "authenticate retained units"))?;
+    authorities.roots =
+        durable_history_roots_with(repo, ref_roots, &mut authorities.publication)
+            .map_err(|error| annotate_index_stage(error, "authenticate history roots"))?;
+    let rebuild_roots = &authorities.roots;
     if rebuild_roots.is_empty() {
         return Ok(Step3RebuildReport::default());
     }
@@ -797,7 +886,7 @@ pub(crate) fn rebuild_step3_index(
     // the old database. Every root was proven to belong to HEAD ancestry.
     let mut tree_rows = BTreeMap::<(String, String), TreeEntryRow>::new();
     let (graph, _) = HistoryReader::new_with_store(repo.kio_dir(), repo.object_store())
-        .walk_for_roots_allow_shallowed(&rebuild_roots)
+        .walk_for_roots_allow_shallowed(rebuild_roots)
         .map_err(|error| annotate_index_stage(error, "walk retained history"))?;
     for node in graph.nodes_in_visit_order() {
         for entry in &node.tree.entries {
@@ -834,10 +923,6 @@ pub(crate) fn rebuild_step3_index(
     // several `step3_p0_contract.rs` history/deleted-content tests). Instead this
     // rebuild-only set below narrows WHICH retained instances may receive a brand
     // NEW `chunk_config_generations` association this pass — see the loop below.
-    let retained_instances = retained_history_instances_for_roots(repo, &rebuild_roots)
-        .map_err(|error| annotate_index_stage(error, "load retained instances"))?;
-    let mut authorities = stage_rebuild_authorities(repo, &retained_instances, rebuild_roots)
-        .map_err(|error| annotate_index_stage(error, "authenticate retained units"))?;
     let retained_instance_keys = retained_instances
         .iter()
         .map(|instance| manifest_pin(&instance.raw_hash, &instance.normalize))
@@ -909,7 +994,6 @@ pub(crate) fn rebuild_step3_index(
     // reported here rather than aborting the whole rebuild (docs/10 §7.2: "最悪
     // objects/ と refs/ が保全されていれば復旧できる" — one bad unit must not veto
     // the recovery of every healthy document). Never silent: the caller surfaces this.
-    let mut skipped_units = Vec::<SkippedUnit>::new();
     let mut first_document = true;
 
     // PC61/62 (04 §4.6, U145): a retained instance NOT referenced by HEAD's own
@@ -983,6 +1067,10 @@ pub(crate) fn rebuild_step3_index(
                                 introduction: Option<&String>,
                                 retained: bool|
      -> Result<()> {
+        let pin = manifest_pin(raw, normalize);
+        if authorities.publication.unavailable_pins.contains(&pin) {
+            return Ok(());
+        }
         match stage_document_chunks(repo, raw, path, normalize, &config, &mut first_document)? {
             DocumentChunks::Ready { rows, bodies } => publish(rows, bodies, introduction),
             DocumentChunks::Unavailable(error) => {
@@ -996,10 +1084,7 @@ pub(crate) fn rebuild_step3_index(
                 if !is_rebuild_skippable_unit_error(&error) {
                     return Err(error);
                 }
-                authorities
-                    .publication
-                    .unavailable_pins
-                    .insert(manifest_pin(raw, normalize));
+                authorities.publication.unavailable_pins.insert(pin);
                 skipped_units.push(SkippedUnit {
                     raw_hash: raw.to_owned(),
                     path: path.to_owned(),
@@ -1053,6 +1138,8 @@ pub(crate) fn rebuild_step3_index(
     }
 
     authorities.retain_available_introductions(&retained_instances);
+    // An attestation cached while selecting roots predates document staging.
+    authorities.publication.attestations.clear();
 
     // A creation record proves only that the chunk/config association is
     // durable.  Publication is a separate fact: every retained manifest
@@ -1523,6 +1610,26 @@ fn rebuild_sqlite_index(
 /// not be crossed. Objects whose profile is not the live one are skipped rather
 /// than replayed — 04 §4.3 requires the rebuild to bind exactly one candidate
 /// per chunk, and several profiles can legitimately coexist in the store.
+fn rebuild_image_targets(repo: &Repository) -> Result<BTreeSet<String>> {
+    let Some(expected) = rebuild_embedding_profile_from_tool_lock(repo.kio_dir())? else {
+        return Ok(BTreeSet::new());
+    };
+    let store = repo.object_store();
+    Ok(store
+        .embedding_hashes()?
+        .into_iter()
+        .filter_map(|hash| {
+            let object = store.read_embedding(&hash).ok()?;
+            (object.target_type == "image"
+                && object.dimensions == expected.dimensions
+                && object.distance == expected.distance
+                && object.modality == expected.modality
+                && object.profile_hash == expected.profile_hash)
+                .then_some(object.target_hash)
+        })
+        .collect())
+}
+
 /// Replay image vectors from `objects/embeddings/` into `embeddings` +
 /// `image_vec` (04 §4.3's rebuild order, last step).
 ///
@@ -1541,18 +1648,17 @@ fn replay_image_embeddings_from_objects(
     retained_chunks: &[RetainedEmbeddingChunk],
     secrets_allowed: bool,
 ) -> Result<()> {
-    let store = repo.object_store();
-    let hashes = store.embedding_hashes()?;
-    if hashes.is_empty() {
+    let (retained_instances, authorities) = sources;
+    let Some(expected) = expected_profile else {
+        return Ok(());
+    };
+    if authorities.image_units.is_none() {
         return Ok(());
     }
+    let store = repo.object_store();
+    let hashes = store.embedding_hashes()?;
     let policy = current_embedding_policy(repo)?;
-    let (retained_instances, authorities) = sources;
-    let authority = crate::image_authority::retained_image_authority_with(
-        retained_instances,
-        &policy,
-        |instance| authorities.owned_unit_images(instance),
-    )?;
+    let authority = authorities.replay_image_authority(retained_instances, &policy)?;
     let scope_id = repo.scope_identity()?.scope_id;
     let eligible = crate::embedding::input::referenced_authorized_image_hashes_for_chunks(
         retained_chunks,
@@ -1575,9 +1681,6 @@ fn replay_image_embeddings_from_objects(
         if object.target_type != "image" || !eligible.contains(&object.target_hash) {
             continue;
         }
-        let Some(expected) = expected_profile else {
-            continue;
-        };
         if object.dimensions != expected.dimensions
             || object.distance != expected.distance
             || object.modality != expected.modality
@@ -1779,6 +1882,7 @@ pub(crate) struct PublicationAuthenticationCache {
     trees: BTreeMap<String, CachedPublicationTree>,
     pinned_unit_closures: BTreeMap<NormalizedInstanceCacheKey, BTreeSet<(String, String)>>,
     unavailable_pins: BTreeSet<NormalizedInstanceCacheKey>,
+    unreadable_unit_keys: BTreeMap<NormalizedInstanceCacheKey, BTreeSet<String>>,
     attestations: BTreeMap<PublicationAttestationCacheKey, bool>,
 }
 
@@ -1892,6 +1996,12 @@ pub(crate) fn authenticate_publication_event_cached(
             normalize.r#gen,
             normalize.manifest_hash.clone(),
         );
+        if let Some(keys) = cache.unreadable_unit_keys.get(&unit_key) {
+            // A structurally valid pin can identify the skipped unit but
+            // cannot attest a chunk without a verified unit closure.
+            skipped_attestation |= keys.contains(&creation.row.unit_key);
+            continue;
+        }
         if !cache.pinned_unit_closures.contains_key(&unit_key) {
             let manifest = pinned_manifest(repo, &creation.row.raw_hash, &normalize)?;
             let mut closure = BTreeSet::new();
@@ -2186,4 +2296,116 @@ fn build_sqlite_index_at(
         .map_err(|err| KioError::schema(err.to_string()))?;
     drop(fts);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kio_core::cas::{ContentObjectKind, hash_bytes};
+    use kio_pipeline::markdownize::{
+        MarkdownizeMode, NormalizedUnitManifestEntry, NormalizedUnitObject, PreparationProvenance,
+    };
+    use kio_pipeline::prepare::{UnitType, unit_ref};
+
+    #[test]
+    fn p0_fifth_image_ownership_is_only_staged_for_image_replay() {
+        let root = tempfile::tempdir().unwrap();
+        let crate::management::ExplicitRoot::Created(repo) =
+            crate::management::initialize_explicit_root(root.path(), &ControlHandle::default())
+                .unwrap()
+        else {
+            panic!("fresh root must be created");
+        };
+        let store = repo.object_store();
+        let raw_hash = hash_bytes(b"source");
+        let profile = hash_bytes(b"profile");
+        let image_hash = hash_bytes(b"owned image");
+        let generated_at = "2026-11-20T00:00:00Z".to_owned();
+        let mut manifest = NormalizedInstanceManifest {
+            raw_hash: raw_hash.clone(),
+            tool_profile_hash: profile.clone(),
+            r#gen: 0,
+            parent_gen: None,
+            run_id: "p0-image-ownership".into(),
+            preparation_provenance: PreparationProvenance::local(),
+            units: Vec::new(),
+            generated_at: generated_at.clone(),
+        };
+        for order in 0..2 {
+            let unit = NormalizedUnitObject {
+                unit_key: format!("page:{}", order + 1),
+                unit_type: UnitType::Page,
+                raw_hash: raw_hash.clone(),
+                prepared_hash: hash_bytes(b"prepared"),
+                preparation_profile_hash: hash_bytes(b"preparation profile"),
+                tool_profile_hash: profile.clone(),
+                r#gen: 0,
+                mode: MarkdownizeMode::Full,
+                markdown: format!("page {order}"),
+                owned_image_hashes: BTreeSet::from([image_hash.clone()]),
+                metadata: BTreeMap::new(),
+                reused_from: None,
+                generated_at: generated_at.clone(),
+            };
+            let hash = store
+                .write_content_object(
+                    ContentObjectKind::NormalizedUnit,
+                    &serde_jcs::to_vec(&unit).unwrap(),
+                )
+                .unwrap();
+            manifest.units.push(NormalizedUnitManifestEntry {
+                order,
+                unit_ref: unit_ref(&unit.unit_key),
+                unit_key: unit.unit_key,
+                unit_type: unit.unit_type,
+                status: UnitStatus::Done,
+                prepared_hash: unit.prepared_hash,
+                preparation_profile_hash: unit.preparation_profile_hash,
+                unit_object_hash: Some(hash),
+                resource_limit: None,
+                error_kind: None,
+            });
+        }
+        let manifest_hash = store
+            .write_content_object(
+                ContentObjectKind::Manifest,
+                &serde_jcs::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+        let instances = [RetainedNormalizedInstance {
+            raw_hash,
+            normalize: NormalizeRef {
+                tool_profile_hash: profile,
+                r#gen: 0,
+                manifest_hash,
+            },
+            raw_path: "public.pdf".to_owned(),
+            policy_paths: BTreeSet::from(["public.pdf".to_owned()]),
+            introductions: Vec::new(),
+        }];
+        let targets = rebuild_image_targets(&repo).unwrap();
+        assert!(targets.is_empty());
+        let (authorities, _) =
+            stage_rebuild_authorities(&repo, &instances, BTreeSet::new(), &targets).unwrap();
+        assert!(authorities.image_units.is_none());
+
+        let (authorities, _) = stage_rebuild_authorities(
+            &repo,
+            &instances,
+            BTreeSet::new(),
+            &BTreeSet::from([image_hash.clone()]),
+        )
+        .unwrap();
+        let stage = authorities.image_units.as_ref().unwrap();
+        assert_eq!(
+            stage.len(),
+            2,
+            "each unit contributes an owned-image record"
+        );
+        let policy = current_embedding_policy(&repo).unwrap();
+        let authority = authorities
+            .replay_image_authority(&instances, &policy)
+            .unwrap();
+        assert!(authority.permits(&image_hash));
+    }
 }

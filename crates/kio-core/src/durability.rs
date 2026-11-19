@@ -61,6 +61,7 @@ pub enum DurabilityPoint {
     StageFileCreated,
     AtomicWriteStaged,
     AtomicWritePublished,
+    AtomicWriteBeforeDirectorySync,
     AtomicRemoveReady,
     AtomicRemoveQuarantined,
     AtomicRemoveDeleted,
@@ -127,6 +128,7 @@ impl DurabilityPoint {
             "stage_file_created" => Some(Self::StageFileCreated),
             "atomic_write_staged" => Some(Self::AtomicWriteStaged),
             "atomic_write_published" => Some(Self::AtomicWritePublished),
+            "atomic_write_before_directory_sync" => Some(Self::AtomicWriteBeforeDirectorySync),
             "atomic_remove_ready" => Some(Self::AtomicRemoveReady),
             "atomic_remove_quarantined" => Some(Self::AtomicRemoveQuarantined),
             "atomic_remove_deleted" => Some(Self::AtomicRemoveDeleted),
@@ -194,6 +196,7 @@ impl DurabilityPoint {
             Self::StageFileCreated => "stage_file_created",
             Self::AtomicWriteStaged => "atomic_write_staged",
             Self::AtomicWritePublished => "atomic_write_published",
+            Self::AtomicWriteBeforeDirectorySync => "atomic_write_before_directory_sync",
             Self::AtomicRemoveReady => "atomic_remove_ready",
             Self::AtomicRemoveQuarantined => "atomic_remove_quarantined",
             Self::AtomicRemoveDeleted => "atomic_remove_deleted",
@@ -250,6 +253,7 @@ fn checkpoint_debug(owner: &crate::control::ControlHandle, point: DurabilityPoin
                     | DurabilityPoint::ExtractionBeforeDestinationSync
                     | DurabilityPoint::ExtractionDirectoryBeforeSync
                     | DurabilityPoint::BeforeAdapterSourceRead
+                    | DurabilityPoint::AtomicWriteBeforeDirectorySync
             ))
     {
         return Err(crate::error::ResourceLimit {
