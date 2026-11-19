@@ -314,21 +314,7 @@ pub(crate) fn classify_online_markdownize_precondition(
         Ok(max) => max,
         Err(error) => return OnlineMarkdownizePrecondition::PolicyUnavailable(error),
     };
-    let path = repository_input_display_path(repo, &task.input_path);
-    let media_type = media_type_for_cli_path(&path);
-    // PDF and raster requests carry the exact verified source bytes. Their
-    // send cap can be checked without allocating the payload.
-    if supports_ocr_from_scratch(media_type)
-        && !raw_ingest_is_purge_blocked(repo, &task.input_hash)
-        && repository_scan_policy_allows_file(repo, &task.input_path).unwrap_or(false)
-        && let Ok(identity) =
-            crate::index::command::hash_repository_scan_input(repo, &task.input_path)
-        && identity.raw_hash == task.input_hash
-        && identity.size_bytes > max
-    {
-        return OnlineMarkdownizePrecondition::OversizedPreparedInput;
-    }
-    let mut input = match classify_markdownize_source(repo, task) {
+    let mut input = match classify_markdownize_source_for_admission(repo, task, Some(max)) {
         OnlineMarkdownizePrecondition::Send(input) => input,
         other => return other,
     };
@@ -351,10 +337,59 @@ pub(crate) fn classify_online_markdownize_precondition(
     OnlineMarkdownizePrecondition::Send(input)
 }
 
+fn read_current_adapter_source(
+    repo: &Repository,
+    task: &TaskDescriptor,
+    passthrough_max: Option<u64>,
+) -> std::result::Result<kio_pipeline::scan::VerifiedScanInput, OnlineMarkdownizePrecondition> {
+    let identity = crate::index::command::hash_repository_scan_input(repo, &task.input_path)
+        .map_err(|_| OnlineMarkdownizePrecondition::Retire)?;
+    if identity.raw_hash != task.input_hash {
+        return Err(OnlineMarkdownizePrecondition::Retire);
+    }
+    if passthrough_max.is_some_and(|max| identity.size_bytes > max) {
+        return Err(OnlineMarkdownizePrecondition::OversizedPreparedInput);
+    }
+    if let Err(error) = repo
+        .control()
+        .checkpoint(kio_core::durability::DurabilityPoint::BeforeAdapterSourceRead)
+    {
+        return Err(match error.resource_limit() {
+            Some(limit) => OnlineMarkdownizePrecondition::ResourceLimit(limit.clone()),
+            None => OnlineMarkdownizePrecondition::PolicyUnavailable(error),
+        });
+    }
+    let verified = match read_verified_adapter_source(repo, &task.input_path, identity.size_bytes) {
+        Ok(input) => input,
+        Err(kio_pipeline::PipelineError::ResourceLimit(limit)) => {
+            if limit
+                .observed
+                .is_some_and(|size| size > identity.size_bytes)
+            {
+                return Err(OnlineMarkdownizePrecondition::Retire);
+            }
+            return Err(OnlineMarkdownizePrecondition::ResourceLimit(limit));
+        }
+        Err(_) => return Err(OnlineMarkdownizePrecondition::Retire),
+    };
+    if verified.raw_hash != task.input_hash {
+        return Err(OnlineMarkdownizePrecondition::Retire);
+    }
+    Ok(verified)
+}
+
 /// Authenticate current source for result adoption independently of send policy.
 pub(super) fn classify_markdownize_source(
     repo: &Repository,
     task: &TaskDescriptor,
+) -> OnlineMarkdownizePrecondition {
+    classify_markdownize_source_for_admission(repo, task, None)
+}
+
+fn classify_markdownize_source_for_admission(
+    repo: &Repository,
+    task: &TaskDescriptor,
+    send_max: Option<u64>,
 ) -> OnlineMarkdownizePrecondition {
     if raw_ingest_is_purge_blocked(repo, &task.input_hash) {
         return OnlineMarkdownizePrecondition::Retire;
@@ -367,16 +402,11 @@ pub(super) fn classify_markdownize_source(
     if is_text_native_media(&media_type) {
         return OnlineMarkdownizePrecondition::Retire;
     }
-    let verified = match read_verified_adapter_source(repo, &task.input_path, &media_type) {
+    let passthrough_max = send_max.filter(|_| supports_ocr_from_scratch(&media_type));
+    let verified = match read_current_adapter_source(repo, task, passthrough_max) {
         Ok(input) => input,
-        Err(kio_pipeline::PipelineError::ResourceLimit(limit)) => {
-            return OnlineMarkdownizePrecondition::ResourceLimit(limit);
-        }
-        Err(_) => return OnlineMarkdownizePrecondition::Retire,
+        Err(disposition) => return disposition,
     };
-    if verified.raw_hash != task.input_hash {
-        return OnlineMarkdownizePrecondition::Retire;
-    }
     let prepare_profile_hash = builtin_prepare_profile().tool_profile_hash;
     let input_path = path.display().to_string();
     let prepare = match prepare_units_from_bytes_with_control(
@@ -2426,6 +2456,62 @@ fn task_failure_from_pipeline(error: kio_pipeline::PipelineError) -> TaskExecuti
 #[cfg(test)]
 mod resource_failure_tests {
     use super::*;
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn p0_third_stale_ocr_source_is_retired_before_body_read() {
+        use kio_core::{
+            durability::DurabilityPoint,
+            test_control::{CoreTestControl, DebugTestControl, Selector},
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().canonicalize().unwrap();
+        let root = kio_core::store_dir::StoreDirectory::open(&path).unwrap();
+        let control = ControlHandle::new(DebugTestControl {
+            core: CoreTestControl {
+                durability_point: Selector::Known(DurabilityPoint::BeforeAdapterSourceRead),
+                durability_storage_fault: true,
+                ..CoreTestControl::default()
+            },
+            ..DebugTestControl::default()
+        });
+        let repo = Repository::init_bound_with_control(
+            path.clone(),
+            root.root_handle().try_clone().unwrap(),
+            control,
+        )
+        .unwrap();
+        let current = b"%PDF-1.4 replacement";
+        std::fs::write(path.join("note.pdf"), current).unwrap();
+        let candidate = ScanCandidate {
+            input_path: "note.pdf".into(),
+            media_type: "application/pdf".into(),
+            size_bytes: current.len() as u64,
+            raw_hash: None,
+            ignored: false,
+            quarantine_reason: None,
+        };
+        let mut task = task_descriptor(
+            &repo,
+            TaskType::Markdownize,
+            Some(MarkdownizeMode::Full),
+            &candidate,
+            &kio_core::cas::hash_bytes(b"previous"),
+            "pending",
+            TaskStatus::Pending,
+            None,
+            "2026-11-20T00:00:00Z",
+        );
+        assert!(matches!(
+            read_current_adapter_source(&repo, &task, None),
+            Err(OnlineMarkdownizePrecondition::Retire)
+        ));
+        task.input_hash = kio_core::cas::hash_bytes(current);
+        assert!(matches!(
+            read_current_adapter_source(&repo, &task, None),
+            Err(OnlineMarkdownizePrecondition::ResourceLimit(_))
+        ));
+    }
 
     #[test]
     fn resource_limit_local_ocr_failure_and_mirror_preserve_verified_done_units() {

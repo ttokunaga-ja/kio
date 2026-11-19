@@ -1,12 +1,12 @@
 use crate::object_persistence::{bound_extraction_store, normalized_output_ref, pipeline_to_kio};
 use kio_core::cas::is_hash;
 use kio_core::dag::{NormalizeRef, TreeObject};
+use kio_core::disk_records::{DiskRecords, RecordSorter, RecordWriter, decode_bounded_json};
 use kio_core::scope::Repository;
 use kio_core::store_dir::Publication;
 use kio_core::{KioError, Result};
 use kio_pipeline::task::{EXTRACTION_HOLD_OUTPUT_REF, TaskStatus, TaskStore};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
 
@@ -23,36 +23,47 @@ pub(super) struct Retirement {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Journal<R = Vec<Retirement>> {
+struct Journal {
     head: String,
     parent: Option<String>,
-    retire: R,
+    retire: DiskRecords<Retirement>,
 }
 
 pub(super) fn record(
     repo: &Repository,
     head: &str,
     tree: &TreeObject,
-    completed: &[Retirement],
+    completed: &DiskRecords<Retirement>,
 ) -> Result<()> {
-    let wanted: BTreeSet<_> = completed
-        .iter()
-        .filter(|item| item.hold.is_some())
-        .map(|item| item.path.as_str())
-        .collect();
-    let mut committed = BTreeMap::new();
-    if !wanted.is_empty() {
-        for entry in &tree.entries {
-            let entry = entry?;
-            if wanted.contains(entry.path.as_str()) {
-                committed.insert(entry.path, entry.raw_hash);
+    let stages = repo.object_store().record_stages()?;
+    let mut by_path = RecordSorter::new(&stages, |a: &Retirement, b| a.path.cmp(&b.path));
+    let mut retire = RecordWriter::new(&stages)?;
+    for item in completed {
+        let item = item?;
+        if item.hold.is_none() {
+            retire.push(&item)?;
+        } else {
+            by_path.push(item)?;
+        }
+    }
+    let paths = by_path.finish()?;
+    if !paths.is_empty() {
+        let mut tree = tree.entries.iter();
+        let mut entry = tree.next().transpose()?;
+        for item in &paths {
+            let item = item?;
+            while entry.as_ref().is_some_and(|entry| entry.path < item.path) {
+                entry = tree.next().transpose()?;
+            }
+            if entry
+                .as_ref()
+                .is_some_and(|entry| entry.path == item.path && entry.raw_hash == item.raw)
+            {
+                retire.push(&item)?;
             }
         }
     }
-    let retire = completed
-        .iter()
-        .filter(|item| item.hold.is_none() || committed.get(&item.path) == Some(&item.raw))
-        .collect::<Vec<_>>();
+    let retire = retire.finish()?;
     let directory = bound_extraction_store(repo)?;
     directory.create_directory_all(Path::new("extraction-stages"))?;
 
@@ -109,9 +120,9 @@ fn recover_with(
 ) -> Result<bool> {
     let directory = bound_extraction_store(repo)?;
     let path = Path::new(JOURNAL);
+    let stages = repo.object_store().record_stages()?;
     let parsed = directory.read_optional_with(path, u64::MAX, |reader| {
-        serde_json::from_reader(BufReader::new(reader))
-            .map_err(|error| KioError::schema(error.to_string()))
+        decode_bounded_json(&stages, BufReader::new(reader))
     })?;
     let Some(journal): Option<Journal> = parsed else {
         return Ok(false);
@@ -121,9 +132,15 @@ fn recover_with(
             .parent
             .as_deref()
             .is_some_and(|parent| !is_hash(parent))
-        || journal.retire.iter().any(|item| !is_hash(&item.raw))
     {
         return Err(KioError::schema("invalid extraction retirement identity"));
+    }
+    for item in &journal.retire {
+        if !is_hash(&item?.raw) {
+            return Err(KioError::schema(
+                "invalid extraction retirement raw identity",
+            ));
+        }
     }
     repo.recover_extraction_publication(&journal.head, || before_history_recovery(&journal))?;
     let mut current = repo.head_commit_hash()?;
@@ -145,29 +162,49 @@ fn recover_with(
 fn retire(
     repo: &Repository,
     directory: &kio_core::store_dir::StoreDirectory,
-    completed: &[Retirement],
+    completed: &DiskRecords<Retirement>,
 ) -> Result<()> {
     if completed.is_empty() {
         return Ok(());
     }
+    let stages = repo.object_store().record_stages()?;
     let store = TaskStore::new_with_control(repo.kio_dir(), repo.control().clone());
-    let holds: BTreeMap<_, _> = completed
-        .iter()
-        .filter_map(|item| item.hold.as_deref().map(|id| (id, item)))
-        .collect();
-    if !holds.is_empty() {
-        store
-            .update_matching(|task| {
-                let Some(item) = holds.get(task.task_id.as_str()) else {
-                    return false;
-                };
-                if task.input_hash != item.raw
-                    || task.input_path != item.path
-                    || task.output_ref != EXTRACTION_HOLD_OUTPUT_REF
-                    || task.resource_limit.is_none()
-                {
-                    return false;
-                }
+    let mut holds = RecordSorter::new(&stages, |a: &Retirement, b| a.hold.cmp(&b.hold));
+    let mut raws = RecordSorter::new(&stages, String::cmp);
+    for item in completed {
+        let item = item?;
+        raws.push(item.raw.clone())?;
+        if item.hold.is_some() {
+            holds.push(item)?;
+        }
+    }
+    let holds = holds.finish()?;
+    let mut hold_iter = holds.iter();
+    let mut hold = hold_iter.next().transpose()?;
+    let mut updated = (!holds.is_empty())
+        .then(|| RecordWriter::new(&stages))
+        .transpose()?;
+    let mut held_raws = RecordSorter::new(&stages, String::cmp);
+    for task in &store
+        .sorted_bound(directory, &stages)
+        .map_err(pipeline_to_kio)?
+    {
+        let mut task = task?;
+        while hold
+            .as_ref()
+            .and_then(|item| item.hold.as_ref())
+            .is_some_and(|id| id < &task.task_id)
+        {
+            hold = hold_iter.next().transpose()?;
+        }
+        let is_held =
+            task.output_ref == EXTRACTION_HOLD_OUTPUT_REF && task.resource_limit.is_some();
+        if is_held {
+            if let Some(item) = hold.as_ref().filter(|item| {
+                item.hold.as_ref() == Some(&task.task_id)
+                    && item.raw == task.input_hash
+                    && item.path == task.input_path
+            }) {
                 if let Some(normalize) = &item.normalize {
                     task.output_ref = normalized_output_ref(
                         repo,
@@ -182,29 +219,40 @@ fn retire(
                 task.resource_limit = None;
                 task.hold_reason = None;
                 task.fallback_reason = Some("extraction_completed".to_owned());
-                true
-            })
+            } else {
+                held_raws.push(task.input_hash.clone())?;
+            }
+        }
+        if let Some(updated) = &mut updated {
+            updated.push(&task)?;
+        }
+    }
+    if let Some(updated) = updated {
+        store
+            .replace_sorted_bound(directory, &updated.finish()?)
             .map_err(pipeline_to_kio)?;
     }
     repo.control()
         .checkpoint(kio_core::durability::DurabilityPoint::ExtractionBeforeRetirementCleanup)?;
-    let held_raws: BTreeSet<_> = store
-        .all()
-        .map_err(pipeline_to_kio)?
-        .into_iter()
-        .filter(|task| {
-            task.output_ref == EXTRACTION_HOLD_OUTPUT_REF && task.resource_limit.is_some()
-        })
-        .map(|task| task.input_hash)
-        .collect();
-    let raws: BTreeSet<_> = completed.iter().map(|item| item.raw.as_str()).collect();
-    for raw in raws {
-        if !held_raws.contains(raw) {
-            kio_pipeline::prepare::discard_prepared_stages(directory, raw)
+    let held = held_raws.finish()?;
+    let mut held_iter = held.iter();
+    let mut held_raw = held_iter.next().transpose()?;
+    let mut previous = None;
+    for raw in &raws.finish()? {
+        let raw = raw?;
+        if previous.as_ref() == Some(&raw) {
+            continue;
+        }
+        while held_raw.as_ref().is_some_and(|held| held < &raw) {
+            held_raw = held_iter.next().transpose()?;
+        }
+        if held_raw.as_ref() != Some(&raw) {
+            kio_pipeline::prepare::discard_prepared_stages(directory, &raw)
                 .map_err(pipeline_to_kio)?;
-            kio_pipeline::markdownize::discard_normalized_stages(directory, raw)
+            kio_pipeline::markdownize::discard_normalized_stages(directory, &raw)
                 .map_err(pipeline_to_kio)?;
         }
+        previous = Some(raw);
     }
     Ok(())
 }

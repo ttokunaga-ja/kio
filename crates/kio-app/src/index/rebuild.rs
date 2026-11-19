@@ -400,17 +400,6 @@ fn final_shallow_commit_set(repo: &Repository) -> Result<BTreeSet<String>> {
         .collect())
 }
 
-fn checked_chunking_manifest(
-    repo: &Repository,
-    raw_hash: &str,
-    normalize: &NormalizeRef,
-) -> Result<NormalizedInstanceManifest> {
-    let manifest = pinned_manifest(repo, raw_hash, normalize)?;
-    visit_validated_normalized_units(&repo.object_store(), &manifest, |_| Ok(()))
-        .map_err(pipeline_to_kio)?;
-    Ok(manifest)
-}
-
 fn chunk_inputs<'a>(
     store: &'a kio_core::cas::ObjectStore,
     manifest: &'a NormalizedInstanceManifest,
@@ -437,6 +426,81 @@ fn chunk_inputs<'a>(
                 markdown: unit.markdown,
             })
         })
+}
+
+enum DocumentChunks {
+    Ready(kio_core::disk_records::DiskRecords<ChunkRow>),
+    Unavailable(KioError),
+}
+
+fn stage_document_chunks(
+    repo: &Repository,
+    raw_hash: &str,
+    raw_path: &str,
+    normalize: &NormalizeRef,
+    config: &ChunkingConfig,
+    first_document: &mut bool,
+) -> Result<DocumentChunks> {
+    let manifest = match pinned_manifest(repo, raw_hash, normalize) {
+        Ok(manifest) => manifest,
+        Err(error) => return Ok(DocumentChunks::Unavailable(error)),
+    };
+    if std::mem::take(first_document) {
+        repo.control()
+            .checkpoint(kio_core::durability::DurabilityPoint::BeforeChunkUnitRead)?;
+    }
+    let store = repo.object_store();
+    let mut staged = kio_core::disk_records::RecordWriter::new(&store.record_stages()?)?;
+    for unit in chunk_inputs(&store, &manifest) {
+        let unit = match unit {
+            Ok(unit) => unit,
+            Err(error) => return Ok(DocumentChunks::Unavailable(error)),
+        };
+        let input = ChunkingInput {
+            raw_path: raw_path.to_owned(),
+            units: vec![unit],
+            config: config.clone(),
+            created_at: repo.control().now_utc_seconds(),
+        };
+        let authorities = unit_authorities_from_inputs(&input.units);
+        for row in chunk_normalized_instance(input).map_err(index_to_kio)? {
+            authenticate_chunk_row(&row, &authorities)?;
+            staged.push(&row)?;
+        }
+    }
+    Ok(DocumentChunks::Ready(staged.finish()?))
+}
+
+/// The source index publishes the HEAD binding in the same SQLite transaction
+/// as its chunks. A retired extraction task alone cannot prove index completion.
+pub(crate) fn source_index_matches_head(repo: &Repository) -> Result<bool> {
+    let Some(head) = repo.head_commit_hash()? else {
+        return Ok(true);
+    };
+    use kio_index::fts::{ExistingSourceIndexOpenMode, open_existing_source_index_connection};
+    let Ok(connection) = open_existing_source_index_connection(
+        sqlite_path(repo.kio_dir()),
+        ExistingSourceIndexOpenMode::ReadOnly,
+        &FtsSchemaConfig {
+            tokenizer: FtsTokenizer::Trigram,
+        },
+    ) else {
+        return Ok(false);
+    };
+    let indexed = connection
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM tree_entries WHERE commit_hash = ?1)",
+            [&head],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| KioError::schema(error.to_string()))?;
+    if !indexed {
+        // Resuming an extraction always captures at least one direct source.
+        // An empty tree has no tree_entries rows to reconcile.
+        return Ok(read_head_tree_for_rebuild(repo, &head)?.entries.is_empty());
+    }
+    sync_chunk_ledger_dir(&open_chunk_ledger_dir(repo.kio_dir(), false)?)?;
+    Ok(true)
 }
 
 pub(crate) fn rebuild_step3_index(
@@ -513,7 +577,7 @@ pub(crate) fn rebuild_step3_index(
     // NEW `chunk_config_generations` association this pass — see the loop below.
     let retained_instances = retained_history_instances_for_roots(repo, &rebuild_roots)
         .map_err(|error| annotate_index_stage(error, "load retained instances"))?;
-    let retained_unit_introductions = retained_unit_introductions(repo, &retained_instances)
+    let mut retained_unit_introductions = retained_unit_introductions(repo, &retained_instances)
         .map_err(|error| annotate_index_stage(error, "authenticate retained units"))?;
     let retained_instance_keys = retained_instances
         .iter()
@@ -597,6 +661,7 @@ pub(crate) fn rebuild_step3_index(
     // objects/ と refs/ が保全されていれば復旧できる" — one bad unit must not veto
     // the recovery of every healthy document). Never silent: the caller surfaces this.
     let mut skipped_units = Vec::<SkippedUnit>::new();
+    let mut first_document = true;
 
     // PC61/62 (04 §4.6, U145): a retained instance NOT referenced by HEAD's own
     // tree, that ALREADY has some durable association from an earlier pass (it
@@ -610,83 +675,98 @@ pub(crate) fn rebuild_step3_index(
     // processed regardless of HEAD membership, exactly as before PC61/62.
     // Association creation is recorded once; every authenticated tree
     // introduction is staged separately below as a publication event.
+    let mut publish = |chunks: kio_core::disk_records::DiskRecords<ChunkRow>,
+                       introduction: Option<&String>|
+     -> Result<()> {
+        for row in &chunks {
+            let row = row?;
+            let chunk_id = row.chunk_id.clone();
+            let chunking_config_hash = row.chunking_config_hash.clone();
+            let outcome = append_authenticated_chunk_association(
+                repo,
+                row,
+                &mut known_associations,
+                &mut chunk_rowids,
+                &mut next_rowid,
+                &mut next_association_rowid,
+                &mut appended,
+            )?;
+            if outcome == AssociationAppend::Created
+                && let Some(introduction) = introduction
+            {
+                pending_publication_events.push(ChunkPublicationEvent {
+                    event: "publication".to_owned(),
+                    chunk_id,
+                    chunking_config_hash,
+                    introduction_commit: introduction.clone(),
+                });
+            }
+            if appended.len() == 128 {
+                append_stored_chunks(repo.kio_dir(), &appended)
+                    .map_err(|error| annotate_index_stage(error, "append chunk creations"))?;
+                appended_count += appended.len() as u64;
+                appended.clear();
+            }
+        }
+        if !appended.is_empty() {
+            append_stored_chunks(repo.kio_dir(), &appended)
+                .map_err(|error| annotate_index_stage(error, "append chunk creations"))?;
+            appended_count += appended.len() as u64;
+            appended.clear();
+        }
+        Ok(())
+    };
+
+    let mut rebuild_document = |raw: &str,
+                                path: &str,
+                                normalize: &NormalizeRef,
+                                introduction: Option<&String>,
+                                retained: bool|
+     -> Result<()> {
+        match stage_document_chunks(repo, raw, path, normalize, &config, &mut first_document)? {
+            DocumentChunks::Ready(rows) => publish(rows, introduction),
+            DocumentChunks::Unavailable(error) => {
+                if retained
+                    && verify_objects::purge_explains_missing_retained_instance(
+                        repo, raw, normalize,
+                    )?
+                {
+                    return Ok(());
+                }
+                if !is_rebuild_skippable_unit_error(&error) {
+                    return Err(error);
+                }
+                // Exclude existing ledger rows for this unavailable instance too.
+                retained_unit_introductions.retain(|key, _| {
+                    key.0 != raw || key.1 != normalize.tool_profile_hash || key.2 != normalize.r#gen
+                });
+                skipped_units.push(SkippedUnit {
+                    raw_hash: raw.to_owned(),
+                    path: path.to_owned(),
+                    r#gen: normalize.r#gen,
+                    reason: error.error_code().to_owned(),
+                });
+                Ok(())
+            }
+        }
+    };
     for retained in &retained_instances {
         let identity_key = (
             retained.raw_hash.clone(),
             retained.normalize.tool_profile_hash.clone(),
             retained.normalize.r#gen,
         );
-        if !head_identity_keys.contains(&identity_key)
-            && existing_identity_keys.contains(&identity_key)
-        {
+        let in_head = head_identity_keys.contains(&identity_key);
+        if !in_head && existing_identity_keys.contains(&identity_key) {
             continue;
         }
-        // `manifest.json` is mutable working state. The commit/tree's pinned
-        // manifest is the only authority for which same-gen units existed at
-        // this retained introduction; otherwise a later failed→done retry can
-        // back-publish its chunk into an older snapshot.
-        let manifest =
-            match checked_chunking_manifest(repo, &retained.raw_hash, &retained.normalize) {
-                Ok(manifest) => manifest,
-                Err(error) => {
-                    if verify_objects::purge_explains_missing_retained_instance(
-                        repo,
-                        &retained.raw_hash,
-                        &retained.normalize,
-                    )? {
-                        continue;
-                    }
-                    if !is_rebuild_skippable_unit_error(&error) {
-                        return Err(error);
-                    }
-                    skipped_units.push(SkippedUnit {
-                        raw_hash: retained.raw_hash.clone(),
-                        path: retained.raw_path.clone(),
-                        r#gen: retained.normalize.r#gen,
-                        reason: error.error_code().to_owned(),
-                    });
-                    continue;
-                }
-            };
-        let store = repo.object_store();
-        for unit in chunk_inputs(&store, &manifest) {
-            let input = ChunkingInput {
-                raw_path: retained.raw_path.clone(),
-                units: vec![unit?],
-                config: config.clone(),
-                created_at: ctx.control.now_utc_seconds(),
-            };
-            let unit_authorities = unit_authorities_from_inputs(&input.units);
-            for row in chunk_normalized_instance(input).map_err(index_to_kio)? {
-                let chunk_id = row.chunk_id.clone();
-                let chunking_config_hash = row.chunking_config_hash.clone();
-                let outcome = append_new_chunk_association(
-                    repo,
-                    row,
-                    &mut known_associations,
-                    &mut chunk_rowids,
-                    &mut next_rowid,
-                    &mut next_association_rowid,
-                    &mut appended,
-                    &unit_authorities,
-                )?;
-                if outcome == AssociationAppend::Created
-                    && head_identity_keys.contains(&identity_key)
-                    && let Some(introduction_commit) = head.as_ref()
-                {
-                    pending_publication_events.push(ChunkPublicationEvent {
-                        event: "publication".to_owned(),
-                        chunk_id,
-                        chunking_config_hash,
-                        introduction_commit: introduction_commit.clone(),
-                    });
-                }
-            }
-            appended_count += appended.len() as u64;
-            append_stored_chunks(repo.kio_dir(), &appended)
-                .map_err(|error| annotate_index_stage(error, "append chunk creations"))?;
-            appended.clear();
-        }
+        rebuild_document(
+            &retained.raw_hash,
+            &retained.raw_path,
+            &retained.normalize,
+            head.as_ref().filter(|_| in_head),
+            true,
+        )?;
     }
 
     for entry in head_tree
@@ -695,12 +775,8 @@ pub(crate) fn rebuild_step3_index(
         .flat_map(|tree| &tree.entries)
     {
         let entry = entry?;
-        let normalize = match &entry.normalize {
-            Some(normalize) => normalize.clone(),
-            // A tree's omitted normalized reference is immutable historical
-            // truth. Never fill it from the mutable current pointer while
-            // rebuilding a derived cache.
-            None => continue,
+        let Some(normalize) = entry.normalize else {
+            continue;
         };
         if retained_instance_keys.contains(&(
             entry.raw_hash.clone(),
@@ -709,62 +785,13 @@ pub(crate) fn rebuild_step3_index(
         )) {
             continue;
         }
-        let manifest = match checked_chunking_manifest(repo, &entry.raw_hash, &normalize) {
-            Ok(manifest) => manifest,
-            // A single document's missing/corrupt normalized instance (STORE-IO /
-            // STORE-CORRUPT) is skipped so the rest of the scope still rebuilds; its
-            // tree_entries row is kept (the tree structure is faithful — the document
-            // simply has no live chunks until re-normalized). Any other error class is
-            // not a localized unit fault and still aborts.
-            Err(error) if is_rebuild_skippable_unit_error(&error) => {
-                skipped_units.push(SkippedUnit {
-                    raw_hash: entry.raw_hash.clone(),
-                    path: entry.path.clone(),
-                    r#gen: normalize.r#gen,
-                    reason: error.error_code().to_owned(),
-                });
-                continue;
-            }
-            Err(error) => return Err(error),
-        };
-        let store = repo.object_store();
-        for unit in chunk_inputs(&store, &manifest) {
-            let input = ChunkingInput {
-                raw_path: entry.path.clone(),
-                units: vec![unit?],
-                config: config.clone(),
-                created_at: ctx.control.now_utc_seconds(),
-            };
-            let unit_authorities = unit_authorities_from_inputs(&input.units);
-            for row in chunk_normalized_instance(input).map_err(index_to_kio)? {
-                let chunk_id = row.chunk_id.clone();
-                let chunking_config_hash = row.chunking_config_hash.clone();
-                if append_new_chunk_association(
-                    repo,
-                    row,
-                    &mut known_associations,
-                    &mut chunk_rowids,
-                    &mut next_rowid,
-                    &mut next_association_rowid,
-                    &mut appended,
-                    &unit_authorities,
-                )? == AssociationAppend::Created
-                {
-                    pending_publication_events.push(ChunkPublicationEvent {
-                        event: "publication".to_owned(),
-                        chunk_id,
-                        chunking_config_hash,
-                        introduction_commit: head
-                            .clone()
-                            .expect("a working-tree loop requires a non-empty HEAD"),
-                    });
-                }
-            }
-            appended_count += appended.len() as u64;
-            append_stored_chunks(repo.kio_dir(), &appended)
-                .map_err(|error| annotate_index_stage(error, "append chunk creations"))?;
-            appended.clear();
-        }
+        rebuild_document(
+            &entry.raw_hash,
+            &entry.path,
+            &normalize,
+            head.as_ref(),
+            false,
+        )?;
     }
 
     // A creation record proves only that the chunk/config association is
@@ -902,6 +929,49 @@ pub(crate) fn append_new_chunk_association(
         return Ok(AssociationAppend::Blocked);
     }
     authenticate_chunk_row(&row, unit_authorities)?;
+    insert_chunk_association(
+        repo,
+        row,
+        known_associations,
+        chunk_rowids,
+        next_rowid,
+        next_association_rowid,
+        appended,
+    )
+}
+
+fn append_authenticated_chunk_association(
+    repo: &Repository,
+    row: ChunkRow,
+    known_associations: &mut BTreeSet<(String, String)>,
+    chunk_rowids: &mut BTreeMap<String, u64>,
+    next_rowid: &mut u64,
+    next_association_rowid: &mut u64,
+    appended: &mut Vec<StoredChunk>,
+) -> Result<AssociationAppend> {
+    if purge_blocks_rebuild_raw(repo.kio_dir(), &row.raw_hash, repo.control())? {
+        return Ok(AssociationAppend::Blocked);
+    }
+    insert_chunk_association(
+        repo,
+        row,
+        known_associations,
+        chunk_rowids,
+        next_rowid,
+        next_association_rowid,
+        appended,
+    )
+}
+
+fn insert_chunk_association(
+    repo: &Repository,
+    row: ChunkRow,
+    known_associations: &mut BTreeSet<(String, String)>,
+    chunk_rowids: &mut BTreeMap<String, u64>,
+    next_rowid: &mut u64,
+    next_association_rowid: &mut u64,
+    appended: &mut Vec<StoredChunk>,
+) -> Result<AssociationAppend> {
     let association = (row.chunk_id.clone(), row.chunking_config_hash.clone());
     if !known_associations.insert(association) {
         return Ok(AssociationAppend::Existing);
@@ -1157,6 +1227,8 @@ fn rebuild_sqlite_index(
                 Path::new("sqlite.db"),
             )
             .map_err(|err| KioError::io(err.to_string(), path.display().to_string()))?;
+            repo.control()
+                .checkpoint(kio_core::durability::DurabilityPoint::ExtractionIndexRenamed)?;
             sync_chunk_ledger_dir(&directory)?;
             // 05 §1.8 write-through, placed on the rename rather than in each
             // command that triggers a rebuild: `index`, `reindex` and

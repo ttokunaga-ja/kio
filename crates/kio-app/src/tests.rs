@@ -5284,11 +5284,8 @@ fn p0_recheck_office_source_has_a_finite_preconversion_budget() {
     let path = dir.path().join("over-budget.docx");
     let size = 256 * 1024 * 1024 + 1;
     std::fs::File::create(path).unwrap().set_len(size).unwrap();
-    let result = crate::index::command::read_verified_adapter_source(
-        &repo,
-        "over-budget.docx",
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    );
+    let result =
+        crate::index::command::read_verified_adapter_source(&repo, "over-budget.docx", size);
     let Err(error) = result else {
         panic!("reject before allocating the original");
     };

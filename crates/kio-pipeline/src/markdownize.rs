@@ -1533,25 +1533,11 @@ fn persist_normalized_units<'a>(
         .contains_entry(instance_leaf)
         .map_err(|error| stage_error(&instance_parent, error))?;
     let (instance_directory, staged_instance) = if instance_exists {
-        let instance_directory = child_directory(&instance_parent, instance_leaf)?;
-        let record = Path::new("instance.json");
-        if let Some(saved) =
-            read_record::<SavedNormalizedDirectory>(&stage_workspace, record, 4096)?
-        {
-            saved
-                .identity
-                .verify(&instance_directory)
-                .map_err(|error| stage_error(&instance_directory, error))?;
-            instance_parent
-                .sync()
-                .map_err(|error| stage_error(&instance_parent, error))?;
-            stage_workspace
-                .remove_file(record)
-                .map_err(|error| stage_error(&stage_workspace, error))?;
-        }
+        let instance_directory =
+            adopt_normalized_directory(directory, &identity, &instance_parent, instance_leaf)?;
         (instance_directory, None)
     } else {
-        let (stage, saved) = staged_normalized_instance(&stage_workspace)?;
+        let (stage, saved) = staged_normalized_instance(&stage_workspace, &identity)?;
         (stage, Some(saved))
     };
     let mut total_bytes = 0;
@@ -1681,7 +1667,16 @@ fn persist_normalized_units<'a>(
             .verify(&instance_directory)
             .map_err(|error| stage_error(&stage_workspace, error))?;
         stage_workspace
-            .rename_directory_between_create_only(&saved.leaf, &instance_parent, instance_leaf)
+            .rename_directory_between_create_only_checked(
+                &saved.leaf,
+                &instance_parent,
+                instance_leaf,
+                || {
+                    directory.control().checkpoint(
+                        kio_core::durability::DurabilityPoint::ExtractionDirectoryBeforeSync,
+                    )
+                },
+            )
             .map_err(|error| stage_error(&stage_workspace, error))?;
         stage_workspace
             .remove_file(Path::new("instance.json"))
@@ -1840,21 +1835,128 @@ pub fn verify_normalized_view_bytes(
 struct SavedNormalizedDirectory {
     leaf: PathBuf,
     identity: DirectoryStageIdentity,
+    profile: String,
+    generation: u64,
+}
+
+/// Validate an existing generation before exposing it through a new reference.
+/// An already retired stage leaves no local file-identity requirement on a
+/// portable normalized generation.
+pub fn adopt_normalized_instance(
+    root: &StoreDirectory,
+    raw_hash: &str,
+    profile: &str,
+    generation: u64,
+) -> Result<()> {
+    let identity = NormalizedInstanceIdentity {
+        raw_hash: raw_hash.to_owned(),
+        tool_profile_hash: profile.to_owned(),
+        r#gen: generation,
+    };
+    let relative = normalized_instance_relative_path(raw_hash, profile, generation);
+    let parent = child_directory(root, relative.parent().expect("normalized instance parent"))?;
+    adopt_normalized_directory(
+        root,
+        &identity,
+        &parent,
+        Path::new(relative.file_name().expect("normalized instance leaf")),
+    )?;
+    Ok(())
+}
+
+fn adopt_normalized_directory(
+    root: &StoreDirectory,
+    identity: &NormalizedInstanceIdentity,
+    parent: &StoreDirectory,
+    leaf: &Path,
+) -> Result<StoreDirectory> {
+    let handle = parent
+        .open_directory(leaf)
+        .map_err(|error| stage_error(parent, error))?;
+    let instance = StoreDirectory::from_retained_with_control(
+        handle,
+        parent.path().join(leaf),
+        parent.control().clone(),
+    )
+    .map_err(|error| stage_error(parent, error))?;
+    let mut pending = false;
+    crate::extraction_stage::visit_raw_workspaces(
+        root,
+        "views",
+        &identity.raw_hash,
+        |workspace| {
+            let Some(saved) = read_record::<SavedNormalizedDirectory>(
+                workspace,
+                Path::new("instance.json"),
+                4096,
+            )?
+            else {
+                return Ok(());
+            };
+            if saved.profile != identity.tool_profile_hash || saved.generation != identity.r#gen {
+                return Ok(());
+            }
+            if !workspace
+                .contains_entry(&saved.leaf)
+                .map_err(|error| stage_error(workspace, error))?
+            {
+                saved
+                    .identity
+                    .verify(&instance)
+                    .map_err(|error| stage_error(&instance, error))?;
+                workspace
+                    .sync()
+                    .map_err(|error| stage_error(workspace, error))?;
+                pending = true;
+            }
+            Ok(())
+        },
+    )?;
+    if pending {
+        parent
+            .control()
+            .checkpoint(kio_core::durability::DurabilityPoint::ExtractionDirectoryBeforeSync)
+            .map_err(|error| stage_error(parent, error))?;
+    }
+    parent.sync().map_err(|error| stage_error(parent, error))?;
+    Ok(instance)
 }
 
 fn staged_normalized_instance(
     workspace: &StoreDirectory,
+    target: &NormalizedInstanceIdentity,
 ) -> Result<(StoreDirectory, SavedNormalizedDirectory)> {
     let record = Path::new("instance.json");
     if let Some(saved) = read_record::<SavedNormalizedDirectory>(workspace, record, 4096)? {
-        let directory = open_staged_normalized_directory(workspace, &saved)?;
-        return Ok((directory, saved));
+        if saved.profile != target.tool_profile_hash || saved.generation != target.r#gen {
+            return Err(normalized_corrupt(
+                workspace.path(),
+                "normalized stage target does not match",
+            ));
+        }
+        if workspace
+            .contains_entry(&saved.leaf)
+            .map_err(|error| stage_error(workspace, error))?
+        {
+            let directory = open_staged_normalized_directory(workspace, &saved)?;
+            return Ok((directory, saved));
+        }
+        // The destination was absent too. A rename that did not survive
+        // can be rebuilt using the already journaled unit payloads.
+        workspace
+            .remove_file(record)
+            .map_err(|error| stage_error(workspace, error))?;
     }
     let leaf = PathBuf::from(format!("instance-{}", new_ulid(workspace.path())));
     let (directory, identity) = workspace
         .create_stage_directory(&leaf)
         .map_err(|error| stage_error(workspace, error))?;
-    let saved = SavedNormalizedDirectory { leaf, identity };
+    let saved = SavedNormalizedDirectory {
+        leaf,
+        identity,
+        profile: target.tool_profile_hash.clone(),
+        generation: target.r#gen,
+    };
     write_record(workspace, record, &saved, Publication::CreateOnly)?;
     Ok((directory, saved))
 }
@@ -1895,6 +1997,36 @@ fn open_staged_normalized_directory(
 /// Discard the journaled private normalization payloads of a purged raw.
 pub fn discard_normalized_stages(root: &StoreDirectory, raw_hash: &str) -> Result<()> {
     crate::extraction_stage::visit_raw_workspaces(root, "views", raw_hash, |workspace| {
+        let record = Path::new("instance.json");
+        if let Some(saved) = read_record::<SavedNormalizedDirectory>(workspace, record, 4096)? {
+            if workspace
+                .contains_entry(&saved.leaf)
+                .map_err(|error| stage_error(workspace, error))?
+            {
+                open_staged_normalized_directory(workspace, &saved)?;
+                workspace
+                    .remove_directory_all(&saved.leaf)
+                    .map_err(|error| stage_error(workspace, error))?;
+            } else {
+                if !kio_core::cas::is_hash(&saved.profile) {
+                    return Err(normalized_corrupt(
+                        workspace.path(),
+                        "invalid normalized stage profile",
+                    ));
+                }
+                let target =
+                    normalized_instance_relative_path(raw_hash, &saved.profile, saved.generation);
+                let parent =
+                    child_directory(root, target.parent().expect("normalized instance parent"))?;
+                let leaf = Path::new(target.file_name().expect("normalized instance leaf"));
+                if parent
+                    .contains_entry(leaf)
+                    .map_err(|error| stage_error(&parent, error))?
+                {
+                    adopt_normalized_instance(root, raw_hash, &saved.profile, saved.generation)?;
+                }
+            }
+        }
         for entry in workspace
             .entries(Path::new(""))
             .map_err(|error| stage_error(workspace, error))?
@@ -1924,17 +2056,10 @@ pub fn discard_normalized_stages(root: &StoreDirectory, raw_hash: &str) -> Resul
         for journal in ["manifest-cas.json", "view.json"] {
             crate::extraction_stage::discard_payload(workspace, Path::new(journal))?;
         }
-        let record = Path::new("instance.json");
-        if let Some(saved) = read_record::<SavedNormalizedDirectory>(workspace, record, 4096)? {
-            if workspace
-                .contains_entry(&saved.leaf)
-                .map_err(|error| stage_error(workspace, error))?
-            {
-                open_staged_normalized_directory(workspace, &saved)?;
-                workspace
-                    .remove_directory_all(&saved.leaf)
-                    .map_err(|error| stage_error(workspace, error))?;
-            }
+        if workspace
+            .contains_entry(record)
+            .map_err(|error| stage_error(workspace, error))?
+        {
             workspace
                 .remove_file(record)
                 .map_err(|error| stage_error(workspace, error))?;

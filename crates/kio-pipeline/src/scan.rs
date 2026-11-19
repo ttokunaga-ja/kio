@@ -1618,7 +1618,17 @@ pub fn read_bound_extraction_input(
     input_path: &str,
     tier: kio_core::error::ResourceTier,
 ) -> Result<VerifiedScanInput> {
-    let max_bytes = crate::prepare::ExtractionBudget::new(tier).memory_bytes();
+    read_bound_extraction_input_at_most(root, input_path, tier, u64::MAX)
+}
+
+/// Apply both the parser budget and the size of a verified source identity.
+pub fn read_bound_extraction_input_at_most(
+    root: &File,
+    input_path: &str,
+    tier: kio_core::error::ResourceTier,
+    max_bytes: u64,
+) -> Result<VerifiedScanInput> {
+    let max_bytes = max_bytes.min(crate::prepare::ExtractionBudget::new(tier).memory_bytes());
     read_bound_scan_input(root, input_path, max_bytes, Some(tier))
 }
 

@@ -199,7 +199,7 @@ pub(crate) struct IndexPipelineResult {
     pub(crate) pending_files: usize,
     pub(crate) failed_files: usize,
     pub(crate) deferred_budget: Vec<DeferredPaidPlaceholder>,
-    retired_extractions: Vec<Retirement>,
+    retired_extractions: Option<kio_core::disk_records::DiskRecords<Retirement>>,
     // R22-4: binary inputs with no locally-extractable text whose media type is not an
     // OCR-able one (R21-4 skips their online task). Archived, but never enriched — surfaced
     // so `enriched_ratio: 1.0` cannot silently mean "this file does not exist".
@@ -689,6 +689,22 @@ fn hash_unsupported_input(
     })
 }
 
+fn classify_verified_unsupported(
+    path: &str,
+    media_type: &str,
+    verified: &kio_pipeline::scan::VerifiedScanInput,
+) -> Option<UnsupportedInputDisposition> {
+    let reason = unsupported_reason_for_path(Path::new(path))
+        .or_else(|| unsupported_reason_for_content(media_type, &verified.bytes))?;
+    Some(UnsupportedInputDisposition {
+        path: path.to_owned(),
+        raw_hash: verified.raw_hash.clone(),
+        media_type: media_type.to_owned(),
+        size_bytes: verified.size_bytes,
+        reason: reason.to_owned(),
+    })
+}
+
 #[derive(Default)]
 pub(super) struct ReindexInputClassifications {
     pub(super) raw_by_path: BTreeMap<String, String>,
@@ -847,6 +863,8 @@ pub(crate) fn run_index_pipeline(
             .map_err(pipeline_to_kio)?;
     }
 
+    let mut retire =
+        kio_core::disk_records::RecordWriter::new(&repo.object_store().record_stages()?)?;
     let mut result = IndexPipelineResult {
         network_allowed,
         ..IndexPipelineResult::default()
@@ -1021,16 +1039,11 @@ pub(crate) fn run_index_pipeline(
         // Reject before Prepare/Markdownize writes any derived state. The closing
         // snapshot independently rechecks every staged raw under the store lock.
         ensure_raw_ingest_allowed(repo, &raw_hash)?;
-        if let Some(reason) = unsupported_reason_for_content(&candidate.media_type, &verified.bytes)
+        if let Some(disposition) =
+            classify_verified_unsupported(&candidate.input_path, &candidate.media_type, &verified)
         {
             result.skipped_unrecognized_binary_files += 1;
-            unsupported_observations.push(UnsupportedInputDisposition {
-                path: candidate.input_path.clone(),
-                raw_hash,
-                media_type: candidate.media_type.clone(),
-                size_bytes: verified.size_bytes,
-                reason: reason.to_owned(),
-            });
+            unsupported_observations.push(disposition);
             repo.control().append_event_log_in_session(
                 repo.lock_session(),
                 "KIO-I-INDEX-INPUT-UNRECOGNIZED-BINARY-001",
@@ -1103,14 +1116,14 @@ pub(crate) fn run_index_pipeline(
             } else {
                 result.pending_files += 1;
             }
-            result.retired_extractions.push(Retirement {
+            retire.push(&Retirement {
                 raw: raw_hash.clone(),
                 path: candidate.input_path.clone(),
                 hold: held
                     .filter(|task| task.input_hash == staged.raw_hash())
                     .map(|task| task.task_id.clone()),
                 normalize: None,
-            });
+            })?;
             continue;
         }
 
@@ -1169,14 +1182,14 @@ pub(crate) fn run_index_pipeline(
                     &mut office_conversion_unavailable_paths,
                 )?;
             }
-            result.retired_extractions.push(Retirement {
+            retire.push(&Retirement {
                 raw: raw_hash.clone(),
                 path: candidate.input_path.clone(),
                 hold: held
                     .filter(|task| task.input_hash == staged.raw_hash())
                     .map(|task| task.task_id.clone()),
                 normalize: None,
-            });
+            })?;
             continue;
         }
 
@@ -1214,14 +1227,14 @@ pub(crate) fn run_index_pipeline(
                     &mut office_conversion_unavailable_paths,
                 )?;
             }
-            result.retired_extractions.push(Retirement {
+            retire.push(&Retirement {
                 raw: raw_hash.clone(),
                 path: candidate.input_path.clone(),
                 hold: held
                     .filter(|task| task.input_hash == staged.raw_hash())
                     .map(|task| task.task_id.clone()),
                 normalize: None,
-            });
+            })?;
             continue;
         }
 
@@ -1293,14 +1306,14 @@ pub(crate) fn run_index_pipeline(
                     }
                     return Err(error);
                 }
-                result.retired_extractions.push(Retirement {
+                retire.push(&Retirement {
                     raw: raw_hash.clone(),
                     path: candidate.input_path.clone(),
                     hold: held
                         .filter(|task| task.input_hash == staged.raw_hash())
                         .map(|task| task.task_id.clone()),
                     normalize: None,
-                });
+                })?;
                 continue;
             }
             // Keep the latest generation pinned when preparation is unchanged.
@@ -1355,14 +1368,14 @@ pub(crate) fn run_index_pipeline(
                     &mut office_conversion_unavailable_paths,
                 )?;
             }
-            result.retired_extractions.push(Retirement {
+            retire.push(&Retirement {
                 raw: raw_hash.clone(),
                 path: candidate.input_path.clone(),
                 hold: held
                     .filter(|task| task.input_hash == staged.raw_hash())
                     .map(|task| task.task_id.clone()),
                 normalize: None,
-            });
+            })?;
             continue;
         }
 
@@ -1453,14 +1466,14 @@ pub(crate) fn run_index_pipeline(
                         &now,
                     )?;
                     result.failed_files += 1;
-                    result.retired_extractions.push(Retirement {
+                    retire.push(&Retirement {
                         raw: raw_hash.clone(),
                         path: candidate.input_path.clone(),
                         hold: held
                             .filter(|task| task.input_hash == staged.raw_hash())
                             .map(|task| task.task_id.clone()),
                         normalize: None,
-                    });
+                    })?;
                     continue;
                 }
                 Err(error) if error.resource_limit().is_some() => {
@@ -1565,14 +1578,14 @@ pub(crate) fn run_index_pipeline(
                         "detail": error.to_string(),
                     }),
                 )?;
-                    result.retired_extractions.push(Retirement {
+                    retire.push(&Retirement {
                         raw: raw_hash.clone(),
                         path: candidate.input_path.clone(),
                         hold: held
                             .filter(|task| task.input_hash == staged.raw_hash())
                             .map(|task| task.task_id.clone()),
                         normalize: None,
-                    });
+                    })?;
                     continue;
                 }
                 let mut full_request = request;
@@ -1602,14 +1615,14 @@ pub(crate) fn run_index_pipeline(
                         &now,
                     )?;
                     result.failed_files += 1;
-                    result.retired_extractions.push(Retirement {
+                    retire.push(&Retirement {
                         raw: raw_hash.clone(),
                         path: candidate.input_path.clone(),
                         hold: held
                             .filter(|task| task.input_hash == staged.raw_hash())
                             .map(|task| task.task_id.clone()),
                         normalize: None,
-                    });
+                    })?;
                     continue;
                 };
                 response = fallback_response;
@@ -1722,14 +1735,14 @@ pub(crate) fn run_index_pipeline(
                 &mut office_conversion_unavailable_paths,
             )?;
         }
-        result.retired_extractions.push(Retirement {
+        retire.push(&Retirement {
             raw: raw_hash.clone(),
             path: candidate.input_path.clone(),
             hold: held
                 .filter(|task| task.input_hash == staged.raw_hash())
                 .map(|task| task.task_id.clone()),
             normalize: None,
-        });
+        })?;
     }
     result.unsupported_raws = unsupported_observations
         .iter()
@@ -1754,6 +1767,7 @@ pub(crate) fn run_index_pipeline(
         result.resource_limit = result.resource_limit.or(outcome.resource_limit);
         result.pending_online_tasks = result.pending_online_tasks.saturating_sub(outcome.executed);
     }
+    result.retired_extractions = Some(retire.finish()?);
     Ok(result)
 }
 
@@ -1766,23 +1780,30 @@ pub(crate) fn retry_local_extractions(
     tier: kio_core::error::ResourceTier,
 ) -> Result<(usize, bool)> {
     let recovered = extraction_retirement::recover(repo)?;
-    let tasks = store.all().map_err(pipeline_to_kio)?;
-    let held = tasks.iter().filter(|task| {
-        task.output_ref == EXTRACTION_HOLD_OUTPUT_REF && task.resource_limit.is_some()
-    });
+    let _publication = repo.lock_store_for_publication()?;
     let root = repo.bound_root_handle().ok_or_else(|| {
         kio_core::KioError::schema("extraction retry requires retained scope authority")
     })?;
     let directory = bound_extraction_store(repo)?;
     let objects = repo.object_store();
+    let stages = objects.record_stages()?;
+    let tasks = store
+        .sorted_bound(&directory, &stages)
+        .map_err(pipeline_to_kio)?;
     let prepare_profile = builtin_prepare_profile().tool_profile_hash;
     let markdown_profile = builtin_offline_markdownize_adapter()
         .profile()
         .tool_profile_hash;
     let mut ready = BTreeMap::new();
-    let mut completed = Vec::new();
+    let mut completed = kio_core::disk_records::RecordWriter::new(&stages)?;
+    let mut unsupported = BTreeMap::new();
     let mut reused = BTreeMap::<(String, &str), Option<NormalizeRef>>::new();
-    for task in held {
+    for task in &tasks {
+        let task = task?;
+        if task.output_ref != EXTRACTION_HOLD_OUTPUT_REF || task.resource_limit.is_none() {
+            continue;
+        }
+        let task = &task;
         if !kio_pipeline::scan::bound_scan_input_is_regular(root, &task.input_path)
             .map_err(pipeline_to_kio)?
             || !repository_scan_policy_allows_file(repo, &task.input_path)
@@ -1818,6 +1839,13 @@ pub(crate) fn retry_local_extractions(
         ensure_raw_ingest_allowed(repo, &task.input_hash)?;
         let path = repository_input_display_path(repo, &task.input_path);
         let media_type = crate::task_execution::media_type_for_cli_path(&path);
+        if let Some(disposition) =
+            classify_verified_unsupported(&task.input_path, media_type, &verified)
+        {
+            unsupported.insert(task.input_path.clone(), disposition);
+            completed.push(&retry_retirement(task, None))?;
+            continue;
+        }
         let key = (task.input_hash.clone(), media_type);
         if let Some(normalize) = reused.get(&key) {
             if let Some(normalize) = normalize {
@@ -1829,7 +1857,7 @@ pub(crate) fn retry_local_extractions(
                     },
                 );
             }
-            completed.push(retry_retirement(task, normalize.clone()));
+            completed.push(&retry_retirement(task, normalize.clone()))?;
             continue;
         }
         let result = (|| {
@@ -1923,7 +1951,7 @@ pub(crate) fn retry_local_extractions(
                     );
                 }
                 reused.insert(key, normalize.clone());
-                completed.push(retry_retirement(task, normalize));
+                completed.push(&retry_retirement(task, normalize))?;
             }
             Err(error) => {
                 let Some(limit) = error.resource_limit() else {
@@ -1940,16 +1968,54 @@ pub(crate) fn retry_local_extractions(
     if completed.is_empty() {
         return Ok((0, recovered));
     }
+    let completed = completed.finish()?;
     let expected = completed
         .iter()
-        .map(|item| (item.path.clone(), item.raw.clone()))
-        .collect();
+        .map(|item| {
+            let item = item?;
+            Ok((item.path, item.raw))
+        })
+        .collect::<Result<_>>()?;
     let policy = crate::search::scope::current_embedding_policy(repo)?;
+    let raw_only = unsupported.keys().cloned().collect();
+    let prior = repo
+        .head_commit_hash()?
+        .map(|head| read_head_tree_for_rebuild(repo, &head))
+        .transpose()?;
+    let unsupported_store = UnsupportedInputStore::new(repo.kio_dir())
+        .with_published_tree(prior.as_ref())
+        .map_err(pipeline_to_kio)?;
     let outcome = repo.snapshot_retried_extractions(
         &expected,
         &ready,
-        &|head, tree| extraction_retirement::record(repo, head, tree, &completed),
-        &|_| policy.revalidate().map_err(pipeline_to_kio),
+        &raw_only,
+        &|head, tree| {
+            unsupported_store
+                .record_observations(unsupported.values().cloned())
+                .map_err(pipeline_to_kio)?;
+            extraction_retirement::record(repo, head, tree, &completed)
+        },
+        &|tree| {
+            policy.revalidate().map_err(pipeline_to_kio)?;
+            let mut matched = 0;
+            for entry in &tree.entries {
+                let entry = entry?;
+                if let Some(observation) = unsupported.get(&entry.path) {
+                    if entry.raw_hash != observation.raw_hash || entry.normalize.is_some() {
+                        return Err(kio_core::KioError::schema(
+                            "unsupported retry does not match captured raw-only tree entry",
+                        ));
+                    }
+                    matched += 1;
+                }
+            }
+            if matched != unsupported.len() {
+                return Err(kio_core::KioError::schema(
+                    "unsupported retry is missing from captured tree",
+                ));
+            }
+            Ok(())
+        },
     )?;
     repo.control()
         .checkpoint(kio_core::durability::DurabilityPoint::ExtractionAfterHead)?;
@@ -2023,10 +2089,13 @@ impl IndexPipelineResult {
         head: &str,
         tree: &kio_core::dag::TreeObject,
     ) -> Result<()> {
-        if self.retired_extractions.is_empty() && self.resource_limit.is_none() {
+        let Some(retire) = &self.retired_extractions else {
+            return Ok(());
+        };
+        if retire.is_empty() && self.resource_limit.is_none() {
             return Ok(());
         }
-        extraction_retirement::record(repo, head, tree, &self.retired_extractions)
+        extraction_retirement::record(repo, head, tree, retire)
     }
 }
 

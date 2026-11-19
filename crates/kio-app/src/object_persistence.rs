@@ -190,12 +190,20 @@ pub(crate) fn published_manifest_hash(
     repo: &Repository,
     manifest: &NormalizedInstanceManifest,
 ) -> Result<String> {
+    let directory = bound_extraction_store(repo)?;
+    kio_pipeline::markdownize::adopt_normalized_instance(
+        &directory,
+        &manifest.raw_hash,
+        &manifest.tool_profile_hash,
+        manifest.r#gen,
+    )
+    .map_err(pipeline_to_kio)?;
     let hash =
         kio_pipeline::markdownize::normalized_manifest_hash(manifest).map_err(pipeline_to_kio)?;
     if !repo.object_store().publish_content_stage(
         ContentObjectKind::Manifest,
         &hash,
-        &bound_extraction_store(repo)?,
+        &directory,
         None,
     )? {
         return Err(KioError::not_found(&hash));

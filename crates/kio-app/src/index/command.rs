@@ -1339,7 +1339,7 @@ pub(crate) fn read_repository_extraction_input(
 pub(crate) fn read_verified_adapter_source(
     repo: &Repository,
     input_path: &str,
-    media_type: &str,
+    max_bytes: u64,
 ) -> kio_pipeline::Result<kio_pipeline::scan::VerifiedScanInput> {
     let root = repo.bound_root_handle().ok_or_else(|| {
         kio_pipeline::PipelineError::contract(
@@ -1347,15 +1347,11 @@ pub(crate) fn read_verified_adapter_source(
             "managed index is missing its retained scope handle",
         )
     })?;
-    if !kio_adapter::office_convert::is_office_media(media_type) {
-        return kio_pipeline::scan::read_bound_verified_scan_input(root, input_path, u64::MAX);
-    }
-    // This is the local conversion buffer, independent of the prepared
-    // request size policy enforced after conversion.
-    kio_pipeline::scan::read_bound_extraction_input(
+    kio_pipeline::scan::read_bound_extraction_input_at_most(
         root,
         input_path,
         kio_core::error::ResourceTier::Standard,
+        max_bytes,
     )
     .map_err(|error| match error {
         kio_pipeline::PipelineError::ResourceLimit(mut limit) => {
@@ -2139,7 +2135,8 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
     // still points at its last-good normalized instance and search keeps serving that
     // gen's cached chunks) and is recorded; healthy documents still re-normalize.
     let mut reindex_skipped = Vec::<SkippedUnit>::new();
-    let mut retire = Vec::new();
+    let mut retire =
+        kio_core::disk_records::RecordWriter::new(&repo.object_store().record_stages()?)?;
     for entry in &tree.entries {
         let entry = entry?;
         if classified.unsupported_paths.contains(&entry.path) {
@@ -2151,12 +2148,12 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
         let new_gen = normalize.r#gen + 1;
         match copy_normalized_instance_gen(&repo, &entry.raw_hash, normalize, new_gen) {
             Ok(manifest_hash) => {
-                retire.push(super::extraction_retirement::Retirement {
+                retire.push(&super::extraction_retirement::Retirement {
                     raw: entry.raw_hash.clone(),
                     path: entry.path.clone(),
                     hold: None,
                     normalize: None,
-                });
+                })?;
                 normalize_by_path.insert(
                     entry.path.clone(),
                     PendingNormalizeRef {
@@ -2198,6 +2195,7 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
             Err(error) => return Err(error),
         }
     }
+    let retire = retire.finish()?;
     repo.control()
         .checkpoint(kio_core::durability::DurabilityPoint::BeforeIndexSnapshot)?;
     let outcome = repo.auto_snapshot_with_extraction_retirement(

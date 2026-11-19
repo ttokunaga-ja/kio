@@ -346,12 +346,22 @@ pub(crate) fn run_batch(ctx: &Invocation<'_>, args: BatchArgs) -> Result<Command
                 &store,
                 kio_core::error::ResourceTier::Standard,
             )?;
-            if local_published {
+            if local_published || !crate::index::rebuild::source_index_matches_head(&repo)? {
+                ctx.control.checkpoint(
+                    kio_core::durability::DurabilityPoint::ExtractionBeforeIndexRebuild,
+                )?;
                 crate::index::rebuild::rebuild_step3_index(ctx, &repo)?;
                 crate::index::chunk_ledger::recover_index_generation(
                     repo.kio_dir(),
                     repo.control(),
                 )?;
+                crate::scope_access::register_scope(ctx, &repo, true);
+            } else if repo.head_commit_hash()?.is_some()
+                && crate::search::projection::capture_ready_replica_snapshot(&repo).is_none()
+            {
+                // SQLite can survive the swap even if the writer stopped
+                // before publishing its replica projection.
+                crate::search::projection::write_through_projection_or_log_for_repo(ctx, &repo);
                 crate::scope_access::register_scope(ctx, &repo, true);
             }
             let resources_reenqueued =

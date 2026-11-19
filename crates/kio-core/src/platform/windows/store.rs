@@ -907,6 +907,7 @@ pub(crate) fn rename_directory_between_create_only(
     destination_leaf: &Path,
     source_label: &Path,
     destination_label: &Path,
+    before_sync: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
     let source = direct_leaf(source_leaf, source_label)?;
     let destination = direct_leaf(destination_leaf, destination_label)?;
@@ -929,6 +930,7 @@ pub(crate) fn rename_directory_between_create_only(
             "published directory identity changed",
         ));
     }
+    before_sync()?;
     sync_directory(source_parent, source_label)?;
     sync_directory(destination_parent, destination_label)
 }

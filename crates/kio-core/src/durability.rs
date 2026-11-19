@@ -8,6 +8,11 @@ use crate::Result;
 /// A named durable state transition that native process-stop tests may select.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DurabilityPoint {
+    ExtractionBeforeIndexRebuild,
+    ExtractionIndexRenamed,
+    ExtractionDirectoryBeforeSync,
+    BeforeChunkUnitRead,
+    BeforeAdapterSourceRead,
     BeforeIndexSnapshot,
     BeforeReadDispositions,
     PublicationJournal,
@@ -67,6 +72,11 @@ impl DurabilityPoint {
     #[cfg(debug_assertions)]
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value {
+            "extraction_index_renamed" => Some(Self::ExtractionIndexRenamed),
+            "extraction_before_index_rebuild" => Some(Self::ExtractionBeforeIndexRebuild),
+            "extraction_directory_before_sync" => Some(Self::ExtractionDirectoryBeforeSync),
+            "before_chunk_unit_read" => Some(Self::BeforeChunkUnitRead),
+            "before_adapter_source_read" => Some(Self::BeforeAdapterSourceRead),
             "before_index_snapshot" => Some(Self::BeforeIndexSnapshot),
             "before_read_dispositions" => Some(Self::BeforeReadDispositions),
             "publication_journal" => Some(Self::PublicationJournal),
@@ -127,6 +137,11 @@ impl DurabilityPoint {
     #[cfg(debug_assertions)]
     fn name(self) -> &'static str {
         match self {
+            Self::ExtractionIndexRenamed => "extraction_index_renamed",
+            Self::ExtractionBeforeIndexRebuild => "extraction_before_index_rebuild",
+            Self::ExtractionDirectoryBeforeSync => "extraction_directory_before_sync",
+            Self::BeforeChunkUnitRead => "before_chunk_unit_read",
+            Self::BeforeAdapterSourceRead => "before_adapter_source_read",
             Self::BeforeIndexSnapshot => "before_index_snapshot",
             Self::BeforeReadDispositions => "before_read_dispositions",
             Self::PublicationJournal => "publication_journal",
@@ -227,6 +242,8 @@ fn checkpoint_debug(owner: &crate::control::ControlHandle, point: DurabilityPoin
                 DurabilityPoint::ExtractionStageWriting
                     | DurabilityPoint::ExtractionBeforeManifest
                     | DurabilityPoint::ExtractionBeforeDestinationSync
+                    | DurabilityPoint::ExtractionDirectoryBeforeSync
+                    | DurabilityPoint::BeforeAdapterSourceRead
             ))
     {
         return Err(crate::error::ResourceLimit {

@@ -3,7 +3,7 @@ use super::*;
 type ExtractionRetirementHook<'a> = dyn Fn(&str, &TreeObject) -> Result<()> + 'a;
 
 pub(super) struct ExtractionPublication<'a> {
-    selected: Option<&'a BTreeMap<String, String>>,
+    selected: Option<(&'a BTreeMap<String, String>, &'a BTreeSet<String>)>,
     hook: &'a ExtractionRetirementHook<'a>,
 }
 type SnapshotPublicationGuard<'a> = &'a dyn Fn(&TreeObject) -> Result<()>;
@@ -140,6 +140,7 @@ impl Repository {
         &self,
         expected_raw_by_path: &BTreeMap<String, String>,
         normalize_by_path: &BTreeMap<String, PendingNormalizeRef>,
+        raw_only: &BTreeSet<String>,
         before_head: &ExtractionRetirementHook<'_>,
         publication_guard: SnapshotPublicationGuard<'_>,
     ) -> Result<SnapshotOutcome> {
@@ -161,7 +162,7 @@ impl Repository {
             None,
             Some(publication_guard),
             Some(ExtractionPublication {
-                selected: Some(expected_raw_by_path),
+                selected: Some((expected_raw_by_path, raw_only)),
                 hook: before_head,
             }),
         )
@@ -760,7 +761,7 @@ impl Repository {
             explicitly_allowed_tier_a_paths,
             true,
             self.archive_limits,
-            selected,
+            selected.map(|(paths, _)| paths),
         )?;
         let mut working = {
             let _archive_lock = self.lock_store_in_session(&self.lock_session)?;
@@ -777,7 +778,7 @@ impl Repository {
         }
         .tree;
 
-        if let Some(selected) = selected {
+        if let Some((selected, raw_only)) = selected {
             let mut matched = 0;
             for entry in &working.entries {
                 let entry = entry?;
@@ -808,7 +809,10 @@ impl Repository {
                         next = retries.next().transpose()?;
                     }
                     if let Some(mut entry) = next.take_if(|entry| entry.path == old.path) {
-                        if entry.normalize.is_none() && entry.raw_hash == old.raw_hash {
+                        if entry.normalize.is_none()
+                            && entry.raw_hash == old.raw_hash
+                            && !raw_only.contains(&entry.path)
+                        {
                             entry.normalize = old.normalize;
                         }
                         builder.push(entry)?;

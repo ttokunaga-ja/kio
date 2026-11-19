@@ -495,13 +495,77 @@ impl TaskStore {
         &self,
         retained: &kio_core::store_dir::StoreDirectory,
     ) -> Result<Vec<TaskDescriptor>> {
+        let mut by_id = BTreeMap::new();
+        self.visit_bound(retained, |descriptor| {
+            by_id.insert(descriptor.task_id.clone(), descriptor);
+            Ok(())
+        })?;
+        Ok(by_id.into_values().collect())
+    }
+
+    /// Materialize the last frame for each task in ID order using store-local runs.
+    pub fn sorted_bound(
+        &self,
+        retained: &kio_core::store_dir::StoreDirectory,
+        stages: &kio_core::disk_records::RecordStageRoot,
+    ) -> Result<kio_core::disk_records::DiskRecords<TaskDescriptor>> {
+        use kio_core::disk_records::{RecordSorter, RecordWriter};
+        let error = |error| crate::journal::error(&self.path, error);
+        let mut sorter = RecordSorter::<(u64, TaskDescriptor)>::new(stages, |a, b| {
+            a.1.task_id.cmp(&b.1.task_id).then_with(|| a.0.cmp(&b.0))
+        });
+        let mut sequence = 0u64;
+        self.visit_bound(retained, |descriptor| {
+            sorter.push((sequence, descriptor)).map_err(error)?;
+            sequence += 1;
+            Ok(())
+        })?;
+        let mut output = RecordWriter::new(stages).map_err(error)?;
+        let mut previous: Option<TaskDescriptor> = None;
+        for row in sorter.finish().map_err(error)?.iter() {
+            let (_, descriptor) = row.map_err(error)?;
+            if let Some(old) = previous.replace(descriptor)
+                && previous
+                    .as_ref()
+                    .is_some_and(|next| next.task_id != old.task_id)
+            {
+                output.push(&old).map_err(error)?;
+            }
+        }
+        if let Some(old) = previous {
+            output.push(&old).map_err(error)?;
+        }
+        output.finish().map_err(error)
+    }
+
+    pub fn replace_sorted_bound(
+        &self,
+        retained: &kio_core::store_dir::StoreDirectory,
+        descriptors: &kio_core::disk_records::DiskRecords<TaskDescriptor>,
+    ) -> Result<()> {
+        crate::journal::replace(
+            retained,
+            Path::new("tasks.jsonl"),
+            descriptors.iter().map(|descriptor| {
+                let descriptor =
+                    descriptor.map_err(|error| crate::journal::error(&self.path, error))?;
+                self.framed_record(&descriptor)
+            }),
+        )
+    }
+
+    fn visit_bound(
+        &self,
+        retained: &kio_core::store_dir::StoreDirectory,
+        mut visit: impl FnMut(TaskDescriptor) -> Result<()>,
+    ) -> Result<()> {
         kio_core::private_fs::verify_private_directory_handle(retained)
             .map_err(|error| self.private_error(error))?;
         let leaf = Path::new("tasks.jsonl");
         if !retained.contains_entry(leaf).map_err(|error| {
             PipelineError::corrupt(self.path.display().to_string(), error.to_string())
         })? {
-            return Ok(Vec::new());
+            return Ok(());
         }
         let file = retained
             .open_regular_read(leaf, u64::MAX)
@@ -510,17 +574,6 @@ impl TaskStore {
             })?;
         kio_core::private_fs::verify_private_regular_file_handle(&file)
             .map_err(|error| self.private_error(error))?;
-        self.read_descriptors(file, |descriptor| {
-            validate_task_descriptor(self.kio_dir(), descriptor)
-        })
-    }
-
-    fn read_descriptors(
-        &self,
-        file: fs::File,
-        mut validate: impl FnMut(&TaskDescriptor) -> Result<()>,
-    ) -> Result<Vec<TaskDescriptor>> {
-        let mut by_id = BTreeMap::new();
         let mut reader = std::io::BufReader::new(file);
         let mut line = Vec::new();
         loop {
@@ -553,10 +606,10 @@ impl TaskStore {
             let descriptor: TaskDescriptor = serde_json::from_slice(&line).map_err(|err| {
                 PipelineError::corrupt(self.path.display().to_string(), err.to_string())
             })?;
-            validate(&descriptor)?;
-            by_id.insert(descriptor.task_id.clone(), descriptor);
+            validate_task_descriptor(self.kio_dir(), &descriptor)?;
+            visit(descriptor)?;
         }
-        Ok(by_id.into_values().collect())
+        Ok(())
     }
 
     pub fn replace_all(&self, descriptors: &[TaskDescriptor]) -> Result<()> {

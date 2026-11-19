@@ -391,6 +391,22 @@ impl StoreDirectory {
         destination_directory: &StoreDirectory,
         destination_leaf: &Path,
     ) -> Result<()> {
+        self.rename_directory_between_create_only_checked(
+            source_leaf,
+            destination_directory,
+            destination_leaf,
+            || Ok(()),
+        )
+    }
+
+    /// Run a check after the retained rename and before syncing either parent.
+    pub fn rename_directory_between_create_only_checked(
+        &self,
+        source_leaf: &Path,
+        destination_directory: &StoreDirectory,
+        destination_leaf: &Path,
+        before_sync: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
         platform::rename_directory_between_create_only(
             &self.handle,
             source_leaf,
@@ -398,6 +414,7 @@ impl StoreDirectory {
             destination_leaf,
             &self.logical,
             &destination_directory.logical,
+            before_sync,
         )
     }
 
