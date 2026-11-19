@@ -1688,7 +1688,8 @@ pub(crate) fn task_failure_from_adapter(error: kio_adapter::AdapterError) -> Tas
         kio_adapter::AdapterError::Network(_) | kio_adapter::AdapterError::Io { .. } => {
             RetryErrorKind::NetworkError
         }
-        kio_adapter::AdapterError::RuntimeConfiguration { .. } => RetryErrorKind::InvalidInput,
+        kio_adapter::AdapterError::InvalidInput(_)
+        | kio_adapter::AdapterError::RuntimeConfiguration { .. } => RetryErrorKind::InvalidInput,
         kio_adapter::AdapterError::ContractViolation(_)
         | kio_adapter::AdapterError::ConfigSchema(_)
         | kio_adapter::AdapterError::ConfigSchemaCoded { .. } => RetryErrorKind::ContractViolation,

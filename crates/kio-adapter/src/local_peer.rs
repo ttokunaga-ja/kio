@@ -939,8 +939,8 @@ mod tests {
 
         vec![
             ("embedding", |endpoint| {
-                EnvLocalEmbeddingClient::new(endpoint, "model", None)
-                    .embed_messages(json!([]))
+                EnvLocalEmbeddingClient::new(endpoint, "model", None, false)
+                    .embed_payload(json!({"messages": []}))
                     .map(|_| ())
             }),
             ("ocr", |endpoint| {

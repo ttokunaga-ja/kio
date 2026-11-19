@@ -794,7 +794,7 @@ pub(crate) fn poll_batch_embedding_jobs(
     {
         return Ok(outcome);
     }
-    let profile = declared_embedding_profile(execution);
+    let profile = declared_embedding_profile(adapter_settings, execution)?;
     let mut rows = batch_poll_candidates(ledger, &scope_id, EMBEDDING_ADAPTER_KIND)
         .map_err(pipeline_to_kio)?;
     rows.retain(|row| {

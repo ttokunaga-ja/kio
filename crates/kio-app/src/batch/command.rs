@@ -1101,8 +1101,9 @@ fn run_batch_resend_unknown(
         ));
     }
     let markdown_profile = online_markdownize_profile_for(repo)?;
-    let embedding_profile =
-        embedding_execution(adapter_settings, ctx.control).map(declared_embedding_profile);
+    let embedding_profile = embedding_execution(adapter_settings, ctx.control)
+        .map(|execution| declared_embedding_profile(adapter_settings, execution))
+        .transpose()?;
     let store = TaskStore::new_with_control(repo.kio_dir(), repo.control().clone());
     let tasks = store.all().map_err(pipeline_to_kio)?;
     let matching_task_ids = match key.adapter_kind.as_str() {

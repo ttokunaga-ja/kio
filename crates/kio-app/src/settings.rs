@@ -1,10 +1,9 @@
 use crate::batch_recovery_key;
 use crate::cursor_key;
-use crate::embedding::admission::declared_embedding_profile;
 use crate::object_persistence::adapter_to_kio;
 use crate::search::query::toml_f64;
 use crate::search::query::toml_u64;
-use kio_adapter::catalog::EmbeddingExecution;
+use kio_adapter::catalog::declared_deterministic_embedding_profile;
 use kio_adapter::tool_lock::MAX_TOOLS_TOML_BYTES;
 use kio_adapter::tool_lock::load_tool_lock;
 use kio_adapter::tool_lock::parse_tools_toml_for_roles;
@@ -549,7 +548,7 @@ pub(crate) fn embedding_profile_summary(
 pub(crate) fn persisted_embedding_is_deterministic(
     entry: &kio_adapter::tool_lock::EmbeddingToolLockEntry,
 ) -> bool {
-    let builtin = declared_embedding_profile(EmbeddingExecution::DeterministicEvaluator);
+    let builtin = declared_deterministic_embedding_profile();
     entry.kind == Some(ExecutionMode::DeterministicLibrary)
         && entry.tool_id == builtin.tool_id
         && entry.profile_hash == builtin.profile_hash

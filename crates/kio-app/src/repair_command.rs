@@ -385,17 +385,18 @@ fn run_rebuild_db_locked(
     // with a second vector space.  `index` is the explicit operation that may
     // materialize a new lock/profile.
     let locked_embedding_profile = rebuild_embedding_profile_from_tool_lock(repo.kio_dir())?;
-    let enrichment_authorized = embedding_ready
-        && locked_embedding_profile.as_ref().is_some_and(|locked| {
-            embedding_execution(adapter_settings, ctx.control)
-                .map(declared_embedding_profile)
-                .is_some_and(|active| {
-                    active.dimensions == locked.dimensions
-                        && active.distance == locked.distance
-                        && active.modality == locked.modality
-                        && active.profile_hash == locked.profile_hash
-                })
-        });
+    let enrichment_authorized = if embedding_ready
+        && let Some(locked) = locked_embedding_profile.as_ref()
+        && let Some(execution) = embedding_execution(adapter_settings, ctx.control)
+    {
+        let active = declared_embedding_profile(adapter_settings, execution)?;
+        active.dimensions == locked.dimensions
+            && active.distance == locked.distance
+            && active.modality == locked.modality
+            && active.profile_hash == locked.profile_hash
+    } else {
+        false
+    };
     let embedding_online = if enrichment_authorized {
         embedding_online_allowed(adapter_settings, repo, offline, online_requested, false)?
     } else {

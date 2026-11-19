@@ -241,7 +241,7 @@ pub(crate) fn embedding_online_allowed(
     if !embedding_transport_allowed(execution, offline) {
         return Ok(false);
     }
-    let profile = declared_embedding_profile(execution);
+    let profile = declared_embedding_profile(adapter_settings, execution)?;
     persistent_network_allowed_for(
         adapter_settings,
         repo,
@@ -262,7 +262,7 @@ pub(crate) fn active_embedding_adapter_identity(
     let Some(execution) = embedding_execution(adapter_settings, control) else {
         return Ok(None);
     };
-    let profile = declared_embedding_profile(execution);
+    let profile = declared_embedding_profile(adapter_settings, execution)?;
     Ok(Some((profile.tool_id, profile.profile_hash)))
 }
 

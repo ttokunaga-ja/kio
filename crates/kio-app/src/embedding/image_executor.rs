@@ -162,10 +162,10 @@ pub(crate) fn run_image_embedding_enrichment(
     .map_err(adapter_to_kio)?;
     let free_execution = !embedding.execution.is_online() && !descriptor.effects.paid_authorization;
     let external_images_allowed = embedding.repo.image_external_send_allowed()?;
-    let exclusion = if descriptor.effects.egress && !external_images_allowed {
-        Some("images_excluded_from_external_send")
-    } else if descriptor.capability.image_mime_types.is_empty() {
+    let exclusion = if descriptor.capability.image_mime_types.is_empty() {
         Some("image_capability_unavailable")
+    } else if descriptor.effects.egress && !external_images_allowed {
+        Some("images_excluded_from_external_send")
     } else {
         None
     };
@@ -727,7 +727,14 @@ pub(crate) fn run_image_embedding_enrichment(
                         Err(crate::embedding::transport::LocalEmbeddingRunFailure::Classified(
                             failure,
                         )) => {
-                            let next = fail_local_embedding_claim(&mut claim, &failure, &now)?;
+                            let next = fail_local_embedding_claim(
+                                &mut claim,
+                                &failure,
+                                &now,
+                                crate::embedding::transport::local_max_attempts(
+                                    embedding.execution,
+                                ),
+                            )?;
                             mirror_local_embedding_failure(
                                 task_store,
                                 &refs,

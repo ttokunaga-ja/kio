@@ -215,7 +215,7 @@ fn run_embedding_enrichment_for_instances(
     let Some(execution) = embedding_execution(adapter_settings, invocation.control) else {
         return Ok(ExecOutcome::default());
     };
-    let profile = declared_embedding_profile(execution);
+    let profile = declared_embedding_profile(adapter_settings, execution)?;
     // Non-multimodal is rejected at materialize_tool_lock; never reach embed here.
     if profile.modality != "multimodal" {
         return Ok(ExecOutcome::default());
@@ -799,10 +799,12 @@ fn run_embedding_enrichment_for_instances(
                 let refs = tasks.iter().map(|task| task.output_ref.clone()).collect();
                 mirror_local_embedding_start(&task_store, &refs, claim.attempts(), &now)?;
                 let completed = if let Some(bytes) = recovered_bytes {
+                    // Verify the staged member list before linking the input's
+                    // vector to the currently authorized aliases below.
                     crate::embedding::transport::decode_local_embedding_result(
                         &bytes,
                         &profile,
-                        members.iter().map(|member| member.id.clone()).collect(),
+                        claim.embedding_member_ids()?,
                     )?
                 } else {
                     match send_local_embed_group(
@@ -849,7 +851,12 @@ fn run_embedding_enrichment_for_instances(
                         Err(crate::embedding::transport::LocalEmbeddingRunFailure::Classified(
                             failure,
                         )) => {
-                            let next = fail_local_embedding_claim(&mut claim, &failure, &now)?;
+                            let next = fail_local_embedding_claim(
+                                &mut claim,
+                                &failure,
+                                &now,
+                                crate::embedding::transport::local_max_attempts(execution),
+                            )?;
                             let refs = tasks.iter().map(|task| task.output_ref.clone()).collect();
                             mirror_local_embedding_failure(
                                 &task_store,
@@ -2098,11 +2105,20 @@ pub(crate) fn fail_local_embedding_claim(
     claim: &mut crate::local_execution::LocalGuard,
     failure: &TaskExecutionFailure,
     now: &str,
+    max_attempts: u32,
 ) -> Result<Option<i64>> {
     let policy = retry_policy(failure.retry_kind);
+    let retry_budget_remaining = if failure.retry_kind == RetryErrorKind::ContractViolation {
+        claim.attempts() < max_attempts
+            && policy
+                .max_attempts
+                .is_none_or(|max| claim.contract_violation_count() < max)
+    } else {
+        policy.max_attempts.is_none_or(|max| claim.attempts() < max)
+    };
     let next = if failure.retry_kind == RetryErrorKind::RateLimit {
         Some(rate_limit_retry_at(now, failure.retry_after_ms))
-    } else if policy.retryable && policy.max_attempts.is_none_or(|max| claim.attempts() < max) {
+    } else if policy.retryable && retry_budget_remaining {
         Some(scheduled_retry_at(now, &policy.backoff, claim.attempts()))
     } else {
         None

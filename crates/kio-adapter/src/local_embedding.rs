@@ -1,29 +1,4 @@
-//! The `offline_api` embedding adapter — a local multimodal embedding server
-//! reached over loopback (07 §5.3, 07 §3's D1 url restriction).
-//!
-//! # The wire, and why it is the shape it is
-//!
-//! 07 §5.3 (2) mandates chat-form `messages` for every call, text-only ones
-//! included, because a server's plain-`input` path tokenizes the same
-//! characters differently and would split one declared profile across two
-//! vector spaces that [03 §7]'s compatibility gate cannot tell apart. V4
-//! measured that split rather than assuming it: the same string through
-//! `input[]` and through `messages` lands at cosine 0.474, while two
-//! *unrelated* sentences both through `messages` sit at 0.597. Changing the
-//! wire format moves a vector further than changing the text does. The price
-//! is one item per request — `messages` takes a single conversation — and that
-//! is what the price buys.
-//!
-//! No system message is sent. That is not an omission: the model's own chat
-//! template injects `"Represent the user's input."` when none is present, so
-//! the string belongs to the template, which `prompt_template_hash` already
-//! covers. Sending one while the profile records `instruction: ""` would make
-//! the identity describe a token stream the adapter does not produce, which is
-//! precisely the failure 07 §5.3 exists to prevent. See the dated ruling there.
-//!
-//! The sole backend talks to the measured local model. Evaluator-only
-//! deterministic embeddings live in their own adapter module, so this runtime
-//! can never silently mint evaluator vectors under a local-model identity.
+//! Loopback embedding transport for configured endpoints and the measured Qwen target.
 
 use serde_json::{Value, json};
 
@@ -33,6 +8,7 @@ use crate::http_policy::{
 };
 use crate::identity::tool_profile_hash;
 use crate::local_peer::{LocalEndpoint, is_local_peer_tls_error};
+use crate::tool_lock::DeclaredAdapter;
 use crate::traits::EmbeddingAdapter;
 use crate::types::{
     AdapterKind, AdapterProfile, EmbeddingCompleted, EmbeddingContent, EmbeddingItem,
@@ -41,8 +17,9 @@ use crate::types::{
 };
 use crate::{AdapterError, Result};
 
-/// The `tool_id` the local embedding target is declared under in `tools.toml`
-/// (see `tool_lock::EMBEDDING_RUNTIME_TARGETS`).
+/// Tool ID of the configurable loopback embedding target.
+pub const GENERIC_LOCAL_EMBEDDING_TOOL_ID: &str = "local_embedding";
+
 pub const LOCAL_EMBEDDING_ADAPTER_ID: &str = "qwen3_vl_embedding_local";
 pub const LOCAL_EMBEDDING_MODEL_FAMILY: &str = "qwen3-vl-embedding";
 
@@ -117,28 +94,148 @@ pub enum LocalEmbeddingExecution {
     Real,
 }
 
-/// One request, one vector. There is no batch method here and that is the
-/// point: 07 §5.3 (2) rules out the `input[]` form that would allow batching,
-/// so a batching signature would only invite someone to reintroduce it.
-pub trait LocalEmbeddingClient: Clone {
-    /// `messages` is the full array, already built by [`user_messages`]. The
-    /// returned vector is the server's **native** width; MRL truncation is the
-    /// adapter's job, not the transport's.
-    fn embed_messages(&self, messages: Value) -> Result<Vec<f32>>;
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WireFormat {
+    Input,
+    Messages,
 }
 
-/// Talks OpenAI-compatible `/v1/embeddings` to a loopback server.
-///
-/// Not named after a serving backend, and it must not be: 07 §5.3 (3) keeps
-/// the backend out of the identity so that the same weights served two ways
-/// stay one vector space. V4 ran this shape against vLLM 0.26.0, where
-/// `/v1/embeddings` accepted `messages` directly and no `/pooling` fallback
-/// was needed, but nothing here depends on that being vLLM.
+#[derive(Clone)]
+pub(crate) struct LocalEmbeddingSpec {
+    wire_format: WireFormat,
+    pub(crate) model: String,
+    model_version_pin: String,
+    chat_template_hash: String,
+    instruction: String,
+    truncate_dimensions: bool,
+}
+
+impl LocalEmbeddingSpec {
+    pub(crate) fn from_declaration(declared: &DeclaredAdapter) -> Result<Self> {
+        fn required(key: &str) -> AdapterError {
+            AdapterError::ConfigSchema(format!("embedding.local_embedding requires `{key}`"))
+        }
+
+        fn sha256_pin(value: Option<&str>, key: &str) -> Result<String> {
+            let value = value.ok_or_else(|| required(key))?;
+            if !kio_core::cas::is_hash(value) {
+                return Err(AdapterError::ConfigSchema(format!(
+                    "embedding.local_embedding `{key}` must be a lowercase sha256 digest"
+                )));
+            }
+            Ok(value.to_owned())
+        }
+
+        if declared.kind.as_deref() != Some("offline_api") {
+            return Err(AdapterError::ConfigSchema(
+                "embedding.local_embedding requires kind = 'offline_api'".to_owned(),
+            ));
+        }
+        if declared.url.is_none() {
+            return Err(required("url"));
+        }
+        if declared.auth.is_some() {
+            return Err(AdapterError::ConfigSchema(
+                "embedding.local_embedding does not accept `auth`".to_owned(),
+            ));
+        }
+        let options = declared
+            .local_embedding
+            .as_ref()
+            .ok_or_else(|| required("wire_format"))?;
+        let wire_format = match options.wire_format.as_deref() {
+            Some("input") => WireFormat::Input,
+            Some("messages") => WireFormat::Messages,
+            Some(_) => {
+                return Err(AdapterError::ConfigSchema(
+                    "embedding.local_embedding `wire_format` must be `input` or `messages`"
+                        .to_owned(),
+                ));
+            }
+            None => return Err(required("wire_format")),
+        };
+        Ok(Self {
+            wire_format,
+            model: declared
+                .model
+                .as_ref()
+                .filter(|model| !model.trim().is_empty())
+                .ok_or_else(|| required("model"))?
+                .clone(),
+            model_version_pin: sha256_pin(
+                options.model_version_pin.as_deref(),
+                "model_version_pin",
+            )?,
+            chat_template_hash: sha256_pin(
+                options.chat_template_hash.as_deref(),
+                "chat_template_hash",
+            )?,
+            instruction: options
+                .instruction
+                .clone()
+                .ok_or_else(|| required("instruction"))?,
+            truncate_dimensions: options.truncate_dimensions,
+        })
+    }
+
+    pub(crate) fn profile(&self) -> AdapterProfile {
+        let identity = json!({
+            "adapter_kind": "embedding",
+            "adapter_role": if self.wire_format == WireFormat::Input { "text" } else { "multimodal" },
+            "dimensions": LOCAL_EMBEDDING_DIMENSIONS,
+            "distance": "cosine",
+            "modality": "multimodal",
+            "input_construction": "chunk_filename_context_v1",
+            "model_or_tool_family": self.model,
+            "model_version_pin": self.model_version_pin,
+            "embedding_semantics": {
+                "wire_format": self.wire_format,
+                "chat_template_hash": self.chat_template_hash,
+                "instruction": self.instruction,
+                "truncate_dimensions": self.truncate_dimensions,
+            },
+            "runtime_kind": "local",
+            "spec_version": 1,
+        });
+        local_profile(GENERIC_LOCAL_EMBEDDING_TOOL_ID, &identity, self.wire_format)
+    }
+
+    fn payload(&self, item: &EmbeddingItem) -> Result<Value> {
+        let mut payload = match self.wire_format {
+            WireFormat::Input => {
+                let EmbeddingContent::Text { text } = &item.content else {
+                    return Err(violation("image_capability_unavailable"));
+                };
+                json!({ "input": format!("{}{text}", self.instruction) })
+            }
+            WireFormat::Messages => json!({ "messages": user_messages(item, &self.instruction) }),
+        };
+        payload["dimensions"] = json!(LOCAL_EMBEDDING_DIMENSIONS);
+        Ok(payload)
+    }
+
+    fn accept_vector(&self, raw: Vec<f32>) -> Result<Vec<f32>> {
+        if raw.len() > LOCAL_EMBEDDING_DIMENSIONS as usize && self.truncate_dimensions {
+            return truncate_and_renormalize(&raw, LOCAL_EMBEDDING_DIMENSIONS as usize);
+        }
+        validate_cosine_vector(&raw, LOCAL_EMBEDDING_DIMENSIONS)?;
+        Ok(raw)
+    }
+}
+
+/// One payload and one response vector per embedding item.
+pub trait LocalEmbeddingClient {
+    fn embed_payload(&self, payload: Value) -> Result<Vec<f32>>;
+}
+
+/// Shared loopback client for the OpenAI-compatible embedding route.
 #[derive(Debug, Clone)]
 pub struct EnvLocalEmbeddingClient {
     endpoint: LocalEndpoint,
     model: String,
     http_policy: HttpPolicy,
+    require_response_index: bool,
 }
 
 impl EnvLocalEmbeddingClient {
@@ -155,10 +252,12 @@ impl EnvLocalEmbeddingClient {
         endpoint: LocalEndpoint,
         model: impl Into<String>,
         timeout_seconds: Option<u64>,
+        require_response_index: bool,
     ) -> Self {
         Self {
             endpoint,
             model: model.into(),
+            require_response_index,
             http_policy: timeout_seconds
                 .map_or_else(HttpPolicy::default, HttpPolicy::with_timeout_seconds),
         }
@@ -166,15 +265,13 @@ impl EnvLocalEmbeddingClient {
 }
 
 impl LocalEmbeddingClient for EnvLocalEmbeddingClient {
-    fn embed_messages(&self, messages: Value) -> Result<Vec<f32>> {
+    fn embed_payload(&self, mut payload: Value) -> Result<Vec<f32>> {
+        payload["model"] = json!(self.model);
+        payload["encoding_format"] = json!("float");
         let url = self.endpoint.endpoint_url("/v1/embeddings");
         let response = local_peer_agent(&self.endpoint, self.http_policy)?
             .post(&url)
-            .send_json(json!({
-                "model": self.model,
-                "encoding_format": "float",
-                "messages": messages,
-            }))
+            .send_json(payload)
             .map_err(local_http_error)
             .and_then(|response| require_success(response, local_http_status_error))?;
         let body = read_json_bounded(
@@ -182,13 +279,11 @@ impl LocalEmbeddingClient for EnvLocalEmbeddingClient {
             EMBEDDING_RESPONSE_MAX_BYTES,
             "local embedding response",
         )?;
-        parse_single_embedding(&body)
+        parse_single_embedding(&body, self.require_response_index)
     }
 }
 
-/// A local server has no credential and no invoice, so the classifications the
-/// online adapters need (`Auth`, `QuotaExceeded`) cannot arise. What can is a
-/// full request queue, which is a retry, and everything else, which is not.
+/// Classify failures to reach the configured loopback peer.
 fn local_http_error(error: ureq::Error) -> AdapterError {
     if is_local_peer_tls_error(&error) {
         return AdapterError::LocalPeerAuth(format!(
@@ -214,6 +309,9 @@ fn local_http_status_error(response: &HttpResponse) -> AdapterError {
                 retry_after_ms,
             }
         }
+        code @ 400..=499 if code != 408 => AdapterError::InvalidInput(format!(
+            "local embedding server rejected the request (HTTP {code})"
+        )),
         code => AdapterError::Network(format!("local embedding server returned HTTP {code}")),
     }
 }
@@ -222,7 +320,7 @@ fn local_http_status_error(response: &HttpResponse) -> AdapterError {
 /// wire rule forces. More than one vector back means the server batched
 /// something we did not send, so it is a contract violation rather than a
 /// value to pick from.
-fn parse_single_embedding(body: &Value) -> Result<Vec<f32>> {
+fn parse_single_embedding(body: &Value, require_index: bool) -> Result<Vec<f32>> {
     let data = body
         .get("data")
         .and_then(Value::as_array)
@@ -233,6 +331,11 @@ fn parse_single_embedding(body: &Value) -> Result<Vec<f32>> {
             data.len()
         )));
     };
+    if require_index && entry.get("index").and_then(Value::as_u64) != Some(0) {
+        return Err(violation(
+            "local embedding response must identify the single input with index 0",
+        ));
+    }
     let embedding = entry
         .get("embedding")
         .and_then(Value::as_array)
@@ -242,8 +345,8 @@ fn parse_single_embedding(body: &Value) -> Result<Vec<f32>> {
         .map(|value| {
             value
                 .as_f64()
-                .filter(|number| number.is_finite())
                 .map(|number| number as f32)
+                .filter(|number| number.is_finite())
                 .ok_or_else(|| violation("local embedding response contains a non-numeric value"))
         })
         .collect()
@@ -281,15 +384,8 @@ fn truncate_and_renormalize(raw: &[f32], dimensions: usize) -> Result<Vec<f32>> 
     Ok(vector)
 }
 
-/// The `messages` array for one item — 07 §5.3 (2)'s single wire form.
-///
-/// Text and image take the same array-of-content shape rather than the string
-/// shorthand. The model's template renders both identically for a lone text
-/// part, so this costs no tokens, and it means there is one code path whose
-/// rendering V4 measured instead of two that merely ought to agree.
-///
-/// **No system message.** See the module docs.
-fn user_messages(item: &EmbeddingItem) -> Result<Value> {
+/// One user message, optionally preceded by the configured system instruction.
+fn user_messages(item: &EmbeddingItem, instruction: &str) -> Value {
     let content = match &item.content {
         EmbeddingContent::Text { text } => json!([{ "type": "text", "text": text }]),
         EmbeddingContent::Image { bytes, mime } => {
@@ -300,49 +396,56 @@ fn user_messages(item: &EmbeddingItem) -> Result<Value> {
             json!([{ "type": "image_url", "image_url": { "url": format!("data:{mime};base64,{encoded}") } }])
         }
     };
-    Ok(json!([{ "role": "user", "content": content }]))
+    let user = json!({ "role": "user", "content": content });
+    if instruction.is_empty() {
+        json!([user])
+    } else {
+        json!([{ "role": "system", "content": instruction }, user])
+    }
 }
 
 fn violation(message: impl Into<String>) -> AdapterError {
     AdapterError::ContractViolation(message.into())
 }
 
-/// The measured local backend carried by an adapter instance.
-enum Backend<C> {
-    Real(C),
-}
-
 /// The `offline_api` embedding adapter.
 pub struct LocalEmbeddingAdapter<C = EnvLocalEmbeddingClient> {
-    backend: Backend<C>,
-    dimensions: u32,
+    client: C,
+    spec: Option<LocalEmbeddingSpec>,
+    profile: AdapterProfile,
 }
 
 pub(crate) fn descriptor_from_profile(
     profile: &AdapterProfile,
 ) -> crate::types::EmbeddingDescriptor {
     let mut descriptor = crate::types::EmbeddingDescriptor::from_profile(profile);
-    descriptor.capability.image_mime_types = vec!["image/png".to_owned(), "image/jpeg".to_owned()];
+    if profile
+        .capability_flags
+        .iter()
+        .any(|flag| flag == IMAGE_OBJECT_CAPABILITY)
+    {
+        descriptor.capability.image_mime_types =
+            vec!["image/png".to_owned(), "image/jpeg".to_owned()];
+    }
     descriptor
 }
 
 impl<C: LocalEmbeddingClient> LocalEmbeddingAdapter<C> {
-    /// The measured backend, over whichever transport `client` provides.
+    /// The measured Qwen backend, over whichever transport the client provides.
     #[must_use]
     pub fn with_client(client: C) -> Self {
         Self {
-            backend: Backend::Real(client),
-            dimensions: LOCAL_EMBEDDING_DIMENSIONS,
+            client,
+            spec: None,
+            profile: profile_for(LocalEmbeddingExecution::Real),
         }
     }
-}
 
-impl<C> LocalEmbeddingAdapter<C> {
-    /// Which backend this instance holds, without exposing the client.
-    #[must_use]
-    fn execution(&self) -> LocalEmbeddingExecution {
-        match self.backend {
-            Backend::Real(_) => LocalEmbeddingExecution::Real,
+    pub(crate) fn with_spec(client: C, spec: LocalEmbeddingSpec) -> Self {
+        Self {
+            profile: spec.profile(),
+            client,
+            spec: Some(spec),
         }
     }
 }
@@ -395,29 +498,25 @@ pub fn profile_value_for(execution: LocalEmbeddingExecution) -> Value {
 /// [`profile_value_for`] for being free-standing.
 #[must_use]
 pub fn profile_for(execution: LocalEmbeddingExecution) -> AdapterProfile {
-    let profile = profile_value_for(execution);
+    local_profile(
+        LOCAL_EMBEDDING_ADAPTER_ID,
+        &profile_value_for(execution),
+        WireFormat::Messages,
+    )
+}
+
+fn local_profile(tool_id: &str, identity: &Value, wire_format: WireFormat) -> AdapterProfile {
+    let mut capability_flags = vec!["text".to_owned()];
+    if wire_format == WireFormat::Messages {
+        capability_flags.extend(["multimodal".to_owned(), IMAGE_OBJECT_CAPABILITY.to_owned()]);
+    }
     AdapterProfile {
         adapter_kind: AdapterKind::Embedding,
-        adapter_id: LOCAL_EMBEDDING_ADAPTER_ID.to_owned(),
+        adapter_id: tool_id.to_owned(),
         execution_mode: ExecutionMode::OfflineApi,
-        tool_profile_hash: tool_profile_hash(&profile)
-            .expect("built-in local embedding profile is valid"),
+        tool_profile_hash: tool_profile_hash(identity).expect("local embedding profile is valid"),
         version: env!("CARGO_PKG_VERSION").to_owned(),
-        // `image_object` is the flag the index path gates image enrichment
-        // on. It says this implementation actually reads an item's
-        // `path`/`mime`, which is not something `modality: "multimodal"`
-        // implies — the adopted online adapter declares multimodal and then
-        // reads only `text`, so handing it an image item would embed the
-        // empty string and store a confidently wrong vector. Capability
-        // flags are outside `PROFILE_FIELDS`, so this does not perturb the
-        // profile hash (qa35 pins that `capabilities` are not hashed).
-        capability_flags: vec![
-            "text".to_owned(),
-            "multimodal".to_owned(),
-            IMAGE_OBJECT_CAPABILITY.to_owned(),
-        ],
-        // Local egress still requires an exact paired grant. The descriptor
-        // declares that effect independently of this online-policy flag.
+        capability_flags,
         allow_network: false,
         // Nothing to bill: the model runs on hardware the user already has.
         // An empty set is also what stops the ledger from reserving and
@@ -430,7 +529,7 @@ pub fn profile_for(execution: LocalEmbeddingExecution) -> AdapterProfile {
 
 impl<C: LocalEmbeddingClient> EmbeddingAdapter for LocalEmbeddingAdapter<C> {
     fn profile(&self) -> AdapterProfile {
-        profile_for(self.execution())
+        self.profile.clone()
     }
 
     fn descriptor(&self) -> crate::types::EmbeddingDescriptor {
@@ -439,45 +538,44 @@ impl<C: LocalEmbeddingClient> EmbeddingAdapter for LocalEmbeddingAdapter<C> {
 
     fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingOutcome> {
         validate_embedding_request_bytes(&request)?;
-        let vectors = match &self.backend {
-            // One request per item, in order. 07 §5.3 (2) forbids the batching
-            // form, and the local server's continuous batching is what absorbs
-            // the cost — so this loop is the design, not a naive first draft.
-            Backend::Real(client) => request
+        if self
+            .spec
+            .as_ref()
+            .is_some_and(|spec| spec.wire_format == WireFormat::Input)
+            && request
                 .items
                 .iter()
-                .map(|item| {
-                    let native = client.embed_messages(user_messages(item)?)?;
-                    Ok(EmbeddingVector {
-                        id: item.id.clone(),
-                        vector: truncate_and_renormalize(&native, self.dimensions as usize)?,
-                    })
+                .any(|item| matches!(item.content, EmbeddingContent::Image { .. }))
+        {
+            return Err(violation("image_capability_unavailable"));
+        }
+        let vectors = request
+            .items
+            .iter()
+            .map(|item| {
+                let vector = match &self.spec {
+                    Some(spec) => {
+                        spec.accept_vector(self.client.embed_payload(spec.payload(item)?)?)?
+                    }
+                    None => {
+                        let native = self
+                            .client
+                            .embed_payload(json!({ "messages": user_messages(item, "") }))?;
+                        truncate_and_renormalize(&native, LOCAL_EMBEDDING_DIMENSIONS as usize)?
+                    }
+                };
+                Ok(EmbeddingVector {
+                    id: item.id.clone(),
+                    vector,
                 })
-                .collect::<Result<Vec<_>>>()?,
-        };
-        // 07 §5.3 acceptance checks (1)-(3): one vector per input, in order,
-        // each of the declared width and usable as a cosine operand. The mock
-        // satisfies these by construction, but running them here means the
-        // checks are exercised on this path too rather than only on Gemini's.
-        if vectors.len() != request.items.len() {
-            return Err(AdapterError::ContractViolation(
-                "local embedding returned a different number of vectors than inputs".to_owned(),
-            ));
-        }
-        for (vector, item) in vectors.iter().zip(&request.items) {
-            if vector.id != item.id {
-                return Err(AdapterError::ContractViolation(
-                    "local embedding returned vectors out of input order".to_owned(),
-                ));
-            }
-            validate_cosine_vector(&vector.vector, self.dimensions)?;
-        }
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(EmbeddingOutcome::Completed(EmbeddingCompleted {
             members: vectors.into_iter().map(Into::into).collect(),
-            dimensions: self.dimensions,
+            dimensions: LOCAL_EMBEDDING_DIMENSIONS,
             distance: "cosine".to_owned(),
             modality: "multimodal".to_owned(),
-            embedding_profile_hash: self.profile().tool_profile_hash,
+            embedding_profile_hash: self.profile.tool_profile_hash.clone(),
             // No token accounting: there is no provider and no invoice. The
             // ledger path reads `billable_kinds` (empty, above) and skips.
             usage: EmbeddingUsage::Unmetered,
@@ -667,10 +765,10 @@ mod tests {
     }
 
     impl LocalEmbeddingClient for RecordingClient {
-        fn embed_messages(&self, messages: Value) -> Result<Vec<f32>> {
+        fn embed_payload(&self, payload: Value) -> Result<Vec<f32>> {
             let mut sent = self.sent.lock().unwrap();
             let index = sent.len();
-            sent.push(messages);
+            sent.push(payload);
             let mut native = vec![0.0_f32; NATIVE_DIMENSIONS];
             // 0.6 inside the kept prefix, 0.8 past it: unit at native width,
             // 0.6 long once truncated.
@@ -702,7 +800,9 @@ mod tests {
         let sent = client.sent();
         assert_eq!(sent.len(), 2, "one request per item — never a batch");
         for (index, messages) in sent.iter().enumerate() {
-            let turns = messages.as_array().expect("messages is an array");
+            let turns = messages["messages"]
+                .as_array()
+                .expect("messages is an array");
             assert_eq!(
                 turns.len(),
                 1,
@@ -714,6 +814,143 @@ mod tests {
                 turns[0]["content"][0]["text"],
                 ["alpha", "beta"][index],
                 "items must go out in order"
+            );
+        }
+    }
+
+    #[test]
+    fn generic_local_embedding_wire_and_dimension_policy_apply_to_all_text_items() {
+        for wire_format in [WireFormat::Input, WireFormat::Messages] {
+            let mut spec = LocalEmbeddingSpec {
+                wire_format,
+                model: "test-model".into(),
+                model_version_pin: "test-weights".into(),
+                chat_template_hash: "test-template".into(),
+                instruction: String::new(),
+                truncate_dimensions: false,
+            };
+            let client = RecordingClient::new();
+            let call = || EmbeddingRequest {
+                input_type: EmbeddingInputType::Query,
+                ..request(&["needle"])
+            };
+            let error = LocalEmbeddingAdapter::with_spec(client, spec.clone())
+                .embed(call())
+                .unwrap_err();
+            assert!(matches!(error, AdapterError::ContractViolation(_)));
+            let short = vec![1.0; LOCAL_EMBEDDING_DIMENSIONS as usize - 1];
+            assert!(spec.accept_vector(short.clone()).is_err());
+
+            spec.truncate_dimensions = true;
+            assert!(spec.accept_vector(short).is_err());
+            let client = RecordingClient::new();
+            let response = LocalEmbeddingAdapter::with_spec(client.clone(), spec)
+                .embed(call())
+                .unwrap()
+                .into_completed()
+                .unwrap();
+            assert_eq!(response.dimensions, 768);
+            assert_eq!(response.usage, EmbeddingUsage::Unmetered);
+            assert!((norm(&response.vectors()[0].vector) - 1.0).abs() < 1e-6);
+
+            let mut payloads = client.sent();
+            assert_eq!(payloads.len(), 1);
+            let payload = payloads.pop().unwrap();
+            assert_eq!(payload["dimensions"], 768);
+            match wire_format {
+                WireFormat::Input => {
+                    assert_eq!(payload["input"], "needle");
+                    assert!(payload.get("messages").is_none());
+                }
+                WireFormat::Messages => {
+                    assert_eq!(
+                        payload["messages"],
+                        json!([
+                            {"role": "user", "content": [{"type": "text", "text": "needle"}]}
+                        ])
+                    );
+                    assert!(payload.get("input").is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn generic_local_embedding_input_rejects_a_mixed_request_before_sending_text() {
+        let spec = LocalEmbeddingSpec {
+            wire_format: WireFormat::Input,
+            model: "test-model".into(),
+            model_version_pin: "test-weights".into(),
+            chat_template_hash: "test-template".into(),
+            instruction: "prefix: ".into(),
+            truncate_dimensions: true,
+        };
+        let client = RecordingClient::new();
+        let adapter = LocalEmbeddingAdapter::with_spec(client.clone(), spec);
+        let mut mixed = request(&["public document"]);
+        mixed.items.push(EmbeddingItem {
+            id: "image".into(),
+            content: EmbeddingContent::Image {
+                bytes: vec![0],
+                mime: "image/png".into(),
+            },
+        });
+        assert!(matches!(
+            adapter.embed(mixed),
+            Err(AdapterError::ContractViolation(reason)) if reason == "image_capability_unavailable"
+        ));
+        assert!(client.sent().is_empty());
+
+        adapter.embed(request(&["public document"])).unwrap();
+        assert_eq!(client.sent()[0]["input"], "prefix: public document");
+    }
+
+    #[test]
+    fn generic_local_embedding_messages_send_each_image_in_its_own_user_turn() {
+        let spec = LocalEmbeddingSpec {
+            wire_format: WireFormat::Messages,
+            model: "test-model".into(),
+            model_version_pin: "test-weights".into(),
+            chat_template_hash: "test-template".into(),
+            instruction: "Describe the image.".into(),
+            truncate_dimensions: true,
+        };
+        let client = RecordingClient::new();
+        let adapter = LocalEmbeddingAdapter::with_spec(client.clone(), spec);
+        let items = [(b"a", "YQ=="), (b"b", "Yg==")];
+        let response = adapter
+            .embed(EmbeddingRequest {
+                input_type: EmbeddingInputType::ImageObject,
+                items: items
+                    .iter()
+                    .map(|(bytes, id)| EmbeddingItem {
+                        id: (*id).into(),
+                        content: EmbeddingContent::Image {
+                            bytes: bytes.to_vec(),
+                            mime: "image/png".into(),
+                        },
+                    })
+                    .collect(),
+                idempotency_token: None,
+            })
+            .unwrap()
+            .into_completed()
+            .unwrap();
+        let payloads = client.sent();
+        assert_eq!(payloads.len(), 2);
+        for ((payload, member), (_, encoded)) in payloads.iter().zip(response.members).zip(items) {
+            assert_eq!(member.id, encoded);
+            assert_eq!(
+                payload,
+                &json!({
+                    "dimensions": 768,
+                    "messages": [
+                        {"role": "system", "content": "Describe the image."},
+                        {"role": "user", "content": [
+                            {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{encoded}")}}
+                        ]}
+                    ],
+                })
             );
         }
     }
@@ -785,9 +1022,9 @@ mod tests {
             .unwrap();
 
         let sent = client.sent();
-        let content = &sent[0][0]["content"][0];
+        let content = &sent[0]["messages"][0]["content"][0];
         assert_eq!(
-            sent[0][0]["role"], "user",
+            sent[0]["messages"][0]["role"], "user",
             "no system turn on the image lane either"
         );
         assert_eq!(content["type"], "image_url");
@@ -871,7 +1108,7 @@ mod tests {
     fn a_response_carrying_more_than_one_vector_is_a_contract_violation() {
         let body = json!({"data": [{"embedding": [1.0, 2.0]}, {"embedding": [3.0, 4.0]}]});
         assert!(matches!(
-            parse_single_embedding(&body).unwrap_err(),
+            parse_single_embedding(&body, false).unwrap_err(),
             AdapterError::ContractViolation(_)
         ));
     }
@@ -879,15 +1116,17 @@ mod tests {
     #[test]
     fn a_response_with_a_non_numeric_component_is_a_contract_violation() {
         let body = json!({"data": [{"embedding": [1.0, "nope"]}]});
-        assert!(parse_single_embedding(&body).is_err());
-        assert!(parse_single_embedding(&json!({"data": [{"embedding": [1.0, null]}]})).is_err());
+        assert!(parse_single_embedding(&body, false).is_err());
+        assert!(
+            parse_single_embedding(&json!({"data": [{"embedding": [1.0, null]}]}), false).is_err()
+        );
         // JSON has no literal for infinity, so the `is_finite` filter is
         // defence against a PARSER that maps an overflowing exponent to one.
         // Guarded because rejecting it outright is equally correct.
         if let Ok(overflowed) = serde_json::from_str::<Value>(r#"{"data":[{"embedding":[1e400]}]}"#)
         {
             assert!(
-                parse_single_embedding(&overflowed).is_err(),
+                parse_single_embedding(&overflowed, false).is_err(),
                 "a non-finite component must not reach the stored vector"
             );
         }
@@ -897,7 +1136,7 @@ mod tests {
     fn a_well_formed_response_parses_in_order() {
         let body = json!({"data": [{"embedding": [0.25, -0.5, 0.75]}], "usage": {}});
         assert_eq!(
-            parse_single_embedding(&body).unwrap(),
+            parse_single_embedding(&body, false).unwrap(),
             vec![0.25, -0.5, 0.75]
         );
     }
@@ -956,6 +1195,54 @@ mod tests {
     /// A busy local server is a retry; anything else is not. There is no
     /// credential and no invoice here, so `Auth` and `QuotaExceeded` cannot
     /// arise and must not be invented.
+    #[test]
+    fn single_embedding_checks_response_index() {
+        for index in [json!(1), json!(-1), json!("0"), json!(0.0), Value::Null] {
+            let body = json!({"data": [{"index": index, "embedding": [1.0]}]});
+            assert!(
+                matches!(
+                    parse_single_embedding(&body, true),
+                    Err(AdapterError::ContractViolation(_))
+                ),
+                "{body}"
+            );
+        }
+        let missing = json!({"data": [{"embedding": [1.0]}]});
+        assert!(matches!(
+            parse_single_embedding(&missing, true),
+            Err(AdapterError::ContractViolation(_))
+        ));
+        assert_eq!(
+            parse_single_embedding(&json!({"data": [{"index": 0, "embedding": [1.0]}]}), true)
+                .unwrap(),
+            [1.0]
+        );
+    }
+
+    #[test]
+    fn local_http_input_rejection_is_not_a_network_error() {
+        for code in [400, 404, 413, 422] {
+            let response = ureq::http::Response::builder()
+                .status(code)
+                .body(ureq::Body::builder().data(Vec::new()))
+                .unwrap();
+            assert_eq!(
+                local_http_status_error(&response).error_code(),
+                "KIO-E-BATCH-INPUT-001"
+            );
+        }
+        for code in [408, 503] {
+            let response = ureq::http::Response::builder()
+                .status(code)
+                .body(ureq::Body::builder().data(Vec::new()))
+                .unwrap();
+            assert!(matches!(
+                local_http_status_error(&response),
+                AdapterError::Network(_)
+            ));
+        }
+    }
+
     #[test]
     fn a_busy_server_classifies_as_a_rate_limit_and_a_broken_one_does_not() {
         let busy = ureq::http::Response::builder()

@@ -84,6 +84,8 @@ pub struct ApprovalStatusResponse {
 pub struct EndpointPeerStatus {
     pub binding: crate::grants::DeviceEndpointBinding,
     pub peer_authenticated: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub configured_disclosures: Vec<crate::grants::EndpointDisclosure>,
 }
 #[derive(Debug, Serialize)]
 pub struct EffectiveApproval {
