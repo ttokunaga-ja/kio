@@ -94,7 +94,7 @@ enum ConverterBackend {
 struct RealRenderer {
     sources: RenderSources,
     program_fingerprint: ExecutableFingerprint,
-    runtime_snapshot: RuntimeSnapshot,
+    runtime_snapshot: Box<RuntimeSnapshot>,
     runtime: OfficeRuntime,
     control: ControlHandle,
     #[cfg(test)]
@@ -189,6 +189,7 @@ impl OfficeConverter {
                 renderer
                     .verify_runtime("before conversion", deadline)
                     .map_err(verification_error)?;
+                #[cfg(not(target_os = "linux"))]
                 if OfficeRuntime::new(renderer.sources.program(), deadline)? != renderer.runtime {
                     return Err(AdapterError::ContractViolation(
                         "Office runtime changed after converter probe".to_owned(),
@@ -353,6 +354,8 @@ impl RealRenderer {
             .chain(package_roots.iter().cloned());
         let sources = RenderSources::resolve(program, runtime_roots)
             .map_err(|error| AdapterError::ContractViolation(error.to_string()))?;
+        #[cfg(target_os = "linux")]
+        let sources = runtime.bind_runtime(sources)?;
         if sources.program() != program {
             return Err(AdapterError::ContractViolation(
                 "office converter executable changed before runtime verification".to_owned(),
@@ -360,13 +363,18 @@ impl RealRenderer {
         }
         let program_fingerprint =
             ExecutableFingerprint::new(sources.program(), deadline).map_err(verification_error)?;
+        #[cfg(target_os = "linux")]
+        let runtime_snapshot = runtime
+            .snapshot(package_roots, &sources, deadline)
+            .map_err(verification_error)?;
+        #[cfg(not(target_os = "linux"))]
         let runtime_snapshot =
             RuntimeSnapshot::new(package_roots, &sources, deadline).map_err(verification_error)?;
         Ok(Self {
             sources,
             program_fingerprint,
             runtime,
-            runtime_snapshot,
+            runtime_snapshot: Box::new(runtime_snapshot),
             control: control.clone(),
             #[cfg(test)]
             native_acceptance_diagnostics: false,
@@ -425,6 +433,8 @@ impl RealRenderer {
         check_verification_deadline(deadline)?;
         self.program_fingerprint
             .verify(self.sources.program(), stage, deadline)?;
+        #[cfg(target_os = "linux")]
+        self.runtime.verify_roots(deadline)?;
         self.runtime_snapshot.verify(&self.sources, stage, deadline)
     }
 }
@@ -1043,9 +1053,13 @@ mod tests {
         std::fs::create_dir(&package).unwrap();
         std::fs::write(package.join("component"), b"original").unwrap();
         let deadline = test_deadline();
+        #[cfg(target_os = "linux")]
+        let runtime = OfficeRuntime::fixture(package.clone());
+        #[cfg(not(target_os = "linux"))]
         let runtime = OfficeRuntime::new(&program, deadline).unwrap();
-        let mut roots = runtime.runtime_roots(&program).unwrap();
-        roots.push(package.clone());
+        let roots = runtime.runtime_roots(&program).unwrap();
+        #[cfg(not(target_os = "linux"))]
+        let roots = roots.into_iter().chain([package.clone()]).collect();
         let renderer = RealRenderer::new(
             &program,
             vec![package.clone()],
@@ -1445,62 +1459,6 @@ mod tests {
             !roots.contains(&home.join("bin")) && !roots.contains(&home),
             "a caller-selected converter must not grant its directory or home"
         );
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn linux_tdf_layout_is_exact_and_version_components_are_bounded() {
-        assert_eq!(
-            linux_tdf_bundle_candidate(Path::new("/opt/libreoffice26.2/program/soffice")),
-            Some(PathBuf::from("/opt/libreoffice26.2"))
-        );
-        for path in [
-            "/opt/libreoffice/program/soffice",
-            "/opt/libreoffice26/program/soffice",
-            "/opt/libreoffice26.2.5/program/soffice",
-            "/opt/libreoffice26./program/soffice",
-            "/opt/libreoffice.2/program/soffice",
-            "/opt/libreoffice12345.2/program/soffice",
-            "/opt/libreoffice26.beta/program/soffice",
-            "/home/user/libreoffice26.2/program/soffice",
-            "/opt/libreoffice26.2//program/soffice",
-            "/opt/libreoffice26.2/program/../program/soffice",
-            "/opt/libreoffice26.2/program/custom",
-            "/opt/libreoffice26.2/sibling/soffice",
-        ] {
-            assert!(
-                linux_tdf_bundle_candidate(Path::new(path)).is_none(),
-                "{path}"
-            );
-        }
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn linux_package_authority_requires_root_and_rejects_unsafe_modes() {
-        assert!(trusted_linux_package_mode(0, 0o100755, false));
-        assert!(trusted_linux_package_mode(0, 0o40755, true));
-        for (owner, mode) in [
-            (501, 0o100755),
-            (0, 0o100775),
-            (0, 0o100757),
-            (0, 0o104755),
-            (0, 0o102755),
-        ] {
-            assert!(!trusted_linux_package_mode(owner, mode, false));
-        }
-        assert!(!trusted_linux_package_mode(0, 0o40777, true));
-        assert!(
-            linux_tdf_runtime_roots(Path::new("/tmp/custom/soffice"))
-                .unwrap()
-                .is_empty()
-        );
-        assert!(verify_linux_package_path(Path::new("/"), true).is_ok());
-        let fixture = tempfile::tempdir().unwrap();
-        let alias = fixture.path().join("alias");
-        std::os::unix::fs::symlink("/", &alias).unwrap();
-        assert!(verify_linux_package_path(&alias, true).is_err());
-        assert!(verify_linux_package_path(&fixture.path().join("missing"), false).is_err());
     }
 
     #[cfg(windows)]
@@ -1970,6 +1928,47 @@ mod tests {
         .expect("successful fixture conversions establish capability");
         assert_eq!(media_types, [DOCX_MEDIA_TYPE, PPTX_MEDIA_TYPE]);
         assert_eq!(version, "unknown");
+    }
+
+    // The supplied soffice capture exercises the Writer TJ text run.
+    const LIBREOFFICE_DOCX_PROBE_PDF: &[u8] =
+        include_bytes!("../fixtures/office-probe-libreoffice-docx.pdf");
+    // LibreOfficeKit export of the probe slide with a text box sized to fit the marker.
+    const LIBREOFFICE_PPTX_PROBE_PDF: &[u8] =
+        include_bytes!("../fixtures/office-probe-libreoffice-pptx.pdf");
+    // The supplied soffice capture wraps one glyph per row and positions the tail off the page.
+    const LIBREOFFICE_CLIPPED_PPTX_PROBE_PDF: &[u8] =
+        include_bytes!("../fixtures/office-probe-libreoffice-pptx-clipped.pdf");
+
+    fn probe_captured_libreoffice_pdfs(presentation: &[u8]) -> Result<String> {
+        probe_renderer_capability(
+            || Ok("LibreOffice 24.2".to_owned()),
+            |_, media_type| match media_type {
+                DOCX_MEDIA_TYPE => Ok(LIBREOFFICE_DOCX_PROBE_PDF.to_vec()),
+                PPTX_MEDIA_TYPE => Ok(presentation.to_vec()),
+                _ => panic!("unexpected probe media type: {media_type}"),
+            },
+            test_deadline(),
+        )
+    }
+
+    #[test]
+    fn probe_accepts_captured_libreoffice_docx_and_pptx() {
+        let version = probe_captured_libreoffice_pdfs(LIBREOFFICE_PPTX_PROBE_PDF)
+            .expect("real LibreOffice PDFs contain both expected probe pages");
+        assert_eq!(version, "LibreOffice 24.2");
+    }
+
+    #[test]
+    fn probe_rejects_captured_libreoffice_pptx_with_clipped_marker() {
+        let error = probe_captured_libreoffice_pdfs(LIBREOFFICE_CLIPPED_PPTX_PROBE_PDF)
+            .expect_err("a marker that runs off the slide does not establish capability");
+        assert!(
+            error
+                .to_string()
+                .contains("did not contain the expected pptx page"),
+            "{error}"
+        );
     }
 
     #[test]

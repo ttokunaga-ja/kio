@@ -1,8 +1,5 @@
 #[cfg(target_os = "linux")]
 mod linux;
-#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
-#[path = "linux/package.rs"]
-mod linux_package;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -11,11 +8,6 @@ mod unix;
 mod windows;
 #[cfg(target_os = "linux")]
 pub(crate) use linux::office::{OfficeRuntime, canonical_renderer_program, private_temp_dir};
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
-pub(crate) use linux_package::{
-    linux_tdf_bundle_candidate, linux_tdf_runtime_roots, trusted_linux_package_mode,
-    verify_linux_package_path,
-};
 #[cfg(target_os = "macos")]
 pub(crate) use macos::office::{OfficeRuntime, canonical_renderer_program, private_temp_dir};
 #[cfg(all(test, target_os = "macos"))]
