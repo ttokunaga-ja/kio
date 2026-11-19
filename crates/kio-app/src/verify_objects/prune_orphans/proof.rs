@@ -29,7 +29,7 @@ use std::path::PathBuf;
 
 const MAX_SCAN_ENTRIES: usize = 1_000_000;
 const MAX_SCAN_BYTES: u64 = 1024 * 1024 * 1024;
-const MAX_MANIFEST: u64 = 8 * 1024 * 1024;
+const MAX_MANIFEST: u64 = kio_core::cas::MAX_MANIFEST_OBJECT_BYTES;
 const MAX_UNIT: u64 = 64 * 1024 * 1024;
 const DIRECTORY_QUARANTINE: &str = ".kio-prune-directory-";
 const CAS_QUARANTINE: &str = ".kio-cas-remove-";

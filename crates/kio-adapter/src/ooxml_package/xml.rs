@@ -71,7 +71,7 @@ pub(crate) fn walk(
                     }
                     let (resolved, local) = reader.resolver().resolve_attribute(attribute.key);
                     let namespace = namespace_bytes(resolved)?;
-                    if !expanded.insert((namespace.to_vec(), local.as_ref().to_vec())) {
+                    if !expanded.insert((namespace, local.into_inner())) {
                         return Err(contract("Office", "XML has duplicate expanded attributes"));
                     }
                     if namespace.is_empty() {

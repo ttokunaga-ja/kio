@@ -1478,9 +1478,10 @@ fn scan_derived_inventory(
     let mut identities = BTreeSet::new();
     for leaf in leaves {
         let manifest_path = leaf.join("manifest.json");
-        let bytes = read_bounded_regular(&manifest_path, 8 * 1024 * 1024)?.ok_or_else(|| {
-            store_corrupt(&manifest_path, "normalized instance manifest is missing")
-        })?;
+        let bytes = read_bounded_regular(&manifest_path, MAX_NORMALIZED_MANIFEST_OBJECT_BYTES)?
+            .ok_or_else(|| {
+                store_corrupt(&manifest_path, "normalized instance manifest is missing")
+            })?;
         let manifest: NormalizedInstanceManifest = serde_json::from_slice(&bytes)
             .map_err(|error| store_corrupt(&manifest_path, &error.to_string()))?;
         validate_instance_leaf(&leaf, &manifest)?;
@@ -1710,7 +1711,7 @@ fn historical_manifest_was_purged_before_resurrection(
     )
 }
 
-const MAX_NORMALIZED_MANIFEST_OBJECT_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_NORMALIZED_MANIFEST_OBJECT_BYTES: u64 = kio_core::cas::MAX_MANIFEST_OBJECT_BYTES;
 
 fn manifest_content_hash(manifest: &NormalizedInstanceManifest) -> Result<String> {
     let value =

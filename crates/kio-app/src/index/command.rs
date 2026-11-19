@@ -1294,7 +1294,7 @@ fn preview_extraction_issues(
                 kio_pipeline::scan::read_bound_extraction_input(root, &candidate.input_path, tier)
                     .and_then(|verified| {
                         let path = display_root.join(&candidate.input_path);
-                        visit_prepared_units_with_budget(
+                        let output = visit_prepared_units_with_budget(
                             PrepareStageBytesRequest {
                                 raw_hash: &verified.raw_hash,
                                 media_type: &candidate.media_type,
@@ -1314,15 +1314,25 @@ fn preview_extraction_issues(
                                     bytes,
                                 )
                             },
-                        )
+                        )?;
+                        if kio_adapter::xlsx_extract::is_xlsx_media(&candidate.media_type) {
+                            super::pipeline::check_preview_xlsx_manifest(
+                                &path,
+                                &verified.raw_hash,
+                                &output.prepared_units,
+                            )?;
+                        }
+                        Ok(())
                     });
             let error = pipeline_to_kio(result.err()?);
             let is_xlsx = kio_adapter::xlsx_extract::is_xlsx_media(&candidate.media_type);
             let resource_limit = error.resource_limit().cloned();
-            let retry = (is_xlsx && resource_limit.is_some()).then_some(match tier {
-                kio_core::error::ResourceTier::Standard => "kio index --resource-tier large",
-                kio_core::error::ResourceTier::Large => {
-                    "Reduce the workbook and run kio index --resource-tier large"
+            let retry = resource_limit.as_ref().filter(|_| is_xlsx).map(|limit| {
+                use kio_core::error::{Resource, ResourceTier};
+                match (limit.resource, limit.resource_tier) {
+                    (Resource::Storage, _) => "Free space for extraction and rerun kio index",
+                    (_, Some(ResourceTier::Standard)) => "kio index --resource-tier large",
+                    _ => "Reduce the workbook and run kio index --resource-tier large",
                 }
             });
             Some(crate::response::index::ExtractionIssue {

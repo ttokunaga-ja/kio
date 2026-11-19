@@ -3,6 +3,7 @@
 use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    io::{BufRead, BufReader},
 };
 
 use kio_core::error::ResourceTier;
@@ -14,9 +15,13 @@ use crate::{
 };
 
 mod budget;
+mod values;
 mod xml;
 
+use values::{Lookup, Values, ValuesWriter};
+
 use budget::Budget;
+pub use budget::SheetUsage;
 use xml::{DOCUMENT_REL_NS, Xml, reference_text};
 
 const XLSX_MEDIA: &str = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
@@ -43,10 +48,6 @@ pub fn raw_zip_limit(tier: ResourceTier) -> u64 {
     BoundedZipLimits::xlsx(tier).raw_bytes()
 }
 
-pub(super) fn check_raw_zip_size(tier: ResourceTier, bytes: u64) -> Result<()> {
-    BoundedZipLimits::xlsx(tier).check_raw_bytes(bytes)
-}
-
 struct SheetRef {
     name: String,
     target: String,
@@ -58,7 +59,7 @@ pub struct XlsxWorkbook<'a> {
     archive: BoundedZip<'a>,
     budget: Budget,
     sheets: Vec<SheetRef>,
-    shared: Vec<String>,
+    shared: Values<String>,
     formats: CellFormats,
 }
 
@@ -78,11 +79,11 @@ impl<'a> XlsxWorkbook<'a> {
         )?;
         let metadata_start = budget.retained();
         let main = with_part(&mut archive, &mut budget, ROOT_RELS, |bytes, budget| {
-            Xml::validate(bytes)?;
+            Xml::validate(&mut &*bytes, budget)?;
             opc::office_document_target(bytes, |size| retain_record(budget, size))
         })?;
         let content = with_part(&mut archive, &mut budget, MANIFEST, |bytes, budget| {
-            Xml::validate(bytes)?;
+            Xml::validate(&mut &*bytes, budget)?;
             opc::content_types(bytes, |size| retain_record(budget, size))
         })?;
         if content
@@ -93,7 +94,7 @@ impl<'a> XlsxWorkbook<'a> {
         {
             return Err(invalid("workbook part has no XLSX content type"));
         }
-        let pending = with_part(&mut archive, &mut budget, &main, parse_workbook_sheets)?;
+        let pending = with_xml_member(&mut archive, &mut budget, &main, parse_workbook_sheets)?;
         let relations_part = relationship_part(&main);
         let mut worksheets = HashMap::new();
         let mut shared_part = None;
@@ -103,7 +104,7 @@ impl<'a> XlsxWorkbook<'a> {
             &mut budget,
             &relations_part,
             |bytes, budget| {
-                Xml::validate(bytes)?;
+                Xml::validate(&mut &*bytes, budget)?;
                 opc::relationships(
                     bytes,
                     |size| retain_record(budget, 2 * size + 2 * main.len()),
@@ -169,8 +170,8 @@ impl<'a> XlsxWorkbook<'a> {
                 continue;
             }
             if name.ends_with(".xml") || name.ends_with(".rels") {
-                with_part(&mut archive, &mut budget, &name, |bytes, _| {
-                    Xml::validate(bytes)
+                with_xml_member(&mut archive, &mut budget, &name, |input, budget| {
+                    Xml::validate(input, budget)
                 })?;
             } else {
                 archive.consume(&name, false, |length| {
@@ -186,11 +187,11 @@ impl<'a> XlsxWorkbook<'a> {
         // The remaining part names are short-lived and already charged above.
         budget.release(budget.retained() - metadata_start - sheets_memory);
         let shared = match shared_part {
-            Some(part) => with_part(&mut archive, &mut budget, &part, parse_shared_strings)?,
-            None => Vec::new(),
+            Some(part) => with_xml_member(&mut archive, &mut budget, &part, parse_shared_strings)?,
+            None => Values::default(),
         };
         let formats = match styles_part {
-            Some(part) => with_part(&mut archive, &mut budget, &part, parse_styles)?,
+            Some(part) => with_xml_member(&mut archive, &mut budget, &part, parse_styles)?,
             None => CellFormats::default(),
         };
         Ok(Self {
@@ -217,21 +218,35 @@ impl<'a> XlsxWorkbook<'a> {
 
     /// Render one sheet. On exhaustion, the cursor identifies the last source
     /// row processed in that sheet. No partial Markdown is returned.
-    pub fn read_sheet(&mut self, index: usize, through_row: &mut u64) -> Result<String> {
-        *through_row = 0;
+    pub fn read_sheet(
+        &mut self,
+        index: usize,
+        progress: &mut SheetProgress,
+    ) -> Result<(String, SheetUsage)> {
+        *progress = SheetProgress::default();
         let sheet = self
             .sheets
             .get(index)
             .ok_or_else(|| invalid("worksheet index is out of range"))?;
         let before = self.budget.retained();
-        let result = with_part(
+        let checkpoint = self.budget.begin_sheet();
+        let result = with_xml_member(
             &mut self.archive,
             &mut self.budget,
             &sheet.target,
-            |bytes, budget| parse_sheet(bytes, &self.shared, &self.formats, budget, through_row),
+            |input, budget| {
+                parse_sheet_stream(input, &self.shared, &self.formats, budget, progress)
+            },
         );
         self.budget.release(self.budget.retained() - before);
-        result
+        result.map(|markdown| {
+            let usage = self.budget.sheet_usage(checkpoint, markdown.len());
+            (markdown, usage)
+        })
+    }
+
+    pub fn reuse_sheet(&mut self, usage: SheetUsage) -> Result<()> {
+        self.budget.replay(usage)
     }
 }
 
@@ -260,7 +275,33 @@ fn with_part<T>(
         .ok_or_else(|| invalid("required part is missing"))?;
     let result = parse(&part, budget);
     budget.release(part_memory(part.len()));
+    budget.set_xml_scratch(0)?;
     result
+}
+
+fn with_xml_member<T>(
+    archive: &mut BoundedZip<'_>,
+    budget: &mut Budget,
+    name: &str,
+    parse: impl FnOnce(&mut dyn BufRead, &mut Budget) -> Result<T>,
+) -> Result<T> {
+    const BUFFER: usize = 16 * 1024;
+    budget.retain(BUFFER)?;
+    let result = archive.read_member(name, |input, length| {
+        budget.visit()?;
+        budget.expand(length)?;
+        parse(&mut BufReader::with_capacity(BUFFER, input), budget)
+    });
+    budget.release(BUFFER);
+    budget.set_xml_scratch(0)?;
+    result?.ok_or_else(|| invalid("required XML part is missing"))
+}
+
+#[derive(Debug, Default, Clone, Copy, serde::Serialize)]
+pub struct SheetProgress {
+    pub parsed_through_row: u64,
+    pub completed_through_row: u64,
+    pub first_unprocessed_row: Option<u64>,
 }
 
 fn part_memory(length: usize) -> usize {
@@ -311,12 +352,16 @@ fn xml_error(error: impl std::fmt::Display) -> AdapterError {
     AdapterError::ContractViolation(format!("XLSX XML is malformed: {error}"))
 }
 
-fn parse_workbook_sheets(bytes: &[u8], budget: &mut Budget) -> Result<Vec<(String, String)>> {
-    let mut xml = Xml::new(bytes, Some(b"workbook"))?;
+fn parse_workbook_sheets(
+    input: &mut dyn BufRead,
+    budget: &mut Budget,
+) -> Result<Vec<(String, String)>> {
+    let mut xml = Xml::new(input, Some(b"workbook"));
+    let mut buffer = Vec::new();
     let mut sheets = Vec::new();
     let mut in_sheets = false;
     loop {
-        match xml.next()? {
+        match xml.next(&mut buffer, budget)? {
             (1, Event::Start(tag)) if xml.sheet_element(tag.name(), b"sheets") => {
                 in_sheets = true;
             }
@@ -344,17 +389,20 @@ fn parse_workbook_sheets(bytes: &[u8], budget: &mut Budget) -> Result<Vec<(Strin
     }
 }
 
-fn parse_shared_strings(bytes: &[u8], budget: &mut Budget) -> Result<Vec<String>> {
-    let mut xml = Xml::new(bytes, Some(b"sst"))?;
-    let mut strings = Vec::new();
+fn parse_shared_strings(input: &mut dyn BufRead, budget: &mut Budget) -> Result<Values<String>> {
+    let mut xml = Xml::new(input, Some(b"sst"));
+    let mut buffer = Vec::new();
+    let mut strings = ValuesWriter::default();
     let mut current = String::new();
+    let mut current_bytes = 0;
     let mut in_item = false;
     let mut run = false;
     let mut text_depth = None;
     loop {
-        let (depth, event) = xml.next()?;
+        let (depth, event) = xml.next(&mut buffer, budget)?;
         if let Some(text) = text_content(&event, depth, text_depth)? {
             budget.retain(text.len() * 2)?;
+            current_bytes += text.len() * 2;
             current.push_str(&text);
             continue;
         }
@@ -365,7 +413,7 @@ fn parse_shared_strings(bytes: &[u8], budget: &mut Budget) -> Result<Vec<String>
             {
                 retain_record(budget, 0)?;
                 if empty {
-                    strings.push(String::new());
+                    strings.push(String::new(), RECORD_BYTES, budget)?;
                 } else {
                     in_item = true;
                 }
@@ -381,7 +429,11 @@ fn parse_shared_strings(bytes: &[u8], budget: &mut Budget) -> Result<Vec<String>
                 text_depth = Some(depth + 1);
             }
             Event::End(_) if depth == 1 && in_item => {
-                strings.push(std::mem::take(&mut current));
+                strings.push(
+                    std::mem::take(&mut current),
+                    RECORD_BYTES + std::mem::take(&mut current_bytes),
+                    budget,
+                )?;
                 in_item = false;
             }
             Event::End(_) => {
@@ -392,7 +444,7 @@ fn parse_shared_strings(bytes: &[u8], budget: &mut Budget) -> Result<Vec<String>
                     run = false;
                 }
             }
-            Event::Eof => return Ok(strings),
+            Event::Eof => return strings.finish(budget),
             _ => {}
         }
     }
@@ -430,13 +482,14 @@ impl CellFormats {
     }
 }
 
-fn parse_styles(bytes: &[u8], budget: &mut Budget) -> Result<CellFormats> {
-    let mut xml = Xml::new(bytes, Some(b"styleSheet"))?;
+fn parse_styles(input: &mut dyn BufRead, budget: &mut Budget) -> Result<CellFormats> {
+    let mut xml = Xml::new(input, Some(b"styleSheet"));
+    let mut buffer = Vec::new();
     let mut formats = CellFormats::default();
     let mut in_custom = false;
     let mut in_cell_xfs = false;
     loop {
-        let (depth, event) = xml.next()?;
+        let (depth, event) = xml.next(&mut buffer, budget)?;
         match event {
             Event::Start(tag) if depth == 1 => {
                 in_custom = xml.sheet_element(tag.name(), b"numFmts");
@@ -477,17 +530,28 @@ fn format_id(xml: &Xml<'_>, tag: &BytesStart<'_>) -> Result<Option<u32>> {
         .transpose()
 }
 
-struct Row<'a> {
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Row {
     number: u64,
+    #[serde(skip)]
     next_column: usize,
-    cells: Vec<(usize, Cow<'a, str>)>,
+    #[serde(skip)]
+    bytes: usize,
+    cells: Vec<(usize, CellValue)>,
 }
 
-impl Row<'_> {
+#[derive(serde::Serialize, serde::Deserialize)]
+enum CellValue {
+    Text(String),
+    Shared(usize),
+}
+
+impl Row {
     fn new(number: u64) -> Self {
         Self {
             number,
             next_column: 0,
+            bytes: 0,
             cells: Vec::new(),
         }
     }
@@ -502,7 +566,7 @@ struct Cell {
 }
 
 impl Cell {
-    fn new(xml: &Xml<'_>, tag: &BytesStart<'_>, row: &Row<'_>) -> Result<Self> {
+    fn new(xml: &Xml<'_>, tag: &BytesStart<'_>, row: &Row) -> Result<Self> {
         let column = match xml.attribute(tag, b"", b"r")? {
             Some(reference) => {
                 let (column, number) = cell_reference(&reference)?;
@@ -536,13 +600,13 @@ impl Cell {
         Ok(())
     }
 
-    fn finish<'a>(
+    fn finish(
         self,
-        row: &mut Row<'a>,
-        shared: &'a [String],
+        row: &mut Row,
+        shared: &mut Lookup<'_, String>,
         formats: &CellFormats,
         budget: &mut Budget,
-    ) -> Result<usize> {
+    ) -> Result<()> {
         row.next_column = self
             .column
             .checked_add(1)
@@ -550,29 +614,41 @@ impl Cell {
         let raw = self.text.trim();
         if raw.is_empty() {
             budget.release(self.text_bytes);
-            return Ok(0);
+            return Ok(());
+        }
+        if self
+            .style
+            .is_some_and(|index| index >= formats.style_formats.len())
+        {
+            return Err(invalid("cell references an absent style"));
         }
         let (value, bytes) = match self.kind.as_deref() {
             Some("s") => {
                 budget.visit()?;
                 let index = raw.parse::<usize>().map_err(xml_error)?;
-                let value = shared
-                    .get(index)
-                    .ok_or_else(|| invalid("cell references an absent shared string"))?;
-                budget.expand(value.len())?;
-                (Cow::Borrowed(value.as_str()), 0)
+                let empty = shared.get(index, budget, |value, budget| {
+                    budget.expand(value.len())?;
+                    Ok(value.trim().is_empty())
+                })?;
+                if empty {
+                    budget.release(self.text_bytes);
+                    return Ok(());
+                }
+                (CellValue::Shared(index), 0)
             }
             Some("inlineStr" | "str" | "e" | "d") => {
                 budget.retain(raw.len())?;
-                (Cow::Owned(raw.to_owned()), raw.len())
+                (CellValue::Text(raw.to_owned()), raw.len())
             }
-            Some("b") => (Cow::Borrowed(if raw == "1" { "TRUE" } else { "FALSE" }), 0),
+            Some("b") => {
+                let value = if raw == "1" { "TRUE" } else { "FALSE" };
+                budget.retain(value.len())?;
+                (CellValue::Text(value.to_owned()), value.len())
+            }
             _ => {
                 let format = formats.code_for_style(self.style);
                 let format_bytes = format.map_or(0, str::len);
                 budget.expand(format_bytes)?;
-                // f64 formatting may add a sign, punctuation, and up to 309
-                // integral digits. Precision is bounded by the format string.
                 let bound = (raw.len() + format_bytes + 320) * 2;
                 budget.retain(bound)?;
                 let value = format_cell(raw, format);
@@ -581,18 +657,15 @@ impl Cell {
                     return Err(invalid("numeric format exceeds its render bound"));
                 }
                 budget.release(bound - size);
-                (Cow::Owned(value), size)
+                (CellValue::Text(value), size)
             }
         };
         budget.release(self.text_bytes);
-        if value.trim().is_empty() {
-            budget.release(bytes);
-            return Ok(0);
-        }
-        let charge = bytes + 2 * size_of::<(usize, Cow<'_, str>)>() + 64;
-        budget.retain(charge - bytes)?;
+        let slot = 2 * size_of::<(usize, CellValue)>() + 64;
+        budget.retain(slot)?;
+        row.bytes += bytes + slot;
         row.cells.push((self.column, value));
-        Ok(charge)
+        Ok(())
     }
 }
 
@@ -628,14 +701,16 @@ fn positive_row(text: &str) -> Result<u64> {
         .ok_or_else(|| invalid("invalid source row number"))
 }
 
-fn parse_sheet(
-    bytes: &[u8],
-    shared: &[String],
+fn parse_sheet_stream(
+    input: &mut dyn BufRead,
+    shared: &Values<String>,
     formats: &CellFormats,
     budget: &mut Budget,
-    through_row: &mut u64,
+    progress: &mut SheetProgress,
 ) -> Result<String> {
-    let mut xml = Xml::new(bytes, Some(b"worksheet"))?;
+    let mut xml = Xml::new(input, Some(b"worksheet"));
+    let mut shared = shared.lookup();
+    let mut buffer = Vec::new();
     let mut out = String::new();
     let mut region = Region::default();
     let mut row = None;
@@ -646,7 +721,7 @@ fn parse_sheet(
     let mut sheet_data = false;
     let mut saw_sheet_data = false;
     loop {
-        let (depth, event) = xml.next()?;
+        let (depth, event) = xml.next(&mut buffer, budget)?;
         if let Some(text) = text_content(&event, depth, text_depth)? {
             if let Some(cell) = &mut cell {
                 Cell::append(cell, &text, budget)?;
@@ -668,8 +743,8 @@ fn parse_sheet(
             Event::Start(tag) | Event::Empty(tag)
                 if sheet_data && depth == 2 && xml.sheet_element(tag.name(), b"row") =>
             {
-                budget.visit()?;
-                let next = through_row
+                let next = progress
+                    .parsed_through_row
                     .checked_add(1)
                     .ok_or_else(|| invalid("row number overflows"))?;
                 let number = match xml.attribute(&tag, b"", b"r")? {
@@ -680,11 +755,14 @@ fn parse_sheet(
                     return Err(invalid("worksheet has duplicate or backwards row numbers"));
                 }
                 if number > next || empty {
-                    region.flush(&mut out, budget, through_row)?;
-                    *through_row = number - 1;
+                    region.flush(&mut out, &mut shared, budget, progress)?;
                 }
+                progress.first_unprocessed_row.get_or_insert(number);
+                budget.visit()?;
                 if empty {
-                    *through_row = number;
+                    progress.parsed_through_row = number;
+                    progress.completed_through_row = number;
+                    progress.first_unprocessed_row = None;
                 } else {
                     row = Some(Row::new(number));
                 }
@@ -696,7 +774,7 @@ fn parse_sheet(
                 let row = row.as_mut().expect("matched row");
                 let next = Cell::new(&xml, &tag, row)?;
                 if empty {
-                    region.bytes += next.finish(row, shared, formats, budget)?;
+                    next.finish(row, &mut shared, formats, budget)?;
                 } else {
                     cell = Some(next);
                 }
@@ -732,18 +810,20 @@ fn parse_sheet(
                     4 => inline = false,
                     3 => {
                         if let (Some(cell), Some(row)) = (cell.take(), &mut row) {
-                            region.bytes += cell.finish(row, shared, formats, budget)?;
+                            cell.finish(row, &mut shared, formats, budget)?;
                         }
                     }
                     2 => {
                         if let Some(row) = row.take() {
                             let number = row.number;
+                            progress.parsed_through_row = number;
                             if row.cells.is_empty() {
-                                region.flush(&mut out, budget, through_row)?;
+                                region.flush(&mut out, &mut shared, budget, progress)?;
+                                progress.completed_through_row = number;
+                                progress.first_unprocessed_row = None;
                             } else {
-                                region.push(row, *through_row, budget)?;
+                                region.push(row, budget)?;
                             }
-                            *through_row = number;
                         }
                     }
                     _ => {}
@@ -753,7 +833,7 @@ fn parse_sheet(
                 if !saw_sheet_data {
                     return Err(invalid("worksheet has no sheetData"));
                 }
-                region.flush(&mut out, budget, through_row)?;
+                region.flush(&mut out, &mut shared, budget, progress)?;
                 return Ok(out);
             }
             _ => {}
@@ -762,81 +842,91 @@ fn parse_sheet(
 }
 
 #[derive(Default)]
-struct Region<'a> {
-    rows: Vec<Row<'a>>,
-    bytes: usize,
-    before: u64,
+struct Region {
+    rows: ValuesWriter<Row>,
+    columns: BTreeSet<usize>,
+    last_row: u64,
 }
 
-impl<'a> Region<'a> {
-    fn push(&mut self, row: Row<'a>, before: u64, budget: &mut Budget) -> Result<()> {
-        if self.rows.is_empty() {
-            self.before = before;
+impl Region {
+    fn push(&mut self, row: Row, budget: &mut Budget) -> Result<()> {
+        if row.cells.len() >= 2 || !self.columns.is_empty() {
+            for &(column, _) in &row.cells {
+                if !self.columns.contains(&column) {
+                    budget.retain(64)?;
+                    self.columns.insert(column);
+                }
+            }
         }
-        let charge = 2 * size_of::<Row<'_>>();
-        budget.retain(charge)?;
-        self.bytes += charge;
-        self.rows.push(row);
-        Ok(())
+        budget.retain(2 * size_of::<Row>())?;
+        let charge = row.bytes + 2 * size_of::<Row>();
+        self.last_row = row.number;
+        self.rows.push(row, charge, budget)
     }
 
     fn flush(
         &mut self,
         out: &mut String,
+        shared: &mut Lookup<'_, String>,
         budget: &mut Budget,
-        through_row: &mut u64,
+        progress: &mut SheetProgress,
     ) -> Result<()> {
-        if self.rows.is_empty() {
-            return Ok(());
-        }
-        *through_row = self.before;
-        // Rendering uses the union of populated columns of each table. No
-        // vector is indexed by the largest referenced column.
-        let header = self.rows.iter().position(|row| row.cells.len() >= 2);
-        let (notes, table) = self.rows.split_at(header.unwrap_or(self.rows.len()));
-        let mut columns = BTreeSet::new();
-        for row in table {
-            for &(column, _) in &row.cells {
-                if !columns.contains(&column) {
-                    budget.retain(64)?;
-                    self.bytes += 64;
-                    columns.insert(column);
+        let rows = std::mem::take(&mut self.rows).finish(budget)?;
+        let mut in_table = false;
+        rows.for_each(budget, |row, budget| {
+            progress.first_unprocessed_row = Some(row.number);
+            if !in_table && row.cells.len() == 1 {
+                separate(out, "\n\n", budget)?;
+                write_value(&row.cells[0].1, shared, budget, |value, budget| {
+                    push(out, value, budget)
+                })?;
+            } else {
+                let header = !in_table;
+                separate(out, if header { "\n\n" } else { "\n" }, budget)?;
+                push(out, "|", budget)?;
+                let mut cells = row.cells.iter().peekable();
+                for column in &self.columns {
+                    push(out, " ", budget)?;
+                    if let Some((_, value)) = cells.next_if(|(index, _)| index == column) {
+                        write_value(value, shared, budget, |value, budget| {
+                            escape_cell(out, value, budget)
+                        })?;
+                    }
+                    push(out, " |", budget)?;
                 }
-            }
-        }
-        for row in notes {
-            separate(out, "\n\n", budget)?;
-            push(out, row.cells[0].1.trim(), budget)?;
-            *through_row = row.number;
-        }
-        if !table.is_empty() {
-            separate(out, "\n\n", budget)?;
-        }
-        for (index, row) in table.iter().enumerate() {
-            if index != 0 {
-                push(out, "\n", budget)?;
-            }
-            push(out, "|", budget)?;
-            let mut cells = row.cells.iter().peekable();
-            for column in &columns {
-                push(out, " ", budget)?;
-                if let Some((_, value)) = cells.next_if(|(index, _)| index == column) {
-                    escape_cell(out, value.trim(), budget)?;
+                if header {
+                    push(out, "\n|", budget)?;
+                    for _ in &self.columns {
+                        push(out, " --- |", budget)?;
+                    }
                 }
-                push(out, " |", budget)?;
+                in_table = true;
             }
-            if index == 0 {
-                push(out, "\n|", budget)?;
-                for _ in &columns {
-                    push(out, " --- |", budget)?;
-                }
-            }
-            *through_row = row.number;
-        }
-        drop(columns);
-        self.rows = Vec::new();
-        budget.release(std::mem::take(&mut self.bytes));
+            progress.completed_through_row = row.number;
+            // Explicit blanks and coordinate gaps terminate regions.
+            progress.first_unprocessed_row = (row.number < self.last_row).then(|| row.number + 1);
+            Ok(())
+        })?;
+        let bytes = rows.resident() + self.columns.len() * 64;
+        self.columns.clear();
+        self.last_row = 0;
+        drop(rows);
+        budget.release(bytes);
         Ok(())
+    }
+}
+
+fn write_value(
+    value: &CellValue,
+    shared: &mut Lookup<'_, String>,
+    budget: &mut Budget,
+    write: impl FnOnce(&str, &mut Budget) -> Result<()>,
+) -> Result<()> {
+    match value {
+        CellValue::Text(value) => write(value.trim(), budget),
+        CellValue::Shared(index) => {
+            shared.get(*index, budget, |value, budget| write(value.trim(), budget))
+        }
     }
 }
 
@@ -1100,6 +1190,24 @@ mod tests {
     use kio_core::error::Resource;
     use xml::{MAX_XML_ATTRIBUTES, MAX_XML_DEPTH};
 
+    fn parse_sheet(
+        bytes: &[u8],
+        shared: &[String],
+        formats: &CellFormats,
+        budget: &mut Budget,
+        row: &mut u64,
+    ) -> Result<String> {
+        let mut writer = ValuesWriter::default();
+        for value in shared {
+            writer.push(value.clone(), 0, budget)?;
+        }
+        let shared = writer.finish(budget)?;
+        let mut progress = SheetProgress::default();
+        let value = parse_sheet_stream(&mut &*bytes, &shared, formats, budget, &mut progress);
+        *row = progress.completed_through_row;
+        value
+    }
+
     fn standard() -> Budget {
         Budget::new(ResourceTier::Standard)
     }
@@ -1127,15 +1235,21 @@ mod tests {
         let namespace = std::str::from_utf8(xml::SPREADSHEET_NS).unwrap();
         let input = format!(r#"<sst xmlns="{namespace}"><si/><si><t>x</t></si></sst>"#);
         let mut budget = standard();
-        budget.memory_limit = (2 * RECORD_BYTES + 2) as u64;
-        assert_eq!(
-            parse_shared_strings(input.as_bytes(), &mut budget).unwrap(),
-            ["", "x"]
-        );
+        let before = budget.begin_sheet();
+        let values = parse_shared_strings(&mut input.as_bytes(), &mut budget).unwrap();
+        let mut output = Vec::new();
+        values
+            .for_each(&mut budget, |value, _| {
+                output.push(value.clone());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(output, ["", "x"]);
+        let required = budget.sheet_usage(before, 0).peak_bytes();
         let mut budget = standard();
-        budget.memory_limit = (2 * RECORD_BYTES + 1) as u64;
+        budget.memory_limit = required - 1;
         assert!(
-            matches!(parse_shared_strings(input.as_bytes(), &mut budget),
+            matches!(parse_shared_strings(&mut input.as_bytes(), &mut budget),
             Err(AdapterError::ResourceLimit(limit)) if limit.resource == Resource::Memory)
         );
     }
@@ -1256,6 +1370,143 @@ mod tests {
     }
 
     #[test]
+    fn review_rejects_invalid_xml_names_and_explicit_missing_styles() {
+        for rows in ["<7invalid/>", "<row><c s='7'><v>1</v></c></row>"] {
+            let input = sheet_xml(rows);
+            assert!(
+                matches!(
+                    parse_sheet(
+                        input.as_bytes(),
+                        &[],
+                        &CellFormats::default(),
+                        &mut standard(),
+                        &mut 0
+                    ),
+                    Err(AdapterError::ContractViolation(_))
+                ),
+                "{rows}"
+            );
+        }
+    }
+
+    #[test]
+    fn review_reports_only_rendered_rows_when_parsing_stops() {
+        let input = sheet_xml("<row r='50'/><row r='99'><c><v>2</v></c></row>");
+        let mut budget = standard();
+        budget.work_limit = 5;
+        let mut progress = SheetProgress::default();
+        assert!(matches!(
+            parse_sheet_stream(
+                &mut input.as_bytes(),
+                &Values::default(),
+                &CellFormats::default(),
+                &mut budget,
+                &mut progress
+            ),
+            Err(AdapterError::ResourceLimit(_))
+        ));
+        assert_eq!(progress.completed_through_row, 50);
+        assert_eq!(progress.parsed_through_row, 50);
+        assert_eq!(progress.first_unprocessed_row, Some(99));
+
+        let input = sheet_xml("<row r='50'><c><v>1</v></c></row><row r='51'><c><v>2</v></c></row>");
+        let mut budget = standard();
+        budget.work_limit = 6;
+        progress = SheetProgress::default();
+        assert!(matches!(
+            parse_sheet_stream(
+                &mut input.as_bytes(),
+                &Values::default(),
+                &CellFormats::default(),
+                &mut budget,
+                &mut progress
+            ),
+            Err(AdapterError::ResourceLimit(_))
+        ));
+        assert_eq!(progress.completed_through_row, 0);
+        assert_eq!(progress.parsed_through_row, 50);
+        assert_eq!(progress.first_unprocessed_row, Some(50));
+    }
+
+    #[test]
+    fn review_renders_a_long_region_with_bounded_memory() {
+        let input = sheet_xml(&"<row><c><v>1</v></c><c><v>2</v></c></row>".repeat(20_000));
+        let mut budget = standard();
+        budget.memory_limit = 3 * 1024 * 1024;
+        let markdown = parse_sheet(
+            input.as_bytes(),
+            &[],
+            &CellFormats::default(),
+            &mut budget,
+            &mut 0,
+        )
+        .unwrap();
+        assert_eq!(markdown.lines().count(), 20_001);
+    }
+
+    #[test]
+    fn review_shared_strings_spill_under_the_same_memory_budget() {
+        use std::fmt::Write as _;
+        let namespace = std::str::from_utf8(xml::SPREADSHEET_NS).unwrap();
+        let mut xml = format!("<sst xmlns='{namespace}'>");
+        let padding = "v".repeat(256);
+        for index in 0..6_000 {
+            write!(xml, "<si><t>{index}:{padding}</t></si>").unwrap();
+        }
+        xml.push_str("</sst>");
+        let mut budget = standard();
+        budget.memory_limit = 1024 * 1024;
+        let shared = parse_shared_strings(&mut xml.as_bytes(), &mut budget).unwrap();
+        budget.set_xml_scratch(0).unwrap();
+        assert!(shared.resident() < 128 * 1024);
+        let mut shared = shared.lookup();
+        for index in [5999, 0, 900, 901, 5999] {
+            shared
+                .get(index, &mut budget, |value, _| {
+                    assert_eq!(value, &format!("{index}:{padding}"));
+                    Ok(())
+                })
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn review_repeated_namespace_attributes_charge_work_without_multiplying_memory() {
+        use std::fmt::Write as _;
+        let mut input = format!("<ignored xmlns:a='urn:{}'", "x".repeat(8192));
+        for index in 0..512 {
+            write!(input, " a:name{index}='1'").unwrap();
+        }
+        input.push_str("/>");
+        let mut budget = standard();
+        budget.memory_limit = 1024 * 1024;
+        Xml::validate(&mut input.as_bytes(), &mut budget).unwrap();
+
+        let mut budget = standard();
+        budget.memory_limit = 1024 * 1024;
+        budget.work_limit = 700;
+        assert!(matches!(Xml::validate(&mut input.as_bytes(), &mut budget),
+            Err(AdapterError::ResourceLimit(limit)) if limit.resource == Resource::Work));
+    }
+
+    #[test]
+    fn review_charges_xml_attribute_work() {
+        let input = sheet_xml("<ignored xmlns:a='urn:long' a:x='1' a:y='2' a:z='3'/>");
+        let mut budget = standard();
+        budget.work_limit = 2;
+        assert!(matches!(
+            parse_sheet(
+                input.as_bytes(),
+                &[],
+                &CellFormats::default(),
+                &mut budget,
+                &mut 0
+            ),
+            Err(AdapterError::ResourceLimit(_))
+        ));
+    }
+
+    #[test]
     fn p2_shared_references_and_escaped_output_are_charged() {
         let xml = sheet_xml(concat!(
             r#"<row r="99"><c r="A99" t="s"><v>0</v></c><c r="XFD99"><v>2</v></c></row>"#,
@@ -1289,11 +1540,11 @@ mod tests {
         let xml = sheet_xml(r#"<row><c t="s"><v>0</v></c><c t="s"><v>0</v></c></row>"#);
         let shared = ["x".repeat(1024)];
         let mut budget = standard();
-        budget.work_limit = 6; // one row, two cells, two references and 2 KiB
+        budget.work_limit = 9; // The row, cells, references, attributes and expanded bytes.
         assert!(
             matches!(parse_sheet(xml.as_bytes(), &shared, &CellFormats::default(),
             &mut budget, &mut 0), Err(AdapterError::ResourceLimit(limit))
-            if limit.resource == Resource::Work && limit.observed == Some(7))
+            if limit.resource == Resource::Work && limit.observed == Some(10))
         );
     }
 
@@ -1379,7 +1630,11 @@ mod tests {
         let names: Vec<_> = workbook.sheet_names().map(str::to_owned).collect();
         let media_paths = workbook.media_paths().map(str::to_owned).collect();
         let sheets = (0..names.len())
-            .map(|index| workbook.read_sheet(index, &mut 0))
+            .map(|index| {
+                workbook
+                    .read_sheet(index, &mut SheetProgress::default())
+                    .map(|(markdown, _)| markdown)
+            })
             .collect::<Result<_>>()?;
         Ok(Extracted {
             names,

@@ -1423,10 +1423,7 @@ fn p2_preparation_emits_a_prefix_and_keeps_source_coordinates_across_tiers() {
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 #[test]
 fn p2_preview_and_staged_resume_report_the_same_sheet_and_row() {
-    use kio_core::error::ResourceTier;
-    use kio_pipeline::prepare::{
-        ExtractionBudget, PrepareStageBytesRequest, hash_bytes, prepare_staged,
-    };
+    use kio_pipeline::prepare::hash_bytes;
 
     let dir = canonical_tempdir();
     init(&dir);
@@ -1441,16 +1438,7 @@ fn p2_preview_and_staged_resume_report_the_same_sheet_and_row() {
     assert_eq!(issue["retry"], "kio index --resource-tier large");
     assert!(!dir.path().join(".kio/extraction-stages").exists());
 
-    let root = kio_core::store_dir::StoreDirectory::open(&dir.path().join(".kio")).unwrap();
     let hash = hash_bytes(&input);
-    let profile = kio_adapter::catalog::builtin_prepare_profile();
-    let request = PrepareStageBytesRequest {
-        input_path: "ranges.xlsx",
-        raw_hash: &hash,
-        bytes: &input,
-        media_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        tool_profile_hash: &profile.tool_profile_hash,
-    };
     let stopped = kio(&dir, &["index", "--offline"])
         .arg("--json")
         .assert()
@@ -1474,21 +1462,44 @@ fn p2_preview_and_staged_resume_report_the_same_sheet_and_row() {
         .unwrap()
         .unwrap()
         .path();
-    let first = fs::read(workspace.join("unit-0.json")).unwrap();
+    let first: Value =
+        serde_json::from_slice(&fs::read(workspace.join("unit-0.json")).unwrap()).unwrap();
+    assert_eq!(first["unit"]["unit_key"], "sheet:A##2");
+    assert!(first["sheet_usage"]["output_bytes"].as_u64().is_some());
     assert!(!workspace.join("complete.json").exists());
     assert!(!workspace.join("unit-1.json").exists());
-    let staged =
-        prepare_staged(&root, request, ExtractionBudget::new(ResourceTier::Large)).unwrap();
-    assert_eq!(fs::read(workspace.join("unit-0.json")).unwrap(), first);
-    assert!(workspace.join("complete.json").exists());
-    assert_eq!(staged.output.prepared_units[0].unit_key, "sheet:A##2");
-    assert_eq!(staged.output.prepared_units[1].unit_key, "sheet:A");
-    assert_eq!(staged.output.prepared_units[2].unit_key, "sheet:A#2");
     kio(&dir, &["index", "--offline", "--resource-tier", "large"])
         .assert()
         .success();
     assert_eq!(
         json_success(&dir, &["status"])["paused_by_hold_reason"]["resource_limit"],
         0
+    );
+}
+
+#[test]
+fn p2_completed_large_stage_is_rechecked_under_standard_tier() {
+    use kio_core::error::{Resource, ResourceTier};
+    use kio_pipeline::{
+        PipelineError,
+        prepare::{ExtractionBudget, PrepareStageBytesRequest, hash_bytes, prepare_staged},
+    };
+    let dir = canonical_tempdir();
+    init(&dir);
+    let input = p2_xlsx_workbook();
+    let hash = hash_bytes(&input);
+    let profile = kio_adapter::catalog::builtin_prepare_profile();
+    let root = kio_core::store_dir::StoreDirectory::open(&dir.path().join(".kio")).unwrap();
+    let request = PrepareStageBytesRequest {
+        input_path: "ranges.xlsx",
+        raw_hash: &hash,
+        bytes: &input,
+        media_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        tool_profile_hash: &profile.tool_profile_hash,
+    };
+    prepare_staged(&root, request, ExtractionBudget::new(ResourceTier::Large)).unwrap();
+    assert!(
+        matches!(prepare_staged(&root, request, ExtractionBudget::new(ResourceTier::Standard)),
+        Err(PipelineError::ResourceLimit(limit)) if limit.resource == Resource::UnitText)
     );
 }

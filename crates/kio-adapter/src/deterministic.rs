@@ -8,7 +8,6 @@ use crate::types::{
 };
 use crate::{AdapterError, Result};
 use serde_json::json;
-use std::io::Read;
 use unicode_normalization::UnicodeNormalization;
 
 pub const MAX_DETERMINISTIC_PDF_PAGES: usize = 256;
@@ -143,27 +142,12 @@ impl MarkdownizeAdapter for DeterministicAdapter {
     }
 
     fn markdownize(&self, request: MarkdownizeRequest) -> Result<MarkdownizeResponse> {
+        require_prepared_xlsx(&request.media_type)?;
         if let Some(path) = request.raw.path.as_deref() {
-            let io_error = |err: std::io::Error| AdapterError::Io {
+            let bytes = std::fs::read(path).map_err(|error| AdapterError::Io {
                 path: path.to_owned(),
-                message: err.to_string(),
-            };
-            let bytes = if crate::xlsx_extract::is_xlsx_media(&request.media_type) {
-                let tier = kio_core::error::ResourceTier::Standard;
-                let file = std::fs::File::open(path).map_err(io_error)?;
-                crate::xlsx_extract::check_raw_zip_size(
-                    tier,
-                    file.metadata().map_err(io_error)?.len(),
-                )?;
-                let mut bytes = Vec::new();
-                file.take(crate::xlsx_extract::raw_zip_limit(tier) + 1)
-                    .read_to_end(&mut bytes)
-                    .map_err(io_error)?;
-                crate::xlsx_extract::check_raw_zip_size(tier, bytes.len() as u64)?;
-                bytes
-            } else {
-                std::fs::read(path).map_err(io_error)?
-            };
+                message: error.to_string(),
+            })?;
             return markdownize_from_bytes(request, &bytes);
         }
         markdownize_with_source(request, None)
@@ -176,6 +160,7 @@ pub fn markdownize_from_bytes(
     request: MarkdownizeRequest,
     verified_raw_bytes: &[u8],
 ) -> Result<MarkdownizeResponse> {
+    require_prepared_xlsx(&request.media_type)?;
     let actual_hash = crate::identity::hash_bytes(verified_raw_bytes);
     if actual_hash != request.raw.raw_hash {
         return Err(AdapterError::ContractViolation(format!(
@@ -183,31 +168,17 @@ pub fn markdownize_from_bytes(
             request.raw.raw_hash
         )));
     }
-    if crate::xlsx_extract::is_xlsx_media(&request.media_type) {
-        let mut workbook = crate::xlsx_extract::XlsxWorkbook::open(
-            verified_raw_bytes,
-            kio_core::error::ResourceTier::Standard,
-        )?;
-        let mut rendered = std::collections::BTreeSet::new();
-        let response = markdownize_with_units(&request, |hint| {
-            let index = usize::try_from(hint.order).map_err(|_| {
-                AdapterError::ContractViolation("XLSX sheet order overflows".to_owned())
-            })?;
-            let mut markdown = workbook.read_sheet(index, &mut 0)?;
-            rendered.insert(index);
-            markdown.push('\n');
-            Ok(finish_markdown_unit(hint, markdown))
-        })?;
-        let sheet_count = workbook.sheet_names().len();
-        for index in 0..sheet_count {
-            if !rendered.contains(&index) {
-                workbook.read_sheet(index, &mut 0)?;
-            }
-        }
-        return Ok(response);
-    }
     let source = source_document_from_verified_bytes(&request, verified_raw_bytes)?;
     markdownize_with_source(request, Some(&source))
+}
+
+fn require_prepared_xlsx(media_type: &str) -> Result<()> {
+    if crate::xlsx_extract::is_xlsx_media(media_type) {
+        return Err(AdapterError::ContractViolation(
+            "XLSX markdownization requires a staged prepared worksheet".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Markdownize a converted-PDF intermediate for an Office document
@@ -1120,6 +1091,37 @@ stream\nBT (scanner-only literal page text) Tj ET\nendstream\nendobj\n";
         }
         let err = extract_pdf_text_pages_bounded(&pdf, 3).unwrap_err();
         assert!(err.to_string().contains("page count exceeds 3"));
+    }
+
+    #[test]
+    fn review_requires_prepared_xlsx_units() {
+        use crate::types::RawInput;
+        let input =
+            include_bytes!("../../kio-eval/acceptance-fixtures/v1/office-public/table.xlsx");
+        let request = MarkdownizeRequest {
+            raw: RawInput {
+                raw_hash: crate::identity::hash_bytes(input),
+                path: None,
+            },
+            media_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet".into(),
+            prepared_unit_hint: None,
+            mode: MarkdownizeMode::Full,
+            previous: None,
+            hints: None,
+            restrict_to_hint_pages: false,
+            bbox_annotation_enabled: false,
+            tool_profile_hash: "sha256:tool".into(),
+            spec_version: 1,
+            idempotency_token: None,
+        };
+        assert!(matches!(
+            markdownize_from_bytes(request.clone(), input),
+            Err(AdapterError::ContractViolation(_))
+        ));
+        assert!(matches!(
+            DeterministicAdapter.markdownize(request),
+            Err(AdapterError::ContractViolation(_))
+        ));
     }
 
     #[test]

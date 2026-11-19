@@ -214,6 +214,29 @@ impl<'a> BoundedZip<'a> {
         retain: bool,
         admit: impl FnOnce(usize) -> Result<()>,
     ) -> Result<Option<Vec<u8>>> {
+        let self_label = self.limits.label;
+        self.read_member(name, |input, length| {
+            admit(length)?;
+            if retain {
+                let mut bytes = vec![0; length];
+                input
+                    .read_exact(&mut bytes)
+                    .map_err(|err| read_error(self_label, name, err))?;
+                Ok(bytes)
+            } else {
+                std::io::copy(input, &mut std::io::sink())
+                    .map_err(|err| read_error(self_label, name, err))?;
+                Ok(Vec::new())
+            }
+        })
+        .map(|bytes| bytes.filter(|_| retain))
+    }
+
+    pub(crate) fn read_member<T>(
+        &mut self,
+        name: &str,
+        parse: impl FnOnce(&mut dyn Read, usize) -> Result<T>,
+    ) -> Result<Option<T>> {
         let mut file = self.archive.by_name(name).map_err(|err| {
             contract(
                 self.limits.label,
@@ -240,41 +263,31 @@ impl<'a> BoundedZip<'a> {
         )?;
         let length = usize::try_from(declared)
             .map_err(|_| contract(self.limits.label, "ZIP member size is unrepresentable"))?;
-        admit(length)?;
 
-        let read_error = |err| {
-            contract(
-                self.limits.label,
-                format!("ZIP member `{name}` failed CRC-checked read: {err}"),
-            )
-        };
-        let bytes = if retain {
-            let mut bytes = vec![0; length];
-            file.read_exact(&mut bytes).map_err(read_error)?;
-            Some(bytes)
-        } else {
-            let mut remaining = length;
-            let mut buffer = [0; 16 * 1024];
-            while remaining > 0 {
-                let chunk = remaining.min(buffer.len());
-                file.read_exact(&mut buffer[..chunk]).map_err(read_error)?;
-                remaining -= chunk;
-            }
-            None
-        };
-        // The read past the declared length verifies CRC and detects expansion
-        // beyond the header without allocating or decoding the rest of it.
-        if file.read(&mut [0]).map_err(read_error)? != 0 {
+        let mut input = (&mut file).take(declared);
+        let result = parse(&mut input, length)?;
+        if input.limit() != 0
+            || file
+                .read(&mut [0])
+                .map_err(|err| read_error(self.limits.label, name, err))?
+                != 0
+        {
             return Err(contract(
                 self.limits.label,
                 format!("ZIP member `{name}` did not match its declared size"),
             ));
         }
         self.total_read_bytes = next_total;
-        Ok(bytes)
+        Ok(Some(result))
     }
 }
 
+fn read_error(label: &str, name: &str, error: std::io::Error) -> AdapterError {
+    contract(
+        label,
+        format!("ZIP member `{name}` failed CRC-checked read: {error}"),
+    )
+}
 /// Validate a DOCX or PPTX package before handing it to a real renderer.
 pub(crate) fn validate_real_office_package(input: &[u8], media_type: &str) -> Result<()> {
     const MAX_OFFICE_MEMBER_BYTES: usize = 32 * 1024 * 1024;

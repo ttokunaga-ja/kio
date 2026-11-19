@@ -4,7 +4,6 @@ use crate::historical_reindex::pinned_done_units;
 use crate::object_persistence::index_to_kio;
 use crate::object_persistence::search_to_kio;
 use crate::open_view::AssociationCheck;
-use crate::open_view::MAX_MANIFEST_OBJECT_READ_BYTES;
 use crate::open_view::check_publication_and_association_on_connection;
 use crate::open_view::parse_object_uri;
 use crate::open_view::parse_pointer_text;
@@ -460,6 +459,9 @@ fn read_exact_retarget_commit(store: &ObjectStore, at: &str) -> Result<CommitObj
     Ok(commit)
 }
 
+// Retarget has a separate per-candidate budget (08 §5).
+const RETARGET_MAX_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Authenticate the manifest object and bound its declared unit count before
 /// any unit CAS loader is reached. This is intentionally retarget-local: the
 /// existing verifier retains its own historical degraded-result contract.
@@ -472,7 +474,7 @@ fn retarget_manifest_unit_preflight(
     let bytes = match store.read_content_object_bytes(
         ContentObjectKind::Manifest,
         &normalize.manifest_hash,
-        MAX_MANIFEST_OBJECT_READ_BYTES,
+        RETARGET_MAX_MANIFEST_BYTES,
     ) {
         Ok(bytes) => bytes,
         Err(error) if is_store_not_found(&error) && missing_is_corrupt => {

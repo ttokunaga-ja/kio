@@ -488,6 +488,28 @@ fn local_normalized_unit(
     })
 }
 
+pub(super) fn check_preview_xlsx_manifest(
+    path: &Path,
+    raw: &str,
+    prepared: &[PreparedUnit],
+) -> kio_pipeline::Result<()> {
+    let profile = builtin_offline_markdownize_adapter()
+        .profile()
+        .tool_profile_hash;
+    // Reserve the full generation and parent widths and the usual run stamp
+    // even when preview does not yet know the generation it will publish.
+    let draft = local_manifest(
+        raw,
+        &profile,
+        u64::MAX,
+        Some(u64::MAX - 1),
+        "00000000-0000-0000-0000-000000000000",
+        "2000-01-01T00:00:00Z",
+        prepared,
+    );
+    kio_pipeline::markdownize::check_normalized_manifest_write_size(path, draft)
+}
+
 pub(super) fn check_preview_normalized_unit(
     path: &Path,
     raw: &str,

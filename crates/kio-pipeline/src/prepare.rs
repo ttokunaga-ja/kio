@@ -203,6 +203,7 @@ pub struct XlsxExtractionProgress {
     pub completed_sheets: usize,
     pub first_unprocessed_sheet: usize,
     pub current_sheet: Option<String>,
+    pub parsed_through_row: u64,
     pub completed_through_row: u64,
     pub first_unprocessed_row: Option<u64>,
 }
@@ -214,6 +215,7 @@ impl Default for XlsxExtractionProgress {
             completed_sheets: 0,
             first_unprocessed_sheet: 1,
             current_sheet: None,
+            parsed_through_row: 0,
             completed_through_row: 0,
             first_unprocessed_row: None,
         }
@@ -237,7 +239,8 @@ pub fn visit_prepared_units_with_budget(
         progress,
         &mut PreparedUnitSink {
             declare: &mut |_| Ok(()),
-            write: &mut visit,
+            write: &mut |unit, bytes, _| visit(unit, bytes),
+            read_sheet_usage: &|_| unreachable!("preview has no staged worksheet"),
         },
     )
 }
@@ -335,7 +338,9 @@ fn prepare_units_emitting(
         let mut prepared_units = Vec::with_capacity(total);
         for (index, unit_key) in unit_keys.into_iter().enumerate() {
             progress.current_sheet = Some(unit_key.clone());
+            progress.parsed_through_row = 0;
             progress.completed_through_row = 0;
+            progress.first_unprocessed_row = None;
             if let Some(unit) = completed.get(index) {
                 if unit.unit_key != unit_key {
                     return Err(crate::PipelineError::contract(
@@ -343,11 +348,18 @@ fn prepare_units_emitting(
                         "staged worksheet identity does not match the workbook",
                     ));
                 }
+                let usage = (emit.read_sheet_usage)(unit.order)?;
+                workbook
+                    .reuse_sheet(usage)
+                    .map_err(|err| prepare_adapter_error(CODE, err))?;
                 prepared_units.push(unit.clone());
             } else {
-                let result = workbook.read_sheet(index, &mut progress.completed_through_row);
-                progress.first_unprocessed_row = progress.completed_through_row.checked_add(1);
-                let markdown = result.map_err(|err| prepare_adapter_error(CODE, err))?;
+                let mut rows = kio_adapter::xlsx_extract::SheetProgress::default();
+                let result = workbook.read_sheet(index, &mut rows);
+                progress.parsed_through_row = rows.parsed_through_row;
+                progress.completed_through_row = rows.completed_through_row;
+                progress.first_unprocessed_row = rows.first_unprocessed_row;
+                let (markdown, usage) = result.map_err(|err| prepare_adapter_error(CODE, err))?;
                 let markdown = markdown.as_bytes();
                 let unit = PreparedUnit {
                     renderer: None,
@@ -361,7 +373,7 @@ fn prepare_units_emitting(
                     page_number: None,
                 };
                 progress.first_unprocessed_row = None;
-                emit.write(&unit, markdown)?;
+                emit.write_sheet(&unit, markdown, usage)?;
                 prepared_units.push(unit);
             }
             progress.completed_sheets += 1;
@@ -594,7 +606,7 @@ where
 }
 
 fn xlsx_preparation_profile_hash(profile: &str) -> String {
-    hash_bytes(format!("{profile}\0xlsx-resource-tiers").as_bytes())
+    hash_bytes(format!("{profile}\0xlsx-streaming-resources").as_bytes())
 }
 
 #[must_use]

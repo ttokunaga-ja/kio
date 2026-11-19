@@ -29,7 +29,7 @@ use crate::prepare::{
 use crate::store_path::{StorePathKind, resolve_existing_store_path};
 use crate::{IoResultExt, PipelineError, Result};
 
-const MAX_NORMALIZED_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_NORMALIZED_MANIFEST_BYTES: u64 = kio_core::cas::MAX_MANIFEST_OBJECT_BYTES;
 const MAX_NORMALIZED_UNIT_BYTES: u64 = MAX_NORMALIZED_UNIT_OBJECT_BYTES;
 // CT4-FSCK's invocation-wide object ceiling is also the outer bound for the
 // physical manifest/unit entries inspected before the loader can identify the
@@ -1461,19 +1461,7 @@ fn persist_normalized_units<'a>(
     ) -> Result<Cow<'a, NormalizedUnitObject>>,
 ) -> Result<NormalizedInstanceManifest> {
     let mut stamped = manifest.clone();
-    let identity = NormalizedInstanceIdentity {
-        raw_hash: stamped.raw_hash.clone(),
-        tool_profile_hash: stamped.tool_profile_hash.clone(),
-        r#gen: stamped.r#gen,
-    };
-    // Body pins are filled as units arrive. Validate the rest of the manifest
-    // before using its identity or entry names as storage paths.
-    for entry in &mut stamped.units {
-        if entry.status == UnitStatus::Done {
-            entry.unit_object_hash = Some(entry.prepared_hash.clone());
-        }
-    }
-    validate_normalized_manifest(directory.path(), &identity, &stamped)?;
+    let identity = validate_normalized_manifest_draft(directory.path(), &mut stamped)?;
     let instance = normalized_instance_relative_path(
         &stamped.raw_hash,
         &stamped.tool_profile_hash,
@@ -2111,13 +2099,53 @@ pub fn discard_normalized_stages(root: &StoreDirectory, raw_hash: &str) -> Resul
     })
 }
 
+fn validate_normalized_manifest_draft(
+    path: &Path,
+    manifest: &mut NormalizedInstanceManifest,
+) -> Result<NormalizedInstanceIdentity> {
+    // Body pins are filled as units arrive. Use the matching fixed hash width
+    // when checking the draft before any bodies are published.
+    for entry in &mut manifest.units {
+        if entry.status == UnitStatus::Done {
+            entry.unit_object_hash = Some(entry.prepared_hash.clone());
+        }
+    }
+    let identity = NormalizedInstanceIdentity {
+        raw_hash: manifest.raw_hash.clone(),
+        tool_profile_hash: manifest.tool_profile_hash.clone(),
+        r#gen: manifest.r#gen,
+    };
+    validate_normalized_manifest(path, &identity, manifest)?;
+    check_normalized_manifest_size(manifest, path)?;
+    Ok(identity)
+}
+
+/// Check the same size and layout that the writer checks with every body pin filled.
+pub fn check_normalized_manifest_write_size(
+    path: &Path,
+    mut manifest: NormalizedInstanceManifest,
+) -> Result<()> {
+    validate_normalized_manifest_draft(path, &mut manifest).map(|_| ())
+}
+
 fn check_normalized_manifest_size(
     manifest: &NormalizedInstanceManifest,
     path: &Path,
 ) -> Result<Vec<u8>> {
     let bytes = serde_json::to_vec_pretty(manifest)
         .map_err(|error| PipelineError::Schema(error.to_string()))?;
-    checked_manifest_size(path, bytes.len() as u64, NORMALIZED_SIZE_LIMITS)?;
+    let observed = bytes.len() as u64;
+    if checked_manifest_size(path, observed, NORMALIZED_SIZE_LIMITS).is_err() {
+        return Err(PipelineError::ResourceLimit(
+            kio_core::error::ResourceLimit {
+                resource: kio_core::error::Resource::Memory,
+                stage: "normalized_manifest".to_owned(),
+                limit: Some(MAX_NORMALIZED_MANIFEST_BYTES),
+                observed: Some(observed),
+                resource_tier: None,
+            },
+        ));
+    }
     Ok(bytes)
 }
 
@@ -4195,6 +4223,44 @@ mod tests {
     }
 
     #[test]
+    fn review_admits_a_manifest_with_many_legal_sheet_entries() {
+        let (_, mut manifest, _) = normalized_fixture();
+        let entry = manifest.units[0].clone();
+        manifest.units = (0..40_000)
+            .map(|order| {
+                let mut entry = entry.clone();
+                entry.order = order;
+                entry.unit_type = UnitType::Sheet;
+                entry.unit_key = format!("sheet:Worksheet {order:05}");
+                entry.unit_ref = prepared_unit_ref(&entry.unit_key);
+                entry
+            })
+            .collect();
+        let path = Path::new("manifest.json");
+        check_normalized_manifest_write_size(path, manifest.clone()).unwrap();
+        validate_normalized_manifest_draft(path, &mut manifest).unwrap();
+        let bytes = canonical_normalized_manifest_bytes(&manifest).unwrap();
+        assert!(bytes.len() > 8 * 1024 * 1024);
+
+        let dir = canonical_tempdir();
+        initialize_persist_store(dir.path());
+        let store = ObjectStore::new(dir.path());
+        let hash = store
+            .write_content_object(ContentObjectKind::Manifest, &bytes)
+            .unwrap();
+        assert_eq!(
+            store
+                .read_content_object_bytes(
+                    ContentObjectKind::Manifest,
+                    &hash,
+                    MAX_NORMALIZED_MANIFEST_BYTES
+                )
+                .unwrap(),
+            bytes
+        );
+    }
+
+    #[test]
     fn p0_normalized_size_accounting_accepts_units_over_256_mib_in_total() {
         let path = Path::new("test normalized instance");
         let mut total = checked_manifest_size(path, 1024, NORMALIZED_SIZE_LIMITS).unwrap();
@@ -4227,7 +4293,7 @@ mod tests {
         assert!(checked_unit_size(&unit_path, u64::MAX, 1, limits).is_err());
 
         let (identity, mut manifest, mut units) = normalized_fixture();
-        let oversized_key = "x".repeat(MAX_NORMALIZED_MANIFEST_BYTES as usize);
+        let oversized_key = r#"\""#.repeat(MAX_NORMALIZED_MANIFEST_BYTES as usize / 4);
         manifest.units[0].unit_key = oversized_key.clone();
         manifest.units[0].unit_ref = prepared_unit_ref(&oversized_key);
         units[0].unit_key = oversized_key;
@@ -4238,7 +4304,9 @@ mod tests {
             identity.r#gen,
         );
         let err = persist_normalized_instance(dir.path(), &manifest, &units).unwrap_err();
-        assert!(err.to_string().contains("normalized manifest exceeds"));
+        assert!(
+            matches!(err, PipelineError::ResourceLimit(limit) if limit.stage == "normalized_manifest")
+        );
         assert!(!expected_dir.exists());
     }
 

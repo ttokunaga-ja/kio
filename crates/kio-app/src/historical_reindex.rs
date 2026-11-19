@@ -26,7 +26,6 @@ use crate::index::rebuild::skipped_disclosure;
 use crate::index::rebuild::unit_authorities_from_inputs;
 use crate::object_persistence::index_to_kio;
 use crate::object_persistence::pipeline_to_kio;
-use crate::open_view::MAX_MANIFEST_OBJECT_READ_BYTES;
 use crate::response::reindex::{HistoricalReindexResponse, ReindexExecution, ReindexResponse};
 use crate::response::skipped_units::SkippedUnit;
 use crate::scope_access::active_erase_purge_explains_historical_missing_manifest;
@@ -37,6 +36,7 @@ use crate::task_execution::enrichment_completion;
 use kio_core::ExitCode;
 use kio_core::KioError;
 use kio_core::cas::ContentObjectKind;
+use kio_core::cas::MAX_MANIFEST_OBJECT_BYTES;
 use kio_core::cas::canonical_json_bytes;
 use kio_core::control::ControlHandle;
 use kio_core::dag::NormalizeRef;
@@ -95,7 +95,7 @@ pub(super) fn pinned_manifest(
     let bytes = store.read_content_object_bytes(
         ContentObjectKind::Manifest,
         manifest_hash,
-        MAX_MANIFEST_OBJECT_READ_BYTES,
+        MAX_MANIFEST_OBJECT_BYTES,
     )?;
     let manifest_path = Path::new("objects/manifests/<retained>");
     if kio_core::cas::hash_bytes(&bytes) != *manifest_hash {
