@@ -173,6 +173,7 @@ pub struct AdapterTestControl {
 /// Snapshot and GC barriers used by core operations.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CoreTestControl {
+    pub record_stage_root: Option<PathBuf>,
     pub windows_profile: Option<PathBuf>,
     pub hold_lock_ready: Option<PathBuf>,
     pub snapshot_authority_capture_ready: Option<PathBuf>,
@@ -295,6 +296,7 @@ impl DebugTestControl {
                 capture_sent_media: path("KIO_TEST_CAPTURE_SENT_MEDIA"),
             },
             core: CoreTestControl {
+                record_stage_root: path("KIO_TEST_RECORD_STAGE_ROOT"),
                 windows_profile: path("KIO_TEST_WINDOWS_PROFILE"),
                 hold_lock_ready: path("KIO_TEST_HOLD_LOCK_READY"),
                 snapshot_authority_capture_ready: path(

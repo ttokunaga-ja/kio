@@ -412,6 +412,23 @@ impl StoreDirectory {
         atomic::remove(self, self, relative, expected, max_bytes)
     }
 
+    /// Retire self-owned metadata by exact streamed digest and length.
+    /// Like `quarantine_then_remove`, the durable removal intent is sufficient
+    /// recovery proof. Working files with parent-journal phases must instead
+    /// use `remove_hash_verified` and acknowledge only after that phase syncs.
+    pub(crate) fn quarantine_then_remove_hash(
+        &self,
+        relative: &Path,
+        hash: &str,
+        length: u64,
+    ) -> Result<()> {
+        let digest = hash
+            .strip_prefix("sha256:")
+            .filter(|_| crate::cas::is_hash(hash))
+            .ok_or_else(|| KioError::invalid_usage("invalid expected removal hash"))?;
+        atomic::remove_hash(self, self, relative, digest, length, length)
+    }
+
     /// Remove an exact target using a durable intent in a separate retained
     /// private owner. No removal artifact is written among working-tree files.
     pub fn quarantine_then_remove_with_owner(
@@ -599,6 +616,46 @@ pub(crate) fn relative_components<'a>(
 
 #[cfg(test)]
 mod journal_resource_tests {
+    #[test]
+    fn metadata_hash_retirement_streams_large_body_and_rejects_mismatch() {
+        use sha2::{Digest, Sha256};
+        use std::{io::Write, path::Path};
+        let fixture = tempfile::tempdir().unwrap();
+        let directory =
+            super::StoreDirectory::open_or_create_directories(&fixture.path().join("store"))
+                .unwrap();
+        let leaf = Path::new("publication-v1.json");
+        let mut file = directory.create_private_file(leaf).unwrap();
+        let chunk = [b' '; 8192];
+        let mut digest = Sha256::new();
+        for _ in 0..4097 {
+            file.write_all(&chunk).unwrap();
+            digest.update(chunk);
+        }
+        file.sync_all().unwrap();
+        drop(file);
+        let length = chunk.len() as u64 * 4097;
+        let hash = format!("sha256:{}", crate::cas::lower_hex(&digest.finalize()));
+        assert!(
+            directory
+                .quarantine_then_remove_hash(leaf, &format!("sha256:{}", "0".repeat(64)), length,)
+                .is_err()
+        );
+        assert!(directory.contains_entry(leaf).unwrap());
+        assert_eq!(
+            directory.inspect_atomic().unwrap(),
+            super::AtomicWorkspaceState::Clean
+        );
+        directory
+            .quarantine_then_remove_hash(leaf, &hash, length)
+            .unwrap();
+        assert!(!directory.contains_entry(leaf).unwrap());
+        assert_eq!(
+            directory.inspect_atomic().unwrap(),
+            super::AtomicWorkspaceState::Clean
+        );
+    }
+
     #[test]
     fn j1_storage_exhaustion_stays_distinct_from_corruption() {
         let make_error = || std::io::Error::from(std::io::ErrorKind::StorageFull);

@@ -897,7 +897,7 @@ fn collector_missing_manifest_requires_retired_purge_for_every_introduction() {
     let latest_commit = repo.read_commit(&latest).unwrap();
     let latest_tree = repo.read_tree(&latest_commit.tree).unwrap();
     assert_eq!(
-        latest_tree.entries[0].normalize,
+        latest_tree.entries.first().unwrap().unwrap().normalize,
         Some(instance.normalize.clone())
     );
     let post_purge_retained = retained_history_instances(&repo, &latest).unwrap();

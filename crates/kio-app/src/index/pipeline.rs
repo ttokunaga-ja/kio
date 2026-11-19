@@ -593,7 +593,9 @@ pub(super) fn record_reindex_unsupported_inputs(
     head_tree: &TreeObject,
 ) -> Result<ReindexInputClassifications> {
     let max_input_bytes = effective_max_input_bytes(repo)?;
-    let store = UnsupportedInputStore::new(repo.kio_dir()).with_published_tree(Some(head_tree));
+    let store = UnsupportedInputStore::new(repo.kio_dir())
+        .with_published_tree(Some(head_tree))
+        .map_err(pipeline_to_kio)?;
     let mut observations = Vec::new();
     let mut classified = ReindexInputClassifications::default();
     for candidate in preview
@@ -743,8 +745,9 @@ pub(crate) fn run_index_pipeline(
         .head_commit_hash()?
         .map(|head| read_head_tree_for_rebuild(repo, &head))
         .transpose()?;
-    let unsupported_store =
-        UnsupportedInputStore::new(repo.kio_dir()).with_published_tree(head_tree.as_ref());
+    let unsupported_store = UnsupportedInputStore::new(repo.kio_dir())
+        .with_published_tree(head_tree.as_ref())
+        .map_err(pipeline_to_kio)?;
     let mut unsupported_by_path = unsupported_store
         .latest_by_path()
         .map_err(pipeline_to_kio)?
@@ -764,15 +767,23 @@ pub(crate) fn run_index_pipeline(
     let max_input_bytes = effective_max_input_bytes(repo)?;
     // R12-1: the documented `[markdownize.incremental]` overrides (were hardcoded).
     let incremental_config = effective_incremental_config(repo)?;
-    let head_ocr_normalizes = head_tree
-        .into_iter()
-        .flat_map(|tree| tree.entries)
-        .filter_map(|entry| {
-            entry
-                .normalize
-                .map(|normalize| (entry.path, (entry.raw_hash, normalize)))
-        })
-        .collect::<BTreeMap<_, _>>();
+    let candidate_paths = preview
+        .candidates
+        .iter()
+        .filter(|candidate| !candidate.ignored && candidate.media_type != "inode/directory")
+        .map(|candidate| candidate.input_path.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut head_ocr_normalizes = BTreeMap::new();
+    if let Some(head_tree) = head_tree {
+        for entry in &head_tree.entries {
+            let entry = entry?;
+            if candidate_paths.contains(entry.path.as_str())
+                && let Some(normalize) = entry.normalize
+            {
+                head_ocr_normalizes.insert(entry.path, (entry.raw_hash, normalize));
+            }
+        }
+    }
 
     let mut unsupported_observations = Vec::new();
     for candidate in preview

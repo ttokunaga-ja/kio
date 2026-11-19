@@ -25,3 +25,5 @@ pub mod xdg;
 
 pub use error::{KioError, Result};
 pub use exit_code::ExitCode;
+
+pub mod disk_records;

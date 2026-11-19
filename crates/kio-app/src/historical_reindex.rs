@@ -272,18 +272,17 @@ fn retained_history_instances_from_graph(
     control: &ControlHandle,
 ) -> Result<Vec<RetainedNormalizedInstance>> {
     let mut all_paths_by_raw = BTreeMap::<String, BTreeSet<String>>::new();
-    for appearance in graph.bindings() {
+    let mut exact_bindings = BTreeSet::<TreeBinding>::new();
+    for appearance in graph.bindings()? {
+        let binding = appearance?.binding;
         all_paths_by_raw
-            .entry(appearance.binding.raw_hash)
+            .entry(binding.raw_hash.clone())
             .or_default()
-            .insert(appearance.binding.path);
+            .insert(binding.path.clone());
+        if binding.normalize.is_some() {
+            exact_bindings.insert(binding);
+        }
     }
-    let exact_bindings = graph
-        .bindings()
-        .into_iter()
-        .map(|appearance| appearance.binding)
-        .filter(|binding| binding.normalize.is_some())
-        .collect::<BTreeSet<TreeBinding>>();
     // PC37/PC41/PC43 (05 §1.6 L265-266): collect EVERY ancestor-most
     // introduction per exact binding (not just its own byte-min winner via
     // `canonical_introduction`) so a content identity reachable through
@@ -306,7 +305,7 @@ fn retained_history_instances_from_graph(
             normalize.r#gen,
             normalize.manifest_hash.clone(),
         );
-        let introductions = graph.ancestor_most_introductions(&binding);
+        let introductions = graph.ancestor_most_introductions(&binding)?;
         if introductions.is_empty() {
             return Err(KioError::schema(
                 "retained history binding has no introduction commit",
@@ -438,6 +437,7 @@ pub(super) fn run(
     // so cache both outcomes instead of reopening its receipts per alias.
     let mut historical_purge_decisions = BTreeMap::<String, bool>::new();
     for entry in &snapshot.tree.entries {
+        let entry = entry?;
         // R23-10 (05-runtime.md §3.5 L813/L934, AUD-08's shrunk finding):
         // `purge.read_tombstone(...).is_some()` blocked on marker EXISTENCE
         // (any tombstone at all, even a retired/resurrected one), not the
@@ -799,6 +799,7 @@ fn selected_history_introductions(
             continue;
         }
         for entry in &node.tree.entries {
+            let entry = entry?;
             let Some(normalize) = &entry.normalize else {
                 continue;
             };

@@ -148,6 +148,7 @@ fn current_raw_for(dir: &TempDir, path: &str) -> String {
         .unwrap()
         .entries
         .into_iter()
+        .map(Result::unwrap)
         .find(|entry| entry.path == path)
         .unwrap()
         .raw_hash
@@ -162,6 +163,7 @@ fn normalized_unit_pins_for(dir: &TempDir, path: &str) -> Vec<String> {
         .unwrap()
         .entries
         .into_iter()
+        .map(Result::unwrap)
         .find(|entry| entry.path == path)
         .unwrap();
     let normalize = entry.normalize.unwrap();
@@ -190,6 +192,7 @@ fn tree_manifest_hash_for(dir: &TempDir, path: &str) -> String {
         .unwrap()
         .entries
         .into_iter()
+        .map(Result::unwrap)
         .find(|entry| entry.path == path)
         .unwrap()
         .normalize
@@ -206,6 +209,7 @@ fn current_manifest_hash_for_raw(dir: &TempDir, raw_hash: &str) -> String {
         .unwrap()
         .entries
         .into_iter()
+        .map(Result::unwrap)
         .find(|entry| entry.raw_hash == raw_hash)
         .unwrap()
         .normalize
@@ -232,6 +236,7 @@ fn add_image_reference(dir: &TempDir, raw_hash: &str, image_bytes: &[u8]) -> Str
     let normalize = tree
         .entries
         .iter()
+        .map(Result::unwrap)
         .find(|entry| entry.raw_hash == raw_hash)
         .and_then(|entry| entry.normalize.clone())
         .unwrap();
@@ -824,12 +829,13 @@ fn ct4_purge_fails_closed_on_cross_raw_reachable_manifest_reuse() {
     let mut forged_tree = repo
         .read_tree(&repo.read_commit(&head).unwrap().tree)
         .unwrap();
-    let survivor = forged_tree
-        .entries
+    let mut entries = forged_tree.entries.to_vec().unwrap();
+    let survivor = entries
         .iter_mut()
         .find(|entry| entry.path == "z-survivor.md")
         .unwrap();
     survivor.normalize.as_mut().unwrap().manifest_hash = target_manifest.clone();
+    forged_tree.entries = kio_core::disk_records::DiskRecords::from_records(entries).unwrap();
     let store = ObjectStore::new(repo.kio_dir());
     let (tree_hash, _) = store
         .write_json(

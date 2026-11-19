@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
 use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -21,8 +21,7 @@ use crate::cas::{
 };
 use crate::dag::{
     CommitObject, CommitStats, CommitType, DEFAULT_CHUNKING_MAX_CHARS, DEFAULT_CHUNKING_STRATEGY,
-    NormalizeRef, TreeEntry, TreeObject, build_tree_with_chunking_config, chunking_config_hash,
-    is_materializable_direct_child,
+    NormalizeRef, TreeEntry, TreeObject, chunking_config_hash, is_materializable_direct_child,
 };
 use crate::error::{IoResultExt, KioError, Result};
 use crate::gc::{SnapshotAutoBinding, SnapshotAutoStateBinding};
@@ -55,7 +54,9 @@ mod approvals;
 mod config;
 mod history;
 mod logging;
+mod manifest;
 mod repository;
+use manifest::{Manifest, ManifestJsonReader};
 mod snapshot;
 mod working_tree;
 pub(crate) use approvals::validate_bound_store_lock_authority;
@@ -95,11 +96,10 @@ pub use managed_restore::{
 pub const KIO_FORMAT_VERSION: &str = "3.0.0";
 pub const DEFAULT_MAX_ARCHIVE_FILE_BYTES: u64 = u64::MAX;
 pub const DEFAULT_MAX_ARCHIVE_SCOPE_BYTES: u64 = u64::MAX;
-pub use crate::dag::MAX_TREE_ENTRIES;
+pub use crate::dag::TREE_ENTRY_WARNING_THRESHOLD;
 const MAX_TAG_REF_BYTES: u64 = 128;
 const MAX_TAG_NAMES_BYTES: u64 = 16 * 1024 * 1024;
 const PUBLICATION_JOURNAL_LEAF: &str = "publication-v1.json";
-const MAX_PUBLICATION_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Durable intent for the only mutable history publication.  The journal is
 /// deliberately separate from the CAS: it records the two mutable files that
@@ -110,7 +110,7 @@ struct PublicationJournal {
     version: u8,
     expected_head: Option<String>,
     new_head: String,
-    manifest: Value,
+    manifest: Manifest,
 }
 /// Bound structured scope metadata on every supported operating system.
 /// Management and policy reads must never become unbounded parser inputs.
@@ -1392,18 +1392,6 @@ fn archive_budget_error(
     .with_context_field("saved", json!(false))
 }
 
-fn scope_tree_entries_oversized(observed: usize) -> KioError {
-    KioError::new(
-        "KIO-E-SCOPE-INPUT-OVERSIZED-001",
-        "scope tree entry count exceeds the persisted tree limit",
-        json!({
-            "observed_entries": observed,
-            "max_tree_entries": MAX_TREE_ENTRIES,
-        }),
-        ExitCode::PermanentFailure,
-    )
-}
-
 fn scope_file_changed(file_name: &str) -> KioError {
     KioError::new(
         "KIO-E-SCOPE-FILE-CHANGED-001",
@@ -1440,40 +1428,61 @@ pub fn restrict_dir_to_owner(dir: &Path) -> Result<()> {
     set_scope_directory_permissions(dir)
 }
 
-fn tree_map(tree: &TreeObject) -> BTreeMap<String, String> {
+fn tree_map(tree: &TreeObject) -> Result<BTreeMap<String, String>> {
     tree.entries
         .iter()
-        .map(|entry| (entry.path.clone(), entry.raw_hash.clone()))
+        .map(|entry| {
+            let entry = entry?;
+            Ok((entry.path, entry.raw_hash))
+        })
         .collect()
 }
 
-/// Commit stats of `working` against an optional prior tree (`None` = unborn: all
-/// files count as added). R15-4: pure (no I/O) — the caller reads the prior tree
-/// once (and rejects a shallow HEAD) rather than re-reading it here.
-fn commit_stats(prior: Option<&TreeObject>, working: &TreeObject) -> CommitStats {
-    let current = tree_map(working);
-    let old = prior.map(tree_map).unwrap_or_default();
-    let mut added = 0;
-    let mut modified = 0;
-    let mut deleted = 0;
-
-    let mut paths = BTreeSet::new();
-    paths.extend(current.keys().cloned());
-    paths.extend(old.keys().cloned());
-    for path in paths {
-        match (old.get(&path), current.get(&path)) {
-            (None, Some(_)) => added += 1,
-            (Some(_), None) => deleted += 1,
-            (Some(a), Some(b)) if a != b => modified += 1,
-            _ => {}
+/// Merge the two sorted streams without a path map proportional to tree size.
+fn commit_stats(prior: Option<&TreeObject>, working: &TreeObject) -> Result<CommitStats> {
+    let mut old = prior.map(|tree| tree.entries.iter());
+    let mut current = working.entries.iter();
+    let mut a = match &mut old {
+        Some(i) => i.next().transpose()?,
+        None => None,
+    };
+    let mut b = current.next().transpose()?;
+    let mut stats = CommitStats {
+        files_added: 0,
+        files_modified: 0,
+        files_deleted: 0,
+    };
+    loop {
+        match (&a, &b) {
+            (Some(x), Some(y)) => match x.path.as_bytes().cmp(y.path.as_bytes()) {
+                std::cmp::Ordering::Equal => {
+                    if x.raw_hash != y.raw_hash {
+                        stats.files_modified += 1;
+                    }
+                    a = old.as_mut().expect("prior").next().transpose()?;
+                    b = current.next().transpose()?;
+                }
+                std::cmp::Ordering::Less => {
+                    stats.files_deleted += 1;
+                    a = old.as_mut().expect("prior").next().transpose()?;
+                }
+                std::cmp::Ordering::Greater => {
+                    stats.files_added += 1;
+                    b = current.next().transpose()?;
+                }
+            },
+            (Some(_), None) => {
+                stats.files_deleted += 1;
+                a = old.as_mut().expect("prior").next().transpose()?;
+            }
+            (None, Some(_)) => {
+                stats.files_added += 1;
+                b = current.next().transpose()?;
+            }
+            (None, None) => break,
         }
     }
-
-    CommitStats {
-        files_added: added,
-        files_modified: modified,
-        files_deleted: deleted,
-    }
+    Ok(stats)
 }
 
 /// R15-4: is `error` a raw missing-CAS-object error? Used to fold a missing tree
@@ -1482,33 +1491,33 @@ fn is_store_not_found(error: &KioError) -> bool {
     error.error_code() == "KIO-E-STORE-NOT-FOUND-001"
 }
 
-fn validate_manifest_matches_tree(manifest: &Value, tree: &TreeObject) -> Result<()> {
-    validate_json_schema(SchemaKind::Manifest, manifest)?;
-    let files = manifest
-        .get("files")
-        .and_then(Value::as_array)
-        .ok_or_else(|| KioError::schema("publication manifest missing files"))?;
-    let live: BTreeMap<_, _> = files
-        .iter()
-        .filter(|file| file.get("status").and_then(Value::as_str) != Some("deleted"))
-        .map(|file| {
-            let path = file
-                .get("path")
-                .and_then(Value::as_str)
-                .ok_or_else(|| KioError::schema("publication manifest file path missing"))?;
-            let raw = file
-                .get("raw_hash")
-                .and_then(Value::as_str)
-                .ok_or_else(|| KioError::schema("publication manifest raw hash missing"))?;
-            Ok((path, raw))
-        })
-        .collect::<Result<_>>()?;
-    let expected: BTreeMap<_, _> = tree
-        .entries
-        .iter()
-        .map(|entry| (entry.path.as_str(), entry.raw_hash.as_str()))
-        .collect();
-    if live != expected {
+fn validate_manifest_matches_tree(manifest: &Manifest, tree: &TreeObject) -> Result<()> {
+    manifest.validate()?;
+    let mut sorted = crate::disk_records::RecordSorter::new(
+        |a: &manifest::ManifestRow, b: &manifest::ManifestRow| {
+            a.path.as_bytes().cmp(b.path.as_bytes())
+        },
+    );
+    for row in &manifest.files {
+        let row = row?;
+        if row.status != "deleted" {
+            sorted.push(row)?;
+        }
+    }
+    let live = sorted.finish()?;
+    let mut expected = tree.entries.iter();
+    for row in &live {
+        let row = row?;
+        let entry = expected.next().transpose()?.ok_or_else(|| {
+            KioError::schema("publication manifest does not describe the new commit tree")
+        })?;
+        if row.path != entry.path || row.raw_hash != entry.raw_hash {
+            return Err(KioError::schema(
+                "publication manifest does not describe the new commit tree",
+            ));
+        }
+    }
+    if expected.next().transpose()?.is_some() {
         return Err(KioError::schema(
             "publication manifest does not describe the new commit tree",
         ));
@@ -1921,12 +1930,13 @@ mod tests {
         )
     }
     use super::{
-        ArchiveLimits, MAX_TREE_ENTRIES, PendingNormalizeRef, RELEASED_LOCK_PID, Repository,
-        StoreLock, append_jsonl_rotating, civil_from_days, format_unix_seconds, format_utc_seconds,
-        open_scope_file_nofollow, parse_utc_seconds, prune_rotated_logs, publish_network_approval,
-        read_adapter_lane, read_logs_retention_days, read_network_approval_pending,
-        read_network_approvals, redact_context, redact_message_paths, revoke_network_approval,
-        rotate_stale_log, write_network_approval_pending,
+        ArchiveLimits, PendingNormalizeRef, RELEASED_LOCK_PID, Repository, StoreLock,
+        TREE_ENTRY_WARNING_THRESHOLD, append_jsonl_rotating, civil_from_days, format_unix_seconds,
+        format_utc_seconds, open_scope_file_nofollow, parse_utc_seconds, prune_rotated_logs,
+        publish_network_approval, read_adapter_lane, read_logs_retention_days,
+        read_network_approval_pending, read_network_approvals, redact_context,
+        redact_message_paths, revoke_network_approval, rotate_stale_log,
+        write_network_approval_pending,
     };
     use super::{enforce_config_semantics, enforce_scope_config_semantics};
     use crate::cas::canonical_json_bytes;
@@ -3135,13 +3145,14 @@ mod tests {
             .unwrap();
         let candidate = candidates
             .iter()
+            .map(Result::unwrap)
             .find(|item| item.file_name == "doc.md")
             .unwrap();
         fs::rename(&root, dir.path().join("moved")).unwrap();
         fs::create_dir(&root).unwrap();
         fs::write(root.join("doc.md"), b"replacement must not be read").unwrap();
         let mut file = super::open_working_file_candidate(
-            candidate,
+            &candidate,
             &crate::control::ControlHandle::default(),
         )
         .unwrap();
@@ -3933,7 +3944,12 @@ mod tests {
         fs::write(&outside, b"outside marker").unwrap();
         symlink(&outside, dir.path().join("linked.txt")).unwrap();
         let tree = repo.build_working_tree(false).unwrap().tree;
-        assert!(tree.entries.iter().all(|entry| entry.path != "linked.txt"));
+        assert!(
+            tree.entries
+                .iter()
+                .map(Result::unwrap)
+                .all(|entry| entry.path != "linked.txt")
+        );
     }
 
     #[test]
@@ -4031,10 +4047,16 @@ mod tests {
         let outcome = repo.snapshot(None, None).unwrap();
         let tree = repo.read_tree(&outcome.tree_hash).unwrap();
         assert_eq!(tree.entries.len(), 2);
-        assert_eq!(tree.entries[0].raw_hash, tree.entries[1].raw_hash);
+        assert_eq!(
+            tree.entries.get(0).unwrap().unwrap().raw_hash,
+            tree.entries.get(1).unwrap().unwrap().raw_hash
+        );
         assert_eq!(
             repo.object_store()
-                .inspect_object(ObjectKind::Raw, &tree.entries[0].raw_hash)
+                .inspect_object(
+                    ObjectKind::Raw,
+                    &tree.entries.get(0).unwrap().unwrap().raw_hash
+                )
                 .unwrap()
                 .size_bytes,
             size
@@ -4073,14 +4095,19 @@ mod tests {
             .unwrap();
         let tree = repo.read_tree(&outcome.tree_hash).unwrap();
         assert_eq!(tree.entries.len(), 1);
-        assert_eq!(tree.entries[0].path, "notes.md");
+        assert_eq!(tree.entries.get(0).unwrap().unwrap().path, "notes.md");
 
         let allowed = BTreeSet::from([".env".to_owned()]);
         let outcome = repo
             .snapshot_filtered_with_policy(Some("explicit lift"), None, &BTreeSet::new(), &allowed)
             .unwrap();
         let tree = repo.read_tree(&outcome.tree_hash).unwrap();
-        assert!(tree.entries.iter().any(|entry| entry.path == ".env"));
+        assert!(
+            tree.entries
+                .iter()
+                .map(Result::unwrap)
+                .any(|entry| entry.path == ".env")
+        );
     }
 
     #[test]
@@ -4112,7 +4139,10 @@ mod tests {
             )
             .unwrap()
             .tree;
-        assert_eq!(tree.entries[0].normalize, Some(normalize));
+        assert_eq!(
+            tree.entries.get(0).unwrap().unwrap().normalize,
+            Some(normalize)
+        );
 
         fs::write(&path, b"new bytes").unwrap();
         let tree = repo
@@ -4125,8 +4155,11 @@ mod tests {
             )
             .unwrap()
             .tree;
-        assert_eq!(tree.entries[0].raw_hash, hash_bytes(b"new bytes"));
-        assert!(tree.entries[0].normalize.is_none());
+        assert_eq!(
+            tree.entries.get(0).unwrap().unwrap().raw_hash,
+            hash_bytes(b"new bytes")
+        );
+        assert!(tree.entries.get(0).unwrap().unwrap().normalize.is_none());
     }
 
     #[test]
@@ -4257,7 +4290,7 @@ mod tests {
     }
 
     #[test]
-    fn cand_046_dag_cardinality_limits_apply_after_bounded_deserialization() {
+    fn malformed_dag_and_duplicate_paths_are_rejected_above_warning_threshold() {
         let dir = tempfile::tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
         let store = ObjectStore::new(repo.kio_dir());
@@ -4276,7 +4309,8 @@ mod tests {
 
         let entry = json!({"path":"a", "type":"file", "raw_hash":hash_bytes(b"raw")});
         let tree = json!({
-            "entries":vec![entry; MAX_TREE_ENTRIES + 1],
+            "entries":vec![entry; TREE_ENTRY_WARNING_THRESHOLD + 1],
+            "chunking_config_hash":crate::dag::build_tree(Vec::new()).unwrap().chunking_config_hash,
             "object_type":"tree"
         });
         let (tree_hash, _) = store.write_json(ObjectKind::Tree, &tree).unwrap();
@@ -4284,39 +4318,113 @@ mod tests {
     }
 
     #[test]
-    fn cand_046_snapshot_rejects_tree_entry_overflow_before_publication() {
+    fn st05_manifest_above_old_metadata_ceiling_remains_readable() {
         let dir = tempfile::tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
-        for index in 0..=MAX_TREE_ENTRIES {
+        let files=(0..10_001).map(|i| json!({"path":format!("file-{i:05}.txt"),"raw_hash":hash_bytes(b"raw"),"status":"deleted"})).collect::<Vec<_>>();
+        let bytes = serde_json::to_vec(&json!({"files":files,"schema_version":1})).unwrap();
+        assert!(bytes.len() > 1024 * 1024);
+        fs::write(repo.kio_dir().join("manifest.json"), bytes).unwrap();
+        repo.validate_manifest().unwrap();
+    }
+
+    #[test]
+    fn st05_snapshot_saves_all_entries_above_warning_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        for index in 0..=TREE_ENTRY_WARNING_THRESHOLD {
             fs::File::create(dir.path().join(format!("entry-{index:05}.txt"))).unwrap();
         }
-
-        let head_before = fs::read(repo.kio_dir().join("HEAD")).unwrap();
-        let error = repo.snapshot(Some("over-limit"), None).unwrap_err();
-        assert_eq!(error.error_code(), "KIO-E-SCOPE-INPUT-OVERSIZED-001");
+        let preview = repo.build_working_tree(false).unwrap().tree;
+        assert_eq!(preview.entries.len(), TREE_ENTRY_WARNING_THRESHOLD + 1);
+        let outcome = repo.snapshot(Some("large tree"), None).unwrap();
+        let saved = repo.read_tree(&outcome.tree_hash).unwrap();
+        assert_eq!(saved, preview);
+        assert_eq!(crate::dag::tree_hash(&saved).unwrap(), outcome.tree_hash);
+        let plan = crate::gc::GcPlanner::bind(dir.path())
+            .unwrap()
+            .plan_at(1_800_000_000)
+            .unwrap();
         assert_eq!(
-            error.context()["observed_entries"],
-            json!(MAX_TREE_ENTRIES + 1)
+            plan.stats.tree_entries,
+            (TREE_ENTRY_WARNING_THRESHOLD + 1) as u64
         );
-        assert_eq!(error.context()["max_tree_entries"], json!(MAX_TREE_ENTRIES));
-        assert_eq!(fs::read(repo.kio_dir().join("HEAD")).unwrap(), head_before);
-        for kind in ["raw", "trees", "commits"] {
-            assert_eq!(
-                fs::read_dir(repo.kio_dir().join("objects").join(kind))
-                    .unwrap()
-                    .count(),
-                0,
-                "over-limit snapshot published a {kind} CAS object"
-            );
-        }
+        let head = outcome.commit_hash.unwrap();
+        let history = crate::history::HistoryReader::new(repo.kio_dir());
+        assert_eq!(
+            history.walk(&head).unwrap().stats().tree_entries,
+            (TREE_ENTRY_WARNING_THRESHOLD + 1) as u64
+        );
+    }
 
-        fs::remove_file(
-            dir.path()
-                .join(format!("entry-{:05}.txt", MAX_TREE_ENTRIES)),
+    #[test]
+    fn st05_tree_stage_storage_exhaustion_preserves_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        fs::write(dir.path().join("a"), b"first").unwrap();
+        repo.snapshot(None, None).unwrap();
+        let head = fs::read(repo.kio_dir().join("HEAD")).unwrap();
+        fs::write(dir.path().join("a"), b"changed").unwrap();
+        let expected = repo.build_working_tree(false).unwrap().tree;
+        let hash = crate::dag::tree_hash(&expected).unwrap();
+        crate::cas::fail_next_tree_write();
+        let error = repo.snapshot(None, None).unwrap_err();
+        assert_eq!(
+            error.resource_limit().unwrap().resource,
+            crate::error::Resource::Storage
+        );
+        assert_eq!(fs::read(repo.kio_dir().join("HEAD")).unwrap(), head);
+        assert!(repo.read_tree(&hash).is_err());
+        assert!(repo.object_store().inspect_raw_stages().unwrap().is_empty());
+        let saved = repo.snapshot(None, None).unwrap();
+        assert_eq!(saved.tree_hash, hash);
+    }
+
+    #[test]
+    fn publication_recovery_manifest_stage_failure_preserves_head_and_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        fs::write(dir.path().join("doc.txt"), "v1").unwrap();
+        let c1 = repo.snapshot(None, None).unwrap().commit_hash.unwrap();
+        let old_head = fs::read(repo.kio_dir().join("HEAD")).unwrap();
+        let old_manifest = fs::read(repo.kio_dir().join("manifest.json")).unwrap();
+        fs::write(dir.path().join("doc.txt"), "v2").unwrap();
+        let c2 = repo.snapshot(None, None).unwrap().commit_hash.unwrap();
+        let new_manifest = fs::read(repo.kio_dir().join("manifest.json")).unwrap();
+        let journal = super::PublicationJournal {
+            version: 1,
+            expected_head: Some(c1),
+            new_head: c2.clone(),
+            manifest: serde_json::from_slice(&new_manifest).unwrap(),
+        };
+        let journal_path = repo.kio_dir().join(super::PUBLICATION_JOURNAL_LEAF);
+        fs::write(
+            &journal_path,
+            canonical_json_bytes(&serde_json::to_value(journal).unwrap()).unwrap(),
         )
         .unwrap();
-        let boundary = repo.build_working_tree(false).unwrap();
-        assert_eq!(boundary.tree.entries.len(), MAX_TREE_ENTRIES);
+        fs::write(repo.kio_dir().join("HEAD"), &old_head).unwrap();
+        fs::write(repo.kio_dir().join("manifest.json"), &old_manifest).unwrap();
+        let recover = Repository::open_for_recovery(dir.path()).unwrap();
+        crate::cas::fail_next_raw_write();
+        let error = recover.recover_publication().unwrap_err();
+        assert_eq!(
+            error.resource_limit().unwrap().resource,
+            crate::error::Resource::Storage
+        );
+        assert_eq!(fs::read(repo.kio_dir().join("HEAD")).unwrap(), old_head);
+        assert_eq!(
+            fs::read(repo.kio_dir().join("manifest.json")).unwrap(),
+            old_manifest
+        );
+        assert!(journal_path.exists());
+        assert!(recover.recover_publication().unwrap());
+        assert_eq!(recover.head_commit_hash().unwrap(), Some(c2));
+        assert_eq!(
+            fs::read(repo.kio_dir().join("manifest.json")).unwrap(),
+            new_manifest
+        );
+        assert!(!journal_path.exists());
     }
 
     #[test]
@@ -4335,7 +4443,7 @@ mod tests {
             .unwrap()
             .commit_hash
             .unwrap();
-        let manifest: Value =
+        let manifest: super::Manifest =
             serde_json::from_slice(&fs::read(repo.kio_dir().join("manifest.json")).unwrap())
                 .unwrap();
         let journal = super::PublicationJournal {
@@ -4514,7 +4622,8 @@ mod tests {
         assert_eq!(
             tree.entries
                 .iter()
-                .map(|entry| entry.path.as_str())
+                .map(Result::unwrap)
+                .map(|entry| entry.path.clone())
                 .collect::<Vec<_>>(),
             vec!["keep.txt"],
             "the purge target's entry must be excluded even though its working-tree \
@@ -4597,7 +4706,8 @@ mod tests {
         assert_eq!(
             tree.entries
                 .iter()
-                .map(|entry| entry.path.as_str())
+                .map(Result::unwrap)
+                .map(|entry| entry.path.clone())
                 .collect::<Vec<_>>(),
             vec!["keep.txt"]
         );

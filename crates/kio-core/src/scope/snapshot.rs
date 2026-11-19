@@ -257,6 +257,14 @@ impl Repository {
         Ok(())
     }
 
+    fn reject_scheduled_tree_marker_targets(&self, tree: &TreeObject) -> Result<()> {
+        for entry in &tree.entries {
+            let entry = entry?;
+            self.reject_scheduled_marker_targets(std::iter::once(&entry.raw_hash))?;
+        }
+        Ok(())
+    }
+
     /// Scheduler-only auto snapshot. Historical normalization is carried only
     /// through a raw-hash-bound reference, never from a mutable cache.
     #[allow(clippy::too_many_arguments)]
@@ -296,6 +304,7 @@ impl Repository {
             let head = scheduled_authority.head.trim();
             let tree = self.read_tree(&self.read_commit(head)?.tree)?;
             for entry in tree.entries {
+                let entry = entry?;
                 if let Some(normalize) = entry.normalize {
                     normalize_by_path.insert(
                         entry.path.clone(),
@@ -406,18 +415,22 @@ impl Repository {
             Err(error) => return Err(error),
         };
         let current = self.build_working_tree(false)?.tree;
-        let current_raw = tree_map(&current);
+        let current_raw = tree_map(&current)?;
         let purge = self.purge_state()?;
         let mut promoted_tree = prior_tree.clone();
         let mut changed = false;
-        for entry in &mut promoted_tree.entries {
+        let mut updated = crate::disk_records::RecordWriter::new()?;
+        for entry in &promoted_tree.entries {
+            let mut entry = entry?;
             let Some(pending) = normalize_by_path.get(&entry.path) else {
+                updated.push(&entry)?;
                 continue;
             };
             let exact_current = current_raw
                 .get(&entry.path)
                 .is_some_and(|raw_hash| raw_hash == &pending.expected_raw_hash);
             if !exact_current || entry.raw_hash != pending.expected_raw_hash {
+                updated.push(&entry)?;
                 continue;
             }
             ensure_raw_publication_allowed(&purge, &pending.expected_raw_hash)?;
@@ -425,9 +438,11 @@ impl Repository {
                 entry.normalize = Some(pending.normalize.clone());
                 changed = true;
             }
+            updated.push(&entry)?;
         }
+        promoted_tree.entries = updated.finish()?;
         promoted_tree.validate()?;
-        let stats = commit_stats(Some(&prior_tree), &promoted_tree);
+        let stats = commit_stats(Some(&prior_tree), &promoted_tree)?;
         if !changed {
             return Ok(SnapshotOutcome {
                 noop: true,
@@ -439,9 +454,7 @@ impl Repository {
             });
         }
 
-        let tree_value = serde_json::to_value(&promoted_tree)
-            .map_err(|error| KioError::schema(error.to_string()))?;
-        let (tree_hash, _) = self.store.write_json(ObjectKind::Tree, &tree_value)?;
+        let tree_hash = self.store.write_tree(&promoted_tree)?;
         let created_at = self.now_utc_seconds();
         let commit = CommitObject::new(
             tree_hash.clone(),
@@ -501,21 +514,19 @@ impl Repository {
             .ok_or_else(|| KioError::invalid_usage("cannot purge an unborn scope"))?;
         let head_commit = self.read_commit(&head)?;
         let head_tree = self.read_tree(&head_commit.tree)?;
-        let normalize_by_path = head_tree
-            .entries
-            .iter()
-            .filter_map(|entry| {
-                entry.normalize.clone().map(|normalize| {
-                    (
-                        entry.path.clone(),
-                        PendingNormalizeRef {
-                            expected_raw_hash: entry.raw_hash.clone(),
-                            normalize,
-                        },
-                    )
-                })
-            })
-            .collect::<BTreeMap<_, _>>();
+        let mut normalize_by_path = BTreeMap::new();
+        for entry in &head_tree.entries {
+            let entry = entry?;
+            if let Some(normalize) = entry.normalize {
+                normalize_by_path.insert(
+                    entry.path,
+                    PendingNormalizeRef {
+                        expected_raw_hash: entry.raw_hash,
+                        normalize,
+                    },
+                );
+            }
+        }
         self.snapshot_with_type(
             Some(reason),
             fixed_now,
@@ -715,6 +726,7 @@ impl Repository {
             let purge = self.purge_state()?;
             let mut candidates = BTreeSet::new();
             for entry in &working.entries {
+                let entry = entry?;
                 let tombstoned = purge
                     .read_tombstone(&entry.raw_hash)?
                     .is_some_and(|record| record.is_active());
@@ -728,10 +740,8 @@ impl Repository {
             candidates
         };
 
-        let tree_value =
-            serde_json::to_value(&working).map_err(|err| KioError::schema(err.to_string()))?;
-        let (tree_hash, _) = self.store.write_json(ObjectKind::Tree, &tree_value)?;
-        let stats = commit_stats(prior_tree.as_ref(), &working);
+        let tree_hash = self.store.write_tree(&working)?;
+        let stats = commit_stats(prior_tree.as_ref(), &working)?;
 
         // A resurrection candidate forces a real commit even when the tree is
         // byte-identical to HEAD's (LC22-26): otherwise the raw bytes we just
@@ -763,9 +773,7 @@ impl Repository {
                     )?;
                 }
                 self.reject_scheduled_bound_purge_state()?;
-                self.reject_scheduled_marker_targets(
-                    working.entries.iter().map(|entry| &entry.raw_hash),
-                )?;
+                self.reject_scheduled_tree_marker_targets(&working)?;
             }
             if let Some(publish) = before_ref_publication {
                 let checkpoint = publish()?;
@@ -797,9 +805,7 @@ impl Repository {
                         self.control(),
                     )?;
                     self.reject_scheduled_bound_purge_state()?;
-                    self.reject_scheduled_marker_targets(
-                        working.entries.iter().map(|entry| &entry.raw_hash),
-                    )?;
+                    self.reject_scheduled_tree_marker_targets(&working)?;
                 }
             }
             if let Some(guard) = publication_guard {
@@ -892,9 +898,7 @@ impl Repository {
                 )?;
             }
             self.reject_scheduled_bound_purge_state()?;
-            self.reject_scheduled_marker_targets(
-                working.entries.iter().map(|entry| &entry.raw_hash),
-            )?;
+            self.reject_scheduled_tree_marker_targets(&working)?;
         }
         let checkpoint = match before_ref_publication {
             Some(publish) => Some(publish()?),
@@ -937,9 +941,7 @@ impl Repository {
                 )?;
             }
             self.reject_scheduled_bound_purge_state()?;
-            self.reject_scheduled_marker_targets(
-                working.entries.iter().map(|entry| &entry.raw_hash),
-            )?;
+            self.reject_scheduled_tree_marker_targets(&working)?;
             self.publish_with_journal(parent.as_deref(), &commit_hash, &commit, manifest.clone())?;
             Some(self.capture_scheduled_snapshot_authority()?)
         } else {

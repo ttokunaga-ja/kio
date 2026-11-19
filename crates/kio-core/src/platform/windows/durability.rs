@@ -7,6 +7,7 @@ use std::path::Path;
 /// What survives is the *fail-closed* half of R23-07: a parent that is missing
 /// or is not a directory still surfaces to the caller rather than
 /// type-checking as success. That is the failure this arm can actually see.
+#[cfg(test)]
 pub(crate) fn sync_directory(path: &Path) -> std::io::Result<()> {
     if fs::metadata(path)?.is_dir() {
         Ok(())

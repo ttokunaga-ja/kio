@@ -86,6 +86,7 @@ fn vp8l_tree_budget_is_enforced_at_native_webp_ingest_before_cas_authority() {
         .unwrap()
         .entries
         .into_iter()
+        .map(Result::unwrap)
         .find(|entry| entry.path == "safe.webp")
         .expect("the accepted standalone WebP must be in the published tree");
     assert!(safe_entry.normalize.is_some());
@@ -148,6 +149,7 @@ fn vp8l_tree_budget_is_enforced_at_native_webp_ingest_before_cas_authority() {
             unsafe_tree
                 .entries
                 .iter()
+                .map(Result::unwrap)
                 .find(|entry| entry.path == "overbudget.webp")
                 .is_none_or(|entry| entry.normalize.is_none()),
             "refused input must not acquire normalized tree authority"
@@ -195,6 +197,7 @@ fn lossy_vp8_decoded_allocations_are_refused_before_cas_authority() {
                 .unwrap()
                 .entries
                 .iter()
+                .map(Result::unwrap)
                 .find(|entry| entry.path == "overbudget.webp")
                 .is_none_or(|entry| entry.normalize.is_none())
         );
@@ -265,6 +268,7 @@ fn jpeg_decoder_owned_metadata_and_encoded_copy_share_the_decoded_budget() {
                 .unwrap()
                 .entries
                 .iter()
+                .map(Result::unwrap)
                 .find(|entry| entry.path == "overbudget.jpg")
                 .is_none_or(|entry| entry.normalize.is_none())
         );

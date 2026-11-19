@@ -827,9 +827,12 @@ fn o3_image_purge_discards_saved_cursor_and_preserves_only_the_surviving_source(
         assert_eq!(cas.target_type, "image");
         assert_eq!(cas.target_hash, survivor_hash);
         assert!(
-            tree.entries.iter().any(|entry| entry.path == "survivor.png"
-                && entry.raw_hash == survivor_hash
-                && entry.normalize.is_some()),
+            tree.entries
+                .iter()
+                .map(Result::unwrap)
+                .any(|entry| entry.path == "survivor.png"
+                    && entry.raw_hash == survivor_hash
+                    && entry.normalize.is_some()),
             "purged HEAD must retain survivor typed normalization"
         );
         let source = support::immutable_sqlite(dir.path().join(".kio/index/sqlite.db"));

@@ -1,6 +1,6 @@
 //! Durable dispositions for archived inputs that cannot be enriched.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 #[cfg(test)]
 use std::fs;
 #[cfg(test)]
@@ -69,7 +69,7 @@ impl UnsupportedInputDisposition {
 pub struct UnsupportedInputStore {
     pub(crate) kio_dir: PathBuf,
     path: PathBuf,
-    published_raws: BTreeMap<String, String>,
+    published_inputs: BTreeMap<String, (String, bool)>,
 }
 
 impl UnsupportedInputStore {
@@ -79,18 +79,32 @@ impl UnsupportedInputStore {
         Self {
             path: kio_dir.join(UNSUPPORTED_INPUTS_FILE),
             kio_dir,
-            published_raws: BTreeMap::new(),
+            published_inputs: BTreeMap::new(),
         }
     }
 
-    #[must_use]
-    pub fn with_published_tree(mut self, tree: Option<&kio_core::dag::TreeObject>) -> Self {
-        self.published_raws = tree
+    /// Retain HEAD identities only for paths that already have journal rows.
+    /// A newer observation may hide a row for the published raw at the same path.
+    pub fn with_published_tree(mut self, tree: Option<&kio_core::dag::TreeObject>) -> Result<Self> {
+        self.published_inputs.clear();
+        let Some(tree) = tree else {
+            return Ok(self);
+        };
+        let paths: BTreeSet<_> = self
+            .latest_by_path()?
             .into_iter()
-            .flat_map(|tree| &tree.entries)
-            .map(|entry| (entry.path.clone(), entry.raw_hash.clone()))
+            .map(|row| row.path)
             .collect();
-        self
+        if !paths.is_empty() {
+            for entry in &tree.entries {
+                let entry = entry.map_err(|error| crate::journal::error(&self.path, error))?;
+                if paths.contains(&entry.path) {
+                    self.published_inputs
+                        .insert(entry.path, (entry.raw_hash, entry.normalize.is_some()));
+                }
+            }
+        }
+        Ok(self)
     }
 
     #[must_use]
@@ -177,12 +191,13 @@ impl UnsupportedInputStore {
             .collect())
     }
 
-    /// Read the latest record matching each path and raw hash in HEAD.
+    /// Read the latest HEAD dispositions and show unsupported reasons only for raw-only entries.
     pub fn published_by_path(&self) -> Result<Vec<UnsupportedInputDisposition>> {
         Ok(self
             .read_bound(&self.private_root()?)?
             .published
             .into_values()
+            .filter(|row| !row.is_unsupported() || !self.published_inputs[&row.path].1)
             .collect())
     }
 
@@ -196,7 +211,11 @@ impl UnsupportedInputStore {
         projection: &mut DispositionProjection,
         disposition: UnsupportedInputDisposition,
     ) {
-        if self.published_raws.get(&disposition.path) == Some(&disposition.raw_hash) {
+        if self
+            .published_inputs
+            .get(&disposition.path)
+            .is_some_and(|(raw_hash, _)| raw_hash == &disposition.raw_hash)
+        {
             projection
                 .published
                 .insert(disposition.path.clone(), disposition.clone());

@@ -31,15 +31,28 @@ fn main() {
     };
     let exit_code = match kio_app::execute(&context, cli.command.into()).and_then(|response| {
         let code = completion_exit_code(response.completion);
-        let output = serde_json::to_value(response.body)
-            .map_err(|error| KioError::schema(error.to_string()))?;
+        let output = match response.body {
+            kio_app::response::ResponseBody::Inspect(
+                kio_app::response::history::InspectResponse::Tree(tree),
+            ) => {
+                let stdout = std::io::stdout();
+                let mut writer = std::io::BufWriter::with_capacity(64 * 1024, stdout.lock());
+                write_inspected_tree(&tree, &mut writer, json_mode)?;
+                None
+            }
+            body => Some(
+                serde_json::to_value(body).map_err(|error| KioError::schema(error.to_string()))?,
+            ),
+        };
         Ok((output, code))
     }) {
         Ok((output, code)) => {
-            if code != ExitCode::Success {
-                append_completion_error(&output, code);
+            if let Some(output) = output {
+                if code != ExitCode::Success {
+                    append_completion_error(&output, code);
+                }
+                print_output(output, json_mode);
             }
-            print_output(output, json_mode);
             code
         }
         Err(error) => {
@@ -49,6 +62,94 @@ fn main() {
         }
     };
     process::exit(exit_code.code());
+}
+
+/// Inspect explicitly emits the complete tree, but neither JSON values nor
+/// rendered strings need to retain that complete output in memory.
+fn write_inspected_tree(
+    tree: &kio_core::dag::TreeObject,
+    writer: &mut impl Write,
+    json_mode: bool,
+) -> Result<()> {
+    if json_mode {
+        kio_core::dag::write_tree_json(tree, writer)?;
+    } else {
+        let mut terminal = TerminalSafeWriter {
+            writer: &mut *writer,
+            pending: [0; 4],
+            filled: 0,
+        };
+        serde_json::to_writer_pretty(&mut terminal, tree).map_err(|error| {
+            if error.is_io() {
+                KioError::io(error.to_string(), "stdout")
+            } else {
+                KioError::schema(error.to_string())
+            }
+        })?;
+        terminal
+            .flush()
+            .map_err(|error| KioError::io(error.to_string(), "stdout"))?;
+    }
+    writer
+        .write_all(b"\n")
+        .and_then(|()| writer.flush())
+        .map_err(|error| KioError::io(error.to_string(), "stdout"))
+}
+
+/// JSON serializers may split UTF-8 between writes. Retain at most one scalar
+/// while applying the same human-output terminal escaping as print_output.
+struct TerminalSafeWriter<'a, W> {
+    writer: &'a mut W,
+    pending: [u8; 4],
+    filled: usize,
+}
+impl<W: Write> Write for TerminalSafeWriter<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.filled == 0
+            && bytes
+                .iter()
+                .all(|b| *b == b'\n' || matches!(*b, 0x20..=0x7e))
+        {
+            self.writer.write_all(bytes)?;
+            return Ok(bytes.len());
+        }
+        for &byte in bytes {
+            self.pending[self.filled] = byte;
+            self.filled += 1;
+            let text = match std::str::from_utf8(&self.pending[..self.filled]) {
+                Ok(text) => text,
+                Err(error) if error.error_len().is_none() && self.filled < 4 => continue,
+                Err(error) => {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error));
+                }
+            };
+            let ch = text.chars().next().expect("one UTF-8 scalar");
+            if ch != '\n' && terminal_active(ch) {
+                let code = ch as u32;
+                if code <= 0xff {
+                    write!(self.writer, "\\x{code:02x}")?;
+                } else {
+                    write!(self.writer, "\\u{{{code:04x}}}")?;
+                }
+            } else {
+                self.writer.write_all(text.as_bytes())?;
+            }
+            self.filled = 0;
+        }
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.filled != 0 {
+            return Err(std::io::Error::other("incomplete UTF-8 output"));
+        }
+        self.writer.flush()
+    }
+}
+
+fn terminal_active(ch: char) -> bool {
+    let code = ch as u32;
+    matches!(code, 0x00..=0x1f | 0x7f..=0x9f)
+        || matches!(code, 0x061c | 0x200e..=0x200f | 0x2028..=0x202e | 0x2066..=0x2069)
 }
 
 struct TerminalInteraction {
@@ -360,9 +461,7 @@ fn terminal_safe_text(input: &str, allow_newlines: bool) -> String {
             continue;
         }
         let code = ch as u32;
-        let terminal_active = matches!(code, 0x00..=0x1f | 0x7f..=0x9f)
-            || matches!(code, 0x061c | 0x200e..=0x200f | 0x2028..=0x202e | 0x2066..=0x2069);
-        if terminal_active {
+        if terminal_active(ch) {
             if code <= 0xff {
                 output.push_str(&format!("\\x{code:02x}"));
             } else {
@@ -378,6 +477,99 @@ fn terminal_safe_text(input: &str, allow_newlines: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::{read_confirmation, terminal_safe_text};
+
+    #[test]
+    fn inspected_tree_stream_preserves_json_and_human_contracts() {
+        let tree = kio_core::dag::build_tree([kio_core::dag::TreeEntry::raw_file(
+            "日本語.txt",
+            format!("sha256:{}", "1".repeat(64)),
+        )
+        .unwrap()])
+        .unwrap();
+        let expected = serde_json::to_value(&tree).unwrap();
+        for json_mode in [false, true] {
+            let mut output = Vec::new();
+            super::write_inspected_tree(&tree, &mut output, json_mode).unwrap();
+            assert!(output.ends_with(b"\n"));
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&output).unwrap(),
+                expected
+            );
+        }
+        let tree = kio_core::dag::build_tree([kio_core::dag::TreeEntry::raw_file(
+            "bidi-\u{202e}.txt",
+            format!("sha256:{}", "1".repeat(64)),
+        )
+        .unwrap()])
+        .unwrap();
+        let mut output = Vec::new();
+        super::write_inspected_tree(&tree, &mut output, false).unwrap();
+        let human = String::from_utf8(output).unwrap();
+        assert!(human.contains("\\u{202e}"));
+        assert!(!human.contains('\u{202e}'));
+    }
+
+    #[test]
+    fn tree_human_output_sanitizes_split_utf8_scalars() {
+        use std::io::Write;
+        let text = "日本語\u{202e}\u{85}\nplain";
+        let mut output = Vec::new();
+        let mut terminal = super::TerminalSafeWriter {
+            writer: &mut output,
+            pending: [0; 4],
+            filled: 0,
+        };
+        for byte in text.as_bytes() {
+            terminal.write_all(&[*byte]).unwrap();
+        }
+        terminal.flush().unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            terminal_safe_text(text, true)
+        );
+    }
+
+    #[test]
+    fn inspected_large_tree_uses_bounded_output_writes() {
+        use std::io::Write;
+        struct Count {
+            bytes: u64,
+            largest: usize,
+        }
+        impl Write for Count {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.bytes += bytes.len() as u64;
+                self.largest = self.largest.max(bytes.len());
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut records = kio_core::disk_records::RecordWriter::new().unwrap();
+        for i in 0..60_000 {
+            records
+                .push(
+                    &kio_core::dag::TreeEntry::raw_file(
+                        format!("{i:06}-{}.txt", "x".repeat(210)),
+                        format!("sha256:{}", "1".repeat(64)),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        let mut tree = kio_core::dag::build_tree([]).unwrap();
+        tree.entries = records.finish().unwrap();
+        for json_mode in [false, true] {
+            let mut output = Count {
+                bytes: 0,
+                largest: 0,
+            };
+            super::write_inspected_tree(&tree, &mut output, json_mode).unwrap();
+            assert!(output.bytes > 16 * 1024 * 1024);
+            assert!(output.largest <= 64 * 1024);
+        }
+    }
 
     #[test]
     fn confirmation_reads_only_one_bounded_line() {

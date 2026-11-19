@@ -940,9 +940,9 @@ fn successor_with_failed_pinned_manifest(dir: &TempDir, pointer: &Value) -> Stri
     let repo = Repository::open(dir.path()).unwrap();
     let parent = pointer["commit"].as_str().unwrap().to_owned();
     let parent_commit = repo.read_commit(&parent).unwrap();
-    let mut tree = repo.read_tree(&parent_commit.tree).unwrap();
-    let entry = tree
-        .entries
+    let tree = repo.read_tree(&parent_commit.tree).unwrap();
+    let mut entries = tree.entries.to_vec().unwrap();
+    let entry = entries
         .iter_mut()
         .find(|entry| entry.raw_hash == pointer["raw_hash"].as_str().unwrap())
         .unwrap();
@@ -966,7 +966,7 @@ fn successor_with_failed_pinned_manifest(dir: &TempDir, pointer: &Value) -> Stri
         .write_content_object(ContentObjectKind::Manifest, &manifest_bytes)
         .unwrap();
 
-    let tree = build_tree(tree.entries).unwrap();
+    let tree = build_tree(entries).unwrap();
     let (tree_hash, _) = store
         .write_json(ObjectKind::Tree, &serde_json::to_value(&tree).unwrap())
         .unwrap();
@@ -1013,9 +1013,9 @@ fn pb46_same_generation_immutable_bodies_remain_commit_pinned_after_rebuild() {
 
     let repo = Repository::open(dir.path()).unwrap();
     let parent_commit = repo.read_commit(&c1).unwrap();
-    let mut tree = repo.read_tree(&parent_commit.tree).unwrap();
-    let entry = tree
-        .entries
+    let tree = repo.read_tree(&parent_commit.tree).unwrap();
+    let mut entries = tree.entries.to_vec().unwrap();
+    let entry = entries
         .iter_mut()
         .find(|entry| entry.path == "evidence.md")
         .unwrap();
@@ -1053,7 +1053,7 @@ fn pb46_same_generation_immutable_bodies_remain_commit_pinned_after_rebuild() {
     normalize.manifest_hash = store
         .write_content_object(ContentObjectKind::Manifest, &replacement_manifest_bytes)
         .unwrap();
-    let tree = build_tree(tree.entries).unwrap();
+    let tree = build_tree(entries).unwrap();
     let (tree_hash, _) = store
         .write_json(ObjectKind::Tree, &serde_json::to_value(&tree).unwrap())
         .unwrap();
@@ -1707,7 +1707,13 @@ fn prune_normalize(dir: &TempDir) -> (String, NormalizeRef) {
     let commit = repo
         .read_commit(&repo.head_commit_hash().unwrap().unwrap())
         .unwrap();
-    let entry = repo.read_tree(&commit.tree).unwrap().entries.remove(0);
+    let entry = repo
+        .read_tree(&commit.tree)
+        .unwrap()
+        .entries
+        .get(0)
+        .unwrap()
+        .unwrap();
     (entry.raw_hash, entry.normalize.unwrap())
 }
 
@@ -2138,8 +2144,9 @@ fn pb15_finalized_partial_blocks_below_retry_limit_and_settles_at_limit() {
         let repo = Repository::open(dir.path()).unwrap();
         let parent = repo.head_commit_hash().unwrap().unwrap();
         let previous = repo.read_commit(&parent).unwrap();
-        let mut tree = repo.read_tree(&previous.tree).unwrap();
-        let entry = &mut tree.entries[0];
+        let tree = repo.read_tree(&previous.tree).unwrap();
+        let mut entries = tree.entries.to_vec().unwrap();
+        let entry = &mut entries[0];
         let raw = entry.raw_hash.clone();
         let normalize = entry.normalize.as_mut().unwrap();
         let store = ObjectStore::new(kio_dir(&dir));
@@ -2176,7 +2183,7 @@ fn pb15_finalized_partial_blocks_below_retry_limit_and_settles_at_limit() {
         .join("manifest.json");
         fs::write(&projection, &bytes).unwrap();
         let staging = prune_staging(&dir, &raw, &normalize.tool_profile_hash, true);
-        let tree = build_tree(tree.entries).unwrap();
+        let tree = build_tree(entries).unwrap();
         let (tree_hash, _) = store
             .write_json(ObjectKind::Tree, &serde_json::to_value(tree).unwrap())
             .unwrap();
@@ -2321,8 +2328,9 @@ fn historical_partial_closure_fixture(unrelated_shallow: bool) {
     let store = ObjectStore::new(kio_dir(&dir));
     let parent = repo.head_commit_hash().unwrap().unwrap();
     let previous = repo.read_commit(&parent).unwrap();
-    let mut tree = repo.read_tree(&previous.tree).unwrap();
-    let normalize = tree.entries[0].normalize.as_mut().unwrap();
+    let tree = repo.read_tree(&previous.tree).unwrap();
+    let mut tree_entries = tree.entries.to_vec().unwrap();
+    let normalize = tree_entries[0].normalize.as_mut().unwrap();
     let mut manifest: Value = serde_json::from_slice(
         &store
             .read_content_object_bytes(
@@ -2379,7 +2387,7 @@ fn historical_partial_closure_fixture(unrelated_shallow: bool) {
     )
     .join("manifest.json");
     fs::write(projection, &historical_bytes).unwrap();
-    let tree = build_tree(tree.entries).unwrap();
+    let tree = build_tree(tree_entries).unwrap();
     let (tree_hash, _) = store
         .write_json(ObjectKind::Tree, &serde_json::to_value(tree).unwrap())
         .unwrap();
@@ -2776,8 +2784,9 @@ fn point_in_time_rejects_forged_pinned_manifest_bytes() {
     let normalize = tree
         .entries
         .iter()
+        .map(Result::unwrap)
         .find(|entry| entry.raw_hash == pointer["raw_hash"].as_str().unwrap())
-        .and_then(|entry| entry.normalize.as_ref())
+        .and_then(|entry| entry.normalize)
         .unwrap();
     let store = ObjectStore::new(kio_dir(&dir));
     let manifest_path = store
@@ -2805,8 +2814,9 @@ fn point_in_time_rejects_missing_pinned_normalized_unit() {
     let normalize = tree
         .entries
         .iter()
+        .map(Result::unwrap)
         .find(|entry| entry.raw_hash == pointer["raw_hash"].as_str().unwrap())
-        .and_then(|entry| entry.normalize.as_ref())
+        .and_then(|entry| entry.normalize)
         .unwrap();
     let store = ObjectStore::new(kio_dir(&dir));
     let manifest_bytes = store
@@ -2849,8 +2859,9 @@ fn point_in_time_rejects_forged_pinned_normalized_unit_bytes() {
     let normalize = tree
         .entries
         .iter()
+        .map(Result::unwrap)
         .find(|entry| entry.raw_hash == pointer["raw_hash"].as_str().unwrap())
-        .and_then(|entry| entry.normalize.as_ref())
+        .and_then(|entry| entry.normalize)
         .unwrap();
     let store = ObjectStore::new(kio_dir(&dir));
     let manifest_bytes = store
@@ -3719,7 +3730,7 @@ fn pb48_pb49_manifest_missing_resolves_via_resurrection_link_after_reingest() {
 /// PB42 (open/view side): when the same raw_hash is duplicate-placed in a
 /// commit's tree under two different `tool_profile_hash` bindings, selection
 /// must bind to the pointer's own `tool_profile_hash` — not to whichever
-/// entry a naive `tree.entries.iter().find(...)` happens to reach first.
+/// entry a naive `tree.entries.find(...)` happens to reach first.
 /// The synthetic alias entry here is a UTF-8-byte-order-earlier path
 /// (`a-alias.md` < `evidence.md`) with a DIFFERENT `tool_profile_hash`/`gen`
 /// than the pointer's own: before PB42's fix, `resolve_pointer_for_cli`
@@ -3738,6 +3749,7 @@ fn pb42_open_view_side_binds_to_pointer_tool_profile_hash_not_first_raw_hash_mat
     let real_entry = tree
         .entries
         .iter()
+        .map(Result::unwrap)
         .find(|entry| entry.raw_hash == pointer["raw_hash"].as_str().unwrap())
         .unwrap()
         .clone();
@@ -3756,7 +3768,7 @@ fn pb42_open_view_side_binds_to_pointer_tool_profile_hash_not_first_raw_hash_mat
     alias_entry.normalize = Some(alias_normalize);
     assert!(alias_entry.path.as_bytes() < real_entry.path.as_bytes());
 
-    let mut entries = tree.entries.clone();
+    let mut entries = tree.entries.to_vec().unwrap();
     entries.push(alias_entry);
     let new_tree = build_tree(entries).unwrap();
     let store = ObjectStore::new(kio_dir(&dir));

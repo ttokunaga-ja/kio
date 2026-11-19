@@ -1016,12 +1016,13 @@ impl GcSweepSession {
         let captured_name = format!("{}-{raw}-captured", marker.sweep_id);
         crate::platform::retire_candidate_tree(
             tree_hash,
+            Self::committed_tree_size(marker, tree_hash)?,
             raw,
             &d,
             &archive_dir,
             &quarantine,
             &captured_name,
-            |bytes| self.validate_committed_tree_bytes(marker, tree_hash, bytes),
+            |observation| self.validate_committed_tree_observation(marker, tree_hash, observation),
             || self.require_active_marker(marker).map(|_| ()),
             || {
                 self.wait_at_gc_pre_quarantine_barrier();
@@ -1136,14 +1137,18 @@ impl GcSweepSession {
                 None => false,
                 Some(a) => match open_optional_dir(&a, &raw[2..4])? {
                     None => false,
-                    Some(dir) => match read_cas_regular_observed(
+                    Some(dir) => match read_cas_tree_observed(
                         &self.reads,
                         &dir,
                         raw,
-                        MAX_TREE_OBJECT_BYTES,
+                        Self::committed_tree_size(marker, tree_hash)?,
                     ) {
-                        Ok((bytes, _)) => {
-                            self.validate_committed_tree_bytes(marker, tree_hash, &bytes)?;
+                        Ok((_, observation)) => {
+                            self.validate_committed_tree_observation(
+                                marker,
+                                tree_hash,
+                                &observation,
+                            )?;
                             true
                         }
                         Err(error) if is_io_not_found(&error) => false,
@@ -1171,7 +1176,10 @@ impl GcSweepSession {
                         archives,
                         &archive,
                         &format!("{}-{raw}-captured", marker.sweep_id),
-                        |bytes| self.validate_committed_tree_bytes(marker, tree_hash, bytes),
+                        Self::committed_tree_size(marker, tree_hash)?,
+                        |observation| {
+                            self.validate_committed_tree_observation(marker, tree_hash, observation)
+                        },
                     )?,
                     None => (false, false),
                 }
@@ -1185,22 +1193,28 @@ impl GcSweepSession {
         }
         Ok((any_missing, all_missing))
     }
-    fn validate_committed_tree_bytes(
-        &self,
-        marker: &GcInProgressMarker,
-        tree_hash: &str,
-        bytes: &[u8],
-    ) -> Result<()> {
-        let expected = marker
+    fn committed_tree_size(marker: &GcInProgressMarker, tree_hash: &str) -> Result<u64> {
+        marker
             .candidates
             .iter()
             .find(|candidate| candidate.tree_hash == tree_hash)
             .map(|candidate| candidate.size_bytes)
-            .ok_or_else(|| corrupt("marker tree has no candidate size"))?;
-        if bytes.len() as u64 != expected {
+            .ok_or_else(|| corrupt("marker tree has no candidate size"))
+    }
+    fn validate_committed_tree_observation(
+        &self,
+        marker: &GcInProgressMarker,
+        tree_hash: &str,
+        observation: &FileObservation,
+    ) -> Result<()> {
+        let expected = Self::committed_tree_size(marker, tree_hash)?;
+        if observation.state.len != expected {
             return Err(corrupt("GC tree length differs from frozen marker"));
         }
-        validate_gc_tree_bytes(bytes, tree_hash)
+        if observation.digest != tree_hash {
+            return Err(corrupt("tree hash changed before removal"));
+        }
+        Ok(())
     }
     /// Prove, using only the retained `.kio` capability, that the public index
     /// leaf names the latest durable state recorded by the marker: the final

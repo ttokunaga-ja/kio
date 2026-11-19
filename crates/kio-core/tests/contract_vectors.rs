@@ -98,11 +98,14 @@ fn ct_hash_006_007_008_hash_shape_round_trip_and_key_order() {
     let repo = Repository::init(temp.path()).unwrap();
     let store = ObjectStore::new(repo.kio_dir());
     let (stored_hash, stored_bytes) = store.write_json(ObjectKind::Tree, &a).unwrap();
-    let read = store.read_by_hash(&stored_hash).unwrap();
-    assert_eq!(hash_bytes(&read.bytes), stored_hash);
-    assert_eq!(read.bytes, stored_bytes);
+    let mut read = Vec::new();
+    store
+        .copy_object_to(ObjectKind::Tree, &stored_hash, &mut read)
+        .unwrap();
+    assert_eq!(hash_bytes(&read), stored_hash);
+    assert_eq!(read, stored_bytes);
 
-    let stored = String::from_utf8(read.bytes).unwrap();
+    let stored = String::from_utf8(read).unwrap();
     assert!(!stored.contains("tree_hash"));
     assert!(!stored.contains("tree_id"));
     assert!(!stored.contains("commit_hash"));
@@ -116,8 +119,8 @@ fn ct_tree_001_002_003_sort_duplicate_and_path_validation() {
         TreeEntry::raw_file("notes.md", RAW_NOTES).unwrap(),
     ])
     .unwrap();
-    assert_eq!(tree.entries[0].path, "notes.md");
-    assert_eq!(tree.entries[1].path, "report.pdf");
+    assert_eq!(tree.entries.get(0).unwrap().unwrap().path, "notes.md");
+    assert_eq!(tree.entries.get(1).unwrap().unwrap().path, "report.pdf");
 
     let duplicate = build_tree(vec![
         TreeEntry::raw_file("notes.md", RAW_NOTES).unwrap(),
@@ -263,7 +266,7 @@ fn ct_scope_001_snapshot_scans_direct_children_only() {
 
     let tree = repo.build_working_tree(false).unwrap().tree;
     assert_eq!(tree.entries.len(), 1);
-    assert_eq!(tree.entries[0].path, "a.pdf");
+    assert_eq!(tree.entries.get(0).unwrap().unwrap().path, "a.pdf");
 }
 
 #[test]

@@ -27,11 +27,13 @@ pub use control::{
 };
 pub mod exchange;
 mod observed_read;
+#[cfg(windows)]
+pub(crate) use observed_read::observe_tree_handle;
 use observed_read::read_user_regular_observed;
-use observed_read::{
-    read_accounted_observed, read_cas_accounted_observed, read_required_accounted_observed,
+pub(crate) use observed_read::{
+    observe_cas_regular, read_cas_tree_observed, read_regular_observed, read_tree_archive_observed,
 };
-pub(crate) use observed_read::{read_cas_regular_observed, read_regular_observed};
+use observed_read::{read_accounted_observed, read_cas_accounted_observed};
 mod unreachable_inventory;
 #[cfg(all(test, windows))]
 #[path = "gc/windows_snapshot_state_tests.rs"]
@@ -54,10 +56,10 @@ use serde_json::json;
 
 use crate::ExitCode;
 use crate::cas::{
-    CasReadAccess, MAX_COMMIT_OBJECT_BYTES, MAX_CONTENT_OBJECT_BYTES, MAX_TREE_OBJECT_BYTES,
-    canonical_json_bytes, hash_bytes, is_hash,
+    CasReadAccess, MAX_COMMIT_OBJECT_BYTES, MAX_CONTENT_OBJECT_BYTES, canonical_json_bytes,
+    hash_bytes, is_hash,
 };
-use crate::dag::{CommitObject, CommitType, MAX_TREE_ENTRIES, TreeObject};
+use crate::dag::{CommitObject, CommitType, TreeObject};
 use crate::error::{KioError, Result};
 use crate::schema::{SchemaKind, validate_json_schema};
 use crate::scope::{
@@ -486,13 +488,8 @@ fn inventory_final_shallow_receipts(planner: &GcPlanner) -> Result<FinalShallowI
                             format!("dir:objects/trees/{}/{}", &raw[..2], &raw[2..4]),
                             &mut observations,
                         )?;
-                        match read_cas_regular_observed(
-                            &planner.reads,
-                            &second,
-                            raw,
-                            MAX_TREE_OBJECT_BYTES,
-                        ) {
-                            Ok((_, observation)) => {
+                        match observe_cas_regular(&planner.reads, &second, raw, u64::MAX) {
+                            Ok(observation) => {
                                 insert_observation(
                                     &mut observations,
                                     format!("tree/{}/{}/{}", &raw[..2], &raw[2..4], raw),
@@ -807,16 +804,6 @@ fn phase_rank(phase: &GcSweepPhase) -> u8 {
         GcSweepPhase::Sweeping => 2,
         GcSweepPhase::Finalizing => 3,
     }
-}
-
-fn validate_gc_tree_bytes(bytes: &[u8], expected_hash: &str) -> Result<()> {
-    if bytes.is_empty() || hash_bytes(bytes) != expected_hash {
-        return Err(corrupt("tree hash changed before removal"));
-    }
-    let tree: TreeObject =
-        serde_json::from_slice(bytes).map_err(|_| corrupt("invalid tree object before removal"))?;
-    tree.validate()
-        .map_err(|_| corrupt("invalid tree object before removal"))
 }
 
 #[derive(Clone, Copy)]
@@ -2921,8 +2908,8 @@ mod tests {
     }
 
     #[test]
-    fn marker_rejects_an_estimated_byte_count_above_the_planner_bound() {
-        let marker = GcInProgressMarker {
+    fn marker_binds_aggregate_bytes_without_a_per_tree_cap() {
+        let mut marker = GcInProgressMarker {
             version: 1,
             sweep_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
             started_at: "2026-01-01T00:00:00Z".into(),
@@ -2942,6 +2929,21 @@ mod tests {
         };
         assert!(marker.validate().is_err());
         assert!(marker.canonical_bytes().is_err());
+
+        // One tree may exceed the former 16 MiB cap while the frozen sum
+        // remains within the existing aggregate sweep budget.
+        let size = 17 * 1024 * 1024;
+        let tree = format!("sha256:{}", "a".repeat(64));
+        marker.candidates = vec![GcMarkerCandidate {
+            commit_hash: format!("sha256:{}", "b".repeat(64)),
+            tree_hash: tree.clone(),
+            size_bytes: size,
+        }];
+        marker.trees = vec![tree];
+        marker.estimated_bytes = size;
+        assert!(marker.validate().is_ok());
+        marker.estimated_bytes += 1;
+        assert!(marker.validate().is_err());
     }
 
     #[test]

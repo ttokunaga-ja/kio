@@ -104,9 +104,9 @@ use kio_pipeline::scan::build_planned_child_scan_preview;
 use kio_pipeline::scan::discover_managed_child_scopes_page;
 use kio_pipeline::scan::managed_scan_policy_allows_file;
 use kio_pipeline::scan::read_bound_verified_scan_input;
-use kio_pipeline::task::TaskStatus;
 use kio_pipeline::task::TaskStore;
 use kio_pipeline::task::TaskType;
+use kio_pipeline::task::{TaskDescriptor, TaskStatus};
 use kio_pipeline::unsupported::UnsupportedInputDisposition;
 use kio_pipeline::unsupported::UnsupportedInputStore;
 use serde_json::json;
@@ -1459,7 +1459,7 @@ pub(crate) fn compute_index_status(
             }
         };
         let first_unsupported = unsupported_inputs.len();
-        let mut current_tree = None;
+        let mut current_inputs = BTreeMap::new();
         // R23-20: `scope.scope_path` is the `.kio` directory; `Repository::open`
         // wants the scope ROOT (it appends `.kio` itself), so this uses the
         // separately-carried `repo_root` field.
@@ -1472,9 +1472,9 @@ pub(crate) fn compute_index_status(
                 // unreadable scope must report exactly ONE error here, not one
                 // per output field (two independent re-reads of the identical
                 // failing store would double-count it).
-                match current_dispositions(&repo) {
-                    Ok((tree, dispositions)) => {
-                        current_tree = tree;
+                match current_dispositions(&repo, &tasks) {
+                    Ok((bindings, dispositions)) => {
+                        current_inputs = bindings;
                         let (office_unavailable, unsupported): (Vec<_>, Vec<_>) =
                             dispositions.into_iter().partition(|disposition| {
                                 disposition.reason == OFFICE_CONVERSION_UNAVAILABLE_REASON
@@ -1583,15 +1583,6 @@ pub(crate) fn compute_index_status(
             .iter()
             .map(|row| row.raw_hash.as_str())
             .collect::<BTreeSet<_>>();
-        // The raw match covers a rename. A supported alias still live at its
-        // own path remains eligible, including raw-only inputs awaiting OCR.
-        let current_inputs = current_tree
-            .as_ref()
-            .filter(|_| !unsupported_raws.is_empty())
-            .into_iter()
-            .flat_map(|tree| &tree.entries)
-            .map(|entry| (entry.path.as_str(), entry.raw_hash.as_str()))
-            .collect::<BTreeSet<_>>();
         for task in tasks {
             if !matches!(task.task_type, TaskType::Markdownize | TaskType::Embedding) {
                 continue;
@@ -1607,8 +1598,7 @@ pub(crate) fn compute_index_status(
             }
             if task.task_type == TaskType::Markdownize
                 && (unsupported_paths.contains(task.input_path.as_str())
-                    || !current_inputs
-                        .contains(&(task.input_path.as_str(), task.input_hash.as_str()))
+                    || current_inputs.get(&task.input_path) != Some(&task.input_hash)
                         && unsupported_raws.contains(task.input_hash.as_str()))
             {
                 continue;
@@ -1743,8 +1733,38 @@ pub(crate) fn read_stable_head<T>(
 
 fn current_dispositions(
     repo: &Repository,
-) -> Result<(Option<TreeObject>, Vec<UnsupportedInputDisposition>)> {
-    read_stable_head(repo, |head| dispositions_at_head(repo, head))
+    tasks: &[TaskDescriptor],
+) -> Result<(BTreeMap<String, String>, Vec<UnsupportedInputDisposition>)> {
+    read_stable_head(repo, |head| {
+        let (tree, dispositions) = dispositions_at_head(repo, head)?;
+        let raw_hashes: BTreeSet<_> = dispositions
+            .iter()
+            .filter(|row| row.is_unsupported())
+            .map(|row| row.raw_hash.as_str())
+            .collect();
+        // Only tasks that share an unsupported raw can be mistaken for a
+        // rename. Keep the live bindings of those tasks, including OCR waits.
+        let task_paths: BTreeSet<_> = tasks
+            .iter()
+            .filter(|task| {
+                task.task_type == TaskType::Markdownize
+                    && raw_hashes.contains(task.input_hash.as_str())
+            })
+            .map(|task| task.input_path.as_str())
+            .collect();
+        let mut bindings = BTreeMap::new();
+        if let Some(tree) = tree.filter(|_| !task_paths.is_empty()) {
+            for entry in &tree.entries {
+                let entry = entry?;
+                if task_paths.contains(entry.path.as_str())
+                    && raw_hashes.contains(entry.raw_hash.as_str())
+                {
+                    bindings.insert(entry.path, entry.raw_hash);
+                }
+            }
+        }
+        Ok((bindings, dispositions))
+    })
 }
 
 /// Unsupported paths must be raw-only in the selected tree.
@@ -1759,21 +1779,11 @@ fn dispositions_at_head(
     };
     let commit = repo.read_commit(head)?;
     let tree = repo.read_tree(&commit.tree)?;
-    let normalized_paths = tree
-        .entries
-        .iter()
-        .filter(|entry| entry.normalize.is_some())
-        .map(|entry| entry.path.as_str())
-        .collect::<BTreeSet<_>>();
     let dispositions = store
         .with_published_tree(Some(&tree))
-        .published_by_path()
         .map_err(pipeline_to_kio)?
-        .into_iter()
-        .filter(|disposition| {
-            !disposition.is_unsupported() || !normalized_paths.contains(disposition.path.as_str())
-        })
-        .collect();
+        .published_by_path()
+        .map_err(pipeline_to_kio)?;
     Ok((Some(tree), dispositions))
 }
 
@@ -1795,20 +1805,24 @@ fn verify_snapshot_inputs(
     preview: &ScanPreview,
     classified_raws: &BTreeMap<String, String>,
 ) -> Result<()> {
-    let scanned_paths = preview
+    let mut scanned_paths = preview
         .candidates
         .iter()
         .filter(|entry| !entry.ignored && entry.media_type != "inode/directory")
         .map(|entry| entry.input_path.as_str());
-    let captured_paths = tree.entries.iter().map(|entry| entry.path.as_str());
+    let mut captured = tree.entries.iter();
     // Both the bound scan and the canonical tree sort by path bytes.
-    if !scanned_paths.eq(captured_paths) {
-        return Err(pipeline_to_kio(kio_pipeline::PipelineError::contract(
-            "KIO-E-SCAN-INPUT-CHANGED-001",
-            "input names changed after scanning; run indexing again",
-        )));
-    }
-    for entry in &tree.entries {
+    loop {
+        let entry = match (scanned_paths.next(), captured.next().transpose()?) {
+            (None, None) => return Ok(()),
+            (Some(path), Some(entry)) if path == entry.path => entry,
+            _ => {
+                return Err(pipeline_to_kio(kio_pipeline::PipelineError::contract(
+                    "KIO-E-SCAN-INPUT-CHANGED-001",
+                    "input names changed after scanning; run indexing again",
+                )));
+            }
+        };
         if classified_raws
             .get(&entry.path)
             .is_some_and(|raw_hash| raw_hash != &entry.raw_hash)
@@ -1822,7 +1836,6 @@ fn verify_snapshot_inputs(
             )));
         }
     }
-    Ok(())
 }
 
 pub(crate) fn run_reindex(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<CommandResponse> {
@@ -1942,6 +1955,7 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
     // generation. A post-barrier reindex must not partially republish derived
     // state for entries encountered before the purged target.
     for entry in &tree.entries {
+        let entry = entry?;
         ensure_raw_ingest_allowed(&repo, &entry.raw_hash)?;
     }
     let closing_preview = build_repository_scan_preview(
@@ -1973,6 +1987,7 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
     // gen's cached chunks) and is recorded; healthy documents still re-normalize.
     let mut reindex_skipped = Vec::<SkippedUnit>::new();
     for entry in &tree.entries {
+        let entry = entry?;
         if classified.unsupported_paths.contains(&entry.path) {
             continue;
         }

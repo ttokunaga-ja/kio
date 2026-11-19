@@ -142,14 +142,17 @@ pub fn bind_renamed_normalize(root: &std::path::Path, old_name: &str, new_name: 
         .unwrap();
     let tree = repo.read_tree(&head.tree).unwrap();
     assert!(
-        tree.entries
-            .iter()
-            .any(|entry| entry.path == old_name && entry.normalize.is_some())
+        tree.find_entry(old_name)
+            .unwrap()
+            .unwrap()
+            .normalize
+            .is_some()
     );
     std::fs::rename(root.join(old_name), root.join(new_name)).unwrap();
     let references = tree
         .entries
-        .into_iter()
+        .iter()
+        .map(Result::unwrap)
         .filter_map(|entry| {
             let path = if entry.path == old_name {
                 new_name.to_owned()

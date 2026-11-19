@@ -193,6 +193,7 @@ pub fn plan_search_history(
             let snapshot = reader.snapshot(snapshot_commit)?;
             let mut live_by_key = BTreeMap::<SearchContentKey, SearchHistoryBinding>::new();
             for entry in &snapshot.tree.entries {
+                let entry = entry?;
                 let Some(normalize) = &entry.normalize else {
                     continue;
                 };
@@ -280,25 +281,21 @@ fn plan_all_history(graph: &LinearHistory) -> Result<Vec<SearchHistoryBinding>> 
     // TreeBinding equality includes path, raw identity, and the exact persisted
     // normalize value.  Repeated appearances in later commits therefore collapse
     // before choosing the canonical ancestor-most introduction.
-    let distinct = graph
-        .bindings()
-        .into_iter()
-        .map(|appearance| appearance.binding)
-        .filter(|binding| binding.normalize.is_some())
-        .collect::<BTreeSet<_>>();
-    let live_bindings = graph
+    let mut distinct = BTreeSet::new();
+    for appearance in graph.bindings()? {
+        let binding = appearance?.binding;
+        if binding.normalize.is_some() {
+            distinct.insert(binding);
+        }
+    }
+    let snapshot = graph
         .node(graph.start_commit())
-        .ok_or_else(|| KioError::schema("history graph is missing its snapshot commit"))?
-        .tree
-        .entries
-        .iter()
-        .map(TreeBinding::from)
-        .collect::<BTreeSet<_>>();
+        .ok_or_else(|| KioError::schema("history graph is missing its snapshot commit"))?;
 
     distinct
         .into_iter()
         .map(|binding| {
-            let introduction = graph.canonical_introduction(&binding).ok_or_else(|| {
+            let introduction = graph.canonical_introduction(&binding)?.ok_or_else(|| {
                 KioError::schema("historical binding has no canonical introduction commit")
             })?;
             let normalize = binding
@@ -312,8 +309,11 @@ fn plan_all_history(graph: &LinearHistory) -> Result<Vec<SearchHistoryBinding>> 
                 manifest_hash: normalize.manifest_hash.clone(),
                 path_at_commit: binding.path.clone(),
                 pointer_commit: introduction.commit_hash,
-                current_paths: graph.snapshot_paths_for_raw(&binding.raw_hash),
-                is_live: live_bindings.contains(&binding),
+                current_paths: graph.snapshot_paths_for_raw(&binding.raw_hash)?,
+                is_live: snapshot
+                    .tree
+                    .entries
+                    .any(|entry| TreeBinding::from(entry) == binding)?,
             })
         })
         .collect()
@@ -328,6 +328,7 @@ fn plan_include_deleted(history: &LinearHistory) -> Result<Vec<SearchHistoryBind
     // live paths share it, the contract selects the UTF-8-bytewise-smallest path.
     let mut live_by_key = BTreeMap::<SearchContentKey, SearchHistoryBinding>::new();
     for entry in &snapshot.tree.entries {
+        let entry = entry?;
         let Some(normalize) = &entry.normalize else {
             continue;
         };
@@ -359,8 +360,8 @@ fn plan_include_deleted(history: &LinearHistory) -> Result<Vec<SearchHistoryBind
 
     let live_keys = live_by_key.keys().cloned().collect::<BTreeSet<_>>();
     let mut planned = live_by_key.into_values().collect::<Vec<_>>();
-    for deleted in history.final_deleted_bindings() {
-        let Some(deleted) = searchable_final_deleted_binding(history, deleted) else {
+    for deleted in history.final_deleted_bindings()? {
+        let Some(deleted) = searchable_final_deleted_binding(history, deleted)? else {
             continue;
         };
         let normalize = deleted
@@ -400,25 +401,24 @@ fn plan_include_deleted(history: &LinearHistory) -> Result<Vec<SearchHistoryBind
 fn searchable_final_deleted_binding(
     history: &LinearHistory,
     deleted: HistoryBinding,
-) -> Option<HistoryBinding> {
+) -> Result<Option<HistoryBinding>> {
     if deleted.binding.normalize.is_some() {
-        return Some(deleted);
+        return Ok(Some(deleted));
     }
-    history.nodes_in_visit_order().find_map(|node| {
-        node.tree
-            .entries
-            .iter()
-            .find(|entry| {
-                entry.path == deleted.binding.path
-                    && entry.raw_hash == deleted.binding.raw_hash
-                    && entry.normalize.is_some()
-            })
-            .map(|entry| HistoryBinding {
+    for node in history.nodes_in_visit_order() {
+        if let Some(entry) = node.tree.entries.find(|entry| {
+            entry.path == deleted.binding.path
+                && entry.raw_hash == deleted.binding.raw_hash
+                && entry.normalize.is_some()
+        })? {
+            return Ok(Some(HistoryBinding {
                 commit_hash: node.commit_hash.clone(),
                 tree_hash: node.commit.tree.clone(),
-                binding: TreeBinding::from(entry),
-            })
-    })
+                binding: TreeBinding::from(&entry),
+            }));
+        }
+    }
+    Ok(None)
 }
 
 fn sort_bindings(bindings: &mut [SearchHistoryBinding]) {

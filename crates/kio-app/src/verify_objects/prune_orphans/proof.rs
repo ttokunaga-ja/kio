@@ -286,6 +286,7 @@ pub(super) fn preflight(repo: &Repository, scope: &BoundScope) -> Checked<Prefli
         let commit = checked(repo.read_commit(&head))?;
         let tree = checked(repo.read_tree(&commit.tree))?;
         for entry in &tree.entries {
+            let entry = checked(entry)?;
             let Some(reference) = &entry.normalize else {
                 continue;
             };
@@ -589,12 +590,7 @@ impl Proof {
             queue.extend(commit.parent.iter().cloned());
             match repo.read_tree(&commit.tree) {
                 Ok(tree) => {
-                    budget.bytes(
-                        checked(canonical_json_bytes(
-                            &serde_json::to_value(&tree).map_err(Blocker::unsafe_state)?,
-                        ))?
-                        .len() as u64,
-                    )?;
+                    budget.bytes(checked(kio_core::dag::tree_json_size(&tree))?)?;
                     if shallow.contains_key(&hash) {
                         return Err(Blocker::unsafe_state("shallow receipt coexists with tree"));
                     }
@@ -606,14 +602,14 @@ impl Proof {
             }
             commits.insert(hash, commit);
         }
-        let explained_authority = explained_historical_manifests(
+        let explained_authority = checked(explained_historical_manifests(
             &purge,
             &commits,
             &trees,
             &reachable,
             head.as_deref(),
             &now,
-        );
+        ))?;
         let mut verifier = State::default();
         let mut explained_missing_manifests = BTreeSet::new();
         for commit in commits.values() {
@@ -621,6 +617,7 @@ impl Proof {
                 continue;
             };
             for entry in &tree.entries {
+                let entry = checked(entry)?;
                 let Some(reference) = &entry.normalize else {
                     continue;
                 };
