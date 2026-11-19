@@ -948,6 +948,7 @@ fn resource_limit(observed: usize) -> KioError {
         limit: None,
         observed: u64::try_from(observed).ok(),
         resource_tier: None,
+        page_progress: None,
     }
     .into_error("local result cannot fit in process memory")
 }

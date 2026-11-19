@@ -1648,6 +1648,7 @@ fn read_bound_scan_input(
             limit: bounded.then_some(max_bytes),
             observed: Some(observed),
             resource_tier: tier,
+            page_progress: None,
         })
     };
     validate_direct_child_name(input_path)?;

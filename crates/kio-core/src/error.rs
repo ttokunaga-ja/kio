@@ -12,6 +12,20 @@ pub struct ResourceLimit {
     pub limit: Option<u64>,
     pub observed: Option<u64>,
     pub resource_tier: Option<ResourceTier>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_progress: Option<Box<PageExtractionProgress>>,
+}
+
+/// Inclusive one-based prefix endpoints. Zero denotes an empty prefix.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PageExtractionProgress {
+    pub total_pages: u64,
+    pub extracted_through: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged_through: Option<u64>,
+    pub next_page: Option<u64>,
+    pub retry: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -39,6 +53,19 @@ impl ResourceLimit {
         !self.stage.is_empty()
             && self.stage.len() <= 256
             && !self.stage.chars().any(char::is_control)
+            && self.page_progress.as_ref().is_none_or(|progress| {
+                progress.extracted_through <= progress.total_pages
+                    && progress
+                        .staged_through
+                        .is_none_or(|end| end <= progress.extracted_through)
+                    && progress.next_page
+                        == (progress.extracted_through < progress.total_pages)
+                            .then(|| progress.extracted_through + 1)
+                    && matches!(
+                        progress.retry.as_str(),
+                        "index --resource-tier large" | "index"
+                    )
+            })
     }
 
     #[must_use]
@@ -267,6 +294,7 @@ impl<T> IoResultExt<T> for std::io::Result<T> {
                     limit: None,
                     observed: None,
                     resource_tier: None,
+                    page_progress: None,
                 }
                 .into_error(err.to_string())
                 .with_context_field("path", json!(path))
@@ -301,6 +329,7 @@ mod resource_limit_tests {
             limit: None,
             observed: Some(42),
             resource_tier: None,
+            page_progress: None,
         };
         let error = descriptor.into_error("insufficient memory");
         assert_eq!(error.resource_limit().unwrap().resource, Resource::Memory);

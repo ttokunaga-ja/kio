@@ -1758,6 +1758,7 @@ mod tests {
             limit: Some(10),
             observed: Some(11),
             resource_tier: Some(kio_core::error::ResourceTier::Standard),
+            page_progress: None,
         });
         let held = task.clone();
         assert!(!task.resume_after_resource_change(|_| false));
@@ -1794,6 +1795,7 @@ mod tests {
             limit: None,
             observed: Some(1024),
             resource_tier: None,
+            page_progress: None,
         });
         assert!(validate_task_descriptor_fields(Path::new("."), &task).is_ok());
         let held = task.clone();

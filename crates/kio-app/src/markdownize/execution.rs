@@ -2593,6 +2593,7 @@ mod resource_failure_tests {
                 limit: None,
                 observed: Some(1024),
                 resource_tier: None,
+                page_progress: None,
             };
             let failure =
                 task_failure_from_adapter(kio_adapter::AdapterError::ResourceLimit(limit.clone()));

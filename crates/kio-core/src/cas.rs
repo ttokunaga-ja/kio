@@ -2204,6 +2204,7 @@ fn object_size_error(kind: ObjectKind, limit: u64, actual: u64) -> KioError {
             limit: Some(limit),
             observed: Some(actual),
             resource_tier: None,
+            page_progress: None,
         }
         .into_error("raw archive byte budget exceeded");
     }

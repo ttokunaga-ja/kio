@@ -213,6 +213,7 @@ mod adapter_error_tests {
             limit: Some(10),
             observed: Some(11),
             resource_tier: Some(kio_core::error::ResourceTier::Standard),
+            page_progress: None,
         };
         let error = AdapterError::ResourceLimit(limit.clone());
         assert_eq!(error.error_code(), "KIO-E-RESOURCE-LIMIT-001");

@@ -402,6 +402,7 @@ fn resource_limit(resource: kio_core::error::Resource) -> kio_core::error::Resou
         limit: None,
         observed: None,
         resource_tier: None,
+        page_progress: None,
     }
 }
 

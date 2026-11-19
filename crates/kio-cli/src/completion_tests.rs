@@ -34,6 +34,7 @@ fn resource_limit_cli_contract_keeps_exit_three_and_exact_context() {
         limit: None,
         observed: Some(42),
         resource_tier: None,
+        page_progress: None,
     }
     .into_error("storage exhausted");
     assert_eq!(error.exit_code().code(), 3);

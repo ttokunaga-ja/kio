@@ -75,11 +75,12 @@ pub fn deterministic_markdown_profile_value() -> serde_json::Value {
     // 1.3.0 (2026-07-23, same day): multi-page markdown follows the graph
     // decoder's page authority (ObjStm-aware) — see the prepare 1.2.0 note.
     // 1.4.0: use page-local fonts and the resource-tiered PDF decoder.
+    // 1.5.0: follow active xref and Kids order.
     json!({
         "adapter_kind": "markdownize",
         "adapter_role": "text",
         "model_or_tool_family": "kio-deterministic-text",
-        "model_version_pin": "1.4.0",
+        "model_version_pin": "1.5.0",
         "output_schema": "kio-markdown-v1",
         "runtime_kind": "local",
         "spec_version": 1
@@ -93,11 +94,12 @@ pub fn deterministic_prepare_profile_value() -> serde_json::Value {
     // truncated multi-page TeX PDFs to one prepared unit. Unit cardinality
     // changes => prepare identity moves (07 §9).
     // 1.3.0: use resource-tiered PDF extraction and fail empty on unsupported filters.
+    // 1.4.0: follow active xref and Kids order.
     json!({
         "adapter_kind": "prepare",
         "adapter_role": "text",
         "model_or_tool_family": "kio-deterministic-prepare",
-        "model_version_pin": "1.3.0",
+        "model_version_pin": "1.4.0",
         "runtime_kind": "local",
         "spec_version": 1
     })
@@ -174,7 +176,7 @@ pub fn markdownize_converted_office(
     unit_kind: UnitKind,
 ) -> Result<MarkdownizeResponse> {
     let source = SourceDocument::Pdf {
-        pages: PdfPages::open(converted_pdf, ResourceTier::Standard)?,
+        pages: Box::new(PdfPages::open(converted_pdf, ResourceTier::Standard)?),
         office_kind: Some(unit_kind),
     };
     markdownize_with_source(request, Some(source))
@@ -183,7 +185,7 @@ pub fn markdownize_converted_office(
 enum SourceDocument<'a> {
     Text(String),
     Pdf {
-        pages: PdfPages<'a>,
+        pages: Box<PdfPages<'a>>,
         office_kind: Option<UnitKind>,
     },
     /// XLSX worksheets, already rendered to Markdown by
@@ -208,7 +210,7 @@ fn source_document_from_verified_bytes<'a>(
     }
     if request.media_type == "application/pdf" {
         return Ok(SourceDocument::Pdf {
-            pages: PdfPages::open(bytes, ResourceTier::Standard)?,
+            pages: Box::new(PdfPages::open(bytes, ResourceTier::Standard)?),
             office_kind: None,
         });
     }

@@ -414,3 +414,66 @@ fn flate_02_objstm_two_byte_codes_index_offline() {
     assert_search_hit(&dir, "twobyte", "paper.pdf");
     assert_search_hit(&dir, "harvest", "paper.pdf");
 }
+
+#[test]
+fn p1_review_cli_reports_pdf_page_ranges_and_resumes() {
+    let dir = canonical_tempdir();
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    pdf.extend(obj(1, b"<< /Type /Page >>"));
+    pdf.extend(obj(2, b"<< /Type /Page /Contents 4 0 R >>"));
+    pdf.extend(obj(3, b"<< /Type /Page /Contents 5 0 R >>"));
+    pdf.extend(stream_obj(4, "<< /Length 13 >>", b"BT (first) Tj"));
+    // Whitespace inside the literal counts toward extraction. Normalization
+    // strips trailing spaces from its first line, keeping indexing light.
+    let mut large = b"BT (large".to_vec();
+    large.resize(4 + 16 * 1024 * 1024 - 1, b' ');
+    large.extend_from_slice(b"\nx) Tj");
+    let compressed = zlib(&large);
+    pdf.extend(stream_obj(
+        5,
+        &format!("<< /Length {} /Filter /FlateDecode >>", compressed.len()),
+        &compressed,
+    ));
+    fs::write(dir.path().join("tier.pdf"), pdf).unwrap();
+    init(&dir);
+
+    let preview = json_success(&dir, &["index", "--preview"]);
+    let preview_limit = &preview["extraction_issues"][0]["resource_limit"];
+    assert_eq!(preview_limit["resource"], "unit_text", "{preview}");
+    let expected = serde_json::json!({
+        "total_pages": 3, "extracted_through": 2, "next_page": 3,
+        "retry": "index --resource-tier large"
+    });
+    assert_eq!(preview_limit["page_progress"], expected, "{preview}");
+
+    kio(&dir, &["index", "--yes", "--offline"]).assert().code(3);
+    let status = json_success(&dir, &["status"]);
+    let hold = status["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["output_ref"] == "extraction:local")
+        .unwrap();
+    let mut expected_durable = expected;
+    expected_durable["staged_through"] = 2.into();
+    assert_eq!(
+        hold["resource_limit"]["page_progress"], expected_durable,
+        "{status}"
+    );
+    assert!(gen_dirs_under(&dir.path().join(".kio/objects/normalized_units")).is_empty());
+
+    kio(
+        &dir,
+        &["index", "--yes", "--offline", "--resource-tier", "large"],
+    )
+    .assert()
+    .success();
+    let status = json_success(&dir, &["status"]);
+    assert_eq!(
+        status["paused_by_hold_reason"]["resource_limit"], 0,
+        "{status}"
+    );
+    let manifests = gen_dirs_under(&dir.path().join(".kio/objects/normalized_units"));
+    let manifest = manifest_json(&manifests[0]);
+    assert_eq!(manifest["units"].as_array().unwrap().len(), 3);
+}

@@ -147,6 +147,7 @@ type UnitWriter<'a> = dyn FnMut(&PreparedUnit, &[u8]) -> Result<()> + 'a;
 /// A producer declares its expected unit count before writing any bodies.
 /// It can then skip the durable prefix and supply the remaining units in order.
 pub struct PreparedUnitSink<'a> {
+    pub(super) durable: bool,
     pub(super) declare: &'a mut dyn FnMut(usize) -> Result<()>,
     pub(super) write: &'a mut UnitWriter<'a>,
 }
@@ -210,6 +211,7 @@ fn stage_units(
             write_record(directory, layout, &count, Publication::CreateOnly)
         }
     };
+    let mut ready_through = completed.len() as u64;
     let mut write = |unit: &PreparedUnit, bytes: &[u8]| {
         let leaf = unit_record_name(unit.order);
         if let Some(record) = read_record::<UnitRecord>(directory, &leaf, RECORD_BYTES)? {
@@ -217,6 +219,7 @@ fn stage_units(
                 return Err(stage_corrupt(directory, "staged unit identity changed"));
             }
             if record.complete {
+                ready_through = ready_through.max(unit.order + 1);
                 return Ok(());
             }
             record.stage.discard(directory)?;
@@ -242,18 +245,28 @@ fn stage_units(
             .map_err(|error| stage_error(directory, error))?;
         record.complete = true;
         write_record(directory, &leaf, &record, Publication::Upsert)?;
+        ready_through = unit.order + 1;
         directory
             .control()
             .checkpoint(kio_core::durability::DurabilityPoint::ExtractionUnitReady)
             .map_err(|error| stage_error(directory, error))
     };
-    let output = extract(
+    let result = extract(
         &completed,
         &mut PreparedUnitSink {
+            durable: true,
             declare: &mut declare,
             write: &mut write,
         },
-    )?;
+    );
+    let output = result.map_err(|mut error| {
+        if let PipelineError::ResourceLimit(limit) = &mut error
+            && let Some(progress) = &mut limit.page_progress
+        {
+            progress.staged_through = Some(ready_through);
+        }
+        error
+    })?;
     if let Some(count) = read_record::<usize>(directory, layout, 64)?
         && count != output.prepared_units.len()
     {
@@ -352,6 +365,7 @@ fn read_staged_unit(directory: &StoreDirectory, record: &UnitRecord) -> Result<V
             limit: None,
             observed: Some(size),
             resource_tier: None,
+            page_progress: None,
         })
     })?;
     file.take(MAX_CONTENT_OBJECT_BYTES + 1)
@@ -512,6 +526,7 @@ mod tests {
             limit: None,
             observed: None,
             resource_tier: None,
+            page_progress: None,
         };
         let failed = stage_units(&directory, |completed, emit| {
             assert!(completed.is_empty());

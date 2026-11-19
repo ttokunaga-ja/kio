@@ -1346,6 +1346,7 @@ fn checked_unit_size(
                 limit: Some(limits.unit_bytes),
                 observed: Some(bytes),
                 resource_tier: None,
+                page_progress: None,
             },
         ));
     }
@@ -4104,6 +4105,7 @@ mod tests {
                         limit: None,
                         observed: None,
                         resource_tier: None,
+                        page_progress: None,
                     },
                 ))
             });
@@ -4131,6 +4133,7 @@ mod tests {
             limit: None,
             observed: None,
             resource_tier: None,
+            page_progress: None,
         };
         let error = persist_normalized_instance_from_units_bound(&store, &manifest, |_| {
             Err(PipelineError::ResourceLimit(limit.clone()))

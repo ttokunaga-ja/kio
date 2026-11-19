@@ -20,6 +20,7 @@ const MAX_PROBE_TEXT_BYTES: usize = 1024 * 1024;
 /// and word gaps ≥ ~300.
 const TJ_WORD_GAP_THRESHOLD: f64 = 100.0;
 
+#[derive(Clone)]
 struct PdfObject<'a> {
     body: Cow<'a, [u8]>,
     generation: u16,
@@ -50,7 +51,7 @@ impl<'a> PdfObject<'a> {
 
     fn owned_bytes(&self) -> usize {
         match &self.body {
-            Cow::Owned(body) => body.len(),
+            Cow::Owned(body) => body.capacity(),
             Cow::Borrowed(_) => 0,
         }
     }
@@ -71,6 +72,85 @@ fn referenced_object<'a, 'pdf>(
         .filter(|object| object.generation == reference.generation)
 }
 
+#[derive(Clone, Copy)]
+enum PackedObject {
+    Member {
+        container: u32,
+        start: usize,
+        end: usize,
+    },
+    Unsupported,
+}
+
+#[derive(Default)]
+struct Objects<'a> {
+    direct: HashMap<u32, PdfObject<'a>>,
+    packed: HashMap<u32, PackedObject>,
+}
+
+impl<'a> Objects<'a> {
+    fn resolve(
+        &self,
+        reference: PdfRef,
+        budget: &mut PdfDecodeBudget,
+    ) -> Result<Option<PdfObject<'a>>> {
+        if let Some(object) = referenced_object(&self.direct, reference) {
+            budget.retain(object.owned_bytes())?;
+            return Ok(Some(object.clone()));
+        }
+        if reference.generation != 0 {
+            return Ok(None);
+        }
+        let Some(&PackedObject::Member {
+            container,
+            start,
+            end,
+        }) = self.packed.get(&reference.number)
+        else {
+            return Ok(None);
+        };
+        if !budget
+            .packed_cache
+            .as_ref()
+            .is_some_and(|(number, _)| *number == container)
+        {
+            // Release the old buffer before admitting the next expansion.
+            budget.packed_cache = None;
+            let object = self.direct.get(&container).ok_or_else(invalid_stream)?;
+            let data =
+                effective_stream(object, &self.direct, budget)?.ok_or_else(invalid_stream)?;
+            budget.release(data.capacity());
+            budget.packed_cache = Some((container, data));
+        }
+        budget.check_memory(end - start)?;
+        budget.retain(end - start)?;
+        budget.scan(end - start)?;
+        let member = &budget.packed_cache.as_ref().expect("loaded container").1[start..end];
+        Ok(Some(PdfObject::new(Cow::Owned(member.to_vec()), 0, None)))
+    }
+
+    fn unsupported(&self, reference: PdfRef) -> bool {
+        reference.generation == 0
+            && matches!(
+                self.packed.get(&reference.number),
+                Some(PackedObject::Unsupported)
+            )
+    }
+
+    fn insert_packed(
+        &mut self,
+        number: u32,
+        member: PackedObject,
+        budget: &mut PdfDecodeBudget,
+    ) -> Result<()> {
+        if !self.packed.contains_key(&number) {
+            budget.retain(std::mem::size_of::<(u32, PackedObject)>())?;
+        }
+        self.packed.insert(number, member);
+        Ok(())
+    }
+}
+
 /// Per-document work and peak retained parser data. The renderer probe also
 /// has its own small limits and deadline because it verifies a single page.
 struct PdfDecodeBudget {
@@ -85,6 +165,7 @@ struct PdfDecodeBudget {
     #[cfg(test)]
     checks_before_timeout: Option<std::cell::Cell<usize>>,
     probe_decoded_bytes: usize,
+    packed_cache: Option<(u32, Vec<u8>)>,
 }
 
 impl Default for PdfDecodeBudget {
@@ -111,6 +192,7 @@ impl PdfDecodeBudget {
             #[cfg(test)]
             checks_before_timeout: None,
             probe_decoded_bytes: 0,
+            packed_cache: None,
         }
     }
 
@@ -136,6 +218,7 @@ impl PdfDecodeBudget {
             limit: Some(limit),
             observed: Some(observed),
             resource_tier: Some(self.tier),
+            page_progress: None,
         })
     }
 
@@ -188,7 +271,8 @@ impl PdfDecodeBudget {
     }
 
     fn check_memory(&self, additional: usize) -> Result<()> {
-        let observed = (self.retained as u64).checked_add(additional as u64);
+        let observed =
+            ((self.retained + self.cached_bytes()) as u64).checked_add(additional as u64);
         if observed.is_none_or(|bytes| bytes > self.memory_limit as u64) {
             if self.deadline.is_some() {
                 return Err(AdapterError::ContractViolation(
@@ -205,6 +289,9 @@ impl PdfDecodeBudget {
     }
 
     fn retain(&mut self, additional: usize) -> Result<()> {
+        if additional > self.memory_limit - self.retained - self.cached_bytes() {
+            self.packed_cache = None;
+        }
         self.check_memory(additional)?;
         self.retained += additional;
         Ok(())
@@ -212,6 +299,70 @@ impl PdfDecodeBudget {
 
     fn release(&mut self, bytes: usize) {
         self.retained -= bytes;
+    }
+
+    fn cached_bytes(&self) -> usize {
+        self.packed_cache
+            .as_ref()
+            .map_or(0, |(_, data)| data.capacity())
+    }
+
+    fn buffer_growth(
+        &mut self,
+        capacity: usize,
+        required: usize,
+        element_bytes: usize,
+    ) -> Result<usize> {
+        if required <= capacity {
+            return Ok(capacity);
+        }
+        let available = (self.memory_limit - self.retained - self.cached_bytes()) / element_bytes;
+        let next = required.max(capacity.saturating_mul(2).min(capacity + available));
+        let additional = (next - capacity)
+            .checked_mul(element_bytes)
+            .ok_or_else(invalid_stream)?;
+        self.retain(additional)?;
+        Ok(next)
+    }
+
+    fn reserve_vec<T>(&mut self, buffer: &mut Vec<T>, extra: usize) -> Result<()> {
+        let required = buffer.len().checked_add(extra).ok_or_else(invalid_stream)?;
+        let next = self.buffer_growth(buffer.capacity(), required, std::mem::size_of::<T>())?;
+        if required > buffer.capacity() {
+            buffer
+                .try_reserve_exact(next - buffer.len())
+                .map_err(|_| self.allocation_error())?;
+        }
+        Ok(())
+    }
+
+    fn reserve_string(&mut self, buffer: &mut String, extra: usize) -> Result<()> {
+        let required = buffer.len().checked_add(extra).ok_or_else(invalid_stream)?;
+        let next = self.buffer_growth(buffer.capacity(), required, 1)?;
+        if required > buffer.capacity() {
+            buffer
+                .try_reserve_exact(next - buffer.len())
+                .map_err(|_| self.allocation_error())?;
+        }
+        Ok(())
+    }
+
+    fn allocation_error(&self) -> AdapterError {
+        if self.deadline.is_some() {
+            return invalid_stream();
+        }
+        self.resource_limit(
+            Resource::Memory,
+            self.memory_limit as u64,
+            (self.retained + self.cached_bytes()) as u64,
+        )
+    }
+
+    fn expand_text(&mut self, bytes: usize) -> Result<()> {
+        if self.deadline.is_none() {
+            self.expand(bytes)?;
+        }
+        Ok(())
     }
 
     fn reserve(counter: &mut usize, amount: usize, limit: usize, label: &str) -> Result<()> {
@@ -269,8 +420,8 @@ enum FontMap {
 /// Indexed PDF source with a single document work budget. Page text and font
 /// tables are built on demand and discarded between units.
 pub struct PdfPages<'a> {
-    objects: HashMap<u32, PdfObject<'a>>,
-    pages: Vec<u32>,
+    objects: Objects<'a>,
+    pages: Vec<PdfRef>,
     non_pdf_input: Option<&'a [u8]>,
     budget: PdfDecodeBudget,
 }
@@ -280,14 +431,21 @@ impl<'a> PdfPages<'a> {
         let mut budget = PdfDecodeBudget::new(tier);
         if !bytes.starts_with(b"%PDF") {
             return Ok(Self {
-                objects: HashMap::new(),
+                objects: Objects::default(),
                 pages: Vec::new(),
                 non_pdf_input: Some(bytes),
                 budget,
             });
         }
-        let objects = collect_objects(bytes, &mut budget)?.unwrap_or_default();
-        let pages = collect_page_numbers(&objects, &mut budget)?;
+        let (objects, pages) = if xref::declares_xref(bytes) {
+            let (root, objects) = xref::load_index(bytes, &mut budget)?;
+            let pages = active_page_numbers(&objects, root, &mut budget)?;
+            (objects, pages)
+        } else {
+            let objects = collect_objects(bytes, &mut budget)?;
+            let pages = collect_page_numbers(&objects, &mut budget)?;
+            (objects, pages)
+        };
         Ok(Self {
             objects,
             pages,
@@ -324,12 +482,17 @@ impl<'a> PdfPages<'a> {
 }
 
 fn decode_indexed_page(
-    objects: &HashMap<u32, PdfObject<'_>>,
-    number: u32,
+    objects: &Objects<'_>,
+    reference: PdfRef,
     budget: &mut PdfDecodeBudget,
 ) -> Result<String> {
-    let fonts = page_font_maps(objects, number, budget)?;
-    decode_page(objects, number, &fonts, budget)
+    let Some(page) = objects.resolve(reference, budget)? else {
+        return Ok(String::new());
+    };
+    let Some(fonts) = page_font_maps(objects, reference.number, &page, budget)? else {
+        return Ok(String::new());
+    };
+    decode_page(objects, reference.number, &page, &fonts, budget)
 }
 
 /// Decode the page reached from the active trailer's catalog in a one-page
@@ -353,7 +516,19 @@ pub(crate) fn office_probe_page_text(
     let Some(page) = probe_page_reference(&objects, root, &budget)? else {
         return Ok(None);
     };
-    let text = decode_indexed_page(&objects, page, &mut budget)?;
+    let generation = objects[&page].generation;
+    let objects = Objects {
+        direct: objects,
+        packed: HashMap::new(),
+    };
+    let text = decode_indexed_page(
+        &objects,
+        PdfRef {
+            number: page,
+            generation,
+        },
+        &mut budget,
+    )?;
     budget.check_deadline()?;
     Ok(Some(text))
 }
@@ -465,10 +640,7 @@ fn probe_dict_value<'a>(dict: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
     None
 }
 
-fn collect_objects<'a>(
-    bytes: &'a [u8],
-    budget: &mut PdfDecodeBudget,
-) -> Result<Option<HashMap<u32, PdfObject<'a>>>> {
+fn collect_objects<'a>(bytes: &'a [u8], budget: &mut PdfDecodeBudget) -> Result<Objects<'a>> {
     budget.scan(bytes.len())?;
     let mut objects = HashMap::new();
     let mut index = 0;
@@ -480,6 +652,8 @@ fn collect_objects<'a>(
                 index = find_endstream_bytes(bytes, index + b"stream".len())
                     .ok_or_else(invalid_stream)?;
             }
+            b'x' if pdf_keyword_at(bytes, index, b"xref") => return Err(xref::invalid()),
+            b's' if pdf_keyword_at(bytes, index, b"startxref") => return Err(xref::invalid()),
             b'o' if pdf_keyword_at(bytes, index, b"obj") => {
                 let Some(reference) = object_reference_before(bytes, index) else {
                     index += b"obj".len();
@@ -488,25 +662,29 @@ fn collect_objects<'a>(
                 budget.visit(1)?;
                 let start = index + b"obj".len();
                 let (end, stream) = raw_object_end(bytes, start)?;
-                insert_object(
-                    &mut objects,
-                    reference.number,
-                    PdfObject::new(
-                        Cow::Borrowed(&bytes[start..end]),
-                        reference.generation,
-                        stream.map(|range| range.start - start..range.end - start),
-                    ),
-                    budget,
-                )?;
+                let object = PdfObject::new(
+                    Cow::Borrowed(&bytes[start..end]),
+                    reference.generation,
+                    stream.map(|range| range.start - start..range.end - start),
+                );
+                if object
+                    .dictionary()
+                    .is_some_and(|dict| probe_dict_type(dict, b"XRef"))
+                {
+                    return Err(xref::invalid());
+                }
+                insert_object(&mut objects, reference.number, object, budget)?;
                 index = end + b"endobj".len();
             }
             _ => index += 1,
         }
     }
-    if !expand_object_streams(&mut objects, budget)? {
-        return Ok(None);
-    }
-    Ok(Some(objects))
+    let mut index = Objects {
+        direct: objects,
+        packed: HashMap::new(),
+    };
+    index_raw_object_streams(&mut index, budget)?;
+    Ok(index)
 }
 
 fn insert_object<'a>(
@@ -920,18 +1098,18 @@ fn inflate_tier_stream(
         let input = &remaining[..remaining.len().min(chunk.len())];
         let available = budget
             .expansion_remaining()
-            .min(budget.memory_limit - budget.retained);
+            .min(budget.memory_limit - budget.retained - budget.cached_bytes());
         let limit = chunk.len().min(available.saturating_add(1));
         let step = inflate(&mut state, input, &mut chunk[..limit], MZFlush::None);
         remaining = &remaining[step.bytes_consumed..];
         budget.expand(step.bytes_written)?;
-        budget.retain(step.bytes_written)?;
+        budget.reserve_vec(&mut output, step.bytes_written)?;
         output.extend_from_slice(&chunk[..step.bytes_written]);
         if step.status == Ok(MZStatus::StreamEnd) {
             return Ok(Some(output));
         }
         if step.status.is_err() || (step.bytes_consumed == 0 && step.bytes_written == 0) {
-            budget.release(output.len());
+            budget.release(output.capacity());
             return Ok(None);
         }
     }
@@ -967,7 +1145,7 @@ fn effective_stream(
             let data = inflate_probe_stream(payload, limit, budget)?;
             if let Some(ref data) = data {
                 budget.expand(data.len())?;
-                budget.retain(data.len())?;
+                budget.retain(data.capacity())?;
             }
             return Ok(data);
         }
@@ -985,33 +1163,24 @@ fn effective_stream(
     }
 }
 
-fn expand_object_streams<'a>(
-    objects: &mut HashMap<u32, PdfObject<'a>>,
-    budget: &mut PdfDecodeBudget,
-) -> Result<bool> {
+fn index_raw_object_streams(objects: &mut Objects<'_>, budget: &mut PdfDecodeBudget) -> Result<()> {
     let mut containers = Vec::new();
-    for (&number, object) in objects.iter() {
+    for (&number, object) in &objects.direct {
         budget.visit(1)?;
         if object
             .dictionary()
             .is_some_and(|dict| probe_dict_type(dict, b"ObjStm"))
         {
-            budget.retain(std::mem::size_of::<u32>())?;
+            budget.reserve_vec(&mut containers, 1)?;
             containers.push(number);
         }
     }
     containers.sort_unstable();
     for &number in &containers {
-        let object = &objects[&number];
-        let dict = object.dictionary().ok_or_else(invalid_stream)?;
-        let count = dict_int(dict, b"N").ok_or_else(invalid_stream)?;
-        let first = dict_int(dict, b"First").ok_or_else(invalid_stream)?;
-        if has_any_filter(dict) && !is_flate_filtered(dict) {
-            // The number and positions of pages in this container are unknown.
-            return Ok(false);
-        }
-        let data = effective_stream(object, objects, budget)?.ok_or_else(invalid_stream)?;
-        let offsets = object_stream_offsets(&data, count, first, budget)?;
+        let Some((data, offsets, first)) = load_packed_container(&objects.direct, number, budget)?
+        else {
+            continue;
+        };
         for (position, &(objnum, offset)) in offsets.iter().enumerate() {
             if containers.binary_search(&objnum).is_ok() {
                 return Err(AdapterError::ContractViolation(
@@ -1019,23 +1188,57 @@ fn expand_object_streams<'a>(
                         .to_owned(),
                 ));
             }
-            let start = first + offset;
-            let end = offsets
-                .get(position + 1)
-                .map_or(data.len(), |(_, next)| first + next);
-            let body = &data[start..end];
-            budget.check_memory(body.len())?;
-            insert_object(
-                objects,
-                objnum,
-                PdfObject::new(Cow::Owned(body.to_vec()), 0, None),
-                budget,
-            )?;
+            let member = member_range(number, &data, &offsets, first, position, offset);
+            if let Some(previous) = objects.direct.remove(&objnum) {
+                budget
+                    .release(previous.owned_bytes() + std::mem::size_of::<(u32, PdfObject<'_>)>());
+            }
+            objects.insert_packed(objnum, member, budget)?;
         }
-        budget.release(data.len() + offsets.len() * std::mem::size_of::<(u32, usize)>());
+        budget.release(data.capacity() + offsets.capacity() * std::mem::size_of::<(u32, usize)>());
     }
-    budget.release(containers.len() * std::mem::size_of::<u32>());
-    Ok(true)
+    budget.release(containers.capacity() * std::mem::size_of::<u32>());
+    Ok(())
+}
+
+type PackedContainer = (Vec<u8>, Vec<(u32, usize)>, usize);
+
+fn load_packed_container(
+    direct: &HashMap<u32, PdfObject<'_>>,
+    number: u32,
+    budget: &mut PdfDecodeBudget,
+) -> Result<Option<PackedContainer>> {
+    let object = direct.get(&number).ok_or_else(invalid_stream)?;
+    let dict = object
+        .dictionary()
+        .filter(|dict| probe_dict_type(dict, b"ObjStm"))
+        .ok_or_else(invalid_stream)?;
+    budget.scan(dict.len())?;
+    let count = dict_int(dict, b"N").ok_or_else(invalid_stream)?;
+    let first = dict_int(dict, b"First").ok_or_else(invalid_stream)?;
+    if has_any_filter(dict) && !is_flate_filtered(dict) {
+        return Ok(None);
+    }
+    let data = effective_stream(object, direct, budget)?.ok_or_else(invalid_stream)?;
+    let offsets = object_stream_offsets(&data, count, first, budget)?;
+    Ok(Some((data, offsets, first)))
+}
+
+fn member_range(
+    container: u32,
+    data: &[u8],
+    offsets: &[(u32, usize)],
+    first: usize,
+    position: usize,
+    offset: usize,
+) -> PackedObject {
+    PackedObject::Member {
+        container,
+        start: first + offset,
+        end: offsets
+            .get(position + 1)
+            .map_or(data.len(), |(_, next)| first + next),
+    }
 }
 
 fn object_stream_offsets(
@@ -1139,96 +1342,182 @@ fn skip_ascii_space(bytes: &[u8], mut index: usize) -> usize {
 /// emission order of every writer this decoder targets; the caller's
 /// structural-page-count normalization stays authoritative for cardinality.
 fn collect_page_numbers(
-    objects: &HashMap<u32, PdfObject<'_>>,
+    objects: &Objects<'_>,
     budget: &mut PdfDecodeBudget,
-) -> Result<Vec<u32>> {
+) -> Result<Vec<PdfRef>> {
+    let count = objects.direct.len() + objects.packed.len();
+    budget.retain(count * std::mem::size_of::<(u32, PdfRef)>())?;
+    let mut candidates = Vec::with_capacity(count);
+    candidates.extend(objects.direct.iter().map(|(&number, object)| {
+        (
+            0,
+            PdfRef {
+                number,
+                generation: object.generation,
+            },
+        )
+    }));
+    candidates.extend(objects.packed.iter().filter_map(|(&number, entry)| {
+        if let PackedObject::Member { container, .. } = *entry {
+            Some((
+                container,
+                PdfRef {
+                    number,
+                    generation: 0,
+                },
+            ))
+        } else {
+            None
+        }
+    }));
+    candidates.sort_unstable_by_key(|(container, reference)| (*container, reference.number));
     let mut pages = Vec::new();
-    for (&number, object) in objects {
+    for (_, reference) in &candidates {
         budget.visit(1)?;
-        if object
-            .dictionary()
-            .is_some_and(|dict| probe_dict_type(dict, b"Page"))
-        {
-            budget.retain(std::mem::size_of::<u32>())?;
-            pages.push(number);
+        let retained = budget.retained;
+        let page = objects.resolve(*reference, budget)?.and_then(|object| {
+            object
+                .dictionary()
+                .filter(|dict| probe_dict_type(dict, b"Page"))
+                .map(|_| *reference)
+        });
+        budget.retained = retained;
+        if let Some(page) = page {
+            budget.reserve_vec(&mut pages, 1)?;
+            pages.push(page);
         }
     }
-    pages.sort_unstable();
-    validate_page_links(objects, b"Kids", budget)?;
-    validate_page_links(objects, b"Parent", budget)?;
+    for key in [b"Kids".as_slice(), b"Parent".as_slice()] {
+        walk_page_links(
+            objects,
+            candidates.iter().map(|(_, reference)| *reference),
+            key,
+            None,
+            budget,
+        )?;
+    }
+    budget.release(candidates.capacity() * std::mem::size_of::<(u32, PdfRef)>());
+    pages.sort_unstable_by_key(|reference| reference.number);
     Ok(pages)
 }
 
-/// Parent and Kids are separate graphs. Valid trees naturally contain a
-/// Parent backlink for each Kids edge.
-fn validate_page_links(
-    objects: &HashMap<u32, PdfObject<'_>>,
-    key: &[u8],
+fn active_page_numbers(
+    objects: &Objects<'_>,
+    root: PdfRef,
     budget: &mut PdfDecodeBudget,
-) -> Result<()> {
+) -> Result<Vec<PdfRef>> {
+    if objects.unsupported(root) {
+        return Ok(Vec::new());
+    }
     let retained = budget.retained;
-    let mut done = HashSet::new();
-    let mut active = HashSet::new();
+    let catalog = objects.resolve(root, budget)?.ok_or_else(invalid_stream)?;
+    let pages = catalog
+        .dictionary()
+        .filter(|dict| probe_dict_type(dict, b"Catalog"))
+        .and_then(|dict| probe_dict_ref(dict, b"Pages"))
+        .ok_or_else(invalid_stream)?;
+    drop(catalog);
+    budget.retained = retained;
+    let mut result = Vec::new();
+    if !walk_page_links(objects, [pages], b"Kids", Some(&mut result), budget)? {
+        budget.release(result.capacity() * std::mem::size_of::<PdfRef>());
+        result.clear();
+        return Ok(Vec::new());
+    }
+    // /Parent is a separate graph from /Kids, so normal backlinks do not
+    // constitute a cycle.
+    walk_page_links(objects, result.iter().copied(), b"Parent", None, budget)?;
+    Ok(result)
+}
+
+/// Walk references in source order without recursion. Layout validation uses
+/// the active catalog; the xref-free literal subset supplies its own roots.
+fn walk_page_links(
+    objects: &Objects<'_>,
+    roots: impl IntoIterator<Item = PdfRef>,
+    key: &[u8],
+    mut pages: Option<&mut Vec<PdfRef>>,
+    budget: &mut PdfDecodeBudget,
+) -> Result<bool> {
+    let mut state = HashMap::<PdfRef, bool>::new();
     let mut stack = Vec::new();
-    for (&number, object) in objects {
-        let Some(dict) = object.dictionary() else {
-            continue;
-        };
-        if done.contains(&number)
-            || !(probe_dict_type(dict, b"Pages") || probe_dict_type(dict, b"Page"))
-        {
+    let mut state_bytes = 0;
+    for root in roots {
+        if state.contains_key(&root) {
             continue;
         }
-        let Some(links) = probe_dict_value(dict, key) else {
-            continue;
-        };
-        budget
-            .retain(std::mem::size_of::<u32>() + std::mem::size_of::<(u32, ReferenceList<'_>)>())?;
-        stack.push((number, ReferenceList::new(links)));
-        active.insert(number);
-        while let Some((number, links)) = stack.last_mut() {
-            let Some(reference) = links.next()? else {
-                active.remove(number);
-                let finished = *number;
-                stack.pop();
-                budget.release(std::mem::size_of::<(u32, ReferenceList<'_>)>());
-                done.insert(finished);
-                continue;
-            };
+        budget.reserve_vec(&mut stack, 1)?;
+        stack.push((root, false));
+        while let Some((reference, exiting)) = stack.pop() {
             budget.visit(1)?;
-            if active.contains(&reference.number) {
-                return Err(AdapterError::ContractViolation(
-                    "PDF page tree contains a reference cycle".to_owned(),
-                ));
-            }
-            if done.contains(&reference.number) {
+            if exiting {
+                state.insert(reference, true);
                 continue;
             }
-            let Some(object) = referenced_object(objects, reference) else {
-                return Err(AdapterError::ContractViolation(
-                    "PDF page tree points to an absent object".to_owned(),
-                ));
-            };
-            let links = if let Some(dict) = object.dictionary() {
+            if let Some(completed) = state.get(&reference) {
+                if !completed {
+                    return Err(AdapterError::ContractViolation(
+                        "PDF page tree contains a reference cycle".to_owned(),
+                    ));
+                }
+                if pages.is_some() {
+                    return Err(invalid_stream());
+                }
+                continue;
+            }
+            if objects.unsupported(reference) {
+                if pages.is_some() {
+                    budget.release(
+                        state_bytes + stack.capacity() * std::mem::size_of::<(PdfRef, bool)>(),
+                    );
+                    return Ok(false);
+                }
+                continue;
+            }
+            let object = objects
+                .resolve(reference, budget)?
+                .ok_or_else(invalid_stream)?;
+            let owned = object.owned_bytes();
+            let dict = object.dictionary();
+            let is_page = dict.is_some_and(|dict| probe_dict_type(dict, b"Page"));
+            let is_tree = dict.is_some_and(|dict| probe_dict_type(dict, b"Pages"));
+            if pages.is_some() && !is_page && !is_tree {
+                return Err(invalid_stream());
+            }
+            if let Some(pages) = pages.as_deref_mut().filter(|_| is_page) {
+                budget.reserve_vec(pages, 1)?;
+                pages.push(reference);
+            }
+            let entry_bytes = std::mem::size_of::<(PdfRef, bool)>();
+            budget.retain(entry_bytes)?;
+            state_bytes += entry_bytes;
+            state.insert(reference, false);
+            budget.reserve_vec(&mut stack, 1)?;
+            stack.push((reference, true));
+            let children = stack.len();
+            if let Some(dict) = dict.filter(|_| is_page || is_tree) {
                 budget.scan(dict.len())?;
-                probe_dict_value(dict, key)
-            } else {
-                None
-            };
-            let Some(links) = links else {
-                budget.retain(std::mem::size_of::<u32>())?;
-                done.insert(reference.number);
-                continue;
-            };
-            budget.retain(
-                std::mem::size_of::<u32>() + std::mem::size_of::<(u32, ReferenceList<'_>)>(),
-            )?;
-            stack.push((reference.number, ReferenceList::new(links)));
-            active.insert(reference.number);
+                let links = probe_dict_value(dict, key);
+                if pages.is_some() && is_tree && !links.is_some_and(|links| links.starts_with(b"["))
+                {
+                    return Err(invalid_stream());
+                }
+                if let Some(links) = links {
+                    let mut references = ReferenceList::new(links);
+                    while let Some(child) = references.next()? {
+                        budget.visit(1)?;
+                        budget.reserve_vec(&mut stack, 1)?;
+                        stack.push((child, false));
+                    }
+                }
+            }
+            stack[children..].reverse();
+            drop(object);
+            budget.release(owned);
         }
     }
-    budget.retained = retained;
-    Ok(())
+    budget.release(state_bytes + stack.capacity() * std::mem::size_of::<(PdfRef, bool)>());
+    Ok(true)
 }
 
 struct ReferenceList<'a> {
@@ -1263,28 +1552,58 @@ impl<'a> ReferenceList<'a> {
     }
 }
 
-fn page_font_maps<'a>(
-    objects: &'a HashMap<u32, PdfObject<'_>>,
+fn page_font_maps(
+    objects: &Objects<'_>,
     page_number: u32,
+    object: &PdfObject<'_>,
     budget: &mut PdfDecodeBudget,
-) -> Result<HashMap<&'a str, FontMap>> {
+) -> Result<Option<HashMap<String, FontMap>>> {
     let empty = HashMap::new();
-    let Some(page) = objects.get(&page_number).and_then(PdfObject::dictionary) else {
-        return Ok(empty);
+    let Some(page) = object.dictionary() else {
+        return Ok(Some(empty));
     };
     budget.visit(1)?;
     budget.scan(page.len())?;
-    let Some(resources) = resource_dictionary(objects, page, b"Resources", &[page_number], budget)?
+    let resource_ref = probe_dict_ref(page, b"Resources");
+    if resource_ref.is_some_and(|reference| objects.unsupported(reference)) {
+        return Ok(None);
+    }
+    let mut resources_object = None;
+    let Some(resources) = resource_dictionary(
+        objects,
+        page,
+        b"Resources",
+        &[page_number],
+        &mut resources_object,
+        budget,
+    )?
     else {
-        return Ok(empty);
+        return Ok(Some(empty));
     };
     let mut ancestors = vec![page_number];
-    ancestors.extend(probe_dict_ref(page, b"Resources").map(|reference| reference.number));
-    let Some(font_dict) = resource_dictionary(objects, resources, b"Font", &ancestors, budget)?
+    ancestors.extend(resource_ref.map(|reference| reference.number));
+    let font_ref = probe_dict_ref(resources, b"Font");
+    if font_ref.is_some_and(|reference| objects.unsupported(reference)) {
+        budget.release(resources_object.as_ref().map_or(0, PdfObject::owned_bytes));
+        return Ok(None);
+    }
+    let mut font_object = None;
+    let Some(font_dict) = resource_dictionary(
+        objects,
+        resources,
+        b"Font",
+        &ancestors,
+        &mut font_object,
+        budget,
+    )?
     else {
-        return Ok(empty);
+        budget.release(
+            resources_object.as_ref().map_or(0, PdfObject::owned_bytes)
+                + font_object.as_ref().map_or(0, PdfObject::owned_bytes),
+        );
+        return Ok(Some(empty));
     };
-    ancestors.extend(probe_dict_ref(resources, b"Font").map(|reference| reference.number));
+    ancestors.extend(font_ref.map(|reference| reference.number));
     let mut fonts = HashMap::new();
     budget.scan(font_dict.len())?;
     for (name, reference) in font_entries(font_dict) {
@@ -1295,14 +1614,18 @@ fn page_font_maps<'a>(
                 "PDF font dictionary repeats a name".to_owned(),
             ));
         }
-        budget.retain(std::mem::size_of::<(&str, FontMap)>())?;
+        budget.retain(std::mem::size_of::<(String, FontMap)>() + name.len())?;
         let map = match font_tounicode_cmap(objects, reference, &ancestors, budget)? {
             Some(cmap) => FontMap::Decoded(cmap),
             None => FontMap::Opaque,
         };
-        fonts.insert(name, map);
+        fonts.insert(name.to_owned(), map);
     }
-    Ok(fonts)
+    budget.release(
+        resources_object.as_ref().map_or(0, PdfObject::owned_bytes)
+            + font_object.as_ref().map_or(0, PdfObject::owned_bytes),
+    );
+    Ok(Some(fonts))
 }
 
 fn ensure_acyclic_reference(reference: PdfRef, ancestors: &[u32]) -> Result<()> {
@@ -1314,11 +1637,12 @@ fn ensure_acyclic_reference(reference: PdfRef, ancestors: &[u32]) -> Result<()> 
     Ok(())
 }
 
-fn resource_dictionary<'a>(
-    objects: &'a HashMap<u32, PdfObject<'_>>,
+fn resource_dictionary<'a, 'pdf>(
+    objects: &Objects<'pdf>,
     dictionary: &'a [u8],
     field: &[u8],
     ancestors: &[u32],
+    owner: &'a mut Option<PdfObject<'pdf>>,
     budget: &mut PdfDecodeBudget,
 ) -> Result<Option<&'a [u8]>> {
     let Some(value) = probe_dict_value(dictionary, field) else {
@@ -1327,7 +1651,8 @@ fn resource_dictionary<'a>(
     if let Some((reference, _)) = parse_ref(value, 0) {
         budget.visit(1)?;
         ensure_acyclic_reference(reference, ancestors)?;
-        let resolved = referenced_object(objects, reference).and_then(PdfObject::dictionary);
+        *owner = objects.resolve(reference, budget)?;
+        let resolved = owner.as_ref().and_then(PdfObject::dictionary);
         if let Some(dict) = resolved {
             budget.scan(dict.len())?;
         }
@@ -1371,32 +1696,39 @@ fn pdf_name_end(bytes: &[u8], mut index: usize) -> usize {
 }
 
 fn font_tounicode_cmap(
-    objects: &HashMap<u32, PdfObject<'_>>,
+    objects: &Objects<'_>,
     font_obj: PdfRef,
     ancestors: &[u32],
     budget: &mut PdfDecodeBudget,
 ) -> Result<Option<CMap>> {
-    let Some(font) = referenced_object(objects, font_obj) else {
+    let Some(font) = objects.resolve(font_obj, budget)? else {
         return Ok(None);
     };
     let Some(dict) = font.dictionary() else {
+        budget.release(font.owned_bytes());
         return Ok(None);
     };
     budget.scan(dict.len())?;
-    let Some(reference) = probe_dict_ref(dict, b"ToUnicode") else {
+    let reference = probe_dict_ref(dict, b"ToUnicode");
+    budget.release(font.owned_bytes());
+    drop(font);
+    let Some(reference) = reference else {
         return Ok(None);
     };
     budget.visit(1)?;
     ensure_acyclic_reference(reference, ancestors)?;
     ensure_acyclic_reference(reference, &[font_obj.number])?;
-    let Some(cmap_obj) = referenced_object(objects, reference) else {
+    let Some(cmap_obj) = objects.resolve(reference, budget)? else {
         return Ok(None);
     };
-    let Some(data) = effective_stream(cmap_obj, objects, budget)? else {
+    let Some(data) = effective_stream(&cmap_obj, &objects.direct, budget)? else {
+        budget.release(cmap_obj.owned_bytes());
         return Ok(None);
     };
+    budget.release(cmap_obj.owned_bytes());
+    drop(cmap_obj);
     let cmap = parse_tounicode_cmap(&data, budget)?;
-    budget.release(data.len());
+    budget.release(data.capacity());
     Ok(cmap)
 }
 
@@ -1595,7 +1927,7 @@ fn insert_cmap_target(
         char::decode_utf16(units.iter().copied()).map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
     };
     let len = chars().map(char::len_utf8).sum::<usize>();
-    budget.expand(len)?;
+    budget.expand_text(len)?;
     let entry_bytes = if map.contains_key(&code) {
         0
     } else {
@@ -1605,7 +1937,7 @@ fn insert_cmap_target(
     let mut target = String::with_capacity(len);
     target.extend(chars());
     if let Some(previous) = map.insert(code, target) {
-        budget.release(previous.len());
+        budget.release(previous.capacity());
     }
     Ok(())
 }
@@ -1615,14 +1947,12 @@ fn insert_cmap_target(
 // ---------------------------------------------------------------------------
 
 fn decode_page(
-    objects: &HashMap<u32, PdfObject<'_>>,
+    objects: &Objects<'_>,
     page_number: u32,
-    fonts: &HashMap<&str, FontMap>,
+    page: &PdfObject<'_>,
+    fonts: &HashMap<String, FontMap>,
     budget: &mut PdfDecodeBudget,
 ) -> Result<String> {
-    let Some(page) = objects.get(&page_number) else {
-        return Ok(String::new());
-    };
     let Some(dict) = page.dictionary() else {
         return Ok(String::new());
     };
@@ -1630,18 +1960,17 @@ fn decode_page(
         let mut content = Vec::new();
         for reference in xref::content_references(dict, budget)? {
             ensure_acyclic_reference(reference, &[page_number])?;
-            let object = referenced_object(objects, reference).ok_or_else(|| {
+            let object = referenced_object(&objects.direct, reference).ok_or_else(|| {
                 AdapterError::ContractViolation(
                     "probe PDF content reference is absent from the active xref".to_owned(),
                 )
             })?;
-            append_stream(objects, object, &mut content, budget)?;
+            append_stream(&objects.direct, object, &mut content, budget)?;
         }
         return decode_content_ops(&content, fonts, budget);
     }
     let Some(value) = probe_dict_value(dict, b"Contents") else {
-        // The supported literal-page subset has the stream on the page itself.
-        let Some(content) = effective_stream(page, objects, budget)? else {
+        let Some(content) = effective_stream(page, &objects.direct, budget)? else {
             return Ok(String::new());
         };
         return decode_content_ops(&content, fonts, budget);
@@ -1651,55 +1980,70 @@ fn decode_page(
 }
 
 fn collect_page_content(
-    objects: &HashMap<u32, PdfObject<'_>>,
+    objects: &Objects<'_>,
     page_number: u32,
     value: &[u8],
     budget: &mut PdfDecodeBudget,
 ) -> Result<Vec<u8>> {
-    let frame_bytes = std::mem::size_of::<(u32, ReferenceList<'_>)>() + std::mem::size_of::<u32>();
-    budget.retain(frame_bytes)?;
-    let mut stack = vec![(page_number, ReferenceList::new(value))];
-    let mut active = HashSet::from([page_number]);
+    let mut stack = Vec::new();
+    let mut active = HashSet::new();
+    push_content_refs(value, &mut stack, budget)?;
     let mut content = Vec::new();
-    while let Some((container, refs)) = stack.last_mut() {
-        let Some(reference) = refs.next()? else {
-            active.remove(container);
-            stack.pop();
-            budget.release(frame_bytes);
+    while let Some((reference, exiting)) = stack.pop() {
+        if exiting {
+            active.remove(&reference.number);
+            budget.release(std::mem::size_of::<u32>());
             continue;
-        };
+        }
         budget.visit(1)?;
-        if active.contains(&reference.number) {
+        if reference.number == page_number || active.contains(&reference.number) {
             return Err(AdapterError::ContractViolation(
                 "PDF content contains a reference cycle".to_owned(),
             ));
         }
-        let object = content_object(objects, reference)?;
+        if objects.unsupported(reference) {
+            continue;
+        }
+        let object = objects.resolve(reference, budget)?.ok_or_else(|| {
+            AdapterError::ContractViolation(
+                "PDF content reference points to an absent object".to_owned(),
+            )
+        })?;
+        let owned = object.owned_bytes();
         if object.stream.is_some() {
-            append_stream(objects, object, &mut content, budget)?;
+            append_stream(&objects.direct, &object, &mut content, budget)?;
         } else {
             budget.scan(object.body.len())?;
             let start = skip_pdf_space_and_comments(&object.body, 0);
             let value = &object.body[start..];
             if value.starts_with(b"[") || parse_ref(value, 0).is_some() {
-                budget.retain(frame_bytes)?;
-                stack.push((reference.number, ReferenceList::new(value)));
+                budget.retain(std::mem::size_of::<u32>())?;
                 active.insert(reference.number);
+                budget.reserve_vec(&mut stack, 1)?;
+                stack.push((reference, true));
+                push_content_refs(value, &mut stack, budget)?;
             }
         }
+        drop(object);
+        budget.release(owned);
     }
+    budget.release(stack.capacity() * std::mem::size_of::<(PdfRef, bool)>());
     Ok(content)
 }
 
-fn content_object<'a, 'pdf>(
-    objects: &'a HashMap<u32, PdfObject<'pdf>>,
-    reference: PdfRef,
-) -> Result<&'a PdfObject<'pdf>> {
-    referenced_object(objects, reference).ok_or_else(|| {
-        AdapterError::ContractViolation(
-            "PDF content reference points to an absent object".to_owned(),
-        )
-    })
+fn push_content_refs(
+    value: &[u8],
+    stack: &mut Vec<(PdfRef, bool)>,
+    budget: &mut PdfDecodeBudget,
+) -> Result<()> {
+    let start = stack.len();
+    let mut references = ReferenceList::new(value);
+    while let Some(reference) = references.next()? {
+        budget.reserve_vec(stack, 1)?;
+        stack.push((reference, false));
+    }
+    stack[start..].reverse();
+    Ok(())
 }
 
 fn append_stream(
@@ -1712,10 +2056,10 @@ fn append_stream(
         if content.is_empty() {
             *content = data;
         } else {
-            budget.retain(data.len() + 1)?;
+            budget.reserve_vec(content, data.len() + 1)?;
             content.push(b'\n');
             content.extend_from_slice(&data);
-            budget.release(data.len());
+            budget.release(data.capacity());
         }
     } else if budget.deadline.is_some() {
         return Err(AdapterError::ContractViolation(
@@ -1746,7 +2090,7 @@ enum ArrayItem<'a> {
 /// decode every show operator (`Tj`, `TJ`, `'`, `"`).
 fn decode_content_ops(
     content: &[u8],
-    fonts: &HashMap<&str, FontMap>,
+    fonts: &HashMap<String, FontMap>,
     budget: &mut PdfDecodeBudget,
 ) -> Result<String> {
     decode_content_ops_with_limits(
@@ -1791,7 +2135,7 @@ fn scan_content_until(
 
 fn decode_content_ops_with_limits(
     content: &[u8],
-    fonts: &HashMap<&str, FontMap>,
+    fonts: &HashMap<String, FontMap>,
     budget: &mut PdfDecodeBudget,
     probe_limits: Option<(usize, usize)>,
 ) -> Result<String> {
@@ -1819,7 +2163,7 @@ fn decode_content_ops_with_limits(
     let mut output = String::new();
     let mut index = 0_usize;
     let mut current_font: Option<&FontMap> = None;
-    let mut last_name = None;
+    let mut last_font = None;
     let mut last_string = None;
     let mut array_items: Option<Vec<ArrayItem<'_>>> = None;
     let item_bytes = std::mem::size_of::<ArrayItem<'_>>();
@@ -1846,7 +2190,7 @@ fn decode_content_ops_with_limits(
                 let string = ShowString::Literal(&content[start..end - usize::from(closed)]);
                 match array_items.as_mut() {
                     Some(items) => {
-                        budget.retain(item_bytes)?;
+                        budget.reserve_vec(items, 1)?;
                         items.push(ArrayItem::Text(string));
                     }
                     None => last_string = Some(string),
@@ -1885,7 +2229,7 @@ fn decode_content_ops_with_limits(
                 let string = ShowString::Hex(&content[index + 1..end]);
                 match array_items.as_mut() {
                     Some(items) => {
-                        budget.retain(item_bytes)?;
+                        budget.reserve_vec(items, 1)?;
                         items.push(ArrayItem::Text(string));
                     }
                     None => last_string = Some(string),
@@ -1895,7 +2239,7 @@ fn decode_content_ops_with_limits(
             b'[' => {
                 admit_operand(0)?;
                 if let Some(items) = array_items.replace(Vec::new()) {
-                    budget.release(items.len() * item_bytes);
+                    budget.release(items.capacity() * item_bytes);
                 }
                 index += 1;
             }
@@ -1909,7 +2253,10 @@ fn decode_content_ops_with_limits(
                     is_pdf_delimiter,
                 )?;
                 admit_operand(end - index - 1)?;
-                last_name = std::str::from_utf8(&content[index + 1..end]).ok();
+                budget.scan(end - index - 1)?;
+                last_font = std::str::from_utf8(&content[index + 1..end])
+                    .ok()
+                    .and_then(|name| fonts.get(name));
                 index = end;
             }
             b'+' | b'-' | b'.' | b'0'..=b'9' => {
@@ -1926,7 +2273,7 @@ fn decode_content_ops_with_limits(
                         .parse::<f64>()
                 {
                     admit_operand(0)?;
-                    budget.retain(item_bytes)?;
+                    budget.reserve_vec(items, 1)?;
                     items.push(ArrayItem::Kern(value));
                 }
                 index = end;
@@ -1942,7 +2289,7 @@ fn decode_content_ops_with_limits(
                 let op = &content[index..end];
                 match op {
                     b"Tf" => {
-                        current_font = last_name.and_then(|name| fonts.get(name));
+                        current_font = last_font;
                     }
                     b"Tj" | b"'" | b"\"" => {
                         if let Some(string) = last_string.take() {
@@ -1956,7 +2303,7 @@ fn decode_content_ops_with_limits(
                     b"TJ" => {
                         if let Some(items) = array_items.take() {
                             let mut assembled = String::new();
-                            let retained = items.len() * item_bytes;
+                            let retained = items.capacity() * item_bytes;
                             for item in items {
                                 budget.check_deadline()?;
                                 match item {
@@ -1965,7 +2312,7 @@ fn decode_content_ops_with_limits(
                                             decode_show_string(&string, current_font, budget)?
                                         {
                                             append_working_text(&mut assembled, &text, budget)?;
-                                            budget.release(text.len());
+                                            budget.release(text.capacity());
                                         }
                                     }
                                     ArrayItem::Kern(value) => {
@@ -1992,7 +2339,7 @@ fn decode_content_ops_with_limits(
 }
 
 fn append_working_text(out: &mut String, text: &str, budget: &mut PdfDecodeBudget) -> Result<()> {
-    budget.retain(text.len())?;
+    budget.reserve_string(out, text.len())?;
     out.push_str(text);
     Ok(())
 }
@@ -2021,7 +2368,7 @@ fn push_decoded(
         }
         append_bounded_text(output, trimmed, budget)?;
     }
-    budget.release(text.len());
+    budget.release(text.capacity());
     Ok(())
 }
 
@@ -2062,7 +2409,7 @@ fn decode_show_string(
                     code = (code << 8) | u32::from(*byte);
                 }
                 if let Some(mapped) = cmap.map.get(&code) {
-                    budget.expand(mapped.len())?;
+                    budget.expand_text(mapped.len())?;
                     append_working_text(&mut out, mapped, budget)?;
                 }
             }
@@ -2071,7 +2418,7 @@ fn decode_show_string(
         Some(FontMap::Opaque) => unreachable!("opaque font rejected above"),
         None => {
             let text = lossy_text(&bytes, budget, false)?;
-            budget.retain(text.len())?;
+            budget.retain(text.capacity())?;
             text
         }
     };
@@ -2095,7 +2442,14 @@ fn lossy_text(bytes: &[u8], budget: &PdfDecodeBudget, unit: bool) -> Result<Stri
         budget.check_text(len)?;
     }
     budget.check_memory(len)?;
-    Ok(String::from_utf8_lossy(bytes).into_owned())
+    let mut text = String::with_capacity(len);
+    for chunk in bytes.utf8_chunks() {
+        text.push_str(chunk.valid());
+        if !chunk.invalid().is_empty() {
+            text.push(char::REPLACEMENT_CHARACTER);
+        }
+    }
+    Ok(text)
 }
 
 fn hex_bytes(raw: &[u8], len: usize) -> Vec<u8> {
@@ -2211,6 +2565,262 @@ mod tests {
         ));
         pdf.extend_from_slice(b"%%EOF\n");
         pdf
+    }
+
+    fn xref_fixture(kids: &str, cycle: bool, objects_count: usize) -> Vec<u8> {
+        use std::io::Write;
+        let mut pdf = b"%PDF-1.6\n".to_vec();
+        let mut offsets = Vec::new();
+        for body in [
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            format!("<< /Type /Pages /Count 2 /Kids [{kids}] >>").into_bytes(),
+            b"<< /Type /Page /Parent 2 0 R /Contents 5 0 R >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /Contents 6 0 R >>".to_vec(),
+            b"<< /Length 11 >> stream\nBT (one) Tj\nendstream".to_vec(),
+            b"<< /Length 11 >> stream\nBT (two) Tj\nendstream".to_vec(),
+        ] {
+            offsets.push(pdf.len());
+            pdf.extend(obj(offsets.len() as u32, &body));
+        }
+        while offsets.len() < objects_count {
+            offsets.push(pdf.len());
+            pdf.extend(obj(offsets.len() as u32, b"null"));
+        }
+        let xref = pdf.len();
+        let size = offsets.len() + 1;
+        write!(pdf, "xref\n0 {size}\n0000000000 65535 f \n").unwrap();
+        for offset in offsets {
+            writeln!(pdf, "{offset:010} 00000 n ").unwrap();
+        }
+        let prev = if cycle {
+            format!(" /Prev {xref}")
+        } else {
+            String::new()
+        };
+        write!(
+            pdf,
+            "trailer\n<< /Size {size} /Root 1 0 R{prev} >>\nstartxref\n{xref}\n%%EOF\n"
+        )
+        .unwrap();
+        pdf
+    }
+
+    #[test]
+    fn p1_review_active_xref_controls_order_and_rejects_invalid_offsets_and_prev() {
+        let pdf = xref_fixture("4 0 R 3 0 R", false, 6);
+        assert_eq!(read_pages(&pdf).unwrap(), ["two", "one"]);
+        assert!(matches!(
+            read_pages(&xref_fixture("3 0 R 4 0 R", true, 6)),
+            Err(AdapterError::ContractViolation(_))
+        ));
+        let mut bad = pdf.clone();
+        let row = b"0000000009 00000 n ";
+        let offset = bad
+            .windows(row.len())
+            .position(|bytes| bytes == row)
+            .unwrap();
+        bad[offset + 9] = b'8';
+        assert!(matches!(
+            read_pages(&bad),
+            Err(AdapterError::ContractViolation(_))
+        ));
+    }
+
+    #[test]
+    fn p1_review_regular_xref_has_no_probe_row_cap() {
+        let pdf = xref_fixture("4 0 R 3 0 R", false, 8193);
+        assert_eq!(read_pages(&pdf).unwrap(), ["two", "one"]);
+    }
+
+    #[test]
+    fn p1_review_incremental_xref_hides_freed_page() {
+        use std::io::Write;
+        let mut pdf = xref_fixture("3 0 R 4 0 R", false, 6);
+        let previous = pdf
+            .windows(b"xref\n0".len())
+            .position(|bytes| bytes == b"xref\n0")
+            .unwrap();
+        let pages = pdf.len();
+        pdf.extend(obj(2, b"<< /Type /Pages /Count 1 /Kids [4 0 R] >>"));
+        let xref = pdf.len();
+        write!(pdf, "xref\n2 2\n{pages:010} 00000 n \n0000000000 00001 f \ntrailer\n<< /Size 7 /Prev {previous} >>\nstartxref\n{xref}\n%%EOF\n").unwrap();
+        assert_eq!(read_pages(&pdf).unwrap(), ["two"]);
+    }
+
+    fn packed_xref_fixture(kids: &str, filter: &str) -> Vec<u8> {
+        use std::io::Write;
+        let mut pdf = b"%PDF-1.6\n".to_vec();
+        let mut rows = vec![0; 7];
+        let raw = b"7 0 << /Type /Page /Parent 2 0 R >>";
+        let payload = if filter == "FlateDecode" {
+            zlib(raw)
+        } else {
+            raw.to_vec()
+        };
+        for (index, body) in [
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            format!("<< /Type /Pages /Count 2 /Kids [{kids}] >>").into_bytes(),
+            b"<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>".to_vec(),
+            b"<< /Length 11 >> stream\nBT (one) Tj\nendstream".to_vec(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            rows.extend([1]);
+            rows.extend((pdf.len() as u32).to_be_bytes());
+            rows.extend([0, 0]);
+            pdf.extend(obj(index as u32 + 1, &body));
+        }
+        rows.extend([1]);
+        rows.extend((pdf.len() as u32).to_be_bytes());
+        rows.extend([0, 0]);
+        pdf.extend(stream_obj(
+            5,
+            &format!(
+                "<< /Type /ObjStm /N 1 /First 4 /Length {} /Filter /{filter} >>",
+                payload.len()
+            ),
+            &payload,
+        ));
+        let xref = pdf.len();
+        rows.extend([1]);
+        rows.extend((xref as u32).to_be_bytes());
+        rows.extend([0, 0]);
+        rows.extend([2, 0, 0, 0, 5, 0, 0]);
+        pdf.extend(stream_obj(
+            6,
+            &format!(
+                "<< /Type /XRef /Size 8 /Root 1 0 R /W [1 4 2] /Length {} >>",
+                rows.len()
+            ),
+            &rows,
+        ));
+        write!(pdf, "startxref\n{xref}\n%%EOF\n").unwrap();
+        pdf
+    }
+
+    #[test]
+    fn p1_review_active_xref_uses_packed_pages_only_when_reachable() {
+        assert_eq!(
+            read_pages(&packed_xref_fixture("7 0 R 3 0 R", "FlateDecode")).unwrap(),
+            ["", "one"]
+        );
+        assert_eq!(
+            read_pages(&packed_xref_fixture("3 0 R", "DCTDecode")).unwrap(),
+            ["one"]
+        );
+        assert!(
+            read_pages(&packed_xref_fixture("7 0 R 3 0 R", "DCTDecode"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn p1_review_packed_index_retains_positions_and_one_container() {
+        let mut pdf = b"%PDF-1.6\n".to_vec();
+        for container in 1..=3 {
+            let mut member = format!("{} 0 (", 10 + container).into_bytes();
+            member.extend([b'x'; 12_000]);
+            member.push(b')');
+            let payload = zlib(&member);
+            pdf.extend(stream_obj(
+                container,
+                &format!(
+                    "<< /Type /ObjStm /N 1 /First 5 /Length {} /Filter /FlateDecode >>",
+                    payload.len()
+                ),
+                &payload,
+            ));
+        }
+        let mut budget = PdfDecodeBudget {
+            memory_limit: 28_000,
+            ..test_budget()
+        };
+        let objects = collect_objects(&pdf, &mut budget).unwrap();
+        let baseline = budget.retained;
+        assert!(baseline < 1024, "index retained {baseline} bytes");
+        for number in 11..=13 {
+            let object = objects
+                .resolve(
+                    PdfRef {
+                        number,
+                        generation: 0,
+                    },
+                    &mut budget,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(object.body.len(), 12_002);
+            assert_eq!(budget.cached_bytes(), 12_007);
+            budget.release(object.owned_bytes());
+            assert_eq!(budget.retained, baseline);
+        }
+    }
+
+    #[test]
+    fn p1_review_unreachable_unsupported_object_stream_keeps_text() {
+        let mut pdf = b"%PDF-1.6\n".to_vec();
+        pdf.extend(obj(1, b"<< /Type /Page /Contents 2 0 R >>"));
+        pdf.extend(stream_obj(2, "<< /Length 11 >>", b"BT (one) Tj"));
+        pdf.extend(stream_obj(
+            3,
+            "<< /Type /ObjStm /N 1 /First 4 /Length 1 /Filter /DCTDecode >>",
+            b"x",
+        ));
+        assert_eq!(read_pages(&pdf).unwrap(), ["one"]);
+    }
+
+    #[test]
+    fn p1_review_font_names_charge_once_before_repeated_tf() {
+        let name = "n".repeat(2048);
+        let content = format!("/{name} {}(one) Tj", "Tf ".repeat(512));
+        let fonts = HashMap::from([(name.clone(), FontMap::Opaque)]);
+        let mut budget = test_budget();
+        budget.work_limit = 2;
+        assert_eq!(
+            decode_content_ops(content.as_bytes(), &fonts, &mut budget).unwrap(),
+            ""
+        );
+        assert_eq!(budget.work, 2);
+        budget.work = 0;
+        budget.work_limit = 1;
+        assert!(matches!(
+            decode_content_ops(content.as_bytes(), &fonts, &mut budget),
+            Err(AdapterError::ResourceLimit(_))
+        ));
+    }
+
+    #[test]
+    fn p1_review_inflate_retains_capacity_within_budget() {
+        let mut budget = test_budget();
+        budget.memory_limit = 25_000;
+        let payload = zlib(&vec![b'a'; 25_000]);
+        let data = inflate_tier_stream(&payload, miniz_oxide::DataFormat::Zlib, &mut budget)
+            .unwrap()
+            .unwrap();
+        assert!(data.capacity() <= budget.memory_limit);
+        assert_eq!(budget.retained, data.capacity());
+    }
+
+    #[test]
+    fn p1_review_probe_expansion_budget_counts_only_streams() {
+        let mut budget = PdfDecodeBudget {
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(5)),
+            probe_decoded_bytes: MAX_PROBE_DECODED_BYTES,
+            ..test_budget()
+        };
+        let data = b"1 beginbfchar\n<01> <0041>\nendbfchar";
+        let cmap = parse_tounicode_cmap(data, &mut budget).unwrap().unwrap();
+        let text = decode_show_string(
+            &ShowString::Hex(b"01"),
+            Some(&FontMap::Decoded(cmap)),
+            &mut budget,
+        )
+        .unwrap();
+        assert_eq!(text.as_deref(), Some("A"));
+        assert_eq!(budget.probe_decoded_bytes, MAX_PROBE_DECODED_BYTES);
+        assert!(budget.expand(1).is_err());
     }
 
     fn read_pages(bytes: &[u8]) -> Result<Vec<String>> {
@@ -2722,8 +3332,7 @@ mod tests {
 
         let mut pages = PdfPages::open(&pdf, ResourceTier::Standard).unwrap();
         let baseline = pages.budget.retained;
-        let traversal =
-            std::mem::size_of::<(u32, ReferenceList<'_>)>() + std::mem::size_of::<u32>();
+        let traversal = 2 * std::mem::size_of::<(PdfRef, bool)>();
         pages.budget.memory_limit = baseline + traversal + 3 * payload.len() + 1;
         let dictionary_work = dictionary.len().div_ceil(1024) as u64;
         pages.budget.work_limit = pages.budget.work + 12 + 4 * dictionary_work;

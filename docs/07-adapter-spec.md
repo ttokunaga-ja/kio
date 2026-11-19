@@ -99,7 +99,7 @@ Kio は `deterministic_library` の Prepare / Markdownize Adapter を同梱す�
 > `tool_profile_hash`** に載せた (§9 / [03-data-model.md §5.1](03-data-model.md) — 既存
 > instance 内の prepared_hash drift ではなく新 identity としての基線再構築)。
 > PDF の資源 tier 対応では、ページごとのフォント解決と unsupported filter の空抽出を
-> Prepare 1.3.0 / Markdownize 1.4.0 の identity に載せる。
+> 有効な xref に従うページ順と合わせて Prepare 1.4.0 / Markdownize 1.5.0 の identity に載せる。
 
 - online Adapter が未設定または network 未承認のとき、Markdownize タスクは同梱 deterministic Adapter で実行する (タスクを止めない)。Embedding はモデル準備済みなら既定の EG2 を使い、未準備なら理由を表示して text fallback する ([05-runtime.md §1](05-runtime.md))
 - この状態を **ベースライン index** と呼ぶ。`init → index --yes → search → open <pointer>` の最低体験ライン ([01-positioning.md §3](01-positioning.md)) はベースライン index のみで成立しなければならない
@@ -395,7 +395,8 @@ invocation 限定の資源選択で、省略時は standard。永続的な安全
 
 PDF の parser work には、object / reference の訪問、入力の走査、実際に展開した bytes を数える。
 展開 bytes はファイル全体で累積し、累計を 1 KiB 単位へ切り上げるため、展開の chunk 分割によって
-消費量は変わらない。content stream、CMap、出力 text はページごとに解放し、object index は処理中に保持する。
+消費量は変わらない。可変長バッファは保持する容量を会計する。content stream、CMap、出力 text は
+ページごとに解放する。圧縮 object の索引は member の位置を持ち、展開の作業領域には最大 1 コンテナを保持する。
 
 XLSX の容量値は選択 tier に対応し、declared size と実読取りの両方に適用する。
 member / aggregate の容量枠は streaming で消費する総量であり、同時保持 memory 枠の拡張ではない。
@@ -405,6 +406,9 @@ member / aggregate の容量枠は streaming で消費する総量であり、�
 流し、文書全体の展開 bytes を同時保持しない。旧固定限界を超える正常 fixture が処理できることと、
 不正構造・展開爆弾・循環が有限 work で止まることの両方を受入条件とする。
 未完了の場合は処理済み範囲・未処理範囲・予算と再実行方法を表示し、cell / page を黙って捨てない。
+PDF のページ総数が確定している場合は、予算情報の `page_progress` に総数、抽出済みの末尾ページ、
+次の抽出ページ、再実行コマンドを含める。stage が作成された実行では、耐久化済みの末尾ページも
+含める。末尾が 0 の範囲は空である。
 preview も同じ予算と受入検査に従い、有料 fallback や外部送信の承認を追加しない。
 
 ## 5.2 Markdownize

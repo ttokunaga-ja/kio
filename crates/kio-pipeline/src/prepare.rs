@@ -163,6 +163,7 @@ impl ExtractionBudget {
                     limit: Some(limit),
                     observed: Some(observed),
                     resource_tier: Some(self.tier),
+                    page_progress: None,
                 },
             ));
         }
@@ -204,6 +205,7 @@ pub fn visit_prepared_units_with_budget(
         budget,
         &[],
         &mut PreparedUnitSink {
+            durable: false,
             declare: &mut |_| Ok(()),
             write: &mut visit,
         },
@@ -377,19 +379,34 @@ fn prepare_units_emitting(
         let mut pages =
             kio_adapter::pdf_decode::PdfPages::open(pdf, budget.tier).map_err(pdf_error)?;
         let count = pages.len();
+        let durable = emit.durable;
+        let annotate = |error, extracted_through, units| {
+            page_extraction_error(
+                error,
+                count,
+                extracted_through,
+                durable.then_some(units),
+                budget.tier,
+            )
+        };
         let mut prepared_units = completed.to_vec();
         let mut declared = !completed.is_empty();
         if declared {
-            emit.declare(count)?;
+            emit.declare(count)
+                .map_err(|err| annotate(err, completed.len(), completed.len()))?;
         }
         for index in completed.len()..count {
-            let page = pages.read_page(index).map_err(pdf_error)?;
+            let page = pages
+                .read_page(index)
+                .map_err(pdf_error)
+                .map_err(|err| annotate(err, index, prepared_units.len()))?;
             let real = is_probably_real_text(&page);
             if !declared {
                 if !real {
                     continue;
                 }
-                emit.declare(count)?;
+                emit.declare(count)
+                    .map_err(|err| annotate(err, index + 1, prepared_units.len()))?;
                 declared = true;
             }
             // Once there is a text layer, preserve blank pages and slides as
@@ -412,7 +429,8 @@ fn prepare_units_emitting(
                     mime: Some(media_type.to_owned()),
                     page_number: (unit_type == UnitType::Page).then_some(page_number),
                 };
-                emit.write(&unit, body)?;
+                emit.write(&unit, body)
+                    .map_err(|err| annotate(err, index + 1, prepared_units.len()))?;
                 prepared_units.push(unit);
             }
         }
@@ -451,6 +469,33 @@ fn prepare_units_emitting(
         prepared_units: vec![unit],
         image_object_hashes: Vec::new(),
     })
+}
+
+fn page_extraction_error(
+    error: crate::PipelineError,
+    total_pages: usize,
+    extracted_through: usize,
+    staged_through: Option<usize>,
+    tier: kio_core::error::ResourceTier,
+) -> crate::PipelineError {
+    use kio_core::error::{PageExtractionProgress, Resource, ResourceTier};
+
+    let crate::PipelineError::ResourceLimit(mut limit) = error else {
+        return error;
+    };
+    let retry = if tier == ResourceTier::Large || limit.resource != Resource::Storage {
+        "index --resource-tier large"
+    } else {
+        "index"
+    };
+    limit.page_progress = Some(Box::new(PageExtractionProgress {
+        total_pages: total_pages as u64,
+        extracted_through: extracted_through as u64,
+        staged_through: staged_through.map(|count| count as u64),
+        next_page: (extracted_through < total_pages).then(|| extracted_through as u64 + 1),
+        retry: retry.to_owned(),
+    }));
+    crate::PipelineError::ResourceLimit(limit)
 }
 
 fn office_preparation_profile_hash(request_profile_hash: &str, converter_profile: &str) -> String {

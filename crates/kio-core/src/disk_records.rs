@@ -251,6 +251,7 @@ impl<T: DeserializeOwned> RecordPayloads<T> {
                 limit: None,
                 observed: Some(reference.size as u64),
                 resource_tier: None,
+                page_progress: None,
             }
             .into_error("cannot allocate a private record payload")
         })?;
@@ -528,6 +529,7 @@ fn record_limit(observed: usize) -> KioError {
         limit: Some(RECORD_BYTES as u64),
         observed: Some(observed as u64),
         resource_tier: None,
+        page_progress: None,
     }
     .into_error("tree metadata record exceeds the streaming buffer")
 }
