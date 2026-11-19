@@ -692,14 +692,9 @@ fn run_index_for_repo_inner(
     )
     .map_err(pipeline_to_kio)?;
 
-    let excluded = preview
-        .candidates
-        .iter()
-        .filter(|candidate| candidate.ignored)
-        .map(|candidate| candidate.input_path.clone())
-        .collect::<BTreeSet<_>>();
+    let include_path = |path: &str| scan_includes_path(&preview, path);
     let explicitly_allowed_tier_a = explicitly_allowed_tier_a_paths(&preview);
-    repo.validate_archive_budget(&excluded, &explicitly_allowed_tier_a)?;
+    repo.validate_archive_budget(&include_path, &explicitly_allowed_tier_a)?;
 
     // Validated management membership is the continuing local scan grant.
     // External adapter consent is evaluated separately below; absence of a
@@ -813,7 +808,7 @@ fn run_index_for_repo_inner(
     let outcome = repo.auto_snapshot_with_bound_normalize(
         Some("kio index auto snapshot"),
         None,
-        &excluded,
+        &include_path,
         &index_result.normalize_by_path,
         &explicitly_allowed_tier_a,
         Some(&|tree| {
@@ -1800,22 +1795,28 @@ pub(crate) fn record_unsupported_if_changed(
     Ok(true)
 }
 
+fn scan_includes_path(preview: &ScanPreview, path: &str) -> bool {
+    // build_managed_scan_preview sorts direct files by path.
+    preview
+        .candidates
+        .binary_search_by(|entry| entry.input_path.as_str().cmp(path))
+        .is_ok_and(|index| !preview.candidates[index].ignored)
+}
+
 fn verify_snapshot_inputs(
     tree: &TreeObject,
     preview: &ScanPreview,
     classified_raws: &BTreeMap<String, String>,
 ) -> Result<()> {
-    let mut scanned_paths = preview
-        .candidates
-        .iter()
-        .filter(|entry| !entry.ignored && entry.media_type != "inode/directory")
-        .map(|entry| entry.input_path.as_str());
+    let mut scanned = preview.candidates.iter().filter(|entry| !entry.ignored);
     let mut captured = tree.entries.iter();
     // Both the bound scan and the canonical tree sort by path bytes.
     loop {
-        let entry = match (scanned_paths.next(), captured.next().transpose()?) {
+        let (candidate, entry) = match (scanned.next(), captured.next().transpose()?) {
             (None, None) => return Ok(()),
-            (Some(path), Some(entry)) if path == entry.path => entry,
+            (Some(candidate), Some(entry)) if candidate.input_path == entry.path => {
+                (candidate, entry)
+            }
             _ => {
                 return Err(pipeline_to_kio(kio_pipeline::PipelineError::contract(
                     "KIO-E-SCAN-INPUT-CHANGED-001",
@@ -1823,9 +1824,10 @@ fn verify_snapshot_inputs(
                 )));
             }
         };
-        if classified_raws
-            .get(&entry.path)
-            .is_some_and(|raw_hash| raw_hash != &entry.raw_hash)
+        if candidate.raw_hash.as_deref() != Some(entry.raw_hash.as_str())
+            || classified_raws
+                .get(&entry.path)
+                .is_some_and(|raw_hash| raw_hash != &entry.raw_hash)
         {
             return Err(pipeline_to_kio(kio_pipeline::PipelineError::contract(
                 "KIO-E-SCAN-INPUT-CHANGED-001",
@@ -1963,17 +1965,11 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
         &repo,
         ScanPreviewRequest {
             scope_path: repo.root().display().to_string(),
-            include_raw_hashes: false,
+            include_raw_hashes: true,
             require_network_approval: false,
         },
     )
     .map_err(pipeline_to_kio)?;
-    let excluded = closing_preview
-        .candidates
-        .iter()
-        .filter(|candidate| candidate.ignored)
-        .map(|candidate| candidate.input_path.clone())
-        .collect::<BTreeSet<_>>();
     let explicitly_allowed_tier_a = explicitly_allowed_tier_a_paths(&closing_preview);
     let classified = record_reindex_unsupported_inputs(&repo, &closing_preview, &tree)?;
     let mut normalize_by_path = BTreeMap::new();
@@ -2060,7 +2056,7 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
     let outcome = repo.auto_snapshot_with_bound_normalize(
         Some("kio reindex --force"),
         None,
-        &excluded,
+        &|path| scan_includes_path(&closing_preview, path),
         &normalize_by_path,
         &explicitly_allowed_tier_a,
         Some(&|tree| {
