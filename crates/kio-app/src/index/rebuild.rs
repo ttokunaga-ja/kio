@@ -5,7 +5,7 @@ use crate::embedding_owners;
 use crate::embedding_owners::RetainedEmbeddingChunk;
 use crate::grants;
 use crate::historical_reindex::RetainedNormalizedInstance;
-use crate::historical_reindex::pinned_done_units;
+use crate::historical_reindex::pinned_manifest;
 use crate::historical_reindex::retained_history_instances_for_roots;
 use crate::index::chunk_ledger::ChunkPublicationEvent;
 use crate::index::chunk_ledger::StoredChunk;
@@ -15,10 +15,10 @@ use crate::index::chunk_ledger::chunks_jsonl_path;
 use crate::index::chunk_ledger::open_chunk_ledger_dir;
 use crate::index::chunk_ledger::persist_chunk_object;
 use crate::index::chunk_ledger::read_chunk_publication_events;
-use crate::index::chunk_ledger::read_stored_chunks;
 use crate::index::chunk_ledger::sqlite_path;
 use crate::index::chunk_ledger::sync_chunk_ledger_dir;
 use crate::index::chunk_ledger::truncate_torn_chunk_tail;
+use crate::index::chunk_ledger::visit_stored_chunks;
 use crate::invocation::Invocation;
 use crate::object_persistence::index_to_kio;
 use crate::object_persistence::pipeline_to_kio;
@@ -56,6 +56,10 @@ use kio_index::embedding_store;
 use kio_index::fts::FtsSchemaConfig;
 use kio_index::fts::FtsTokenizer;
 use kio_index::fts::SqliteFtsIndex;
+use kio_pipeline::markdownize::{
+    NormalizedInstanceIdentity, NormalizedInstanceManifest, NormalizedUnitManifestEntry,
+    UnitStatus, read_validated_normalized_unit, visit_validated_normalized_units,
+};
 use kio_pipeline::task::EmbeddingWorkKey;
 use kio_pipeline::task::TaskStatus;
 use kio_pipeline::task::TaskStore;
@@ -100,8 +104,64 @@ pub(crate) type NormalizedUnitKey = (String, String, u64, String, String);
 
 #[derive(Debug, Clone)]
 pub(crate) struct AuthenticatedNormalizedUnit {
-    pub(crate) markdown: String,
+    pub(crate) text: UnitText,
     pub(crate) introductions: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum UnitText {
+    Inline(String),
+    Pinned {
+        entry: Box<NormalizedUnitManifestEntry>,
+        reader: std::sync::Arc<PinnedUnitReader>,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) struct PinnedUnitReader {
+    store: kio_core::cas::ObjectStore,
+    cached: std::sync::Mutex<Option<(String, std::sync::Arc<str>)>>,
+}
+
+impl PinnedUnitReader {
+    pub(crate) fn new(repo: &Repository) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            store: repo.object_store(),
+            cached: std::sync::Mutex::new(None),
+        })
+    }
+
+    fn markdown(
+        &self,
+        row: &ChunkRow,
+        entry: &NormalizedUnitManifestEntry,
+    ) -> Result<std::sync::Arc<str>> {
+        let mut cache = self
+            .cached
+            .lock()
+            .map_err(|_| KioError::schema("pinned unit reader lock poisoned"))?;
+        let pin = entry.unit_object_hash.as_ref().expect("validated unit pin");
+        if let Some((hash, markdown)) = cache.as_ref()
+            && hash == pin
+        {
+            return Ok(markdown.clone());
+        }
+        let identity = NormalizedInstanceIdentity {
+            raw_hash: row.raw_hash.clone(),
+            tool_profile_hash: row.tool_profile_hash.clone(),
+            r#gen: row.r#gen,
+        };
+        let unit = read_validated_normalized_unit(&self.store, &identity, entry)
+            .map_err(pipeline_to_kio)?;
+        if kio_core::cas::hash_bytes(unit.markdown.as_bytes()) != row.unit_content_hash {
+            return Err(KioError::schema(
+                "pinned normalized unit content hash does not match chunk row",
+            ));
+        }
+        let markdown: std::sync::Arc<str> = unit.markdown.into();
+        *cache = Some((pin.clone(), markdown.clone()));
+        Ok(markdown)
+    }
 }
 
 pub(crate) type AuthenticatedNormalizedUnits =
@@ -112,51 +172,68 @@ pub(crate) fn retained_unit_introductions(
     retained_instances: &[RetainedNormalizedInstance],
 ) -> Result<AuthenticatedNormalizedUnits> {
     let mut units = AuthenticatedNormalizedUnits::new();
+    let reader = PinnedUnitReader::new(repo);
     for instance in retained_instances {
-        let done = match pinned_done_units(repo, &instance.raw_hash, &instance.normalize) {
-            Ok(done) => done,
-            Err(error) => {
-                if verify_objects::purge_explains_missing_retained_instance(
-                    repo,
-                    &instance.raw_hash,
-                    &instance.normalize,
-                )? {
-                    continue;
-                }
-                return Err(error);
+        let loaded = append_pinned_unit_authorities(
+            repo,
+            &instance.raw_hash,
+            &instance.normalize,
+            &instance.introductions,
+            &reader,
+            &mut units,
+        );
+        if let Err(error) = loaded {
+            if verify_objects::purge_explains_missing_retained_instance(
+                repo,
+                &instance.raw_hash,
+                &instance.normalize,
+            )? {
+                continue;
             }
-        };
-        for unit in done {
-            let unit_content_hash = kio_core::cas::hash_bytes(unit.markdown.as_bytes());
-            let key = (
-                instance.raw_hash.clone(),
-                instance.normalize.tool_profile_hash.clone(),
-                instance.normalize.r#gen,
-                unit.unit_key,
-                unit_content_hash,
-            );
-            match units.entry(key) {
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert(AuthenticatedNormalizedUnit {
-                        markdown: unit.markdown,
-                        introductions: instance.introductions.iter().cloned().collect(),
-                    });
-                }
-                std::collections::btree_map::Entry::Occupied(mut entry) => {
-                    let existing = entry.get_mut();
-                    if existing.markdown != unit.markdown {
-                        return Err(KioError::schema(
-                            "normalized units with the same immutable identity have different markdown",
-                        ));
-                    }
-                    existing
-                        .introductions
-                        .extend(instance.introductions.iter().cloned());
-                }
-            }
+            return Err(error);
         }
     }
     Ok(units)
+}
+
+pub(crate) fn append_pinned_unit_authorities(
+    repo: &Repository,
+    raw_hash: &str,
+    normalize: &NormalizeRef,
+    introductions: &[String],
+    reader: &std::sync::Arc<PinnedUnitReader>,
+    units: &mut AuthenticatedNormalizedUnits,
+) -> Result<()> {
+    let manifest = pinned_manifest(repo, raw_hash, normalize)?;
+    let entries = manifest
+        .units
+        .iter()
+        .map(|entry| (entry.unit_key.as_str(), entry))
+        .collect::<BTreeMap<_, _>>();
+    visit_validated_normalized_units(&reader.store, &manifest, |unit| {
+        let key = (
+            raw_hash.to_owned(),
+            normalize.tool_profile_hash.clone(),
+            normalize.r#gen,
+            unit.unit_key.clone(),
+            kio_core::cas::hash_bytes(unit.markdown.as_bytes()),
+        );
+        let authority = units
+            .entry(key)
+            .or_insert_with(|| AuthenticatedNormalizedUnit {
+                text: UnitText::Pinned {
+                    entry: Box::new(entries[unit.unit_key.as_str()].clone()),
+                    reader: reader.clone(),
+                },
+                introductions: BTreeSet::new(),
+            });
+        authority
+            .introductions
+            .extend(introductions.iter().cloned());
+        Ok(())
+    })
+    .map_err(pipeline_to_kio)?;
+    Ok(())
 }
 
 pub(crate) fn unit_authorities_from_inputs(
@@ -174,7 +251,7 @@ pub(crate) fn unit_authorities_from_inputs(
                     unit.unit_content_hash.clone(),
                 ),
                 AuthenticatedNormalizedUnit {
-                    markdown: unit.markdown.clone(),
+                    text: UnitText::Inline(unit.markdown.clone()),
                     introductions: BTreeSet::new(),
                 },
             )
@@ -199,25 +276,35 @@ pub(crate) fn authenticate_chunk_row(
     let unit = units.get(&key).ok_or_else(|| {
         KioError::schema("chunk row identity is not present in a pinned normalized unit")
     })?;
-    if kio_core::cas::hash_bytes(unit.markdown.as_bytes()) != row.unit_content_hash {
-        return Err(KioError::schema(
-            "pinned normalized unit content hash does not match chunk row",
-        ));
-    }
+    let retained;
+    let markdown = match &unit.text {
+        UnitText::Inline(markdown) => {
+            if kio_core::cas::hash_bytes(markdown.as_bytes()) != row.unit_content_hash {
+                return Err(KioError::schema(
+                    "pinned normalized unit content hash does not match chunk row",
+                ));
+            }
+            markdown.as_str()
+        }
+        UnitText::Pinned { entry, reader } => {
+            retained = reader.markdown(row, entry)?;
+            retained.as_ref()
+        }
+    };
     let start = usize::try_from(row.byte_start)
         .map_err(|_| KioError::schema("chunk byte_start does not fit this platform"))?;
     let end = usize::try_from(row.byte_end)
         .map_err(|_| KioError::schema("chunk byte_end does not fit this platform"))?;
     if start > end
-        || end > unit.markdown.len()
-        || !unit.markdown.is_char_boundary(start)
-        || !unit.markdown.is_char_boundary(end)
+        || end > markdown.len()
+        || !markdown.is_char_boundary(start)
+        || !markdown.is_char_boundary(end)
     {
         return Err(KioError::schema(
             "chunk row byte range is not a UTF-8 boundary within its pinned normalized unit",
         ));
     }
-    if unit.markdown[start..end] != row.text {
+    if markdown[start..end] != row.text {
         return Err(KioError::schema(
             "chunk row text is not the exact pinned normalized-unit markdown slice",
         ));
@@ -238,11 +325,23 @@ pub(crate) fn authenticate_chunk_row(
 /// Current refs plus authenticated publication introductions, all constrained
 /// to the sole published HEAD ancestry. Ledger associations cannot publish a
 /// detached CAS commit or recover a different HEAD implicitly.
+fn read_creation_metadata(kio_dir: &Path) -> Result<Vec<StoredChunk>> {
+    let mut entries = Vec::new();
+    visit_stored_chunks(kio_dir, |mut chunk| {
+        // Publication and allocation use row identities only. The text was
+        // authenticated while parsing and is read again only for SQLite replay.
+        chunk.row.text = String::new();
+        entries.push(chunk);
+        Ok(())
+    })?;
+    Ok(entries)
+}
+
 pub(crate) fn durable_history_roots(repo: &Repository) -> Result<BTreeSet<String>> {
     let ref_roots = repo.current_ref_targets()?;
     let mut roots = ref_roots.clone();
     let final_shallow_commits = final_shallow_commit_set(repo)?;
-    let creations = read_stored_chunks(repo.kio_dir())?;
+    let creations = read_creation_metadata(repo.kio_dir())?;
     let events = read_chunk_publication_events(repo.kio_dir())?;
     // Events are append-only and may name the same association repeatedly. Keep
     // the first creation record, matching the previous linear lookup semantics,
@@ -301,6 +400,45 @@ fn final_shallow_commit_set(repo: &Repository) -> Result<BTreeSet<String>> {
         .collect())
 }
 
+fn checked_chunking_manifest(
+    repo: &Repository,
+    raw_hash: &str,
+    normalize: &NormalizeRef,
+) -> Result<NormalizedInstanceManifest> {
+    let manifest = pinned_manifest(repo, raw_hash, normalize)?;
+    visit_validated_normalized_units(&repo.object_store(), &manifest, |_| Ok(()))
+        .map_err(pipeline_to_kio)?;
+    Ok(manifest)
+}
+
+fn chunk_inputs<'a>(
+    store: &'a kio_core::cas::ObjectStore,
+    manifest: &'a NormalizedInstanceManifest,
+) -> impl Iterator<Item = Result<NormalizedUnitInput>> + 'a {
+    let identity = NormalizedInstanceIdentity {
+        raw_hash: manifest.raw_hash.clone(),
+        tool_profile_hash: manifest.tool_profile_hash.clone(),
+        r#gen: manifest.r#gen,
+    };
+    manifest
+        .units
+        .iter()
+        .filter(|entry| entry.status == UnitStatus::Done)
+        .map(move |entry| {
+            let unit =
+                read_validated_normalized_unit(store, &identity, entry).map_err(pipeline_to_kio)?;
+            let unit_content_hash = kio_core::cas::hash_bytes(unit.markdown.as_bytes());
+            Ok(NormalizedUnitInput {
+                raw_hash: unit.raw_hash,
+                tool_profile_hash: unit.tool_profile_hash,
+                r#gen: unit.r#gen,
+                unit_key: unit.unit_key,
+                unit_content_hash,
+                markdown: unit.markdown,
+            })
+        })
+}
+
 pub(crate) fn rebuild_step3_index(
     ctx: &Invocation<'_>,
     repo: &Repository,
@@ -317,7 +455,7 @@ pub(crate) fn rebuild_step3_index(
         .as_deref()
         .map(|head| read_head_tree_for_rebuild(repo, head))
         .transpose()?;
-    let existing = read_stored_chunks(repo.kio_dir())
+    let existing = read_creation_metadata(repo.kio_dir())
         .map_err(|error| annotate_index_stage(error, "read chunk ledger"))?;
     let rebuild_roots = durable_history_roots(repo)
         .map_err(|error| annotate_index_stage(error, "authenticate history roots"))?;
@@ -453,6 +591,7 @@ pub(crate) fn rebuild_step3_index(
         .unwrap_or(0)
         + 1;
     let mut appended = Vec::<StoredChunk>::new();
+    let mut appended_count = 0u64;
     let mut pending_publication_events = Vec::<ChunkPublicationEvent>::new();
     // R16-4: documents whose normalized units are missing/corrupt are skipped and
     // reported here rather than aborting the whole rebuild (docs/10 §7.2: "最悪
@@ -487,72 +626,67 @@ pub(crate) fn rebuild_step3_index(
         // manifest is the only authority for which same-gen units existed at
         // this retained introduction; otherwise a later failed→done retry can
         // back-publish its chunk into an older snapshot.
-        let units = match pinned_done_units(repo, &retained.raw_hash, &retained.normalize) {
-            Ok(units) => units
-                .into_iter()
-                .map(|unit| {
-                    let unit_content_hash = kio_core::cas::hash_bytes(unit.markdown.as_bytes());
-                    Ok(NormalizedUnitInput {
-                        raw_hash: unit.raw_hash,
-                        tool_profile_hash: unit.tool_profile_hash,
-                        r#gen: unit.r#gen,
-                        unit_key: unit.unit_key,
-                        unit_content_hash,
-                        markdown: unit.markdown,
-                    })
-                })
-                .collect::<Result<Vec<_>>>(),
-            Err(error) => {
-                if verify_objects::purge_explains_missing_retained_instance(
-                    repo,
-                    &retained.raw_hash,
-                    &retained.normalize,
-                )? {
+        let manifest =
+            match checked_chunking_manifest(repo, &retained.raw_hash, &retained.normalize) {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    if verify_objects::purge_explains_missing_retained_instance(
+                        repo,
+                        &retained.raw_hash,
+                        &retained.normalize,
+                    )? {
+                        continue;
+                    }
+                    if !is_rebuild_skippable_unit_error(&error) {
+                        return Err(error);
+                    }
+                    skipped_units.push(SkippedUnit {
+                        raw_hash: retained.raw_hash.clone(),
+                        path: retained.raw_path.clone(),
+                        r#gen: retained.normalize.r#gen,
+                        reason: error.error_code().to_owned(),
+                    });
                     continue;
                 }
-                if !is_rebuild_skippable_unit_error(&error) {
-                    return Err(error);
+            };
+        let store = repo.object_store();
+        for unit in chunk_inputs(&store, &manifest) {
+            let input = ChunkingInput {
+                raw_path: retained.raw_path.clone(),
+                units: vec![unit?],
+                config: config.clone(),
+                created_at: ctx.control.now_utc_seconds(),
+            };
+            let unit_authorities = unit_authorities_from_inputs(&input.units);
+            for row in chunk_normalized_instance(input).map_err(index_to_kio)? {
+                let chunk_id = row.chunk_id.clone();
+                let chunking_config_hash = row.chunking_config_hash.clone();
+                let outcome = append_new_chunk_association(
+                    repo,
+                    row,
+                    &mut known_associations,
+                    &mut chunk_rowids,
+                    &mut next_rowid,
+                    &mut next_association_rowid,
+                    &mut appended,
+                    &unit_authorities,
+                )?;
+                if outcome == AssociationAppend::Created
+                    && head_identity_keys.contains(&identity_key)
+                    && let Some(introduction_commit) = head.as_ref()
+                {
+                    pending_publication_events.push(ChunkPublicationEvent {
+                        event: "publication".to_owned(),
+                        chunk_id,
+                        chunking_config_hash,
+                        introduction_commit: introduction_commit.clone(),
+                    });
                 }
-                skipped_units.push(SkippedUnit {
-                    raw_hash: retained.raw_hash.clone(),
-                    path: retained.raw_path.clone(),
-                    r#gen: retained.normalize.r#gen,
-                    reason: error.error_code().to_owned(),
-                });
-                continue;
             }
-        };
-        let input = ChunkingInput {
-            raw_path: retained.raw_path.clone(),
-            units: units?,
-            config: config.clone(),
-            created_at: ctx.control.now_utc_seconds(),
-        };
-        let unit_authorities = unit_authorities_from_inputs(&input.units);
-        for row in chunk_normalized_instance(input).map_err(index_to_kio)? {
-            let chunk_id = row.chunk_id.clone();
-            let chunking_config_hash = row.chunking_config_hash.clone();
-            let outcome = append_new_chunk_association(
-                repo,
-                row,
-                &mut known_associations,
-                &mut chunk_rowids,
-                &mut next_rowid,
-                &mut next_association_rowid,
-                &mut appended,
-                &unit_authorities,
-            )?;
-            if outcome == AssociationAppend::Created
-                && head_identity_keys.contains(&identity_key)
-                && let Some(introduction_commit) = head.as_ref()
-            {
-                pending_publication_events.push(ChunkPublicationEvent {
-                    event: "publication".to_owned(),
-                    chunk_id,
-                    chunking_config_hash,
-                    introduction_commit: introduction_commit.clone(),
-                });
-            }
+            appended_count += appended.len() as u64;
+            append_stored_chunks(repo.kio_dir(), &appended)
+                .map_err(|error| annotate_index_stage(error, "append chunk creations"))?;
+            appended.clear();
         }
     }
 
@@ -575,21 +709,8 @@ pub(crate) fn rebuild_step3_index(
         )) {
             continue;
         }
-        let units = match pinned_done_units(repo, &entry.raw_hash, &normalize) {
-            Ok(units) => units
-                .into_iter()
-                .map(|unit| {
-                    let unit_content_hash = kio_core::cas::hash_bytes(unit.markdown.as_bytes());
-                    Ok(NormalizedUnitInput {
-                        raw_hash: unit.raw_hash,
-                        tool_profile_hash: unit.tool_profile_hash,
-                        r#gen: unit.r#gen,
-                        unit_key: unit.unit_key,
-                        unit_content_hash,
-                        markdown: unit.markdown,
-                    })
-                })
-                .collect::<Result<Vec<_>>>(),
+        let manifest = match checked_chunking_manifest(repo, &entry.raw_hash, &normalize) {
+            Ok(manifest) => manifest,
             // A single document's missing/corrupt normalized instance (STORE-IO /
             // STORE-CORRUPT) is skipped so the rest of the scope still rebuilds; its
             // tree_entries row is kept (the tree structure is faithful — the document
@@ -606,41 +727,46 @@ pub(crate) fn rebuild_step3_index(
             }
             Err(error) => return Err(error),
         };
-        let input = ChunkingInput {
-            raw_path: entry.path.clone(),
-            units: units?,
-            config: config.clone(),
-            created_at: ctx.control.now_utc_seconds(),
-        };
-        let unit_authorities = unit_authorities_from_inputs(&input.units);
-        for row in chunk_normalized_instance(input).map_err(index_to_kio)? {
-            let chunk_id = row.chunk_id.clone();
-            let chunking_config_hash = row.chunking_config_hash.clone();
-            if append_new_chunk_association(
-                repo,
-                row,
-                &mut known_associations,
-                &mut chunk_rowids,
-                &mut next_rowid,
-                &mut next_association_rowid,
-                &mut appended,
-                &unit_authorities,
-            )? == AssociationAppend::Created
-            {
-                pending_publication_events.push(ChunkPublicationEvent {
-                    event: "publication".to_owned(),
-                    chunk_id,
-                    chunking_config_hash,
-                    introduction_commit: head
-                        .clone()
-                        .expect("a working-tree loop requires a non-empty HEAD"),
-                });
+        let store = repo.object_store();
+        for unit in chunk_inputs(&store, &manifest) {
+            let input = ChunkingInput {
+                raw_path: entry.path.clone(),
+                units: vec![unit?],
+                config: config.clone(),
+                created_at: ctx.control.now_utc_seconds(),
+            };
+            let unit_authorities = unit_authorities_from_inputs(&input.units);
+            for row in chunk_normalized_instance(input).map_err(index_to_kio)? {
+                let chunk_id = row.chunk_id.clone();
+                let chunking_config_hash = row.chunking_config_hash.clone();
+                if append_new_chunk_association(
+                    repo,
+                    row,
+                    &mut known_associations,
+                    &mut chunk_rowids,
+                    &mut next_rowid,
+                    &mut next_association_rowid,
+                    &mut appended,
+                    &unit_authorities,
+                )? == AssociationAppend::Created
+                {
+                    pending_publication_events.push(ChunkPublicationEvent {
+                        event: "publication".to_owned(),
+                        chunk_id,
+                        chunking_config_hash,
+                        introduction_commit: head
+                            .clone()
+                            .expect("a working-tree loop requires a non-empty HEAD"),
+                    });
+                }
             }
+            appended_count += appended.len() as u64;
+            append_stored_chunks(repo.kio_dir(), &appended)
+                .map_err(|error| annotate_index_stage(error, "append chunk creations"))?;
+            appended.clear();
         }
     }
 
-    append_stored_chunks(repo.kio_dir(), &appended)
-        .map_err(|error| annotate_index_stage(error, "append chunk creations"))?;
     // A creation record proves only that the chunk/config association is
     // durable.  Publication is a separate fact: every retained manifest
     // introduction that authenticates this exact immutable unit must be
@@ -671,7 +797,7 @@ pub(crate) fn rebuild_step3_index(
     )
     .map_err(|error| annotate_index_stage(error, "rebuild source index"))?;
     Ok(Step3RebuildReport {
-        rebuilt_chunks: appended.len() as u64,
+        rebuilt_chunks: appended_count,
         rebuilt_tree_entries: tree_entries.len() as u64,
         skipped_units,
     })
@@ -698,7 +824,7 @@ fn stage_retained_unit_publication_events(
 ) -> Result<()> {
     let mut authentication_cache = PublicationAuthenticationCache::default();
     let mut introduction_configs = BTreeMap::<String, Option<String>>::new();
-    for creation in read_stored_chunks(kio_dir)? {
+    visit_stored_chunks(kio_dir, |creation| {
         let identity = (
             creation.row.raw_hash.clone(),
             creation.row.tool_profile_hash.clone(),
@@ -707,7 +833,7 @@ fn stage_retained_unit_publication_events(
             creation.row.unit_content_hash.clone(),
         );
         let Some(unit) = retained_units.get(&identity) else {
-            continue;
+            return Ok(());
         };
         // The JSONL record is only an acceleration ledger.  Do not let it
         // mint a durable root unless its exact row is authenticated by a
@@ -749,7 +875,8 @@ fn stage_retained_unit_publication_events(
                 pending.push(event);
             }
         }
-    }
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -866,7 +993,7 @@ pub(crate) fn is_rebuild_skippable_unit_error(error: &KioError) -> bool {
 /// gen, leaving only DEAD old-gen chunks that must NOT read as live.
 pub(crate) fn skipped_disclosure(report: &Step3RebuildReport, kio_dir: &Path) -> SkippedDisclosure {
     // Best-effort: an unreadable ledger conservatively makes every skip unsearchable.
-    let live: BTreeSet<(String, u64)> = read_stored_chunks(kio_dir)
+    let live: BTreeSet<(String, u64)> = read_creation_metadata(kio_dir)
         .unwrap_or_default()
         .into_iter()
         .map(|chunk| (chunk.row.raw_hash, chunk.row.r#gen))
@@ -1426,15 +1553,16 @@ pub(crate) fn authenticate_publication_event_cached(
             normalize.manifest_hash.clone(),
         );
         if !cache.pinned_unit_closures.contains_key(&unit_key) {
-            let closure = pinned_done_units(repo, &creation.row.raw_hash, &normalize)?
-                .into_iter()
-                .map(|unit| {
-                    (
-                        unit.unit_key,
-                        kio_core::cas::hash_bytes(unit.markdown.as_bytes()),
-                    )
-                })
-                .collect();
+            let manifest = pinned_manifest(repo, &creation.row.raw_hash, &normalize)?;
+            let mut closure = BTreeSet::new();
+            visit_validated_normalized_units(&repo.object_store(), &manifest, |unit| {
+                closure.insert((
+                    unit.unit_key,
+                    kio_core::cas::hash_bytes(unit.markdown.as_bytes()),
+                ));
+                Ok(())
+            })
+            .map_err(pipeline_to_kio)?;
             cache.pinned_unit_closures.insert(unit_key.clone(), closure);
         }
         if cache
@@ -1498,22 +1626,10 @@ fn build_sqlite_index_at(
     let mut live_chunk_ids = BTreeSet::new();
     let mut live_associations = BTreeSet::new();
     let durable_publications = read_chunk_publication_events(kio_dir)?;
-    let stored_chunks = read_stored_chunks(kio_dir)?;
-    let stored_chunks_by_association = stored_chunks
-        .iter()
-        .map(|chunk| {
-            (
-                (
-                    chunk.row.chunk_id.clone(),
-                    chunk.row.chunking_config_hash.clone(),
-                ),
-                chunk.clone(),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    for chunk in stored_chunks {
+    let mut stored_chunks_by_association = BTreeMap::new();
+    visit_stored_chunks(kio_dir, |mut chunk| {
         if purge_blocks_rebuild_raw(kio_dir, &chunk.row.raw_hash, repository.control())? {
-            continue;
+            return Ok(());
         }
         let identity = (
             chunk.row.raw_hash.clone(),
@@ -1526,7 +1642,7 @@ fn build_sqlite_index_at(
             // A durable chunk ledger is not a historical authority. This unit
             // is absent or non-Done in every manifest pinned by a current ref,
             // so replaying its old row would back-publish stale content.
-            continue;
+            return Ok(());
         };
         authenticate_chunk_row(&chunk.row, retained_unit_introductions)?;
         live_chunk_ids.insert(chunk.row.chunk_id.clone());
@@ -1540,7 +1656,16 @@ fn build_sqlite_index_at(
         // matching authenticated tagged event below.
         fts.index_chunk_with_rowids(&chunk.row, Some(chunk.rowid), Some(chunk.association_rowid))
             .map_err(index_to_kio)?;
-    }
+        chunk.row.text = String::new();
+        stored_chunks_by_association.insert(
+            (
+                chunk.row.chunk_id.clone(),
+                chunk.row.chunking_config_hash.clone(),
+            ),
+            chunk,
+        );
+        Ok(())
+    })?;
     // Replay event triples only after all creation associations received their
     // durable explicit rowids.  Event rows intentionally use SQLite's auto
     // rowid; doing this inside the loop could occupy a future explicit rowid.
@@ -1612,13 +1737,17 @@ fn build_sqlite_index_at(
         )?,
         None => false,
     };
-    let retained_embedding_chunks = embedding_owners::collect_retained_embedding_chunks(
-        repository,
-        fts.connection(),
-        retained_instances,
-        None,
-        None,
-    )?;
+    let retained_embedding_chunks = if expected_embedding_profile.is_some() {
+        embedding_owners::collect_retained_embedding_chunks(
+            repository,
+            fts.connection(),
+            retained_instances,
+            None,
+            None,
+        )?
+    } else {
+        Vec::new()
+    };
     let embedding_policy = current_embedding_policy(repository)?;
     let selected_contexts =
         selected_embedding_contexts(&retained_embedding_chunks, &embedding_policy)?;

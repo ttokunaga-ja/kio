@@ -37,6 +37,17 @@ pub enum DurabilityPoint {
     LedgerBackupProof,
     LedgerRestoreJournal,
     LedgerRestoreDatabase,
+    ExtractionCasPublished,
+    ExtractionUnitReady,
+    ExtractionViewReady,
+    ExtractionStageWriting,
+    ExtractionBeforeManifest,
+    ExtractionBeforeHead,
+    StageCaptureRecordWriting,
+    ExtractionManifestRenamed,
+    ExtractionBeforeDestinationSync,
+    ExtractionAfterHead,
+    ExtractionBeforeRetirementCleanup,
     StageCaptured,
     StageFileCreated,
     AtomicWriteStaged,
@@ -83,6 +94,17 @@ impl DurabilityPoint {
             "ledger_backup_proof" => Some(Self::LedgerBackupProof),
             "ledger_restore_journal" => Some(Self::LedgerRestoreJournal),
             "ledger_restore_database" => Some(Self::LedgerRestoreDatabase),
+            "extraction_cas_published" => Some(Self::ExtractionCasPublished),
+            "extraction_unit_ready" => Some(Self::ExtractionUnitReady),
+            "extraction_view_ready" => Some(Self::ExtractionViewReady),
+            "extraction_stage_writing" => Some(Self::ExtractionStageWriting),
+            "extraction_before_manifest" => Some(Self::ExtractionBeforeManifest),
+            "extraction_before_head" => Some(Self::ExtractionBeforeHead),
+            "stage_capture_record_writing" => Some(Self::StageCaptureRecordWriting),
+            "extraction_manifest_renamed" => Some(Self::ExtractionManifestRenamed),
+            "extraction_before_destination_sync" => Some(Self::ExtractionBeforeDestinationSync),
+            "extraction_after_head" => Some(Self::ExtractionAfterHead),
+            "extraction_before_retirement_cleanup" => Some(Self::ExtractionBeforeRetirementCleanup),
             "stage_captured" => Some(Self::StageCaptured),
             "stage_file_created" => Some(Self::StageFileCreated),
             "atomic_write_staged" => Some(Self::AtomicWriteStaged),
@@ -130,6 +152,17 @@ impl DurabilityPoint {
             Self::LedgerBackupProof => "ledger_backup_proof",
             Self::LedgerRestoreJournal => "ledger_restore_journal",
             Self::LedgerRestoreDatabase => "ledger_restore_database",
+            Self::ExtractionCasPublished => "extraction_cas_published",
+            Self::ExtractionUnitReady => "extraction_unit_ready",
+            Self::ExtractionViewReady => "extraction_view_ready",
+            Self::ExtractionStageWriting => "extraction_stage_writing",
+            Self::ExtractionBeforeManifest => "extraction_before_manifest",
+            Self::ExtractionBeforeHead => "extraction_before_head",
+            Self::StageCaptureRecordWriting => "stage_capture_record_writing",
+            Self::ExtractionManifestRenamed => "extraction_manifest_renamed",
+            Self::ExtractionBeforeDestinationSync => "extraction_before_destination_sync",
+            Self::ExtractionAfterHead => "extraction_after_head",
+            Self::ExtractionBeforeRetirementCleanup => "extraction_before_retirement_cleanup",
             Self::StageCaptured => "stage_captured",
             Self::StageFileCreated => "stage_file_created",
             Self::AtomicWriteStaged => "atomic_write_staged",
@@ -176,8 +209,28 @@ fn checkpoint_debug(owner: &crate::control::ControlHandle, point: DurabilityPoin
     use std::time::{Duration, Instant};
 
     let control = &owner.debug().core;
-    if control.durability_point.known() != Some(&point) {
+    let extraction_write_fault = control.extraction_write_fault_before_head
+        && point == DurabilityPoint::ExtractionStageWriting;
+    if !extraction_write_fault && control.durability_point.known() != Some(&point) {
         return Ok(());
+    }
+    if extraction_write_fault
+        || (control.durability_storage_fault
+            && matches!(
+                point,
+                DurabilityPoint::ExtractionStageWriting
+                    | DurabilityPoint::ExtractionBeforeManifest
+                    | DurabilityPoint::ExtractionBeforeDestinationSync
+            ))
+    {
+        return Err(crate::error::ResourceLimit {
+            resource: crate::error::Resource::Storage,
+            stage: "private_stage".to_owned(),
+            limit: None,
+            observed: None,
+            resource_tier: None,
+        }
+        .into_error(format!("injected storage failure at {}", point.name())));
     }
     let Some(ready_path) = &control.durability_ready else {
         return Ok(());

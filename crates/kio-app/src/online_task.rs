@@ -33,6 +33,7 @@ pub(crate) fn targets_standard_online_markdownize(
         // pipeline's task must not be picked up by any of them.
         Ok(
             TaskOutputRef::Offline { .. }
+            | TaskOutputRef::ExtractionHold
             | TaskOutputRef::Embedding { .. }
             | TaskOutputRef::ImageEmbedding { .. }
             | TaskOutputRef::QueryEmbedding { .. },

@@ -284,8 +284,17 @@ fn run_repair_with_reads(
             completion,
         });
     }
-    let (response, completion) =
-        run_rebuild_db_locked(ctx, &repo, parsed.online, parsed.offline, true)?;
+    let RepairOperation::RebuildDb(rebuild) = &args.operation else {
+        unreachable!("repair rebuild-db after operation dispatch");
+    };
+    let (response, completion) = run_rebuild_db_locked(
+        ctx,
+        &repo,
+        parsed.online,
+        parsed.offline,
+        true,
+        rebuild.resource_tier,
+    )?;
     Ok(CommandResponse {
         body: ResponseBody::Repair(RepairResponse::RebuildDb(response)),
         completion,
@@ -301,6 +310,7 @@ fn run_rebuild_db_locked(
     online_requested: bool,
     offline: bool,
     poll_remote_jobs: bool,
+    resource_tier: kio_core::error::ResourceTier,
 ) -> Result<(RepairRebuildResponse, Completion)> {
     let adapter_settings = ctx.settings;
     let markdown_ready =
@@ -362,6 +372,7 @@ fn run_rebuild_db_locked(
         &store,
         crate::batch::command::recheck_resource_limit,
     )?;
+    crate::index::pipeline::retry_local_extractions(ctx, repo, &store, resource_tier)?;
     let report = rebuild_step3_index(ctx, repo)?;
     // LC42-LC44 (item 2), same ordering rationale as `run_index`'s call.
     recover_index_generation(repo.kio_dir(), repo.control())?;
@@ -750,7 +761,14 @@ fn run_one_device_repair(
                 ExitCode::PartialFailure,
             ));
         }
-        let (result, completion) = run_rebuild_db_locked(ctx, repo, false, true, false)?;
+        let (result, completion) = run_rebuild_db_locked(
+            ctx,
+            repo,
+            false,
+            true,
+            false,
+            kio_core::error::ResourceTier::Standard,
+        )?;
         // This branch consumes completion as an error classification, retaining the original error context body.
         let exit = match completion {
             Completion::Complete => None,

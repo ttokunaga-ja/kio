@@ -317,6 +317,28 @@ pub(crate) fn rename_regular_between_raw(
     source_label: &Path,
     destination_label: &Path,
 ) -> Result<()> {
+    rename_regular_between_unsynced(
+        source_parent,
+        source_leaf,
+        destination_parent,
+        destination_leaf,
+        publication,
+        source_label,
+        destination_label,
+    )?;
+    sync_directory(destination_parent, destination_label)?;
+    sync_directory(source_parent, source_label)
+}
+
+pub(crate) fn rename_regular_between_unsynced(
+    source_parent: &File,
+    source_leaf: &Path,
+    destination_parent: &File,
+    destination_leaf: &Path,
+    publication: Publication,
+    source_label: &Path,
+    destination_label: &Path,
+) -> Result<()> {
     let source = direct_leaf(source_leaf, source_label)?;
     let destination = direct_leaf(destination_leaf, destination_label)?;
     let source_path = source_label.join(source);
@@ -402,8 +424,7 @@ pub(crate) fn rename_regular_between_raw(
             "published regular-file identity changed",
         ));
     }
-    sync_directory(source_parent, source_label)?;
-    sync_directory(destination_parent, destination_label)
+    Ok(())
 }
 fn rename_regular_replace(
     source_parent: &File,

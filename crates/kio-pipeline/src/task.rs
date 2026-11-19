@@ -309,8 +309,12 @@ impl EmbeddingWorkKey {
     }
 }
 
+/// A local extraction waiting for resources has no published output yet.
+pub const EXTRACTION_HOLD_OUTPUT_REF: &str = "extraction:local";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskOutputRef {
+    ExtractionHold,
     Online {
         adapter_id: String,
     },
@@ -675,6 +679,19 @@ pub fn validate_task_output_ref(
 ) -> Result<TaskOutputRef> {
     if !kio_core::cas::is_hash(&descriptor.input_hash) {
         return Err(invalid_output_ref(kio_dir.as_ref(), &descriptor.output_ref));
+    }
+    if descriptor.output_ref == EXTRACTION_HOLD_OUTPUT_REF {
+        if descriptor.task_type != TaskType::Markdownize
+            || !matches!(
+                descriptor.status,
+                TaskStatus::Paused | TaskStatus::Failed | TaskStatus::Skipped
+            )
+            || descriptor.bbox_annotation_enabled.is_some()
+            || descriptor.reservation_id.is_some()
+        {
+            return Err(invalid_output_ref(kio_dir.as_ref(), &descriptor.output_ref));
+        }
+        return Ok(TaskOutputRef::ExtractionHold);
     }
     if let Some(adapter_id) = descriptor.output_ref.strip_prefix("online:") {
         if descriptor.task_type != TaskType::Markdownize || !is_safe_logical_id(adapter_id) {

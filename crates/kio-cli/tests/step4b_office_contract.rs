@@ -389,8 +389,18 @@ fn office_03_online_send_uses_converted_pdf() {
     let fixtures = tempfile::tempdir().unwrap();
     let fixture =
         write_office_fixture_pdf(&fixtures, "fixture_c.pdf", &["office03 online send text"]);
-    write_office_input(&dir, "report.docx");
+    let prepared_size = fs::metadata(&fixture).unwrap().len();
+    fs::write(
+        dir.path().join("report.docx"),
+        vec![b'x'; prepared_size as usize + 1],
+    )
+    .unwrap();
     init(&dir);
+    fs::write(
+        dir.path().join(".kio/config.toml"),
+        format!("[adapter.policy]\nmax_input_bytes = {prepared_size}\n"),
+    )
+    .unwrap();
     kio(&dir, &["ledger", "init"]).assert().success();
 
     kio(&dir, &["index", "--yes"])
@@ -1181,4 +1191,88 @@ fn office_07_scanned_pdf_done_instance_is_not_drift() {
         "an empty fresh prepare must never drive a gen+1: {gens:?}"
     );
     assert!(gens[0].ends_with(".g0"), "{gens:?}");
+}
+
+#[test]
+fn p0_office_rejects_oversized_converted_input_before_send() {
+    let dir = canonical_tempdir();
+    let fixtures = tempfile::tempdir().unwrap();
+    let fixture =
+        write_office_fixture_pdf(&fixtures, "larger.pdf", &["converted budget boundary text"]);
+    let cap = fs::metadata(&fixture).unwrap().len() - 1;
+    fs::write(dir.path().join("report.docx"), b"small original").unwrap();
+    init(&dir);
+    fs::write(
+        dir.path().join(".kio/config.toml"),
+        format!("[adapter.policy]\nmax_input_bytes = {cap}\n"),
+    )
+    .unwrap();
+    kio(&dir, &["ledger", "init"]).assert().success();
+    kio(&dir, &["index", "--yes"])
+        .env(TEST_OFFICE_CONVERT_ENV, &fixture)
+        .env(TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "mock")
+        .assert()
+        .success();
+    kio(&dir, &["adapter", "approve", "--all", "--yes"])
+        .assert()
+        .success();
+    let capture = dir.path().join("captured-sent-media.txt");
+    kio(&dir, &["batch", "resume"])
+        .env(TEST_OFFICE_CONVERT_ENV, &fixture)
+        .env(TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "mock")
+        .env("KIO_TEST_CAPTURE_SENT_MEDIA", &capture)
+        .assert()
+        .code(4);
+    assert!(!capture.exists());
+    let status = json_success(&dir, &["status"]);
+    assert!(
+        markdownize_tasks_for(&status, "report.docx")
+            .iter()
+            .any(|task| task["status"] == "failed" && task["fallback_reason"] == "invalid_input"),
+        "{status}"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn p0_renderer_drift_storage_failure_is_resumable() {
+    let dir = canonical_tempdir();
+    let fixtures = tempfile::tempdir().unwrap();
+    let before = write_office_fixture_pdf(&fixtures, "before.pdf", &["ALPHA previous rendering"]);
+    let after = write_office_fixture_pdf(&fixtures, "after.pdf", &["BETA replacement rendering"]);
+    write_office_input(&dir, "report.docx");
+    init(&dir);
+    kio(&dir, &["index"])
+        .env(TEST_OFFICE_CONVERT_ENV, &before)
+        .assert()
+        .success();
+
+    kio(&dir, &["index"])
+        .env(TEST_OFFICE_CONVERT_ENV, &after)
+        .env("KIO_TEST_DURABILITY_POINT", "extraction_before_manifest")
+        .env("KIO_TEST_DURABILITY_STORAGE_FAULT", "1")
+        .assert()
+        .code(3);
+    assert_eq!(
+        json_success(&dir, &["status"])["paused_by_hold_reason"]["resource_limit"],
+        1
+    );
+    let units_root = dir.path().join(".kio/objects/normalized_units");
+    assert_eq!(gen_dir_names_under(&units_root).len(), 1);
+
+    kio(&dir, &["batch", "retry", "--offline"])
+        .env(TEST_OFFICE_CONVERT_ENV, &after)
+        .assert()
+        .success();
+    assert_eq!(
+        json_success(&dir, &["status"])["paused_by_hold_reason"]["resource_limit"],
+        0
+    );
+    assert_eq!(gen_dir_names_under(&units_root).len(), 2);
+    assert!(
+        !json_success(&dir, &["search", "BETA", "--mode", "text"])["results"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
 }

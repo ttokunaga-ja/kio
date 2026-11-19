@@ -485,16 +485,20 @@ pub(crate) fn check_index_generation_current(
     Ok(())
 }
 
-pub(crate) struct ParsedChunkLedger {
-    creations: Vec<(usize, StoredChunk)>,
-    events: Vec<ChunkPublicationEvent>,
-}
-
 /// Parse the append-only ledger as framed raw bytes.  Only an unterminated final
 /// frame is crash residue: every newline-terminated frame must be valid UTF-8
 /// and valid JSON.  In particular, invalid UTF-8 is never silently accepted in
 /// an earlier record.
-pub(crate) fn parse_chunk_ledger(kio_dir: &Path) -> Result<ParsedChunkLedger> {
+#[cfg(test)]
+pub(crate) fn parse_chunk_ledger(kio_dir: &Path) -> Result<()> {
+    parse_chunk_ledger_with(kio_dir, |_, _| Ok(())).map(|_| ())
+}
+
+fn parse_chunk_ledger_with(
+    kio_dir: &Path,
+    mut visit: impl FnMut(usize, StoredChunk) -> Result<()>,
+) -> Result<Vec<ChunkPublicationEvent>> {
+    use std::io::BufRead;
     let path = chunks_jsonl_path(kio_dir);
     let directory = match open_chunk_ledger_dir(kio_dir, false) {
         Ok(directory) => directory,
@@ -504,48 +508,33 @@ pub(crate) fn parse_chunk_ledger(kio_dir: &Path) -> Result<ParsedChunkLedger> {
                 Err(metadata_error) if metadata_error.kind() == std::io::ErrorKind::NotFound
             ) =>
         {
-            return Ok(ParsedChunkLedger {
-                creations: Vec::new(),
-                events: Vec::new(),
-            });
+            return Ok(Vec::new());
         }
         Err(error) => return Err(error),
     };
-    let mut file = match try_open_chunk_ledger_file(&directory, true, false, false, false) {
+    let file = match try_open_chunk_ledger_file(&directory, true, false, false, false) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ParsedChunkLedger {
-                creations: Vec::new(),
-                events: Vec::new(),
-            });
+            return Ok(Vec::new());
         }
         Err(error) => return Err(KioError::io(error.to_string(), path.display().to_string())),
     };
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?;
-    let complete_len = bytes
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map_or(0, |i| i + 1);
-    let complete = std::str::from_utf8(&bytes[..complete_len]).map_err(|error| {
-        corrupt_chunk_ledger_error(
-            &path,
-            bytes[..error.valid_up_to()]
-                .iter()
-                .filter(|b| **b == b'\n')
-                .count()
-                + 1,
-            "invalid UTF-8 in framed record",
-        )
-    })?;
-    // The bytes after the final newline are one incomplete frame.  Deliberately
-    // ignore it without decoding: it may end inside a multi-byte UTF-8 scalar.
-    let mut creations = Vec::new();
+    let mut reader = std::io::BufReader::new(file);
+    let mut frame = Vec::new();
     let mut events = Vec::new();
     let mut event_keys = BTreeSet::new();
     let mut created_pairs = BTreeSet::new();
-    for (line_no, line) in complete.lines().enumerate() {
+    for line_no in 0.. {
+        frame.clear();
+        reader
+            .read_until(b'\n', &mut frame)
+            .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?;
+        if frame.last() != Some(&b'\n') {
+            break;
+        }
+        let line = std::str::from_utf8(&frame).map_err(|_| {
+            corrupt_chunk_ledger_error(&path, line_no + 1, "invalid UTF-8 in framed record")
+        })?;
         if line.trim().is_empty() {
             continue;
         }
@@ -590,13 +579,10 @@ pub(crate) fn parse_chunk_ledger(kio_dir: &Path) -> Result<ParsedChunkLedger> {
                 chunk.row.chunk_id.clone(),
                 chunk.row.chunking_config_hash.clone(),
             ));
-            creations.push((line_no + 1, chunk));
+            visit(line_no + 1, chunk)?;
         }
     }
-    Ok(ParsedChunkLedger {
-        creations,
-        events: events.into_iter().map(|(_, event)| event).collect(),
-    })
+    Ok(events.into_iter().map(|(_, event)| event).collect())
 }
 
 /// Validate every creation record before it participates in any durable-ledger
@@ -640,23 +626,31 @@ fn validate_stored_chunk_ledger_row(chunk: &StoredChunk) -> std::result::Result<
 }
 
 pub(crate) fn read_stored_chunks(kio_dir: &Path) -> Result<Vec<StoredChunk>> {
-    let path = chunks_jsonl_path(kio_dir);
-    let chunks = parse_chunk_ledger(kio_dir)?.creations;
+    let mut chunks = Vec::new();
+    visit_stored_chunks(kio_dir, |chunk| {
+        chunks.push(chunk);
+        Ok(())
+    })?;
+    Ok(chunks)
+}
 
-    for (line, chunk) in &chunks {
-        if chunk.rowid == 0 || chunk.association_rowid == 0 {
-            return Err(corrupt_chunk_ledger_error(
-                &path,
-                *line,
-                "chunk and association rowids must be positive",
-            ));
-        }
-    }
+pub(crate) fn visit_stored_chunks(
+    kio_dir: &Path,
+    mut visit: impl FnMut(StoredChunk) -> Result<()>,
+) -> Result<()> {
+    let path = chunks_jsonl_path(kio_dir);
     let mut association_owners = BTreeMap::<u64, (String, String)>::new();
     let mut known_associations = BTreeSet::<(String, String)>::new();
     let mut chunk_rowid_owners = BTreeMap::<u64, String>::new();
     let mut rowid_for_chunk = BTreeMap::<String, u64>::new();
-    for (line, chunk) in &chunks {
+    parse_chunk_ledger_with(kio_dir, |line, chunk| {
+        if chunk.rowid == 0 || chunk.association_rowid == 0 {
+            return Err(corrupt_chunk_ledger_error(
+                &path,
+                line,
+                "chunk and association rowids must be positive",
+            ));
+        }
         let association = (
             chunk.row.chunk_id.clone(),
             chunk.row.chunking_config_hash.clone(),
@@ -664,7 +658,7 @@ pub(crate) fn read_stored_chunks(kio_dir: &Path) -> Result<Vec<StoredChunk>> {
         if !known_associations.insert(association.clone()) {
             return Err(corrupt_chunk_ledger_error(
                 &path,
-                *line,
+                line,
                 "duplicate chunk/config association",
             ));
         }
@@ -675,7 +669,7 @@ pub(crate) fn read_stored_chunks(kio_dir: &Path) -> Result<Vec<StoredChunk>> {
         {
             return Err(corrupt_chunk_ledger_error(
                 &path,
-                *line,
+                line,
                 "association rowid is assigned more than once",
             ));
         }
@@ -685,7 +679,7 @@ pub(crate) fn read_stored_chunks(kio_dir: &Path) -> Result<Vec<StoredChunk>> {
         {
             return Err(corrupt_chunk_ledger_error(
                 &path,
-                *line,
+                line,
                 "chunk rowid is assigned to multiple chunk ids",
             ));
         }
@@ -695,19 +689,20 @@ pub(crate) fn read_stored_chunks(kio_dir: &Path) -> Result<Vec<StoredChunk>> {
         {
             return Err(corrupt_chunk_ledger_error(
                 &path,
-                *line,
+                line,
                 "one chunk id is assigned multiple chunk rowids",
             ));
         }
-    }
-    Ok(chunks.into_iter().map(|(_, chunk)| chunk).collect())
+        visit(chunk)
+    })?;
+    Ok(())
 }
 
 /// Read durable publication event rows from the chunk ledger. Creation rows
 /// remain parsed by `read_stored_chunks`; publication rows are additive and do
 /// not create another chunk/config association.
 pub(crate) fn read_chunk_publication_events(kio_dir: &Path) -> Result<Vec<ChunkPublicationEvent>> {
-    Ok(parse_chunk_ledger(kio_dir)?.events)
+    parse_chunk_ledger_with(kio_dir, |_, _| Ok(()))
 }
 
 fn corrupt_chunk_ledger_error(path: &Path, line: usize, message: &str) -> KioError {
@@ -791,19 +786,27 @@ pub(crate) fn truncate_torn_chunk_tail(kio_dir: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(KioError::io(error.to_string(), path.display().to_string())),
     };
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .map_err(|err| KioError::io(err.to_string(), path.display().to_string()))?;
-    if bytes.is_empty() || bytes.last() == Some(&b'\n') {
+    use std::io::{Seek, SeekFrom};
+    let io = |error: std::io::Error| KioError::io(error.to_string(), path.display().to_string());
+    let length = file.metadata().map_err(io)?.len();
+    let mut end = length;
+    let mut buffer = [0u8; 64 * 1024];
+    let mut keep = 0;
+    while end > 0 {
+        let n = end.min(buffer.len() as u64) as usize;
+        let start = end - n as u64;
+        file.seek(SeekFrom::Start(start)).map_err(io)?;
+        file.read_exact(&mut buffer[..n]).map_err(io)?;
+        if let Some(index) = buffer[..n].iter().rposition(|byte| *byte == b'\n') {
+            keep = start + index as u64 + 1;
+            break;
+        }
+        end = start;
+    }
+    if keep == length {
         return Ok(());
     }
-    // Keep everything up to and including the last newline (0 when none exists).
-    let keep = bytes
-        .iter()
-        .rposition(|&byte| byte == b'\n')
-        .map_or(0, |index| index + 1);
-    file.set_len(keep as u64)
-        .map_err(|err| KioError::io(err.to_string(), path.display().to_string()))?;
+    file.set_len(keep).map_err(io)?;
     file.sync_all()
         .map_err(|err| KioError::io(err.to_string(), path.display().to_string()))?;
     Ok(())
@@ -840,10 +843,11 @@ pub(crate) fn append_chunk_publication_events(
     // Idempotence belongs at the durable boundary, not only at individual
     // callers: retries may re-enter after a successful append but before their
     // next projection step.
-    let creations = read_stored_chunks(kio_dir)?
-        .into_iter()
-        .map(|chunk| (chunk.row.chunk_id, chunk.row.chunking_config_hash))
-        .collect::<BTreeSet<_>>();
+    let mut creations = BTreeSet::new();
+    visit_stored_chunks(kio_dir, |chunk| {
+        creations.insert((chunk.row.chunk_id, chunk.row.chunking_config_hash));
+        Ok(())
+    })?;
     let mut seen = read_chunk_publication_events(kio_dir)?
         .into_iter()
         .map(|event| {

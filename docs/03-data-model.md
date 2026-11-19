@@ -69,7 +69,7 @@ raw / prepared / image / normalized_unit_object / chunk / embedding / manifest /
     normalized_units/ab/cd/<raw64>.<tool64>.g<gen>/
       manifest.json                    # current working projection (最新版、§2.1)
       <unit_ref>.json                  # current mutable view/cache (unit_ref = base16(sha256(unit_key の UTF-8 バイト列))[0:16])
-    normalized/ab/cd/<raw64>.<tool64>.g<gen>.md   # 全文 view (cache, 再生成可能)
+    normalized/ab/cd/<raw64>.<tool64>.g<gen>.<manifest64>.md   # 全文 view (manifest hash で選ぶ再生成可能な cache)
     normalized_unit_objects/ab/cd/<unit-object64> # immutable NormalizedUnitObject (canonical JCS bytes、§2.1)
     manifests/ab/cd/<manifest64>    # manifest の immutable 確定版 (canonical JCS bytes、§2.1。
                                     # tree v2 の normalize.manifest_hash が指す — §8)
@@ -287,8 +287,9 @@ full NormalizedUnitObject を JCS CAS として確定する (per-.kio 重複容�
 この可逆なローカル更新は外部送信や有料再生成の承認を与えない。
 後続の外部／有料処理には current grant、secret hold と [04 §5.4](04-pipeline.md) を適用する。
 
-**全文 view**: `objects/normalized/ab/cd/<raw64>.<tool64>.g<gen>.md` は
-unit を決定論的に結合した **再生成可能な cache** であり、正本ではない。組み立て規則:
+**全文 view**: `objects/normalized/ab/cd/<raw64>.<tool64>.g<gen>.<manifest64>.md` は
+unit を決定論的に結合した **再生成可能な cache** である。現在の確定 manifest の
+canonical JCS bytes の SHA-256 で `<manifest64>` を選ぶ。組み立て規則:
 
 1. manifest.units を `order` 昇順に走査する (`order` は unit 間で一意 — 重複は KIO-E-STORE-CORRUPT-001 の corruption。値自体で順序が確定するため tie-break は存在しない)
 2. `status = done` の unit は、その `markdown` から末尾の連続する改行を除去した文字列を採用する

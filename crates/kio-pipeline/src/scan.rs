@@ -1607,25 +1607,49 @@ pub fn read_bound_verified_scan_input(
     input_path: &str,
     max_bytes: u64,
 ) -> Result<VerifiedScanInput> {
+    read_bound_scan_input(root, input_path, max_bytes, None)
+}
+
+/// Read a verified parser input within the invocation's working-memory tier.
+pub fn read_bound_extraction_input(
+    root: &File,
+    input_path: &str,
+    tier: kio_core::error::ResourceTier,
+) -> Result<VerifiedScanInput> {
+    let max_bytes = crate::prepare::ExtractionBudget::new(tier).memory_bytes();
+    read_bound_scan_input(root, input_path, max_bytes, Some(tier))
+}
+
+fn read_bound_scan_input(
+    root: &File,
+    input_path: &str,
+    max_bytes: u64,
+    tier: Option<kio_core::error::ResourceTier>,
+) -> Result<VerifiedScanInput> {
+    let limit = |observed, bounded| {
+        if tier.is_none() && bounded {
+            return bound_input_oversized(input_path, observed, max_bytes);
+        }
+        crate::PipelineError::ResourceLimit(kio_core::error::ResourceLimit {
+            resource: kio_core::error::Resource::Memory,
+            stage: "read_extraction_input".to_owned(),
+            limit: bounded.then_some(max_bytes),
+            observed: Some(observed),
+            resource_tier: tier,
+        })
+    };
     validate_direct_child_name(input_path)?;
     let path = Path::new(input_path);
     let (mut file, metadata) = open_bound_verified_regular_file(root, input_path)?;
     if metadata.len() > max_bytes {
-        return Err(bound_input_oversized(input_path, metadata.len(), max_bytes));
+        return Err(limit(metadata.len(), true));
     }
-    let initial_capacity = usize::try_from(metadata.len()).map_err(|_| {
-        crate::PipelineError::contract(
-            "KIO-E-SCAN-INPUT-OVERSIZED-001",
-            format!("input {input_path} cannot fit in process memory"),
-        )
-    })?;
+    let initial_capacity =
+        usize::try_from(metadata.len()).map_err(|_| limit(metadata.len(), false))?;
     let mut bytes = Vec::new();
-    bytes.try_reserve_exact(initial_capacity).map_err(|_| {
-        crate::PipelineError::contract(
-            "KIO-E-SCAN-INPUT-OVERSIZED-001",
-            format!("input {input_path} cannot fit in process memory"),
-        )
-    })?;
+    bytes
+        .try_reserve_exact(initial_capacity)
+        .map_err(|_| limit(metadata.len(), false))?;
     let mut buffer = [0_u8; 64 * 1024];
     loop {
         let remaining = max_bytes.saturating_sub(bytes.len() as u64);
@@ -1635,18 +1659,11 @@ pub fn read_bound_verified_scan_input(
             break;
         }
         if read as u64 > remaining {
-            return Err(bound_input_oversized(
-                input_path,
-                max_bytes.saturating_add(1),
-                max_bytes,
-            ));
+            return Err(limit(max_bytes.saturating_add(1), true));
         }
-        bytes.try_reserve_exact(read).map_err(|_| {
-            crate::PipelineError::contract(
-                "KIO-E-SCAN-INPUT-OVERSIZED-001",
-                format!("input {input_path} cannot fit in process memory"),
-            )
-        })?;
+        bytes
+            .try_reserve_exact(read)
+            .map_err(|_| limit(bytes.len() as u64 + read as u64, false))?;
         bytes.extend_from_slice(&buffer[..read]);
     }
     ensure_bound_file_unchanged(&file, &metadata, path)?;
@@ -1804,6 +1821,17 @@ fn bound_input_oversized(input_path: &str, size: u64, max_bytes: u64) -> crate::
         "KIO-E-SCAN-INPUT-OVERSIZED-001",
         format!("input {input_path} is {size} bytes, above the {max_bytes} byte limit"),
     )
+}
+
+/// Test for a live source without following its name or allocating its bytes.
+pub fn bound_scan_input_is_regular(root: &File, input_path: &str) -> Result<bool> {
+    validate_direct_child_name(input_path)?;
+    let path = Path::new(input_path);
+    match cap_fs::stat(root, path, cap_fs::FollowSymlinks::No) {
+        Ok(metadata) => Ok(metadata.file_type().is_file()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).pipeline_io(path),
+    }
 }
 
 fn open_bound_verified_regular_file(

@@ -24,9 +24,9 @@ use kio_core::store_dir::StoreDirectory;
 use kio_core::{KioError, Result};
 use kio_pipeline::markdownize::{
     MarkdownizeMode, NormalizedInstanceManifest, NormalizedUnitManifestEntry, NormalizedUnitObject,
-    UnitStatus, persist_normalized_instance_bound,
+    UnitStatus, persist_resumable_normalized_units,
 };
-use kio_pipeline::prepare::{UnitType, hash_bytes, unit_ref};
+use kio_pipeline::prepare::{StagedPreparation, UnitType, hash_bytes, unit_ref};
 use kio_search::extract_related_images;
 
 pub(crate) struct ImageIngested {
@@ -259,8 +259,7 @@ pub(crate) fn ingest_standalone_image(
     raw_hash: &str,
     bytes: &[u8],
     declared_media_type: &str,
-    _preparation_profile_hash: &str,
-    _markdown_profile_hash: &str,
+    staged: &StagedPreparation,
 ) -> Result<ImageIngested> {
     if hash_bytes(bytes) != raw_hash || !is_hash(raw_hash) {
         return Err(KioError::schema(
@@ -291,26 +290,30 @@ pub(crate) fn ingest_standalone_image(
 
     validate_source_image_identity(raw_hash, &validated)?;
     let image_hash = persist_validated_source_image(repo, raw_hash, &validated)?;
-    let prepared_hash = repo
-        .object_store()
-        .write_content_object(ContentObjectKind::Prepared, bytes)?;
-    if prepared_hash != raw_hash {
+    let [prepared] = staged.output.prepared_units.as_slice() else {
         return Err(KioError::schema(
-            "standalone image prepared CAS identity differs from the verified raw identity",
+            "standalone image must have one staged source unit",
+        ));
+    };
+    if prepared.prepared_hash != raw_hash || prepared.unit_type != UnitType::Image {
+        return Err(KioError::schema(
+            "standalone image stage differs from its verified raw identity",
         ));
     }
+    staged
+        .persist_objects(&repo.object_store())
+        .map_err(crate::object_persistence::pipeline_to_kio)?;
+    let prepared_hash = prepared.prepared_hash.clone();
 
     let scope_id = repo.scope_identity()?.scope_id;
     let unit_key = "image:0".to_owned();
     let generated_at = repo.control().now_utc_seconds();
     let alt = safe_alt_label(input_path);
     let image_uri = format!("kio://{scope_id}/object/image/{image_hash}");
-    let unit = NormalizedUnitObject {
+    let mut unit = NormalizedUnitObject {
         unit_key: unit_key.clone(),
         unit_type: UnitType::Image,
         raw_hash: raw_hash.to_owned(),
-        // The image object is the prepared source; it is never represented as
-        // text or copied to objects/prepared.
         prepared_hash: prepared_hash.clone(),
         preparation_profile_hash: native_profile_hash.clone(),
         tool_profile_hash: native_profile_hash.clone(),
@@ -364,9 +367,13 @@ pub(crate) fn ingest_standalone_image(
         repo.kio_dir().to_path_buf(),
         repo.control().clone(),
     )?;
-    let stamped = persist_normalized_instance_bound(&directory, &manifest, &[unit])
-        .map_err(|error| KioError::schema(error.to_string()))?;
-    let manifest_hash = crate::object_persistence::hash_and_write_manifest_object(repo, &stamped)?;
+    let stamped =
+        persist_resumable_normalized_units(&directory, &manifest, input_path, |draft, _| {
+            unit.generated_at.clone_from(&draft.generated_at);
+            Ok(std::borrow::Cow::Owned(unit.clone()))
+        })
+        .map_err(crate::object_persistence::pipeline_to_kio)?;
+    let manifest_hash = crate::object_persistence::published_manifest_hash(repo, &stamped)?;
     Ok(ImageIngested {
         normalize: NormalizeRef {
             tool_profile_hash: native_profile_hash,

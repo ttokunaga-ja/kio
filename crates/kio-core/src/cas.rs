@@ -120,7 +120,8 @@ impl ContentObjectKind {
             Self::Embedding => MAX_EMBEDDING_OBJECT_BYTES,
             Self::Manifest => MAX_MANIFEST_OBJECT_BYTES,
             Self::NormalizedUnit => MAX_NORMALIZED_UNIT_OBJECT_BYTES,
-            Self::Prepared | Self::Image | Self::Toollock => MAX_CONTENT_OBJECT_BYTES,
+            Self::Prepared => u64::MAX,
+            Self::Image | Self::Toollock => MAX_CONTENT_OBJECT_BYTES,
         }
     }
 }
@@ -2348,6 +2349,45 @@ fn unix_nanos() -> u128 {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    #[ignore = "hashes and publishes a prepared object larger than 512 MiB"]
+    fn p0_recheck_prepared_cas_accepts_more_than_512_mib() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = crate::scope::Repository::init(dir.path()).unwrap();
+        let root = crate::store_dir::StoreDirectory::open(repo.kio_dir()).unwrap();
+        let workspace_path = Path::new("test-prepared-stage");
+        root.create_directory(workspace_path).unwrap();
+        let workspace =
+            crate::store_dir::StoreDirectory::open(&repo.kio_dir().join(workspace_path)).unwrap();
+        let leaf = Path::new("payload");
+        let writer = crate::store_dir::StageWriter::create(&workspace, leaf).unwrap();
+        let identity = writer.identity().clone();
+        drop(writer);
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(workspace.path().join(leaf))
+            .unwrap();
+        let bytes = MAX_CONTENT_OBJECT_BYTES + 1;
+        file.set_len(bytes).unwrap();
+        file.sync_all().unwrap();
+        let hash = bound_hash_open_regular(&CasReadAccess::Unmetered, &mut file, u64::MAX).unwrap();
+        drop(file);
+        assert!(
+            repo.object_store()
+                .publish_content_stage(
+                    ContentObjectKind::Prepared,
+                    &hash,
+                    &workspace,
+                    Some((leaf, &identity)),
+                )
+                .unwrap()
+        );
+        let path = fanout_path(repo.kio_dir().join("objects/prepared"), &hash).unwrap();
+        assert_eq!(fs::metadata(path).unwrap().len(), bytes);
+        assert!(!workspace.contains_entry(leaf).unwrap());
+    }
 
     #[test]
     fn jsonl_append_creates_private_owned_logs_below_external_ancestors() {

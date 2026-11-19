@@ -22,6 +22,7 @@ enum Subject {
 
 fn index() -> CommandRequest {
     CommandRequest::Index(IndexArgs {
+        resource_tier: kio_core::error::ResourceTier::Standard,
         max_file_bytes: None,
         max_total_bytes: None,
         preview: false,

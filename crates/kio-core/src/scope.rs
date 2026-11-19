@@ -4210,6 +4210,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap_err();
         assert_eq!(error.error_code(), "KIO-E-SNAPSHOT-AUTHORITY-CHANGED-001");

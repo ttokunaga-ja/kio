@@ -377,16 +377,10 @@ fn markdown_unit_from_hint(
         Some(SourceDocument::PdfPages(pages)) => {
             let page_index =
                 page_index_from_unit_key(&hint.unit_key).unwrap_or(hint.order as usize);
-            let page_text = pages.get(page_index).cloned().unwrap_or_default();
-            let page_text = if is_probably_real_text(&page_text) {
-                page_text
-            } else {
-                String::new()
-            };
-            format!("{}\n", page_text.trim())
+            page_markdown(pages.get(page_index).map_or("", String::as_str))
         }
         Some(SourceDocument::Sheets(sheets)) => {
-            let sheet = sheets.get(hint.order as usize).cloned().unwrap_or_default();
+            let sheet = sheets.get(hint.order as usize).map_or("", String::as_str);
             format!("{}\n", sheet.trim())
         }
         // text/plain and sniffed octet-stream TEXT (R20-6 passthrough:
@@ -401,6 +395,41 @@ fn markdown_unit_from_hint(
         Some(SourceDocument::Text(text)) => fence_literal_text(text, request.raw.path.as_deref()),
         None => baseline_placeholder(&hint.unit_key, &hint.prepared_hash),
     };
+    finish_markdown_unit(hint, markdown)
+}
+
+/// Format one verified prepared unit without decoding the original again.
+pub fn markdownize_prepared_unit(
+    hint: &PreparedUnitHint,
+    media_type: &str,
+    input_path: &str,
+    bytes: &[u8],
+) -> MarkdownUnit {
+    let text = String::from_utf8_lossy(bytes);
+    let markdown = match hint.unit_kind {
+        UnitKind::Page | UnitKind::Slide => page_markdown(&text),
+        UnitKind::Sheet => format!("{}\n", text.trim()),
+        _ if media_type == "text/markdown" => {
+            text.strip_prefix('\u{feff}').unwrap_or(&text).to_owned()
+        }
+        _ => fence_literal_text(
+            text.strip_prefix('\u{feff}').unwrap_or(&text),
+            Some(input_path),
+        ),
+    };
+    finish_markdown_unit(hint, markdown)
+}
+
+fn page_markdown(text: &str) -> String {
+    let text = if is_probably_real_text(text) {
+        text.trim()
+    } else {
+        ""
+    };
+    format!("{text}\n")
+}
+
+fn finish_markdown_unit(hint: &PreparedUnitHint, markdown: String) -> MarkdownUnit {
     let markdown = if markdown.trim().is_empty() {
         baseline_placeholder(&hint.unit_key, &hint.prepared_hash)
     } else {

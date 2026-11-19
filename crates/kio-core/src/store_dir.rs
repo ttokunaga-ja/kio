@@ -476,6 +476,17 @@ impl StoreDirectory {
         )
     }
 
+    pub(crate) fn sync_stage_destination(&self) -> Result<()> {
+        use crate::durability::DurabilityPoint;
+        if self.path() == Path::new("manifests") {
+            self.control()
+                .checkpoint(DurabilityPoint::ExtractionManifestRenamed)?;
+        }
+        self.control()
+            .checkpoint(DurabilityPoint::ExtractionBeforeDestinationSync)?;
+        self.sync()
+    }
+
     pub fn sync(&self) -> Result<()> {
         platform::sync_directory(&self.handle, &self.logical)
     }
@@ -595,6 +606,24 @@ pub(crate) fn relative_components<'a>(
         return Err(err(label, "store path requires a leaf"));
     }
     Ok(out)
+}
+
+/// Match an identity-derived capture name or a retry slot for that identity.
+pub(crate) fn capture_matches(candidate: &Path, base: &Path) -> bool {
+    if candidate == base {
+        return true;
+    }
+    candidate
+        .to_str()
+        .zip(base.to_str())
+        .is_some_and(|(candidate, base)| {
+            candidate
+                .strip_prefix(base)
+                .and_then(|suffix| suffix.strip_prefix('.'))
+                .is_some_and(|slot| {
+                    slot.len() == 26 && slot.bytes().all(|byte| byte.is_ascii_alphanumeric())
+                })
+        })
 }
 
 #[cfg(test)]

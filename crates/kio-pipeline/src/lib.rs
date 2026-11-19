@@ -1,6 +1,7 @@
 //! Pipeline contracts and deterministic Step 2 helpers.
 
 pub mod budget;
+mod extraction_stage;
 mod journal;
 pub mod ledger;
 pub mod markdownize;

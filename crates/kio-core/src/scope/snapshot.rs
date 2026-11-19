@@ -1,5 +1,12 @@
 use super::*;
 
+type ExtractionRetirementHook<'a> = dyn Fn(&str, &TreeObject) -> Result<()> + 'a;
+
+pub(super) struct ExtractionPublication<'a> {
+    selected: Option<&'a BTreeMap<String, String>>,
+    hook: &'a ExtractionRetirementHook<'a>,
+}
+
 impl Repository {
     pub fn snapshot(
         &self,
@@ -44,6 +51,7 @@ impl Repository {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -80,6 +88,28 @@ impl Repository {
         explicitly_allowed_tier_a_paths: &BTreeSet<String>,
         publication_guard: Option<&dyn Fn() -> Result<()>>,
     ) -> Result<SnapshotOutcome> {
+        self.auto_snapshot_with_extraction_retirement(
+            message,
+            fixed_now,
+            excluded_paths,
+            normalize_by_path,
+            explicitly_allowed_tier_a_paths,
+            publication_guard,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn auto_snapshot_with_extraction_retirement(
+        &self,
+        message: Option<&str>,
+        fixed_now: Option<&str>,
+        excluded_paths: &BTreeSet<String>,
+        normalize_by_path: &BTreeMap<String, PendingNormalizeRef>,
+        explicitly_allowed_tier_a_paths: &BTreeSet<String>,
+        publication_guard: Option<&dyn Fn() -> Result<()>>,
+        before_head: Option<&ExtractionRetirementHook<'_>>,
+    ) -> Result<SnapshotOutcome> {
         self.snapshot_with_type(
             message,
             fixed_now,
@@ -96,6 +126,47 @@ impl Repository {
             None,
             None,
             publication_guard,
+            before_head.map(|hook| ExtractionPublication {
+                selected: None,
+                hook,
+            }),
+        )
+    }
+
+    /// Archive just the explicitly retried sources and retain unrelated HEAD entries.
+    pub fn snapshot_retried_extractions(
+        &self,
+        expected_raw_by_path: &BTreeMap<String, String>,
+        normalize_by_path: &BTreeMap<String, PendingNormalizeRef>,
+        before_head: &ExtractionRetirementHook<'_>,
+        publication_guard: &dyn Fn() -> Result<()>,
+    ) -> Result<SnapshotOutcome> {
+        let excluded = self
+            .bound_snapshot_auto_direct_entries()?
+            .into_iter()
+            .filter(|path| !expected_raw_by_path.contains_key(path))
+            .collect();
+        let explicitly_allowed_tier_a_paths = expected_raw_by_path.keys().cloned().collect();
+        self.snapshot_with_type(
+            Some("kio resume local extraction"),
+            None,
+            CommitType::Auto,
+            &excluded,
+            normalize_by_path,
+            &explicitly_allowed_tier_a_paths,
+            false,
+            &[],
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(publication_guard),
+            Some(ExtractionPublication {
+                selected: Some(expected_raw_by_path),
+                hook: before_head,
+            }),
         )
     }
 
@@ -320,6 +391,7 @@ impl Repository {
             Some(&scheduled_authority),
             Some(before_ref_publication),
             None,
+            None,
         )
     }
 
@@ -529,6 +601,7 @@ impl Repository {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -588,6 +661,7 @@ impl Repository {
         expected_scheduled_authority: Option<&ScheduledSnapshotAuthority>,
         before_ref_publication: Option<&mut dyn FnMut() -> Result<SnapshotAutoStateBinding>>,
         publication_guard: Option<&dyn Fn() -> Result<()>>,
+        extraction: Option<ExtractionPublication<'_>>,
     ) -> Result<SnapshotOutcome> {
         // A retained repository is also used by the existing child-index
         // subprocess.  Bound descriptors plus `commit_type=auto` therefore do
@@ -670,13 +744,19 @@ impl Repository {
         } else {
             BTreeSet::new()
         };
-        let working_candidates = self.working_file_candidates(
+        let mut working_candidates = self.working_file_candidates(
             excluded_paths,
             explicitly_allowed_tier_a_paths,
             true,
             self.archive_limits,
         )?;
-        let working = {
+        let selected = extraction
+            .as_ref()
+            .and_then(|extraction| extraction.selected);
+        if let Some(selected) = selected {
+            working_candidates.retain(|candidate| selected.contains_key(&candidate.file_name));
+        }
+        let mut working = {
             let _archive_lock = self.lock_store_in_session(&self.lock_session)?;
             self.archive_staged_working_tree(
                 working_candidates,
@@ -690,6 +770,47 @@ impl Repository {
             )?
         }
         .tree;
+
+        if let Some(selected) = extraction
+            .as_ref()
+            .and_then(|extraction| extraction.selected)
+        {
+            let actual = tree_map(&working);
+            if &actual != selected {
+                return Err(KioError::new(
+                    "KIO-E-SNAPSHOT-AUTHORITY-CHANGED-001",
+                    "retried extraction inputs changed before publication",
+                    json!({}),
+                    ExitCode::PartialFailure,
+                ));
+            }
+            if let Some(prior) = &prior_tree {
+                let previous: BTreeMap<_, _> = prior
+                    .entries
+                    .iter()
+                    .map(|entry| (entry.path.as_str(), entry))
+                    .collect();
+                for entry in &mut working.entries {
+                    if entry.normalize.is_none()
+                        && let Some(old) = previous.get(entry.path.as_str())
+                        && old.raw_hash == entry.raw_hash
+                    {
+                        entry.normalize.clone_from(&old.normalize);
+                    }
+                }
+                working.entries.extend(
+                    prior
+                        .entries
+                        .iter()
+                        .filter(|entry| !selected.contains_key(&entry.path))
+                        .cloned(),
+                );
+                working = build_tree_with_chunking_config(
+                    working.entries,
+                    prior.chunking_config_hash.clone(),
+                )?;
+            }
+        }
 
         // U19/LC22-LC26: a raw_hash that is both (a) present in the tree we are
         // about to commit and (b) currently the target of an *active*
@@ -801,6 +922,9 @@ impl Repository {
             }
             if let Some(guard) = publication_guard {
                 guard()?;
+            }
+            if let Some(extraction) = &extraction {
+                (extraction.hook)(head_hash.as_deref().expect("existing no-op HEAD"), &working)?;
             }
             return Ok(SnapshotOutcome {
                 noop: true,
@@ -942,6 +1066,9 @@ impl Repository {
         } else {
             if let Some(guard) = publication_guard {
                 guard()?;
+            }
+            if let Some(extraction) = &extraction {
+                (extraction.hook)(&commit_hash, &working)?;
             }
             self.publish_with_journal(parent.as_deref(), &commit_hash, &commit, manifest.clone())?;
             None

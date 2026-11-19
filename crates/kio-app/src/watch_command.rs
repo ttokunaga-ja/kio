@@ -263,6 +263,7 @@ impl Reconcile for LocalReconciler {
             crate::execute_watch_index(
                 &context,
                 IndexArgs {
+                    resource_tier: kio_core::error::ResourceTier::Standard,
                     max_file_bytes: None,
                     max_total_bytes: None,
                     preview: false,
@@ -274,7 +275,17 @@ impl Reconcile for LocalReconciler {
                 },
             )
         })();
-        let output = result.map_err(|error| WatchError::invariant(error.to_string()))?;
+        let output = match result {
+            Ok(output) => output,
+            Err(error)
+                if error.resource_limit().is_some()
+                    && error.context()["published_with_resource_hold"].as_bool() == Some(true) =>
+            {
+                Unattended.diagnostic(&format!("watch reconciliation paused: {error}"));
+                return Ok(ReconcileCompletion::Complete);
+            }
+            Err(error) => return Err(WatchError::invariant(error.to_string())),
+        };
         let index = match &output.body {
             ResponseBody::Index(index) => index,
             _ => unreachable!("Index request returns an Index response"),

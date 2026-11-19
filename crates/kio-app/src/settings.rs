@@ -28,7 +28,7 @@ use std::sync::Arc;
 const DEFAULT_MAX_INPUT_BYTES: u64 = 104_857_600;
 
 /// R12-2: effective `adapter.policy.max_input_bytes` — scope config wins over user
-/// config, default 100 MB (07 §7). Enforced as an input gate in `run_index_pipeline`.
+/// config, default 100 MiB (07 §7). Applied to prepared input before an adapter send.
 pub(crate) fn effective_max_input_bytes(repo: &Repository) -> Result<u64> {
     if let Some(limit) = read_max_input_bytes_config(&repo.kio_dir().join("config.toml")) {
         return Ok(limit);

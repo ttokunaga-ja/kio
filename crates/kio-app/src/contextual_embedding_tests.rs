@@ -152,6 +152,7 @@ fn index(context: &AppContext) {
     execute(
         context,
         CommandRequest::Index(IndexArgs {
+            resource_tier: kio_core::error::ResourceTier::Standard,
             max_file_bytes: None,
             max_total_bytes: None,
             preview: false,
@@ -170,6 +171,7 @@ fn rebuild(context: &AppContext) {
         context,
         CommandRequest::Repair(RepairArgs {
             operation: RepairOperation::RebuildDb(RepairRebuildDbArgs {
+                resource_tier: kio_core::error::ResourceTier::Standard,
                 online: false,
                 offline: true,
                 realtime: false,
@@ -658,6 +660,7 @@ fn new_chunk_associations_with_cached_contexts_complete_without_execution() {
         execute(
             &context,
             CommandRequest::Index(IndexArgs {
+                resource_tier: kio_core::error::ResourceTier::Standard,
                 max_file_bytes: None,
                 max_total_bytes: None,
                 preview: false,

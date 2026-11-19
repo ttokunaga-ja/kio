@@ -342,7 +342,6 @@ struct IndexOutput {
     paused_tasks: u64,
     failed_files: u64,
     normalized_files: u64,
-    skipped_oversized_files: u64,
     skipped_unrecognized_binary_files: u64,
     embedding_tasks_executed: u64,
     embedding_tasks_failed: u64,
@@ -1028,7 +1027,6 @@ fn validate_index_output(
         || output.paused_tasks != 0
         || output.failed_files != 0
         || output.embedding_tasks_failed != 0
-        || output.skipped_oversized_files != 0
         || output.skipped_unrecognized_binary_files != 0
         || !output.skipped_units.is_empty()
         || !output.child_scopes.is_empty()
@@ -1820,7 +1818,6 @@ esac
             "status":"indexed", "approval_method":"yes", "network_allowed":false,
             "network_opt_in":false, "pending_online_tasks":0, "paused_tasks":0,
             "pending_files":0, "failed_files":0, "normalized_files":1,
-            "skipped_oversized_files":0,
             "skipped_unrecognized_binary_files":0, "embedding_tasks_executed":0,
             "embedding_tasks_failed":0,
             "tree_hash":tree,

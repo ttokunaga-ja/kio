@@ -1,3 +1,4 @@
+use super::extraction_retirement::{self, Retirement};
 use crate::batch::command::reclaim_orphaned_running_tasks;
 use crate::commands::IndexArgs;
 use crate::egress::SECRETS_TIER_B_HOLD;
@@ -5,7 +6,7 @@ use crate::egress::network_allowed;
 use crate::historical_reindex::pinned_manifest_is_complete;
 use crate::image_ingest;
 use crate::index::command::OFFICE_CONVERSION_UNAVAILABLE_REASON;
-use crate::index::command::read_repository_scan_input;
+use crate::index::command::read_repository_extraction_input;
 use crate::index::command::record_unsupported_if_changed;
 use crate::index::command::repository_input_display_path;
 use crate::index::command::repository_scan_policy_allows_file;
@@ -16,6 +17,7 @@ use crate::markdownize::batch::retire_online_task;
 use crate::markdownize::execution::NormalizedUnitsError;
 use crate::markdownize::execution::adapter_hints;
 use crate::markdownize::execution::adapter_mode;
+use crate::markdownize::execution::adapter_unit_kind;
 use crate::markdownize::execution::all_changed_hints;
 use crate::markdownize::execution::append_failed_markdownize_task;
 use crate::markdownize::execution::consecutive_incremental_count;
@@ -28,11 +30,11 @@ use crate::markdownize::execution::prepared_unit_hints;
 use crate::markdownize::execution::previous_instance_for_path;
 use crate::markdownize::execution::task_descriptor;
 use crate::object_persistence::adapter_to_kio;
+use crate::object_persistence::bound_extraction_store;
 use crate::object_persistence::compute_manifest_hash;
-use crate::object_persistence::hash_and_write_manifest_object;
 use crate::object_persistence::normalized_output_ref;
 use crate::object_persistence::pipeline_to_kio;
-use crate::object_persistence::write_prepared_objects;
+use crate::object_persistence::published_manifest_hash;
 use crate::online_task::targets_standard_online_markdownize;
 use crate::response::index::{
     AdapterExecutionMode, IndexPreviewResponse, LargeFile, NetworkTransmissionPolicy,
@@ -41,14 +43,12 @@ use crate::response::index::{
 use crate::scope_access::ensure_raw_ingest_allowed;
 use crate::settings::bbox_annotation_enabled;
 use crate::settings::effective_incremental_config;
-use crate::settings::effective_max_input_bytes;
 use crate::settings::user_config_toml_path;
 use crate::task_execution::enqueue_online_placeholder_task;
 use crate::task_execution::is_reservation_bearing_send_failure;
 use kio_adapter::catalog::active_local_ocr_execution_with_control;
 use kio_adapter::catalog::builtin_offline_markdownize_adapter;
 use kio_adapter::catalog::builtin_prepare_profile;
-use kio_adapter::catalog::convert_office_to_pdf_with_control;
 use kio_adapter::catalog::local_ocr_handles_media_type;
 use kio_adapter::catalog::standard_online_markdownize_profile;
 use kio_adapter::catalog::standard_online_markdownize_profile_with_bbox;
@@ -70,7 +70,6 @@ use kio_adapter::types::MarkdownizeRequest;
 use kio_adapter::types::PreparedUnitHint;
 use kio_adapter::types::PreviousMarkdownizeContext;
 use kio_adapter::types::RawInput;
-use kio_adapter::types::UnitKind;
 use kio_core::Result;
 use kio_core::control::ControlHandle;
 use kio_core::dag::NormalizeRef;
@@ -82,22 +81,25 @@ use kio_core::test_control::MarkdownizeAdapterMode;
 use kio_pipeline::budget::read_budget_policy;
 use kio_pipeline::markdownize::IncrementalModeDecision;
 use kio_pipeline::markdownize::IncrementalModeInput;
-use kio_pipeline::markdownize::MarkdownizeMode;
-use kio_pipeline::markdownize::ValidatedNormalizedInstance;
 use kio_pipeline::markdownize::choose_markdownize_mode;
-use kio_pipeline::markdownize::load_validated_normalized_instance_with_control;
 use kio_pipeline::markdownize::persist_normalized_instance_with_control;
+use kio_pipeline::markdownize::read_normalized_instance_manifest;
 use kio_pipeline::markdownize::validate_markdownize_response;
-use kio_pipeline::prepare::PrepareStageBytesRequest;
+use kio_pipeline::markdownize::visit_validated_normalized_units;
+use kio_pipeline::markdownize::{
+    MarkdownizeMode, NormalizedInstanceManifest, NormalizedUnitManifestEntry, NormalizedUnitObject,
+    UnitStatus, persist_resumable_normalized_units, validate_deterministic_markdown,
+};
 use kio_pipeline::prepare::PreparedUnit;
 use kio_pipeline::prepare::map_units;
-use kio_pipeline::prepare::prepare_units_from_bytes_with_control;
+use kio_pipeline::prepare::prepare_staged;
+use kio_pipeline::prepare::{ExtractionBudget, PrepareStageBytesRequest};
 use kio_pipeline::scan::ScanCandidate;
 use kio_pipeline::scan::ScanPreview;
-use kio_pipeline::task::RetryErrorKind;
 use kio_pipeline::task::TaskStatus;
 use kio_pipeline::task::TaskStore;
 use kio_pipeline::task::TaskType;
+use kio_pipeline::task::{EXTRACTION_HOLD_OUTPUT_REF, HoldReason, RetryErrorKind, TaskDescriptor};
 use kio_pipeline::unsupported::UNSUPPORTED_REASON_RESOLVED;
 use kio_pipeline::unsupported::UNSUPPORTED_REASON_UNRECOGNIZED_BINARY;
 use kio_pipeline::unsupported::UnsupportedInputDisposition;
@@ -174,6 +176,7 @@ pub(crate) fn index_preview_response(root: &Path, preview: &ScanPreview) -> Inde
             "baseline completes in this run; online enhancement depends on budget and opt-in"
                 .to_owned(),
         candidates: preview.candidates.clone(),
+        extraction_issues: Vec::new(),
         child_scopes: None,
         estimated_aggregate_file_count: None,
         estimated_aggregate_size_bytes: None,
@@ -193,9 +196,7 @@ pub(crate) struct IndexPipelineResult {
     pub(crate) pending_files: usize,
     pub(crate) failed_files: usize,
     pub(crate) deferred_budget: Vec<DeferredPaidPlaceholder>,
-    // R12-2: files larger than adapter.policy.max_input_bytes, skipped for adapter
-    // processing (input gate, 07 §7.1.2) but still archived.
-    pub(crate) skipped_oversized_files: usize,
+    retired_extractions: Vec<Retirement>,
     // R22-4: binary inputs with no locally-extractable text whose media type is not an
     // OCR-able one (R21-4 skips their online task). Archived, but never enriched — surfaced
     // so `enriched_ratio: 1.0` cannot silently mean "this file does not exist".
@@ -345,51 +346,176 @@ pub(crate) fn active_markdown_adapter(_repo: &Repository) -> Box<dyn Markdownize
     builtin_offline_markdownize_adapter()
 }
 
-#[cfg(debug_assertions)]
-fn offline_markdownize_from_verified_bytes(
-    adapter: &dyn MarkdownizeAdapter,
-    request: MarkdownizeRequest,
-    verified_raw_bytes: &[u8],
-    control: &ControlHandle,
-) -> kio_adapter::Result<kio_adapter::types::MarkdownizeResponse> {
-    if markdownize_test_mode(control).is_some() {
-        return adapter.markdownize(request);
+fn is_builtin_markdownize(control: &ControlHandle) -> bool {
+    #[cfg(debug_assertions)]
+    return markdownize_test_mode(control).is_none();
+
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = control;
+        true
     }
-    // 07 §5.1: DOCX/PPTX get an offline baseline too, sourced from the SAME
-    // converted-PDF page/slide text `write_prepared_objects` already verified
-    // against Prepare's declared `prepared_hash` -- not the raw OOXML zip bytes
-    // (which `markdownize_from_bytes`'s generic non-PDF fallback would otherwise
-    // lossy-UTF8-decode as unsearchable garbage). This candidate only reaches
-    // here with non-empty prepared units, i.e. a converter resolved for it at
-    // Prepare time in this same `kio index` pass; absence here is the same rare
-    // mid-run race `write_prepared_objects` already tolerates as a well-defined
-    // (never crashing) failure rather than a silent corruption stand-in.
-    if let Some(unit_kind) = office_unit_kind(&request.media_type) {
-        let converted =
-            convert_office_to_pdf_with_control(verified_raw_bytes, &request.media_type, control)?;
-        return kio_adapter::deterministic::markdownize_converted_office(
-            request, &converted, unit_kind,
-        );
-    }
-    kio_adapter::deterministic::markdownize_from_bytes(request, verified_raw_bytes)
 }
 
-#[cfg(not(debug_assertions))]
-fn offline_markdownize_from_verified_bytes(
-    adapter: &dyn MarkdownizeAdapter,
-    request: MarkdownizeRequest,
-    verified_raw_bytes: &[u8],
-    control: &ControlHandle,
-) -> kio_adapter::Result<kio_adapter::types::MarkdownizeResponse> {
-    let _ = adapter;
-    if let Some(unit_kind) = office_unit_kind(&request.media_type) {
-        let converted =
-            convert_office_to_pdf_with_control(verified_raw_bytes, &request.media_type, control)?;
-        return kio_adapter::deterministic::markdownize_converted_office(
-            request, &converted, unit_kind,
-        );
+#[allow(clippy::too_many_arguments)]
+fn persist_local_normalization(
+    repo: &Repository,
+    path: &Path,
+    media_type: &str,
+    prepared: &[PreparedUnit],
+    raw_hash: &str,
+    profile: &str,
+    generation: u64,
+    parent: Option<u64>,
+    run_id: &str,
+    generated_at: &str,
+) -> Result<NormalizedInstanceManifest> {
+    let manifest = local_manifest(
+        raw_hash,
+        profile,
+        generation,
+        parent,
+        run_id,
+        generated_at,
+        prepared,
+    );
+    let store = repo.object_store();
+    let path = path.to_string_lossy();
+    persist_resumable_normalized_units(
+        &bound_extraction_store(repo)?,
+        &manifest,
+        &path,
+        |draft, entry| {
+            let bytes = store
+                .read_content_object_bytes(
+                    kio_core::cas::ContentObjectKind::Prepared,
+                    &entry.prepared_hash,
+                    ExtractionBudget::new(kio_core::error::ResourceTier::Large).memory_bytes(),
+                )
+                .map_err(|error| {
+                    kio_pipeline::PipelineError::corrupt(
+                        repo.kio_dir().display().to_string(),
+                        error.to_string(),
+                    )
+                })?;
+            if kio_pipeline::prepare::hash_bytes(&bytes) != entry.prepared_hash {
+                return Err(kio_pipeline::PipelineError::corrupt(
+                    repo.kio_dir().display().to_string(),
+                    "prepared unit differs from its declared hash",
+                ));
+            }
+            Ok(std::borrow::Cow::Owned(local_normalized_unit(
+                draft, entry, media_type, &path, &bytes,
+            )?))
+        },
+    )
+    .map_err(pipeline_to_kio)
+}
+
+fn local_manifest(
+    raw_hash: &str,
+    profile: &str,
+    generation: u64,
+    parent: Option<u64>,
+    run_id: &str,
+    generated_at: &str,
+    prepared: &[PreparedUnit],
+) -> NormalizedInstanceManifest {
+    NormalizedInstanceManifest {
+        preparation_provenance: crate::markdownize::execution::preparation_provenance_from_units(
+            prepared,
+        ),
+        raw_hash: raw_hash.to_owned(),
+        tool_profile_hash: profile.to_owned(),
+        r#gen: generation,
+        parent_gen: parent,
+        run_id: run_id.to_owned(),
+        generated_at: generated_at.to_owned(),
+        units: prepared
+            .iter()
+            .map(|unit| NormalizedUnitManifestEntry {
+                order: unit.order,
+                unit_key: unit.unit_key.clone(),
+                unit_ref: kio_pipeline::prepare::unit_ref(&unit.unit_key),
+                unit_type: unit.unit_type,
+                status: UnitStatus::Done,
+                prepared_hash: unit.prepared_hash.clone(),
+                preparation_profile_hash: unit.preparation_profile_hash.clone(),
+                unit_object_hash: None,
+                error_kind: None,
+                resource_limit: None,
+            })
+            .collect(),
     }
-    kio_adapter::deterministic::markdownize_from_bytes(request, verified_raw_bytes)
+}
+
+fn local_normalized_unit(
+    manifest: &NormalizedInstanceManifest,
+    entry: &NormalizedUnitManifestEntry,
+    media_type: &str,
+    path: &str,
+    bytes: &[u8],
+) -> kio_pipeline::Result<NormalizedUnitObject> {
+    let unit = kio_adapter::deterministic::markdownize_prepared_unit(
+        &kio_adapter::types::PreparedUnitHint {
+            unit_key: entry.unit_key.clone(),
+            prepared_hash: entry.prepared_hash.clone(),
+            order: entry.order,
+            unit_kind: adapter_unit_kind(entry.unit_type),
+        },
+        media_type,
+        path,
+        bytes,
+    );
+    validate_deterministic_markdown(&unit.markdown)?;
+    Ok(NormalizedUnitObject {
+        unit_key: unit.unit_key,
+        unit_type: entry.unit_type,
+        raw_hash: manifest.raw_hash.clone(),
+        prepared_hash: entry.prepared_hash.clone(),
+        preparation_profile_hash: entry.preparation_profile_hash.clone(),
+        tool_profile_hash: manifest.tool_profile_hash.clone(),
+        r#gen: manifest.r#gen,
+        mode: MarkdownizeMode::Full,
+        markdown: unit.markdown,
+        owned_image_hashes: unit.owned_image_hashes,
+        metadata: unit.metadata,
+        reused_from: None,
+        generated_at: manifest.generated_at.clone(),
+    })
+}
+
+pub(super) fn check_preview_normalized_unit(
+    path: &Path,
+    raw: &str,
+    media_type: &str,
+    prepared: &PreparedUnit,
+    bytes: &[u8],
+) -> kio_pipeline::Result<()> {
+    if prepared.unit_type == kio_pipeline::prepare::UnitType::Image {
+        // Standalone images use their fixed-size URI and metadata.
+        return Ok(());
+    }
+    let profile = builtin_offline_markdownize_adapter()
+        .profile()
+        .tool_profile_hash;
+    let draft = local_manifest(
+        raw,
+        &profile,
+        0,
+        None,
+        "",
+        "2000-01-01T00:00:00Z",
+        std::slice::from_ref(prepared),
+    );
+    let unit = local_normalized_unit(
+        &draft,
+        &draft.units[0],
+        media_type,
+        &path.to_string_lossy(),
+        bytes,
+    )?;
+    kio_pipeline::markdownize::check_normalized_unit_write_size(&unit)
 }
 
 #[cfg(debug_assertions)]
@@ -411,24 +537,6 @@ fn markdownize_test_mode(control: &ControlHandle) -> Option<MarkdownizeTestMode>
             Some(MarkdownizeTestMode::RejectIncrementalAndFull)
         }
         None => None,
-    }
-}
-
-/// 07-adapter-spec.md §5.1: which `UnitKind` an Office media type's
-/// converted-PDF units use -- DOCX enumerates `page:N` (the converted PDF's
-/// pages themselves), PPTX enumerates `slide:N` (1 converted-PDF page = 1
-/// slide). `None` for every other media type, including XLSX (the sheet
-/// conversion mechanism is explicitly out of this addendum's scope, 07 §5.1
-/// closing sentence).
-fn office_unit_kind(media_type: &str) -> Option<UnitKind> {
-    match media_type {
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => {
-            Some(UnitKind::Page)
-        }
-        "application/vnd.openxmlformats-officedocument.presentationml.presentation" => {
-            Some(UnitKind::Slide)
-        }
-        _ => None,
     }
 }
 
@@ -558,6 +666,7 @@ pub(crate) fn run_index_pipeline(
     preview: &ScanPreview,
     args: &IndexArgs,
     ledger: Option<&kio_pipeline::ledger::LedgerDb>,
+    explicit_resource_retry: bool,
 ) -> Result<IndexPipelineResult> {
     let task_store = TaskStore::new_with_control(repo.kio_dir(), repo.control().clone());
     // Q3: index holds the folder store lock end-to-end, so any Running online task
@@ -672,11 +781,6 @@ pub(crate) fn run_index_pipeline(
         .filter(|entry| entry.reason == OFFICE_CONVERSION_UNAVAILABLE_REASON)
         .map(|entry| entry.path.clone())
         .collect::<BTreeSet<_>>();
-    // R12-2: the documented `adapter.policy.max_input_bytes` input gate (07 §7.1.2 —
-    // "Kio 側の入力制御" is an MVP contract). Scope config wins over user config,
-    // default 100 MB. A file larger than the cap is never handed to the Markdownize
-    // adapter (below); it stays archived but unenriched, and the count is disclosed.
-    let max_input_bytes = effective_max_input_bytes(repo)?;
     // R12-1: the documented `[markdownize.incremental]` overrides (were hardcoded).
     let incremental_config = effective_incremental_config(repo)?;
     let head_ocr_normalizes = repo
@@ -695,26 +799,33 @@ pub(crate) fn run_index_pipeline(
         })
         .unwrap_or_default();
 
+    let extraction_store = bound_extraction_store(repo)?;
+    let object_store = repo.object_store();
+    let extraction_holds = task_store
+        .all()
+        .map_err(pipeline_to_kio)?
+        .into_iter()
+        .filter(|task| {
+            task.output_ref == EXTRACTION_HOLD_OUTPUT_REF && task.resource_limit.is_some()
+        })
+        .map(|task| (task.input_path.clone(), task))
+        .collect::<BTreeMap<_, _>>();
+    let live_inputs = preview
+        .candidates
+        .iter()
+        .filter(|candidate| !candidate.ignored && candidate.media_type != "inode/directory")
+        .map(|candidate| candidate.input_path.as_str())
+        .collect::<BTreeSet<_>>();
+    for held in extraction_holds.values() {
+        if !live_inputs.contains(held.input_path.as_str()) {
+            discard_stages_if_unheld_after_retirement(&extraction_store, &task_store, held)?;
+        }
+    }
     for candidate in preview
         .candidates
         .iter()
         .filter(|candidate| !candidate.ignored && candidate.media_type != "inode/directory")
     {
-        if candidate.size_bytes > max_input_bytes
-            && !kio_pipeline::unsupported::is_source_code_path(Path::new(&candidate.input_path))
-        {
-            result.skipped_oversized_files += 1;
-            repo.control().append_event_log_in_session(
-                repo.lock_session(),
-                "KIO-I-INDEX-INPUT-OVERSIZED-001",
-                "input file exceeds adapter.policy.max_input_bytes; skipped adapter processing",
-                json!({
-                    "size_bytes": candidate.size_bytes,
-                    "max_input_bytes": max_input_bytes,
-                }),
-            )?;
-            continue;
-        }
         let path = repository_input_display_path(repo, &candidate.input_path);
         if !repository_scan_policy_allows_file(repo, &candidate.input_path)
             .map_err(pipeline_to_kio)?
@@ -755,9 +866,47 @@ pub(crate) fn run_index_pipeline(
             unsupported_paths.insert(candidate.input_path.clone());
             continue;
         }
+        let held = extraction_holds.get(&candidate.input_path);
+        if let Some(task) = held {
+            let current =
+                crate::index::command::hash_repository_scan_input(repo, &candidate.input_path);
+            if let Ok(current) = current {
+                if current.raw_hash != task.input_hash {
+                    discard_stages_if_unheld_after_retirement(
+                        &extraction_store,
+                        &task_store,
+                        task,
+                    )?;
+                } else if !explicit_resource_retry {
+                    result.pending_files += 1;
+                    result.paused_tasks += 1;
+                    result.resource_limit = task.resource_limit.clone();
+                    continue;
+                }
+            }
+        }
         let verified =
-            match read_repository_scan_input(repo, &candidate.input_path, max_input_bytes) {
+            match read_repository_extraction_input(repo, &candidate.input_path, args.resource_tier)
+            {
                 Ok(verified) => verified,
+                Err(kio_pipeline::PipelineError::ResourceLimit(limit)) => {
+                    let identity = crate::index::command::hash_repository_scan_input(
+                        repo,
+                        &candidate.input_path,
+                    )
+                    .map_err(pipeline_to_kio)?;
+                    ensure_raw_ingest_allowed(repo, &identity.raw_hash)?;
+                    pause_extraction(
+                        repo,
+                        &task_store,
+                        candidate,
+                        &identity.raw_hash,
+                        &now,
+                        &limit.into_error("cannot read extraction input"),
+                        &mut result,
+                    )?;
+                    continue;
+                }
                 Err(error) => {
                     repo.control().append_event_log_in_session(
                         repo.lock_session(),
@@ -798,7 +947,12 @@ pub(crate) fn run_index_pipeline(
         // Reject before Prepare/Markdownize writes any derived state. The closing
         // snapshot independently rechecks every staged raw under the store lock.
         ensure_raw_ingest_allowed(repo, &raw_hash)?;
-        let prepare = prepare_units_from_bytes_with_control(
+        let native_image = matches!(
+            candidate.media_type.as_str(),
+            "image/png" | "image/jpeg" | "image/webp"
+        );
+        let staged = match prepare_staged(
+            &extraction_store,
             PrepareStageBytesRequest {
                 raw_hash: &raw_hash,
                 media_type: &candidate.media_type,
@@ -806,17 +960,32 @@ pub(crate) fn run_index_pipeline(
                 tool_profile_hash: &prepare_profile_hash,
                 bytes: &verified.bytes,
             },
-            repo.control(),
+            ExtractionBudget::new(args.resource_tier),
         )
-        .map_err(pipeline_to_kio)?;
-
-        write_prepared_objects(
-            repo,
-            &prepare.prepared_units,
-            &prepare.prepared_object_hashes,
-            &verified.bytes,
-            &candidate.media_type,
-        )?;
+        .and_then(|staged| {
+            if !native_image {
+                staged.persist_objects(&object_store)?;
+            }
+            Ok(staged)
+        })
+        .map_err(pipeline_to_kio)
+        {
+            Ok(staged) => staged,
+            Err(error) if error.resource_limit().is_some() => {
+                pause_extraction(
+                    repo,
+                    &task_store,
+                    candidate,
+                    &raw_hash,
+                    &now,
+                    &error,
+                    &mut result,
+                )?;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let prepare = &staged.output;
 
         if let Some((normalize, complete)) = reusable_current_normalize(
             adapter_settings,
@@ -839,6 +1008,14 @@ pub(crate) fn run_index_pipeline(
             } else {
                 result.pending_files += 1;
             }
+            result.retired_extractions.push(Retirement {
+                raw: raw_hash.clone(),
+                path: candidate.input_path.clone(),
+                hold: held
+                    .filter(|task| task.input_hash == staged.raw_hash())
+                    .map(|task| task.task_id.clone()),
+                normalize: None,
+            });
             continue;
         }
 
@@ -846,41 +1023,29 @@ pub(crate) fn run_index_pipeline(
         // objects. Their normalized unit contains only a kio:// image reference,
         // so no binary bytes are treated as Markdown and local image-vector
         // enrichment can discover the pixels through the ordinary chunk path.
-        if matches!(
-            candidate.media_type.as_str(),
-            "image/png" | "image/jpeg" | "image/webp"
-        ) {
-            let native_profile_hash = image_ingest::native_image_profile_hash();
-            let native_instance = kio_pipeline::markdownize::normalized_instance_dir(
-                repo.kio_dir(),
+        if native_image {
+            let normalize = match normalize_native_image(
+                repo,
+                &candidate.input_path,
                 &raw_hash,
-                &native_profile_hash,
-                0,
-            );
-            let normalize = if native_instance.is_dir() {
-                // A same raw/profile/gen instance is immutable authority. Reuse
-                // only after the normal validated loader rebinds its manifest.
-                NormalizeRef {
-                    tool_profile_hash: native_profile_hash,
-                    r#gen: 0,
-                    manifest_hash: compute_manifest_hash(
+                &verified.bytes,
+                &candidate.media_type,
+                &staged,
+            ) {
+                Ok(normalize) => normalize,
+                Err(error) if error.resource_limit().is_some() => {
+                    pause_extraction(
                         repo,
+                        &task_store,
+                        candidate,
                         &raw_hash,
-                        &image_ingest::native_image_profile_hash(),
-                        0,
-                    )?,
+                        &now,
+                        &error,
+                        &mut result,
+                    )?;
+                    continue;
                 }
-            } else {
-                image_ingest::ingest_standalone_image(
-                    repo,
-                    &candidate.input_path,
-                    &raw_hash,
-                    &verified.bytes,
-                    &candidate.media_type,
-                    &prepare_profile_hash,
-                    &markdown_profile_hash,
-                )?
-                .normalize
+                Err(error) => return Err(error),
             };
             result.normalize_by_path.insert(
                 candidate.input_path.clone(),
@@ -909,6 +1074,14 @@ pub(crate) fn run_index_pipeline(
                     &mut office_conversion_unavailable_paths,
                 )?;
             }
+            result.retired_extractions.push(Retirement {
+                raw: raw_hash.clone(),
+                path: candidate.input_path.clone(),
+                hold: held
+                    .filter(|task| task.input_hash == staged.raw_hash())
+                    .map(|task| task.task_id.clone()),
+                normalize: None,
+            });
             continue;
         }
 
@@ -988,6 +1161,14 @@ pub(crate) fn run_index_pipeline(
                     }),
                 )?;
             }
+            result.retired_extractions.push(Retirement {
+                raw: raw_hash.clone(),
+                path: candidate.input_path.clone(),
+                hold: held
+                    .filter(|task| task.input_hash == staged.raw_hash())
+                    .map(|task| task.task_id.clone()),
+                normalize: None,
+            });
             continue;
         }
 
@@ -1028,7 +1209,7 @@ pub(crate) fn run_index_pipeline(
                 &prepare.prepared_units,
                 repo.control(),
             ) {
-                create_prepared_hash_drift_instance(
+                if let Err(error) = create_prepared_hash_drift_instance(
                     repo,
                     &task_store,
                     markdown_adapter.as_ref(),
@@ -1041,7 +1222,29 @@ pub(crate) fn run_index_pipeline(
                     new_gen,
                     &now,
                     &mut result,
-                )?;
+                ) {
+                    if error.resource_limit().is_some() {
+                        pause_extraction(
+                            repo,
+                            &task_store,
+                            candidate,
+                            &raw_hash,
+                            &now,
+                            &error,
+                            &mut result,
+                        )?;
+                        continue;
+                    }
+                    return Err(error);
+                }
+                result.retired_extractions.push(Retirement {
+                    raw: raw_hash.clone(),
+                    path: candidate.input_path.clone(),
+                    hold: held
+                        .filter(|task| task.input_hash == staged.raw_hash())
+                        .map(|task| task.task_id.clone()),
+                    normalize: None,
+                });
                 continue;
             }
             // Keep the latest generation pinned when preparation is unchanged.
@@ -1053,7 +1256,6 @@ pub(crate) fn run_index_pipeline(
                 repo.control(),
             )
             .map_err(pipeline_to_kio)?
-            .manifest
             .r#gen;
             let manifest_hash =
                 compute_manifest_hash(repo, &raw_hash, &markdown_profile_hash, latest_gen)?;
@@ -1097,6 +1299,14 @@ pub(crate) fn run_index_pipeline(
                     &mut office_conversion_unavailable_paths,
                 )?;
             }
+            result.retired_extractions.push(Retirement {
+                raw: raw_hash.clone(),
+                path: candidate.input_path.clone(),
+                hold: held
+                    .filter(|task| task.input_hash == staged.raw_hash())
+                    .map(|task| task.task_id.clone()),
+                normalize: None,
+            });
             continue;
         }
 
@@ -1105,17 +1315,22 @@ pub(crate) fn run_index_pipeline(
         // error (a store read fault, an unreadable prior instance the `Ok(None)` fix
         // above did not already absorb), degrade to no-previous = a Full re-send for this
         // candidate only, keeping the blast radius to the one file.
-        let previous =
-            previous_instance_for_path(&task_store, &candidate.input_path, &markdown_profile_hash)
-                .unwrap_or_else(|_err| {
-                    let _ = repo.control().append_event_log_in_session(
-                        repo.lock_session(),
-                        "KIO-I-INDEX-PREVIOUS-UNREADABLE-001",
-                        "prior normalized instance unreadable; indexing this file as Full",
-                        json!({ "input_path": candidate.input_path }),
-                    );
-                    None
-                });
+        let builtin = is_builtin_markdownize(repo.control());
+        let previous = previous_instance_for_path(
+            &task_store,
+            &candidate.input_path,
+            &markdown_profile_hash,
+            !builtin,
+        )
+        .unwrap_or_else(|_err| {
+            let _ = repo.control().append_event_log_in_session(
+                repo.lock_session(),
+                "KIO-I-INDEX-PREVIOUS-UNREADABLE-001",
+                "prior normalized instance unreadable; indexing this file as Full",
+                json!({ "input_path": candidate.input_path }),
+            );
+            None
+        });
         let mapping = if incremental_config.enabled {
             previous
                 .as_ref()
@@ -1153,88 +1368,140 @@ pub(crate) fn run_index_pipeline(
             }
         };
         let mode = mode_decision.mode;
-        let hints = prepared_unit_hints(&prepare.prepared_units);
-        let adapter_previous = previous
-            .as_ref()
-            .map(|previous| PreviousMarkdownizeContext {
-                raw: RawInput {
-                    raw_hash: previous.manifest.raw_hash.clone(),
-                    path: Some(
-                        repo.canonical_root()
-                            .join(&candidate.input_path)
-                            .display()
-                            .to_string(),
-                    ),
-                },
-                normalized_units: previous
-                    .units
-                    .iter()
-                    .map(normalized_unit_to_adapter_unit)
-                    .collect(),
-                tool_profile_hash: previous.manifest.tool_profile_hash.clone(),
-            });
-        let request = MarkdownizeRequest {
-            raw: RawInput {
-                raw_hash: raw_hash.clone(),
-                path: Some(path.display().to_string()),
-            },
-            media_type: candidate.media_type.clone(),
-            prepared_unit_hint: Some(hints),
-            mode: adapter_mode(mode),
-            previous: (mode == MarkdownizeMode::Incremental)
-                .then_some(adapter_previous)
-                .flatten(),
-            hints: (mode == MarkdownizeMode::Incremental)
-                .then(|| adapter_hints(&incremental_hints)),
-            // Offline (deterministic) markdownize path: the builtin adapter ignores
-            // page scoping (R15-5 concerns only the real Mistral client).
-            restrict_to_hint_pages: false,
-            bbox_annotation_enabled: false,
-            tool_profile_hash: markdown_profile_hash.clone(),
-            spec_version: 1,
-            // QA13 (step4b-contract-tests-p3a.md §E, 04 §5.5 L880): this is
-            // the free/local (no ledger charge) offline Markdownize path —
-            // there is no `intent_token` to carry.
-            idempotency_token: None,
-        };
-
-        let mut response = offline_markdownize_from_verified_bytes(
-            markdown_adapter.as_ref(),
-            request.clone(),
-            &verified.bytes,
-            repo.control(),
-        )
-        .map_err(adapter_to_kio)?;
+        let generated_at = repo.control().now_utc_seconds();
+        let run_id = format!("run_{}", new_ulid(repo.canonical_root()));
         let mut final_mode = mode;
         let mut fallback_reason = mode_decision.reason.clone();
-        let validation = if response.fallback_to_full {
-            Err(kio_pipeline::PipelineError::contract(
-                "KIO-E-ADAPTER-CONTRACT-001",
-                "adapter_requested_full_fallback",
-            ))
+        let stamped_manifest = if builtin {
+            match persist_local_normalization(
+                repo,
+                &path,
+                &candidate.media_type,
+                &prepare.prepared_units,
+                &raw_hash,
+                &markdown_profile_hash,
+                0,
+                previous.as_ref().map(|value| value.manifest.r#gen),
+                &run_id,
+                &generated_at,
+            ) {
+                Ok(manifest) => manifest,
+                Err(error) if error.error_code() == "KIO-E-ADAPTER-CONTRACT-001" => {
+                    append_failed_markdownize_task(
+                        repo,
+                        &task_store,
+                        candidate,
+                        &raw_hash,
+                        &output_ref,
+                        "contract_violation",
+                        &now,
+                    )?;
+                    result.failed_files += 1;
+                    result.retired_extractions.push(Retirement {
+                        raw: raw_hash.clone(),
+                        path: candidate.input_path.clone(),
+                        hold: held
+                            .filter(|task| task.input_hash == staged.raw_hash())
+                            .map(|task| task.task_id.clone()),
+                        normalize: None,
+                    });
+                    continue;
+                }
+                Err(error) if error.resource_limit().is_some() => {
+                    pause_extraction(
+                        repo,
+                        &task_store,
+                        candidate,
+                        &raw_hash,
+                        &now,
+                        &error,
+                        &mut result,
+                    )?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
         } else {
-            validate_markdownize_response(&response, &incremental_hints, &prepare.prepared_units)
-        };
-        if let Err(error) = validation {
-            if mode != MarkdownizeMode::Incremental {
-                append_failed_markdownize_task(
-                    repo,
-                    &task_store,
-                    candidate,
-                    &raw_hash,
-                    &output_ref,
-                    "contract_violation",
-                    &now,
-                )?;
-                result.failed_files += 1;
-                // The validation verdict used to be silently discarded here,
-                // which made every such failure a blind "contract_violation"
-                // task (2026-07-23 fixture registration: 48 opaque failures
-                // whose real cause — unfenced raw HTML in octet-text
-                // passthrough — took a live probe to recover). Keep the
-                // task-record shape, but preserve the actual reason in the
-                // event log.
-                repo.control().append_event_log_in_session(repo.lock_session(),
+            let hints = prepared_unit_hints(&prepare.prepared_units);
+            let adapter_previous = previous
+                .as_ref()
+                .map(|previous| PreviousMarkdownizeContext {
+                    raw: RawInput {
+                        raw_hash: previous.manifest.raw_hash.clone(),
+                        path: Some(
+                            repo.canonical_root()
+                                .join(&candidate.input_path)
+                                .display()
+                                .to_string(),
+                        ),
+                    },
+                    normalized_units: previous
+                        .units
+                        .iter()
+                        .map(normalized_unit_to_adapter_unit)
+                        .collect(),
+                    tool_profile_hash: previous.manifest.tool_profile_hash.clone(),
+                });
+            let request = MarkdownizeRequest {
+                raw: RawInput {
+                    raw_hash: raw_hash.clone(),
+                    path: Some(path.display().to_string()),
+                },
+                media_type: candidate.media_type.clone(),
+                prepared_unit_hint: Some(hints),
+                mode: adapter_mode(mode),
+                previous: (mode == MarkdownizeMode::Incremental)
+                    .then_some(adapter_previous)
+                    .flatten(),
+                hints: (mode == MarkdownizeMode::Incremental)
+                    .then(|| adapter_hints(&incremental_hints)),
+                // Offline (deterministic) markdownize path: the builtin adapter ignores
+                // page scoping (R15-5 concerns only the real Mistral client).
+                restrict_to_hint_pages: false,
+                bbox_annotation_enabled: false,
+                tool_profile_hash: markdown_profile_hash.clone(),
+                spec_version: 1,
+                // QA13 (step4b-contract-tests-p3a.md §E, 04 §5.5 L880): this is
+                // the free/local (no ledger charge) offline Markdownize path —
+                // there is no `intent_token` to carry.
+                idempotency_token: None,
+            };
+
+            let mut response = markdown_adapter
+                .markdownize(request.clone())
+                .map_err(adapter_to_kio)?;
+            let validation = if response.fallback_to_full {
+                Err(kio_pipeline::PipelineError::contract(
+                    "KIO-E-ADAPTER-CONTRACT-001",
+                    "adapter_requested_full_fallback",
+                ))
+            } else {
+                validate_markdownize_response(
+                    &response,
+                    &incremental_hints,
+                    &prepare.prepared_units,
+                )
+            };
+            if let Err(error) = validation {
+                if mode != MarkdownizeMode::Incremental {
+                    append_failed_markdownize_task(
+                        repo,
+                        &task_store,
+                        candidate,
+                        &raw_hash,
+                        &output_ref,
+                        "contract_violation",
+                        &now,
+                    )?;
+                    result.failed_files += 1;
+                    // The validation verdict used to be silently discarded here,
+                    // which made every such failure a blind "contract_violation"
+                    // task (2026-07-23 fixture registration: 48 opaque failures
+                    // whose real cause — unfenced raw HTML in octet-text
+                    // passthrough — took a live probe to recover). Keep the
+                    // task-record shape, but preserve the actual reason in the
+                    // event log.
+                    repo.control().append_event_log_in_session(repo.lock_session(),
                     "KIO-E-ADAPTER-CONTRACT-001",
                     "offline markdownize response failed acceptance; task recorded as contract_violation",
                     json!({
@@ -1242,87 +1509,98 @@ pub(crate) fn run_index_pipeline(
                         "detail": error.to_string(),
                     }),
                 )?;
-                continue;
+                    result.retired_extractions.push(Retirement {
+                        raw: raw_hash.clone(),
+                        path: candidate.input_path.clone(),
+                        hold: held
+                            .filter(|task| task.input_hash == staged.raw_hash())
+                            .map(|task| task.task_id.clone()),
+                        normalize: None,
+                    });
+                    continue;
+                }
+                let mut full_request = request;
+                full_request.mode = AdapterMarkdownizeMode::Full;
+                full_request.previous = None;
+                full_request.hints = None;
+                let fallback_response = markdown_adapter
+                    .markdownize(full_request)
+                    .map_err(adapter_to_kio)
+                    .and_then(|response| {
+                        validate_markdownize_response(
+                            &response,
+                            &incremental_hints,
+                            &prepare.prepared_units,
+                        )
+                        .map_err(pipeline_to_kio)?;
+                        Ok(response)
+                    });
+                let Ok(fallback_response) = fallback_response else {
+                    append_failed_markdownize_task(
+                        repo,
+                        &task_store,
+                        candidate,
+                        &raw_hash,
+                        &output_ref,
+                        "full_fallback_failed",
+                        &now,
+                    )?;
+                    result.failed_files += 1;
+                    result.retired_extractions.push(Retirement {
+                        raw: raw_hash.clone(),
+                        path: candidate.input_path.clone(),
+                        hold: held
+                            .filter(|task| task.input_hash == staged.raw_hash())
+                            .map(|task| task.task_id.clone()),
+                        normalize: None,
+                    });
+                    continue;
+                };
+                response = fallback_response;
+                final_mode = MarkdownizeMode::Full;
+                fallback_reason = Some("full_fallback_after_incremental_reject".to_owned());
             }
-            let mut full_request = request;
-            full_request.mode = AdapterMarkdownizeMode::Full;
-            full_request.previous = None;
-            full_request.hints = None;
-            let fallback_response = offline_markdownize_from_verified_bytes(
-                markdown_adapter.as_ref(),
-                full_request,
+
+            let units = normalized_units_from_response(
+                repo,
+                &candidate.media_type,
                 &verified.bytes,
+                &response,
+                &prepare.prepared_units,
+                previous.as_ref(),
+                &raw_hash,
+                &markdown_profile_hash,
+                0,
+                final_mode,
+                &generated_at,
+            )
+            .map_err(NormalizedUnitsError::into_kio)?;
+            let manifest = manifest_from_units(
+                &prepare.prepared_units,
+                &units,
+                &raw_hash,
+                &markdown_profile_hash,
+                0,
+                previous.as_ref().map(|previous| previous.manifest.r#gen),
+                &run_id,
+                &generated_at,
+                // The local deterministic markdownize always returns every unit, so this
+                // kind is inert here; a hypothetical missing unit would be a
+                // non-retryable library/contract fault rather than a transient.
+                RetryErrorKind::ContractViolation,
+            );
+            persist_normalized_instance_with_control(
+                repo.kio_dir(),
+                &manifest,
+                &units,
                 repo.control(),
             )
-            .map_err(adapter_to_kio)
-            .and_then(|response| {
-                validate_markdownize_response(
-                    &response,
-                    &incremental_hints,
-                    &prepare.prepared_units,
-                )
-                .map_err(pipeline_to_kio)?;
-                Ok(response)
-            });
-            let Ok(fallback_response) = fallback_response else {
-                append_failed_markdownize_task(
-                    repo,
-                    &task_store,
-                    candidate,
-                    &raw_hash,
-                    &output_ref,
-                    "full_fallback_failed",
-                    &now,
-                )?;
-                result.failed_files += 1;
-                continue;
-            };
-            response = fallback_response;
-            final_mode = MarkdownizeMode::Full;
-            fallback_reason = Some("full_fallback_after_incremental_reject".to_owned());
-        }
-
-        let generated_at = repo.control().now_utc_seconds();
-        let run_id = format!("run_{}", new_ulid(repo.canonical_root()));
-        let units = normalized_units_from_response(
-            repo,
-            &candidate.media_type,
-            &verified.bytes,
-            &response,
-            &prepare.prepared_units,
-            previous.as_ref(),
-            &raw_hash,
-            &markdown_profile_hash,
-            0,
-            final_mode,
-            &generated_at,
-        )
-        .map_err(NormalizedUnitsError::into_kio)?;
-        let manifest = manifest_from_units(
-            &prepare.prepared_units,
-            &units,
-            &raw_hash,
-            &markdown_profile_hash,
-            0,
-            previous.as_ref().map(|previous| previous.manifest.r#gen),
-            &run_id,
-            &generated_at,
-            // The local deterministic markdownize always returns every unit, so this
-            // kind is inert here; a hypothetical missing unit would be a
-            // non-retryable library/contract fault rather than a transient.
-            RetryErrorKind::ContractViolation,
-        );
-        let stamped_manifest = persist_normalized_instance_with_control(
-            repo.kio_dir(),
-            &manifest,
-            &units,
-            repo.control(),
-        )
-        .map_err(pipeline_to_kio)?;
+            .map_err(pipeline_to_kio)?
+        };
         // The returned manifest includes the immutable normalized-unit CAS
         // pins that the writer just committed; derive the tree pin from those
         // exact bytes rather than the pre-persist nullable manifest.
-        let manifest_hash = hash_and_write_manifest_object(repo, &stamped_manifest)?;
+        let manifest_hash = published_manifest_hash(repo, &stamped_manifest)?;
         let task = task_descriptor(
             repo,
             TaskType::Markdownize,
@@ -1388,6 +1666,14 @@ pub(crate) fn run_index_pipeline(
                 &mut office_conversion_unavailable_paths,
             )?;
         }
+        result.retired_extractions.push(Retirement {
+            raw: raw_hash.clone(),
+            path: candidate.input_path.clone(),
+            hold: held
+                .filter(|task| task.input_hash == staged.raw_hash())
+                .map(|task| task.task_id.clone()),
+            normalize: None,
+        });
     }
     // Stage 3: drain approved loopback OCR even when external networking is
     // offline. Current endpoint approval still gates the selected peer. The task is
@@ -1402,10 +1688,344 @@ pub(crate) fn run_index_pipeline(
             network_allowed,
             true,
         )?;
-        result.resource_limit = outcome.resource_limit;
+        result.resource_limit = result.resource_limit.or(outcome.resource_limit);
         result.pending_online_tasks = result.pending_online_tasks.saturating_sub(outcome.executed);
     }
     Ok(result)
+}
+
+/// Resume local holds whose original is still the archived and live input.
+/// Promote only their normalization refs, leaving the other HEAD entries alone.
+pub(crate) fn retry_local_extractions(
+    ctx: &crate::invocation::Invocation<'_>,
+    repo: &Repository,
+    store: &TaskStore,
+    tier: kio_core::error::ResourceTier,
+) -> Result<(usize, bool)> {
+    let recovered = extraction_retirement::recover(repo)?;
+    let tasks = store.all().map_err(pipeline_to_kio)?;
+    let held = tasks.iter().filter(|task| {
+        task.output_ref == EXTRACTION_HOLD_OUTPUT_REF && task.resource_limit.is_some()
+    });
+    let root = repo.bound_root_handle().ok_or_else(|| {
+        kio_core::KioError::schema("extraction retry requires retained scope authority")
+    })?;
+    let directory = bound_extraction_store(repo)?;
+    let objects = repo.object_store();
+    let prepare_profile = builtin_prepare_profile().tool_profile_hash;
+    let markdown_profile = builtin_offline_markdownize_adapter()
+        .profile()
+        .tool_profile_hash;
+    let mut ready = BTreeMap::new();
+    let mut completed = Vec::new();
+    let mut reused = BTreeMap::<(String, &str), Option<NormalizeRef>>::new();
+    for task in held {
+        if !kio_pipeline::scan::bound_scan_input_is_regular(root, &task.input_path)
+            .map_err(pipeline_to_kio)?
+            || !repository_scan_policy_allows_file(repo, &task.input_path)
+                .map_err(pipeline_to_kio)?
+        {
+            discard_stages_if_unheld_after_retirement(&directory, store, task)?;
+            continue;
+        }
+        let verified = match read_repository_extraction_input(repo, &task.input_path, tier) {
+            Ok(verified) if verified.raw_hash == task.input_hash => verified,
+            Ok(_) => {
+                discard_stages_if_unheld_after_retirement(&directory, store, task)?;
+                continue;
+            }
+            Err(kio_pipeline::PipelineError::ResourceLimit(limit)) => {
+                if let Ok(current) =
+                    crate::index::command::hash_repository_scan_input(repo, &task.input_path)
+                {
+                    if current.raw_hash != task.input_hash {
+                        discard_stages_if_unheld_after_retirement(&directory, store, task)?;
+                    } else {
+                        crate::task_execution::hold_resource_task(
+                            store,
+                            &task.task_id,
+                            Some(limit),
+                        )?;
+                    }
+                }
+                continue;
+            }
+            Err(_) => continue,
+        };
+        ensure_raw_ingest_allowed(repo, &task.input_hash)?;
+        let path = repository_input_display_path(repo, &task.input_path);
+        let media_type = crate::task_execution::media_type_for_cli_path(&path);
+        let key = (task.input_hash.clone(), media_type);
+        if let Some(normalize) = reused.get(&key) {
+            if let Some(normalize) = normalize {
+                ready.insert(
+                    task.input_path.clone(),
+                    PendingNormalizeRef {
+                        expected_raw_hash: task.input_hash.clone(),
+                        normalize: normalize.clone(),
+                    },
+                );
+            }
+            completed.push(retry_retirement(task, normalize.clone()));
+            continue;
+        }
+        let result = (|| {
+            let staged = prepare_staged(
+                &directory,
+                PrepareStageBytesRequest {
+                    raw_hash: &task.input_hash,
+                    media_type,
+                    input_path: &path.to_string_lossy(),
+                    tool_profile_hash: &prepare_profile,
+                    bytes: &verified.bytes,
+                },
+                ExtractionBudget::new(tier),
+            )
+            .map_err(pipeline_to_kio)?;
+            if matches!(media_type, "image/png" | "image/jpeg" | "image/webp") {
+                let normalize = normalize_native_image(
+                    repo,
+                    &task.input_path,
+                    &task.input_hash,
+                    &verified.bytes,
+                    media_type,
+                    &staged,
+                )?;
+                return Ok(Some(normalize));
+            }
+            if staged.output.prepared_units.is_empty() {
+                return Ok(None);
+            }
+            staged.persist_objects(&objects).map_err(pipeline_to_kio)?;
+            let normalized = if let Ok(instance) = latest_normalized_instance(
+                repo.kio_dir(),
+                &task.input_hash,
+                &markdown_profile,
+                repo.control(),
+            ) {
+                let generation = instance.r#gen;
+                let next = prepared_hash_drift_new_gen(
+                    repo.kio_dir(),
+                    &task.input_hash,
+                    &markdown_profile,
+                    &staged.output.prepared_units,
+                    repo.control(),
+                );
+                if let Some(next) = next {
+                    persist_local_normalization(
+                        repo,
+                        &path,
+                        media_type,
+                        &staged.output.prepared_units,
+                        &task.input_hash,
+                        &markdown_profile,
+                        next,
+                        Some(generation),
+                        &format!("run_{}", new_ulid(repo.canonical_root())),
+                        &repo.control().now_utc_seconds(),
+                    )?
+                } else {
+                    instance
+                }
+            } else {
+                persist_local_normalization(
+                    repo,
+                    &path,
+                    media_type,
+                    &staged.output.prepared_units,
+                    &task.input_hash,
+                    &markdown_profile,
+                    0,
+                    None,
+                    &format!("run_{}", new_ulid(repo.canonical_root())),
+                    &repo.control().now_utc_seconds(),
+                )?
+            };
+            let manifest_hash = published_manifest_hash(repo, &normalized)?;
+            Ok::<_, kio_core::KioError>(Some(NormalizeRef {
+                tool_profile_hash: markdown_profile.clone(),
+                r#gen: normalized.r#gen,
+                manifest_hash,
+            }))
+        })();
+        match result {
+            Ok(normalize) => {
+                if let Some(normalize) = &normalize {
+                    ready.insert(
+                        task.input_path.clone(),
+                        PendingNormalizeRef {
+                            expected_raw_hash: task.input_hash.clone(),
+                            normalize: normalize.clone(),
+                        },
+                    );
+                }
+                reused.insert(key, normalize.clone());
+                completed.push(retry_retirement(task, normalize));
+            }
+            Err(error) => {
+                let Some(limit) = error.resource_limit() else {
+                    return Err(error);
+                };
+                crate::task_execution::hold_resource_task(
+                    store,
+                    &task.task_id,
+                    Some(limit.clone()),
+                )?;
+            }
+        }
+    }
+    if completed.is_empty() {
+        return Ok((0, recovered));
+    }
+    let expected = completed
+        .iter()
+        .map(|item| (item.path.clone(), item.raw.clone()))
+        .collect();
+    let policy = crate::search::scope::current_embedding_policy(repo)?;
+    let outcome = repo.snapshot_retried_extractions(
+        &expected,
+        &ready,
+        &|head, tree| extraction_retirement::record(repo, head, tree, &completed),
+        &|| policy.revalidate().map_err(pipeline_to_kio),
+    )?;
+    repo.control()
+        .checkpoint(kio_core::durability::DurabilityPoint::ExtractionAfterHead)?;
+    if let Some(head) = &outcome.commit_hash {
+        crate::search::projection::mark_replica_rebuilding_or_log(ctx, repo.kio_dir(), head);
+    }
+    extraction_retirement::recover(repo)?;
+    Ok((completed.len(), recovered || outcome.commit_hash.is_some()))
+}
+
+fn retry_retirement(task: &TaskDescriptor, normalize: Option<NormalizeRef>) -> Retirement {
+    Retirement {
+        raw: task.input_hash.clone(),
+        path: task.input_path.clone(),
+        hold: Some(task.task_id.clone()),
+        normalize,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pause_extraction(
+    repo: &Repository,
+    store: &TaskStore,
+    candidate: &ScanCandidate,
+    raw_hash: &str,
+    now: &str,
+    error: &kio_core::KioError,
+    result: &mut IndexPipelineResult,
+) -> Result<()> {
+    let limit = error
+        .resource_limit()
+        .expect("typed extraction resource error");
+    let updated = store
+        .update_matching(|task| {
+            if task.output_ref != EXTRACTION_HOLD_OUTPUT_REF
+                || task.input_path != candidate.input_path
+                || task.input_hash != raw_hash
+                || task.hold_reason != Some(HoldReason::ResourceLimit)
+            {
+                return false;
+            }
+            task.resource_limit = Some(limit.clone());
+            true
+        })
+        .map_err(pipeline_to_kio)?;
+    if updated == 0 {
+        let mut task = task_descriptor(
+            repo,
+            TaskType::Markdownize,
+            Some(MarkdownizeMode::Full),
+            candidate,
+            raw_hash,
+            EXTRACTION_HOLD_OUTPUT_REF,
+            TaskStatus::Paused,
+            Some("resource_limit"),
+            now,
+        );
+        task.resource_limit = Some(limit.clone());
+        store.append(&task).map_err(pipeline_to_kio)?;
+    }
+    result.resource_limit = Some(limit.clone());
+    result.paused_tasks += 1;
+    result.pending_files += 1;
+    Ok(())
+}
+
+impl IndexPipelineResult {
+    pub(crate) fn record_extraction_retirement(
+        &self,
+        repo: &Repository,
+        head: &str,
+        tree: &kio_core::dag::TreeObject,
+    ) -> Result<()> {
+        if self.retired_extractions.is_empty() && self.resource_limit.is_none() {
+            return Ok(());
+        }
+        extraction_retirement::record(repo, head, tree, &self.retired_extractions)
+    }
+}
+
+fn normalize_native_image(
+    repo: &Repository,
+    input_path: &str,
+    raw: &str,
+    bytes: &[u8],
+    media_type: &str,
+    staged: &kio_pipeline::prepare::StagedPreparation,
+) -> Result<NormalizeRef> {
+    let profile = image_ingest::native_image_profile_hash();
+    if kio_pipeline::markdownize::normalized_instance_dir(repo.kio_dir(), raw, &profile, 0).is_dir()
+    {
+        return Ok(NormalizeRef {
+            manifest_hash: compute_manifest_hash(repo, raw, &profile, 0)?,
+            tool_profile_hash: profile,
+            r#gen: 0,
+        });
+    }
+    Ok(
+        image_ingest::ingest_standalone_image(repo, input_path, raw, bytes, media_type, staged)?
+            .normalize,
+    )
+}
+
+fn discard_stages_if_unheld_after_retirement(
+    directory: &kio_core::store_dir::StoreDirectory,
+    store: &TaskStore,
+    obsolete: &TaskDescriptor,
+) -> Result<()> {
+    // Keep the task durable until cleanup succeeds. Another path with the same
+    // raw identity may still need the workspace.
+    let shared = store.all().map_err(pipeline_to_kio)?.iter().any(|task| {
+        task.task_id != obsolete.task_id
+            && task.output_ref == EXTRACTION_HOLD_OUTPUT_REF
+            && task.input_hash == obsolete.input_hash
+            && task.resource_limit.is_some()
+    });
+    if !shared {
+        kio_pipeline::prepare::discard_prepared_stages(directory, &obsolete.input_hash)
+            .map_err(pipeline_to_kio)?;
+        kio_pipeline::markdownize::discard_normalized_stages(directory, &obsolete.input_hash)
+            .map_err(pipeline_to_kio)?;
+    }
+    clear_extraction_hold(store, obsolete, "input_changed")
+}
+
+fn clear_extraction_hold(store: &TaskStore, held: &TaskDescriptor, reason: &str) -> Result<()> {
+    store
+        .update_matching(|task| {
+            if task.task_id != held.task_id {
+                return false;
+            }
+            task.status = TaskStatus::Skipped;
+            task.resource_limit = None;
+            task.hold_reason = None;
+            task.fallback_reason = Some(reason.to_owned());
+            true
+        })
+        .map_err(pipeline_to_kio)?;
+    Ok(())
 }
 
 /// QB41 (03 §2.1's second legal gen+1 path, 07 §5.1): the newest existing
@@ -1420,27 +2040,19 @@ fn latest_normalized_instance(
     raw_hash: &str,
     tool_profile_hash: &str,
     control: &ControlHandle,
-) -> kio_pipeline::Result<ValidatedNormalizedInstance> {
-    // Gen numbers are always small in practice (only `kio reindex --force` and
-    // this QB41 path ever create gen > 0) -- this bound only protects against a
-    // pathological/adversarial store, not a real workload.
+) -> kio_pipeline::Result<NormalizedInstanceManifest> {
     const MAX_GEN_PROBE: u64 = 4096;
-    let mut latest = load_validated_normalized_instance_with_control(
-        kio_dir,
-        raw_hash,
-        tool_profile_hash,
-        0,
-        control,
-    )?;
-    for r#gen in 1..MAX_GEN_PROBE {
-        match load_validated_normalized_instance_with_control(
-            kio_dir,
-            raw_hash,
-            tool_profile_hash,
-            r#gen,
-            control,
-        ) {
-            Ok(instance) => latest = instance,
+    let store = kio_core::cas::ObjectStore::new_with_control(kio_dir, control.clone());
+    let validated_manifest = |generation| {
+        let (manifest, _) =
+            read_normalized_instance_manifest(kio_dir, raw_hash, tool_profile_hash, generation)?;
+        visit_validated_normalized_units(&store, &manifest, |_| Ok(()))?;
+        Ok::<_, kio_pipeline::PipelineError>(manifest)
+    };
+    let mut latest = validated_manifest(0)?;
+    for generation in 1..MAX_GEN_PROBE {
+        match validated_manifest(generation) {
+            Ok(manifest) => latest = manifest,
             Err(_) => break,
         }
     }
@@ -1487,7 +2099,6 @@ pub(crate) fn prepared_hash_drift_new_gen(
     }
     let latest = latest_normalized_instance(kio_dir, raw_hash, tool_profile_hash, control).ok()?;
     let existing: BTreeMap<&str, (&str, &str)> = latest
-        .manifest
         .units
         .iter()
         .map(|unit| {
@@ -1533,18 +2144,14 @@ pub(crate) fn prepared_hash_drift_new_gen(
     // OCR-discovered units can differ from the local hint basis. Only a
     // renderer-backed local preparation (or a changed profile) can establish
     // that a changed unit set is a real pagination change.
-    let renderer_prepared = latest
-        .manifest
-        .preparation_provenance
-        .renderer_name
-        .is_some()
+    let renderer_prepared = latest.preparation_provenance.renderer_name.is_some()
         && fresh_prepared_units
             .iter()
             .all(|unit| unit.renderer.is_some());
     if existing.keys().ne(fresh.keys()) && !preparation_profile_changed && !renderer_prepared {
         return None;
     }
-    Some(latest.manifest.r#gen.saturating_add(1))
+    Some(latest.r#gen.saturating_add(1))
 }
 
 /// QB41 (03 §2.1's second legal gen+1 path): create a FRESH normalized
@@ -1557,7 +2164,7 @@ pub(crate) fn prepared_hash_drift_new_gen(
 /// (mirrors `execute_online_markdownize_task`'s office incremental-skip doc,
 /// the analogous online-side reasoning). The OLD gen is left completely
 /// untouched (first-instance-wins) -- only a NEW `g<new_gen>` directory is
-/// created; `write_prepared_objects` already durably wrote the (gen-independent,
+/// created; `prepared object preservation` already durably wrote the (gen-independent,
 /// content-addressed) prepared CAS objects earlier in this same candidate's
 /// pass, so this function does not repeat that step.
 ///
@@ -1584,30 +2191,58 @@ fn create_prepared_hash_drift_instance(
     result: &mut IndexPipelineResult,
 ) -> Result<()> {
     let output_ref = normalized_output_ref(repo, raw_hash, tool_profile_hash, new_gen);
-    let request = MarkdownizeRequest {
-        raw: RawInput {
-            raw_hash: raw_hash.to_owned(),
-            path: Some(path.display().to_string()),
-        },
-        media_type: candidate.media_type.clone(),
-        prepared_unit_hint: Some(prepared_unit_hints(fresh_prepared_units)),
-        mode: AdapterMarkdownizeMode::Full,
-        previous: None,
-        hints: None,
-        restrict_to_hint_pages: false,
-        bbox_annotation_enabled: false,
-        tool_profile_hash: tool_profile_hash.to_owned(),
-        spec_version: 1,
-        idempotency_token: None,
-    };
-    let response = match offline_markdownize_from_verified_bytes(
-        markdown_adapter,
-        request,
-        verified_bytes,
-        repo.control(),
-    ) {
-        Ok(response) => response,
-        Err(_) => {
+    let generated_at = repo.control().now_utc_seconds();
+    let run_id = format!("run_{}", new_ulid(repo.canonical_root()));
+    let stamped_manifest = if is_builtin_markdownize(repo.control()) {
+        persist_local_normalization(
+            repo,
+            path,
+            &candidate.media_type,
+            fresh_prepared_units,
+            raw_hash,
+            tool_profile_hash,
+            new_gen,
+            Some(new_gen.saturating_sub(1)),
+            &run_id,
+            &generated_at,
+        )?
+    } else {
+        let request = MarkdownizeRequest {
+            raw: RawInput {
+                raw_hash: raw_hash.to_owned(),
+                path: Some(path.display().to_string()),
+            },
+            media_type: candidate.media_type.clone(),
+            prepared_unit_hint: Some(prepared_unit_hints(fresh_prepared_units)),
+            mode: AdapterMarkdownizeMode::Full,
+            previous: None,
+            hints: None,
+            restrict_to_hint_pages: false,
+            bbox_annotation_enabled: false,
+            tool_profile_hash: tool_profile_hash.to_owned(),
+            spec_version: 1,
+            idempotency_token: None,
+        };
+        let response = match markdown_adapter.markdownize(request) {
+            Ok(response) => response,
+            Err(_) => {
+                append_failed_markdownize_task(
+                    repo,
+                    task_store,
+                    candidate,
+                    raw_hash,
+                    &output_ref,
+                    "contract_violation",
+                    now,
+                )?;
+                result.failed_files += 1;
+                return Ok(());
+            }
+        };
+        let full_hints = all_changed_hints(fresh_prepared_units);
+        if response.fallback_to_full
+            || validate_markdownize_response(&response, &full_hints, fresh_prepared_units).is_err()
+        {
             append_failed_markdownize_task(
                 repo,
                 task_store,
@@ -1620,54 +2255,36 @@ fn create_prepared_hash_drift_instance(
             result.failed_files += 1;
             return Ok(());
         }
-    };
-    let full_hints = all_changed_hints(fresh_prepared_units);
-    if response.fallback_to_full
-        || validate_markdownize_response(&response, &full_hints, fresh_prepared_units).is_err()
-    {
-        append_failed_markdownize_task(
+        let units = normalized_units_from_response(
             repo,
-            task_store,
-            candidate,
+            &candidate.media_type,
+            verified_bytes,
+            &response,
+            fresh_prepared_units,
+            None,
             raw_hash,
-            &output_ref,
-            "contract_violation",
-            now,
-        )?;
-        result.failed_files += 1;
-        return Ok(());
-    }
-    let generated_at = repo.control().now_utc_seconds();
-    let run_id = format!("run_{}", new_ulid(repo.canonical_root()));
-    let units = normalized_units_from_response(
-        repo,
-        &candidate.media_type,
-        verified_bytes,
-        &response,
-        fresh_prepared_units,
-        None,
-        raw_hash,
-        tool_profile_hash,
-        new_gen,
-        MarkdownizeMode::Full,
-        &generated_at,
-    )
-    .map_err(NormalizedUnitsError::into_kio)?;
-    let manifest = manifest_from_units(
-        fresh_prepared_units,
-        &units,
-        raw_hash,
-        tool_profile_hash,
-        new_gen,
-        Some(new_gen.saturating_sub(1)),
-        &run_id,
-        &generated_at,
-        RetryErrorKind::ContractViolation,
-    );
-    let stamped_manifest =
+            tool_profile_hash,
+            new_gen,
+            MarkdownizeMode::Full,
+            &generated_at,
+        )
+        .map_err(NormalizedUnitsError::into_kio)?;
+        let manifest = manifest_from_units(
+            fresh_prepared_units,
+            &units,
+            raw_hash,
+            tool_profile_hash,
+            new_gen,
+            Some(new_gen.saturating_sub(1)),
+            &run_id,
+            &generated_at,
+            RetryErrorKind::ContractViolation,
+        );
+
         persist_normalized_instance_with_control(repo.kio_dir(), &manifest, &units, repo.control())
-            .map_err(pipeline_to_kio)?;
-    let manifest_hash = hash_and_write_manifest_object(repo, &stamped_manifest)?;
+            .map_err(pipeline_to_kio)?
+    };
+    let manifest_hash = published_manifest_hash(repo, &stamped_manifest)?;
     let mut task = task_descriptor(
         repo,
         TaskType::Markdownize,

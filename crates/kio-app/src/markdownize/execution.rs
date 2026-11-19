@@ -1,6 +1,6 @@
 use crate::egress::local_markdownize_transport_allowed;
 use crate::image_ingest;
-use crate::index::command::read_repository_scan_input;
+use crate::index::command::read_verified_adapter_source;
 use crate::index::command::repository_input_display_path;
 use crate::index::command::repository_scan_policy_allows_file;
 use crate::index::pipeline::offline_output_ref;
@@ -9,10 +9,10 @@ use crate::local_execution::{
     Claim as LocalClaim, LocalContract, LocalExecution, LocalExecutionKind, LocalGuard,
     LocalIdentity, LocalTarget,
 };
+use crate::object_persistence::bound_extraction_store;
 use crate::object_persistence::compute_manifest_hash;
 use crate::object_persistence::normalized_output_ref;
 use crate::object_persistence::pipeline_to_kio;
-use crate::object_persistence::write_canonical_cas_object_or_reuse;
 use crate::ocr_discovery::prepared_units_from_ocr_discovery;
 use crate::ocr_discovery::supports_ocr_from_scratch;
 use crate::scope_access::raw_ingest_is_purge_blocked;
@@ -57,9 +57,12 @@ use kio_pipeline::markdownize::NormalizedUnitManifestEntry;
 use kio_pipeline::markdownize::NormalizedUnitObject;
 use kio_pipeline::markdownize::UnitStatus;
 use kio_pipeline::markdownize::choose_markdownize_mode;
+#[cfg(test)]
 use kio_pipeline::markdownize::load_validated_normalized_instance_with_control;
 use kio_pipeline::markdownize::persist_normalized_instance_with_control;
+use kio_pipeline::markdownize::read_normalized_instance_manifest;
 use kio_pipeline::markdownize::validate_markdownize_response;
+use kio_pipeline::markdownize::visit_validated_normalized_units;
 use kio_pipeline::prepare::PrepareStageBytesRequest;
 use kio_pipeline::prepare::PreparedUnit;
 use kio_pipeline::prepare::UnitFingerprint;
@@ -228,6 +231,7 @@ pub(crate) fn prorated_markdownize_cost(
 /// R21-3: outcome of the send-time online-markdownize precondition check.
 pub(crate) enum OnlineMarkdownizePrecondition {
     ResourceLimit(kio_core::error::ResourceLimit),
+    OversizedPreparedInput,
     /// Consumed source policy is unavailable; preserve task and billing authority.
     PolicyUnavailable(KioError),
     /// File present, unchanged, within the input cap, non-text-native, with locally
@@ -254,6 +258,17 @@ pub(crate) struct PreparedOnlineMarkdownizeInput {
     pub(crate) media_type: String,
     pub(crate) bytes: Vec<u8>,
     pub(crate) prepared_units: Vec<PreparedUnit>,
+    converted_pdf: Option<Vec<u8>>,
+}
+
+impl PreparedOnlineMarkdownizeInput {
+    pub(super) fn adapter_input(&self) -> (&str, &[u8]) {
+        self.converted_pdf
+            .as_deref()
+            .map_or((self.media_type.as_str(), self.bytes.as_slice()), |pdf| {
+                ("application/pdf", pdf)
+            })
+    }
 }
 
 /// R22-5: whether a locally-preparable input is really a TEXT file that only landed in
@@ -295,6 +310,52 @@ pub(crate) fn classify_online_markdownize_precondition(
     repo: &Repository,
     task: &TaskDescriptor,
 ) -> OnlineMarkdownizePrecondition {
+    let max = match effective_max_input_bytes(repo) {
+        Ok(max) => max,
+        Err(error) => return OnlineMarkdownizePrecondition::PolicyUnavailable(error),
+    };
+    let path = repository_input_display_path(repo, &task.input_path);
+    let media_type = media_type_for_cli_path(&path);
+    // PDF and raster requests carry the exact verified source bytes. Their
+    // send cap can be checked without allocating the payload.
+    if supports_ocr_from_scratch(media_type)
+        && !raw_ingest_is_purge_blocked(repo, &task.input_hash)
+        && repository_scan_policy_allows_file(repo, &task.input_path).unwrap_or(false)
+        && let Ok(identity) =
+            crate::index::command::hash_repository_scan_input(repo, &task.input_path)
+        && identity.raw_hash == task.input_hash
+        && identity.size_bytes > max
+    {
+        return OnlineMarkdownizePrecondition::OversizedPreparedInput;
+    }
+    let mut input = match classify_markdownize_source(repo, task) {
+        OnlineMarkdownizePrecondition::Send(input) => input,
+        other => return other,
+    };
+    if is_office_media(&input.media_type) {
+        match kio_adapter::catalog::convert_office_to_pdf_with_control(
+            &input.bytes,
+            &input.media_type,
+            repo.control(),
+        ) {
+            Ok(pdf) => input.converted_pdf = Some(pdf),
+            Err(kio_adapter::AdapterError::ResourceLimit(limit)) => {
+                return OnlineMarkdownizePrecondition::ResourceLimit(limit);
+            }
+            Err(_) => return OnlineMarkdownizePrecondition::ConversionFailed,
+        }
+    }
+    if input.adapter_input().1.len() as u64 > max {
+        return OnlineMarkdownizePrecondition::OversizedPreparedInput;
+    }
+    OnlineMarkdownizePrecondition::Send(input)
+}
+
+/// Authenticate current source for result adoption independently of send policy.
+pub(super) fn classify_markdownize_source(
+    repo: &Repository,
+    task: &TaskDescriptor,
+) -> OnlineMarkdownizePrecondition {
     if raw_ingest_is_purge_blocked(repo, &task.input_hash) {
         return OnlineMarkdownizePrecondition::Retire;
     }
@@ -303,11 +364,10 @@ pub(crate) fn classify_online_markdownize_precondition(
     if !repository_scan_policy_allows_file(repo, &task.input_path).unwrap_or(false) {
         return OnlineMarkdownizePrecondition::Retire;
     }
-    let max_input_bytes = match effective_max_input_bytes(repo) {
-        Ok(limit) => limit,
-        Err(error) => return OnlineMarkdownizePrecondition::PolicyUnavailable(error),
-    };
-    let verified = match read_repository_scan_input(repo, &task.input_path, max_input_bytes) {
+    if is_text_native_media(&media_type) {
+        return OnlineMarkdownizePrecondition::Retire;
+    }
+    let verified = match read_verified_adapter_source(repo, &task.input_path, &media_type) {
         Ok(input) => input,
         Err(kio_pipeline::PipelineError::ResourceLimit(limit)) => {
             return OnlineMarkdownizePrecondition::ResourceLimit(limit);
@@ -315,14 +375,6 @@ pub(crate) fn classify_online_markdownize_precondition(
         Err(_) => return OnlineMarkdownizePrecondition::Retire,
     };
     if verified.raw_hash != task.input_hash {
-        return OnlineMarkdownizePrecondition::Retire;
-    }
-    // R19-8: honor a `max_input_bytes` cap that was tightened AFTER this task was
-    // enqueued. The enqueue-time gate (run_index_pipeline) only checked the cap in effect
-    // then; a Pending task must not be sent to the online adapter if the operator has
-    // since lowered the cap below the file's size — the same live re-check the sibling
-    // `[adapter.policy]` key `allow_network` already gets at send time.
-    if is_text_native_media(&media_type) {
         return OnlineMarkdownizePrecondition::Retire;
     }
     let prepare_profile_hash = builtin_prepare_profile().tool_profile_hash;
@@ -377,7 +429,7 @@ pub(crate) fn classify_online_markdownize_precondition(
         }
         let prepared_units = if task.unit_keys.is_some() {
             let store = TaskStore::new_with_control(repo.kio_dir(), repo.control().clone());
-            let Ok(Some(previous)) = load_previous_instance_for_task(&store, task) else {
+            let Ok(Some(previous)) = load_previous_instance_for_task(&store, task, false) else {
                 return OnlineMarkdownizePrecondition::Retire;
             };
             previous.prepared_units
@@ -392,6 +444,7 @@ pub(crate) fn classify_online_markdownize_precondition(
             media_type,
             bytes: verified.bytes,
             prepared_units,
+            converted_pdf: None,
         });
     }
     // R22-5: retire a stale task for octet-stream TEXT. The recovery is a re-index (which
@@ -407,6 +460,7 @@ pub(crate) fn classify_online_markdownize_precondition(
         media_type,
         bytes: verified.bytes,
         prepared_units: prepare.prepared_units,
+        converted_pdf: None,
     })
 }
 
@@ -478,6 +532,11 @@ pub(crate) fn execute_pending_offline_markdownize_tasks(
             }
             OnlineMarkdownizePrecondition::Send(prepared_input) => prepared_input,
             OnlineMarkdownizePrecondition::PolicyUnavailable(error) => return Err(error),
+            OnlineMarkdownizePrecondition::OversizedPreparedInput => {
+                retire_offline_markdownize_task(store, &task.task_id, "invalid_input")?;
+                counts.failed += 1;
+                continue;
+            }
             OnlineMarkdownizePrecondition::Retire => {
                 retire_offline_markdownize_task(
                     store,
@@ -999,6 +1058,7 @@ pub(crate) fn execute_online_markdownize_task(
         media_type,
         bytes,
         prepared_units,
+        converted_pdf,
     } = prepared_input;
     // R14-2: an online markdownize task is always deferred — one pass enqueues it and
     // a later `batch resume` / `index --online` executes it — so the file may have been
@@ -1102,14 +1162,27 @@ pub(crate) fn execute_online_markdownize_task(
             .collect(),
         None => prepared_units.clone(),
     };
+    let (send_hash, send_media_type, send_bytes) = if let Some(pdf) = &converted_pdf {
+        (
+            kio_adapter::identity::hash_bytes(pdf),
+            "application/pdf",
+            pdf.as_slice(),
+        )
+    } else {
+        (
+            task.input_hash.clone(),
+            media_type.as_str(),
+            bytes.as_slice(),
+        )
+    };
     let outcome = run_standard_online_markdownize_with_bytes_with_control(
         std::sync::Arc::clone(adapter_settings),
         StandardOnlineMarkdownizeRequest {
             scope_id: &scope_id,
             image_store: image_store_for_task(repo)?,
-            raw_hash: &task.input_hash,
+            raw_hash: &send_hash,
             path: &path,
-            media_type: &media_type,
+            media_type: send_media_type,
             prepared_unit_hints: prepared_unit_hints(&request_units),
             // Full send (or unit-scoped retry): every requested unit, no previous/hints.
             mode: AdapterMarkdownizeMode::Full,
@@ -1125,7 +1198,7 @@ pub(crate) fn execute_online_markdownize_task(
             // param doc.
             idempotency_token,
         },
-        &bytes,
+        send_bytes,
         repo.control(),
     )
     .map_err(task_failure_from_adapter)?;
@@ -1185,17 +1258,16 @@ pub(crate) fn materialize_online_markdownize_response(
         // No page artifact exists before OCR for a scanned PDF. The already-verified
         // immutable raw object is the bounded prepared source shared by each discovered
         // unit; publish it under the same content hash before the manifest can refer to it.
-        write_canonical_cas_object_or_reuse(
-            repo.kio_dir(),
-            kio_core::cas::ContentObjectKind::Prepared,
-            &task.input_hash,
-            bytes,
-        )
-        .map_err(|_| TaskExecutionFailure {
-            resource_limit: None,
-            retry_kind: persist_failure_retry_kind(),
-            retry_after_ms: None,
-        })?;
+        bound_extraction_store(repo)
+            .and_then(|root| {
+                kio_pipeline::prepare::publish_prepared_source(&root, &task.input_hash, bytes)
+                    .map_err(pipeline_to_kio)
+            })
+            .map_err(|error| TaskExecutionFailure {
+                resource_limit: error.resource_limit().cloned(),
+                retry_kind: persist_failure_retry_kind(),
+                retry_after_ms: None,
+            })?;
     }
     // QA17 (step4b-contract-tests-p3a.md §F): carry the adapter's
     // self-reported billing usage (Mistral OCR's real processed-page count)
@@ -1239,6 +1311,7 @@ pub(crate) fn materialize_online_markdownize_response(
                 &profile_tool_hash,
                 0,
                 repo.control(),
+                true,
             )
             .map_err(|_| TaskExecutionFailure {
                 resource_limit: None,
@@ -1610,7 +1683,7 @@ fn latest_online_instance_for_path(
         .collect::<Vec<_>>();
     tasks.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     for task in tasks {
-        if let Some(previous) = load_previous_instance_for_task(task_store, &task)? {
+        if let Some(previous) = load_previous_instance_for_task(task_store, &task, true)? {
             return Ok(Some(previous));
         }
     }
@@ -1811,6 +1884,7 @@ pub(crate) fn previous_instance_for_path(
     task_store: &TaskStore,
     input_path: &str,
     tool_profile_hash: &str,
+    include_unit_bodies: bool,
 ) -> Result<Option<PreviousInstance>> {
     let mut tasks = task_store
         .all()
@@ -1824,7 +1898,9 @@ pub(crate) fn previous_instance_for_path(
         .collect::<Vec<_>>();
     tasks.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     for task in tasks {
-        let Some(previous) = load_previous_instance_for_task(task_store, &task)? else {
+        let Some(previous) =
+            load_previous_instance_for_task(task_store, &task, include_unit_bodies)?
+        else {
             continue;
         };
         if previous.manifest.tool_profile_hash == tool_profile_hash {
@@ -1837,6 +1913,7 @@ pub(crate) fn previous_instance_for_path(
 fn load_previous_instance_for_task(
     task_store: &TaskStore,
     task: &TaskDescriptor,
+    include_unit_bodies: bool,
 ) -> Result<Option<PreviousInstance>> {
     let identity = validate_task_output_ref(task_store.kio_dir(), task).map_err(pipeline_to_kio)?;
     let TaskOutputRef::NormalizedInstance {
@@ -1856,6 +1933,7 @@ fn load_previous_instance_for_task(
         &tool_profile_hash,
         r#gen,
         task_store.control(),
+        include_unit_bodies,
     )
     .ok())
 }
@@ -1866,17 +1944,20 @@ fn load_previous_instance_identity(
     tool_profile_hash: &str,
     r#gen: u64,
     control: &ControlHandle,
+    include_unit_bodies: bool,
 ) -> Result<PreviousInstance> {
-    let instance = load_validated_normalized_instance_with_control(
-        kio_dir,
-        raw_hash,
-        tool_profile_hash,
-        r#gen,
-        control,
-    )
+    let (manifest, _) =
+        read_normalized_instance_manifest(kio_dir, raw_hash, tool_profile_hash, r#gen)
+            .map_err(pipeline_to_kio)?;
+    let store = kio_core::cas::ObjectStore::new_with_control(kio_dir, control.clone());
+    let mut units = Vec::new();
+    visit_validated_normalized_units(&store, &manifest, |unit| {
+        if include_unit_bodies {
+            units.push(unit);
+        }
+        Ok(())
+    })
     .map_err(pipeline_to_kio)?;
-    let manifest = instance.manifest;
-    let units = instance.units;
     let prepared_units = manifest
         .units
         .iter()
@@ -2201,7 +2282,7 @@ pub(crate) fn merged_failed_unit_retry_kinds(
     kinds
 }
 
-fn preparation_provenance_from_units(
+pub(crate) fn preparation_provenance_from_units(
     prepared: &[PreparedUnit],
 ) -> kio_pipeline::markdownize::PreparationProvenance {
     let mut provenance = kio_pipeline::markdownize::PreparationProvenance::local();

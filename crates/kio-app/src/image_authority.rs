@@ -14,7 +14,7 @@ use kio_core::{KioError, Result};
 use kio_pipeline::policy::CurrentPolicyEvaluator;
 use kio_pipeline::scan::classify_secret;
 
-use crate::historical_reindex::{RetainedNormalizedInstance, pinned_done_units};
+use crate::historical_reindex::{RetainedNormalizedInstance, visit_pinned_done_units};
 use crate::object_persistence::pipeline_to_kio;
 
 /// Current authority for one typed, immutable image CAS object.
@@ -86,7 +86,7 @@ impl ImageAuthorityMap {
     }
 }
 
-/// Build the image authority from the retained source graph. `pinned_done_units`
+/// Build the image authority from the retained source graph. The unit visitor
 /// verifies the exact tree-pinned manifest and immutable normalized-unit CAS
 /// object before exposing typed ownership, preventing a mutable cache or
 /// arbitrary Markdown from adding an owner.
@@ -106,8 +106,16 @@ pub(crate) fn retained_image_authority(
             requires_secret_approval |= classify_secret(path).is_some();
         }
 
-        let units = match pinned_done_units(repo, &instance.raw_hash, &instance.normalize) {
-            Ok(units) => units,
+        let mut owned_by_unit = Vec::new();
+        let verified =
+            visit_pinned_done_units(repo, &instance.raw_hash, &instance.normalize, |unit| {
+                if !unit.owned_image_hashes.is_empty() {
+                    owned_by_unit.push((unit.unit_key, unit.owned_image_hashes));
+                }
+                Ok(())
+            });
+        match verified {
+            Ok(()) => {}
             Err(error) => {
                 // Unit absence may be wrapped as a pipeline corruption error.
                 // The verifier independently proves actual CAS absence and
@@ -126,8 +134,8 @@ pub(crate) fn retained_image_authority(
                 return Err(error);
             }
         };
-        for unit in units {
-            if policy_allowed && !unit.owned_image_hashes.is_empty() {
+        for (unit_key, hashes) in owned_by_unit {
+            if policy_allowed {
                 authority
                     .unit_images
                     .entry((
@@ -135,12 +143,12 @@ pub(crate) fn retained_image_authority(
                         instance.normalize.tool_profile_hash.clone(),
                         instance.normalize.r#gen,
                         instance.normalize.manifest_hash.clone(),
-                        unit.unit_key.clone(),
+                        unit_key,
                     ))
                     .or_default()
-                    .extend(unit.owned_image_hashes.iter().cloned());
+                    .extend(hashes.iter().cloned());
             }
-            for image_hash in unit.owned_image_hashes {
+            for image_hash in hashes {
                 if !is_hash(&image_hash) {
                     return Err(KioError::schema(
                         "retained image source unit has a non-canonical owned image hash",

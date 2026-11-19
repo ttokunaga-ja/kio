@@ -166,6 +166,19 @@ impl Repository {
         Ok(true)
     }
 
+    /// Finish the repository publication associated with a saved extraction
+    /// retirement. An unrelated pending publication keeps its own owner.
+    pub fn recover_extraction_publication(&self, expected: &str) -> Result<bool> {
+        let _lock = self.lock_store_in_session(&self.lock_session)?;
+        if self
+            .publication_journal()?
+            .is_some_and(|journal| journal.new_head == expected)
+        {
+            return self.recover_publication();
+        }
+        Ok(false)
+    }
+
     pub(super) fn publish_with_journal(
         &self,
         expected_head: Option<&str>,

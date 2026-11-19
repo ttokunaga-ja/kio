@@ -10,7 +10,7 @@ use crate::markdownize::execution::OnlineMarkdownizePrecondition;
 use crate::markdownize::execution::PreparedOnlineMarkdownizeInput;
 use crate::markdownize::execution::TaskExecutionFailure;
 use crate::markdownize::execution::adapter_unit_kind;
-use crate::markdownize::execution::classify_online_markdownize_precondition;
+use crate::markdownize::execution::classify_markdownize_source;
 use crate::markdownize::execution::materialize_online_markdownize_response;
 use crate::markdownize::execution::task_failure_from_adapter;
 use crate::object_persistence::adapter_to_kio;
@@ -31,10 +31,8 @@ use kio_adapter::batch_client::batch_input_line;
 use kio_adapter::batch_client::batch_upload_filename;
 use kio_adapter::batch_client::configured_mistral_batch_client_with_control;
 use kio_adapter::batch_client::ocr_batch_body;
-use kio_adapter::catalog::convert_office_to_pdf_with_control;
 use kio_adapter::catalog::resolve_standard_online_markdownize_profile_with_bbox_with_control;
 use kio_adapter::materialize_mistral_batch_ocr_body;
-use kio_adapter::office_convert::is_office_media;
 use kio_adapter::tool_lock::AdapterRuntimeSettings;
 use kio_adapter::traits::PreferredRequestKind;
 use kio_adapter::types::AdapterProfile;
@@ -277,24 +275,7 @@ pub(crate) fn submit_batch_markdownize_job(
         // until it is cleaned or self-described. Conservative: skip.
         return Ok(Ok(()));
     }
-    // Same input material as the sync lane (07 §5.1): Office media is sent as
-    // its converted PDF; storage identity stays the ORIGINAL file's raw_hash.
-    let (effective_media_type, send_bytes): (String, Vec<u8>) =
-        if is_office_media(&prepared_input.media_type) {
-            match convert_office_to_pdf_with_control(
-                &prepared_input.bytes,
-                &prepared_input.media_type,
-                ledger.control(),
-            ) {
-                Ok(converted) => ("application/pdf".to_owned(), converted),
-                Err(error) => return Ok(Err(task_failure_from_adapter(error))),
-            }
-        } else {
-            (
-                prepared_input.media_type.clone(),
-                prepared_input.bytes.clone(),
-            )
-        };
+    let (effective_media_type, send_bytes) = prepared_input.adapter_input();
     // A unit-scoped retry sends only the still-failed subset's pages, exactly
     // like the sync lane's `restrict_to_hint_pages` (R15-5); a full send (or
     // OCR-from-scratch discovery, empty prepared units) sends no `pages`.
@@ -334,8 +315,8 @@ pub(crate) fn submit_batch_markdownize_job(
         None => None,
     };
     let body = ocr_batch_body(
-        &effective_media_type,
-        &send_bytes,
+        effective_media_type,
+        send_bytes,
         pages.as_deref(),
         task.bbox_annotation_enabled.unwrap_or(false),
     );
@@ -908,7 +889,7 @@ fn collect_batch_markdownize_output(
     // gate the sync send runs): the output is persisted under the SUBMIT-time
     // identity (input_hash), so an edited/removed working file retires the
     // task instead of persisting under a stale identity.
-    let prepared_input = match classify_online_markdownize_precondition(repo, task) {
+    let prepared_input = match classify_markdownize_source(repo, task) {
         OnlineMarkdownizePrecondition::ResourceLimit(limit) => {
             crate::task_execution::hold_resource_task(store, &task.task_id, Some(limit.clone()))?;
             return Ok(BatchPollDisposition::Collected(ExecOutcome {
@@ -918,6 +899,9 @@ fn collect_batch_markdownize_output(
         }
         OnlineMarkdownizePrecondition::Send(prepared_input) => prepared_input,
         OnlineMarkdownizePrecondition::PolicyUnavailable(error) => return Err(error),
+        OnlineMarkdownizePrecondition::OversizedPreparedInput => {
+            unreachable!("collect has no send admission")
+        }
         OnlineMarkdownizePrecondition::AwaitConversion
         | OnlineMarkdownizePrecondition::ConversionFailed => {
             // Transient local-material gap (e.g. office converter hiccup):

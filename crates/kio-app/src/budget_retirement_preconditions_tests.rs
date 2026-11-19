@@ -16,6 +16,7 @@ fn offline_index(root: &Path) -> crate::response::CommandResponse {
     crate::execute(
         &context(root),
         CommandRequest::Index(IndexArgs {
+            resource_tier: kio_core::error::ResourceTier::Standard,
             max_file_bytes: None,
             max_total_bytes: None,
             preview: false,

@@ -186,6 +186,8 @@ pub struct CoreTestControl {
     pub gc_index_copy_ready: Option<PathBuf>,
     pub durability_point: Selector<DurabilityPoint>,
     pub durability_ready: Option<PathBuf>,
+    pub durability_storage_fault: bool,
+    pub extraction_write_fault_before_head: bool,
 }
 
 /// CLI-only seams and process coordination controls.
@@ -314,6 +316,12 @@ impl DebugTestControl {
                 gc_index_copy_ready: path("KIO_TEST_GC_INDEX_COPY_READY"),
                 durability_point: selector("KIO_TEST_DURABILITY_POINT", DurabilityPoint::parse),
                 durability_ready: path("KIO_TEST_DURABILITY_READY"),
+                extraction_write_fault_before_head: std::env::var_os(
+                    "KIO_TEST_EXTRACTION_WRITE_FAULT_BEFORE_HEAD",
+                )
+                .is_some_and(|value| value == "1"),
+                durability_storage_fault: std::env::var_os("KIO_TEST_DURABILITY_STORAGE_FAULT")
+                    .is_some(),
             },
             cli: CliTestControl {
                 snapshot_pre_gc_preflight_ready: path(

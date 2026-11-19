@@ -385,7 +385,8 @@ fn execute_pending_markdownize_tasks(
             {
                 match classify_online_markdownize_precondition(repo, &task) {
                     OnlineMarkdownizePrecondition::PolicyUnavailable(error) => return Err(error),
-                    OnlineMarkdownizePrecondition::Retire => {}
+                    OnlineMarkdownizePrecondition::Retire
+                    | OnlineMarkdownizePrecondition::OversizedPreparedInput => {}
                     _ => {
                         auth_revivable.insert(task.task_id);
                     }
@@ -530,7 +531,8 @@ fn execute_pending_markdownize_tasks(
                 // local conversion contract exists. Nothing was sent or charged.
                 continue;
             }
-            OnlineMarkdownizePrecondition::Retire => {
+            disposition @ (OnlineMarkdownizePrecondition::Retire
+            | OnlineMarkdownizePrecondition::OversizedPreparedInput) => {
                 // R18-2: this task may carry a still-open reservation from a PRIOR
                 // failed send (its file was deleted/edited after that attempt).
                 // Release it here — settling `unknown_settled` at the reservation
@@ -541,6 +543,12 @@ fn execute_pending_markdownize_tasks(
                 update_tasks_preserving_resource_holds(store, |candidate| {
                     if candidate.task_id == task_id {
                         retire_online_task(candidate);
+                        if matches!(
+                            disposition,
+                            OnlineMarkdownizePrecondition::OversizedPreparedInput
+                        ) {
+                            candidate.fallback_reason = Some("invalid_input".to_owned());
+                        }
                         candidate.attempts = candidate.attempts.saturating_add(1);
                         true
                     } else {

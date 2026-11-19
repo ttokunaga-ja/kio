@@ -58,7 +58,7 @@ pub(crate) fn publish(
         publication != Publication::CreateOnly,
         target.path(),
     )?;
-    target.sync()
+    target.sync_stage_destination()
 }
 
 fn retire(held: &File) -> Result<()> {
@@ -115,6 +115,14 @@ pub(crate) fn inspect_capture(
 ) -> Result<bool> {
     Ok(false)
 }
+pub(crate) fn recover_for_publication(
+    _: &StoreDirectory,
+    _: &Path,
+    _: &StageIdentity,
+) -> Result<()> {
+    Ok(())
+}
+
 pub(crate) fn recover_file(
     _parent: &StoreDirectory,
     _source: &Path,
