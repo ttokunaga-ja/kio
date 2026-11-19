@@ -1,6 +1,6 @@
 use super::*;
 use crate::dag::TreeBuilder;
-use crate::disk_records::{DiskRecords, RecordSorter, RecordWriter};
+use crate::disk_records::{DiskRecords, RecordSorter, RecordWriter, SortedRecordCursor};
 
 pub(super) struct WorkingCandidates {
     names: DiskRecords<String>,
@@ -45,22 +45,6 @@ impl Drop for ArchiveBatch<'_> {
 }
 
 impl Repository {
-    /// Check invocation archive budgets before preprocessing can save any raw.
-    /// Publication repeats this check against the final working-tree state.
-    pub fn validate_archive_budget(
-        &self,
-        excluded_paths: &BTreeSet<String>,
-        explicitly_allowed_tier_a_paths: &BTreeSet<String>,
-    ) -> Result<()> {
-        self.working_file_candidates(
-            excluded_paths,
-            explicitly_allowed_tier_a_paths,
-            true,
-            self.archive_limits,
-        )
-        .map(|_| ())
-    }
-
     pub fn build_working_tree(&self, store_raw: bool) -> Result<WorkingTree> {
         self.build_working_tree_filtered(store_raw, &BTreeSet::new())
     }
@@ -145,7 +129,7 @@ impl Repository {
             // applies unconditionally here, as it always has.
             return self.archive_staged_working_tree(
                 candidates,
-                normalize_by_path,
+                &mut |path| Ok(normalize_by_path.get(path).cloned()),
                 limits,
                 &BTreeSet::new(),
                 None,
@@ -209,7 +193,7 @@ impl Repository {
     pub(super) fn archive_staged_working_tree(
         &self,
         candidates: WorkingCandidates,
-        normalize_by_path: &BTreeMap<String, PendingNormalizeRef>,
+        normalize_for_path: &mut dyn FnMut(&str) -> Result<Option<PendingNormalizeRef>>,
         limits: ArchiveLimits,
         purge_self_targets: &BTreeSet<String>,
         expected_raw_by_path: Option<&BTreeMap<String, String>>,
@@ -357,7 +341,7 @@ impl Repository {
                     .with_context_field("saved", json!(false))
             })?;
             let mut entry = TreeEntry::raw_file(record.name.clone(), hash)?;
-            attach_pending_normalize(&mut entry, &record.name, normalize_by_path);
+            attach_pending_normalize(&mut entry, &record.name, normalize_for_path(&record.name)?);
             entries.push(entry)?;
         }
         Ok(WorkingTree {
@@ -512,58 +496,179 @@ impl Repository {
         })
     }
 
+    pub fn validate_scanned_archive_budget(
+        &self,
+        policy: &DiskRecords<ScannedPathPolicy>,
+    ) -> Result<()> {
+        self.scanned_working_file_candidates(policy).map(|_| ())
+    }
+
+    pub(super) fn scanned_working_file_candidates(
+        &self,
+        policy: &DiskRecords<ScannedPathPolicy>,
+    ) -> Result<WorkingCandidates> {
+        use cap_primitives::fs as cap_fs;
+
+        // At most one sort buffer of rules can be checked during enumeration.
+        // Larger policy streams join with the externally sorted names below.
+        if policy.len() <= crate::disk_records::SORT_BUFFER_RECORDS {
+            let mut excluded = BTreeSet::new();
+            let mut allowed_tier_a = BTreeSet::new();
+            for rule in policy {
+                let rule = rule?;
+                if rule.excluded {
+                    excluded.insert(rule.path);
+                } else if rule.allow_tier_a {
+                    allowed_tier_a.insert(rule.path);
+                }
+            }
+            return self.working_file_candidates(
+                &excluded,
+                &allowed_tier_a,
+                true,
+                self.archive_limits,
+            );
+        }
+        let root = self.bound_root.as_ref().ok_or_else(|| {
+            KioError::invalid_usage("index scan requires a retained scope capability")
+        })?;
+        let stages = self.store.record_stages()?;
+        let mut listed = RecordSorter::new(&stages, |a: &(String, usize), b| a.0.cmp(&b.0));
+        for (position, entry) in cap_fs::read_base_dir(root)
+            .kio_io(&self.canonical_root)?
+            .enumerate()
+        {
+            let entry = entry.kio_io(&self.canonical_root)?;
+            let name = match entry.file_name().into_string() {
+                Ok(name) => name,
+                Err(name) => {
+                    eprintln!(
+                        "warning: skipping non-UTF-8 file name: {}",
+                        self.canonical_root.join(name).display()
+                    );
+                    continue;
+                }
+            };
+            if name == ".kio" {
+                continue;
+            }
+            let path = self.canonical_root.join(&name);
+            let file_type = entry.file_type().kio_io(&path)?;
+            if file_type.is_file() {
+                listed.push((name, position))?;
+            } else if !file_type.is_dir() {
+                eprintln!("warning: skipping non-regular file: {}", path.display());
+            }
+        }
+
+        let mut policy = SortedRecordCursor::new(policy.iter(), |row| &row.path);
+        let mut eligible =
+            RecordSorter::new(&stages, |a: &(usize, (String, bool)), b| a.0.cmp(&b.0));
+        for row in listed.finish()? {
+            let (name, position) = row?;
+            let rule = policy.at(&name)?;
+            if rule.is_some_and(|row| row.excluded) {
+                continue;
+            }
+            let allow_tier_a = rule.is_some_and(|row| row.allow_tier_a);
+            eligible.push((position, (name, allow_tier_a)))?;
+        }
+        // Budget accounting follows the directory's enumeration order, as in
+        // the other snapshot paths. Archive and normalization join by path.
+        let mut names = RecordSorter::new(&stages, String::cmp);
+        let limits = self.archive_limits;
+        let mut declared_scope_bytes = 0u64;
+        let mut count = 0;
+        for row in eligible.finish()? {
+            let (_, (name, allow_tier_a)) = row?;
+            if is_tier_a_secret_name(&name) && !allow_tier_a {
+                eprintln!("warning: skipping Tier-A secret file: {name}");
+                continue;
+            }
+            if count == TREE_ENTRY_WARNING_THRESHOLD {
+                eprintln!(
+                    "warning: scope has more than 10,000 direct files; split into subfolders or use ignore; processing all files"
+                );
+            }
+            let path = self.canonical_root.join(&name);
+            let file = open_bound_scope_file_nofollow(root, &name, &path, self.control())?;
+            let metadata = file.metadata().kio_io(&path)?;
+            if metadata.len() > limits.max_file_bytes {
+                return Err(scope_input_oversized(&name, limits, metadata.len()));
+            }
+            declared_scope_bytes = declared_scope_bytes
+                .checked_add(metadata.len())
+                .ok_or_else(|| scope_total_oversized(&name, limits, u64::MAX))?;
+            if declared_scope_bytes > limits.max_scope_bytes {
+                return Err(scope_total_oversized(&name, limits, declared_scope_bytes));
+            }
+            names.push(name)?;
+            count += 1;
+        }
+        Ok(WorkingCandidates {
+            names: names.finish()?,
+            root: self.canonical_root.clone(),
+            bound_root: Some(root.clone()),
+        })
+    }
+
     pub fn status(&self) -> Result<StatusReport> {
         let _inspection = crate::disk_records::StageInspection::begin();
         self.validate()?;
         let current = self.build_working_tree(false)?.tree;
-        let current_map = tree_map(&current)?;
-        // R15-4: a shallow HEAD (tree object discarded) must NOT brick a pure read.
-        // Degrade to listing the current files without a classification instead of
-        // propagating the raw KIO-E-STORE-NOT-FOUND-001 from `read_tree`.
-        let (head_map, head_shallow) = match self.head_tree_state()? {
-            HeadTreeState::Unborn => (BTreeMap::new(), false),
-            HeadTreeState::Present(tree) => (tree_map(&tree)?, false),
-            HeadTreeState::Shallow => (BTreeMap::new(), true),
+        let (head, head_shallow) = match self.head_tree_state()? {
+            HeadTreeState::Unborn => (None, false),
+            HeadTreeState::Present(tree) => (Some(tree), false),
+            HeadTreeState::Shallow => (None, true),
         };
 
-        let mut paths = BTreeSet::new();
-        paths.extend(current_map.keys().cloned());
-        paths.extend(head_map.keys().cloned());
-
-        let mut statuses = Vec::new();
-        for path in paths {
-            // Omit the tree-derived classification when HEAD is shallow — the prior
-            // tree needed to compute it is gone.
-            let status = if head_shallow {
-                if !current_map.contains_key(&path) {
-                    continue;
-                }
-                None
-            } else {
-                Some(
-                    match (head_map.get(&path), current_map.get(&path)) {
-                        (None, Some(_)) => "new",
-                        (Some(old), Some(new)) if old == new => "unchanged",
-                        (Some(_), Some(_)) => "modified",
-                        (Some(_), None) => "deleted",
-                        (None, None) => continue,
-                    }
-                    .to_owned(),
-                )
+        let mut current = current.entries.iter();
+        let mut head = head.iter().flat_map(|tree| tree.entries.iter());
+        let mut new = current.next().transpose()?;
+        let mut old = head.next().transpose()?;
+        let mut statuses = RecordWriter::new_lazy(&self.store.record_stages()?);
+        while new.is_some() || old.is_some() {
+            let order = match (&old, &new) {
+                (Some(old), Some(new)) => old.path.cmp(&new.path),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                _ => std::cmp::Ordering::Greater,
             };
-            statuses.push(FileStatus {
-                path: is_materializable_direct_child(&path).then(|| self.root.join(&path)),
-                relative_path: path.clone(),
-                status,
-                raw_hash: current_map
-                    .get(&path)
-                    .or_else(|| head_map.get(&path))
-                    .cloned(),
-            });
+            let (entry, status) = match order {
+                std::cmp::Ordering::Less => (
+                    std::mem::replace(&mut old, head.next().transpose()?),
+                    "deleted",
+                ),
+                std::cmp::Ordering::Greater => (
+                    std::mem::replace(&mut new, current.next().transpose()?),
+                    "new",
+                ),
+                std::cmp::Ordering::Equal => {
+                    let previous = std::mem::replace(&mut old, head.next().transpose()?)
+                        .expect("matched HEAD entry");
+                    let entry = std::mem::replace(&mut new, current.next().transpose()?);
+                    let status = if entry
+                        .as_ref()
+                        .is_some_and(|row| row.raw_hash == previous.raw_hash)
+                    {
+                        "unchanged"
+                    } else {
+                        "modified"
+                    };
+                    (entry, status)
+                }
+            };
+            let entry = entry.expect("status merge has an entry");
+            statuses.push(&FileStatus {
+                path: is_materializable_direct_child(&entry.path)
+                    .then(|| self.root.join(&entry.path)),
+                relative_path: entry.path,
+                status: (!head_shallow).then(|| status.to_owned()),
+                raw_hash: Some(entry.raw_hash),
+            })?;
         }
         Ok(StatusReport {
             stage_residues: self.store.inspect_raw_stages()?,
-            files: statuses,
+            files: statuses.finish()?,
             head_shallow,
         })
     }

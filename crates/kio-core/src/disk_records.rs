@@ -131,7 +131,7 @@ fn changed_records() -> KioError {
     KioError::schema("private record stage changed after sealing")
 }
 pub struct DiskRecords<T> {
-    run: Arc<RunFile>,
+    run: Option<Arc<RunFile>>,
     count: usize,
     size: u64,
     digest: [u8; 32],
@@ -156,6 +156,16 @@ impl<T> std::fmt::Debug for DiskRecords<T> {
     }
 }
 impl<T> DiskRecords<T> {
+    pub fn empty() -> Self {
+        Self {
+            run: None,
+            count: 0,
+            size: 0,
+            digest: Sha256::digest([]).into(),
+            _value: PhantomData,
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.count
     }
@@ -163,61 +173,64 @@ impl<T> DiskRecords<T> {
         self.count == 0
     }
     pub fn iter(&self) -> RecordIter<T> {
-        let opened = (|| {
-            self.run._location.identity.verify(&self.run.directory)?;
-            let mut file = self
-                .run
-                .directory
-                .open_regular_read(Path::new("records"), u64::MAX)?;
-            self.run.identity.verify(&file)?;
-            let metadata = file
-                .metadata()
-                .map_err(|error| crate::store_dir::ioerr(Path::new("records"), error))?;
-            let before = crate::platform::cas_io::observe_regular_file_stability(
-                &metadata,
-                Path::new("records"),
-            )?;
-            if metadata.len() != self.size {
-                return Err(changed_records());
-            }
-            let mut hasher = Sha256::new();
-            let mut buffer = [0; RECORD_BYTES];
-            let mut size = 0u64;
-            loop {
-                let count = file
-                    .read(&mut buffer)
+        let opened = self
+            .run
+            .as_ref()
+            .map(|run| {
+                run._location.identity.verify(&run.directory)?;
+                let mut file = run
+                    .directory
+                    .open_regular_read(Path::new("records"), u64::MAX)?;
+                run.identity.verify(&file)?;
+                let metadata = file
+                    .metadata()
                     .map_err(|error| crate::store_dir::ioerr(Path::new("records"), error))?;
-                if count == 0 {
-                    break;
-                }
-                size = size.checked_add(count as u64).ok_or_else(changed_records)?;
-                if size > self.size {
+                let before = crate::platform::cas_io::observe_regular_file_stability(
+                    &metadata,
+                    Path::new("records"),
+                )?;
+                if metadata.len() != self.size {
                     return Err(changed_records());
                 }
-                hasher.update(&buffer[..count]);
-            }
-            let digest: [u8; 32] = hasher.finalize().into();
-            let after = file
-                .metadata()
-                .map_err(|error| crate::store_dir::ioerr(Path::new("records"), error))?;
-            if size != self.size
-                || digest != self.digest
-                || crate::platform::cas_io::observe_regular_file_stability(
-                    &after,
-                    Path::new("records"),
-                )? != before
-            {
-                return Err(changed_records());
-            }
-            self.run.identity.verify(&file)?;
-            file.seek(SeekFrom::Start(0))
-                .map_err(|error| crate::store_dir::ioerr(Path::new("records"), error))?;
-            Ok(file)
-        })();
+                let mut hasher = Sha256::new();
+                let mut buffer = [0; RECORD_BYTES];
+                let mut size = 0u64;
+                loop {
+                    let count = file
+                        .read(&mut buffer)
+                        .map_err(|error| crate::store_dir::ioerr(Path::new("records"), error))?;
+                    if count == 0 {
+                        break;
+                    }
+                    size = size.checked_add(count as u64).ok_or_else(changed_records)?;
+                    if size > self.size {
+                        return Err(changed_records());
+                    }
+                    hasher.update(&buffer[..count]);
+                }
+                let digest: [u8; 32] = hasher.finalize().into();
+                let after = file
+                    .metadata()
+                    .map_err(|error| crate::store_dir::ioerr(Path::new("records"), error))?;
+                if size != self.size
+                    || digest != self.digest
+                    || crate::platform::cas_io::observe_regular_file_stability(
+                        &after,
+                        Path::new("records"),
+                    )? != before
+                {
+                    return Err(changed_records());
+                }
+                run.identity.verify(&file)?;
+                file.seek(SeekFrom::Start(0))
+                    .map_err(|error| crate::store_dir::ioerr(Path::new("records"), error))?;
+                Ok(file)
+            })
+            .transpose();
         match opened {
             Ok(file) => RecordIter {
                 _run: self.run.clone(),
-                reader: Some(BufReader::with_capacity(64 * 1024, file)),
+                reader: file.map(|file| BufReader::with_capacity(64 * 1024, file)),
                 remaining: self.count,
                 error: None,
                 buffer: Vec::new(),
@@ -292,7 +305,8 @@ impl<T: DeserializeOwned> IntoIterator for DiskRecords<T> {
 }
 
 pub struct RecordWriter<T> {
-    run: Arc<RunFile>,
+    root: RecordStageRoot,
+    run: Option<Arc<RunFile>>,
     writer: Option<StageWriter>,
     count: usize,
     size: u64,
@@ -301,26 +315,41 @@ pub struct RecordWriter<T> {
 }
 impl<T: Serialize> RecordWriter<T> {
     pub fn new(root: &RecordStageRoot) -> Result<Self> {
-        let reclaim = PRESERVE_STAGES.with(|depth| depth.get() == 0);
-        let created = RunDirectory::create(root, reclaim);
-        if created.is_err() {
-            root.preserve_scratch();
-        }
-        let (location, writer) = created?;
-        let directory = location.directory.clone();
-        let identity = writer.identity().clone();
-        Ok(Self {
-            run: Arc::new(RunFile {
-                directory,
-                identity,
-                _location: location,
-            }),
-            writer: Some(writer),
+        let mut out = Self::new_lazy(root);
+        out.open()?;
+        Ok(out)
+    }
+
+    /// Allocate a stage on the first push. Empty output has no on-disk run.
+    pub fn new_lazy(root: &RecordStageRoot) -> Self {
+        Self {
+            root: root.clone(),
+            run: None,
+            writer: None,
             count: 0,
             size: 0,
             hasher: Sha256::new(),
             _value: PhantomData,
-        })
+        }
+    }
+
+    fn open(&mut self) -> Result<()> {
+        if self.writer.is_some() {
+            return Ok(());
+        }
+        let reclaim = PRESERVE_STAGES.with(|depth| depth.get() == 0);
+        let created = RunDirectory::create(&self.root, reclaim);
+        if created.is_err() {
+            self.root.preserve_scratch();
+        }
+        let (location, writer) = created?;
+        self.run = Some(Arc::new(RunFile {
+            directory: location.directory.clone(),
+            identity: writer.identity().clone(),
+            _location: location,
+        }));
+        self.writer = Some(writer);
+        Ok(())
     }
     pub fn len(&self) -> usize {
         self.count
@@ -367,6 +396,7 @@ impl<T: Serialize> RecordWriter<T> {
         encoded.map_err(|e| KioError::schema(e.to_string()))?;
         let mut bytes = buffer.bytes;
         bytes.push(b'\n');
+        self.open()?;
         self.writer
             .as_mut()
             .expect("record writer")
@@ -383,8 +413,9 @@ impl<T: Serialize> RecordWriter<T> {
         Ok(())
     }
     pub fn finish(mut self) -> Result<DiskRecords<T>> {
-        self.writer.as_ref().expect("record writer").sync()?;
-        drop(self.writer.take());
+        if let Some(writer) = self.writer.take() {
+            writer.sync()?;
+        }
         Ok(DiskRecords {
             run: self.run,
             count: self.count,
@@ -405,7 +436,7 @@ fn record_limit(observed: usize) -> KioError {
     .into_error("tree metadata record exceeds the streaming buffer")
 }
 pub struct RecordIter<T> {
-    _run: Arc<RunFile>,
+    _run: Option<Arc<RunFile>>,
     reader: Option<BufReader<File>>,
     remaining: usize,
     error: Option<KioError>,
@@ -453,6 +484,61 @@ impl<T: DeserializeOwned> Iterator for RecordIter<T> {
         Some(result)
     }
 }
+/// Merge two ordered streams while keeping at most one record from each.
+pub fn merge_sorted_records<T>(
+    left: impl Iterator<Item = Result<T>>,
+    right: impl Iterator<Item = Result<T>>,
+    compare: impl Fn(&T, &T) -> Ordering,
+) -> impl Iterator<Item = Result<T>> {
+    let mut left = left.peekable();
+    let mut right = right.peekable();
+    std::iter::from_fn(move || match (left.peek(), right.peek()) {
+        (Some(Err(_)), _) | (Some(Ok(_)), None) => left.next(),
+        (_, Some(Err(_))) | (None, Some(Ok(_))) => right.next(),
+        (Some(Ok(a)), Some(Ok(b))) if compare(a, b) != Ordering::Greater => left.next(),
+        (Some(Ok(_)), Some(Ok(_))) => right.next(),
+        (None, None) => None,
+    })
+}
+
+/// Look up increasing keys in a path-sorted stream while retaining one record.
+pub struct SortedRecordCursor<T, I, F> {
+    records: I,
+    current: Option<T>,
+    key: F,
+}
+
+impl<T, I, F> SortedRecordCursor<T, I, F>
+where
+    I: Iterator<Item = Result<T>>,
+    F: Fn(&T) -> &str,
+{
+    pub fn new(records: I, key: F) -> Self {
+        Self {
+            records,
+            current: None,
+            key,
+        }
+    }
+
+    pub fn at(&mut self, path: &str) -> Result<Option<&T>> {
+        while self
+            .current
+            .as_ref()
+            .is_none_or(|item| (self.key)(item) < path)
+        {
+            self.current = self.records.next().transpose()?;
+            if self.current.is_none() {
+                break;
+            }
+        }
+        Ok(self
+            .current
+            .as_ref()
+            .filter(|item| (self.key)(item) == path))
+    }
+}
+
 impl<T: Serialize + DeserializeOwned> Serialize for DiskRecords<T> {
     fn serialize<S: serde::Serializer>(
         &self,
@@ -510,6 +596,7 @@ impl<T: DeserializeOwned + PartialEq> PartialEq for DiskRecords<T> {
 }
 impl<T: DeserializeOwned + Eq> Eq for DiskRecords<T> {}
 
+/// Stable external sort with one fixed-size run buffer and two merge heads.
 pub struct RecordSorter<T> {
     root: RecordStageRoot,
     chunk: Vec<T>,
@@ -563,7 +650,7 @@ impl<T: Serialize + DeserializeOwned> RecordSorter<T> {
         if self.chunk.is_empty() {
             return Ok(());
         }
-        self.chunk.sort_unstable_by(self.compare);
+        self.chunk.sort_by(self.compare);
         let mut out = RecordWriter::new(&self.root)?;
         for item in self.chunk.drain(..) {
             out.push(&item)?;
@@ -588,12 +675,12 @@ impl<T: Serialize + DeserializeOwned> RecordSorter<T> {
         for level in 0..MERGE_SLOTS {
             if let Some(run) = self.runs[level].take() {
                 result = Some(match result {
-                    Some(previous) => self.merge(previous, run)?,
+                    Some(recent) => self.merge(run, recent)?,
                     None => run,
                 });
             }
         }
-        result.map_or_else(|| RecordWriter::new(&self.root)?.finish(), Ok)
+        Ok(result.unwrap_or_else(DiskRecords::empty))
     }
 }
 
@@ -721,7 +808,13 @@ mod tests {
     fn sealed_records_reject_valid_same_length_edits_and_appends() {
         let records =
             DiskRecords::from_records(&RecordStageRoot::temporary().unwrap(), [11u64, 22]).unwrap();
-        let path = records.run.directory.path().join("records");
+        let path = records
+            .run
+            .as_ref()
+            .unwrap()
+            .directory
+            .path()
+            .join("records");
         std::fs::write(&path, b"33\n22\n").unwrap();
         assert!(
             records.first().is_err(),
@@ -749,7 +842,7 @@ mod tests {
     fn cleanup_removes_only_verified_stages_and_empty_owned_directories() {
         let records =
             DiskRecords::from_records(&RecordStageRoot::temporary().unwrap(), [11u64]).unwrap();
-        let path = records.run.directory.path().to_owned();
+        let path = records.run.as_ref().unwrap().directory.path().to_owned();
         drop(records);
         assert!(!path.exists());
     }
@@ -761,11 +854,14 @@ mod tests {
         let mut writer = RecordWriter::new(&root).unwrap();
         writer.push(&11u64).unwrap();
         let records = writer.finish().unwrap();
-        let directory = records.run.directory.path().to_owned();
+        let directory = records.run.as_ref().unwrap().directory.path().to_owned();
         let path = directory.join("records");
         std::fs::rename(&path, fixture.path().join("original-records")).unwrap();
-        let mut replacement =
-            StageWriter::create(&records.run.directory, Path::new("records")).unwrap();
+        let mut replacement = StageWriter::create(
+            &records.run.as_ref().unwrap().directory,
+            Path::new("records"),
+        )
+        .unwrap();
         replacement.write_chunk(b"foreign replacement").unwrap();
         replacement.sync().unwrap();
         drop(replacement);
@@ -782,7 +878,7 @@ mod tests {
         let mut writer = RecordWriter::new(&root).unwrap();
         writer.push(&11u64).unwrap();
         let records = writer.finish().unwrap();
-        let path = records.run.directory.path().to_owned();
+        let path = records.run.as_ref().unwrap().directory.path().to_owned();
         std::fs::rename(&path, fixture.path().join("original-directory")).unwrap();
         std::fs::create_dir(&path).unwrap();
         let foreign = path.join("foreign");
@@ -812,6 +908,20 @@ mod tests {
         }
     }
     #[test]
+    fn external_sort_preserves_equal_key_order_across_runs() {
+        let root = RecordStageRoot::temporary().unwrap();
+        let mut sorter = RecordSorter::new(&root, |a: &(usize, usize), b| a.0.cmp(&b.0));
+        let count = SORT_BUFFER_RECORDS * 2 + 1;
+        for position in 0..count {
+            sorter.push((position % 2, position)).unwrap();
+        }
+        let sorted = sorter.finish().unwrap();
+        let expected =
+            (0..2).flat_map(|key| (key..count).step_by(2).map(move |position| (key, position)));
+        assert!(sorted.iter().map(|row| row.unwrap()).eq(expected));
+    }
+
+    #[test]
     fn record_token_buffer_and_read_errors_never_grow_with_record_count() {
         let error = RecordWriter::new(&RecordStageRoot::temporary().unwrap())
             .unwrap()
@@ -824,7 +934,13 @@ mod tests {
         )
         .unwrap();
         std::fs::write(
-            records.run.directory.path().join("records"),
+            records
+                .run
+                .as_ref()
+                .unwrap()
+                .directory
+                .path()
+                .join("records"),
             b"not a record\n",
         )
         .unwrap();

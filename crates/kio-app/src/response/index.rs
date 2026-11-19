@@ -1,8 +1,9 @@
 use super::gc::{GcReport, PrepublicationDeferredResponse};
 use super::skipped_units::SkippedDisclosure;
 use kio_core::dag::CommitObject;
+use kio_core::disk_records::DiskRecords;
 use kio_pipeline::scan::{ChildScopeDiscovery, CostPreview, ScanCandidate};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 #[derive(Debug, Serialize)]
@@ -20,16 +21,16 @@ pub struct IndexPreviewResponse {
     pub scope: String,
     pub estimated_file_count: usize,
     pub estimated_size_bytes: u64,
-    pub large_files: Vec<LargeFile>,
+    pub large_files: DiskRecords<LargeFile>,
     pub effective_ignore: String,
-    pub excluded_candidates: Vec<String>,
-    pub sensitive_candidates: Vec<SensitiveCandidate>,
+    pub excluded_candidates: DiskRecords<String>,
+    pub sensitive_candidates: DiskRecords<SensitiveCandidate>,
     pub network_transmission_policy: NetworkTransmissionPolicy,
     pub adapter_execution_mode: AdapterExecutionMode,
     pub estimated_cost: Option<CostPreview>,
     pub budget_cap: Option<f64>,
     pub estimated_completion: String,
-    pub candidates: Vec<ScanCandidate>,
+    pub candidates: DiskRecords<ScanCandidate>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub child_scopes: Option<Vec<ChildPreviewRow>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -42,12 +43,12 @@ pub struct IndexPreviewResponse {
     pub child_scope_discovery: Option<PreviewChildDiscovery>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct LargeFile {
     pub path: String,
     pub size_bytes: u64,
 }
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SensitiveCandidate {
     pub path: String,
     pub reason: String,

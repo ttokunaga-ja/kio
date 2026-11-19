@@ -17,13 +17,13 @@ pub struct StatusResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub office_readiness: Option<OfficeReadiness>,
     pub scope_path: PathBuf,
-    pub files: Vec<FileStatus>,
+    pub files: kio_core::disk_records::DiskRecords<FileStatus>,
     pub head_shallow: bool,
     pub paused_by_hold_reason: PausedTasksByHoldReason,
     pub tasks: Vec<TaskDescriptor>,
     // The status reader returns every valid JSON row verbatim.
     pub quarantine: Vec<Value>,
-    pub unsupported_inputs: Vec<UnsupportedInputDisposition>,
+    pub unsupported_inputs: kio_core::disk_records::DiskRecords<UnsupportedInputDisposition>,
     pub unsupported_inputs_complete: bool,
     pub budget: BudgetStatusResponse,
     pub stalled_batch: Vec<StalledBatchStatus>,

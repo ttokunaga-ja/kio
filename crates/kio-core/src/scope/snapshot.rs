@@ -1,4 +1,10 @@
 use super::*;
+use crate::disk_records::{DiskRecords, RecordSorter, SortedRecordCursor};
+
+type ScannedSnapshotInputs<'a> = (
+    &'a DiskRecords<ScannedPathPolicy>,
+    &'a DiskRecords<(String, PendingNormalizeRef)>,
+);
 
 type SnapshotPublicationGuard<'a> = &'a dyn Fn(&TreeObject) -> Result<()>;
 
@@ -40,6 +46,7 @@ impl Repository {
             false,
             &[],
             true,
+            None,
             None,
             None,
             None,
@@ -99,6 +106,34 @@ impl Repository {
             None,
             None,
             publication_guard,
+            None,
+        )
+    }
+
+    pub fn auto_snapshot_from_scan(
+        &self,
+        message: &str,
+        policy: &DiskRecords<ScannedPathPolicy>,
+        normalize: &DiskRecords<(String, PendingNormalizeRef)>,
+        publication_guard: SnapshotPublicationGuard<'_>,
+    ) -> Result<SnapshotOutcome> {
+        self.snapshot_with_type(
+            Some(message),
+            None,
+            CommitType::Auto,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            false,
+            &[],
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(publication_guard),
+            Some((policy, normalize)),
         )
     }
 
@@ -332,6 +367,7 @@ impl Repository {
             Some(&scheduled_authority),
             Some(before_ref_publication),
             None,
+            None,
         )
     }
 
@@ -350,7 +386,11 @@ impl Repository {
         message: Option<&str>,
         normalize_by_path: &BTreeMap<String, PendingNormalizeRef>,
     ) -> Result<SnapshotOutcome> {
-        self.promote_normalize_refs_with_tool_lock_hash(message, normalize_by_path, None)
+        self.promote_normalize_refs_with_tool_lock_hash(
+            message,
+            &mut |path| Ok(normalize_by_path.get(path).cloned()),
+            None,
+        )
     }
 
     /// Promotion variant used by a caller that has durably staged the next
@@ -359,7 +399,7 @@ impl Repository {
     pub fn promote_normalize_refs_with_staged_tool_lock(
         &self,
         message: Option<&str>,
-        normalize_by_path: &BTreeMap<String, PendingNormalizeRef>,
+        normalizes: &DiskRecords<(String, PendingNormalizeRef)>,
         tool_lock_hash: &str,
     ) -> Result<SnapshotOutcome> {
         if !is_hash(tool_lock_hash) {
@@ -374,9 +414,10 @@ impl Repository {
                     "staged promotion tool_lock_hash must name a published immutable tool-lock",
                 )
             })?;
+        let mut normalizes = SortedRecordCursor::new(normalizes.iter(), |row| &row.0);
         self.promote_normalize_refs_with_tool_lock_hash(
             message,
-            normalize_by_path,
+            &mut |path| Ok(normalizes.at(path)?.map(|row| row.1.clone())),
             Some(tool_lock_hash),
         )
     }
@@ -384,7 +425,7 @@ impl Repository {
     fn promote_normalize_refs_with_tool_lock_hash(
         &self,
         message: Option<&str>,
-        normalize_by_path: &BTreeMap<String, PendingNormalizeRef>,
+        normalize_for_path: &mut dyn FnMut(&str) -> Result<Option<PendingNormalizeRef>>,
         staged_tool_lock_hash: Option<&str>,
     ) -> Result<SnapshotOutcome> {
         self.validate()?;
@@ -415,20 +456,20 @@ impl Repository {
             Err(error) => return Err(error),
         };
         let current = self.build_working_tree(false)?.tree;
-        let current_raw = tree_map(&current)?;
+        let mut current_raw = SortedRecordCursor::new(current.entries.iter(), |entry| &entry.path);
         let purge = self.purge_state()?;
         let mut promoted_tree = prior_tree.clone();
         let mut changed = false;
         let mut updated = crate::disk_records::RecordWriter::new(&self.store.record_stages()?)?;
         for entry in &promoted_tree.entries {
             let mut entry = entry?;
-            let Some(pending) = normalize_by_path.get(&entry.path) else {
+            let Some(pending) = normalize_for_path(&entry.path)? else {
                 updated.push(&entry)?;
                 continue;
             };
             let exact_current = current_raw
-                .get(&entry.path)
-                .is_some_and(|raw_hash| raw_hash == &pending.expected_raw_hash);
+                .at(&entry.path)?
+                .is_some_and(|file| file.raw_hash == pending.expected_raw_hash);
             if !exact_current || entry.raw_hash != pending.expected_raw_hash {
                 updated.push(&entry)?;
                 continue;
@@ -543,6 +584,7 @@ impl Repository {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -602,6 +644,7 @@ impl Repository {
         expected_scheduled_authority: Option<&ScheduledSnapshotAuthority>,
         before_ref_publication: Option<&mut dyn FnMut() -> Result<SnapshotAutoStateBinding>>,
         publication_guard: Option<SnapshotPublicationGuard<'_>>,
+        scan: Option<ScannedSnapshotInputs<'_>>,
     ) -> Result<SnapshotOutcome> {
         // A retained repository is also used by the existing child-index
         // subprocess.  Bound descriptors plus `commit_type=auto` therefore do
@@ -684,17 +727,26 @@ impl Repository {
         } else {
             BTreeSet::new()
         };
-        let working_candidates = self.working_file_candidates(
-            excluded_paths,
-            explicitly_allowed_tier_a_paths,
-            true,
-            self.archive_limits,
-        )?;
+        let working_candidates = match scan {
+            Some((policy, _)) => self.scanned_working_file_candidates(policy)?,
+            None => self.working_file_candidates(
+                excluded_paths,
+                explicitly_allowed_tier_a_paths,
+                true,
+                self.archive_limits,
+            )?,
+        };
+        let mut scanned_normalize =
+            scan.map(|(_, normalize)| SortedRecordCursor::new(normalize.iter(), |row| &row.0));
+        let mut normalize_for_path = |path: &str| match &mut scanned_normalize {
+            Some(cursor) => Ok(cursor.at(path)?.map(|(_, pending)| pending.clone())),
+            None => Ok(normalize_by_path.get(path).cloned()),
+        };
         let working = {
             let _archive_lock = self.lock_store_in_session(&self.lock_session)?;
             self.archive_staged_working_tree(
                 working_candidates,
-                normalize_by_path,
+                &mut normalize_for_path,
                 self.archive_limits,
                 &purge_self_targets,
                 expected_raw_by_path,
@@ -720,11 +772,11 @@ impl Repository {
         // stays defensive (keeps a mid-purge re-run of this method, e.g.
         // re-purge, from ever retiring the marker it is itself about to
         // create).
-        let resurrection_candidates = if scheduled_bound || commit_type == CommitType::Purged {
-            BTreeSet::new()
-        } else {
+        let mut resurrection_candidates = None;
+        if !scheduled_bound && commit_type != CommitType::Purged {
             let purge = self.purge_state()?;
-            let mut candidates = BTreeSet::new();
+            let mut sorter = RecordSorter::new(&self.store.record_stages()?, String::cmp);
+            let mut found = false;
             for entry in &working.entries {
                 let entry = entry?;
                 let tombstoned = purge
@@ -734,11 +786,14 @@ impl Repository {
                     .read_erase_receipt(&entry.raw_hash)?
                     .is_some_and(|receipt| receipt.is_active());
                 if tombstoned || erased {
-                    candidates.insert(entry.raw_hash.clone());
+                    sorter.push(entry.raw_hash)?;
+                    found = true;
                 }
             }
-            candidates
-        };
+            if found {
+                resurrection_candidates = Some(sorter.finish()?);
+            }
+        }
 
         let tree_hash = self.store.write_tree(&working)?;
         let stats = commit_stats(prior_tree.as_ref(), &working)?;
@@ -751,7 +806,7 @@ impl Repository {
         // object being alive again.
         let (current_tool_lock_hash, current_tool_lock_bytes) = self.tool_lock_identity()?;
         if !force_commit
-            && resurrection_candidates.is_empty()
+            && resurrection_candidates.is_none()
             && head_tree_hash.as_deref() == Some(tree_hash.as_str())
             && head_commit
                 .as_ref()
@@ -983,11 +1038,11 @@ impl Repository {
         // active (LC24, safe side); the next locked mutation touching this
         // raw_hash (this same code path, naturally re-run) or an explicit
         // `kio repair verify-objects` backfill (LC27) completes it later.
-        if !resurrection_candidates.is_empty() {
+        if let Some(resurrection_candidates) = resurrection_candidates {
             let purge = self.purge_state()?;
             let actor = std::env::var("USER").unwrap_or_else(|_| "local-user".to_owned());
             purge.retire_resurrected(
-                &resurrection_candidates,
+                resurrection_candidates.iter(),
                 &commit_hash,
                 &commit.created_at,
                 &actor,

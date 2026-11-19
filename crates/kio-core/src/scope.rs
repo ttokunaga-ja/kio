@@ -159,10 +159,18 @@ pub struct ScopeIdentity {
     pub canonical_root: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingNormalizeRef {
     pub expected_raw_hash: String,
     pub normalize: NormalizeRef,
+}
+
+/// Per-path policy captured by index's sorted working-tree scan.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ScannedPathPolicy {
+    pub path: String,
+    pub excluded: bool,
+    pub allow_tier_a: bool,
 }
 
 #[derive(Debug)]
@@ -222,7 +230,7 @@ pub struct WorkingTree {
     pub tree: TreeObject,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
@@ -245,7 +253,7 @@ pub struct FileStatus {
 #[derive(Debug, Clone, Serialize)]
 pub struct StatusReport {
     pub stage_residues: Vec<crate::cas::RawStageResidue>,
-    pub files: Vec<FileStatus>,
+    pub files: crate::disk_records::DiskRecords<FileStatus>,
     pub head_shallow: bool,
 }
 
@@ -1331,11 +1339,11 @@ fn wait_at_bound_snapshot_auto_barrier(_: Option<&Path>) {}
 fn attach_pending_normalize(
     tree_entry: &mut TreeEntry,
     file_name: &str,
-    normalize_by_path: &BTreeMap<String, PendingNormalizeRef>,
+    pending: Option<PendingNormalizeRef>,
 ) {
-    if let Some(pending) = normalize_by_path.get(file_name) {
+    if let Some(pending) = pending {
         if pending.expected_raw_hash == tree_entry.raw_hash {
-            tree_entry.normalize = Some(pending.normalize.clone());
+            tree_entry.normalize = Some(pending.normalize);
         } else {
             eprintln!(
                 "warning: normalization metadata not attached because {file_name} changed after normalization"
@@ -4247,6 +4255,7 @@ mod tests {
                 &[],
                 true,
                 Some(&expected),
+                None,
                 None,
                 None,
                 None,

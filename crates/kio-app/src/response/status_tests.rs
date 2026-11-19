@@ -46,12 +46,19 @@ fn legacy_uninitialized_budget() -> Value {
         "warn_at_percent":80,"warned":false,"warning":null,"ledger_status":"uninitialized"})
 }
 
+fn records<T: serde::Serialize + serde::de::DeserializeOwned>(
+    rows: impl IntoIterator<Item = T>,
+) -> kio_core::disk_records::DiskRecords<T> {
+    use kio_core::disk_records::{DiskRecords, RecordStageRoot};
+    DiskRecords::from_records(&RecordStageRoot::temporary().unwrap(), rows).unwrap()
+}
+
 fn empty_status(quarantine: Vec<Value>) -> StatusResponse {
     StatusResponse {
         stage_residues: Vec::new(),
         office_readiness: None,
         scope_path: PathBuf::from("scope/日本語/.kio"),
-        files: Vec::new(),
+        files: records([]),
         head_shallow: false,
         paused_by_hold_reason: PausedTasksByHoldReason {
             budget: 0,
@@ -62,7 +69,7 @@ fn empty_status(quarantine: Vec<Value>) -> StatusResponse {
         },
         tasks: Vec::new(),
         quarantine,
-        unsupported_inputs: Vec::new(),
+        unsupported_inputs: records([]),
         unsupported_inputs_complete: true,
         budget: uninitialized_budget(),
         stalled_batch: Vec::new(),
@@ -185,7 +192,7 @@ fn status_stalled_batch_projection_preserves_nullable_fields_and_signed_timestam
 fn status_projection_preserves_domain_file_omission_and_unsupported_input_records() {
     let mut dto = empty_status(Vec::new());
     let mut legacy = legacy_empty_status(Vec::new());
-    dto.files = vec![
+    dto.files = records([
         FileStatus {
             path: None,
             relative_path: "shallow.txt".to_owned(),
@@ -198,15 +205,15 @@ fn status_projection_preserves_domain_file_omission_and_unsupported_input_record
             status: Some("new".to_owned()),
             raw_hash: Some("raw".to_owned()),
         },
-    ];
+    ]);
     legacy["files"] = json!([{"relative_path":"shallow.txt"},{"path":PathBuf::from("scope/new.txt"),"relative_path":"new.txt","status":"new","raw_hash":"raw"}]);
-    dto.unsupported_inputs = vec![UnsupportedInputDisposition {
+    dto.unsupported_inputs = records([UnsupportedInputDisposition {
         path: "clip.bin".to_owned(),
         raw_hash: "hash".to_owned(),
         media_type: "application/octet-stream".to_owned(),
         size_bytes: 7,
         reason: "unsupported".to_owned(),
-    }];
+    }]);
     legacy["unsupported_inputs"] = json!([{"path":"clip.bin","raw_hash":"hash","media_type":"application/octet-stream","size_bytes":7,"reason":"unsupported"}]);
     assert_projection(dto, legacy);
 }

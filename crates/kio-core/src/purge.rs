@@ -1201,35 +1201,36 @@ impl PurgeState {
         Ok(Some(self.append_erase_receipt_event(raw_hash, event)?))
     }
 
-    /// LC22-LC26: retire every active tombstone/erase-receipt among
-    /// `raw_hashes` against the same `resurrection_commit`, as one
-    /// locked-mutation batch. Returns the raw hashes that were actually
-    /// retired (empty = nothing to do, no lifecycle-epoch/counter churn).
-    pub fn retire_resurrected(
+    /// Retire every active marker in the ordered raw hash stream against the
+    /// same resurrection commit while the surrounding writer lock is held.
+    pub(crate) fn retire_resurrected(
         &self,
-        raw_hashes: &BTreeSet<String>,
+        raw_hashes: impl IntoIterator<Item = Result<String>>,
         resurrection_commit: &str,
         at: &str,
         actor: &str,
-    ) -> Result<BTreeSet<String>> {
-        let mut retired = BTreeSet::new();
+    ) -> Result<()> {
+        let mut previous = None;
         for raw_hash in raw_hashes {
+            let raw_hash = raw_hash?;
+            if previous.as_ref() == Some(&raw_hash) {
+                continue;
+            }
             if self
-                .read_tombstone(raw_hash)?
+                .read_tombstone(&raw_hash)?
                 .is_some_and(|record| record.is_active())
             {
-                self.retire_tombstone(raw_hash, resurrection_commit, at, actor)?;
-                retired.insert(raw_hash.clone());
+                self.retire_tombstone(&raw_hash, resurrection_commit, at, actor)?;
             }
             if self
-                .read_erase_receipt(raw_hash)?
+                .read_erase_receipt(&raw_hash)?
                 .is_some_and(|receipt| receipt.is_active())
             {
-                self.retire_erase_receipt(raw_hash, resurrection_commit, at, actor)?;
-                retired.insert(raw_hash.clone());
+                self.retire_erase_receipt(&raw_hash, resurrection_commit, at, actor)?;
             }
+            previous = Some(raw_hash);
         }
-        Ok(retired)
+        Ok(())
     }
 
     pub fn abort_before_barrier(&self, expected: &PurgeJournal) -> Result<()> {
@@ -2143,10 +2144,9 @@ mod tests {
         // "Crash before retire": tombstone stays active, safe-side resolution.
         assert!(state.read_tombstone(&raw()).unwrap().unwrap().is_active());
 
-        let retired = state
-            .retire_resurrected(&BTreeSet::from([raw()]), &other_commit(), LATER, "user")
+        state
+            .retire_resurrected([Ok(raw()), Ok(raw())], &other_commit(), LATER, "user")
             .unwrap();
-        assert_eq!(retired, BTreeSet::from([raw()]));
         let record = state.read_tombstone(&raw()).unwrap().unwrap();
         assert!(!record.is_active());
         assert_eq!(

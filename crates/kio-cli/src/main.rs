@@ -9,7 +9,7 @@ use clap::Parser;
 
 use crate::args::Cli;
 use kio_app::context::{AppContext, Interaction};
-use kio_app::response::Completion;
+use kio_app::response::{Completion, ResponseBody, index::IndexResponse};
 use kio_core::{ExitCode, KioError, Result};
 use serde_json::{Value, json};
 
@@ -32,12 +32,40 @@ fn main() {
     let exit_code = match kio_app::execute(&context, cli.command.into()).and_then(|response| {
         let code = completion_exit_code(response.completion);
         let output = match response.body {
-            kio_app::response::ResponseBody::Inspect(
-                kio_app::response::history::InspectResponse::Tree(tree),
-            ) => {
+            ResponseBody::Inspect(kio_app::response::history::InspectResponse::Tree(tree)) => {
                 let stdout = std::io::stdout();
                 let mut writer = std::io::BufWriter::with_capacity(64 * 1024, stdout.lock());
                 write_inspected_tree(&tree, &mut writer, json_mode)?;
+                None
+            }
+            ResponseBody::Index(IndexResponse::Preview(preview)) => {
+                if json_mode {
+                    write_output_json(|writer| serde_json::to_writer(writer, &preview))?;
+                } else {
+                    println!("{}", terminal_safe_text(&preview.status, false));
+                }
+                None
+            }
+            ResponseBody::Status(status) => {
+                if json_mode {
+                    write_output_json(|writer| serde_json::to_writer(writer, &status))?;
+                } else {
+                    for file in &status.files {
+                        let file = file?;
+                        println!(
+                            "{} {}",
+                            terminal_safe_text(file.status.as_deref().unwrap_or_default(), false),
+                            terminal_safe_text(&file.relative_path, false)
+                        );
+                    }
+                    if let Some(readiness) = status.office_readiness.as_ref() {
+                        print_office_readiness(
+                            readiness.state,
+                            &readiness.reason,
+                            readiness.alternatives,
+                        );
+                    }
+                }
                 None
             }
             body => Some(
@@ -62,6 +90,22 @@ fn main() {
         }
     };
     process::exit(exit_code.code());
+}
+
+fn write_output_json(write: impl FnOnce(&mut dyn Write) -> serde_json::Result<()>) -> Result<()> {
+    let stdout = std::io::stdout();
+    let mut writer = std::io::BufWriter::with_capacity(64 * 1024, stdout.lock());
+    write(&mut writer).map_err(|error| {
+        if error.is_io() {
+            KioError::io(error.to_string(), "stdout")
+        } else {
+            KioError::schema(error.to_string())
+        }
+    })?;
+    writer
+        .write_all(b"\n")
+        .and_then(|()| writer.flush())
+        .map_err(|error| KioError::io(error.to_string(), "stdout"))
 }
 
 /// Inspect explicitly emits the complete tree, but neither JSON values nor
@@ -289,6 +333,11 @@ fn clap_error_reason(err: &clap::Error) -> String {
         .to_string()
 }
 
+fn print_office_readiness(state: &str, reason: &str, alternatives: &str) {
+    let rendered = format!("Office: {state} — {reason}. {alternatives}");
+    println!("{}", terminal_safe_text(&rendered, false));
+}
+
 fn print_output(value: Value, json_mode: bool) {
     if json_mode {
         println!(
@@ -413,13 +462,11 @@ fn print_output(value: Value, json_mode: bool) {
             .get("index_status")
             .and_then(|status| status.get("office_readiness"))
     }) {
-        let rendered = format!(
-            "Office: {} — {}. {}",
+        print_office_readiness(
             readiness["state"].as_str().unwrap_or("unavailable"),
             readiness["reason"].as_str().unwrap_or(""),
-            readiness["alternatives"].as_str().unwrap_or("")
+            readiness["alternatives"].as_str().unwrap_or(""),
         );
-        println!("{}", terminal_safe_text(&rendered, false));
     }
     if let Some(gc) = value.get("gc").and_then(Value::as_object) {
         let status = gc

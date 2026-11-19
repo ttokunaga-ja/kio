@@ -278,12 +278,11 @@ pub(crate) fn execute_pending_tasks(
     if crate::index::pipeline::optional_role_planning_ready(adapter_settings, "markdown")? {
         if active_local_ocr_execution_with_control(adapter_settings, repo.control()).is_some() {
             let local_allowed = persistent_network_allowed(adapter_settings, repo)?;
-            let mut normalize_by_path = BTreeMap::new();
             outcome.add(execute_pending_offline_markdownize_tasks(
                 adapter_settings,
                 repo,
                 store,
-                &mut normalize_by_path,
+                &mut |_, _| Ok(()),
                 local_allowed,
                 allow_auth_revive,
             )?);
@@ -1488,8 +1487,8 @@ pub(crate) fn enqueue_online_placeholder_task(
     result: &mut IndexPipelineResult,
     ledger: Option<&LedgerDb>,
     unsupported_store: &UnsupportedInputStore,
-    unsupported_by_path: &mut BTreeMap<String, UnsupportedInputDisposition>,
-    office_conversion_unavailable_paths: &mut BTreeSet<String>,
+    latest_unsupported: &mut Option<UnsupportedInputDisposition>,
+    office_conversion_unavailable: &mut bool,
 ) -> Result<()> {
     // R9-2: text-native files (Markdown / plain text) are fully handled by
     // the deterministic Adapter (07 §2.1) and must never enqueue an online OCR task
@@ -1511,7 +1510,7 @@ pub(crate) fn enqueue_online_placeholder_task(
         if resolve_office_converter_with_control(repo.control()).is_err() {
             record_unsupported_if_changed(
                 unsupported_store,
-                unsupported_by_path,
+                latest_unsupported,
                 UnsupportedInputDisposition {
                     path: candidate.input_path.clone(),
                     raw_hash: raw_hash.to_owned(),
@@ -1520,13 +1519,13 @@ pub(crate) fn enqueue_online_placeholder_task(
                     reason: OFFICE_CONVERSION_UNAVAILABLE_REASON.to_owned(),
                 },
             )?;
-            office_conversion_unavailable_paths.insert(candidate.input_path.clone());
+            *office_conversion_unavailable = true;
             return Ok(());
         }
-        if office_conversion_unavailable_paths.remove(&candidate.input_path) {
+        if std::mem::take(office_conversion_unavailable) {
             record_unsupported_if_changed(
                 unsupported_store,
-                unsupported_by_path,
+                latest_unsupported,
                 UnsupportedInputDisposition {
                     path: candidate.input_path.clone(),
                     raw_hash: raw_hash.to_owned(),
@@ -1765,8 +1764,9 @@ pub(crate) fn enqueue_online_placeholder_task(
                     "ready_for_online_adapter"
                 } else {
                     "network_opt_in_required"
-                },
-            });
+                }
+                .to_owned(),
+            })?;
     }
     match status {
         TaskStatus::Paused => result.paused_tasks += 1,
