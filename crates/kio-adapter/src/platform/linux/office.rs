@@ -137,18 +137,19 @@ impl OfficeRuntime {
             {
                 roots.push(presets);
             }
-            let evidence = if optional_metadata(&bundle.join(MANIFEST))
-                .map_err(contract_error)?
-                .is_some()
-            {
-                PackageEvidence::Portable(bundle.into())
-            } else if let Some(version) = tdf_version(bundle, system) {
+            let evidence = if let Some(version) = tdf_version(bundle, system) {
+                // A manifest cannot override package-manager state at the TDF path.
                 if trust.owner != system_uid {
                     return Err(contract_error(
                         "installed TDF Office package must be system-owned",
                     ));
                 }
                 PackageEvidence::Tdf(version.into())
+            } else if optional_metadata(&bundle.join(MANIFEST))
+                .map_err(contract_error)?
+                .is_some()
+            {
+                PackageEvidence::Portable(bundle.into())
             } else {
                 return Err(contract_error(format_args!(
                     "cannot verify portable Office runtime without {MANIFEST}: {}",
@@ -601,6 +602,37 @@ mod tests {
             error.contains("outside the verified Office runtime"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn linux_closure_requires_tdf_dpkg_even_with_matching_portable_manifest() {
+        let scratch = tempfile::tempdir().unwrap();
+        let system = scratch.path().canonicalize().unwrap();
+        let bundle = system.join("opt/libreoffice26.2");
+        let files = [
+            "program/soffice",
+            "program/soffice.bin",
+            "program/bootstraprc",
+            "share/data",
+        ];
+        for path in files {
+            file(&bundle, path, b"abc");
+        }
+        let program = bundle.join("program/soffice");
+        tdf_records(&system, &bundle, &files, &["program", "share"]);
+        portable_records(&bundle, &files, &[], &[]);
+        assert!(verify(&program, &system).is_ok());
+        let update = file(&system, "var/lib/dpkg/updates/0000", b"pending");
+        let pending = verify(&program, &system);
+        fs::remove_file(update).unwrap();
+        file(
+            &system,
+            "var/lib/dpkg/status",
+            b"Package: libobasis26.2-core\nStatus: install ok unpacked\nArchitecture: amd64\n",
+        );
+        let unpacked = verify(&program, &system);
+        assert!(pending.unwrap_err().to_string().contains("pending updates"));
+        assert!(unpacked.unwrap_err().to_string().contains("not configured"));
     }
 
     #[test]

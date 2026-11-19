@@ -5,7 +5,9 @@ use super::{
 };
 use crate::{
     office_convert::hex_digest,
-    office_runtime_identity::{RecordSnapshot, RuntimeSnapshot, check_verification_deadline},
+    office_runtime_identity::{
+        MAX_PACKAGE_ENTRIES, RecordSnapshot, RuntimeSnapshot, check_verification_deadline,
+    },
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -17,6 +19,8 @@ use std::{
 };
 
 pub(super) const MANIFEST: &str = "SHA256SUMS";
+const MAX_RELATIVE_PATH_BYTES: usize = 1024;
+const MAX_RELATIVE_PATH_DEPTH: usize = 32;
 
 #[derive(PartialEq, Eq)]
 enum Member {
@@ -51,6 +55,24 @@ impl PortableCatalog {
             let (kind, relative) = line
                 .split_once("  ")
                 .ok_or_else(|| invalid(&path, "invalid portable Office runtime manifest row"))?;
+            if relative.len() > MAX_RELATIVE_PATH_BYTES {
+                return Err(invalid(
+                    &path,
+                    "portable Office runtime manifest path length exceeds limit",
+                ));
+            }
+            if relative.split('/').count() > MAX_RELATIVE_PATH_DEPTH {
+                return Err(invalid(
+                    &path,
+                    "portable Office runtime manifest path depth exceeds limit",
+                ));
+            }
+            if members.len() >= MAX_PACKAGE_ENTRIES {
+                return Err(invalid(
+                    &path,
+                    "too many portable Office runtime manifest entries",
+                ));
+            }
             let mut parts = relative.split('/');
             if !matches!(parts.next(), Some("program" | "share" | "presets"))
                 || parts.any(|part| matches!(part, "" | "." | ".."))
@@ -91,7 +113,14 @@ impl PortableCatalog {
                 .take_while(|parent| *parent != bundle)
             {
                 check_verification_deadline(deadline)?;
+                let at_limit = members.len() >= MAX_PACKAGE_ENTRIES;
                 match members.entry(parent.into()) {
+                    Entry::Vacant(_) if at_limit => {
+                        return Err(invalid(
+                            &path,
+                            "too many portable Office runtime manifest entries",
+                        ));
+                    }
                     Entry::Vacant(entry) => {
                         entry.insert(Member::Directory);
                     }
@@ -171,4 +200,54 @@ impl PortableCatalog {
 
 fn invalid(path: &Path, message: &str) -> io::Error {
     io::Error::other(format!("{message}: {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn check(manifest: &str) -> io::Result<PortableCatalog> {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join(MANIFEST), manifest)?;
+        PortableCatalog::read(
+            root.path(),
+            RuntimeTrust::fixture(root.path()),
+            Instant::now() + Duration::from_secs(10),
+        )
+    }
+
+    #[test]
+    fn portable_rejects_a_long_path_before_expanding_parents() {
+        let manifest = format!("dir  share/{}\n", "a".repeat(1024));
+        let error = check(&manifest).err().expect("long paths must be rejected");
+        assert!(error.to_string().contains("path length"), "{error}");
+    }
+
+    #[test]
+    fn portable_rejects_a_deep_path_before_expanding_parents() {
+        let manifest = format!("dir  share/{}leaf\n", "a/".repeat(32));
+        let error = check(&manifest).err().expect("deep paths must be rejected");
+        assert!(error.to_string().contains("path depth"), "{error}");
+    }
+
+    #[test]
+    fn portable_bounds_explicit_entries_and_counts_implicit_parents() {
+        let manifest: String = (0..32768).map(|i| format!("dir  share/{i}\n")).collect();
+        assert!(
+            check(&format!(
+                "dir  share\n{}",
+                manifest.lines().take(32767).collect::<Vec<_>>().join("\n")
+            ))
+            .is_ok()
+        );
+        let explicit = check(&format!("dir  share\n{manifest}"));
+        let implicit = check(&manifest);
+        for result in [explicit, implicit] {
+            let error = result
+                .err()
+                .expect("entry limits must count every directory");
+            assert!(error.to_string().contains("too many"), "{error}");
+        }
+    }
 }

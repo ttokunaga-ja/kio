@@ -146,13 +146,8 @@ impl DpkgCatalog {
                 .skip(1)
                 .take_while(|line| line.starts_with(' '))
             {
-                let mut fields = line.split_ascii_whitespace();
-                if let (Some(path), Some(hash), None) =
-                    (fields.next(), fields.next(), fields.next())
-                {
-                    let path = package_path(Path::new(path))?;
-                    merge_checksum(&mut sums, path, parse_checksum(hash, &status_path)?)?;
-                }
+                let (path, hash) = parse_conffile(line, &status_path)?;
+                merge_checksum(&mut sums, path, hash)?;
             }
             let mut members = BTreeMap::new();
             for line in list.lines().filter(|line| *line != "/." && *line != "/") {
@@ -271,6 +266,20 @@ fn package_path(path: &Path) -> io::Result<PathBuf> {
         .strip_prefix("/")
         .expect("absolute package path")
         .into())
+}
+
+fn parse_conffile(line: &str, record: &Path) -> io::Result<(PathBuf, Checksum)> {
+    let line = line.strip_prefix(' ').expect("conffile continuation");
+    // dpkg writes the path verbatim, then the digest and any flags.
+    let line = line.strip_suffix(" remove-on-upgrade").unwrap_or(line);
+    let line = line.strip_suffix(" obsolete").unwrap_or(line);
+    let (path, hash) = line
+        .rsplit_once(' ')
+        .ok_or_else(|| invalid(record, "invalid dpkg conffile entry"))?;
+    Ok((
+        package_path(Path::new(path))?,
+        parse_checksum(hash, record)?,
+    ))
 }
 
 fn parse_checksum(hash: &str, record: &Path) -> io::Result<Checksum> {
@@ -477,5 +486,58 @@ mod tests {
             error.to_string().contains("conflicting dpkg checksums"),
             "{error}"
         );
+    }
+    #[test]
+    fn dpkg_merges_the_full_spaced_conffile_path_with_ucf() {
+        let scratch = tempfile::tempdir().unwrap();
+        let root = scratch.path();
+        records(root).unwrap();
+        let config = CONFIG.replace("config.xcd", "office config.xcd");
+        let template = TEMPLATE.replace("config.xcd", "office config.xcd");
+        let db = root.join("var/lib/dpkg");
+        fs::write(
+            db.join(format!("info/{PACKAGE}.list")),
+            format!("{template}\n{config}\n"),
+        )
+        .unwrap();
+        fs::write(
+            db.join(format!("info/{PACKAGE}.md5sums")),
+            format!("{ABC}  {}\n", &template[1..]),
+        )
+        .unwrap();
+        fs::write(
+            root.join("var/lib/ucf/registry"),
+            format!("{PACKAGE} {config}\n"),
+        )
+        .unwrap();
+
+        for flags in [
+            "",
+            " obsolete",
+            " remove-on-upgrade",
+            " obsolete remove-on-upgrade",
+        ] {
+            fs::write(
+                db.join("status"),
+                format!("{INSTALLED}Conffiles:\n {config} {ABC}{flags}\n"),
+            )
+            .unwrap();
+            assert!(read(root, || {}).is_ok(), "{flags}");
+            fs::write(
+                db.join("status"),
+                format!(
+                    "{INSTALLED}Conffiles:\n {config} d41d8cd98f00b204e9800998ecf8427e{flags}\n"
+                ),
+            )
+            .unwrap();
+            let error = read(root, || {})
+                .err()
+                .expect("the complete conffile path must take part in checksum merging");
+            assert!(
+                error.to_string().contains("conflicting dpkg checksums")
+                    && error.to_string().contains(&config[1..]),
+                "{error}"
+            );
+        }
     }
 }

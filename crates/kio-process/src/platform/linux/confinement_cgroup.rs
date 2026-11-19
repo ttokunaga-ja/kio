@@ -337,7 +337,8 @@ fn validate_mounts(sandbox: &NativeRenderSandbox) -> Result<(), ConfinementError
             return Err(ConfinementError::Runtime(path.clone()));
         }
     }
-    super::confinement_mounts::validate_sources(&sources).map_err(ConfinementError::Resource)?;
+    super::confinement_mounts::validate_sources(&sources, sandbox.masked_runtime_source.as_deref())
+        .map_err(ConfinementError::Resource)?;
     Ok(())
 }
 fn trusted_helper(path: &str) -> Result<PathBuf, ConfinementError> {

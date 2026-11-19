@@ -81,6 +81,8 @@ fn executable_error(error: &dyn std::fmt::Display) -> io::Error {
     ))
 }
 
+pub(crate) const MAX_PACKAGE_ENTRIES: usize = 32_768;
+
 /// Identity of the package and the parts of the mounted runtime it links to.
 #[derive(Debug, Clone)]
 pub(crate) struct RuntimeSnapshot {
@@ -183,7 +185,6 @@ impl RuntimeSnapshot {
         check_entry: &EntryCheck<'_>,
         deadline: Instant,
     ) -> Result<BTreeMap<PathBuf, EntryIdentity>> {
-        const MAX_PACKAGE_ENTRIES: usize = 32_768;
         if roots.is_empty() {
             return Err(io::Error::other(format!(
                 "unsupported Office runtime placement for {}: cannot identify its package",

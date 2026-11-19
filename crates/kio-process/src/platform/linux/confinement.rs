@@ -8,6 +8,7 @@ pub(crate) struct NativeRenderSandbox {
     pub(super) program: PathBuf,
     pub(super) scratch: PathBuf,
     pub(super) runtime_mounts: Vec<(PathBuf, PathBuf)>,
+    pub(super) masked_runtime_source: Option<PathBuf>,
     masked_runtime_directories: Vec<PathBuf>,
     pub(super) limits: RenderResourceLimits,
     #[cfg(test)]
@@ -37,6 +38,7 @@ impl NativeRenderSandbox {
                 .into_iter()
                 .map(|(destination, source)| (source, destination))
                 .collect(),
+            masked_runtime_source: sources.masked_runtime_directory().map(PathBuf::from),
             masked_runtime_directories: sources.runtime_mask_destinations(),
             limits,
             #[cfg(test)]
