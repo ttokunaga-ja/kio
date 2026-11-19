@@ -340,17 +340,32 @@ pub fn build_managed_scan_preview(
             Err(_) => continue,
         };
         let path = Path::new(&name);
-        let metadata = cap_fs::stat(binding.root_handle(), path, cap_fs::FollowSymlinks::No)
-            .pipeline_io(path)?;
-        if !metadata.file_type().is_file() {
-            continue;
-        }
+        let metadata = match cap_fs::stat(binding.root_handle(), path, cap_fs::FollowSymlinks::No) {
+            Ok(metadata) if metadata.file_type().is_file() => Some(metadata),
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !request.include_raw_hashes {
+                    continue;
+                }
+                None
+            }
+            Err(error) => return Err(bound_scan_io(error, path)),
+        };
         let allowed = policy.allows_path(&name)?;
-        let raw_hash = if allowed && request.include_raw_hashes {
-            Some(
-                hash_bound_verified_scan_input(binding.root_handle(), &name, metadata.len())?
-                    .raw_hash,
-            )
+        let size_bytes = metadata.as_ref().map_or(0, cap_fs::Metadata::len);
+        let raw_hash = if allowed && request.include_raw_hashes && metadata.is_some() {
+            match hash_bound_verified_scan_input(binding.root_handle(), &name, size_bytes) {
+                Ok(input) => Some(input.raw_hash),
+                Err(crate::PipelineError::Contract {
+                    code:
+                        "KIO-E-SCAN-FILE-MISSING-001"
+                        | "KIO-E-SCAN-FILE-IDENTITY-001"
+                        | "KIO-E-SCAN-INPUT-CHANGED-001"
+                        | "KIO-E-SCAN-INPUT-OVERSIZED-001",
+                    ..
+                }) => None,
+                Err(error) => return Err(error),
+            }
         } else {
             None
         };
@@ -359,7 +374,7 @@ pub fn build_managed_scan_preview(
         candidates.push(ScanCandidate {
             input_path: name,
             media_type,
-            size_bytes: metadata.len(),
+            size_bytes,
             raw_hash,
             ignored: !allowed,
             quarantine_reason: match secret {
@@ -1808,13 +1823,27 @@ fn bound_input_oversized(input_path: &str, size: u64, max_bytes: u64) -> crate::
     )
 }
 
+fn bound_scan_io(error: std::io::Error, path: &Path) -> crate::PipelineError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        return crate::PipelineError::contract(
+            "KIO-E-SCAN-FILE-MISSING-001",
+            format!("scan candidate disappeared: {}", path.display()),
+        );
+    }
+    crate::PipelineError::Io {
+        path: path.display().to_string(),
+        message: error.to_string(),
+    }
+}
+
 fn open_bound_verified_regular_file(
     root: &File,
     input_path: &str,
 ) -> Result<(File, cap_fs::Metadata)> {
     validate_direct_child_name(input_path)?;
     let path = Path::new(input_path);
-    let listed = cap_fs::stat(root, path, cap_fs::FollowSymlinks::No).pipeline_io(path)?;
+    let listed = cap_fs::stat(root, path, cap_fs::FollowSymlinks::No)
+        .map_err(|error| bound_scan_io(error, path))?;
     if !listed.file_type().is_file() {
         return Err(crate::PipelineError::contract(
             "KIO-E-SCAN-FILE-IDENTITY-001",
@@ -1824,9 +1853,10 @@ fn open_bound_verified_regular_file(
     let mut options = cap_fs::OpenOptions::new();
     options.read(true);
     options._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
-    let file = cap_fs::open(root, path, &options).pipeline_io(path)?;
-    let opened = cap_fs::Metadata::from_file(&file).pipeline_io(path)?;
-    let after = cap_fs::stat(root, path, cap_fs::FollowSymlinks::No).pipeline_io(path)?;
+    let file = cap_fs::open(root, path, &options).map_err(|error| bound_scan_io(error, path))?;
+    let opened = cap_fs::Metadata::from_file(&file).map_err(|error| bound_scan_io(error, path))?;
+    let after = cap_fs::stat(root, path, cap_fs::FollowSymlinks::No)
+        .map_err(|error| bound_scan_io(error, path))?;
     if !opened.file_type().is_file()
         || !same_cap_file_identity(&listed, &opened)
         || !same_cap_file_identity(&opened, &after)

@@ -91,6 +91,8 @@ pub struct PublishedChildDiscovery {
 }
 #[derive(Debug, Serialize)]
 pub struct ChildPublishedRow {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub deferred_inputs: Vec<kio_core::scope::DeferredInput>,
     #[serde(flatten)]
     pub discovery: ChildScopeDiscovery,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -99,6 +101,8 @@ pub struct ChildPublishedRow {
 
 #[derive(Debug, Serialize)]
 pub struct IndexPublishedResponse {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub deferred_inputs: Vec<kio_core::scope::DeferredInput>,
     pub status: String,
     pub approval_method: String,
     pub network_allowed: bool,

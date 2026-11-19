@@ -408,6 +408,12 @@ fn print_output(value: Value, json_mode: bool) {
             serde_json::to_string_pretty(&value).expect("serializing command output cannot fail");
         println!("{}", terminal_safe_text(&rendered, true));
     }
+    print_deferred_inputs(&value, None);
+    if let Some(children) = value.get("child_scopes").and_then(Value::as_array) {
+        for child in children {
+            print_deferred_inputs(child, child["path"].as_str());
+        }
+    }
     if let Some(readiness) = value.get("office_readiness").or_else(|| {
         value
             .get("index_status")
@@ -432,6 +438,20 @@ fn print_output(value: Value, json_mode: bool) {
             |reason| format!("gc: {status} ({reason})"),
         );
         println!("{}", terminal_safe_text(&line, false));
+    }
+}
+
+fn print_deferred_inputs(report: &Value, scope: Option<&str>) {
+    if let Some(inputs) = report.get("deferred_inputs").and_then(Value::as_array) {
+        for input in inputs {
+            let path = input["path"].as_str().unwrap_or_default();
+            let path = scope.map_or_else(|| path.to_owned(), |scope| format!("{scope}/{path}"));
+            println!(
+                "deferred {} ({})",
+                terminal_safe_text(&path, false),
+                terminal_safe_text(input["reason"].as_str().unwrap_or_default(), false),
+            );
+        }
     }
 }
 

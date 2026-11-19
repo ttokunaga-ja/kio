@@ -777,15 +777,19 @@ canonical path、no-follow、record schema、identity と不正 record の拒否
 ソースコードのファイル（拡張子 `rs` / `py` / `js` / `ts` / `go` / `java` / `c` / `h` / `cpp`、大文字小文字を区別しない）は索引・抽出の対象外とし、unsupported に理由 `source_code_is_not_supported` を記録・表示する。中身がテキストでも plain text として処理しない。Markdown 内のコードブロック・インラインコードは引き続き Markdown の一部として扱う。
 
 `index`、HEAD の `reindex --regenerate`、および `watch` の再走査で unsupported と判定したファイルは、以前に索引済みでも、
-現行 tree には raw のみを記録する。今回の公開対象は走査で採用した path に限り、走査後に現れた新しい path は次の走査で扱う。
-採用したファイルが削除・改名されるか、走査または判定に使った raw_hash が公開する raw_hash と異なる場合は公開を中断する。
+現行 tree には raw のみを記録する。公開する新しい内容は、今回の走査で採用し、走査・判定と同じ raw_hash を確認できた入力に限る。
+走査中に安定した内容を確認できないファイル、走査後に追加・変更・改名・削除されたファイルは次の走査に見送り、他のファイルの公開を続ける。
+見送った path は前の HEAD の tree entry（raw と正規化参照）を保ち、前に存在しなければ含めない。判定の結果を異なる内容に結び付けない。
+公開結果と `status` の `deferred_inputs` に、見送った path と理由（`added_after_scan`、`missing_after_scan`、`changed_after_scan`、`unstable_during_scan`）を表示する。
+`status` は現行 HEAD に対応する直近の公開結果を表示し、次の公開結果で一覧を更新する。
+見送った path は `deferred_inputs` に表示し、状態表示のためにその内容を読み直すことはしない。
 status の unsupported 一覧には、公開済みの理由を表示する。読み取り中に HEAD が変わった場合は読み直す。
 検索の現行集計から該当する旧 Markdownize タスクを外し、タスク履歴は保持する。
 同じ path と raw_hash の対応する現行入力がサポートされていれば、raw のみを記録した OCR 待ちタスクも集計する。
 
 `index`、`reindex`、`watch` の再走査、`purge` は store lock の取得後に保留中の公開を確認する。
 公開ジャーナルが残っている scope では理由の書き換えや purge 計画の確定に進まず、`kio init` による公開回復を求める。
-現行検索の FTS・vector は当該ファイルの旧世代を返さない。過去の tree が参照する世代、raw、
+現行検索の FTS・vector は unsupported として公開したファイルの旧世代を返さない。過去の tree が参照する世代、raw、
 Evidence Pointer の解決に必要なデータは既存の履歴保持規則に従う (§4、[03-data-model.md §8](03-data-model.md))。
 
 ```json

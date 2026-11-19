@@ -95,7 +95,14 @@ fn json_any(dir: &TempDir, batch_script: &str, args: &[&str]) -> Value {
         .args(args)
         .output()
         .unwrap();
-    serde_json::from_slice(&output.stdout).unwrap()
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "kio {args:?} exited with {} and did not produce a JSON report: {error}\nstdout: {}\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })
 }
 
 /// Run and discard the result. For the failure paths whose report goes to
@@ -187,37 +194,18 @@ fn submitted_key(capture: &Path) -> String {
 
 /// Every chunk id the first submit carried.
 fn submitted_keys(capture: &Path) -> Vec<String> {
-    let line = std::fs::read_to_string(capture).unwrap();
-    let first = line.lines().next().unwrap();
-    let value: Value = serde_json::from_str(first).unwrap();
+    let value = std::fs::read_to_string(capture)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|event| event["call"] == "create_embedding_job")
+        .expect("capture must contain a batch submission");
     value["keys"]
         .as_array()
         .unwrap()
         .iter()
         .map(|key| key.as_str().unwrap().to_owned())
         .collect()
-}
-
-/// Every chunk id any submit carried, deduplicated — for fixtures with more
-/// than one job, where a per-job key list would fail the bijection check.
-fn all_submitted_keys(capture: &Path) -> Vec<String> {
-    let text = std::fs::read_to_string(capture).unwrap();
-    let mut keys = Vec::new();
-    for line in text.lines() {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        if value["call"] != "create_embedding_job" {
-            continue;
-        }
-        for key in value["keys"].as_array().into_iter().flatten() {
-            let key = key.as_str().unwrap().to_owned();
-            if !keys.contains(&key) {
-                keys.push(key);
-            }
-        }
-    }
-    keys
 }
 
 fn success_script(job: &str, key: &str) -> String {
@@ -887,7 +875,8 @@ fn every_row_of_a_realtime_pass_settles_on_its_own_reported_tokens() {
 #[test]
 fn resubmitting_the_same_member_set_reuses_the_row_and_creates_no_second_job() {
     let dir = scope();
-    let capture = root(&dir).join("capture.jsonl");
+    // Polling during index appends to this log after the input scan.
+    let capture = dir.path().join("capture.jsonl");
     let script = serde_json::json!({
         "state_sequence": ["BATCH_STATE_PENDING"],
         "job_name": "batches/contract-6",
@@ -895,7 +884,8 @@ fn resubmitting_the_same_member_set_reuses_the_row_and_creates_no_second_job() {
     })
     .to_string();
     json(&dir, &script, &["index", "--online"]);
-    json_any(&dir, &script, &["index", "--online"]);
+    let indexed = json_any(&dir, &script, &["index", "--online"]);
+    assert_eq!(indexed["status"], "noop", "{indexed}");
 
     let creates = std::fs::read_to_string(&capture)
         .unwrap()
@@ -1726,7 +1716,7 @@ fn a_submit_failure_does_not_abort_the_invocation() {
 #[test]
 fn an_unreachable_row_does_not_block_collection_of_the_others() {
     let dir = scope();
-    let capture = root(&dir).join("capture.jsonl");
+    let capture = dir.path().join("capture.jsonl");
 
     // Row A.
     json(
@@ -1734,7 +1724,6 @@ fn an_unreachable_row_does_not_block_collection_of_the_others() {
         &serde_json::json!({
             "state_sequence": ["BATCH_STATE_PENDING"],
             "job_name": "batches/blocked",
-            "capture_path": capture.to_string_lossy(),
         })
         .to_string(),
         &["index", "--online"],
@@ -1745,7 +1734,7 @@ fn an_unreachable_row_does_not_block_collection_of_the_others() {
         "# 請求仕様\n\n締め日は毎月 15 日です。\n",
     )
     .unwrap();
-    json_any(
+    let indexed = json_any(
         &dir,
         &serde_json::json!({
             "state_sequence": ["BATCH_STATE_PENDING"],
@@ -1755,6 +1744,7 @@ fn an_unreachable_row_does_not_block_collection_of_the_others() {
         .to_string(),
         &["index", "--online"],
     );
+    assert_eq!(indexed["status"], "indexed", "{indexed}");
     assert_eq!(
         ledger_query(
             &dir,
@@ -1765,7 +1755,7 @@ fn an_unreachable_row_does_not_block_collection_of_the_others() {
     );
 
     // `batches/blocked` is unreachable; `batches/ok` answers normally.
-    let keys = all_submitted_keys(&capture);
+    let keys = submitted_keys(&capture);
     let component = 1.0f64 / (768.0f64).sqrt();
     let script = serde_json::json!({
         "state_sequence": ["BATCH_STATE_SUCCEEDED"],

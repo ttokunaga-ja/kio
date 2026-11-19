@@ -48,6 +48,7 @@ fn legacy_uninitialized_budget() -> Value {
 
 fn empty_status(quarantine: Vec<Value>) -> StatusResponse {
     StatusResponse {
+        deferred_inputs: Vec::new(),
         stage_residues: Vec::new(),
         office_readiness: None,
         scope_path: PathBuf::from("scope/日本語/.kio"),
