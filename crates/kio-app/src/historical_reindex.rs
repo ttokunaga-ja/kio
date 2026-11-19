@@ -763,6 +763,7 @@ pub(super) fn run(
         rebuilt_chunks: appended.len() as u64,
         rebuilt_tree_entries: tree_entries.len() as u64,
         skipped_units,
+        enrichment_replay: None,
     };
     let response = HistoricalReindexResponse {
         status: "reindexed".to_owned(),

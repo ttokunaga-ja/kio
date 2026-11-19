@@ -373,7 +373,7 @@ fn run_rebuild_db_locked(
         crate::batch::command::recheck_resource_limit,
     )?;
     crate::index::pipeline::retry_local_extractions(ctx, repo, &store, resource_tier)?;
-    let report = rebuild_step3_index(ctx, repo)?;
+    let mut report = rebuild_step3_index(ctx, repo)?;
     // LC42-LC44 (item 2), same ordering rationale as `run_index`'s call.
     recover_index_generation(repo.kio_dir(), repo.control())?;
     if promotion_rebuild_pending {
@@ -416,7 +416,14 @@ fn run_rebuild_db_locked(
     // R11-2: keep the enrichment ExecOutcome (was discarded) — disclose it and let an
     // auth/budget-pause raise the exit while the rebuild JSON still prints to stdout.
     let enrichment = if enrichment_authorized {
-        run_embedding_enrichment(ctx, repo, embedding_online, false, false)?
+        run_embedding_enrichment(
+            ctx,
+            repo,
+            embedding_online,
+            false,
+            false,
+            report.enrichment_replay.as_mut(),
+        )?
     } else {
         ExecOutcome::default()
     };

@@ -233,6 +233,7 @@ pub(crate) fn retained_unit_introductions(
 
 /// Rebuild reuses the unit bodies verified during preflight. References to
 /// those bodies are shared across the exact manifest pins that attest them.
+#[derive(Debug)]
 pub(crate) struct RebuildAuthorities {
     pub(crate) roots: BTreeSet<String>,
     image_units: Option<StagedImageOwnership>,
@@ -255,7 +256,7 @@ fn stage_rebuild_authorities(
     repo: &Repository,
     instances: &[RetainedNormalizedInstance],
     roots: BTreeSet<String>,
-    image_targets: &BTreeSet<String>,
+    image_targets: Option<&BTreeSet<String>>,
 ) -> Result<(RebuildAuthorities, Vec<SkippedUnit>)> {
     let store = repo.object_store();
     let stages = store.record_stages()?;
@@ -303,7 +304,7 @@ fn stage_rebuild_authorities(
             for hash in unit
                 .owned_image_hashes
                 .into_iter()
-                .filter(|hash| image_targets.contains(hash))
+                .filter(|hash| image_targets.is_none_or(|targets| targets.contains(hash)))
             {
                 if image_stage.is_none() {
                     image_stage = Some(RecordWriter::new(&stages)?);
@@ -412,6 +413,12 @@ fn stage_rebuild_authorities(
 }
 
 impl RebuildAuthorities {
+    pub(crate) fn excludes(&self, instance: &RetainedNormalizedInstance) -> bool {
+        self.publication
+            .unavailable_pins
+            .contains(&manifest_pin(&instance.raw_hash, &instance.normalize))
+    }
+
     pub(crate) fn exact_units(
         &self,
         instance: &RetainedNormalizedInstance,
@@ -858,22 +865,34 @@ pub(crate) fn rebuild_step3_index(
     let existing = read_creation_metadata(repo.kio_dir())
         .map_err(|error| annotate_index_stage(error, "read chunk ledger"))?;
     let ref_roots = repo.current_ref_targets()?;
+    if ref_roots.is_empty() {
+        // Validate the ledger even without a ref. A detached publication
+        // cannot supply a HEAD or justify allocating any extraction stages.
+        durable_history_roots_with(
+            repo,
+            ref_roots,
+            &mut PublicationAuthenticationCache::default(),
+        )
+        .map_err(|error| annotate_index_stage(error, "authenticate history roots"))?;
+        return Ok(Step3RebuildReport::default());
+    }
     // Publication events can only keep ancestors of the published HEAD.
     // Inspect the pins in that ref graph before authenticating those events,
     // so root selection and replay agree on which exact pins can attest them.
     let retained_instances = retained_history_instances_for_roots(repo, &ref_roots)
         .map_err(|error| annotate_index_stage(error, "load retained instances"))?;
     let image_targets = rebuild_image_targets(repo)?;
-    let (mut authorities, mut skipped_units) =
-        stage_rebuild_authorities(repo, &retained_instances, ref_roots.clone(), &image_targets)
-            .map_err(|error| annotate_index_stage(error, "authenticate retained units"))?;
+    let (mut authorities, mut skipped_units) = stage_rebuild_authorities(
+        repo,
+        &retained_instances,
+        ref_roots.clone(),
+        image_targets.as_ref(),
+    )
+    .map_err(|error| annotate_index_stage(error, "authenticate retained units"))?;
     authorities.roots =
         durable_history_roots_with(repo, ref_roots, &mut authorities.publication)
             .map_err(|error| annotate_index_stage(error, "authenticate history roots"))?;
     let rebuild_roots = &authorities.roots;
-    if rebuild_roots.is_empty() {
-        return Ok(Step3RebuildReport::default());
-    }
     // R16-1/R16-4: `repair rebuild-db` (the only implemented recovery command),
     // `index`, and `reindex` all rebuild through here. A shallow HEAD (commit OR tree
     // object gone) must fail with a clear KIO-E-COMMIT-SHALLOW-001 + recovery guidance
@@ -1176,6 +1195,11 @@ pub(crate) fn rebuild_step3_index(
         rebuilt_chunks: appended_count,
         rebuilt_tree_entries: tree_entries.len() as u64,
         skipped_units,
+        enrichment_replay: if authorities.publication.unavailable_pins.is_empty() {
+            None
+        } else {
+            Some(authorities)
+        },
     })
 }
 
@@ -1460,6 +1484,8 @@ pub(crate) struct Step3RebuildReport {
     /// R16-4: documents skipped because their normalized units are missing/corrupt,
     /// each `{raw_hash, path, reason}`. Empty on a clean rebuild.
     pub(crate) skipped_units: Vec<SkippedUnit>,
+    /// Keep the verified pins and exact exclusions for same-command enrichment.
+    pub(crate) enrichment_replay: Option<RebuildAuthorities>,
 }
 
 pub(crate) fn read_chunking_config(repo: &Repository) -> Result<ChunkingConfig> {
@@ -1610,24 +1636,32 @@ fn rebuild_sqlite_index(
 /// not be crossed. Objects whose profile is not the live one are skipped rather
 /// than replayed — 04 §4.3 requires the rebuild to bind exactly one candidate
 /// per chunk, and several profiles can legitimately coexist in the store.
-fn rebuild_image_targets(repo: &Repository) -> Result<BTreeSet<String>> {
+fn rebuild_image_targets(repo: &Repository) -> Result<Option<BTreeSet<String>>> {
     let Some(expected) = rebuild_embedding_profile_from_tool_lock(repo.kio_dir())? else {
-        return Ok(BTreeSet::new());
+        return Ok(Some(BTreeSet::new()));
     };
     let store = repo.object_store();
-    Ok(store
-        .embedding_hashes()?
-        .into_iter()
-        .filter_map(|hash| {
-            let object = store.read_embedding(&hash).ok()?;
-            (object.target_type == "image"
-                && object.dimensions == expected.dimensions
-                && object.distance == expected.distance
-                && object.modality == expected.modality
-                && object.profile_hash == expected.profile_hash)
-                .then_some(object.target_hash)
-        })
-        .collect())
+    let mut targets = BTreeSet::new();
+    for hash in store.embedding_hashes()? {
+        let Ok(object) = repo
+            .control()
+            .checkpoint(kio_core::durability::DurabilityPoint::BeforeImageReplayCandidateRead)
+            .and_then(|()| store.read_embedding(&hash))
+        else {
+            // This is an optimization only. The object may become readable
+            // during replay, so keep all verified ownership in this case.
+            return Ok(None);
+        };
+        if object.target_type == "image"
+            && object.dimensions == expected.dimensions
+            && object.distance == expected.distance
+            && object.modality == expected.modality
+            && object.profile_hash == expected.profile_hash
+        {
+            targets.insert(object.target_hash);
+        }
+    }
+    Ok(Some(targets))
 }
 
 /// Replay image vectors from `objects/embeddings/` into `embeddings` +
@@ -2308,6 +2342,38 @@ mod tests {
     use kio_pipeline::prepare::{UnitType, unit_ref};
 
     #[test]
+    fn p0_sixth_empty_rebuild_does_not_need_record_stages() {
+        let root = tempfile::tempdir().unwrap();
+        let control = ControlHandle::default();
+        let crate::management::ExplicitRoot::Created(repo) =
+            crate::management::initialize_explicit_root(root.path(), &control).unwrap()
+        else {
+            panic!("fresh root must be created");
+        };
+        kio_core::store_dir::StoreDirectory::open(repo.kio_dir())
+            .unwrap()
+            .create_directory_all(Path::new("internal"))
+            .unwrap();
+        let stages = repo.kio_dir().join("internal/record-stages");
+        if stages.is_dir() {
+            fs::rename(&stages, stages.with_extension("saved")).unwrap();
+        }
+        fs::write(&stages, b"record stages unavailable").unwrap();
+        let report = rebuild_step3_index(
+            &Invocation {
+                context: &crate::context::test_support::context(root.path()),
+                settings: &Arc::new(kio_adapter::tool_lock::AdapterRuntimeSettings::default()),
+                control: &control,
+                locks: &kio_core::scope::LockSession::default(),
+            },
+            &repo,
+        )
+        .unwrap();
+        assert_eq!(report.rebuilt_chunks, 0);
+        assert_eq!(report.rebuilt_tree_entries, 0);
+    }
+
+    #[test]
     fn p0_fifth_image_ownership_is_only_staged_for_image_replay() {
         let root = tempfile::tempdir().unwrap();
         let crate::management::ExplicitRoot::Created(repo) =
@@ -2384,16 +2450,17 @@ mod tests {
             introductions: Vec::new(),
         }];
         let targets = rebuild_image_targets(&repo).unwrap();
-        assert!(targets.is_empty());
+        assert_eq!(targets, Some(BTreeSet::new()));
         let (authorities, _) =
-            stage_rebuild_authorities(&repo, &instances, BTreeSet::new(), &targets).unwrap();
+            stage_rebuild_authorities(&repo, &instances, BTreeSet::new(), targets.as_ref())
+                .unwrap();
         assert!(authorities.image_units.is_none());
 
         let (authorities, _) = stage_rebuild_authorities(
             &repo,
             &instances,
             BTreeSet::new(),
-            &BTreeSet::from([image_hash.clone()]),
+            Some(&BTreeSet::from([image_hash.clone()])),
         )
         .unwrap();
         let stage = authorities.image_units.as_ref().unwrap();

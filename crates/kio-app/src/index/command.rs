@@ -880,7 +880,7 @@ fn run_index_for_repo_inner(
         )?;
     }
     super::extraction_retirement::recover(repo)?;
-    let rebuild_report = rebuild_step3_index(ctx, repo)?;
+    let mut rebuild_report = rebuild_step3_index(ctx, repo)?;
     // LC42-LC44: after the rebuild's temp-build-then-rename lands the final
     // `sqlite.db`, reconcile `index_metadata` (item 2).
     recover_index_generation(repo.kio_dir(), repo.control())?;
@@ -888,7 +888,8 @@ fn run_index_for_repo_inner(
     // guardrails (K4). No-op unless an embedding adapter is configured. R11-2: keep
     // the ExecOutcome (was discarded) so the embedding enrichment result is disclosed
     // and can raise the exit code (auth/budget) instead of a silent exit 0.
-    let enrichment = generate_scope_embeddings(ctx, repo, &args)?;
+    let enrichment =
+        generate_scope_embeddings(ctx, repo, &args, rebuild_report.enrichment_replay.as_mut())?;
     // The scope now has a search index; register it as indexed so it participates
     // in default multi-scope search (05 §1.8, K3). Cache write, never fatal.
     register_scope(ctx, repo, true);
@@ -2251,7 +2252,14 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
     )?;
     // R11-2: keep the enrichment ExecOutcome (was discarded) so a new-generation
     // embedding auth/budget-pause is disclosed and raises the exit (result on stdout).
-    let enrichment = run_embedding_enrichment(ctx, &repo, embedding_online, false, false)?;
+    let enrichment = run_embedding_enrichment(
+        ctx,
+        &repo,
+        embedding_online,
+        false,
+        false,
+        report.enrichment_replay.as_mut(),
+    )?;
     let response = HeadReindexResponse {
         status: "reindexed".to_owned(),
         reindexed_files: reindexed,

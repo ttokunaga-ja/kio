@@ -1710,6 +1710,7 @@ fn o3_fresh_local_image_claim_survives_competing_enrichment() {
         false,
         false,
         false,
+        None,
     );
     // Always release and join the real owner before checking the competitor.
     release_tx.send(()).unwrap();

@@ -14,6 +14,7 @@ pub enum DurabilityPoint {
     AfterNormalizedStageRemoval,
     AfterChunkDocumentStaging,
     BeforeChunkUnitRead,
+    BeforeImageReplayCandidateRead,
     BeforeAdapterSourceRead,
     BeforeIndexSnapshot,
     BeforeReadDispositions,
@@ -81,6 +82,7 @@ impl DurabilityPoint {
             "after_normalized_stage_removal" => Some(Self::AfterNormalizedStageRemoval),
             "after_chunk_document_staging" => Some(Self::AfterChunkDocumentStaging),
             "before_chunk_unit_read" => Some(Self::BeforeChunkUnitRead),
+            "before_image_replay_candidate_read" => Some(Self::BeforeImageReplayCandidateRead),
             "before_adapter_source_read" => Some(Self::BeforeAdapterSourceRead),
             "before_index_snapshot" => Some(Self::BeforeIndexSnapshot),
             "before_read_dispositions" => Some(Self::BeforeReadDispositions),
@@ -149,6 +151,7 @@ impl DurabilityPoint {
             Self::AfterNormalizedStageRemoval => "after_normalized_stage_removal",
             Self::AfterChunkDocumentStaging => "after_chunk_document_staging",
             Self::BeforeChunkUnitRead => "before_chunk_unit_read",
+            Self::BeforeImageReplayCandidateRead => "before_image_replay_candidate_read",
             Self::BeforeAdapterSourceRead => "before_adapter_source_read",
             Self::BeforeIndexSnapshot => "before_index_snapshot",
             Self::BeforeReadDispositions => "before_read_dispositions",
@@ -253,6 +256,7 @@ fn checkpoint_debug(owner: &crate::control::ControlHandle, point: DurabilityPoin
                     | DurabilityPoint::ExtractionBeforeDestinationSync
                     | DurabilityPoint::ExtractionDirectoryBeforeSync
                     | DurabilityPoint::BeforeAdapterSourceRead
+                    | DurabilityPoint::BeforeImageReplayCandidateRead
                     | DurabilityPoint::AtomicWriteBeforeDirectorySync
             ))
     {

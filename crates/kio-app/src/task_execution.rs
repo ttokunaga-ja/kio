@@ -325,6 +325,7 @@ pub(crate) fn execute_pending_tasks(
         embedding_online,
         override_budget,
         allow_auth_revive,
+        None,
     )?);
     Ok(outcome)
 }

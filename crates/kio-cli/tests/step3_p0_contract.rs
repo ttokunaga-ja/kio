@@ -16608,23 +16608,32 @@ fn p0_fourth_discarded_stage_does_not_claim_another_images_generation() {
 #[cfg(debug_assertions)]
 #[test]
 fn p0_fourth_failed_manifest_keeps_same_generation_history() {
-    check_failed_manifest_keeps_same_generation_history(None);
+    check_failed_manifest_keeps_same_generation_history(None, false);
 }
 
 #[cfg(debug_assertions)]
 #[test]
 fn p0_fifth_missing_second_page_preserves_healthy_history_from_rebuild_start() {
-    check_failed_manifest_keeps_same_generation_history(Some(false));
+    check_failed_manifest_keeps_same_generation_history(Some(false), false);
 }
 
 #[cfg(debug_assertions)]
 #[test]
 fn p0_fifth_existing_publication_cannot_retain_an_unreadable_manifest() {
-    check_failed_manifest_keeps_same_generation_history(Some(true));
+    check_failed_manifest_keeps_same_generation_history(Some(true), false);
 }
 
 #[cfg(debug_assertions)]
-fn check_failed_manifest_keeps_same_generation_history(missing_at_start: Option<bool>) {
+#[test]
+fn p0_sixth_repair_enrichment_uses_the_rebuild_manifest_exclusions() {
+    check_failed_manifest_keeps_same_generation_history(Some(true), true);
+}
+
+#[cfg(debug_assertions)]
+fn check_failed_manifest_keeps_same_generation_history(
+    missing_at_start: Option<bool>,
+    embedding_enabled: bool,
+) {
     use kio_core::dag::{CommitStats, CommitType, build_tree};
     use kio_pipeline::markdownize::{NormalizedInstanceManifest, NormalizedUnitObject};
     let dir = canonical_tempdir();
@@ -16634,7 +16643,15 @@ fn check_failed_manifest_keeps_same_generation_history(missing_at_start: Option<
         fake_pdf(&["historicalfirstneedle"]),
     )
     .unwrap();
-    let old = json_success(&dir, &["index", "--offline"]);
+    let run = if embedding_enabled {
+        json_success_deterministic_embed
+    } else {
+        json_success
+    };
+    let old = run(&dir, &["index", "--offline"]);
+    if embedding_enabled {
+        assert!(count(&index_db(&dir), "SELECT count(*) FROM chunk_vec") > 0);
+    }
     let old_head = old["commit_hash"].as_str().unwrap();
     let repo = Repository::open(dir.path()).unwrap();
     let old_commit = repo.read_commit(old_head).unwrap();
@@ -16721,7 +16738,7 @@ fn check_failed_manifest_keeps_same_generation_history(missing_at_start: Option<
         .unwrap();
     if let Some(has_publication) = missing_at_start {
         if has_publication {
-            json_success(&dir, &["repair", "rebuild-db", "--offline"]);
+            run(&dir, &["repair", "rebuild-db", "--offline"]);
             let conn = Connection::open(repo.kio_dir().join("index/sqlite.db")).unwrap();
             let count: i64 = conn
                 .query_row(
@@ -16733,7 +16750,7 @@ fn check_failed_manifest_keeps_same_generation_history(missing_at_start: Option<
             assert!(count > 0);
         }
         fs::remove_file(second_page).unwrap();
-        let out = json_success(&dir, &["repair", "rebuild-db", "--offline"]);
+        let out = run(&dir, &["repair", "rebuild-db", "--offline"]);
         assert_eq!(out["skipped_units"].as_array().unwrap().len(), 1, "{out}");
     } else {
         let marker = canonical_tempdir();
@@ -16767,4 +16784,26 @@ fn check_failed_manifest_keeps_same_generation_history(missing_at_start: Option<
         )
         .unwrap();
     assert_eq!(unavailable, 0);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn p0_sixth_image_replay_recovers_after_candidate_read_failure() {
+    let dir = indexed_scope_deterministic_embed_with_images();
+    let before = count(&index_db(&dir), "SELECT count(*) FROM image_vec");
+    assert!(before > 0);
+    fs::remove_file(dir.path().join(".kio/index/sqlite.db")).unwrap();
+
+    kio(&dir, &["repair", "rebuild-db", "--offline"])
+        .env(
+            "KIO_TEST_DURABILITY_POINT",
+            "before_image_replay_candidate_read",
+        )
+        .env("KIO_TEST_DURABILITY_STORAGE_FAULT", "1")
+        .assert()
+        .success();
+    assert_eq!(
+        count(&index_db(&dir), "SELECT count(*) FROM image_vec"),
+        before
+    );
 }
