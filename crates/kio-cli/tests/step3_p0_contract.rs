@@ -15120,29 +15120,43 @@ fn nc2_index_status_does_not_count_old_markdownize_tasks_for_unsupported_path() 
 }
 
 #[cfg(debug_assertions)]
-fn pause_nc2_reindex(dir: &TempDir, ready: &Path) -> std::process::Child {
+fn pause_nc2_command(
+    dir: &TempDir,
+    ready: &Path,
+    point: &str,
+    args: &[&str],
+) -> std::process::Child {
     let mut command = hermetic_process_command(&assert_cmd::cargo::cargo_bin("kio"));
     let mut child = command
         .current_dir(dir.path())
         .envs(support::home_env(dir.path()))
-        .env("KIO_TEST_DURABILITY_POINT", "before_index_snapshot")
+        .env("KIO_TEST_DURABILITY_POINT", point)
         .env("KIO_TEST_DURABILITY_READY", ready)
-        .args(["reindex", "--regenerate", "--yes", "--offline", "--json"])
+        .args(args)
+        .arg("--json")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    let expected = format!("point=before_index_snapshot\npid={}\n", child.id());
+    let expected = format!("point={point}\npid={}\n", child.id());
     let deadline = Instant::now() + Duration::from_secs(25);
     while fs::read_to_string(ready).ok().as_deref() != Some(&expected) {
         if child.try_wait().unwrap().is_some() || Instant::now() >= deadline {
             let _ = child.kill();
             let output = child.wait_with_output().unwrap();
-            panic!("reindex did not reach checkpoint: {:?}", output);
+            panic!("{args:?} did not reach checkpoint {point}: {output:?}");
         }
         std::thread::sleep(Duration::from_millis(10));
     }
     child
+}
+
+#[cfg(debug_assertions)]
+const NC2_REINDEX: &[&str] = &["reindex", "--regenerate", "--yes", "--offline"];
+
+#[cfg(debug_assertions)]
+fn pause_nc2_reindex(dir: &TempDir, ready: &Path) -> std::process::Child {
+    pause_nc2_command(dir, ready, "before_index_snapshot", NC2_REINDEX)
 }
 
 #[cfg(debug_assertions)]
@@ -15210,4 +15224,183 @@ fn nc2_aborted_reindex_preserves_published_unsupported_reason() {
     let current = json_success(&dir, &["status"])["unsupported_inputs"].clone();
     assert_eq!(current[0]["reason"], published[0]["reason"]);
     assert_ne!(current[0]["raw_hash"], published[0]["raw_hash"]);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn nc2_retry_keeps_reason_for_pending_publication() {
+    for command in [&["index", "--yes", "--offline"][..], NC2_REINDEX] {
+        let dir = canonical_tempdir();
+        let path = dir.path().join("document.cfg");
+        fs::write(&path, b"\xff").unwrap();
+        json_success(&dir, &["init"]);
+        json_success(&dir, &["index", "--yes", "--offline"]);
+        fs::write(&path, b"\xfe").unwrap();
+        let markers = canonical_tempdir();
+        let mut child = pause_nc2_command(
+            &dir,
+            &markers.path().join("ready"),
+            "publication_journal",
+            command,
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        fs::write(&path, b"\xfd").unwrap();
+        kio(&dir, command).assert().failure();
+        json_success(&dir, &["init"]);
+        let status = json_success(&dir, &["status"]);
+        assert_eq!(
+            status["unsupported_inputs"][0]["raw_hash"],
+            kio_pipeline::prepare::hash_bytes(b"\xfe"),
+            "{command:?}: {status}"
+        );
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn nc2_purge_cannot_delete_raw_from_pending_publication() {
+    let dir = canonical_tempdir();
+    let path = dir.path().join("document.txt");
+    fs::write(&path, b"previous snapshot\n").unwrap();
+    json_success(&dir, &["init"]);
+    json_success(&dir, &["snapshot", "create"]);
+    let pending = b"pending snapshot\n";
+    fs::write(&path, pending).unwrap();
+    let markers = canonical_tempdir();
+    let mut child = pause_nc2_command(
+        &dir,
+        &markers.path().join("ready"),
+        "publication_journal",
+        &["snapshot", "create"],
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let raw = kio_pipeline::prepare::hash_bytes(pending);
+    fs::remove_file(path).unwrap();
+    kio(
+        &dir,
+        &["purge", "--raw-hash", &raw, "--reason", "privacy", "--yes"],
+    )
+    .assert()
+    .failure();
+
+    json_success(&dir, &["init"]);
+    let repo = Repository::open(dir.path()).unwrap();
+    let commit = repo
+        .read_commit(&repo.head_commit_hash().unwrap().unwrap())
+        .unwrap();
+    let tree = repo.read_tree(&commit.tree).unwrap();
+    assert_eq!(tree.entries[0].raw_hash, raw);
+    assert!(
+        repo.object_store()
+            .inspect_object(ObjectKind::Raw, &raw)
+            .is_ok(),
+        "recovered HEAD points to deleted raw {raw}"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn nc2_rejects_renamed_or_added_inputs_before_snapshot() {
+    for command in [NC2_REINDEX, &["index", "--yes", "--offline"][..]] {
+        for rename in [true, false] {
+            let dir = canonical_tempdir();
+            let original = dir.path().join("a.cfg");
+            let added = dir.path().join("b.cfg");
+            fs::write(&original, b"\xff").unwrap();
+            json_success(&dir, &["init"]);
+            json_success(&dir, &["index", "--yes", "--offline"]);
+            let kio_dir = dir.path().join(".kio");
+            let head = head_commit(&kio_dir);
+            let markers = canonical_tempdir();
+            let ready = markers.path().join("ready");
+            let child = pause_nc2_command(&dir, &ready, "before_index_snapshot", command);
+            if rename {
+                fs::rename(original, &added).unwrap();
+            } else {
+                fs::write(&added, b"\xfe").unwrap();
+            }
+            fs::write(ready.with_extension("release"), b"release").unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                !output.status.success(),
+                "{command:?}, rename={rename}: {output:?}"
+            );
+            assert_eq!(head_commit(&kio_dir), head);
+            json_success(&dir, command);
+            let status = json_success(&dir, &["status"]);
+            assert!(
+                status["unsupported_inputs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| {
+                        row["path"] == "b.cfg"
+                            && row["reason"] == "unrecognized_binary_without_local_text"
+                    }),
+                "{status}"
+            );
+        }
+    }
+}
+
+#[test]
+fn nc2_search_counts_raw_only_ocr_task_with_unsupported_alias() {
+    let dir = canonical_tempdir();
+    let mut scan = b"%PDF-1.4\n".to_vec();
+    scan.extend([0xff; 64]);
+    for name in ["scan.pdf", "copy.cfg"] {
+        fs::write(dir.path().join(name), &scan).unwrap();
+    }
+    json_success(&dir, &["init"]);
+    json_both_mock(&dir, &["index", "--yes", "--offline"]);
+    let status = json_success(&dir, &["status"]);
+    let task = &status["tasks"][0];
+    assert_eq!(task["input_path"], "scan.pdf", "{status}");
+    assert_eq!(task["status"], "paused", "{status}");
+    assert_eq!(status["unsupported_inputs"][0]["path"], "copy.cfg");
+    assert_eq!(
+        task["input_hash"],
+        status["unsupported_inputs"][0]["raw_hash"]
+    );
+
+    let search = json_success(&dir, &["search", "ocrneedle", "--mode", "text"]);
+    assert_eq!(
+        search["index_status"]["pending_enrichment_tasks"], 1,
+        "{search}"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn nc2_status_retries_if_head_changes_after_observation() {
+    let dir = canonical_tempdir();
+    let path = dir.path().join("document.cfg");
+    fs::write(&path, b"\xff").unwrap();
+    json_success(&dir, &["init"]);
+    json_success(&dir, &["index", "--yes", "--offline"]);
+
+    let markers = canonical_tempdir();
+    let ready = markers.path().join("ready");
+    let child = pause_nc2_command(&dir, &ready, "before_read_dispositions", &["status"]);
+    for contents in [b"\xfe", b"\xfd"] {
+        fs::write(&path, contents).unwrap();
+        json_success(&dir, NC2_REINDEX);
+    }
+    fs::write(ready.with_extension("release"), b"release").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["unsupported_inputs_complete"], true);
+    assert_eq!(
+        status["unsupported_inputs"][0]["raw_hash"],
+        kio_pipeline::prepare::hash_bytes(b"\xfd"),
+        "{status}"
+    );
+    assert_eq!(
+        status["files"][0]["raw_hash"],
+        status["unsupported_inputs"][0]["raw_hash"]
+    );
 }

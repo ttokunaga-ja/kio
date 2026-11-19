@@ -9,6 +9,7 @@ use crate::Result;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DurabilityPoint {
     BeforeIndexSnapshot,
+    BeforeReadDispositions,
     PublicationJournal,
     PublicationManifest,
     PublicationHead,
@@ -56,6 +57,7 @@ impl DurabilityPoint {
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value {
             "before_index_snapshot" => Some(Self::BeforeIndexSnapshot),
+            "before_read_dispositions" => Some(Self::BeforeReadDispositions),
             "publication_journal" => Some(Self::PublicationJournal),
             "publication_manifest" => Some(Self::PublicationManifest),
             "publication_head" => Some(Self::PublicationHead),
@@ -104,6 +106,7 @@ impl DurabilityPoint {
     fn name(self) -> &'static str {
         match self {
             Self::BeforeIndexSnapshot => "before_index_snapshot",
+            Self::BeforeReadDispositions => "before_read_dispositions",
             Self::PublicationJournal => "publication_journal",
             Self::PublicationManifest => "publication_manifest",
             Self::PublicationHead => "publication_head",

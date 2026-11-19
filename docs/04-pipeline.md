@@ -777,9 +777,13 @@ canonical path、no-follow、record schema、identity と不正 record の拒否
 ソースコードのファイル（拡張子 `rs` / `py` / `js` / `ts` / `go` / `java` / `c` / `h` / `cpp`、大文字小文字を区別しない）は索引・抽出の対象外とし、unsupported に理由 `source_code_is_not_supported` を記録・表示する。中身がテキストでも plain text として処理しない。Markdown 内のコードブロック・インラインコードは引き続き Markdown の一部として扱う。
 
 `index`、HEAD の `reindex --regenerate`、および `watch` の再走査で unsupported と判定したファイルは、以前に索引済みでも、
-現行 tree には raw のみを記録する。判定に使った raw_hash と公開対象が異なる場合は公開を中断する。
-status の unsupported 一覧には、公開済みの理由を表示する。検索の現行集計から該当する旧 Markdownize
-タスクを外し、タスク履歴は保持する。
+現行 tree には raw のみを記録する。走査した path の集合や、判定に使った raw_hash が公開対象と異なる場合は公開を中断する。
+status の unsupported 一覧には、公開済みの理由を表示する。読み取り中に HEAD が変わった場合は読み直す。
+検索の現行集計から該当する旧 Markdownize タスクを外し、タスク履歴は保持する。
+同じ path と raw_hash の対応する現行入力がサポートされていれば、raw のみを記録した OCR 待ちタスクも集計する。
+
+`index`、`reindex`、`watch` の再走査、`purge` は store lock の取得後に保留中の公開を確認する。
+公開ジャーナルが残っている scope では理由の書き換えや purge 計画の確定に進まず、`kio init` による公開回復を求める。
 現行検索の FTS・vector は当該ファイルの旧世代を返さない。過去の tree が参照する世代、raw、
 Evidence Pointer の解決に必要なデータは既存の履歴保持規則に従う (§4、[03-data-model.md §8](03-data-model.md))。
 

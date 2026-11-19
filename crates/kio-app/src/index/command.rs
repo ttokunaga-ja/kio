@@ -674,7 +674,7 @@ fn run_index_for_repo_inner(
     // only then constructs a fresh preview, binding approvals and writes to the
     // current tree rather than a stale pre-lock observation. The lock is
     // reentrant, so the internal auto-snapshot re-acquisition does not deadlock.
-    let lock = repo.lock_store_in_session(repo.lock_session())?;
+    let lock = repo.lock_store_for_publication()?;
     admission_policy.revalidate().map_err(pipeline_to_kio)?;
     management::reconcile_child_lifecycle(repo)?;
     // Lifecycle reconciliation may legitimately change management records.
@@ -808,6 +808,8 @@ fn run_index_for_repo_inner(
     index_result
         .normalize_by_path
         .retain(|path, _| !index_result.unsupported_raws.contains_key(path));
+    repo.control()
+        .checkpoint(kio_core::durability::DurabilityPoint::BeforeIndexSnapshot)?;
     let outcome = repo.auto_snapshot_with_bound_normalize(
         Some("kio index auto snapshot"),
         None,
@@ -816,7 +818,7 @@ fn run_index_for_repo_inner(
         &explicitly_allowed_tier_a,
         Some(&|tree| {
             publication_policy.revalidate().map_err(pipeline_to_kio)?;
-            verify_classified_input_raws(tree, &index_result.unsupported_raws)
+            verify_snapshot_inputs(tree, &preview, &index_result.unsupported_raws)
         }),
     )?;
     if let Some(commit_hash) = &outcome.commit_hash {
@@ -1581,14 +1583,13 @@ pub(crate) fn compute_index_status(
             .iter()
             .map(|row| row.raw_hash.as_str())
             .collect::<BTreeSet<_>>();
-        // The raw match also covers a rename. A supported alias with its own
-        // current normalized reference remains eligible for task accounting.
-        let normalized_inputs = current_tree
+        // The raw match covers a rename. A supported alias still live at its
+        // own path remains eligible, including raw-only inputs awaiting OCR.
+        let current_inputs = current_tree
             .as_ref()
             .filter(|_| !unsupported_raws.is_empty())
             .into_iter()
             .flat_map(|tree| &tree.entries)
-            .filter(|entry| entry.normalize.is_some())
             .map(|entry| (entry.path.as_str(), entry.raw_hash.as_str()))
             .collect::<BTreeSet<_>>();
         for task in tasks {
@@ -1606,9 +1607,9 @@ pub(crate) fn compute_index_status(
             }
             if task.task_type == TaskType::Markdownize
                 && (unsupported_paths.contains(task.input_path.as_str())
-                    || unsupported_raws.contains(task.input_hash.as_str())
-                        && !normalized_inputs
-                            .contains(&(task.input_path.as_str(), task.input_hash.as_str())))
+                    || !current_inputs
+                        .contains(&(task.input_path.as_str(), task.input_hash.as_str()))
+                        && unsupported_raws.contains(task.input_hash.as_str()))
             {
                 continue;
             }
@@ -1704,27 +1705,59 @@ pub(crate) fn compute_index_status(
     })
 }
 
-pub(crate) fn current_unsupported_inputs(
+pub(crate) fn unsupported_inputs_at_head(
     repo: &Repository,
+    head: Option<&str>,
 ) -> Result<Vec<UnsupportedInputDisposition>> {
-    let (_, dispositions) = current_dispositions(repo)?;
+    let (_, dispositions) = dispositions_at_head(repo, head)?;
     Ok(dispositions
         .into_iter()
         .filter(UnsupportedInputDisposition::is_unsupported)
         .collect())
 }
 
-/// Read dispositions selected by the published tree and share that tree with
-/// the search status aggregation. Unsupported paths must also be raw-only.
+/// Read against one observed HEAD. A writer may prune the previous HEAD's
+/// reasons as soon as it starts preparing another publication.
+pub(crate) fn read_stable_head<T>(
+    repo: &Repository,
+    mut read: impl FnMut(Option<&str>) -> Result<T>,
+) -> Result<T> {
+    let mut head = repo.head_commit_hash()?;
+    repo.control()
+        .checkpoint(kio_core::durability::DurabilityPoint::BeforeReadDispositions)?;
+    for _ in 0..3 {
+        let result = read(head.as_deref());
+        let next = repo.head_commit_hash()?;
+        if next == head {
+            return result;
+        }
+        head = next;
+    }
+    Err(KioError::new(
+        "KIO-E-PUBLICATION-CONFLICT-001",
+        "HEAD kept changing while reading index status; retry the command",
+        json!({}),
+        ExitCode::PartialFailure,
+    ))
+}
+
 fn current_dispositions(
     repo: &Repository,
 ) -> Result<(Option<TreeObject>, Vec<UnsupportedInputDisposition>)> {
+    read_stable_head(repo, |head| dispositions_at_head(repo, head))
+}
+
+/// Unsupported paths must be raw-only in the selected tree.
+fn dispositions_at_head(
+    repo: &Repository,
+    head: Option<&str>,
+) -> Result<(Option<TreeObject>, Vec<UnsupportedInputDisposition>)> {
     let store = UnsupportedInputStore::new(repo.kio_dir());
-    let Some(head) = repo.head_commit_hash()? else {
+    let Some(head) = head else {
         store.latest_by_path().map_err(pipeline_to_kio)?;
         return Ok((None, Vec::new()));
     };
-    let commit = repo.read_commit(&head)?;
+    let commit = repo.read_commit(head)?;
     let tree = repo.read_tree(&commit.tree)?;
     let normalized_paths = tree
         .entries
@@ -1757,10 +1790,24 @@ pub(crate) fn record_unsupported_if_changed(
     Ok(true)
 }
 
-fn verify_classified_input_raws(
+fn verify_snapshot_inputs(
     tree: &TreeObject,
+    preview: &ScanPreview,
     classified_raws: &BTreeMap<String, String>,
 ) -> Result<()> {
+    let scanned_paths = preview
+        .candidates
+        .iter()
+        .filter(|entry| !entry.ignored && entry.media_type != "inode/directory")
+        .map(|entry| entry.input_path.as_str());
+    let captured_paths = tree.entries.iter().map(|entry| entry.path.as_str());
+    // Both the bound scan and the canonical tree sort by path bytes.
+    if !scanned_paths.eq(captured_paths) {
+        return Err(pipeline_to_kio(kio_pipeline::PipelineError::contract(
+            "KIO-E-SCAN-INPUT-CHANGED-001",
+            "input names changed after scanning; run indexing again",
+        )));
+    }
     for entry in &tree.entries {
         if classified_raws
             .get(&entry.path)
@@ -1812,7 +1859,7 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
     // M1(a): serialize both HEAD reindex and historical enrichment against
     // concurrent index/repair/reindex. Historical enrichment is derived-state
     // only, but still appends to the chunk ledger and SQLite projection.
-    let _lock = repo.lock_store_in_session(repo.lock_session())?;
+    let _lock = repo.lock_store_for_publication()?;
     publication_policy.revalidate().map_err(pipeline_to_kio)?;
     validate_repo_tool_lock(&repo)?;
     // CL45/item 5: reconcile any stale `request_kind='sync'` cost-ledger.sqlite
@@ -2003,7 +2050,7 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
         &explicitly_allowed_tier_a,
         Some(&|tree| {
             publication_policy.revalidate().map_err(pipeline_to_kio)?;
-            verify_classified_input_raws(tree, &classified.raw_by_path)
+            verify_snapshot_inputs(tree, &closing_preview, &classified.raw_by_path)
         }),
     )?;
     if let Some(commit_hash) = &outcome.commit_hash {
