@@ -217,6 +217,31 @@ impl Repository {
     }
 }
 
+/// Input admitted by the managed index scan. No hash means the scan
+/// observed this path but could not read a stable version.
+pub struct ScannedInput {
+    pub raw_hash: Option<String>,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeferredInputReason {
+    AddedAfterScan,
+    MissingAfterScan,
+    ChangedAfterScan,
+    UnstableDuringScan,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeferredInput {
+    pub path: String,
+    pub reason: DeferredInputReason,
+}
+
+type ScannedInputs = BTreeMap<String, ScannedInput>;
+type DeferredInputs = BTreeMap<String, DeferredInputReason>;
+
 #[derive(Debug, Clone)]
 pub struct WorkingTree {
     pub tree: TreeObject,
@@ -4242,6 +4267,7 @@ mod tests {
                 &[],
                 true,
                 Some(&expected),
+                None,
                 None,
                 None,
                 None,

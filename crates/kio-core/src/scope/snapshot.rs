@@ -2,6 +2,12 @@ use super::*;
 
 type SnapshotPublicationGuard<'a> = &'a dyn Fn(&TreeObject) -> Result<()>;
 
+#[derive(Serialize, Deserialize)]
+struct IndexDeferrals {
+    head: Option<String>,
+    inputs: Vec<DeferredInput>,
+}
+
 impl Repository {
     pub fn snapshot(
         &self,
@@ -40,6 +46,7 @@ impl Repository {
             false,
             &[],
             true,
+            None,
             None,
             None,
             None,
@@ -100,7 +107,75 @@ impl Repository {
             None,
             None,
             publication_guard,
+            None,
         )
+    }
+
+    /// Capture only verified scan inputs and keep the prior entries for paths
+    /// that changed during this pass. Normalization still binds to the raw hash.
+    pub fn auto_snapshot_scanned(
+        &self,
+        message: &str,
+        inputs: &ScannedInputs,
+        deferred: &mut DeferredInputs,
+        normalize_by_path: &BTreeMap<String, PendingNormalizeRef>,
+        publication_guard: SnapshotPublicationGuard<'_>,
+    ) -> Result<(SnapshotOutcome, Vec<DeferredInput>)> {
+        let _lock = self.lock_store_in_session(&self.lock_session)?;
+        let outcome = self.snapshot_with_type(
+            Some(message),
+            None,
+            CommitType::Auto,
+            &|_| true,
+            normalize_by_path,
+            &BTreeSet::new(),
+            false,
+            &[],
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(publication_guard),
+            Some((inputs, deferred)),
+        )?;
+        let inputs: Vec<_> = std::mem::take(deferred)
+            .into_iter()
+            .map(|(path, reason)| DeferredInput { path, reason })
+            .collect();
+        self.write_index_deferrals(&inputs)?;
+        Ok((outcome, inputs))
+    }
+
+    fn write_index_deferrals(&self, inputs: &[DeferredInput]) -> Result<()> {
+        let directory = self.store_directory()?;
+        let leaf = Path::new("index-deferrals.json");
+        if inputs.is_empty() && directory.read_optional(leaf, u64::MAX)?.is_none() {
+            return Ok(());
+        }
+        let bytes = serde_json::to_vec(&IndexDeferrals {
+            head: self.head_commit_hash()?,
+            inputs: inputs.to_vec(),
+        })
+        .map_err(|error| KioError::schema(error.to_string()))?;
+        directory.write_atomic(leaf, &bytes, crate::store_dir::Publication::Upsert)
+    }
+
+    pub fn index_deferrals_at_head(&self, head: Option<&str>) -> Result<Vec<DeferredInput>> {
+        let Some(bytes) = self
+            .store_directory()?
+            .read_optional(Path::new("index-deferrals.json"), u64::MAX)?
+        else {
+            return Ok(Vec::new());
+        };
+        let report: IndexDeferrals = serde_json::from_slice(&bytes)
+            .map_err(|error| KioError::schema(format!("invalid index deferrals: {error}")))?;
+        Ok(if report.head.as_deref() == head {
+            report.inputs
+        } else {
+            Vec::new()
+        })
     }
 
     pub(super) fn bound_snapshot_auto_direct_entries(&self) -> Result<BTreeSet<String>> {
@@ -333,6 +408,7 @@ impl Repository {
             Some(&scheduled_authority),
             Some(before_ref_publication),
             None,
+            None,
         )
     }
 
@@ -544,6 +620,7 @@ impl Repository {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -603,6 +680,7 @@ impl Repository {
         expected_scheduled_authority: Option<&ScheduledSnapshotAuthority>,
         before_ref_publication: Option<&mut dyn FnMut() -> Result<SnapshotAutoStateBinding>>,
         publication_guard: Option<SnapshotPublicationGuard<'_>>,
+        mut scanned: Option<(&ScannedInputs, &mut DeferredInputs)>,
     ) -> Result<SnapshotOutcome> {
         // A retained repository is also used by the existing child-index
         // subprocess.  Bound descriptors plus `commit_type=auto` therefore do
@@ -685,24 +763,34 @@ impl Repository {
         } else {
             BTreeSet::new()
         };
-        let working_candidates = self.working_file_candidates(
-            include_path,
-            explicitly_allowed_tier_a_paths,
-            true,
-            self.archive_limits,
-        )?;
         let working = {
             let _archive_lock = self.lock_store_in_session(&self.lock_session)?;
-            self.archive_staged_working_tree(
-                working_candidates,
-                normalize_by_path,
-                self.archive_limits,
-                &purge_self_targets,
-                expected_raw_by_path,
-                expected_direct_entries,
-                expected_snapshot_policy,
-                &chunking_config_hash,
-            )?
+            if let Some((inputs, deferred)) = scanned.as_mut() {
+                self.archive_scanned_working_tree(
+                    inputs,
+                    deferred,
+                    prior_tree.as_ref(),
+                    normalize_by_path,
+                    &chunking_config_hash,
+                )?
+            } else {
+                let candidates = self.working_file_candidates(
+                    include_path,
+                    explicitly_allowed_tier_a_paths,
+                    true,
+                    self.archive_limits,
+                )?;
+                self.archive_staged_working_tree(
+                    candidates,
+                    normalize_by_path,
+                    self.archive_limits,
+                    &purge_self_targets,
+                    expected_raw_by_path,
+                    expected_direct_entries,
+                    expected_snapshot_policy,
+                    &chunking_config_hash,
+                )?
+            }
         }
         .tree;
 
@@ -728,6 +816,12 @@ impl Repository {
             let mut candidates = BTreeSet::new();
             for entry in &working.entries {
                 let entry = entry?;
+                if scanned
+                    .as_ref()
+                    .is_some_and(|(_, deferred)| deferred.contains_key(&entry.path))
+                {
+                    continue;
+                }
                 let tombstoned = purge
                     .read_tombstone(&entry.raw_hash)?
                     .is_some_and(|record| record.is_active());

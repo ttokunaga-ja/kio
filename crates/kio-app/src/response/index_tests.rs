@@ -164,6 +164,7 @@ fn index_preview_projection_preserves_domain_candidates_costs_and_parent_child_s
 
 fn published() -> IndexPublishedResponse {
     IndexPublishedResponse {
+        deferred_inputs: Vec::new(),
         status: "noop".to_owned(),
         approval_method: "existing".to_owned(),
         network_allowed: false,
@@ -292,6 +293,7 @@ fn index_published_projection_preserves_child_errors_gc_and_discovery_widths() {
     let mut payload = published();
     payload.child_scopes = Some(vec![
         ChildPublishedRow {
+            deferred_inputs: Vec::new(),
             discovery: ChildScopeDiscovery {
                 path: "子".to_owned(),
                 status: "indexed_partial".to_owned(),
@@ -307,6 +309,7 @@ fn index_published_projection_preserves_child_errors_gc_and_discovery_widths() {
             })),
         },
         ChildPublishedRow {
+            deferred_inputs: Vec::new(),
             discovery: ChildScopeDiscovery {
                 path: "empty".to_owned(),
                 status: "indexed".to_owned(),
@@ -346,6 +349,7 @@ fn index_child_projection_preserves_current_non_success_fallback_codes() {
     ] {
         assert_projection(
             ChildPublishedRow {
+                deferred_inputs: Vec::new(),
                 discovery: ChildScopeDiscovery {
                     path: "子".to_owned(),
                     status: "indexed_partial".to_owned(),

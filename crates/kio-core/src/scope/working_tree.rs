@@ -27,6 +27,11 @@ struct ArchivedFile {
     source: crate::platform::ScheduledSourceIdentity,
     stage: crate::cas::SavedRawStage,
 }
+type StagedInput = (
+    crate::cas::BoundRawStage,
+    crate::platform::ScheduledSourceIdentity,
+);
+
 struct ArchiveBatch<'a> {
     records: RecordWriter<ArchivedFile>,
     store: &'a ObjectStore,
@@ -45,22 +50,6 @@ impl Drop for ArchiveBatch<'_> {
 }
 
 impl Repository {
-    /// Check invocation archive budgets before preprocessing can save any raw.
-    /// Publication repeats this check against the final working-tree state.
-    pub fn validate_archive_budget(
-        &self,
-        include_path: &dyn Fn(&str) -> bool,
-        explicitly_allowed_tier_a_paths: &BTreeSet<String>,
-    ) -> Result<()> {
-        self.working_file_candidates(
-            include_path,
-            explicitly_allowed_tier_a_paths,
-            true,
-            self.archive_limits,
-        )
-        .map(|_| ())
-    }
-
     pub fn build_working_tree(&self, store_raw: bool) -> Result<WorkingTree> {
         self.build_working_tree_filtered(store_raw, &BTreeSet::new())
     }
@@ -205,6 +194,146 @@ impl Repository {
         })
     }
 
+    pub fn validate_scanned_archive_budget(&self, inputs: &ScannedInputs) -> Result<()> {
+        let limits = self.archive_limits;
+        let mut consumed = 0u64;
+        for (name, input) in inputs {
+            if input.raw_hash.is_none() {
+                continue;
+            }
+            if input.size_bytes > limits.max_file_bytes {
+                return Err(scope_input_oversized(name, limits, input.size_bytes));
+            }
+            consumed = consumed
+                .checked_add(input.size_bytes)
+                .ok_or_else(|| scope_total_oversized(name, limits, u64::MAX))?;
+            if consumed > limits.max_scope_bytes {
+                return Err(scope_total_oversized(name, limits, consumed));
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn archive_scanned_working_tree(
+        &self,
+        inputs: &ScannedInputs,
+        deferred: &mut DeferredInputs,
+        prior_tree: Option<&TreeObject>,
+        normalize_by_path: &BTreeMap<String, PendingNormalizeRef>,
+        chunking_config_hash: &str,
+    ) -> Result<WorkingTree> {
+        let root = self.bound_root.as_deref().ok_or_else(|| {
+            KioError::invalid_usage("scanned archive requires a retained scope capability")
+        })?;
+        self.validate_scanned_archive_budget(inputs)?;
+        if inputs.len() > TREE_ENTRY_WARNING_THRESHOLD {
+            eprintln!(
+                "warning: scope has more than 10,000 direct files; split into subfolders or use ignore; processing all files"
+            );
+        }
+        self.store.cleanup_bound_raw_stages()?;
+        let record_stages = self.store.record_stages()?;
+        let mut batch = ArchiveBatch {
+            records: RecordWriter::new(&record_stages)?,
+            store: &self.store,
+        };
+        for (name, input) in inputs {
+            if deferred.contains_key(name) {
+                continue;
+            }
+            let Some(raw_hash) = input.raw_hash.as_deref() else {
+                deferred.insert(name.clone(), DeferredInputReason::UnstableDuringScan);
+                continue;
+            };
+            match self.stage_scanned_input(root, name, raw_hash, input.size_bytes)? {
+                Ok((stage, source)) => {
+                    batch.records.push(&ArchivedFile {
+                        name: name.clone(),
+                        size: stage.size_bytes(),
+                        source,
+                        stage: stage.saved(),
+                    })?;
+                    let mut stage = stage;
+                    stage.detach();
+                }
+                Err(reason) => {
+                    deferred.insert(name.clone(), reason);
+                }
+            }
+        }
+
+        let purge = self.purge_state()?;
+        let mut entries = TreeBuilder::new(&record_stages, chunking_config_hash.to_owned());
+        if !deferred.is_empty()
+            && let Some(prior) = prior_tree
+        {
+            for entry in &prior.entries {
+                let entry = entry?;
+                if deferred.contains_key(&entry.path) {
+                    ensure_raw_publication_allowed(&purge, &entry.raw_hash)?;
+                    entries.push(entry)?;
+                }
+            }
+        }
+        self.publish_archive_batch(
+            &batch,
+            &mut entries,
+            normalize_by_path,
+            &BTreeSet::new(),
+            Some(&purge),
+        )?;
+        Ok(WorkingTree {
+            tree: entries.finish()?,
+        })
+    }
+
+    fn stage_scanned_input(
+        &self,
+        root: &File,
+        name: &str,
+        expected_hash: &str,
+        expected_size: u64,
+    ) -> Result<std::result::Result<StagedInput, DeferredInputReason>> {
+        use DeferredInputReason::ChangedAfterScan;
+
+        let path = self.canonical_root.join(name);
+        let file = open_bound_scope_file_nofollow(root, name, &path, self.control());
+        let mut file = match file {
+            Ok(file) => file,
+            Err(error) => return Ok(Err(scanned_open_failure(root, name, error)?)),
+        };
+        let before = file.metadata().kio_io(&path)?;
+        if before.len() != expected_size {
+            return Ok(Err(ChangedAfterScan));
+        }
+        let source = scheduled_source_identity(&file)?;
+        // Read at most one byte beyond the scan's size, even for a growing log.
+        let limit = expected_size.saturating_add(1);
+        let stage = self
+            .store
+            .stage_raw_from_reader(&mut (&mut file).take(limit), limit)
+            .map_err(|error| {
+                error
+                    .with_context_field("path", json!(name))
+                    .with_context_field("saved", json!(false))
+            })?;
+        if stage.size_bytes() != expected_size || stage.raw_hash() != expected_hash {
+            return Ok(Err(ChangedAfterScan));
+        }
+        let current = match open_bound_scope_file_nofollow(root, name, &path, self.control()) {
+            Ok(file) => file,
+            Err(error) => return Ok(Err(scanned_open_failure(root, name, error)?)),
+        };
+        let after = current.metadata().kio_io(&path)?;
+        if after.len() != expected_size
+            || after.modified().kio_io(&path)? != before.modified().kio_io(&path)?
+            || scheduled_source_identity(&current)? != source
+        {
+            return Ok(Err(ChangedAfterScan));
+        }
+        Ok(Ok((stage, source)))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn archive_staged_working_tree(
         &self,
@@ -328,14 +457,35 @@ impl Repository {
         } else {
             Some(self.purge_state()?)
         };
+        let mut entries = TreeBuilder::new(&record_stages, chunking_config_hash.to_owned());
+        self.publish_archive_batch(
+            &batch,
+            &mut entries,
+            normalize_by_path,
+            purge_self_targets,
+            purge.as_ref(),
+        )?;
+        Ok(WorkingTree {
+            tree: entries.finish()?,
+        })
+    }
+
+    fn publish_archive_batch(
+        &self,
+        batch: &ArchiveBatch<'_>,
+        entries: &mut TreeBuilder,
+        normalize_by_path: &BTreeMap<String, PendingNormalizeRef>,
+        purge_self_targets: &BTreeSet<String>,
+        purge: Option<&PurgeState>,
+    ) -> Result<()> {
         for record in batch.records.iter() {
             let record = record?;
             let mut stage = self.store.reopen_saved_stage(&record.stage)?;
             if !purge_self_targets.contains(stage.raw_hash()) {
-                if let Some(purge) = &purge {
+                if let Some(purge) = purge {
                     ensure_raw_publication_allowed(purge, stage.raw_hash())?;
                 }
-                if scheduled_bound {
+                if purge.is_none() {
                     self.reject_scheduled_marker_targets(std::iter::once(
                         &stage.raw_hash().to_owned(),
                     ))?;
@@ -343,7 +493,6 @@ impl Repository {
             }
             stage.detach();
         }
-        let mut entries = TreeBuilder::new(&record_stages, chunking_config_hash.to_owned());
         for record in batch.records.iter() {
             let record = record?;
             let mut stage = self.store.reopen_saved_stage(&record.stage)?;
@@ -359,9 +508,7 @@ impl Repository {
             attach_pending_normalize(&mut entry, &record.name, normalize_by_path);
             entries.push(entry)?;
         }
-        Ok(WorkingTree {
-            tree: entries.finish()?,
-        })
+        Ok(())
     }
 
     pub(super) fn working_file_candidates(
@@ -511,9 +658,16 @@ impl Repository {
     }
 
     pub fn status(&self) -> Result<StatusReport> {
+        self.status_with_deferred(&[])
+    }
+
+    pub fn status_with_deferred(&self, deferred: &[DeferredInput]) -> Result<StatusReport> {
+        let deferred_paths: BTreeSet<_> = deferred.iter().map(|entry| entry.path.clone()).collect();
         let _inspection = crate::disk_records::StageInspection::begin();
         self.validate()?;
-        let current = self.build_working_tree(false)?.tree;
+        let current = self
+            .build_working_tree_filtered(false, &deferred_paths)?
+            .tree;
         let current_map = tree_map(&current)?;
         // R15-4: a shallow HEAD (tree object discarded) must NOT brick a pure read.
         // Degrade to listing the current files without a classification instead of
@@ -530,6 +684,9 @@ impl Repository {
 
         let mut statuses = Vec::new();
         for path in paths {
+            if deferred_paths.contains(&path) {
+                continue;
+            }
             // Omit the tree-derived classification when HEAD is shallow — the prior
             // tree needed to compute it is gone.
             let status = if head_shallow {
@@ -564,5 +721,20 @@ impl Repository {
             files: statuses,
             head_shallow,
         })
+    }
+}
+
+fn scanned_open_failure(root: &File, name: &str, error: KioError) -> Result<DeferredInputReason> {
+    use cap_primitives::fs as cap_fs;
+
+    match cap_fs::stat(root, Path::new(name), cap_fs::FollowSymlinks::No) {
+        Err(stat) if stat.kind() == std::io::ErrorKind::NotFound => {
+            Ok(DeferredInputReason::MissingAfterScan)
+        }
+        Ok(metadata) if !metadata.is_file() => Ok(DeferredInputReason::ChangedAfterScan),
+        _ if error.error_code() == "KIO-E-SCOPE-FILE-CHANGED-001" => {
+            Ok(DeferredInputReason::ChangedAfterScan)
+        }
+        _ => Err(error),
     }
 }
