@@ -1,4 +1,4 @@
-//! Strict, create-only publication and consumption of persona artifacts.
+//! Strict, create-only publication and consumption of artifacts.
 //!
 //! This module deliberately retains the directory descriptor used to bind an
 //! artifact.  Public paths are rechecked as diagnostics only; all file I/O is
@@ -13,19 +13,19 @@ use std::{
 };
 use thiserror::Error;
 
-const TEMP_PREFIX: &str = ".kio-persona-artifact-";
+const TEMP_PREFIX: &str = ".kio-artifact-";
 const MAX_PATH_COMPONENTS: usize = 64;
 const MAX_PATH_COMPONENT_BYTES: usize = 255;
 
 #[derive(Debug, Error)]
-pub enum PersonaArtifactError {
-    #[error("unsafe persona artifact: {0}")]
+pub enum StrictArtifactError {
+    #[error("unsafe artifact: {0}")]
     Unsafe(String),
-    #[error("persona artifact I/O: {0}")]
+    #[error("artifact I/O: {0}")]
     Io(#[from] std::io::Error),
-    #[error("persona artifact publication is indeterminate: {0}")]
+    #[error("artifact publication is indeterminate: {0}")]
     Indeterminate(String),
-    #[error("persona artifact output already exists: {0}")]
+    #[error("artifact output already exists: {0}")]
     AlreadyExists(PathBuf),
 }
 
@@ -72,18 +72,13 @@ pub struct StrictArtifact {
 
 impl StrictArtifact {
     #[must_use]
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    #[must_use]
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
 
     /// Re-read through the retained descriptor and require the original file
     /// identity, length, hash, and bytes to remain exact.
-    pub fn recheck(&self) -> Result<(), PersonaArtifactError> {
+    pub fn recheck(&self) -> Result<(), StrictArtifactError> {
         recheck_parent(&self.parent)?;
         let (retained_bytes, retained_observation) =
             observe_open_file(&self.file, self.maximum, &self.path)?;
@@ -117,12 +112,13 @@ struct FileIdentity {
 
 /// Read a bounded, single-link UTF-8 regular artifact through a retained,
 /// no-follow path walk.  Inputs must be absolute and lexically normalized.
-pub fn read_strict(path: &Path, maximum: usize) -> Result<Vec<u8>, PersonaArtifactError> {
+#[cfg(test)]
+fn read_strict(path: &Path, maximum: usize) -> Result<Vec<u8>, StrictArtifactError> {
     Ok(bind_strict(path, maximum)?.bytes)
 }
 
 /// Bind a strict artifact for an exact identity recheck before later mutation.
-pub fn bind_strict(path: &Path, maximum: usize) -> Result<StrictArtifact, PersonaArtifactError> {
+pub fn bind_strict(path: &Path, maximum: usize) -> Result<StrictArtifact, StrictArtifactError> {
     let parent = bind_parent(path)?;
     recheck_parent(&parent)?;
     let (file, bytes, observation) = observe_regular(&parent.handle, &parent.leaf, maximum, path)?;
@@ -137,62 +133,13 @@ pub fn bind_strict(path: &Path, maximum: usize) -> Result<StrictArtifact, Person
     })
 }
 
-/// Bind a strict leaf below an already-retained, no-follow directory.
-///
-/// Callers which need a multi-file transaction use this to ensure every leaf
-/// is observed beneath one root descriptor, rather than independently walking
-/// public paths that could be swapped between observations. `root_path` is the
-/// canonical public spelling of that retained directory and is used solely for
-/// the diagnostic rewalk performed by [`StrictArtifact::recheck`].
-pub fn bind_strict_at(
-    root: &fs::File,
-    root_path: &Path,
-    leaf: &str,
-    maximum: usize,
-) -> Result<StrictArtifact, PersonaArtifactError> {
-    if !root_path.is_absolute()
-        || root_path
-            .components()
-            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
-        || !safe_leaf(leaf)
-    {
-        return unsafe_state("strict artifact root or leaf is unsafe");
-    }
-    let public = normalize_persona_path(root_path)?;
-    if public != root_path {
-        return unsafe_state("strict artifact root must use canonical alias spelling");
-    }
-    let identity = cap_fs::Metadata::from_file(root)?;
-    if !identity.is_dir() || identity.file_type().is_symlink() {
-        return unsafe_state("strict artifact root is not a real directory");
-    }
-    let parent = BoundParent {
-        handle: root.try_clone()?,
-        identity,
-        public,
-        leaf: leaf.to_owned(),
-    };
-    recheck_parent(&parent)?;
-    let path = parent.public.join(leaf);
-    let (file, bytes, observation) = observe_regular(&parent.handle, leaf, maximum, &path)?;
-    recheck_parent(&parent)?;
-    Ok(StrictArtifact {
-        parent,
-        file,
-        path,
-        maximum,
-        bytes,
-        observation,
-    })
-}
-
 /// Publish canonical bytes once.  The destination is never overwritten and
 /// success is returned only after an exact descriptor-bound readback.
 pub fn publish_create_only(
     path: &Path,
     bytes: &[u8],
     maximum: usize,
-) -> Result<PathBuf, PersonaArtifactError> {
+) -> Result<PathBuf, StrictArtifactError> {
     prepare_create_only(path, bytes, maximum)?.publish()
 }
 
@@ -215,7 +162,7 @@ pub(crate) fn prepare_create_only<'a>(
     path: &Path,
     bytes: &'a [u8],
     maximum: usize,
-) -> Result<PreparedArtifact<'a>, PersonaArtifactError> {
+) -> Result<PreparedArtifact<'a>, StrictArtifactError> {
     if bytes.len() > maximum {
         return unsafe_state("artifact exceeds byte limit");
     }
@@ -243,7 +190,7 @@ pub(crate) fn prepare_create_only<'a>(
 }
 
 impl PreparedArtifact<'_> {
-    pub(crate) fn publish(mut self) -> Result<PathBuf, PersonaArtifactError> {
+    pub(crate) fn publish(mut self) -> Result<PathBuf, StrictArtifactError> {
         recheck_parent(&self.parent)?;
         crate::scale_fixture::rename_noreplace(
             &self.parent.handle,
@@ -258,12 +205,12 @@ impl PreparedArtifact<'_> {
                 cap_fs::FollowSymlinks::No,
             ) {
                 Ok(_) => {
-                    PersonaArtifactError::AlreadyExists(self.parent.public.join(&self.parent.leaf))
+                    StrictArtifactError::AlreadyExists(self.parent.public.join(&self.parent.leaf))
                 }
                 Err(check) if check.kind() == std::io::ErrorKind::NotFound => {
-                    PersonaArtifactError::Indeterminate(error.to_string())
+                    StrictArtifactError::Indeterminate(error.to_string())
                 }
-                Err(_) => PersonaArtifactError::Indeterminate(error.to_string()),
+                Err(_) => StrictArtifactError::Indeterminate(error.to_string()),
             }
         })?;
         self.temp.published = true;
@@ -291,7 +238,7 @@ impl PreparedArtifact<'_> {
             }
             Ok(self.parent.public.join(&self.parent.leaf))
         })();
-        verification.map_err(|error| PersonaArtifactError::Indeterminate(error.to_string()))
+        verification.map_err(|error| StrictArtifactError::Indeterminate(error.to_string()))
     }
 }
 
@@ -305,7 +252,7 @@ struct TempArtifact {
 }
 
 impl TempArtifact {
-    fn create(parent: &BoundParent) -> Result<Self, PersonaArtifactError> {
+    fn create(parent: &BoundParent) -> Result<Self, StrictArtifactError> {
         for _ in 0..32 {
             let name = temporary_name()?;
             let mut options = cap_fs::OpenOptions::new();
@@ -356,7 +303,7 @@ impl Drop for TempArtifact {
     }
 }
 
-fn bind_parent(path: &Path) -> Result<BoundParent, PersonaArtifactError> {
+fn bind_parent(path: &Path) -> Result<BoundParent, StrictArtifactError> {
     if !path.is_absolute()
         || path.as_os_str().is_empty()
         || path
@@ -381,16 +328,16 @@ fn bind_parent(path: &Path) -> Result<BoundParent, PersonaArtifactError> {
     {
         return unsafe_state("path exceeds component bounds");
     }
-    let path = normalize_persona_path(path)?;
+    let path = normalize_artifact_path(path)?;
     let leaf = path
         .file_name()
         .and_then(|name| name.to_str())
         .filter(|name| safe_leaf(name))
-        .ok_or_else(|| PersonaArtifactError::Unsafe("path has an unsafe final component".into()))?
+        .ok_or_else(|| StrictArtifactError::Unsafe("path has an unsafe final component".into()))?
         .to_owned();
     let public = path
         .parent()
-        .ok_or_else(|| PersonaArtifactError::Unsafe("path has no parent directory".into()))?
+        .ok_or_else(|| StrictArtifactError::Unsafe("path has no parent directory".into()))?
         .to_owned();
     let mut components = public.components().peekable();
     let mut root = PathBuf::new();
@@ -429,7 +376,7 @@ fn bind_parent(path: &Path) -> Result<BoundParent, PersonaArtifactError> {
     })
 }
 
-fn recheck_parent(parent: &BoundParent) -> Result<(), PersonaArtifactError> {
+fn recheck_parent(parent: &BoundParent) -> Result<(), StrictArtifactError> {
     let retained = cap_fs::Metadata::from_file(&parent.handle)?;
     // Rewalk every public ancestor without following links.  A plain metadata
     // lookup would follow an ancestor symlink that points back to the retained
@@ -447,14 +394,14 @@ fn recheck_parent(parent: &BoundParent) -> Result<(), PersonaArtifactError> {
     Ok(())
 }
 
-fn absent(parent: &BoundParent) -> Result<(), PersonaArtifactError> {
+fn absent(parent: &BoundParent) -> Result<(), StrictArtifactError> {
     match cap_fs::stat(
         &parent.handle,
         Path::new(&parent.leaf),
         cap_fs::FollowSymlinks::No,
     ) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Ok(_) => Err(PersonaArtifactError::AlreadyExists(
+        Ok(_) => Err(StrictArtifactError::AlreadyExists(
             parent.public.join(&parent.leaf),
         )),
         Err(error) => Err(error.into()),
@@ -466,7 +413,7 @@ fn observe_regular(
     leaf: &str,
     maximum: usize,
     label: &Path,
-) -> Result<(fs::File, Vec<u8>, Observation), PersonaArtifactError> {
+) -> Result<(fs::File, Vec<u8>, Observation), StrictArtifactError> {
     let before = cap_fs::stat(parent, Path::new(leaf), cap_fs::FollowSymlinks::No)?;
     if !regular(&before, maximum) {
         return unsafe_state(format!(
@@ -500,7 +447,7 @@ fn observe_open_file(
     file: &fs::File,
     maximum: usize,
     label: &Path,
-) -> Result<(Vec<u8>, Observation), PersonaArtifactError> {
+) -> Result<(Vec<u8>, Observation), StrictArtifactError> {
     let opened = cap_fs::Metadata::from_file(file)?;
     if !regular(&opened, maximum) {
         return unsafe_state(format!(
@@ -514,7 +461,7 @@ fn observe_open_file(
     let read_limit = u64::try_from(maximum)
         .ok()
         .and_then(|value| value.checked_add(1))
-        .ok_or_else(|| PersonaArtifactError::Unsafe("artifact byte limit is unsupported".into()))?;
+        .ok_or_else(|| StrictArtifactError::Unsafe("artifact byte limit is unsupported".into()))?;
     (&mut reader).take(read_limit).read_to_end(&mut bytes)?;
     let final_metadata = cap_fs::Metadata::from_file(file)?;
     if bytes.len() as u64 != opened.len()
@@ -524,7 +471,7 @@ fn observe_open_file(
         return unsafe_state("retained artifact changed while reading");
     }
     std::str::from_utf8(&bytes)
-        .map_err(|_| PersonaArtifactError::Unsafe("artifact is not UTF-8".into()))?;
+        .map_err(|_| StrictArtifactError::Unsafe("artifact is not UTF-8".into()))?;
     let observation = Observation {
         identity: identity(&opened),
         len: opened.len(),
@@ -545,7 +492,7 @@ fn observe_open_file(
     Ok((bytes, observation))
 }
 
-fn sync_parent(parent: &BoundParent) -> Result<(), PersonaArtifactError> {
+fn sync_parent(parent: &BoundParent) -> Result<(), StrictArtifactError> {
     recheck_parent(parent)?;
 
     #[cfg(unix)]
@@ -572,7 +519,7 @@ fn sync_parent(parent: &BoundParent) -> Result<(), PersonaArtifactError> {
     #[cfg(windows)]
     {
         kio_core::platform::directory_handle_identity(&parent.handle).ok_or_else(|| {
-            PersonaArtifactError::Unsafe(
+            StrictArtifactError::Unsafe(
                 "artifact parent must be a real directory, not a reparse point".into(),
             )
         })?;
@@ -591,10 +538,10 @@ fn safe_leaf(name: &str) -> bool {
     !name.is_empty() && Path::new(name).components().count() == 1 && !name.contains('\0')
 }
 
-fn temporary_name() -> Result<String, PersonaArtifactError> {
+fn temporary_name() -> Result<String, StrictArtifactError> {
     let mut random = [0_u8; 16];
     getrandom::fill(&mut random).map_err(|error| {
-        PersonaArtifactError::Unsafe(format!("secure staging randomness unavailable: {error}"))
+        StrictArtifactError::Unsafe(format!("secure staging randomness unavailable: {error}"))
     })?;
     let name = format!(
         "{TEMP_PREFIX}{}",
@@ -610,7 +557,7 @@ fn temporary_name() -> Result<String, PersonaArtifactError> {
     }
 }
 
-fn validate_publication_parent(parent: &BoundParent) -> Result<(), PersonaArtifactError> {
+fn validate_publication_parent(parent: &BoundParent) -> Result<(), StrictArtifactError> {
     let metadata = cap_fs::Metadata::from_file(&parent.handle)?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return unsafe_state("artifact publication parent is not a real directory");
@@ -644,14 +591,14 @@ fn private_temporary(metadata: &cap_fs::Metadata) -> bool {
     }
 }
 
-/// Canonicalize only the Darwin public aliases used by descriptor-bound persona
+/// Canonicalize only the Darwin public aliases used by descriptor-bound artifact
 /// boundaries.  This is intentionally not filesystem canonicalization: every
 /// caller must still walk components with no-follow descriptors.
 #[cfg(target_os = "macos")]
-pub(crate) fn normalize_persona_path(path: &Path) -> Result<PathBuf, PersonaArtifactError> {
+pub(crate) fn normalize_artifact_path(path: &Path) -> Result<PathBuf, StrictArtifactError> {
     let text = path
         .to_str()
-        .ok_or_else(|| PersonaArtifactError::Unsafe("path is not UTF-8".into()))?;
+        .ok_or_else(|| StrictArtifactError::Unsafe("path is not UTF-8".into()))?;
     if text == "/tmp" || text.starts_with("/tmp/") || text == "/var" || text.starts_with("/var/") {
         Ok(PathBuf::from(format!("/private{text}")))
     } else {
@@ -660,7 +607,7 @@ pub(crate) fn normalize_persona_path(path: &Path) -> Result<PathBuf, PersonaArti
 }
 
 #[cfg(not(target_os = "macos"))]
-pub(crate) fn normalize_persona_path(path: &Path) -> Result<PathBuf, PersonaArtifactError> {
+pub(crate) fn normalize_artifact_path(path: &Path) -> Result<PathBuf, StrictArtifactError> {
     if path.to_str().is_none() {
         unsafe_state("path is not UTF-8")
     } else {
@@ -668,8 +615,8 @@ pub(crate) fn normalize_persona_path(path: &Path) -> Result<PathBuf, PersonaArti
     }
 }
 
-fn unsafe_state<T>(message: impl Into<String>) -> Result<T, PersonaArtifactError> {
-    Err(PersonaArtifactError::Unsafe(message.into()))
+fn unsafe_state<T>(message: impl Into<String>) -> Result<T, StrictArtifactError> {
+    Err(StrictArtifactError::Unsafe(message.into()))
 }
 
 fn links(metadata: &cap_fs::Metadata) -> u64 {
@@ -710,7 +657,7 @@ fn same(left: &cap_fs::Metadata, right: &cap_fs::Metadata) -> bool {
 
 /// Identity alone is insufficient for a retained artifact: chmod/utime can
 /// alter the object without replacement. Require every observable Unix
-/// metadata field the persona boundaries bind, as well as the object identity.
+/// metadata field the artifact boundary binds, as well as the object identity.
 fn same_metadata(left: &cap_fs::Metadata, right: &cap_fs::Metadata) -> bool {
     if !same(left, right) || left.len() != right.len() || links(left) != links(right) {
         return false;

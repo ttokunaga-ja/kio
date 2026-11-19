@@ -100,9 +100,7 @@ exactly 16 lowercase hexadecimal digits; `volume_serial_number` uses exactly 8.
 This preserves every bit through JCS canonicalization, including values above
 2^53. Rust comparisons continue to use the original integer components. Numeric,
 uppercase, signed, or non-fixed-width encodings are rejected; earlier numeric
-records are not migrated or accepted as authority. The current unreleased persona
-materialization record and filesystem attestation also encode `filesystem_device`
-with the same 16-digit string format, preserving their numeric runtime checks.
+records are not migrated or accepted as authority.
 
 An independently initialized nested root is not silently adopted. A moved,
 copied, revoked or inconsistent child is ineligible until an explicit management
