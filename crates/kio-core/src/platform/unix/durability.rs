@@ -16,6 +16,7 @@ use std::path::Path;
 /// reproduced both defects one layer down — the discarded POSIX fsync, and the
 /// permanent Windows no-op. They now call this, so the two arms have exactly
 /// one definition to keep correct.
+#[cfg(test)]
 pub(crate) fn sync_directory(path: &Path) -> std::io::Result<()> {
     File::open(path)?.sync_all()
 }

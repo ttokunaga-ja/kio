@@ -305,8 +305,9 @@ fn assert_recovered_publication(
     let actual_hashes: BTreeMap<_, _> = tree
         .entries
         .iter()
-        .map(|entry| (entry.path.clone(), entry.raw_hash.clone()))
-        .collect();
+        .map(|entry| entry.map(|entry| (entry.path, entry.raw_hash)))
+        .collect::<kio_core::Result<_>>()
+        .map_err(|error| publication_error(error.to_string()))?;
     if tree.entries.len() != expected.len() || actual_hashes != expected_hashes {
         return Err(publication_error(
             "recovered full tree differs from independent fixture hash map",

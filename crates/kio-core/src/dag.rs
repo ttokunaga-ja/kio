@@ -1,6 +1,7 @@
 //! Snapshot DAG object types.
 
 use std::fmt;
+use std::io::{Read, Write};
 use std::path::{Component, Path};
 use std::str::FromStr;
 
@@ -10,7 +11,8 @@ use serde_json::json;
 use crate::cas::{hash_json, is_hash};
 use crate::error::{KioError, Result};
 
-pub const MAX_TREE_ENTRIES: usize = 10_000;
+/// Directory size above this threshold is advisory, never a schema limit.
+pub const TREE_ENTRY_WARNING_THRESHOLD: usize = 10_000;
 /// The only shipped chunking strategy.  Persisted trees bind its exact
 /// configuration hash so a historical publication cannot be interpreted using
 /// a later mutable `config.toml` value.
@@ -163,16 +165,28 @@ pub fn is_materializable_direct_child(path: &str) -> bool {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TreeObject {
     /// Hash of the exact chunking configuration effective while this tree was
     /// constructed. Required with no legacy deserialization default: a tree
     /// without this binding cannot authoritatively select chunk publications.
     pub chunking_config_hash: String,
-    pub entries: Vec<TreeEntry>,
+    pub entries: crate::disk_records::DiskRecords<TreeEntry>,
     pub object_type: String,
 }
 
 impl TreeObject {
+    pub fn find_entry(&self, path: &str) -> Result<Option<TreeEntry>> {
+        for entry in self.entries.iter() {
+            let entry = entry?;
+            match entry.path.as_bytes().cmp(path.as_bytes()) {
+                std::cmp::Ordering::Equal => return Ok(Some(entry)),
+                std::cmp::Ordering::Greater => break,
+                _ => {}
+            }
+        }
+        Ok(None)
+    }
     /// Validate the semantic invariants that serde alone cannot enforce.
     ///
     /// Callers that deserialize persisted tree objects must invoke this before
@@ -188,14 +202,16 @@ impl TreeObject {
             ));
         }
 
-        for entry in &self.entries {
+        let mut previous: Option<String> = None;
+        for entry in self.entries.iter() {
+            let entry = entry?;
             entry.validate()?;
-        }
-
-        for pair in self.entries.windows(2) {
-            match pair[0].path.as_bytes().cmp(pair[1].path.as_bytes()) {
+            let Some(path) = previous.replace(entry.path.clone()) else {
+                continue;
+            };
+            match path.as_bytes().cmp(entry.path.as_bytes()) {
                 std::cmp::Ordering::Equal => {
-                    return Err(KioError::duplicate_path(pair[0].path.clone()));
+                    return Err(KioError::duplicate_path(path));
                 }
                 std::cmp::Ordering::Greater => {
                     return Err(KioError::schema(
@@ -210,7 +226,7 @@ impl TreeObject {
     }
 }
 
-pub fn build_tree(entries: Vec<TreeEntry>) -> Result<TreeObject> {
+pub fn build_tree(entries: impl IntoIterator<Item = TreeEntry>) -> Result<TreeObject> {
     let config_hash = chunking_config_hash(DEFAULT_CHUNKING_STRATEGY, DEFAULT_CHUNKING_MAX_CHARS)?;
     build_tree_with_chunking_config(entries, config_hash)
 }
@@ -219,24 +235,115 @@ pub fn build_tree(entries: Vec<TreeEntry>) -> Result<TreeObject> {
 /// The builder validates it before serialization so no mutable configuration
 /// lookup can be substituted after the tree has been constructed.
 pub fn build_tree_with_chunking_config(
-    mut entries: Vec<TreeEntry>,
+    entries: impl IntoIterator<Item = TreeEntry>,
     chunking_config_hash: String,
 ) -> Result<TreeObject> {
-    for entry in &entries {
-        entry.validate_materialization_path()?;
+    let mut builder = TreeBuilder::new(chunking_config_hash);
+    for entry in entries {
+        builder.push(entry)?;
     }
-    entries.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
-    let tree = TreeObject {
-        chunking_config_hash,
-        entries,
-        object_type: "tree".to_owned(),
-    };
-    tree.validate()?;
-    Ok(tree)
+    builder.finish()
+}
+
+pub struct TreeBuilder {
+    config: String,
+    sorter: crate::disk_records::RecordSorter<TreeEntry>,
+}
+impl TreeBuilder {
+    pub fn new(config: String) -> Self {
+        Self {
+            config,
+            sorter: crate::disk_records::RecordSorter::new(|a, b| {
+                a.path.as_bytes().cmp(b.path.as_bytes())
+            }),
+        }
+    }
+    pub fn push(&mut self, entry: TreeEntry) -> Result<()> {
+        entry.validate_materialization_path()?;
+        self.sorter.push(entry)
+    }
+    pub fn peak_buffered_entries(&self) -> usize {
+        self.sorter.peak_buffered_records()
+    }
+    pub fn finish(self) -> Result<TreeObject> {
+        let tree = TreeObject {
+            chunking_config_hash: self.config,
+            entries: self.sorter.finish()?,
+            object_type: "tree".into(),
+        };
+        tree.validate()?;
+        Ok(tree)
+    }
+}
+
+/// Canonical tree bytes, generated one entry at a time. JCS buffers an entire
+/// object before sorting its keys, so serializing the outer tree with JCS would
+/// retain the whole entries array. The three outer keys below are already in
+/// canonical order; JCS is used only for the individual bounded metadata entry.
+pub(crate) struct TreeJsonReader<'a> {
+    entries: crate::disk_records::RecordIter<TreeEntry>,
+    _tree: std::marker::PhantomData<&'a TreeObject>,
+    buffer: std::io::Cursor<Vec<u8>>,
+    first: bool,
+    finished: bool,
+}
+
+impl<'a> TreeJsonReader<'a> {
+    pub(crate) fn new(tree: &'a TreeObject) -> Result<Self> {
+        tree.validate()?;
+        let mut prefix = b"{\"chunking_config_hash\":".to_vec();
+        serde_json::to_writer(&mut prefix, &tree.chunking_config_hash)
+            .map_err(|e| KioError::schema(e.to_string()))?;
+        prefix.extend_from_slice(b",\"entries\":[");
+        Ok(Self {
+            entries: tree.entries.iter(),
+            _tree: std::marker::PhantomData,
+            buffer: std::io::Cursor::new(prefix),
+            first: true,
+            finished: false,
+        })
+    }
+}
+
+impl Read for TreeJsonReader<'_> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let count = self.buffer.read(output)?;
+            if count != 0 || self.finished {
+                return Ok(count);
+            }
+            let mut next = Vec::new();
+            if let Some(entry) = self.entries.next() {
+                let entry = entry.map_err(std::io::Error::other)?;
+                if !self.first {
+                    next.push(b',');
+                }
+                self.first = false;
+                serde_jcs::to_writer(&mut next, &entry).map_err(std::io::Error::other)?;
+            } else {
+                next.extend_from_slice(b"],\"object_type\":\"tree\"}");
+                self.finished = true;
+            }
+            self.buffer = std::io::Cursor::new(next);
+        }
+    }
+}
+
+/// Stream canonical bytes into a caller-owned sink without an object-sized buffer.
+pub fn write_tree_json(tree: &TreeObject, writer: &mut impl Write) -> Result<u64> {
+    std::io::copy(&mut TreeJsonReader::new(tree)?, writer)
+        .map_err(|error| crate::cas::stream_error(error, Path::new("tree JSON")))
+}
+
+pub fn tree_json_size(tree: &TreeObject) -> Result<u64> {
+    write_tree_json(tree, &mut std::io::sink())
 }
 
 pub fn tree_hash(tree: &TreeObject) -> Result<String> {
-    hash_json(&serde_json::to_value(tree).map_err(|err| KioError::schema(err.to_string()))?)
+    crate::cas::hash_stream(&mut TreeJsonReader::new(tree)?).map(|(hash, _)| hash)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -944,10 +1051,11 @@ mod tests {
                 DEFAULT_CHUNKING_MAX_CHARS,
             )
             .unwrap(),
-            entries: vec![
+            entries: crate::disk_records::DiskRecords::from_records(vec![
                 valid_entry("z.txt", OTHER_RAW_HASH),
                 valid_entry("a.txt", RAW_HASH),
-            ],
+            ])
+            .unwrap(),
             object_type: "tree".to_owned(),
         };
         assert_eq!(
@@ -961,10 +1069,11 @@ mod tests {
                 DEFAULT_CHUNKING_MAX_CHARS,
             )
             .unwrap(),
-            entries: vec![
+            entries: crate::disk_records::DiskRecords::from_records(vec![
                 valid_entry("same.txt", RAW_HASH),
                 valid_entry("same.txt", OTHER_RAW_HASH),
-            ],
+            ])
+            .unwrap(),
             object_type: "tree".to_owned(),
         };
         assert_eq!(
@@ -977,7 +1086,7 @@ mod tests {
             valid_entry("a.txt", RAW_HASH),
         ])
         .unwrap();
-        assert_eq!(sorted.entries[0].path, "a.txt");
+        assert_eq!(sorted.entries.get(0).unwrap().unwrap().path, "a.txt");
         assert!(sorted.validate().is_ok());
     }
 
@@ -993,7 +1102,7 @@ mod tests {
 
         let malformed = TreeObject {
             chunking_config_hash: "sha256:not-a-canonical-hash".to_owned(),
-            entries: Vec::new(),
+            entries: crate::disk_records::DiskRecords::from_records(Vec::new()).unwrap(),
             object_type: "tree".to_owned(),
         };
         assert_eq!(

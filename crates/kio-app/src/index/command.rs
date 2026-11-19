@@ -1699,15 +1699,20 @@ fn current_dispositions(repo: &Repository) -> Result<Vec<UnsupportedInputDisposi
     };
     let commit = repo.read_commit(&head)?;
     let tree = repo.read_tree(&commit.tree)?;
-    let live = tree
-        .entries
+    let mut pending = dispositions
         .into_iter()
-        .map(|entry| (entry.path, entry.raw_hash))
+        .map(|disposition| (disposition.path.clone(), disposition))
         .collect::<BTreeMap<_, _>>();
-    Ok(dispositions
-        .into_iter()
-        .filter(|disposition| live.get(&disposition.path) == Some(&disposition.raw_hash))
-        .collect())
+    let mut live = Vec::new();
+    for entry in &tree.entries {
+        let entry = entry?;
+        if let Some(disposition) = pending.remove(&entry.path)
+            && disposition.raw_hash == entry.raw_hash
+        {
+            live.push(disposition);
+        }
+    }
+    Ok(live)
 }
 
 pub(crate) fn record_unsupported_if_changed(
@@ -1840,6 +1845,7 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
     // generation. A post-barrier reindex must not partially republish derived
     // state for entries encountered before the purged target.
     for entry in &tree.entries {
+        let entry = entry?;
         ensure_raw_ingest_allowed(&repo, &entry.raw_hash)?;
     }
     let mut normalize_by_path = BTreeMap::new();
@@ -1853,6 +1859,7 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
     // gen's cached chunks) and is recorded; healthy documents still re-normalize.
     let mut reindex_skipped = Vec::<SkippedUnit>::new();
     for entry in &tree.entries {
+        let entry = entry?;
         let Some(normalize) = &entry.normalize else {
             continue;
         };

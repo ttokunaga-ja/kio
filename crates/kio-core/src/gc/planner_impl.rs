@@ -330,30 +330,34 @@ impl GcPlanner {
         let b = open_path(&self.kio, "objects/trees")?;
         let a = open_required_dir(&b, &raw[..2], "tree object fanout is missing")?;
         let d = open_required_dir(&a, &raw[2..4], "tree object fanout is missing")?;
-        let x = read_required_accounted_observed(
-            &self.reads,
-            (&d, raw, MAX_TREE_OBJECT_BYTES),
-            "tree object is missing",
-            s,
-            &self.limits,
-            observations,
-            &format!("tree/{}/{}/{}", &raw[..2], &raw[2..4], raw),
-        )?;
-        if hash_bytes(&x) != h {
+        let remaining = self
+            .limits
+            .max_verified_bytes
+            .saturating_sub(s.verified_bytes);
+        let (t, observation) =
+            read_cas_tree_observed(&self.reads, &d, raw, remaining).map_err(|error| {
+                if is_io_not_found(&error) {
+                    corrupt("tree object is missing")
+                } else {
+                    error
+                }
+            })?;
+        if observation.digest != h {
             return Err(corrupt("tree hash mismatch"));
         }
-        let t: TreeObject =
-            serde_json::from_slice(&x).map_err(|_| corrupt("invalid tree object"))?;
-        if t.entries.len() > MAX_TREE_ENTRIES {
-            return Err(corrupt("tree entry limit exceeded"));
-        }
-        t.validate().map_err(|_| corrupt("invalid tree object"))?;
+        let size = observation.state.len;
+        account(s, size, &self.limits)?;
+        insert_observation(
+            observations,
+            format!("tree/{}/{}/{}", &raw[..2], &raw[2..4], raw),
+            observation,
+        )?;
         s.trees_verified = checked(s.trees_verified, 1, "trees")?;
         s.tree_entries = checked(s.tree_entries, t.entries.len() as u64, "tree entries")?;
         if s.tree_entries > self.limits.max_tree_entries {
             return Err(limit("tree entries"));
         }
-        Ok(x.len() as u64)
+        Ok(size)
     }
 
     /// Outside an active, strictly validated operation marker, a receipt must
@@ -388,12 +392,7 @@ impl GcPlanner {
                     None => None,
                 };
                 match second.as_ref() {
-                    Some(dir) => match read_cas_regular_observed(
-                        &self.reads,
-                        dir,
-                        raw,
-                        MAX_TREE_OBJECT_BYTES,
-                    ) {
+                    Some(dir) => match observe_cas_regular(&self.reads, dir, raw, u64::MAX) {
                         Ok(_) => true,
                         Err(error) if is_io_not_found(&error) => false,
                         Err(error) => return Err(error),

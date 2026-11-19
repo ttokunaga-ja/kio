@@ -7,11 +7,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::ExitCode;
 use crate::cas::{ObjectKind, ObjectStore, StoredObject};
-use crate::dag::{CommitObject, MAX_TREE_ENTRIES, NormalizeRef, TreeEntry, TreeObject};
+use crate::dag::{CommitObject, NormalizeRef, TreeEntry, TreeObject};
 use crate::error::{KioError, Result};
 
 pub const DEFAULT_MAX_HISTORY_COMMITS: u64 = 100_000;
@@ -58,7 +59,7 @@ pub struct HistoryStats {
 /// The immutable tree identity used to join a persisted tree entry to indexed
 /// chunks. `normalize = None` is an exact value and is never supplemented from a
 /// later commit or mutable cache.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct TreeBinding {
     pub path: String,
     pub raw_hash: String,
@@ -76,7 +77,7 @@ impl From<&TreeEntry> for TreeBinding {
 }
 
 /// One exact binding appearance, including the commit and tree that attest it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryBinding {
     pub commit_hash: String,
     pub tree_hash: String,
@@ -101,16 +102,17 @@ impl HistoryNode {
         }
     }
 
-    fn entry(&self, path: &str) -> Option<&TreeEntry> {
-        self.tree
-            .entries
-            .binary_search_by(|entry| entry.path.as_bytes().cmp(path.as_bytes()))
-            .ok()
-            .map(|index| &self.tree.entries[index])
+    fn entry(&self, path: &str) -> Result<Option<TreeEntry>> {
+        self.tree.find_entry(path)
     }
 
-    fn contains_binding(&self, binding: &TreeBinding) -> bool {
-        self.entry(&binding.path).map(TreeBinding::from).as_ref() == Some(binding)
+    fn contains_binding(&self, binding: &TreeBinding) -> Result<bool> {
+        Ok(self
+            .entry(&binding.path)?
+            .as_ref()
+            .map(TreeBinding::from)
+            .as_ref()
+            == Some(binding))
     }
 }
 
@@ -148,20 +150,14 @@ impl LinearHistory {
     }
 
     /// Every binding appearance, sorted by exact identity and then commit hash.
-    #[must_use]
-    pub fn bindings(&self) -> Vec<HistoryBinding> {
-        let mut bindings = self
-            .nodes
-            .values()
-            .flat_map(|node| {
-                node.tree
-                    .entries
-                    .iter()
-                    .map(move |entry| node.binding(entry))
-            })
-            .collect::<Vec<_>>();
-        sort_bindings(&mut bindings);
-        bindings
+    pub fn bindings(&self) -> Result<crate::disk_records::DiskRecords<HistoryBinding>> {
+        let mut bindings = crate::disk_records::RecordSorter::new(compare_bindings);
+        for node in self.nodes.values() {
+            for entry in node.tree.entries.iter() {
+                bindings.push(node.binding(&entry?))?;
+            }
+        }
+        bindings.finish()
     }
 
     /// Test reachability within the complete graph. A commit is its own ancestor.
@@ -189,96 +185,105 @@ impl LinearHistory {
     }
 
     /// The earliest linear commit where `binding` appears.
-    #[must_use]
-    pub fn introduction_candidates(&self, binding: &TreeBinding) -> Vec<HistoryBinding> {
-        let mut candidates = self
-            .nodes
-            .values()
-            .filter(|node| {
-                node.contains_binding(binding)
-                    && node.commit.parent.as_deref().is_none_or(|parent| {
-                        self.nodes
-                            .get(parent)
-                            .is_none_or(|parent_node| !parent_node.contains_binding(binding))
-                    })
-            })
-            .filter_map(|node| node.entry(&binding.path).map(|entry| node.binding(entry)))
-            .collect::<Vec<_>>();
+    pub fn introduction_candidates(&self, binding: &TreeBinding) -> Result<Vec<HistoryBinding>> {
+        let mut candidates = Vec::new();
+        for node in self.nodes.values() {
+            if !node.contains_binding(binding)? {
+                continue;
+            }
+            let parent_has = match node
+                .commit
+                .parent
+                .as_deref()
+                .and_then(|h| self.nodes.get(h))
+            {
+                Some(parent) => parent.contains_binding(binding)?,
+                None => false,
+            };
+            if !parent_has && let Some(entry) = node.entry(&binding.path)? {
+                candidates.push(node.binding(&entry));
+            }
+        }
         candidates.sort_by(|a, b| a.commit_hash.as_bytes().cmp(b.commit_hash.as_bytes()));
-        candidates
+        Ok(candidates)
     }
 
-    /// The unique earliest introduction in a linear history.
-    #[must_use]
-    pub fn ancestor_most_introductions(&self, binding: &TreeBinding) -> Vec<HistoryBinding> {
-        // `visit_order` is newest-first. The oldest matching introduction is
-        // the first one encountered from its reverse, irrespective of how its
-        // content-addressed commit hash happens to sort.
-        self.visit_order
+    pub fn ancestor_most_introductions(
+        &self,
+        binding: &TreeBinding,
+    ) -> Result<Vec<HistoryBinding>> {
+        for node in self
+            .visit_order
             .iter()
             .rev()
-            .filter_map(|hash| self.nodes.get(hash))
-            .find_map(|node| {
-                (node.contains_binding(binding)
-                    && node.commit.parent.as_deref().is_none_or(|parent| {
-                        self.nodes
-                            .get(parent)
-                            .is_none_or(|parent_node| !parent_node.contains_binding(binding))
-                    }))
-                .then(|| node.entry(&binding.path).map(|entry| node.binding(entry)))
-                .flatten()
-            })
-            .into_iter()
-            .collect()
+            .filter_map(|h| self.nodes.get(h))
+        {
+            if !node.contains_binding(binding)? {
+                continue;
+            }
+            let parent_has = match node
+                .commit
+                .parent
+                .as_deref()
+                .and_then(|h| self.nodes.get(h))
+            {
+                Some(parent) => parent.contains_binding(binding)?,
+                None => false,
+            };
+            if !parent_has && let Some(entry) = node.entry(&binding.path)? {
+                return Ok(vec![node.binding(&entry)]);
+            }
+        }
+        Ok(Vec::new())
     }
 
-    /// Canonical introduction in the unique linear ancestry.
-    #[must_use]
-    pub fn canonical_introduction(&self, binding: &TreeBinding) -> Option<HistoryBinding> {
-        self.ancestor_most_introductions(binding).into_iter().next()
+    pub fn canonical_introduction(&self, binding: &TreeBinding) -> Result<Option<HistoryBinding>> {
+        Ok(self
+            .ancestor_most_introductions(binding)?
+            .into_iter()
+            .next())
     }
 
-    /// Distinct snapshot paths carrying `raw_hash`, in UTF-8 byte order.
-    #[must_use]
-    pub fn snapshot_paths_for_raw(&self, raw_hash: &str) -> Vec<String> {
-        self.nodes
-            .get(&self.start_commit)
-            .into_iter()
-            .flat_map(|node| node.tree.entries.iter())
-            .filter(|entry| entry.raw_hash == raw_hash)
-            .map(|entry| entry.path.clone())
-            .collect()
-    }
-    /// The newest exact persisted binding for `path`.
-    #[must_use]
-    pub fn newest_binding_for_path(&self, path: &str) -> Option<HistoryBinding> {
-        self.nodes_in_visit_order()
-            .find_map(|node| node.entry(path).map(|entry| node.binding(entry)))
-    }
-
-    /// For every path absent from the snapshot tree, return its newest exact
-    /// linear-ancestry binding. Results are sorted by path bytes. A binding whose
-    /// normalize reference is absent remains present here with `normalize=None`;
-    /// downstream chunk projection must treat it as ineligible.
-    #[must_use]
-    pub fn final_deleted_bindings(&self) -> Vec<HistoryBinding> {
-        let live_paths = self
-            .nodes
-            .get(&self.start_commit)
-            .into_iter()
-            .flat_map(|node| node.tree.entries.iter().map(|entry| entry.path.as_str()))
-            .collect::<BTreeSet<_>>();
-        let mut newest_by_path = BTreeMap::new();
-        for node in self.nodes_in_visit_order() {
-            for entry in &node.tree.entries {
-                if !live_paths.contains(entry.path.as_str()) {
-                    newest_by_path
-                        .entry(entry.path.clone())
-                        .or_insert_with(|| node.binding(entry));
+    pub fn snapshot_paths_for_raw(&self, raw_hash: &str) -> Result<Vec<String>> {
+        let mut paths = Vec::new();
+        if let Some(node) = self.nodes.get(&self.start_commit) {
+            for entry in node.tree.entries.iter() {
+                let entry = entry?;
+                if entry.raw_hash == raw_hash {
+                    paths.push(entry.path);
                 }
             }
         }
-        newest_by_path.into_values().collect()
+        Ok(paths)
+    }
+    pub fn newest_binding_for_path(&self, path: &str) -> Result<Option<HistoryBinding>> {
+        for node in self.nodes_in_visit_order() {
+            if let Some(entry) = node.entry(path)? {
+                return Ok(Some(node.binding(&entry)));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn final_deleted_bindings(&self) -> Result<Vec<HistoryBinding>> {
+        let mut live_paths = BTreeSet::new();
+        if let Some(node) = self.nodes.get(&self.start_commit) {
+            for entry in node.tree.entries.iter() {
+                live_paths.insert(entry?.path);
+            }
+        }
+        let mut newest_by_path = BTreeMap::new();
+        for node in self.nodes_in_visit_order() {
+            for entry in node.tree.entries.iter() {
+                let entry = entry?;
+                if !live_paths.contains(&entry.path) {
+                    newest_by_path
+                        .entry(entry.path.clone())
+                        .or_insert_with(|| node.binding(&entry));
+                }
+            }
+        }
+        Ok(newest_by_path.into_values().collect())
     }
 }
 
@@ -553,8 +558,20 @@ impl HistoryReader {
         }
         let commit = decode_commit(commit_object)?;
 
-        let tree_object = self.read_required(ObjectKind::Tree, &commit.tree, commit_hash)?;
-        let tree_bytes = tree_object.bytes.len() as u64;
+        let (tree, tree_bytes) =
+            match self.read_history_tree(&commit.tree, stats, after_commit_bytes) {
+                Ok(value) => value,
+                Err(error) if error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => {
+                    self.gc_session()?
+                        .validate_final_shallow_tree(commit_hash, &commit.tree)?;
+                    return Err(history_shallow_error(
+                        commit_hash,
+                        ObjectKind::Tree,
+                        &commit.tree,
+                    ));
+                }
+                Err(error) => return Err(error),
+            };
         let next_verified_bytes = checked_total(after_commit_bytes, tree_bytes);
         if next_verified_bytes > self.limits.max_verified_bytes {
             return Err(history_limit_error(
@@ -564,7 +581,6 @@ impl HistoryReader {
                 next_verified_bytes,
             ));
         }
-        let tree = decode_tree(tree_object)?;
         let next_tree_entries = checked_total(stats.tree_entries, tree.entries.len() as u64);
         if next_tree_entries > self.limits.max_tree_entries {
             return Err(history_limit_error(
@@ -589,6 +605,35 @@ impl HistoryReader {
                 verified_bytes: next_verified_bytes,
             },
         ))
+    }
+
+    fn read_history_tree(
+        &self,
+        hash: &str,
+        stats: HistoryStats,
+        after_commit_bytes: u64,
+    ) -> Result<(TreeObject, u64)> {
+        let remaining = self
+            .limits
+            .max_verified_bytes
+            .saturating_sub(after_commit_bytes);
+        self.store
+            .read_tree_accounted_with_limit(hash, remaining)
+            .map_err(|failure| {
+                if failure.error.error_code() == "KIO-E-STORE-OBJECT-OVERSIZED-001" {
+                    let observed = failure.error.context()["actual_bytes"]
+                        .as_u64()
+                        .unwrap_or(remaining.saturating_add(1));
+                    history_limit_error(
+                        "verified_bytes",
+                        stats,
+                        self.limits,
+                        after_commit_bytes.saturating_add(observed),
+                    )
+                } else {
+                    failure.error
+                }
+            })
     }
 
     fn read_required(
@@ -645,36 +690,36 @@ impl HistoryReader {
         }
         let commit = decode_commit(commit_object)?;
 
-        let tree_object = match self.store.read_object(ObjectKind::Tree, &commit.tree) {
-            Ok(object) => object,
-            Err(error) if error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => {
-                if _allowed_shallow.get(commit_hash) != Some(&commit.tree) {
-                    return Err(KioError::new(
-                        "KIO-E-STORE-CORRUPT-001",
-                        "missing commit tree has no canonical shallow receipt",
-                        json!({"commit_hash": commit_hash, "tree_hash": commit.tree}),
-                        ExitCode::PermanentFailure,
-                    ));
+        let (tree, tree_bytes) =
+            match self.read_history_tree(&commit.tree, stats, after_commit_bytes) {
+                Ok(object) => object,
+                Err(error) if error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => {
+                    if _allowed_shallow.get(commit_hash) != Some(&commit.tree) {
+                        return Err(KioError::new(
+                            "KIO-E-STORE-CORRUPT-001",
+                            "missing commit tree has no canonical shallow receipt",
+                            json!({"commit_hash": commit_hash, "tree_hash": commit.tree}),
+                            ExitCode::PermanentFailure,
+                        ));
+                    }
+                    if is_start {
+                        return Err(history_shallow_error(
+                            commit_hash,
+                            ObjectKind::Tree,
+                            &commit.tree,
+                        ));
+                    }
+                    return Ok(TolerantNodeOutcome::ShallowSkipped {
+                        parent: commit.parent,
+                        stats: HistoryStats {
+                            commits: next_commit_count,
+                            tree_entries: stats.tree_entries,
+                            verified_bytes: after_commit_bytes,
+                        },
+                    });
                 }
-                if is_start {
-                    return Err(history_shallow_error(
-                        commit_hash,
-                        ObjectKind::Tree,
-                        &commit.tree,
-                    ));
-                }
-                return Ok(TolerantNodeOutcome::ShallowSkipped {
-                    parent: commit.parent,
-                    stats: HistoryStats {
-                        commits: next_commit_count,
-                        tree_entries: stats.tree_entries,
-                        verified_bytes: after_commit_bytes,
-                    },
-                });
-            }
-            Err(error) => return Err(error),
-        };
-        let tree_bytes = tree_object.bytes.len() as u64;
+                Err(error) => return Err(error),
+            };
         let next_verified_bytes = checked_total(after_commit_bytes, tree_bytes);
         if next_verified_bytes > self.limits.max_verified_bytes {
             return Err(history_limit_error(
@@ -684,7 +729,6 @@ impl HistoryReader {
                 next_verified_bytes,
             ));
         }
-        let tree = decode_tree(tree_object)?;
         let next_tree_entries = checked_total(stats.tree_entries, tree.entries.len() as u64);
         if next_tree_entries > self.limits.max_tree_entries {
             return Err(history_limit_error(
@@ -751,18 +795,6 @@ fn decode_commit(object: StoredObject) -> Result<CommitObject> {
         .map_err(|error| KioError::schema(error.to_string()))?;
     commit.validate()?;
     Ok(commit)
-}
-
-fn decode_tree(object: StoredObject) -> Result<TreeObject> {
-    let tree: TreeObject = serde_json::from_slice(&object.bytes)
-        .map_err(|error| KioError::schema(error.to_string()))?;
-    if tree.entries.len() > MAX_TREE_ENTRIES {
-        return Err(KioError::schema(format!(
-            "tree entries exceed the limit of {MAX_TREE_ENTRIES}"
-        )));
-    }
-    tree.validate()?;
-    Ok(tree)
 }
 
 fn parent_edges_from_nodes(
@@ -893,13 +925,11 @@ fn ensure_acyclic_edges(edges: &BTreeMap<String, Option<String>>) -> Result<()> 
     Ok(())
 }
 
-fn sort_bindings(bindings: &mut [HistoryBinding]) {
-    bindings.sort_by(|a, b| {
-        a.binding
-            .cmp(&b.binding)
-            .then_with(|| a.commit_hash.as_bytes().cmp(b.commit_hash.as_bytes()))
-            .then_with(|| a.tree_hash.as_bytes().cmp(b.tree_hash.as_bytes()))
-    });
+fn compare_bindings(a: &HistoryBinding, b: &HistoryBinding) -> std::cmp::Ordering {
+    a.binding
+        .cmp(&b.binding)
+        .then_with(|| a.commit_hash.as_bytes().cmp(b.commit_hash.as_bytes()))
+        .then_with(|| a.tree_hash.as_bytes().cmp(b.tree_hash.as_bytes()))
 }
 
 fn checked_total(current: u64, increment: u64) -> u64 {
@@ -1088,10 +1118,9 @@ mod tests {
             .len() as u64;
         let tree_bytes = fixture
             .store
-            .read_object(ObjectKind::Tree, &tree)
+            .inspect_object(ObjectKind::Tree, &tree)
             .unwrap()
-            .bytes
-            .len() as u64;
+            .size_bytes;
         let expected = commit_bytes + tree_bytes;
         let owner = crate::cas::VerifiedCasReadBudget::new();
         let (snapshot, consumed) = owner
@@ -1140,6 +1169,29 @@ mod tests {
     }
 
     #[test]
+    fn bindings_are_disk_backed_and_sorted_across_commits() {
+        let fixture = Fixture::new();
+        let entries = (0..1200)
+            .rev()
+            .map(|i| entry(&format!("file-{i:04}"), b"same", None))
+            .collect();
+        let tree = fixture.tree(entries);
+        let root = fixture.commit("root", &tree, Vec::new());
+        let head = fixture.commit("head", &tree, vec![root.clone()]);
+        let graph = HistoryReader::new(&fixture.kio_dir).walk(&head).unwrap();
+        let records: crate::disk_records::DiskRecords<super::HistoryBinding> =
+            graph.bindings().unwrap();
+        assert_eq!(records.len(), 2400);
+        let mut commits = [root, head];
+        commits.sort();
+        for (i, record) in records.iter().enumerate() {
+            let record = record.unwrap();
+            assert_eq!(record.binding.path, format!("file-{:04}", i / 2));
+            assert_eq!(record.commit_hash, commits[i % 2]);
+        }
+    }
+
+    #[test]
     fn linear_history_has_one_earliest_introduction() {
         let fixture = Fixture::new();
         let empty = fixture.tree(Vec::new());
@@ -1154,7 +1206,7 @@ mod tests {
             raw_hash: hash_bytes(b"x"),
             normalize: Some(profile()),
         };
-        let candidates = graph.introduction_candidates(&binding);
+        let candidates = graph.introduction_candidates(&binding).unwrap();
         let expected = vec![first.as_str()];
         assert_eq!(
             candidates
@@ -1163,9 +1215,16 @@ mod tests {
                 .collect::<Vec<_>>(),
             expected
         );
-        assert_eq!(graph.ancestor_most_introductions(&binding), candidates);
         assert_eq!(
-            graph.canonical_introduction(&binding).unwrap().commit_hash,
+            graph.ancestor_most_introductions(&binding).unwrap(),
+            candidates
+        );
+        assert_eq!(
+            graph
+                .canonical_introduction(&binding)
+                .unwrap()
+                .unwrap()
+                .commit_hash,
             first
         );
     }
@@ -1185,7 +1244,7 @@ mod tests {
             raw_hash: hash_bytes(b"side"),
             normalize: Some(profile()),
         };
-        let historical = graph.canonical_introduction(&binding).unwrap();
+        let historical = graph.canonical_introduction(&binding).unwrap().unwrap();
         assert_eq!(historical.commit_hash, side);
         assert_eq!(historical.binding.path, "side.md");
     }
@@ -1237,8 +1296,8 @@ mod tests {
             raw_hash: hash_bytes(b"x"),
             normalize: Some(profile()),
         };
-        assert_eq!(graph.introduction_candidates(&binding).len(), 2);
-        let ancestor_most = graph.ancestor_most_introductions(&binding);
+        assert_eq!(graph.introduction_candidates(&binding).unwrap().len(), 2);
+        let ancestor_most = graph.ancestor_most_introductions(&binding).unwrap();
         assert_eq!(ancestor_most.len(), 1);
         assert_eq!(ancestor_most[0].commit_hash, root);
     }
@@ -1282,6 +1341,7 @@ mod tests {
             history
                 .canonical_introduction(&binding)
                 .unwrap()
+                .unwrap()
                 .commit_hash,
             first
         );
@@ -1296,14 +1356,15 @@ mod tests {
         let head = fixture.commit("head", &current, vec![root.clone()]);
 
         let history = HistoryReader::new(&fixture.kio_dir).walk(&head).unwrap();
-        let newest = history.newest_binding_for_path("old.md").unwrap();
+        let newest = history.newest_binding_for_path("old.md").unwrap().unwrap();
         assert_eq!(newest.commit_hash, root);
         assert_eq!(newest.binding.normalize, None);
-        let deleted = history.final_deleted_bindings();
+        let deleted = history.final_deleted_bindings().unwrap();
         assert_eq!(deleted, vec![newest]);
         assert!(
             history
                 .final_deleted_bindings()
+                .unwrap()
                 .iter()
                 .all(|binding| binding.binding.path != "live.md")
         );
@@ -1317,6 +1378,7 @@ mod tests {
         assert_eq!(
             graph
                 .canonical_introduction(&binding)
+                .unwrap()
                 .unwrap()
                 .binding
                 .normalize,
@@ -1520,7 +1582,11 @@ mod tests {
             normalize: Some(profile()),
         };
         assert_eq!(
-            graph.canonical_introduction(&binding).unwrap().commit_hash,
+            graph
+                .canonical_introduction(&binding)
+                .unwrap()
+                .unwrap()
+                .commit_hash,
             root
         );
     }

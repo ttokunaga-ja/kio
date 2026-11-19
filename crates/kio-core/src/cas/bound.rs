@@ -14,7 +14,8 @@ pub(crate) fn fail_next_raw_write() {
 
 use super::*;
 
-struct RawStageDirectories {
+#[derive(Debug, Clone)]
+pub(super) struct RawStageDirectories {
     stages: crate::store_dir::StoreDirectory,
     journals: Option<crate::store_dir::StoreDirectory>,
 }
@@ -97,7 +98,33 @@ impl BoundObjectDirs {
         let Some(stages) = open("raw-stages")? else {
             return Ok(None);
         };
-        Ok(Some(RawStageDirectories { stages, journals }))
+        let fresh = RawStageDirectories { stages, journals };
+        if let Some(fresh_journals) = &fresh.journals {
+            let mut cached = self
+                .stage_directories
+                .lock()
+                .map_err(|_| bound_stage_corrupt("stage directories lock poisoned"))?;
+            if let Some(retained) = cached.as_ref() {
+                if !same_bound_directory(
+                    &retained.stages.root_handle(),
+                    &fresh.stages.root_handle(),
+                )? || !same_bound_directory(
+                    &retained
+                        .journals
+                        .as_ref()
+                        .expect("cached journals")
+                        .root_handle(),
+                    &fresh_journals.root_handle(),
+                )? {
+                    return Err(bound_stage_corrupt(
+                        "stage directory replaced during ingest",
+                    ));
+                }
+                return Ok(Some(retained.clone()));
+            }
+            *cached = Some(fresh.clone());
+        }
+        Ok(Some(fresh))
     }
 
     pub(super) fn inspect_raw_stages(
@@ -178,7 +205,31 @@ impl BoundObjectDirs {
                 });
             }
         }
+        residues.extend(crate::disk_records::inspect_stage_residues()?);
         Ok(residues)
+    }
+
+    pub(super) fn reopen_saved_stage(&self, saved: &SavedRawStage) -> Result<BoundRawStage> {
+        // A record is private, but still validate its leaf before any access.
+        if !saved.name.starts_with("raw-") || saved.name.contains('/') || saved.name.contains('\\')
+        {
+            return Err(bound_stage_corrupt("invalid saved stage name"));
+        }
+        let dirs = self
+            .raw_stage_directories(false)?
+            .ok_or_else(|| bound_stage_corrupt("missing stage directory"))?;
+        Ok(BoundRawStage {
+            parent: Arc::clone(&self.raw),
+            directory: dirs.stages,
+            journals: dirs
+                .journals
+                .ok_or_else(|| bound_stage_corrupt("missing stage journals"))?,
+            name: saved.name.clone(),
+            writer: None,
+            identity: saved.identity.clone(),
+            raw_hash: saved.raw_hash.clone(),
+            size_bytes: saved.size_bytes,
+        })
     }
 
     pub(super) fn stage_raw_from_reader<R: Read>(
@@ -231,7 +282,7 @@ impl BoundObjectDirs {
                 .min(buffer.len() as u64) as usize;
             let count = reader
                 .read(&mut buffer[..cap])
-                .kio_io(Path::new(&stage.name))?;
+                .map_err(|error| stream_error(error, Path::new(&stage.name)))?;
             if count == 0 {
                 break;
             }
@@ -266,23 +317,33 @@ impl BoundObjectDirs {
             }
         }
         stage.writer.as_ref().expect("live stage").sync()?;
+        // Keep the durable identity, not one open handle per input file.
+        drop(stage.writer.take());
         stage.raw_hash = format!("sha256:{}", lower_hex(&hasher.finalize()));
         Ok(stage)
     }
 
-    pub(super) fn publish_raw_stage(&self, mut stage: BoundRawStage) -> Result<(String, u64)> {
+    pub(super) fn publish_raw_stage(&self, stage: BoundRawStage) -> Result<(String, u64)> {
+        self.publish_stage(ObjectKind::Raw, stage)
+    }
+
+    pub(super) fn publish_stage(
+        &self,
+        kind: ObjectKind,
+        mut stage: BoundRawStage,
+    ) -> Result<(String, u64)> {
         if !same_bound_directory(&stage.parent, &self.raw)? {
             return Err(KioError::invalid_usage(
                 "raw stage belongs to another store",
             ));
         }
         stage.verify()?;
-        let (parent, leaf) = self.fanout(ObjectKind::Raw, &stage.raw_hash, true)?;
+        let (parent, leaf) = self.fanout(kind, &stage.raw_hash, true)?;
         match bound_read_verified(
             &CasReadAccess::Unmetered,
             &parent,
             &leaf,
-            ObjectKind::Raw,
+            kind,
             &stage.raw_hash,
             false,
         ) {
@@ -298,11 +359,7 @@ impl BoundObjectDirs {
                     parent.try_clone().kio_io(Path::new(&leaf))?,
                     PathBuf::from("raw fanout"),
                 )?;
-                stage.writer.take().expect("live stage").publish(
-                    &target,
-                    Path::new(&leaf),
-                    crate::store_dir::Publication::CreateOnly,
-                )?;
+                stage.publish_saved_to(&target, Path::new(&leaf))?;
             }
             Err(error) => return Err(error),
         }
@@ -310,7 +367,7 @@ impl BoundObjectDirs {
             &CasReadAccess::Unmetered,
             &parent,
             &leaf,
-            ObjectKind::Raw,
+            kind,
             &stage.raw_hash,
             false,
         )?;
@@ -735,6 +792,20 @@ impl BoundObjectDirs {
             return Err(KioError::invalid_usage("invalid hash"));
         }
         for kind in [ObjectKind::Tree, ObjectKind::Commit, ObjectKind::Raw] {
+            if kind == ObjectKind::Tree {
+                match self
+                    .fanout(kind, hash, false)
+                    .and_then(|(parent, leaf)| bound_open_regular_handle(&parent, &leaf))
+                {
+                    Ok(_) => {
+                        return Err(KioError::invalid_usage(
+                            "tree objects require streaming read_tree or copy_object_to",
+                        ));
+                    }
+                    Err(error) if error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => continue,
+                    Err(error) => return Err(error),
+                }
+            }
             match self.read_object_with_size(reads, kind, hash) {
                 Ok((object, _)) => return Ok(object),
                 Err(error) if error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => continue,

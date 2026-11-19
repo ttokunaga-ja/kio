@@ -1,4 +1,3 @@
-use crate::cas::MAX_TREE_OBJECT_BYTES;
 use crate::error::Result;
 use crate::gc::{
     FileObservation, MAX_METADATA, corrupt, id_meta, ioerr, valid_file, validate_directory_handle,
@@ -18,7 +17,7 @@ pub(crate) fn open_gc_tree_writable(
         cap_fs::open(directory, Path::new(leaf), &options).map_err(|error| ioerr(error, leaf))?;
     crate::private_fs::verify_private_regular_file_handle(&file)?;
     let metadata = cap_fs::Metadata::from_file(&file).map_err(|error| ioerr(error, leaf))?;
-    valid_file(&metadata, MAX_TREE_OBJECT_BYTES)?;
+    valid_file(&metadata, u64::MAX)?;
     if id_meta(&metadata)? != expected.identity || metadata.len() != expected.state.len {
         return Err(corrupt("tree changed before writable handle bind"));
     }

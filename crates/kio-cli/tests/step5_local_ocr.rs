@@ -249,7 +249,11 @@ fn current_ocr_normalizes(dir: &TempDir) -> BTreeMap<String, OcrNormalizeWitness
     ["scan.pdf", "scan.png"]
         .into_iter()
         .filter_map(|path| {
-            let entry = tree.entries.iter().find(|entry| entry.path == path)?;
+            let entry = tree
+                .entries
+                .iter()
+                .map(Result::unwrap)
+                .find(|entry| entry.path == path)?;
             let normalize = entry.normalize.as_ref()?;
             Some((
                 path.to_owned(),

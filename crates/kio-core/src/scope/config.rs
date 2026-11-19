@@ -87,49 +87,11 @@ impl Repository {
     }
 
     pub(super) fn validate_manifest(&self) -> Result<()> {
-        let text = self.metadata_text("manifest.json", MAX_BOUND_CONFIG_BYTES)?;
-        let value: Value =
-            serde_json::from_str(&text).map_err(|err| KioError::schema(err.to_string()))?;
-        validate_json_schema(SchemaKind::Manifest, &value)?;
-        if !value.is_object() {
-            return Err(KioError::schema("manifest.json must be an object"));
-        }
-        let Some(files) = value.get("files") else {
-            return Err(KioError::schema("manifest.json missing files"));
-        };
-        let files = files
-            .as_array()
-            .ok_or_else(|| KioError::schema("manifest.files must be an array"))?;
-        for file in files {
-            let object = file
-                .as_object()
-                .ok_or_else(|| KioError::schema("manifest file entry must be an object"))?;
-            let path = object
-                .get("path")
-                .and_then(Value::as_str)
-                .ok_or_else(|| KioError::schema("manifest file entry missing path"))?;
-            if path.is_empty() || path.contains('/') {
-                return Err(KioError::path(
-                    "manifest file path must be a direct child file name",
-                    path.to_owned(),
-                ));
-            }
-            let raw_hash = object
-                .get("raw_hash")
-                .and_then(Value::as_str)
-                .ok_or_else(|| KioError::schema("manifest file entry missing raw_hash"))?;
-            if !is_hash(raw_hash) {
-                return Err(KioError::schema("manifest raw_hash must be a hash"));
-            }
-            let status = object
-                .get("status")
-                .and_then(Value::as_str)
-                .ok_or_else(|| KioError::schema("manifest file entry missing status"))?;
-            if !matches!(status, "new" | "modified" | "deleted" | "unchanged") {
-                return Err(KioError::schema("manifest status has invalid value"));
-            }
-        }
-        Ok(())
+        let _inspection = crate::disk_records::StageInspection::begin();
+        let file = self
+            .store_directory()?
+            .open_regular_read(Path::new("manifest.json"), u64::MAX)?;
+        super::manifest::Manifest::read(file).map(|_| ())
     }
 
     /// Merge the current working tree into `manifest.json`, preserving rows for
@@ -146,102 +108,40 @@ impl Repository {
         &self,
         tree: &TreeObject,
         prior_tree: Option<&TreeObject>,
-    ) -> Result<Value> {
-        let mut previous: BTreeMap<String, String> = prior_tree
-            .map(|prior| {
-                prior
-                    .entries
-                    .iter()
-                    .map(|entry| (entry.path.clone(), entry.raw_hash.clone()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        for (path, raw_hash) in self.read_manifest_deleted_hashes()? {
-            previous.entry(path).or_insert(raw_hash);
-        }
-        let current: BTreeMap<&str, &str> = tree
-            .entries
-            .iter()
-            .map(|entry| (entry.path.as_str(), entry.raw_hash.as_str()))
-            .collect();
-
-        // BTreeMap keyed by path gives a deterministic, path-sorted file list.
-        let mut rows: BTreeMap<String, Value> = BTreeMap::new();
-
-        for entry in &tree.entries {
-            let status = match previous.get(&entry.path) {
-                None => "new",
-                Some(prev) if *prev != entry.raw_hash => "modified",
-                Some(_) => "unchanged",
-            };
-            rows.insert(
-                entry.path.clone(),
-                json!({ "path": entry.path, "raw_hash": entry.raw_hash, "status": status }),
-            );
-        }
-
-        // Retain vanished paths as deleted rows carrying their last raw_hash.
-        for (path, raw_hash) in &previous {
-            if !current.contains_key(path.as_str()) {
-                rows.insert(
-                    path.clone(),
-                    json!({ "path": path, "raw_hash": raw_hash, "status": "deleted" }),
-                );
-            }
-        }
-
-        let files = rows.into_values().collect::<Vec<_>>();
-        Ok(json!({
-            "schema_version": 1,
-            "files": files,
-            "updated_at": self.now_utc_seconds(),
-        }))
+    ) -> Result<super::manifest::Manifest> {
+        super::manifest::build_manifest(
+            tree,
+            prior_tree,
+            self.read_manifest_deleted_hashes()?,
+            self.now_utc_seconds(),
+        )
     }
 
-    pub(super) fn write_manifest_value(&self, value: &Value) -> Result<()> {
-        validate_json_schema(SchemaKind::Manifest, value)?;
-        let bytes =
-            serde_json::to_vec_pretty(value).map_err(|err| KioError::schema(err.to_string()))?;
-        if bytes.len() as u64 > MAX_PUBLICATION_JOURNAL_BYTES {
-            return Err(KioError::schema(
-                "manifest exceeds the publication size limit",
-            ));
-        }
-        self.replace_metadata("manifest.json", &bytes)
+    pub(super) fn write_manifest_value(&self, value: &super::manifest::Manifest) -> Result<()> {
+        self.write_streamed_metadata(
+            "manifest.json",
+            &mut super::manifest::ManifestJsonReader::new(value)?,
+            crate::store_dir::Publication::Replace,
+        )
     }
 
-    /// Read the current `manifest.json` `deleted` rows as a
-    /// `path -> last raw_hash` map. Live rows are intentionally excluded — the
-    /// prior HEAD tree is the authoritative source for those (see
-    /// `write_manifest`).
-    /// Returns an empty map when the manifest is absent. The manifest is schema
-    /// validated before `snapshot` runs, so entries are well formed here.
-    fn read_manifest_deleted_hashes(&self) -> Result<BTreeMap<String, String>> {
-        let mut map = BTreeMap::new();
-        let Some(bytes) = self
-            .store_directory()?
-            .read_optional(Path::new("manifest.json"), MAX_BOUND_CONFIG_BYTES)?
-        else {
-            return Ok(map);
-        };
-        let text = String::from_utf8(bytes)
-            .map_err(|_| KioError::schema("manifest.json must be UTF-8"))?;
-        let value: Value =
-            serde_json::from_str(&text).map_err(|err| KioError::schema(err.to_string()))?;
-        if let Some(files) = value.get("files").and_then(Value::as_array) {
-            for file in files {
-                if file.get("status").and_then(Value::as_str) != Some("deleted") {
-                    continue;
-                }
-                if let (Some(entry_path), Some(raw_hash)) = (
-                    file.get("path").and_then(Value::as_str),
-                    file.get("raw_hash").and_then(Value::as_str),
-                ) {
-                    map.insert(entry_path.to_owned(), raw_hash.to_owned());
+    /// Only deleted rows are retained from mutable metadata; prior HEAD supplies live rows.
+    fn read_manifest_deleted_hashes(
+        &self,
+    ) -> Result<crate::disk_records::DiskRecords<super::manifest::ManifestRow>> {
+        let directory = self.store_directory()?;
+        let mut rows = crate::disk_records::RecordWriter::new()?;
+        if directory.contains_entry(Path::new("manifest.json"))? {
+            let file = directory.open_regular_read(Path::new("manifest.json"), u64::MAX)?;
+            let manifest = super::manifest::Manifest::read(file)?;
+            for row in &manifest.files {
+                let row = row?;
+                if row.status == "deleted" {
+                    rows.push(&row)?;
                 }
             }
         }
-        Ok(map)
+        rows.finish()
     }
 
     pub(super) fn publish_tool_lock(&self) -> Result<String> {

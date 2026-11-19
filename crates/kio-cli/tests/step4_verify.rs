@@ -488,9 +488,9 @@ fn ct4_fsck_checks_failed_prepared_and_metadata_only_image_references() {
     let repo = kio_core::scope::Repository::open(dir.path()).unwrap();
     let parent_hash = pointer["commit"].as_str().unwrap().to_owned();
     let parent = repo.read_commit(&parent_hash).unwrap();
-    let mut tree = repo.read_tree(&parent.tree).unwrap();
-    let entry = tree
-        .entries
+    let tree = repo.read_tree(&parent.tree).unwrap();
+    let mut entries = tree.entries.to_vec().unwrap();
+    let entry = entries
         .iter_mut()
         .find(|entry| entry.raw_hash == pointer["raw_hash"].as_str().unwrap())
         .unwrap();
@@ -542,7 +542,7 @@ fn ct4_fsck_checks_failed_prepared_and_metadata_only_image_references() {
         .write_content_object(ContentObjectKind::Manifest, &manifest_bytes)
         .unwrap();
 
-    let tree = build_tree(tree.entries).unwrap();
+    let tree = build_tree(entries).unwrap();
     let (tree_hash, _) = store
         .write_json(ObjectKind::Tree, &serde_json::to_value(&tree).unwrap())
         .unwrap();
@@ -713,7 +713,7 @@ fn ct4_fsck_unindexed_scope_recovers_lifecycle_epoch_before_retired_backfill() {
         .commit
         .as_ref()
         .and_then(|commit| repo.read_tree(&commit.tree).ok())
-        .and_then(|tree| tree.entries.first().map(|entry| entry.raw_hash.clone()))
+        .and_then(|tree| tree.entries.first().unwrap().map(|entry| entry.raw_hash))
         .unwrap();
     assert!(!dir.path().join(".kio/index/sqlite.db").exists());
 

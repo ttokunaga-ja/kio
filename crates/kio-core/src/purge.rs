@@ -14,6 +14,7 @@
 //! flow: re-publication is allowed and retires the marker in the same locked
 //! mutation as the republication's snapshot finalize (05-runtime.md §3.5).
 
+#[cfg(test)]
 pub(crate) use crate::platform::sync_directory;
 
 use std::collections::BTreeSet;
