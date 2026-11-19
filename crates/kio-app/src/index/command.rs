@@ -25,6 +25,7 @@ use crate::index::pipeline::DeferredPaidPlaceholder;
 use crate::index::pipeline::explicitly_allowed_tier_a_paths;
 use crate::index::pipeline::index_preview_response;
 use crate::index::pipeline::optional_role_planning_ready;
+use crate::index::pipeline::record_reindex_unsupported_inputs;
 use crate::index::pipeline::run_index_pipeline;
 use crate::index::rebuild::is_rebuild_skippable_unit_error;
 use crate::index::rebuild::read_head_tree_for_rebuild;
@@ -86,7 +87,7 @@ use kio_core::KioError;
 use kio_core::Result;
 use kio_core::control::ControlHandle;
 use kio_core::dag::CommitObject;
-use kio_core::dag::NormalizeRef;
+use kio_core::dag::{NormalizeRef, TreeObject};
 use kio_core::scope::PendingNormalizeRef;
 use kio_core::scope::Repository;
 use kio_pipeline::budget::read_budget_policy;
@@ -100,14 +101,12 @@ use kio_pipeline::scan::ScanPreviewRequest;
 use kio_pipeline::scan::bind_planned_child;
 use kio_pipeline::scan::build_managed_scan_preview;
 use kio_pipeline::scan::build_planned_child_scan_preview;
-use kio_pipeline::scan::build_scan_preview;
 use kio_pipeline::scan::discover_managed_child_scopes_page;
 use kio_pipeline::scan::managed_scan_policy_allows_file;
 use kio_pipeline::scan::read_bound_verified_scan_input;
 use kio_pipeline::task::TaskStatus;
 use kio_pipeline::task::TaskStore;
 use kio_pipeline::task::TaskType;
-use kio_pipeline::unsupported::UNSUPPORTED_REASON_UNRECOGNIZED_BINARY;
 use kio_pipeline::unsupported::UnsupportedInputDisposition;
 use kio_pipeline::unsupported::UnsupportedInputStore;
 use serde_json::json;
@@ -805,13 +804,20 @@ fn run_index_for_repo_inner(
     // index neither demotes the file to the deterministic baseline nor creates a
     // second promotion commit.
     apply_online_promotion_to_index(adapter_settings, repo, &mut index_result)?;
+    // No recovered or completed output may replace a raw-only entry.
+    index_result
+        .normalize_by_path
+        .retain(|path, _| !index_result.unsupported_raws.contains_key(path));
     let outcome = repo.auto_snapshot_with_bound_normalize(
         Some("kio index auto snapshot"),
         None,
         &excluded,
         &index_result.normalize_by_path,
         &explicitly_allowed_tier_a,
-        Some(&|| publication_policy.revalidate().map_err(pipeline_to_kio)),
+        Some(&|tree| {
+            publication_policy.revalidate().map_err(pipeline_to_kio)?;
+            verify_classified_input_raws(tree, &index_result.unsupported_raws)
+        }),
     )?;
     if let Some(commit_hash) = &outcome.commit_hash {
         maybe_inject_replica_after_head_fault("index_before_marker", ctx.control)?;
@@ -1450,69 +1456,8 @@ pub(crate) fn compute_index_status(
                 Vec::new()
             }
         };
-        for task in tasks {
-            if !matches!(task.task_type, TaskType::Markdownize | TaskType::Embedding) {
-                continue;
-            }
-            // R20-7: a `retired_non_live` task's chunk went non-live (deleted / re-chunked /
-            // superseded), so it is NOT an enrichment gap in the CURRENT corpus and must not
-            // deflate enriched_ratio. R11-8 deliberately keeps a LIVE permanent-gap Failed
-            // (invalid_input/contract) in the denominator; this excludes only the non-live
-            // subset, which R19-3's dedicated reason makes unambiguous. Without this, a
-            // deleted/reverted chunk left enriched_ratio < 1.0 with pending == 0 forever.
-            if task.fallback_reason.as_deref() == Some(RETIRED_NON_LIVE) {
-                continue;
-            }
-            total_enrichment_tasks += 1;
-            if task.status == TaskStatus::Skipped {
-                skipped_enrichment_tasks += 1;
-                *skipped_enrichment_reasons
-                    .entry(
-                        task.fallback_reason
-                            .clone()
-                            .expect("validated skipped reason"),
-                    )
-                    .or_insert(0) += 1;
-                continue;
-            }
-            total += 1;
-            match task.status {
-                TaskStatus::Done => done += 1,
-                // R9-4: a Partial task has Failed units still awaiting completion —
-                // count it as incomplete (pending), not done. Counting it as done
-                // made `index_status` report enriched_ratio = 1.0 with
-                // pending_enrichment_tasks = 0 while units were permanently missing
-                // (a silent data gap on text-layer-less scans). `batch retry` now
-                // drives it to Done (docs/04 §5.2).
-                TaskStatus::Partial | TaskStatus::Pending | TaskStatus::Running => pending += 1,
-                // R22-7: only a BUDGET pause may set `budget_paused`. docs/05-runtime.md:200
-                // has agents render this flag as "(budget により一時停止中)", so a Tier B
-                // `secrets_tier_b_hold` — which costs nothing and is cleared by
-                // `--send-secrets`, never by raising a cap — was steering them to
-                // `--override-budget` while `device_remaining_usd` sat untouched at its full
-                // cap. It is still outstanding work, so it stays in `pending`.
-                TaskStatus::Paused => {
-                    pending += 1;
-                    if task.fallback_reason.as_deref() == Some("budget_exceeded") {
-                        budget_paused = true;
-                    }
-                }
-                // R11-8: a RETRYABLE Failed enrichment task (network_error/
-                // quota_exceeded etc., holding next_retry_at, recoverable by
-                // `batch retry`) is outstanding work — count it as pending.
-                // (rate_limit no longer reaches this arm at all under QA3,
-                // 04 §5.3: it stays Pending — already counted by the
-                // `TaskStatus::Partial | TaskStatus::Pending | TaskStatus::Running`
-                // arm above — never Failed.) Otherwise the scope reads
-                // enriched_ratio<1.0 with pending_enrichment_tasks=0 and
-                // budget_paused=false, an impossible-looking dead end an Agent
-                // cannot act on (the dual of R9-4). A NON-retryable Failed task
-                // (permanent gap) stays excluded: it surfaces only as
-                // ratio<1.0, never as actionable pending work.
-                TaskStatus::Failed if task_retry_allowed(&task) => pending += 1,
-                TaskStatus::Failed | TaskStatus::Skipped => {}
-            }
-        }
+        let first_unsupported = unsupported_inputs.len();
+        let mut current_tree = None;
         // R23-20: `scope.scope_path` is the `.kio` directory; `Repository::open`
         // wants the scope ROOT (it appends `.kio` itself), so this uses the
         // separately-carried `repo_root` field.
@@ -1526,18 +1471,15 @@ pub(crate) fn compute_index_status(
                 // per output field (two independent re-reads of the identical
                 // failing store would double-count it).
                 match current_dispositions(&repo) {
-                    Ok(dispositions) => {
+                    Ok((tree, dispositions)) => {
+                        current_tree = tree;
                         let (office_unavailable, unsupported): (Vec<_>, Vec<_>) =
                             dispositions.into_iter().partition(|disposition| {
                                 disposition.reason == OFFICE_CONVERSION_UNAVAILABLE_REASON
                             });
                         let unsupported: Vec<_> = unsupported
                             .into_iter()
-                            .filter(|disposition| {
-                                disposition.reason == UNSUPPORTED_REASON_UNRECOGNIZED_BINARY
-                                    || disposition.reason
-                                        == kio_pipeline::unsupported::UNSUPPORTED_REASON_SOURCE_CODE
-                            })
+                            .filter(UnsupportedInputDisposition::is_unsupported)
                             .collect();
                         total = total.saturating_add(unsupported.len() as u64);
                         total = total.saturating_add(office_unavailable.len() as u64);
@@ -1630,6 +1572,96 @@ pub(crate) fn compute_index_status(
                 unsupported_input_errors.push(error);
             }
         }
+        let unsupported = &unsupported_inputs[first_unsupported..];
+        let unsupported_paths = unsupported
+            .iter()
+            .map(|row| row.path.as_str())
+            .collect::<BTreeSet<_>>();
+        let unsupported_raws = unsupported
+            .iter()
+            .map(|row| row.raw_hash.as_str())
+            .collect::<BTreeSet<_>>();
+        // The raw match also covers a rename. A supported alias with its own
+        // current normalized reference remains eligible for task accounting.
+        let normalized_inputs = current_tree
+            .as_ref()
+            .filter(|_| !unsupported_raws.is_empty())
+            .into_iter()
+            .flat_map(|tree| &tree.entries)
+            .filter(|entry| entry.normalize.is_some())
+            .map(|entry| (entry.path.as_str(), entry.raw_hash.as_str()))
+            .collect::<BTreeSet<_>>();
+        for task in tasks {
+            if !matches!(task.task_type, TaskType::Markdownize | TaskType::Embedding) {
+                continue;
+            }
+            // R20-7: a `retired_non_live` task's chunk went non-live (deleted / re-chunked /
+            // superseded), so it is NOT an enrichment gap in the CURRENT corpus and must not
+            // deflate enriched_ratio. R11-8 deliberately keeps a LIVE permanent-gap Failed
+            // (invalid_input/contract) in the denominator; this excludes only the non-live
+            // subset, which R19-3's dedicated reason makes unambiguous. Without this, a
+            // deleted/reverted chunk left enriched_ratio < 1.0 with pending == 0 forever.
+            if task.fallback_reason.as_deref() == Some(RETIRED_NON_LIVE) {
+                continue;
+            }
+            if task.task_type == TaskType::Markdownize
+                && (unsupported_paths.contains(task.input_path.as_str())
+                    || unsupported_raws.contains(task.input_hash.as_str())
+                        && !normalized_inputs
+                            .contains(&(task.input_path.as_str(), task.input_hash.as_str())))
+            {
+                continue;
+            }
+            total_enrichment_tasks += 1;
+            if task.status == TaskStatus::Skipped {
+                skipped_enrichment_tasks += 1;
+                *skipped_enrichment_reasons
+                    .entry(
+                        task.fallback_reason
+                            .clone()
+                            .expect("validated skipped reason"),
+                    )
+                    .or_insert(0) += 1;
+                continue;
+            }
+            total += 1;
+            match task.status {
+                TaskStatus::Done => done += 1,
+                // R9-4: a Partial task has Failed units still awaiting completion —
+                // count it as incomplete (pending), not done. Counting it as done
+                // made `index_status` report enriched_ratio = 1.0 with
+                // pending_enrichment_tasks = 0 while units were permanently missing
+                // (a silent data gap on text-layer-less scans). `batch retry` now
+                // drives it to Done (docs/04 §5.2).
+                TaskStatus::Partial | TaskStatus::Pending | TaskStatus::Running => pending += 1,
+                // R22-7: only a BUDGET pause may set `budget_paused`. docs/05-runtime.md:200
+                // has agents render this flag as "(budget により一時停止中)", so a Tier B
+                // `secrets_tier_b_hold` — which costs nothing and is cleared by
+                // `--send-secrets`, never by raising a cap — was steering them to
+                // `--override-budget` while `device_remaining_usd` sat untouched at its full
+                // cap. It is still outstanding work, so it stays in `pending`.
+                TaskStatus::Paused => {
+                    pending += 1;
+                    if task.fallback_reason.as_deref() == Some("budget_exceeded") {
+                        budget_paused = true;
+                    }
+                }
+                // R11-8: a RETRYABLE Failed enrichment task (network_error/
+                // quota_exceeded etc., holding next_retry_at, recoverable by
+                // `batch retry`) is outstanding work — count it as pending.
+                // (rate_limit no longer reaches this arm at all under QA3,
+                // 04 §5.3: it stays Pending — already counted by the
+                // `TaskStatus::Partial | TaskStatus::Pending | TaskStatus::Running`
+                // arm above — never Failed.) Otherwise the scope reads
+                // enriched_ratio<1.0 with pending_enrichment_tasks=0 and
+                // budget_paused=false, an impossible-looking dead end an Agent
+                // cannot act on (the dual of R9-4). A NON-retryable Failed task
+                // (permanent gap) stays excluded: it surfaces only as
+                // ratio<1.0, never as actionable pending work.
+                TaskStatus::Failed if task_retry_allowed(&task) => pending += 1,
+                TaskStatus::Failed | TaskStatus::Skipped => {}
+            }
+        }
     }
 
     let enriched_ratio = if total == 0 {
@@ -1675,39 +1707,41 @@ pub(crate) fn compute_index_status(
 pub(crate) fn current_unsupported_inputs(
     repo: &Repository,
 ) -> Result<Vec<UnsupportedInputDisposition>> {
-    Ok(current_dispositions(repo)?
+    let (_, dispositions) = current_dispositions(repo)?;
+    Ok(dispositions
         .into_iter()
-        .filter(|disposition| {
-            disposition.reason == UNSUPPORTED_REASON_UNRECOGNIZED_BINARY
-                || disposition.reason == kio_pipeline::unsupported::UNSUPPORTED_REASON_SOURCE_CODE
-        })
+        .filter(UnsupportedInputDisposition::is_unsupported)
         .collect())
 }
 
-/// Shared body for [`current_unsupported_inputs`] / `compute_index_status`'s
-/// own combined read (which partitions by `reason` itself — including 07
-/// §5.1's `OFFICE_CONVERSION_UNAVAILABLE_REASON` — in one pass, so a single
-/// corrupt/unreadable scope reports exactly one error rather than one per
-/// reason): every `UnsupportedInputStore` disposition (any reason) still LIVE
-/// at HEAD with the SAME `raw_hash` the disposition recorded (a reverted /
-/// deleted / re-hashed file's stale disposition must not keep surfacing).
-fn current_dispositions(repo: &Repository) -> Result<Vec<UnsupportedInputDisposition>> {
+/// Read dispositions selected by the published tree and share that tree with
+/// the search status aggregation. Unsupported paths must also be raw-only.
+fn current_dispositions(
+    repo: &Repository,
+) -> Result<(Option<TreeObject>, Vec<UnsupportedInputDisposition>)> {
     let store = UnsupportedInputStore::new(repo.kio_dir());
-    let dispositions = store.latest_by_path().map_err(pipeline_to_kio)?;
     let Some(head) = repo.head_commit_hash()? else {
-        return Ok(Vec::new());
+        store.latest_by_path().map_err(pipeline_to_kio)?;
+        return Ok((None, Vec::new()));
     };
     let commit = repo.read_commit(&head)?;
     let tree = repo.read_tree(&commit.tree)?;
-    let live = tree
+    let normalized_paths = tree
         .entries
+        .iter()
+        .filter(|entry| entry.normalize.is_some())
+        .map(|entry| entry.path.as_str())
+        .collect::<BTreeSet<_>>();
+    let dispositions = store
+        .with_published_tree(Some(&tree))
+        .published_by_path()
+        .map_err(pipeline_to_kio)?
         .into_iter()
-        .map(|entry| (entry.path, entry.raw_hash))
-        .collect::<BTreeMap<_, _>>();
-    Ok(dispositions
-        .into_iter()
-        .filter(|disposition| live.get(&disposition.path) == Some(&disposition.raw_hash))
-        .collect())
+        .filter(|disposition| {
+            !disposition.is_unsupported() || !normalized_paths.contains(disposition.path.as_str())
+        })
+        .collect();
+    Ok((Some(tree), dispositions))
 }
 
 pub(crate) fn record_unsupported_if_changed(
@@ -1721,6 +1755,27 @@ pub(crate) fn record_unsupported_if_changed(
     store.record(&disposition).map_err(pipeline_to_kio)?;
     latest_by_path.insert(disposition.path.clone(), disposition);
     Ok(true)
+}
+
+fn verify_classified_input_raws(
+    tree: &TreeObject,
+    classified_raws: &BTreeMap<String, String>,
+) -> Result<()> {
+    for entry in &tree.entries {
+        if classified_raws
+            .get(&entry.path)
+            .is_some_and(|raw_hash| raw_hash != &entry.raw_hash)
+        {
+            return Err(pipeline_to_kio(kio_pipeline::PipelineError::contract(
+                "KIO-E-SCAN-INPUT-CHANGED-001",
+                format!(
+                    "input {} changed after classification; run indexing again",
+                    entry.path
+                ),
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn run_reindex(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<CommandResponse> {
@@ -1842,6 +1897,24 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
     for entry in &tree.entries {
         ensure_raw_ingest_allowed(&repo, &entry.raw_hash)?;
     }
+    let closing_preview = build_repository_scan_preview(
+        adapter_settings,
+        &repo,
+        ScanPreviewRequest {
+            scope_path: repo.root().display().to_string(),
+            include_raw_hashes: false,
+            require_network_approval: false,
+        },
+    )
+    .map_err(pipeline_to_kio)?;
+    let excluded = closing_preview
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.ignored)
+        .map(|candidate| candidate.input_path.clone())
+        .collect::<BTreeSet<_>>();
+    let explicitly_allowed_tier_a = explicitly_allowed_tier_a_paths(&closing_preview);
+    let classified = record_reindex_unsupported_inputs(&repo, &closing_preview, &tree)?;
     let mut normalize_by_path = BTreeMap::new();
     let mut reindexed = 0u64;
     // R17-2: a single document's missing/corrupt normalized unit must not abort the
@@ -1853,6 +1926,9 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
     // gen's cached chunks) and is recorded; healthy documents still re-normalize.
     let mut reindex_skipped = Vec::<SkippedUnit>::new();
     for entry in &tree.entries {
+        if classified.unsupported_paths.contains(&entry.path) {
+            continue;
+        }
         let Some(normalize) = &entry.normalize else {
             continue;
         };
@@ -1917,30 +1993,18 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
             Err(error) => return Err(error),
         }
     }
-    let closing_preview = build_scan_preview(
-        &adapter_settings.declared_pricing("markdown"),
-        &adapter_settings.declared_pricing("embedding"),
-        ScanPreviewRequest {
-            scope_path: repo.root().display().to_string(),
-            include_raw_hashes: false,
-            require_network_approval: false,
-        },
-    )
-    .map_err(pipeline_to_kio)?;
-    let excluded = closing_preview
-        .candidates
-        .iter()
-        .filter(|candidate| candidate.ignored)
-        .map(|candidate| candidate.input_path.clone())
-        .collect::<BTreeSet<_>>();
-    let explicitly_allowed_tier_a = explicitly_allowed_tier_a_paths(&closing_preview);
+    repo.control()
+        .checkpoint(kio_core::durability::DurabilityPoint::BeforeIndexSnapshot)?;
     let outcome = repo.auto_snapshot_with_bound_normalize(
         Some("kio reindex --force"),
         None,
         &excluded,
         &normalize_by_path,
         &explicitly_allowed_tier_a,
-        Some(&|| publication_policy.revalidate().map_err(pipeline_to_kio)),
+        Some(&|tree| {
+            publication_policy.revalidate().map_err(pipeline_to_kio)?;
+            verify_classified_input_raws(tree, &classified.raw_by_path)
+        }),
     )?;
     if let Some(commit_hash) = &outcome.commit_hash {
         maybe_inject_replica_after_head_fault("reindex_before_marker", ctx.control)?;

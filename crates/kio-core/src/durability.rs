@@ -8,6 +8,7 @@ use crate::Result;
 /// A named durable state transition that native process-stop tests may select.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DurabilityPoint {
+    BeforeIndexSnapshot,
     PublicationJournal,
     PublicationManifest,
     PublicationHead,
@@ -54,6 +55,7 @@ impl DurabilityPoint {
     #[cfg(debug_assertions)]
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value {
+            "before_index_snapshot" => Some(Self::BeforeIndexSnapshot),
             "publication_journal" => Some(Self::PublicationJournal),
             "publication_manifest" => Some(Self::PublicationManifest),
             "publication_head" => Some(Self::PublicationHead),
@@ -101,6 +103,7 @@ impl DurabilityPoint {
     #[cfg(debug_assertions)]
     fn name(self) -> &'static str {
         match self {
+            Self::BeforeIndexSnapshot => "before_index_snapshot",
             Self::PublicationJournal => "publication_journal",
             Self::PublicationManifest => "publication_manifest",
             Self::PublicationHead => "publication_head",

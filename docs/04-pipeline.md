@@ -766,13 +766,22 @@ local crash は 0 USD で終端記録し、§5.3 の attempt 上限内で再計�
 累積 append bytes の寿命上限で利用不能にしない。保持量の整理後も未終端 task の現在状態、
 attempt / next_retry_at / ownership と unsupported の現在理由を失わない。
 現在状態の key は task が `task_id`、unsupported が scope 内の `path` であり、それぞれ最後の
-検証済み record の全フィールドを保持する。別の task ID や完了・保留・解決済みの状態を整理だけで捨てない。
+検証済み record の全フィールドを保持する。unsupported は HEAD の path と raw_hash に合う最後の record で表示する。
+次の HEAD を公開する前に理由を保存し、整理時は現在の HEAD に対応する record も保持する。
+別の task ID や完了・保留・解決済みの状態を整理だけで捨てない。
 中断・回復後も検証済みの現在状態を一意に採用し、成功や新規入力へ巻き戻さない。
 canonical path、no-follow、record schema、identity と不正 record の拒否を維持する。
 課金／秘密／送信承認の正本はこの整理の対象にしない。容量不足は §5.3 の `resource_limit` として
 破損から区別し、部分成功や必要な状態の黙った切捨てにしない。
 
 ソースコードのファイル（拡張子 `rs` / `py` / `js` / `ts` / `go` / `java` / `c` / `h` / `cpp`、大文字小文字を区別しない）は索引・抽出の対象外とし、unsupported に理由 `source_code_is_not_supported` を記録・表示する。中身がテキストでも plain text として処理しない。Markdown 内のコードブロック・インラインコードは引き続き Markdown の一部として扱う。
+
+`index`、HEAD の `reindex --regenerate`、および `watch` の再走査で unsupported と判定したファイルは、以前に索引済みでも、
+現行 tree には raw のみを記録する。判定に使った raw_hash と公開対象が異なる場合は公開を中断する。
+status の unsupported 一覧には、公開済みの理由を表示する。検索の現行集計から該当する旧 Markdownize
+タスクを外し、タスク履歴は保持する。
+現行検索の FTS・vector は当該ファイルの旧世代を返さない。過去の tree が参照する世代、raw、
+Evidence Pointer の解決に必要なデータは既存の履歴保持規則に従う (§4、[03-data-model.md §8](03-data-model.md))。
 
 ```json
 {

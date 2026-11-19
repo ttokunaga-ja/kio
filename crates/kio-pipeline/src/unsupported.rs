@@ -18,7 +18,7 @@ pub const UNSUPPORTED_INPUTS_FILE: &str = "unsupported-inputs.jsonl";
 pub const UNSUPPORTED_REASON_UNRECOGNIZED_BINARY: &str = "unrecognized_binary_without_local_text";
 pub const UNSUPPORTED_REASON_SOURCE_CODE: &str = "source_code_is_not_supported";
 
-pub fn is_source_code_path(path: &Path) -> bool {
+pub fn unsupported_reason_for_path(path: &Path) -> Option<&'static str> {
     path.extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| {
@@ -27,6 +27,7 @@ pub fn is_source_code_path(path: &Path) -> bool {
                 "rs" | "py" | "js" | "ts" | "go" | "java" | "c" | "h" | "cpp"
             )
         })
+        .then_some(UNSUPPORTED_REASON_SOURCE_CODE)
 }
 
 pub const UNSUPPORTED_REASON_RESOLVED: &str = "resolved";
@@ -51,15 +52,24 @@ pub struct UnsupportedInputDisposition {
     pub reason: String,
 }
 
+impl UnsupportedInputDisposition {
+    pub fn is_unsupported(&self) -> bool {
+        matches!(
+            self.reason.as_str(),
+            UNSUPPORTED_REASON_UNRECOGNIZED_BINARY | UNSUPPORTED_REASON_SOURCE_CODE
+        )
+    }
+}
+
 /// Durable owner of the current unsupported-input projection.
 ///
-/// Multiple rows for one path are expected: the final row is authoritative, so
-/// a re-index can bind the path to its newest raw object. Compaction retains
-/// exactly that final row, including resolved reasons.
+/// Writers retain the latest record and the record selected by published HEAD
+/// until a subsequent HEAD makes the previous record unnecessary.
 #[derive(Debug, Clone)]
 pub struct UnsupportedInputStore {
     pub(crate) kio_dir: PathBuf,
     path: PathBuf,
+    published_raws: BTreeMap<String, String>,
 }
 
 impl UnsupportedInputStore {
@@ -69,7 +79,18 @@ impl UnsupportedInputStore {
         Self {
             path: kio_dir.join(UNSUPPORTED_INPUTS_FILE),
             kio_dir,
+            published_raws: BTreeMap::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_published_tree(mut self, tree: Option<&kio_core::dag::TreeObject>) -> Self {
+        self.published_raws = tree
+            .into_iter()
+            .flat_map(|tree| &tree.entries)
+            .map(|entry| (entry.path.clone(), entry.raw_hash.clone()))
+            .collect();
+        self
     }
 
     #[must_use]
@@ -113,10 +134,9 @@ impl UnsupportedInputStore {
         };
         let projected_len = current_len.saturating_add(line.len() as u64);
         if projected_len > UNSUPPORTED_COMPACTION_BYTES {
-            let mut current = self.latest_bound(&directory)?;
-            current.retain(|row| row.path != disposition.path);
-            current.push(disposition.clone());
-            return self.replace_bound(&directory, &current);
+            let mut projection = self.read_bound(&directory)?;
+            self.add_record(&mut projection, disposition.clone());
+            return self.replace_bound(&directory, &projection.retained_rows());
         }
 
         directory
@@ -124,22 +144,79 @@ impl UnsupportedInputStore {
             .map_err(|e| crate::journal::error(&self.path, e))
     }
 
-    /// Read the current projection with the last valid row for each path winning.
-    /// Returned rows are deterministic (lexicographic path order).
-    pub fn latest_by_path(&self) -> Result<Vec<UnsupportedInputDisposition>> {
-        self.latest_bound(&self.private_root()?)
+    /// Durably stage a scan's new reasons while retaining those visible at HEAD.
+    pub fn record_observations(
+        &self,
+        observations: impl IntoIterator<Item = UnsupportedInputDisposition>,
+    ) -> Result<()> {
+        let mut observations = observations.into_iter().peekable();
+        if observations.peek().is_none() {
+            return Ok(());
+        }
+        let directory = self.private_root()?;
+        let mut projection = self.read_bound(&directory)?;
+        let mut changed = false;
+        for observation in observations {
+            if projection.latest.get(&observation.path) != Some(&observation) {
+                self.add_record(&mut projection, observation);
+                changed = true;
+            }
+        }
+        if changed {
+            self.replace_bound(&directory, &projection.retained_rows())?;
+        }
+        Ok(())
     }
 
-    fn latest_bound(
+    /// Read the latest observation for each path, for writer deduplication.
+    pub fn latest_by_path(&self) -> Result<Vec<UnsupportedInputDisposition>> {
+        Ok(self
+            .read_bound(&self.private_root()?)?
+            .latest
+            .into_values()
+            .collect())
+    }
+
+    /// Read the latest record matching each path and raw hash in HEAD.
+    pub fn published_by_path(&self) -> Result<Vec<UnsupportedInputDisposition>> {
+        Ok(self
+            .read_bound(&self.private_root()?)?
+            .published
+            .into_values()
+            .collect())
+    }
+
+    /// Include both current HEAD reasons and newer observations when rewriting.
+    pub fn retained_rows(&self) -> Result<Vec<UnsupportedInputDisposition>> {
+        Ok(self.read_bound(&self.private_root()?)?.retained_rows())
+    }
+
+    fn add_record(
+        &self,
+        projection: &mut DispositionProjection,
+        disposition: UnsupportedInputDisposition,
+    ) {
+        if self.published_raws.get(&disposition.path) == Some(&disposition.raw_hash) {
+            projection
+                .published
+                .insert(disposition.path.clone(), disposition.clone());
+        }
+        projection
+            .latest
+            .insert(disposition.path.clone(), disposition);
+    }
+
+    fn read_bound(
         &self,
         directory: &kio_core::store_dir::StoreDirectory,
-    ) -> Result<Vec<UnsupportedInputDisposition>> {
+    ) -> Result<DispositionProjection> {
+        let mut projection = DispositionProjection::default();
         let leaf = Path::new(UNSUPPORTED_INPUTS_FILE);
         if !directory
             .contains_entry(leaf)
             .map_err(|e| crate::journal::error(&self.path, e))?
         {
-            return Ok(Vec::new());
+            return Ok(projection);
         }
         let file = directory
             .open_regular_read(leaf, u64::MAX)
@@ -148,7 +225,6 @@ impl UnsupportedInputStore {
             .map_err(|e| crate::journal::error(&self.path, e))?;
         let mut reader = std::io::BufReader::new(file);
         let mut line = Vec::new();
-        let mut by_path = BTreeMap::new();
         loop {
             line.clear();
             let read = reader
@@ -174,10 +250,10 @@ impl UnsupportedInputStore {
             let disposition: UnsupportedInputDisposition =
                 serde_json::from_slice(&line).map_err(|error| self.corrupt(error.to_string()))?;
             validate_disposition(&disposition).map_err(|message| self.corrupt(message))?;
-            by_path.insert(disposition.path.clone(), disposition);
+            self.add_record(&mut projection, disposition);
         }
 
-        Ok(by_path.into_values().collect())
+        Ok(projection)
     }
 
     /// Replace a validated current projection (also used by purge).
@@ -219,6 +295,23 @@ impl UnsupportedInputStore {
 
     pub(crate) fn corrupt(&self, message: impl Into<String>) -> PipelineError {
         PipelineError::corrupt(self.path.display().to_string(), message)
+    }
+}
+
+#[derive(Default)]
+struct DispositionProjection {
+    latest: BTreeMap<String, UnsupportedInputDisposition>,
+    published: BTreeMap<String, UnsupportedInputDisposition>,
+}
+
+impl DispositionProjection {
+    fn retained_rows(mut self) -> Vec<UnsupportedInputDisposition> {
+        self.published
+            .retain(|path, row| self.latest[path].raw_hash != row.raw_hash);
+        self.published
+            .into_values()
+            .chain(self.latest.into_values())
+            .collect()
     }
 }
 
