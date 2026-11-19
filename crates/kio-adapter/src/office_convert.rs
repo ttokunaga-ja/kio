@@ -49,7 +49,10 @@ pub const TEST_OFFICE_CONVERT_ENV: &str = "KIO_TEST_OFFICE_CONVERT";
 /// Explicit converter binary path, checked before the `soffice` PATH lookup.
 pub const OFFICE_CONVERTER_ENV: &str = "KIO_OFFICE_CONVERTER";
 /// The PATH-resolved program name probed as the last resolution step.
+#[cfg(not(windows))]
 const DEFAULT_OFFICE_CONVERTER_PROGRAM: &str = "soffice";
+#[cfg(windows)]
+const DEFAULT_OFFICE_CONVERTER_PROGRAM: &str = "soffice.exe";
 pub(crate) const MAX_OFFICE_PROBE_PDF_BYTES: usize = 2 * 1024 * 1024;
 const MAX_OFFICE_PROBE_SCRATCH_BYTES: u64 = 8 * 1024 * 1024;
 const OFFICE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -189,12 +192,6 @@ impl OfficeConverter {
                 renderer
                     .verify_runtime("before conversion", deadline)
                     .map_err(verification_error)?;
-                #[cfg(not(target_os = "linux"))]
-                if OfficeRuntime::new(renderer.sources.program(), deadline)? != renderer.runtime {
-                    return Err(AdapterError::ContractViolation(
-                        "Office runtime changed after converter probe".to_owned(),
-                    ));
-                }
                 let pdf = renderer.render_pdf(input, media_type, MAX_OFFICE_PDF_BYTES, deadline)?;
                 Ok(normalize_converted_pdf(&pdf))
             }
@@ -323,6 +320,8 @@ fn probe_real_converter_diagnostic(
         control,
         deadline,
     )?;
+    #[cfg(not(target_os = "linux"))]
+    renderer.verify_runtime_signatures(deadline)?;
     let version = probe_renderer_capability(
         || renderer.renderer_version(deadline),
         |fixture, media_type| {
@@ -381,6 +380,27 @@ impl RealRenderer {
         })
     }
 
+    #[cfg(not(target_os = "linux"))]
+    fn verify_runtime_signatures(&self, deadline: Instant) -> Result<()> {
+        let program = self.sources.program();
+        self.runtime_snapshot
+            .verify_signatures(&self.sources, deadline, || {
+                #[cfg(target_os = "macos")]
+                self.runtime
+                    .verify_runtime_signature(program, &self.runtime_snapshot, deadline)
+                    .map_err(std::io::Error::other)?;
+                #[cfg(windows)]
+                self.runtime.verify_runtime_signatures(
+                    program,
+                    &self.runtime_snapshot.pin_windows_package(deadline)?,
+                    deadline,
+                )?;
+                self.program_fingerprint
+                    .verify(program, "during signature verification", deadline)
+            })
+            .map_err(verification_error)
+    }
+
     fn renderer_version(&self, deadline: Instant) -> Result<String> {
         if Instant::now() >= deadline {
             return Ok(String::new());
@@ -403,6 +423,11 @@ impl RealRenderer {
             .environment(self.sources.program(), Some(&profile_dir));
         self.runtime
             .configure_services(scratch.path(), &mut environment, deadline)?;
+        #[cfg(windows)]
+        let _runtime_pins = self
+            .runtime_snapshot
+            .pin_windows_package(deadline)
+            .map_err(verification_error)?;
         let result = sandbox.run_checked_until(
             [
                 OsString::from("--headless"),
@@ -703,6 +728,11 @@ impl RealRenderer {
             ));
         }
         runtime.configure_services(workdir, &mut environment, deadline)?;
+        #[cfg(windows)]
+        let _runtime_pins = self
+            .runtime_snapshot
+            .pin_windows_package(deadline)
+            .map_err(verification_error)?;
         let output = match sandbox.run_checked_until(
             arguments,
             &environment,
@@ -1053,9 +1083,9 @@ mod tests {
         std::fs::create_dir(&package).unwrap();
         std::fs::write(package.join("component"), b"original").unwrap();
         let deadline = test_deadline();
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         let runtime = OfficeRuntime::fixture(package.clone());
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
         let runtime = OfficeRuntime::new(&program, deadline).unwrap();
         let roots = runtime.runtime_roots(&program).unwrap();
         #[cfg(not(target_os = "linux"))]
@@ -1093,23 +1123,25 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn homebrew_name_does_not_substitute_an_unrecognized_wrapper() {
-        assert!(is_macos_office_passthrough_wrapper(
-            b"#!/bin/bash\nexec \"/Applications/LibreOffice.app/Contents/MacOS/soffice\"  \"$@\"\n"
-        ));
-        assert!(!is_macos_office_passthrough_wrapper(
-            b"#!/bin/bash\nexec \"/Applications/OtherOffice.app/Contents/MacOS/soffice\"  \"$@\"\n"
-        ));
-        assert!(!is_macos_office_passthrough_wrapper(
-            b"#!/bin/bash\nexec \"/Applications/LibreOffice.app/Contents/MacOS/soffice\" --changed \"$@\"\n"
-        ));
+    fn macos_path_discovery_does_not_substitute_a_bundle_for_a_script() {
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("soffice");
+        executable_script(&program, "#!/bin/sh\nexit 0\n");
+        let canonical = canonical_renderer_program(program.clone()).unwrap();
+        assert_eq!(canonical, program.canonicalize().unwrap());
+        assert!(macos_office_bundle_candidate(&canonical).is_none());
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_uno_catalog_requires_well_formed_direct_uno_components() {
         let valid = macos_catalog(macos_spell_component());
-        assert!(macos_spell_component_range(&valid).is_ok());
+        assert!(macos_spell_component_range(&valid).unwrap().is_some());
+        assert!(
+            macos_spell_component_range(&macos_catalog(""))
+                .unwrap()
+                .is_none()
+        );
 
         let malformed_root =
             br#"<components xmlns=http://openoffice.org/2010/uno-components></components>"#;
@@ -1256,7 +1288,11 @@ mod tests {
         let _clear_seam = kio_core::test_control::TestEnvGuard::remove(TEST_OFFICE_CONVERT_ENV);
         let _clear_explicit = kio_core::test_control::TestEnvGuard::remove(OFFICE_CONVERTER_ENV);
         let directory = tempfile::tempdir().unwrap();
-        std::fs::create_dir(directory.path().join("soffice")).unwrap();
+        #[cfg(windows)]
+        let name = "soffice.exe";
+        #[cfg(not(windows))]
+        let name = "soffice";
+        std::fs::create_dir(directory.path().join(name)).unwrap();
         let _path = kio_core::test_control::TestEnvGuard::set("PATH", directory.path());
         let error = resolve_office_converter_with_control(&ControlHandle::new(
             kio_core::test_control::DebugTestControl::from_env(),
@@ -1464,9 +1500,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_renderer_environment_uses_only_private_profile_state() {
-        let program = Path::new(r"C:\Program Files\LibreOffice\program\soffice.exe");
+        let windows = Path::new(r"C:\Windows");
         let home = Path::new(r"C:\kio scratch\private プロファイル");
-        let environment = renderer_environment(program, Some(home));
+        let environment = renderer_environment(windows, Some(home));
         for name in ["HOME", "USERPROFILE", "LOCALAPPDATA"] {
             let values: Vec<_> = environment
                 .iter()
@@ -1482,8 +1518,6 @@ mod tests {
                 [
                     "SystemRoot",
                     "WINDIR",
-                    "COMSPEC",
-                    "PATHEXT",
                     "PATH",
                     "HOME",
                     "USERPROFILE",
@@ -1494,7 +1528,7 @@ mod tests {
                 "unexpected renderer environment key: {key:?}"
             );
         }
-        let without_home = renderer_environment(program, None);
+        let without_home = renderer_environment(windows, None);
         assert!(without_home.iter().all(|(key, _)| {
             !["HOME", "USERPROFILE", "LOCALAPPDATA"]
                 .iter()
@@ -1517,14 +1551,13 @@ mod tests {
     fn macos_bundle_candidate_requires_exact_app_layout() {
         let app = Path::new("/private/task/LibreOffice.app");
         assert_eq!(
-            macos_office_bundle_candidate(&app.join("Contents/MacOS/soffice")),
+            macos_office_bundle_candidate(&app.join("Contents/MacOS/alternate-renderer")),
             Some(app.to_path_buf())
         );
         for path in [
             "relative.app/Contents/MacOS/soffice",
             "/private/LibreOffice/Contents/MacOS/soffice",
             "/private/LibreOffice.app/MacOS/soffice",
-            "/private/LibreOffice.app/Contents/MacOS/other",
             "/private/LibreOffice.app/Contents/bin/soffice",
             "/private/bin/soffice",
         ] {
@@ -1534,6 +1567,23 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_rejects_an_executable_other_than_the_declared_bundle_main() {
+        let (_directory, bundle, program, _source) = fake_office_bundle();
+        std::fs::write(
+            bundle.join("Contents/Info.plist"),
+            br#"<?xml version="1.0"?><plist version="1.0"><dict>
+            <key>CFBundleExecutable</key><string>alternate-renderer</string></dict></plist>"#,
+        )
+        .unwrap();
+        let error = verify_macos_office_bundle(&bundle, &program, test_deadline()).unwrap_err();
+        assert!(
+            error.to_string().contains("bundle's main executable"),
+            "{error}"
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -1553,7 +1603,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_forged_bundle_identity_does_not_authorize_runtime() {
-        let (_directory, bundle, program, _source) = fake_office_bundle();
+        let (_directory, bundle, program, source) = fake_office_bundle();
+        std::fs::write(source, macos_catalog(macos_spell_component())).unwrap();
         std::fs::write(
             bundle.join("Contents/Info.plist"),
             br#"<?xml version="1.0"?><plist version="1.0"><dict>
@@ -1562,8 +1613,16 @@ mod tests {
             <key>CFBundleExecutable</key><string>soffice</string></dict></plist>"#,
         )
         .unwrap();
-        assert!(verify_macos_office_bundle(&bundle, test_deadline()).is_err());
-        assert!(private_uno_catalog_for_program(&program, test_deadline()).is_err());
+        assert!(verify_macos_office_bundle(&bundle, &program, test_deadline()).is_err());
+        let deadline = test_deadline();
+        let runtime = OfficeRuntime::new(&program, deadline).unwrap();
+        let sources = RenderSources::resolve(&program, [bundle.clone()]).unwrap();
+        let snapshot = RuntimeSnapshot::new(vec![bundle], &sources, deadline).unwrap();
+        assert!(
+            runtime
+                .verify_runtime_signature(&program, &snapshot, deadline)
+                .is_err()
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -1596,8 +1655,9 @@ mod tests {
             source_digest: hex_digest(&Sha256::digest(&bytes)),
         };
         let scratch = private_temp_dir().unwrap();
-        let filtered =
-            write_private_uno_catalog(&catalog, scratch.path(), test_deadline()).unwrap();
+        let filtered = write_private_uno_catalog(&catalog, scratch.path(), test_deadline())
+            .unwrap()
+            .unwrap();
         assert!(
             !std::fs::read_to_string(filtered)
                 .unwrap()
@@ -1621,7 +1681,7 @@ mod tests {
     fn macos_runtime_roots_admit_only_the_validated_bundle() {
         let (_directory, bundle, program, source) = fake_office_bundle();
         // This constructs the post-verification value only to test root
-        // selection; production can obtain it only through codesign above.
+        // selection; signature verification is tested separately.
         let catalog = PrivateUnoCatalog {
             bundle: bundle.clone(),
             source,
@@ -2376,7 +2436,11 @@ mod tests {
         let bundle =
             macos_office_bundle_candidate(&installed).expect("installed signed Office bundle");
         let temp = tempfile::tempdir().unwrap();
-        let private_bundle = temp.path().canonicalize().unwrap().join("LibreOffice.app");
+        let private_bundle = temp
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("Renamed Office.app");
         let output = kio_process::run_bounded_command(
             std::process::Command::new("/usr/bin/ditto")
                 .arg(&bundle)
@@ -2399,6 +2463,9 @@ mod tests {
             deadline,
         )
         .unwrap();
+        renderer
+            .verify_runtime_signatures(deadline)
+            .expect("verify copied bundle signature");
         let converter = OfficeConverter {
             backend: ConverterBackend::Real(renderer),
             version: "unknown".to_owned(),
