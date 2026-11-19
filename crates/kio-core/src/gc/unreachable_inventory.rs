@@ -296,6 +296,7 @@ where
 }
 
 struct ScanState<'a> {
+    record_stages: &'a crate::disk_records::RecordStageRoot,
     limits: &'a UnreachableInventoryLimits,
     walker_limits: GcPlanLimits,
     walker_stats: GcPlanStats,
@@ -331,7 +332,10 @@ struct ScanState<'a> {
 }
 
 impl<'a> ScanState<'a> {
-    fn new(limits: &'a UnreachableInventoryLimits) -> Self {
+    fn new(
+        limits: &'a UnreachableInventoryLimits,
+        record_stages: &'a crate::disk_records::RecordStageRoot,
+    ) -> Self {
         let walker_limits = GcPlanLimits {
             max_refs: limits.max_refs,
             max_receipts: limits.max_receipts,
@@ -343,6 +347,7 @@ impl<'a> ScanState<'a> {
         };
         Self {
             limits,
+            record_stages,
             walker_limits,
             walker_stats: GcPlanStats::default(),
             stats: InventoryStats::default(),
@@ -501,11 +506,12 @@ impl UnreachableObjectInventory {
         let guard = acquire_bound_store_read_guard_with_control(&self.kio, &self.control)?;
         guard.recheck_idle()?;
         let invocation_time = self.control.now_utc_seconds();
-        let first = self.pass(&invocation_time)?;
+        let record_stages = crate::disk_records::RecordStageRoot::temporary()?;
+        let first = self.pass(&invocation_time, &record_stages)?;
         guard.recheck_idle()?;
         #[cfg(test)]
         self.wait_at_first_pass_test_barrier();
-        let second = self.pass(&invocation_time)?;
+        let second = self.pass(&invocation_time, &record_stages)?;
         guard.recheck_idle()?;
         self.assert_stable()?;
         if first != second {
@@ -578,8 +584,12 @@ impl UnreachableObjectInventory {
         }
     }
 
-    fn pass(&self, invocation_time: &str) -> Result<Pass> {
-        let mut state = ScanState::new(&self.limits);
+    fn pass(
+        &self,
+        invocation_time: &str,
+        record_stages: &crate::disk_records::RecordStageRoot,
+    ) -> Result<Pass> {
+        let mut state = ScanState::new(&self.limits, record_stages);
         state.observe_directory(&self.scope, "scope")?;
         state.observe_directory(&self.kio, ".kio")?;
         self.observe_scope_identity(&mut state)?;
@@ -960,6 +970,7 @@ impl UnreachableObjectInventory {
                             .max_verified_bytes
                             .saturating_sub(state.stats.verified_bytes);
                         let (tree, observation) = read_cas_tree_observed(
+                            state.record_stages,
                             &CasReadAccess::Unmetered,
                             &second_dir,
                             &leaf,

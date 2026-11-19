@@ -123,6 +123,7 @@ impl ObjectStore {
             error: None,
         };
         let decoded = crate::disk_records::decode_bounded_json::<TreeObject>(
+            &self.record_stages()?,
             std::io::BufReader::with_capacity(CAS_STREAM_BUFFER_BYTES, &mut source),
         );
         if decoded
@@ -200,8 +201,16 @@ mod tests {
     fn st05_tree_larger_than_sixteen_mib_roundtrips() {
         let temp = tempfile::tempdir().unwrap();
         let repo = crate::scope::Repository::init(temp.path()).unwrap();
-        let config = build_tree(Vec::new()).unwrap().chunking_config_hash;
-        let mut builder = crate::dag::TreeBuilder::new(config);
+        let config = build_tree(
+            &crate::disk_records::RecordStageRoot::temporary().unwrap(),
+            Vec::new(),
+        )
+        .unwrap()
+        .chunking_config_hash;
+        let mut builder = crate::dag::TreeBuilder::new(
+            &crate::disk_records::RecordStageRoot::temporary().unwrap(),
+            config,
+        );
         for i in 0..100_000 {
             builder
                 .push(
@@ -227,7 +236,11 @@ mod tests {
     fn tree_read_verifies_corruption_and_charges_the_stream_before_schema_errors() {
         let temp = tempfile::tempdir().unwrap();
         let repo = crate::scope::Repository::init(temp.path()).unwrap();
-        let tree = build_tree(vec![TreeEntry::raw_file("a", hash_bytes(b"raw")).unwrap()]).unwrap();
+        let tree = build_tree(
+            &crate::disk_records::RecordStageRoot::temporary().unwrap(),
+            vec![TreeEntry::raw_file("a", hash_bytes(b"raw")).unwrap()],
+        )
+        .unwrap();
         let hash = repo.object_store().write_tree(&tree).unwrap();
         let size = repo
             .object_store()
@@ -281,7 +294,11 @@ mod tests {
             }
             entries.push(entry);
         }
-        let tree = build_tree(entries).unwrap();
+        let tree = build_tree(
+            &crate::disk_records::RecordStageRoot::temporary().unwrap(),
+            entries,
+        )
+        .unwrap();
         let expected = serde_jcs::to_vec(&tree).unwrap();
         let mut streamed = Vec::new();
         let mut source = TreeJsonReader::new(&tree).unwrap();

@@ -542,7 +542,11 @@ fn ct4_fsck_checks_failed_prepared_and_metadata_only_image_references() {
         .write_content_object(ContentObjectKind::Manifest, &manifest_bytes)
         .unwrap();
 
-    let tree = build_tree(entries).unwrap();
+    let tree = build_tree(
+        &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+        entries,
+    )
+    .unwrap();
     let (tree_hash, _) = store
         .write_json(ObjectKind::Tree, &serde_json::to_value(&tree).unwrap())
         .unwrap();

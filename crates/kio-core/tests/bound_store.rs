@@ -103,7 +103,14 @@ fn bound_inspection_accounted_reads_and_streaming_copy_follow_retained_namespace
     objects.push((ObjectKind::Raw, store.write_raw(&raw).unwrap(), raw));
     for kind in [ObjectKind::Tree, ObjectKind::Commit] {
         let value = if kind == ObjectKind::Tree {
-            serde_json::to_value(kio_core::dag::build_tree(Vec::new()).unwrap()).unwrap()
+            serde_json::to_value(
+                kio_core::dag::build_tree(
+                    &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .unwrap()
         } else {
             serde_json::json!({"namespace":format!("{kind:?}")})
         };

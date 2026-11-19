@@ -6,6 +6,7 @@ use cap_primitives::fs as cap_fs;
 
 use crate::{
     cas::{CasReadAccess, hash_bytes},
+    disk_records::RecordStageRoot,
     error::Result,
 };
 
@@ -136,16 +137,17 @@ pub(crate) fn observe_cas_regular(
     name: &str,
     max: u64,
 ) -> Result<FileObservation> {
-    stream_named(reads, directory, name, max, false).map(|(_, observation)| observation)
+    stream_named(None, reads, directory, name, max).map(|(_, observation)| observation)
 }
 
 pub(crate) fn read_cas_tree_observed(
+    root: &RecordStageRoot,
     reads: &CasReadAccess,
     directory: &std::fs::File,
     name: &str,
     max: u64,
 ) -> Result<(crate::dag::TreeObject, FileObservation)> {
-    let (tree, observation) = stream_named(reads, directory, name, max, true)?;
+    let (tree, observation) = stream_named(Some(root), reads, directory, name, max)?;
     Ok((
         tree.ok_or_else(|| corrupt("invalid tree object"))?,
         observation,
@@ -155,20 +157,21 @@ pub(crate) fn read_cas_tree_observed(
 /// The retirement sentinel shares an archive slot with a tree during recovery.
 /// Its fixed digest distinguishes it without materializing either body.
 pub(crate) fn read_tree_archive_observed(
+    root: &RecordStageRoot,
     reads: &CasReadAccess,
     directory: &std::fs::File,
     name: &str,
     max: u64,
 ) -> Result<(Option<crate::dag::TreeObject>, FileObservation)> {
-    stream_named(reads, directory, name, max, true)
+    stream_named(Some(root), reads, directory, name, max)
 }
 
 fn stream_named(
+    root: Option<&RecordStageRoot>,
     reads: &CasReadAccess,
     directory: &std::fs::File,
     name: &str,
     max: u64,
-    decode: bool,
 ) -> Result<(Option<crate::dag::TreeObject>, FileObservation)> {
     reads.charge(0)?;
     let path = Path::new(name);
@@ -184,7 +187,7 @@ fn stream_named(
     if !same_file_state(&before, &opened)? {
         return Err(corrupt("store file changed while opening"));
     }
-    let result = stream_handle(reads, &file, max, decode)?;
+    let result = stream_handle(root, reads, &file, max)?;
     let after =
         cap_fs::stat(directory, path, cap_fs::FollowSymlinks::No).map_err(|e| ioerr(e, name))?;
     valid_file(&after, max)?;
@@ -196,10 +199,11 @@ fn stream_named(
 
 #[cfg(windows)]
 pub(crate) fn observe_tree_handle(
+    root: &RecordStageRoot,
     file: &std::fs::File,
     max: u64,
 ) -> Result<(crate::dag::TreeObject, FileObservation)> {
-    let (tree, observation) = stream_handle(&CasReadAccess::Unmetered, file, max, true)?;
+    let (tree, observation) = stream_handle(Some(root), &CasReadAccess::Unmetered, file, max)?;
     Ok((
         tree.ok_or_else(|| corrupt("invalid tree object"))?,
         observation,
@@ -207,10 +211,10 @@ pub(crate) fn observe_tree_handle(
 }
 
 fn stream_handle(
+    root: Option<&RecordStageRoot>,
     reads: &CasReadAccess,
     file: &std::fs::File,
     max: u64,
-    decode: bool,
 ) -> Result<(Option<crate::dag::TreeObject>, FileObservation)> {
     use sha2::{Digest, Sha256};
     use std::io::{Seek, SeekFrom};
@@ -259,16 +263,12 @@ fn stream_handle(
         max,
         error: None,
     };
-    let decoded = if decode {
-        Some(crate::disk_records::decode_bounded_json::<
-            crate::dag::TreeObject,
-        >(std::io::BufReader::with_capacity(
-            64 * 1024,
-            &mut source,
-        )))
-    } else {
-        None
-    };
+    let decoded = root.map(|root| {
+        crate::disk_records::decode_bounded_json::<crate::dag::TreeObject>(
+            root,
+            std::io::BufReader::with_capacity(64 * 1024, &mut source),
+        )
+    });
     let drained = if source.error.is_none() {
         std::io::copy(&mut source, &mut std::io::sink())
     } else {
@@ -333,10 +333,16 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let directory =
             StoreDirectory::open_or_create_directories(&temp.path().join("owned")).unwrap();
-        let config = crate::dag::build_tree(Vec::new())
-            .unwrap()
-            .chunking_config_hash;
-        let mut builder = TreeBuilder::new(config);
+        let config = crate::dag::build_tree(
+            &crate::disk_records::RecordStageRoot::temporary().unwrap(),
+            Vec::new(),
+        )
+        .unwrap()
+        .chunking_config_hash;
+        let mut builder = TreeBuilder::new(
+            &crate::disk_records::RecordStageRoot::temporary().unwrap(),
+            config,
+        );
         let suffix = "a".repeat(30_000);
         let raw = format!("sha256:{}", "a".repeat(64));
         for index in 0..600 {
@@ -350,6 +356,7 @@ mod tests {
         assert!(size > 16 * 1024 * 1024);
         let expected = crate::dag::tree_hash(&tree).unwrap();
         let (decoded, observed) = read_cas_tree_observed(
+            &RecordStageRoot::temporary().unwrap(),
             &CasReadAccess::Unmetered,
             &directory.root_handle(),
             "tree",
@@ -361,6 +368,7 @@ mod tests {
         assert_eq!(observed.state.len, size);
         assert!(
             read_cas_tree_observed(
+                &RecordStageRoot::temporary().unwrap(),
                 &CasReadAccess::Unmetered,
                 &directory.root_handle(),
                 "tree",
@@ -382,6 +390,7 @@ mod tests {
         sentinel.write_all(b"kio gc retirement sentinel\n").unwrap();
         assert!(
             read_tree_archive_observed(
+                &RecordStageRoot::temporary().unwrap(),
                 &CasReadAccess::Unmetered,
                 &directory.root_handle(),
                 "sentinel",
@@ -393,6 +402,7 @@ mod tests {
         );
         assert!(
             read_cas_tree_observed(
+                &RecordStageRoot::temporary().unwrap(),
                 &CasReadAccess::Unmetered,
                 &directory.root_handle(),
                 "sentinel",
@@ -405,6 +415,7 @@ mod tests {
             .unwrap();
         write!(oversized, "{{\"object_type\":\"{}\"}}", "a".repeat(70_000)).unwrap();
         let error = read_cas_tree_observed(
+            &RecordStageRoot::temporary().unwrap(),
             &CasReadAccess::Unmetered,
             &directory.root_handle(),
             "oversized-token",
@@ -415,13 +426,18 @@ mod tests {
             error.resource_limit().unwrap().resource,
             crate::error::Resource::Memory
         );
-        let tree = crate::dag::build_tree(Vec::new()).unwrap();
+        let tree = crate::dag::build_tree(
+            &crate::disk_records::RecordStageRoot::temporary().unwrap(),
+            Vec::new(),
+        )
+        .unwrap();
         let mut file = directory
             .create_private_file(Path::new("noncanonical"))
             .unwrap();
         serde_json::to_writer_pretty(&mut file, &tree).unwrap();
         assert!(
             read_tree_archive_observed(
+                &RecordStageRoot::temporary().unwrap(),
                 &CasReadAccess::Unmetered,
                 &directory.root_handle(),
                 "noncanonical",

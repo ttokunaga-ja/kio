@@ -13,6 +13,7 @@ use crate::platform::gc_rename_noreplace_between as rename_noreplace_between;
 use cap_primitives::fs as cap_fs;
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn retire_candidate_tree(
+    record_stages: &crate::disk_records::RecordStageRoot,
     tree_hash: &str,
     expected_size: u64,
     raw: &str,
@@ -33,7 +34,13 @@ pub(crate) fn retire_candidate_tree(
     // Both paths bind a no-follow writable descriptor before the archive
     // name is removed; no ambient pathname is ever used for deletion.
     let reads = CasReadAccess::Unmetered;
-    let canonical = read_cas_tree_observed(&reads, canonical_parent, raw, expected_size.max(64));
+    let canonical = read_cas_tree_observed(
+        record_stages,
+        &reads,
+        canonical_parent,
+        raw,
+        expected_size.max(64),
+    );
     let (before, writable, already_captured) = match canonical {
         Ok((_, before)) => {
             validate_observation(&before)?;
@@ -66,6 +73,7 @@ pub(crate) fn retire_candidate_tree(
         }
         Err(error) if is_io_not_found(&error) => {
             let (before, already_captured) = match read_tree_archive_observed(
+                record_stages,
                 &reads,
                 archive_parent,
                 quarantine,
@@ -73,6 +81,7 @@ pub(crate) fn retire_candidate_tree(
             ) {
                 Ok((None, _)) => {
                     match read_cas_tree_observed(
+                        record_stages,
                         &reads,
                         archive_parent,
                         captured_name,

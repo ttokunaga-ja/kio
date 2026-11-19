@@ -2,7 +2,7 @@
 //! at a time; the outer array is never passed to the JCS serializer.
 use kio_core::{
     cas::{canonical_json_bytes, lower_hex},
-    disk_records::DiskRecords,
+    disk_records::{DiskRecords, RecordStageRoot},
 };
 use serde::{Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
@@ -66,7 +66,11 @@ impl<R: Read> Read for Hashed<R> {
 
 /// `max` is the caller's existing budget. Even invalid JSON is drained through
 /// the same reader so bytes used by failed verification are accounted for.
-pub(crate) fn decode<T: DeserializeOwned>(source: impl Read, max: u64) -> Decoded<T> {
+pub(crate) fn decode<T: DeserializeOwned>(
+    root: &RecordStageRoot,
+    source: impl Read,
+    max: u64,
+) -> Decoded<T> {
     let mut reader = Hashed {
         source: source.take(max),
         hash: Sha256::new(),
@@ -77,7 +81,7 @@ pub(crate) fn decode<T: DeserializeOwned>(source: impl Read, max: u64) -> Decode
         rejected: false,
     };
     let mut decoded =
-        kio_core::disk_records::decode_json(BufReader::with_capacity(64 * 1024, &mut reader));
+        kio_core::disk_records::decode_json(root, BufReader::with_capacity(64 * 1024, &mut reader));
     if !reader.rejected
         && let Err(error) = io::copy(&mut reader, &mut io::sink())
     {
@@ -147,8 +151,11 @@ mod tests {
             {"path": "é\"\\.txt", "raw_hash": "sha256:a", "type": "file"},
             {"path": "日本語.txt", "raw_hash": "sha256:b", "type": "file", "normalize": {"gen": 3, "manifest_hash": "sha256:c", "tool_profile_hash": "sha256:d"}}
         ]);
-        let records: DiskRecords<serde_json::Value> =
-            serde_json::from_value(entries.clone()).unwrap();
+        let records: DiskRecords<serde_json::Value> = DiskRecords::from_records(
+            &RecordStageRoot::temporary().unwrap(),
+            entries.as_array().unwrap().iter().cloned(),
+        )
+        .unwrap();
         let envelope = serde_json::json!({"chunking_config_hash": "sha256:config", "entries": entries, "object_type": "tree"});
         assert_eq!(
             canonical_hash("sha256:config", &records, "tree").unwrap(),
@@ -173,6 +180,7 @@ mod tests {
         file.seek(SeekFrom::Start(0)).unwrap();
         let largest = Rc::new(Cell::new(0));
         let outcome = decode::<Tree>(
+            &RecordStageRoot::temporary().unwrap(),
             Measured {
                 source: file,
                 largest: largest.clone(),
@@ -190,7 +198,11 @@ mod tests {
     #[test]
     fn tree_json_never_reads_past_the_callers_remaining_budget() {
         let input = vec![b' '; 1024];
-        let outcome = decode::<Tree>(input.as_slice(), 512);
+        let outcome = decode::<Tree>(
+            &RecordStageRoot::temporary().unwrap(),
+            input.as_slice(),
+            512,
+        );
         assert!(outcome.decoded.is_err());
         assert_eq!(outcome.consumed, 512);
     }
@@ -219,7 +231,11 @@ mod tests {
                 Ok(n)
             }
         }
-        let outcome = decode::<Tree>(Bytes(input), 4 * 1024 * 1024);
+        let outcome = decode::<Tree>(
+            &RecordStageRoot::temporary().unwrap(),
+            Bytes(input),
+            4 * 1024 * 1024,
+        );
         assert!(outcome.decoded.is_err());
         assert!(outcome.consumed <= 128 * 1024);
     }

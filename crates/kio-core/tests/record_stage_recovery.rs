@@ -1,7 +1,10 @@
 //! A killed process cannot run Drop; saved stage identities must survive it.
-use kio_core::{disk_records::RecordWriter, scope::Repository};
+use kio_core::{
+    cas::ObjectStore, disk_records::RecordWriter, scope::Repository, store_dir::StoreDirectory,
+};
 use std::{
     fs,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
     time::{Duration, Instant},
@@ -12,7 +15,9 @@ fn record_stage_crash_child() {
     let Some(ready) = std::env::var_os("KIO_RECORD_CRASH_READY") else {
         return;
     };
-    let mut writer = RecordWriter::new().unwrap();
+    let ready = PathBuf::from(ready);
+    let store = ObjectStore::new(ready.parent().unwrap().join(".kio"));
+    let mut writer = RecordWriter::new(&store.record_stages().unwrap()).unwrap();
     for value in 0..512u64 {
         writer.push(&value).unwrap();
     }
@@ -33,38 +38,29 @@ impl Drop for Child {
 }
 
 #[test]
-fn killed_record_writer_is_reported_and_reclaimed_on_retry() {
-    // Keep the killed run separate from concurrent test processes' retries.
-    if std::env::var_os("KIO_RECORD_CRASH_DRIVER").is_none() {
-        let fixture = tempfile::tempdir().unwrap();
-        let status = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "killed_record_writer_is_reported_and_reclaimed_on_retry",
-                "--nocapture",
-            ])
-            .env("KIO_RECORD_CRASH_DRIVER", "1")
-            .env(
-                "KIO_TEST_RECORD_STAGE_ROOT",
-                fixture.path().join("registry"),
-            )
-            .status()
-            .unwrap();
-        assert!(status.success());
-        return;
-    }
+fn record_stages_follow_the_store_instead_of_the_cache() {
     let fixture = tempfile::tempdir().unwrap();
-    let repo = Repository::init(fixture.path()).unwrap();
     let ready = fixture.path().join("ready");
-    let exe = std::env::current_exe().unwrap();
+    StoreDirectory::open(fixture.path())
+        .unwrap()
+        .create_directory(Path::new(".kio"))
+        .unwrap();
+    let cache = fixture.path().join("unrelated-cache");
     let mut child = Child(
-        Command::new(exe)
+        Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "record_stage_crash_child", "--nocapture"])
             .env("KIO_RECORD_CRASH_READY", &ready)
-            .stdout(Stdio::null())
+            .env("XDG_CACHE_HOME", &cache)
             .spawn()
             .unwrap(),
     );
+    wait_until_ready(&mut child, &ready);
+    let stages = fixture.path().join(".kio/internal/record-stages/stages");
+    assert!(fs::read_dir(stages).unwrap().next().is_some());
+    assert!(!cache.exists());
+}
+
+fn wait_until_ready(child: &mut Child, ready: &std::path::Path) {
     let started = Instant::now();
     while !ready.exists() {
         assert!(
@@ -77,6 +73,23 @@ fn killed_record_writer_is_reported_and_reclaimed_on_retry() {
         );
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[test]
+fn killed_record_writer_is_reported_and_reclaimed_on_retry() {
+    let fixture = tempfile::tempdir().unwrap();
+    let repo = Repository::init(fixture.path()).unwrap();
+    let ready = fixture.path().join("ready");
+    let exe = std::env::current_exe().unwrap();
+    let mut child = Child(
+        Command::new(exe)
+            .args(["--exact", "record_stage_crash_child", "--nocapture"])
+            .env("KIO_RECORD_CRASH_READY", &ready)
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    wait_until_ready(&mut child, &ready);
     // A live owner must not be reported or reclaimed by another process.
     assert!(repo.object_store().inspect_raw_stages().unwrap().is_empty());
     child.0.kill().unwrap();
@@ -95,7 +108,21 @@ fn killed_record_writer_is_reported_and_reclaimed_on_retry() {
             .any(|entry| entry.path.contains("record")),
         "status must report record residues before a retry"
     );
-    let mut retry = RecordWriter::new().unwrap();
+    let other_fixture = tempfile::tempdir().unwrap();
+    let other = Repository::init(other_fixture.path()).unwrap();
+    let mut other_writer =
+        RecordWriter::new(&other.object_store().record_stages().unwrap()).unwrap();
+    other_writer.push(&42u64).unwrap();
+    assert!(
+        other
+            .object_store()
+            .inspect_raw_stages()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!repo.object_store().inspect_raw_stages().unwrap().is_empty());
+
+    let mut retry = RecordWriter::new(&repo.object_store().record_stages().unwrap()).unwrap();
     retry.push(&99u64).unwrap();
     let records = retry.finish().unwrap();
     assert_eq!(records.first().unwrap(), Some(99));

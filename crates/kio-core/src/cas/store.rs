@@ -194,9 +194,24 @@ impl ObjectStore {
             .stage_raw_from_reader(reader, max_bytes)
     }
 
+    /// The retained private registry used by tree readers, writers and sorts.
+    pub fn record_stages(&self) -> Result<crate::disk_records::RecordStageRoot> {
+        let directory = if let Some(bound) = &self.bound {
+            bound.record_stage_directory(self.control.clone())?
+        } else {
+            crate::store_dir::StoreDirectory::open_with_control(
+                self.ambient_kio_dir()?,
+                self.control.clone(),
+            )?
+        };
+        Ok(crate::disk_records::RecordStageRoot::in_store(directory))
+    }
+
     pub fn inspect_raw_stages(&self) -> Result<Vec<RawStageResidue>> {
         if let Some(bound) = &self.bound {
-            return bound.inspect_raw_stages(false);
+            let mut residues = bound.inspect_raw_stages(false)?;
+            residues.extend(self.record_stages()?.inspect()?);
+            return Ok(residues);
         }
         let directory = crate::store_dir::StoreDirectory::open_with_control(
             self.ambient_kio_dir()?,

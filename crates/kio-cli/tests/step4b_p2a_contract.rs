@@ -143,7 +143,11 @@ fn persist_and_pin_normalized_instance(
         .unwrap()
         .manifest_hash = manifest_hash;
 
-    let tree = build_tree(entries).unwrap();
+    let tree = build_tree(
+        &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+        entries,
+    )
+    .unwrap();
     let store = ObjectStore::new(repo.kio_dir());
     let (tree_hash, _) = store
         .write_json(ObjectKind::Tree, &serde_json::to_value(&tree).unwrap())

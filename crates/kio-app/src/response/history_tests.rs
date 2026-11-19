@@ -93,12 +93,15 @@ fn diff_projection_preserves_empty_changes_and_domain_field_omissions() {
 fn inspect_projection_preserves_unwrapped_tree_commit_and_raw_objects() {
     let tree = TreeObject {
         chunking_config_hash: "f".repeat(64),
-        entries: kio_core::disk_records::DiskRecords::from_records([TreeEntry {
-            path: "notes.md".to_owned(),
-            entry_type: "file".to_owned(),
-            raw_hash: "d".repeat(64),
-            normalize: None,
-        }])
+        entries: kio_core::disk_records::DiskRecords::from_records(
+            &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+            [TreeEntry {
+                path: "notes.md".to_owned(),
+                entry_type: "file".to_owned(),
+                raw_hash: "d".repeat(64),
+                normalize: None,
+            }],
+        )
         .unwrap(),
         object_type: "tree".to_owned(),
     };

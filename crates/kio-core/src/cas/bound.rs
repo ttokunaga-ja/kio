@@ -73,6 +73,17 @@ impl BoundObjectDirs {
         Ok(())
     }
 
+    pub(super) fn record_stage_directory(
+        &self,
+        control: crate::control::ControlHandle,
+    ) -> Result<crate::store_dir::StoreDirectory> {
+        crate::store_dir::StoreDirectory::from_retained_with_control(
+            self.kio.try_clone().kio_io(Path::new(".kio"))?,
+            PathBuf::from(".kio"),
+            control,
+        )
+    }
+
     fn raw_stage_directories(&self, create: bool) -> Result<Option<RawStageDirectories>> {
         let internal = match bound_open_or_create_dir(&self.kio, "internal", create) {
             Err(error) if !create && error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => {
@@ -205,7 +216,6 @@ impl BoundObjectDirs {
                 });
             }
         }
-        residues.extend(crate::disk_records::inspect_stage_residues()?);
         Ok(residues)
     }
 

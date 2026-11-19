@@ -980,11 +980,12 @@ file を途中まで保存して成功扱いせず、未保存 file を削除扱
 回復時は保存した identity が一致する stage だけを回収し、確定できない残骸は削除しない。
 `status` の `stage_residues` と `repair verify-objects` の finding に、その path と理由を表示する。
 
-tree の外部 sort や逐次 reader の一時記録は
-`${XDG_CACHE_HOME:-$HOME/.cache}/kio/record-stages/` に置く。
+tree の外部 sort や逐次 reader の一時記録は、操作対象の store の private 領域
+`internal/record-stages/` に置く。store を変更しない GC の読取や manifest の検証、評価ツールでは、
+呼出し側が用意した private な作業ディレクトリを使う。
 記録を書き始める前に、run directory・記録・lease の identity を journal に保存する。
 生存中の lease は回収せず、再試行時に保存した identity が一致する非稼働の記録だけを回収する。
-確定できない記録は保持し、同じ `stage_residues` と finding に表示する。
+確定できない記録は保持する。store 内の残骸は同じ `stage_residues` と finding に表示する。
 
 ## chunk
 

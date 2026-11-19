@@ -190,7 +190,11 @@ impl Fixture {
             r#gen: 0,
             manifest_hash: manifest.to_owned(),
         });
-        let tree = build_tree(vec![entry]).unwrap();
+        let tree = build_tree(
+            &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+            vec![entry],
+        )
+        .unwrap();
         self.store()
             .write_json(ObjectKind::Tree, &serde_json::to_value(tree).unwrap())
             .unwrap()
@@ -468,7 +472,11 @@ fn unreachable_commit_still_protects_its_tree_manifest_unit_and_tool_lock() {
 fn shallow_receipt_classifies_commit_and_explains_only_its_missing_tree() {
     let fixture = Fixture::new();
     let old = fixture.live_graph(0, None);
-    let empty_tree = build_tree(vec![]).unwrap();
+    let empty_tree = build_tree(
+        &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+        vec![],
+    )
+    .unwrap();
     let empty_tree_hash = fixture
         .store()
         .write_json(ObjectKind::Tree, &serde_json::to_value(empty_tree).unwrap())
@@ -538,7 +546,11 @@ fn shallow_receipt_makes_orphaned_semantic_closure_inventory_only() {
     .unwrap();
 
     let boundary = fixture.live_graph(0, None);
-    let empty_tree = build_tree(vec![]).unwrap();
+    let empty_tree = build_tree(
+        &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+        vec![],
+    )
+    .unwrap();
     let empty_tree_hash = fixture
         .store()
         .write_json(ObjectKind::Tree, &serde_json::to_value(empty_tree).unwrap())
@@ -650,7 +662,11 @@ fn completed_purge_and_only_pre_resurrection_manifest_gaps_are_accepted() {
     let original = fixture.live_graph(0, None);
     fixture.set_tip(&original.commit);
 
-    let empty_tree = build_tree(vec![]).unwrap();
+    let empty_tree = build_tree(
+        &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+        vec![],
+    )
+    .unwrap();
     let empty_tree_hash = fixture
         .store()
         .write_json(ObjectKind::Tree, &serde_json::to_value(empty_tree).unwrap())
@@ -780,7 +796,14 @@ fn completed_purge_does_not_explain_post_purge_tree_gaps() {
         .store()
         .write_json(
             ObjectKind::Tree,
-            &serde_json::to_value(build_tree(vec![]).unwrap()).unwrap(),
+            &serde_json::to_value(
+                build_tree(
+                    &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+                    vec![],
+                )
+                .unwrap(),
+            )
+            .unwrap(),
         )
         .unwrap()
         .0;

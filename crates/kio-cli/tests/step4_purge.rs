@@ -835,7 +835,11 @@ fn ct4_purge_fails_closed_on_cross_raw_reachable_manifest_reuse() {
         .find(|entry| entry.path == "z-survivor.md")
         .unwrap();
     survivor.normalize.as_mut().unwrap().manifest_hash = target_manifest.clone();
-    forged_tree.entries = kio_core::disk_records::DiskRecords::from_records(entries).unwrap();
+    forged_tree.entries = kio_core::disk_records::DiskRecords::from_records(
+        &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+        entries,
+    )
+    .unwrap();
     let store = ObjectStore::new(repo.kio_dir());
     let (tree_hash, _) = store
         .write_json(

@@ -13,7 +13,7 @@ use std::{
     fs::File,
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
     marker::PhantomData,
-    path::{Path, PathBuf},
+    path::Path,
     sync::Arc,
 };
 
@@ -40,33 +40,88 @@ impl Drop for StageInspection {
         PRESERVE_STAGES.with(|depth| depth.set(depth.get() - 1));
     }
 }
-fn stage_root() -> Result<PathBuf> {
-    #[cfg(debug_assertions)]
-    if let Some(path) = crate::test_control::DebugTestControl::from_env()
-        .core
-        .record_stage_root
-    {
-        if !path.is_absolute() {
-            return Err(KioError::invalid_usage(
-                "record stage root must be absolute",
-            ));
+/// Retained authority for a store's registry or an isolated scratch workspace.
+#[derive(Clone, Debug)]
+pub struct RecordStageRoot {
+    directory: StoreDirectory,
+    scratch: Option<Arc<ScratchDirectory>>,
+}
+
+#[derive(Debug)]
+struct ScratchDirectory {
+    directory: tempfile::TempDir,
+    preserve: std::sync::atomic::AtomicBool,
+}
+
+impl Drop for ScratchDirectory {
+    fn drop(&mut self) {
+        if *self.preserve.get_mut() {
+            self.directory.disable_cleanup(true);
         }
-        return Ok(path);
     }
-    crate::xdg::xdg_dir("XDG_CACHE_HOME")
-        .or_else(|| crate::xdg::home_dir().map(|path| path.join(".cache")))
-        .map(|path| path.join("kio/record-stages"))
-        .ok_or_else(|| KioError::invalid_usage("record stages require an absolute cache directory"))
 }
-pub(crate) fn inspect_stage_residues() -> Result<Vec<crate::cas::RawStageResidue>> {
-    Ok(stages::inspect(&stage_root()?, false)?
-        .into_iter()
-        .map(|entry| crate::cas::RawStageResidue {
-            path: entry.path,
-            reason: entry.reason,
+
+impl RecordStageRoot {
+    pub(crate) fn in_store(directory: StoreDirectory) -> Self {
+        Self {
+            directory,
+            scratch: None,
+        }
+    }
+
+    /// Allocate a private workspace for callers without a writable store.
+    /// DiskRecords retain it until the last record reader has finished.
+    pub fn temporary() -> Result<Self> {
+        let temp = tempfile::Builder::new()
+            .prefix("kio-records-")
+            .tempdir()
+            .map_err(|error| crate::store_dir::ioerr(Path::new("record scratch"), error))?;
+        let directory = StoreDirectory::open(temp.path())?;
+        crate::store_dir::restrict_new_private_directory(&directory.root_handle())?;
+        Ok(Self {
+            directory,
+            scratch: Some(Arc::new(ScratchDirectory {
+                directory: temp,
+                preserve: false.into(),
+            })),
         })
-        .collect())
+    }
+
+    fn registry(&self, create: bool) -> Result<Option<StoreDirectory>> {
+        crate::private_fs::verify_private_directory_handle(&self.directory)?;
+        let parent = if self.scratch.is_none() {
+            let Some(internal) = stages::container(&self.directory, "internal", create)? else {
+                return Ok(None);
+            };
+            internal
+        } else {
+            self.directory.clone()
+        };
+        stages::container(&parent, "record-stages", create)
+    }
+
+    pub(crate) fn inspect(&self) -> Result<Vec<crate::cas::RawStageResidue>> {
+        let Some(registry) = self.registry(false)? else {
+            return Ok(Vec::new());
+        };
+        Ok(stages::inspect(&registry, false)?
+            .into_iter()
+            .map(|entry| crate::cas::RawStageResidue {
+                path: entry.path,
+                reason: entry.reason,
+            })
+            .collect())
+    }
+
+    fn preserve_scratch(&self) {
+        if let Some(scratch) = &self.scratch {
+            scratch
+                .preserve
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }
+
 struct RunFile {
     directory: StoreDirectory,
     identity: StageIdentity,
@@ -180,8 +235,11 @@ impl<T> DiskRecords<T> {
     }
 }
 impl<T: Serialize + DeserializeOwned> DiskRecords<T> {
-    pub fn from_records(records: impl IntoIterator<Item = T>) -> Result<Self> {
-        let mut out = RecordWriter::new()?;
+    pub fn from_records(
+        root: &RecordStageRoot,
+        records: impl IntoIterator<Item = T>,
+    ) -> Result<Self> {
+        let mut out = RecordWriter::new(root)?;
         for item in records {
             out.push(&item)?;
         }
@@ -242,12 +300,13 @@ pub struct RecordWriter<T> {
     _value: PhantomData<T>,
 }
 impl<T: Serialize> RecordWriter<T> {
-    pub fn new() -> Result<Self> {
+    pub fn new(root: &RecordStageRoot) -> Result<Self> {
         let reclaim = PRESERVE_STAGES.with(|depth| depth.get() == 0);
-        Self::new_at(&stage_root()?, reclaim)
-    }
-    fn new_at(root: &Path, reclaim: bool) -> Result<Self> {
-        let (location, writer) = RunDirectory::create(root, reclaim)?;
+        let created = RunDirectory::create(root, reclaim);
+        if created.is_err() {
+            root.preserve_scratch();
+        }
+        let (location, writer) = created?;
         let directory = location.directory.clone();
         let identity = writer.identity().clone();
         Ok(Self {
@@ -421,7 +480,13 @@ impl<'de, T: Serialize + DeserializeOwned> serde::Deserialize<'de> for DiskRecor
                 self,
                 mut seq: A,
             ) -> std::result::Result<Self::Value, A::Error> {
-                let mut writer = RecordWriter::new().map_err(record_decode_error::<A::Error>)?;
+                let root = DECODE_CONTEXT
+                    .with(|context| context.borrow().last().map(|context| context.root.clone()))
+                    .ok_or_else(|| {
+                        serde::de::Error::custom("disk record decoding requires a stage root")
+                    })?;
+                let mut writer =
+                    RecordWriter::new(&root).map_err(record_decode_error::<A::Error>)?;
                 while let Some(item) = seq.next_element::<T>()? {
                     writer
                         .push(&item)
@@ -446,14 +511,16 @@ impl<T: DeserializeOwned + PartialEq> PartialEq for DiskRecords<T> {
 impl<T: DeserializeOwned + Eq> Eq for DiskRecords<T> {}
 
 pub struct RecordSorter<T> {
+    root: RecordStageRoot,
     chunk: Vec<T>,
     runs: [Option<DiskRecords<T>>; MERGE_SLOTS],
     compare: fn(&T, &T) -> Ordering,
     peak: usize,
 }
 impl<T: Serialize + DeserializeOwned> RecordSorter<T> {
-    pub fn new(compare: fn(&T, &T) -> Ordering) -> Self {
+    pub fn new(root: &RecordStageRoot, compare: fn(&T, &T) -> Ordering) -> Self {
         Self {
+            root: root.clone(),
             chunk: Vec::with_capacity(SORT_BUFFER_RECORDS),
             runs: std::array::from_fn(|_| None),
             compare,
@@ -474,7 +541,7 @@ impl<T: Serialize + DeserializeOwned> RecordSorter<T> {
         let mut b = right.iter();
         let mut first = a.next().transpose()?;
         let mut second = b.next().transpose()?;
-        let mut out = RecordWriter::new()?;
+        let mut out = RecordWriter::new(&self.root)?;
         loop {
             let take_left = match (&first, &second) {
                 (Some(x), Some(y)) => (self.compare)(x, y) != Ordering::Greater,
@@ -497,7 +564,7 @@ impl<T: Serialize + DeserializeOwned> RecordSorter<T> {
             return Ok(());
         }
         self.chunk.sort_unstable_by(self.compare);
-        let mut out = RecordWriter::new()?;
+        let mut out = RecordWriter::new(&self.root)?;
         for item in self.chunk.drain(..) {
             out.push(&item)?;
         }
@@ -526,37 +593,54 @@ impl<T: Serialize + DeserializeOwned> RecordSorter<T> {
                 });
             }
         }
-        result.map_or_else(|| RecordWriter::new()?.finish(), Ok)
+        result.map_or_else(|| RecordWriter::new(&self.root)?.finish(), Ok)
     }
 }
 
-thread_local! {
-    static DECODE_ERRORS: std::cell::RefCell<Vec<Option<KioError>>> = const { std::cell::RefCell::new(Vec::new()) };
+struct DecodeContext {
+    root: RecordStageRoot,
+    error: Option<KioError>,
 }
+
+thread_local! {
+    static DECODE_CONTEXT: std::cell::RefCell<Vec<DecodeContext>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 fn record_decode_error<E: serde::de::Error>(error: KioError) -> E {
     let converted = E::custom(&error);
-    DECODE_ERRORS.with(|errors| {
-        if let Some(slot) = errors.borrow_mut().last_mut() {
-            *slot = Some(error);
+    DECODE_CONTEXT.with(|context| {
+        if let Some(context) = context.borrow_mut().last_mut() {
+            context.error = Some(error);
         }
     });
     converted
 }
-/// Preserve typed private-stage failures across serde's schema error boundary.
+
+/// Pass the caller's retained stage authority through derived serde visitors.
 /// The scope is local to this thread and nests with other JSON decoding scopes.
-pub fn decode_json<T: DeserializeOwned>(reader: impl std::io::Read) -> Result<T> {
+pub fn decode_json<T: DeserializeOwned>(root: &RecordStageRoot, reader: impl Read) -> Result<T> {
     struct Scope;
     impl Drop for Scope {
         fn drop(&mut self) {
-            DECODE_ERRORS.with(|errors| {
-                errors.borrow_mut().pop();
+            DECODE_CONTEXT.with(|context| {
+                context.borrow_mut().pop();
             });
         }
     }
-    DECODE_ERRORS.with(|errors| errors.borrow_mut().push(None));
+    DECODE_CONTEXT.with(|context| {
+        context.borrow_mut().push(DecodeContext {
+            root: root.clone(),
+            error: None,
+        })
+    });
     let scope = Scope;
     let decoded = serde_json::from_reader(reader);
-    let error = DECODE_ERRORS.with(|errors| errors.borrow_mut().last_mut().and_then(Option::take));
+    let error = DECODE_CONTEXT.with(|context| {
+        context
+            .borrow_mut()
+            .last_mut()
+            .and_then(|context| context.error.take())
+    });
     drop(scope);
     if let Some(error) = error {
         return Err(error);
@@ -566,7 +650,10 @@ pub fn decode_json<T: DeserializeOwned>(reader: impl std::io::Read) -> Result<T>
 
 /// Bound one lexical token before serde can grow its string/number scratch.
 /// JSON whitespace and entry count are unbounded; only the live token is capped.
-pub fn decode_bounded_json<T: DeserializeOwned>(reader: impl std::io::Read) -> Result<T> {
+pub fn decode_bounded_json<T: DeserializeOwned>(
+    root: &RecordStageRoot,
+    reader: impl Read,
+) -> Result<T> {
     struct TokenReader<R> {
         source: R,
         string: bool,
@@ -613,7 +700,7 @@ pub fn decode_bounded_json<T: DeserializeOwned>(reader: impl std::io::Read) -> R
         size: 0,
         error: None,
     };
-    let parsed = decode_json(&mut source);
+    let parsed = decode_json(root, &mut source);
     if let Some(error) = source.error {
         return Err(error);
     }
@@ -621,11 +708,19 @@ pub fn decode_bounded_json<T: DeserializeOwned>(reader: impl std::io::Read) -> R
 }
 
 #[cfg(test)]
+fn test_store_root(fixture: &tempfile::TempDir) -> RecordStageRoot {
+    let directory = StoreDirectory::open(fixture.path()).unwrap();
+    crate::store_dir::restrict_new_private_directory(&directory.root_handle()).unwrap();
+    RecordStageRoot::in_store(directory)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]
     fn sealed_records_reject_valid_same_length_edits_and_appends() {
-        let records = DiskRecords::from_records([11u64, 22]).unwrap();
+        let records =
+            DiskRecords::from_records(&RecordStageRoot::temporary().unwrap(), [11u64, 22]).unwrap();
         let path = records.run.directory.path().join("records");
         std::fs::write(&path, b"33\n22\n").unwrap();
         assert!(
@@ -641,7 +736,7 @@ mod tests {
 
     #[test]
     fn snapshots_seal_the_exact_bytes_observed_at_creation() {
-        let mut writer = RecordWriter::new().unwrap();
+        let mut writer = RecordWriter::new(&RecordStageRoot::temporary().unwrap()).unwrap();
         writer.push(&11u64).unwrap();
         let snapshot = writer.snapshot();
         assert_eq!(snapshot.first().unwrap(), Some(11));
@@ -652,7 +747,8 @@ mod tests {
 
     #[test]
     fn cleanup_removes_only_verified_stages_and_empty_owned_directories() {
-        let records = DiskRecords::from_records([11u64]).unwrap();
+        let records =
+            DiskRecords::from_records(&RecordStageRoot::temporary().unwrap(), [11u64]).unwrap();
         let path = records.run.directory.path().to_owned();
         drop(records);
         assert!(!path.exists());
@@ -661,7 +757,8 @@ mod tests {
     #[test]
     fn cleanup_preserves_replaced_record_file() {
         let fixture = tempfile::tempdir().unwrap();
-        let mut writer = RecordWriter::new_at(&fixture.path().join("registry"), true).unwrap();
+        let root = test_store_root(&fixture);
+        let mut writer = RecordWriter::new(&root).unwrap();
         writer.push(&11u64).unwrap();
         let records = writer.finish().unwrap();
         let directory = records.run.directory.path().to_owned();
@@ -681,7 +778,8 @@ mod tests {
     #[test]
     fn cleanup_preserves_replaced_directory_and_its_contents() {
         let fixture = tempfile::tempdir().unwrap();
-        let mut writer = RecordWriter::new_at(&fixture.path().join("registry"), true).unwrap();
+        let root = test_store_root(&fixture);
+        let mut writer = RecordWriter::new(&root).unwrap();
         writer.push(&11u64).unwrap();
         let records = writer.finish().unwrap();
         let path = records.run.directory.path().to_owned();
@@ -698,7 +796,10 @@ mod tests {
     #[test]
     fn external_sort_has_a_fixed_record_buffer_as_input_grows() {
         for count in [257, 4097, 32769] {
-            let mut sorter = RecordSorter::new(|a: &u64, b: &u64| a.cmp(b));
+            let mut sorter = RecordSorter::new(
+                &RecordStageRoot::temporary().unwrap(),
+                |a: &u64, b: &u64| a.cmp(b),
+            );
             for value in (0..count).rev() {
                 sorter.push(value).unwrap();
             }
@@ -712,12 +813,16 @@ mod tests {
     }
     #[test]
     fn record_token_buffer_and_read_errors_never_grow_with_record_count() {
-        let error = RecordWriter::new()
+        let error = RecordWriter::new(&RecordStageRoot::temporary().unwrap())
             .unwrap()
             .push(&"x".repeat(RECORD_BYTES + 1))
             .unwrap_err();
         assert_eq!(error.resource_limit().unwrap().resource, Resource::Memory);
-        let records = DiskRecords::from_records(["a".to_owned(), "b".to_owned()]).unwrap();
+        let records = DiskRecords::from_records(
+            &RecordStageRoot::temporary().unwrap(),
+            ["a".to_owned(), "b".to_owned()],
+        )
+        .unwrap();
         std::fs::write(
             records.run.directory.path().join("records"),
             b"not a record\n",

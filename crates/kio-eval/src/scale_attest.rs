@@ -17,7 +17,7 @@ use cap_primitives::fs::MetadataExt;
 use cap_primitives::{ambient_authority, fs as cap_fs};
 use kio_core::{
     cas::{canonical_json_bytes, hash_bytes, is_hash, lower_hex},
-    disk_records::DiskRecords,
+    disk_records::{DiskRecords, RecordStageRoot},
 };
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
@@ -893,7 +893,8 @@ fn observe_tree_cas(
         ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
     let mut file = cap_fs::open(&b, Path::new(leaf), &options).map_err(|e| other(label, e))?;
     let opened = cap_fs::Metadata::from_file(&file).map_err(|e| other(label, e))?;
-    let outcome = tree_stream::decode::<TreeWire>(&mut file, MAX_CAS);
+    let root = RecordStageRoot::temporary().map_err(|e| other(label, e))?;
+    let outcome = tree_stream::decode::<TreeWire>(&root, &mut file, MAX_CAS);
     if outcome.token_limit_exceeded {
         return Err(unsafe_state(format!(
             "{label} JSON token exceeds streaming resource buffer"
@@ -3319,7 +3320,11 @@ mod publication_tests {
         tree_file.write_all(b"],\"object_type\":\"tree\"}").unwrap();
         assert!(tree_file.as_file().metadata().unwrap().len() > 16 * 1024 * 1024);
         tree_file.as_file_mut().seek(SeekFrom::Start(0)).unwrap();
-        let decoded = tree_stream::decode::<TreeWire>(tree_file.as_file_mut(), MAX_CAS);
+        let decoded = tree_stream::decode::<TreeWire>(
+            &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+            tree_file.as_file_mut(),
+            MAX_CAS,
+        );
         assert_eq!(decoded.decoded.unwrap().entries.len(), 60_000);
         let digest = decoded.hash.strip_prefix("sha256:").unwrap();
         let dir = temp
@@ -3351,11 +3356,15 @@ mod publication_tests {
             "path": format!("{i:05}.txt"), "type": "file",
             "raw_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
         })).collect::<Vec<_>>();
-        let tree: super::TreeWire = serde_json::from_value(serde_json::json!({
-            "object_type": "tree", "chunking_config_hash": crate::scale_spec::CHUNKING_CONFIG_HASH, "entries": entries
-        })).unwrap();
+        let root = kio_core::disk_records::RecordStageRoot::temporary().unwrap();
+        let tree: TreeWire = kio_core::disk_records::decode_json(
+            &root,
+            serde_json::to_vec(&serde_json::json!({
+                "object_type": "tree", "chunking_config_hash": crate::scale_spec::CHUNKING_CONFIG_HASH, "entries": entries
+            })).unwrap().as_slice(),
+        ).unwrap();
         super::validate_tree_wire(&tree).unwrap();
-        let mut writer = kio_core::disk_records::RecordWriter::new().unwrap();
+        let mut writer = kio_core::disk_records::RecordWriter::new(&root).unwrap();
         let mut entries = tree.entries.iter();
         let first = entries.next().unwrap().unwrap();
         writer.push(&entries.next().unwrap().unwrap()).unwrap();
@@ -3376,21 +3385,23 @@ mod publication_tests {
             r#"{{"chunking_config_hash":"{}","entries":[],"object_type":"tree"}}"#,
             scale_spec::CHUNKING_CONFIG_HASH
         );
-        let tree: TreeWire = exact_json(current.as_bytes(), "test tree").unwrap();
+        let root = kio_core::disk_records::RecordStageRoot::temporary().unwrap();
+        let decode = |bytes: &[u8]| kio_core::disk_records::decode_json::<TreeWire>(&root, bytes);
+        let tree = decode(current.as_bytes()).unwrap();
         validate_tree_wire(&tree).unwrap();
 
         let missing = r#"{"entries":[],"object_type":"tree"}"#;
-        assert!(exact_json::<TreeWire>(missing.as_bytes(), "test tree").is_err());
+        assert!(decode(missing.as_bytes()).is_err());
 
         let wrong = r#"{"chunking_config_hash":"sha256:0000000000000000000000000000000000000000000000000000000000000000","entries":[],"object_type":"tree"}"#;
-        let wrong: TreeWire = exact_json(wrong.as_bytes(), "test tree").unwrap();
+        let wrong = decode(wrong.as_bytes()).unwrap();
         assert!(validate_tree_wire(&wrong).is_err());
 
         let unknown = format!(
             r#"{{"chunking_config_hash":"{}","entries":[],"object_type":"tree","unknown":true}}"#,
             scale_spec::CHUNKING_CONFIG_HASH
         );
-        assert!(exact_json::<TreeWire>(unknown.as_bytes(), "test tree").is_err());
+        assert!(decode(unknown.as_bytes()).is_err());
     }
 
     #[test]

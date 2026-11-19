@@ -1491,9 +1491,14 @@ fn is_store_not_found(error: &KioError) -> bool {
     error.error_code() == "KIO-E-STORE-NOT-FOUND-001"
 }
 
-fn validate_manifest_matches_tree(manifest: &Manifest, tree: &TreeObject) -> Result<()> {
+fn validate_manifest_matches_tree(
+    root: &crate::disk_records::RecordStageRoot,
+    manifest: &Manifest,
+    tree: &TreeObject,
+) -> Result<()> {
     manifest.validate()?;
     let mut sorted = crate::disk_records::RecordSorter::new(
+        root,
         |a: &manifest::ManifestRow, b: &manifest::ManifestRow| {
             a.path.as_bytes().cmp(b.path.as_bytes())
         },
@@ -2060,7 +2065,11 @@ mod tests {
         let kio = fixture.path().join(".kio");
         Repository::init(fixture.path()).unwrap();
         let store = ObjectStore::new(&kio);
-        let tree = build_tree(Vec::new()).unwrap();
+        let tree = build_tree(
+            &crate::disk_records::RecordStageRoot::temporary().unwrap(),
+            Vec::new(),
+        )
+        .unwrap();
         let (tree_hash, _) = store
             .write_json(ObjectKind::Tree, &serde_json::to_value(tree).unwrap())
             .unwrap();
@@ -4310,7 +4319,7 @@ mod tests {
         let entry = json!({"path":"a", "type":"file", "raw_hash":hash_bytes(b"raw")});
         let tree = json!({
             "entries":vec![entry; TREE_ENTRY_WARNING_THRESHOLD + 1],
-            "chunking_config_hash":crate::dag::build_tree(Vec::new()).unwrap().chunking_config_hash,
+            "chunking_config_hash":crate::dag::build_tree(&crate::disk_records::RecordStageRoot::temporary().unwrap(), Vec::new()).unwrap().chunking_config_hash,
             "object_type":"tree"
         });
         let (tree_hash, _) = store.write_json(ObjectKind::Tree, &tree).unwrap();
@@ -4395,7 +4404,11 @@ mod tests {
             version: 1,
             expected_head: Some(c1),
             new_head: c2.clone(),
-            manifest: serde_json::from_slice(&new_manifest).unwrap(),
+            manifest: super::Manifest::read(
+                &repo.object_store().record_stages().unwrap(),
+                new_manifest.as_slice(),
+            )
+            .unwrap(),
         };
         let journal_path = repo.kio_dir().join(super::PUBLICATION_JOURNAL_LEAF);
         fs::write(
@@ -4443,9 +4456,11 @@ mod tests {
             .unwrap()
             .commit_hash
             .unwrap();
-        let manifest: super::Manifest =
-            serde_json::from_slice(&fs::read(repo.kio_dir().join("manifest.json")).unwrap())
-                .unwrap();
+        let manifest = super::Manifest::read(
+            &repo.object_store().record_stages().unwrap(),
+            fs::File::open(repo.kio_dir().join("manifest.json")).unwrap(),
+        )
+        .unwrap();
         let journal = super::PublicationJournal {
             version: 1,
             expected_head: Some(c1_hash.clone()),
