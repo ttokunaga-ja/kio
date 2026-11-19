@@ -3,7 +3,7 @@ use crate::{AdapterError, Result};
 use kio_process::BoundedProcessOptions;
 use quick_xml::{Reader, events::Event};
 use sha2::{Digest, Sha256};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{
     ffi::OsString,
     path::{Path, PathBuf},
@@ -37,53 +37,6 @@ pub(crate) fn is_macos_office_passthrough_wrapper(bytes: &[u8]) -> bool {
     bytes == b"#!/bin/bash\nexec \"/Applications/LibreOffice.app/Contents/MacOS/soffice\"  \"$@\"\n"
 }
 
-/// Supported-release policy for verified macOS LibreOffice bundles only.
-/// This prevents known incompatible releases; actual native acceptance remains
-/// the capability proof for each pinned distribution.
-pub(crate) fn validate_macos_office_version(stdout: &str) -> Result<()> {
-    let malformed = || {
-        AdapterError::ContractViolation(
-            "verified macOS LibreOffice returned a malformed or ambiguous version".to_owned(),
-        )
-    };
-    let line = stdout.trim();
-    if line.len() > 128 || line.contains(['\r', '\n']) {
-        return Err(malformed());
-    }
-    let mut tokens = line.split_ascii_whitespace();
-    if tokens.next() != Some("LibreOffice") {
-        return Err(malformed());
-    }
-    let version = tokens.next().ok_or_else(malformed)?;
-    if tokens.next().is_some_and(|build| {
-        build.len() != 40 || !build.bytes().all(|byte| byte.is_ascii_hexdigit())
-    }) {
-        return Err(malformed());
-    }
-    if tokens.next().is_some() {
-        return Err(malformed());
-    }
-    let mut components = Vec::new();
-    for component in version.split('.') {
-        if !(1..=4).contains(&component.len())
-            || !component.bytes().all(|byte| byte.is_ascii_digit())
-            || (component.len() > 1 && component.starts_with('0'))
-        {
-            return Err(malformed());
-        }
-        components.push(component.parse::<u16>().map_err(|_| malformed())?);
-    }
-    if !(3..=4).contains(&components.len()) {
-        return Err(malformed());
-    }
-    if (components[0], components[1]) < (26, 8) {
-        return Err(AdapterError::ContractViolation(
-            "sandboxed macOS Office conversion requires LibreOffice 26.8 or newer; the selected release predates the supported headless runtime".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
 pub(crate) fn macos_office_bundle_candidate(program: &Path) -> Option<PathBuf> {
     if !program.is_absolute() || program.file_name()? != "soffice" {
         return None;
@@ -97,7 +50,7 @@ pub(crate) fn macos_office_bundle_candidate(program: &Path) -> Option<PathBuf> {
         .then(|| bundle.to_path_buf())
 }
 
-pub(crate) fn verify_macos_office_bundle(bundle: &Path) -> Result<()> {
+pub(crate) fn verify_macos_office_bundle(bundle: &Path, deadline: Instant) -> Result<()> {
     // -R= is the codesign inline requirement syntax; no shell or ambient
     // executable search is involved. Deep verification covers nested code,
     // and strict verification rejects unsealed/escaping symbolic links.
@@ -114,10 +67,12 @@ pub(crate) fn verify_macos_office_bundle(bundle: &Path) -> Result<()> {
             REQUIREMENT,
         ])
         .arg(bundle);
+    crate::office_convert::check_renderer_deadline(deadline)?;
     let output = kio_process::run_bounded_command(
         &mut command,
         BoundedProcessOptions {
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_secs(60)
+                .min(deadline.saturating_duration_since(Instant::now())),
             max_stdout_bytes: MAX_OFFICE_LOG_BYTES,
             max_stderr_bytes: MAX_OFFICE_LOG_BYTES,
         },
@@ -126,6 +81,7 @@ pub(crate) fn verify_macos_office_bundle(bundle: &Path) -> Result<()> {
     .map_err(|_| {
         AdapterError::ContractViolation("Office bundle signature verification failed".to_owned())
     })?;
+    crate::office_convert::check_renderer_deadline(deadline)?;
     if !output.status.success() {
         return Err(AdapterError::ContractViolation(
             "Office bundle is not a verified LibreOffice distribution".to_owned(),
@@ -177,14 +133,17 @@ pub(crate) fn office_bundle_path_snapshot(
     .collect()
 }
 
-pub(crate) fn private_uno_catalog_for_program(program: &Path) -> Result<Option<PrivateUnoCatalog>> {
+pub(crate) fn private_uno_catalog_for_program(
+    program: &Path,
+    deadline: Instant,
+) -> Result<Option<PrivateUnoCatalog>> {
     let Some(bundle) = macos_office_bundle_candidate(program) else {
         return Ok(None);
     };
     let source = bundle.join("Contents/Resources/services/services.rdb");
     let before = office_bundle_path_snapshot(&bundle, program, &source)?;
-    verify_macos_office_bundle(&bundle)?;
-    let bytes = read_stable_catalog(&source)?;
+    verify_macos_office_bundle(&bundle, deadline)?;
+    let bytes = read_stable_catalog(&source, deadline)?;
     let _ = macos_spell_component_range(&bytes)?;
     if before != office_bundle_path_snapshot(&bundle, program, &source)? {
         return Err(AdapterError::ContractViolation(
@@ -199,13 +158,14 @@ pub(crate) fn private_uno_catalog_for_program(program: &Path) -> Result<Option<P
     }))
 }
 
-pub(crate) fn read_stable_catalog(path: &Path) -> Result<Vec<u8>> {
+pub(crate) fn read_stable_catalog(path: &Path, deadline: Instant) -> Result<Vec<u8>> {
     const MAX_CATALOG_BYTES: usize = 1024 * 1024;
-    kio_core::cas::read_bounded_regular_file(path, MAX_CATALOG_BYTES as u64).map_err(|error| {
-        AdapterError::ContractViolation(format!(
-            "cannot safely read Office service catalog: {error}"
-        ))
-    })
+    kio_core::cas::read_bounded_regular_file_until(path, MAX_CATALOG_BYTES as u64, deadline)
+        .map_err(|error| {
+            AdapterError::ContractViolation(format!(
+                "cannot safely read Office service catalog: {error}"
+            ))
+        })
 }
 
 pub(crate) fn macos_spell_component_range(bytes: &[u8]) -> Result<(usize, usize)> {
@@ -420,8 +380,9 @@ pub(crate) struct PrivateUnoCatalog {
 pub(crate) fn write_private_uno_catalog(
     catalog: &PrivateUnoCatalog,
     scratch: &Path,
+    deadline: Instant,
 ) -> Result<PathBuf> {
-    let bytes = read_stable_catalog(&catalog.source)?;
+    let bytes = read_stable_catalog(&catalog.source, deadline)?;
     if hex_digest(&Sha256::digest(&bytes)) != catalog.source_digest {
         return Err(AdapterError::ContractViolation(
             "Office service catalog changed after converter probe".to_owned(),
@@ -474,9 +435,9 @@ pub(crate) struct OfficeRuntime {
     catalog: Option<PrivateUnoCatalog>,
 }
 impl OfficeRuntime {
-    pub(crate) fn new(program: &Path) -> Result<Self> {
+    pub(crate) fn new(program: &Path, deadline: Instant) -> Result<Self> {
         Ok(Self {
-            catalog: private_uno_catalog_for_program(program)?,
+            catalog: private_uno_catalog_for_program(program, deadline)?,
         })
     }
     pub(crate) fn catalog_digest(&self) -> Option<&str> {
@@ -484,19 +445,21 @@ impl OfficeRuntime {
             .as_ref()
             .map(|catalog| catalog.source_digest.as_str())
     }
-    pub(crate) fn validate_probe(&self, stdout: &str) -> Result<()> {
-        if self.catalog.is_some() {
-            validate_macos_office_version(stdout)?;
-        }
-        Ok(())
+    pub(crate) fn package_roots(&self, _program: &Path) -> Result<Vec<PathBuf>> {
+        Ok(self
+            .catalog
+            .iter()
+            .map(|catalog| catalog.bundle.clone())
+            .collect())
     }
     pub(crate) fn configure_services(
         &self,
         scratch: &Path,
         environment: &mut Vec<(OsString, OsString)>,
+        deadline: Instant,
     ) -> Result<()> {
         if let Some(catalog) = self.catalog.as_ref() {
-            let private_catalog = write_private_uno_catalog(catalog, scratch)?;
+            let private_catalog = write_private_uno_catalog(catalog, scratch, deadline)?;
             environment.push((
                 OsString::from("URE_MORE_SERVICES"),
                 super::super::file_url(&private_catalog)?.into(),
@@ -551,4 +514,29 @@ pub(crate) fn renderer_environment(
     ));
     super::super::unix::office_fs::add_home(&mut environment, home);
     environment
+}
+
+#[cfg(all(test, debug_assertions))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_scope_is_the_verified_bundle() {
+        let program = Path::new("/Applications/LibreOffice.app/Contents/MacOS/soffice");
+        let bundle = PathBuf::from("/Applications/LibreOffice.app");
+        let runtime = OfficeRuntime {
+            catalog: Some(PrivateUnoCatalog {
+                source: bundle.join("Contents/Resources/services/services.rdb"),
+                bundle: bundle.clone(),
+                source_digest: String::new(),
+            }),
+        };
+        assert_eq!(runtime.package_roots(program).unwrap(), [bundle]);
+        assert!(
+            OfficeRuntime { catalog: None }
+                .package_roots(Path::new("/usr/local/bin/standalone"))
+                .unwrap()
+                .is_empty()
+        );
+    }
 }

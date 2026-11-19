@@ -19,6 +19,7 @@ pub mod local_peer;
 pub mod local_rerank;
 mod mistral_ocr;
 pub mod office_convert;
+mod office_runtime_identity;
 mod ooxml_package;
 pub mod pdf_decode;
 mod platform;

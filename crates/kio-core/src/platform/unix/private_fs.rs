@@ -256,6 +256,7 @@ pub(crate) fn read_private_file(
         path,
         max_bytes,
         uid,
+        None,
     )
 }
 
@@ -263,6 +264,7 @@ pub(crate) fn read_private_file_at_path(
     parent: &StoreDirectory,
     name: &Path,
     max_bytes: u64,
+    deadline: Option<std::time::Instant>,
 ) -> Result<Vec<u8>> {
     let leaf = direct_leaf(name, parent.path())?;
     // SAFETY: geteuid has no arguments and no memory-safety preconditions.
@@ -270,7 +272,7 @@ pub(crate) fn read_private_file_at_path(
     let handle = parent.root_handle();
     verify_directory(&handle, parent.path())?;
     let label = parent.path().join(leaf);
-    read_leaf(&handle, leaf, &label, max_bytes, uid)
+    read_leaf(&handle, leaf, &label, max_bytes, uid, deadline)
 }
 
 fn inherited_private_directory(
@@ -322,7 +324,7 @@ fn read_inherited_private_file(
         })?;
         parent = std::sync::Arc::new(next);
     }
-    read_leaf(&parent, leaf, path, max_bytes, uid)
+    read_leaf(&parent, leaf, path, max_bytes, uid, None)
 }
 
 fn direct_leaf<'a>(name: &'a Path, label: &Path) -> Result<&'a std::ffi::OsStr> {
@@ -370,7 +372,10 @@ fn read_leaf(
     path: &Path,
     max_bytes: u64,
     uid: u32,
+    deadline: Option<std::time::Instant>,
 ) -> Result<Vec<u8>> {
+    crate::private_fs::check_read_deadline(deadline)
+        .map_err(|error| crate::KioError::io(error.to_string(), path.display().to_string()))?;
     let leaf = CString::new(leaf.as_encoded_bytes())
         .map_err(|_| unsafe_file("private trust file leaf contains NUL", Some(path)))?;
     // SAFETY: `parent` is a retained directory capability and `leaf` is a
@@ -380,7 +385,7 @@ fn read_leaf(
         libc::openat(
             parent.as_raw_fd(),
             leaf.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
         )
     };
     if fd < 0 {
@@ -400,10 +405,18 @@ fn read_leaf(
     let capacity =
         usize::try_from(before.len()).map_err(|_| oversized_file(max_bytes, before.len(), path))?;
     let mut bytes = Vec::with_capacity(capacity);
-    file.by_ref()
-        .take(max_bytes.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|_| unsafe_file("cannot read private trust file", Some(path)))?;
+    crate::private_fs::read_to_end_checked(
+        file.by_ref().take(max_bytes.saturating_add(1)),
+        &mut bytes,
+        deadline,
+    )
+    .map_err(|error| {
+        if error.kind() == std::io::ErrorKind::TimedOut {
+            crate::KioError::io(error.to_string(), path.display().to_string())
+        } else {
+            unsafe_file("cannot read private trust file", Some(path))
+        }
+    })?;
     if bytes.len() as u64 > max_bytes {
         return Err(oversized_file(max_bytes, bytes.len() as u64, path));
     }
