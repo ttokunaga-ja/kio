@@ -469,7 +469,9 @@ pub(super) fn content_references(dict: &[u8], budget: &PdfDecodeBudget) -> Resul
 }
 
 fn header(pdf: &[u8], offset: usize) -> Option<(PdfRef, usize)> {
-    if !pdf.get(offset)?.is_ascii_digit() {
+    if !pdf.get(offset)?.is_ascii_digit()
+        || (offset > 0 && !pdf[offset - 1].is_ascii_whitespace() && pdf[offset - 1] != 0)
+    {
         return None;
     }
     let (number, next) = unsigned(pdf, offset)?;
@@ -579,4 +581,20 @@ fn invalid() -> AdapterError {
     AdapterError::ContractViolation(
         "invalid or unsupported Office probe PDF cross-reference data".to_owned(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xref_offset_must_point_to_the_start_of_the_object_number() {
+        let pdf = b"%PDF-1.6\n13 0 obj\n<< /Type /Page >>\nendobj\n";
+        let start = pdf
+            .windows(8)
+            .position(|bytes| bytes == b"13 0 obj")
+            .unwrap();
+        assert_eq!(header(pdf, start).unwrap().0.number, 13);
+        assert!(header(pdf, start + 1).is_none());
+    }
 }

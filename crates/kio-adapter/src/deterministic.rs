@@ -744,9 +744,19 @@ fn structural_pdf_page_count(bytes: &[u8], max_pages: usize) -> Result<usize> {
 }
 
 pub(crate) fn skip_pdf_literal_string(bytes: &[u8], start: usize) -> usize {
+    skip_pdf_literal_string_checked(bytes, start, |_| Ok::<(), std::convert::Infallible>(()))
+        .expect("infallible scan")
+}
+
+pub(crate) fn skip_pdf_literal_string_checked<E>(
+    bytes: &[u8],
+    start: usize,
+    mut check: impl FnMut(usize) -> std::result::Result<(), E>,
+) -> std::result::Result<usize, E> {
     let mut index = start + 1;
     let mut depth = 1_usize;
     while index < bytes.len() {
+        check(index)?;
         match bytes[index] {
             b'\\' => index = (index + 2).min(bytes.len()),
             b'(' => {
@@ -763,7 +773,7 @@ pub(crate) fn skip_pdf_literal_string(bytes: &[u8], start: usize) -> usize {
             _ => index += 1,
         }
     }
-    index
+    Ok(index)
 }
 
 pub(crate) fn skip_pdf_space_and_comments(bytes: &[u8], mut index: usize) -> usize {

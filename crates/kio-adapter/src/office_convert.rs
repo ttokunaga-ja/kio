@@ -30,7 +30,9 @@ use kio_process::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::office_runtime_identity::{ExecutableFingerprint, RuntimeSnapshot};
+use crate::office_runtime_identity::{
+    ExecutableFingerprint, RuntimeSnapshot, check_verification_deadline,
+};
 use crate::platform::{
     OfficeRuntime, canonical_renderer_program, file_url, finish_scratch, private_temp_dir,
     restrict_renderer_state_directory, scratch_recovery_note,
@@ -184,7 +186,9 @@ impl OfficeConverter {
             ConverterBackend::Real(renderer) => {
                 crate::ooxml_package::validate_real_office_package(input, media_type)?;
                 let deadline = Instant::now() + OFFICE_CONVERT_TIMEOUT;
-                renderer.verify_runtime("before conversion", deadline)?;
+                renderer
+                    .verify_runtime("before conversion", deadline)
+                    .map_err(verification_error)?;
                 if OfficeRuntime::new(renderer.sources.program(), deadline)? != renderer.runtime {
                     return Err(AdapterError::ContractViolation(
                         "Office runtime changed after converter probe".to_owned(),
@@ -354,8 +358,10 @@ impl RealRenderer {
                 "office converter executable changed before runtime verification".to_owned(),
             ));
         }
-        let program_fingerprint = ExecutableFingerprint::new(sources.program(), deadline)?;
-        let runtime_snapshot = RuntimeSnapshot::new(package_roots, &sources, deadline)?;
+        let program_fingerprint =
+            ExecutableFingerprint::new(sources.program(), deadline).map_err(verification_error)?;
+        let runtime_snapshot =
+            RuntimeSnapshot::new(package_roots, &sources, deadline).map_err(verification_error)?;
         Ok(Self {
             sources,
             program_fingerprint,
@@ -399,10 +405,7 @@ impl RealRenderer {
             &environment,
             renderer_process_options(OFFICE_PROBE_TIMEOUT),
             deadline,
-            || {
-                self.verify_runtime("before version query", deadline)
-                    .map_err(std::io::Error::other)
-            },
+            || self.verify_runtime("before version query", deadline),
         );
         match advisory_version_output(result) {
             Ok(stdout) => {
@@ -418,12 +421,16 @@ impl RealRenderer {
         }
     }
 
-    fn verify_runtime(&self, stage: &str, deadline: Instant) -> Result<()> {
-        check_renderer_deadline(deadline)?;
+    fn verify_runtime(&self, stage: &str, deadline: Instant) -> std::io::Result<()> {
+        check_verification_deadline(deadline)?;
         self.program_fingerprint
             .verify(self.sources.program(), stage, deadline)?;
         self.runtime_snapshot.verify(&self.sources, stage, deadline)
     }
+}
+
+fn verification_error(error: std::io::Error) -> AdapterError {
+    AdapterError::ContractViolation(error.to_string())
 }
 
 fn advisory_version_output(
@@ -691,10 +698,7 @@ impl RealRenderer {
             &environment,
             renderer_process_options(OFFICE_CONVERT_TIMEOUT),
             deadline,
-            || {
-                self.verify_runtime("before conversion", deadline)
-                    .map_err(std::io::Error::other)
-            },
+            || self.verify_runtime("before conversion", deadline),
         ) {
             Ok(output) => output,
             Err(err) => {
@@ -752,7 +756,8 @@ impl RealRenderer {
         drop(output_directory);
         drop(scratch_directory);
         finish_scratch(scratch)?;
-        self.verify_runtime("after conversion", deadline)?;
+        self.verify_runtime("after conversion", deadline)
+            .map_err(verification_error)?;
         Ok(pdf_bytes)
     }
 }
@@ -2187,6 +2192,21 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("pptx"), "{error}");
+    }
+
+    #[test]
+    fn deadline_reached_during_version_verification_is_typed() {
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("renderer");
+        std::fs::write(&program, b"fixture").unwrap();
+        let (converter, _) = fixture_converter(&program);
+        let ConverterBackend::Real(renderer) = converter.backend else {
+            unreachable!()
+        };
+        let error = renderer
+            .verify_runtime("before version query", Instant::now())
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
     }
 
     #[test]

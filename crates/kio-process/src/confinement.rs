@@ -155,17 +155,27 @@ impl RendererStart<'_> {
     pub(crate) fn remaining(self) -> Result<Duration, BoundedProcessError> {
         let remaining = self.deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            Err(BoundedProcessError::Timeout {
-                timeout_ms: self.budget.as_millis(),
-            })
+            Err(self.timeout_error())
         } else {
             Ok(remaining)
         }
     }
 
+    fn timeout_error(self) -> BoundedProcessError {
+        BoundedProcessError::Timeout {
+            timeout_ms: self.budget.as_millis(),
+        }
+    }
+
     pub(crate) fn verify(self) -> Result<(), BoundedProcessError> {
         self.remaining()?;
-        (self.verify)().map_err(BoundedProcessError::Isolation)?;
+        (self.verify)().map_err(|error| {
+            if error.kind() == std::io::ErrorKind::TimedOut {
+                self.timeout_error()
+            } else {
+                BoundedProcessError::Isolation(error)
+            }
+        })?;
         self.remaining()?;
         Ok(())
     }
@@ -256,6 +266,19 @@ mod tests {
         assert!(matches!(
             start.verify(),
             Err(BoundedProcessError::Timeout { .. })
+        ));
+    }
+
+    #[test]
+    fn launch_verification_preserves_a_typed_deadline_failure() {
+        let start = RendererStart {
+            deadline: Instant::now() + Duration::from_secs(10),
+            budget: Duration::from_secs(10),
+            verify: &|| Err(std::io::ErrorKind::TimedOut.into()),
+        };
+        assert!(matches!(
+            start.verify(),
+            Err(BoundedProcessError::Timeout { timeout_ms: 10_000 })
         ));
     }
 

@@ -2186,12 +2186,16 @@ pub fn read_bounded_regular_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>>
     read_bounded_regular_file_inner(path, max_bytes, &CasReadAccess::Unmetered, false, None)
 }
 
+const BOUNDED_READ_DEADLINE: &str = "KIO-E-STORE-READ-DEADLINE-001";
+
 /// Read bounded metadata with deadline checks between physical reads.
+/// `TimedOut` identifies expiry of the supplied deadline. Other failures
+/// retain the underlying Kio error as their source.
 pub fn read_bounded_regular_file_until(
     path: &Path,
     max_bytes: u64,
     deadline: std::time::Instant,
-) -> Result<Vec<u8>> {
+) -> std::io::Result<Vec<u8>> {
     read_bounded_regular_file_inner(
         path,
         max_bytes,
@@ -2199,6 +2203,13 @@ pub fn read_bounded_regular_file_until(
         false,
         Some(deadline),
     )
+    .map_err(|error| {
+        if error.error_code() == BOUNDED_READ_DEADLINE {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, error)
+        } else {
+            std::io::Error::other(error)
+        }
+    })
 }
 
 /// Shared implementation for bounded metadata records and bounded CAS content
@@ -2211,7 +2222,16 @@ fn read_bounded_regular_file_inner(
     private_cas: bool,
     deadline: Option<std::time::Instant>,
 ) -> Result<Vec<u8>> {
-    let check_deadline = || crate::private_fs::check_read_deadline(deadline).kio_io(path);
+    let check_deadline = || {
+        crate::private_fs::check_read_deadline(deadline).map_err(|error| {
+            KioError::new(
+                BOUNDED_READ_DEADLINE,
+                error.to_string(),
+                serde_json::json!({ "path": path }),
+                crate::ExitCode::Failure,
+            )
+        })
+    };
     check_deadline()?;
     reads.charge(0)?;
     let mut file = if private_cas {
@@ -2369,6 +2389,25 @@ fn unix_nanos() -> u128 {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn bounded_metadata_read_distinguishes_deadline_from_open_failure() {
+        use std::{
+            io::ErrorKind,
+            time::{Duration, Instant},
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("renderer");
+        std::fs::write(&path, b"fixture").unwrap();
+        let error = read_bounded_regular_file_until(&path, 128, Instant::now()).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::TimedOut);
+        std::fs::remove_file(&path).unwrap();
+        let error =
+            read_bounded_regular_file_until(&path, 128, Instant::now() + Duration::from_secs(10))
+                .unwrap_err();
+        assert_ne!(error.kind(), ErrorKind::TimedOut);
+    }
 
     #[test]
     fn jsonl_append_creates_private_owned_logs_below_external_ancestors() {

@@ -28,7 +28,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::deterministic::{
     find_endstream_bytes, is_pdf_delimiter, pdf_keyword_at, pdf_name_at, skip_pdf_literal_string,
-    skip_pdf_space_and_comments,
+    skip_pdf_literal_string_checked, skip_pdf_space_and_comments,
 };
 use crate::{AdapterError, Result};
 
@@ -108,6 +108,8 @@ fn referenced_object(objects: &HashMap<u32, PdfObject>, reference: PdfRef) -> Op
 #[derive(Default)]
 struct PdfDecodeBudget {
     deadline: Option<std::time::Instant>,
+    #[cfg(test)]
+    checks_before_timeout: Option<std::cell::Cell<usize>>,
     materialized_object_bytes: usize,
     decoded_stream_bytes: usize,
     emitted_text_bytes: usize,
@@ -117,6 +119,14 @@ struct PdfDecodeBudget {
 
 impl PdfDecodeBudget {
     fn check_deadline(&self) -> Result<()> {
+        #[cfg(test)]
+        if let Some(remaining) = &self.checks_before_timeout {
+            let count = remaining.get();
+            if count == 0 {
+                return crate::office_convert::check_renderer_deadline(std::time::Instant::now());
+            }
+            remaining.set(count - 1);
+        }
         if let Some(deadline) = self.deadline {
             crate::office_convert::check_renderer_deadline(deadline)?;
         }
@@ -1457,6 +1467,35 @@ fn decode_content_ops(
     )
 }
 
+const CONTENT_SCAN_INTERVAL: usize = 4096;
+
+fn check_content_scan(budget: &PdfDecodeBudget, next_check: &mut usize, at: usize) -> Result<()> {
+    if at >= *next_check {
+        budget.check_deadline()?;
+        *next_check = at + CONTENT_SCAN_INTERVAL;
+    }
+    Ok(())
+}
+
+/// Scan only as far as the next deadline checkpoint, even within a single token.
+fn scan_content_until(
+    content: &[u8],
+    mut at: usize,
+    budget: &PdfDecodeBudget,
+    next_check: &mut usize,
+    stop: impl Fn(u8) -> bool,
+) -> Result<usize> {
+    while at < content.len() {
+        check_content_scan(budget, next_check, at)?;
+        let end = (*next_check).min(content.len());
+        if let Some(offset) = content[at..end].iter().copied().position(&stop) {
+            return Ok(at + offset);
+        }
+        at = end;
+    }
+    Ok(at)
+}
+
 fn decode_content_ops_with_limits(
     content: &[u8],
     fonts: &HashMap<String, FontMap>,
@@ -1491,15 +1530,20 @@ fn decode_content_ops_with_limits(
 
     let mut next_deadline_check = 0;
     while index < content.len() {
-        if index >= next_deadline_check {
-            budget.check_deadline()?;
-            next_deadline_check = index + 4096;
-        }
+        check_content_scan(budget, &mut next_deadline_check, index)?;
         let byte = content[index];
         match byte {
-            b'%' => index = skip_pdf_comment(content, index),
+            b'%' => {
+                let end =
+                    scan_content_until(content, index, budget, &mut next_deadline_check, |b| {
+                        matches!(b, b'\r' | b'\n')
+                    })?;
+                index = (end + 1).min(content.len());
+            }
             b'(' => {
-                let end = skip_pdf_literal_string(content, index);
+                let end = skip_pdf_literal_string_checked(content, index, |at| {
+                    check_content_scan(budget, &mut next_deadline_check, at)
+                })?;
                 admit_operand(end.saturating_sub(index + 2))?;
                 let literal = unescape_pdf_literal(&content[index + 1..end.saturating_sub(1)]);
                 let string = ShowString::Literal(literal);
@@ -1513,6 +1557,7 @@ fn decode_content_ops_with_limits(
                 // inline dictionary (BDC property lists): skip balanced
                 let mut depth = 0_usize;
                 while index < content.len() {
+                    check_content_scan(budget, &mut next_deadline_check, index)?;
                     if content.get(index..index + 2) == Some(b"<<") {
                         depth += 1;
                         index += 2;
@@ -1528,11 +1573,13 @@ fn decode_content_ops_with_limits(
                 }
             }
             b'<' => {
-                let end = content[index + 1..]
-                    .iter()
-                    .position(|b| *b == b'>')
-                    .map(|offset| index + 1 + offset)
-                    .unwrap_or(content.len());
+                let end = scan_content_until(
+                    content,
+                    index + 1,
+                    budget,
+                    &mut next_deadline_check,
+                    |b| b == b'>',
+                )?;
                 // Encoded length is a conservative bound for decoded storage.
                 admit_operand(end - index - 1)?;
                 let hex = hex_bytes(&content[index + 1..end]);
@@ -1550,7 +1597,13 @@ fn decode_content_ops_with_limits(
             }
             b']' => index += 1,
             b'/' => {
-                let end = pdf_name_end(content, index + 1);
+                let end = scan_content_until(
+                    content,
+                    index + 1,
+                    budget,
+                    &mut next_deadline_check,
+                    is_pdf_delimiter,
+                )?;
                 admit_operand(end - index - 1)?;
                 last_name = std::str::from_utf8(&content[index + 1..end])
                     .ok()
@@ -1558,13 +1611,13 @@ fn decode_content_ops_with_limits(
                 index = end;
             }
             b'+' | b'-' | b'.' | b'0'..=b'9' => {
-                let mut end = index + 1;
-                while content
-                    .get(end)
-                    .is_some_and(|b| b.is_ascii_digit() || *b == b'.' || *b == b'-' || *b == b'+')
-                {
-                    end += 1;
-                }
+                let end = scan_content_until(
+                    content,
+                    index + 1,
+                    budget,
+                    &mut next_deadline_check,
+                    |b| !(b.is_ascii_digit() || matches!(b, b'.' | b'-' | b'+')),
+                )?;
                 if let Some(items) = array_items.as_mut()
                     && let Ok(value) = std::str::from_utf8(&content[index..end])
                         .unwrap_or("")
@@ -1579,13 +1632,9 @@ fn decode_content_ops_with_limits(
                 let end = if byte == b'\'' || byte == b'"' {
                     index + 1
                 } else {
-                    let mut end = index + 1;
-                    while content.get(end).is_some_and(|b| {
-                        b.is_ascii_alphabetic() || *b == b'*' || *b == b'0' || *b == b'1'
-                    }) {
-                        end += 1;
-                    }
-                    end
+                    scan_content_until(content, index + 1, budget, &mut next_deadline_check, |b| {
+                        !(b.is_ascii_alphabetic() || matches!(b, b'*' | b'0' | b'1'))
+                    })?
                 };
                 let op = &content[index..end];
                 match op {
@@ -1868,6 +1917,28 @@ mod tests {
         ));
         pdf.extend_from_slice(b"%%EOF\n");
         pdf
+    }
+
+    #[test]
+    fn long_content_tokens_check_the_deadline_before_reaching_their_end() {
+        for (start, payload, end) in [
+            ("%", 'x', ""),
+            ("<< /Key ", 'x', " >>"),
+            ("(", 'x', ")"),
+            ("<", 'a', ">"),
+            ("/", 'x', ""),
+            ("", '1', ""),
+            ("", 'X', ""),
+        ] {
+            let content = format!("{start}{}{end}", payload.to_string().repeat(32 * 1024));
+            let mut budget = PdfDecodeBudget {
+                checks_before_timeout: Some(std::cell::Cell::new(1)),
+                ..PdfDecodeBudget::default()
+            };
+            let error = decode_content_ops(content.as_bytes(), &HashMap::new(), &mut budget)
+                .expect_err(start);
+            assert!(error.to_string().contains("time limit"), "{error}");
+        }
     }
 
     #[test]

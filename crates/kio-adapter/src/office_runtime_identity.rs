@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, HashSet},
     fs::{self, Metadata},
-    io,
+    io::{self, Result},
     path::{Path, PathBuf},
     time::Instant,
 };
@@ -10,10 +10,17 @@ use kio_core::platform::{RegularFileHandleIdentity, real_regular_file_identity};
 use kio_process::confinement::RenderSources;
 use sha2::{Digest, Sha256};
 
-use crate::{
-    AdapterError, Result,
-    office_convert::{check_renderer_deadline, hex_digest},
-};
+use crate::office_convert::hex_digest;
+
+pub(crate) fn check_verification_deadline(deadline: Instant) -> Result<()> {
+    if Instant::now() >= deadline {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "office converter exceeded its time limit",
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExecutableFingerprint {
@@ -29,23 +36,29 @@ impl ExecutableFingerprint {
                 .map_err(|error| executable_error(&error))?
                 .ok_or_else(|| executable_error(&"expected a real, single-link file"))
         };
-        check_renderer_deadline(deadline)?;
+        check_verification_deadline(deadline)?;
         let before = identity()?;
         let bytes = kio_core::cas::read_bounded_regular_file_until(
             program,
             MAX_RENDERER_PROGRAM_BYTES,
             deadline,
         )
-        .map_err(|error| executable_error(&error))?;
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::TimedOut {
+                error
+            } else {
+                executable_error(&error)
+            }
+        })?;
         if before != identity()? {
             return Err(executable_error(&"executable changed while being read"));
         }
         let mut digest = Sha256::new();
         for chunk in bytes.chunks(64 * 1024) {
-            check_renderer_deadline(deadline)?;
+            check_verification_deadline(deadline)?;
             digest.update(chunk);
         }
-        check_renderer_deadline(deadline)?;
+        check_verification_deadline(deadline)?;
         Ok(Self {
             digest: hex_digest(&digest.finalize()),
             identity: before,
@@ -54,7 +67,7 @@ impl ExecutableFingerprint {
 
     pub(crate) fn verify(&self, program: &Path, stage: &str, deadline: Instant) -> Result<()> {
         if Self::new(program, deadline)? != *self {
-            return Err(AdapterError::ContractViolation(format!(
+            return Err(io::Error::other(format!(
                 "office converter executable changed {stage}; resolve a fresh converter before retrying"
             )));
         }
@@ -62,8 +75,8 @@ impl ExecutableFingerprint {
     }
 }
 
-fn executable_error(error: &dyn std::fmt::Display) -> AdapterError {
-    AdapterError::ContractViolation(format!(
+fn executable_error(error: &dyn std::fmt::Display) -> io::Error {
+    io::Error::other(format!(
         "cannot safely fingerprint Office renderer executable: {error}"
     ))
 }
@@ -98,7 +111,7 @@ impl RuntimeSnapshot {
     ) -> Result<BTreeMap<PathBuf, EntryIdentity>> {
         const MAX_PACKAGE_ENTRIES: usize = 32_768;
         if roots.is_empty() {
-            return Err(AdapterError::ContractViolation(format!(
+            return Err(io::Error::other(format!(
                 "unsupported Office runtime placement for {}: cannot identify its package",
                 sources.program().display()
             )));
@@ -107,7 +120,7 @@ impl RuntimeSnapshot {
         let mut scanned = HashSet::new();
         let mut pending = roots.to_vec();
         while let Some(path) = pending.pop() {
-            check_renderer_deadline(deadline)?;
+            check_verification_deadline(deadline)?;
             if !scanned.insert(path.clone()) {
                 continue;
             }
@@ -126,7 +139,7 @@ impl RuntimeSnapshot {
                 pending.push(target);
             } else if metadata.is_dir() {
                 for child in fs::read_dir(&path).map_err(error)? {
-                    check_renderer_deadline(deadline)?;
+                    check_verification_deadline(deadline)?;
                     if entries.len() + pending.len() >= MAX_PACKAGE_ENTRIES {
                         return Err(error(io::Error::other("too many Office runtime entries")));
                     }
@@ -149,16 +162,16 @@ impl RuntimeSnapshot {
         if mount_identities(sources, deadline)? != self.mounts
             || Self::read(&self.roots, sources, deadline)? != self.entries
         {
-            return Err(AdapterError::ContractViolation(format!(
+            return Err(io::Error::other(format!(
                 "Office runtime changed {stage}; resolve a fresh converter before retrying"
             )));
         }
-        check_renderer_deadline(deadline)
+        check_verification_deadline(deadline)
     }
 }
 
-fn path_error(path: &Path, cause: io::Error) -> AdapterError {
-    AdapterError::ContractViolation(format!(
+fn path_error(path: &Path, cause: io::Error) -> io::Error {
+    io::Error::other(format!(
         "cannot verify Office runtime path {}: {cause}",
         path.display()
     ))
@@ -169,7 +182,7 @@ fn mount_identities(sources: &RenderSources, deadline: Instant) -> Result<Vec<En
         .roots()
         .iter()
         .map(|(destination, source)| {
-            check_renderer_deadline(deadline)?;
+            check_verification_deadline(deadline)?;
             // Inspect the resolved path the native backend uses. Refuse an alias
             // that now points to a different source, even if both paths exist.
             let current =
@@ -207,7 +220,7 @@ fn runtime_link_target(
     // Follow each link in the namespace the renderer sees and record
     // intermediate symlinks, even when they live in another mounted package.
     'resolve: for _ in 0..40 {
-        check_renderer_deadline(deadline)?;
+        check_verification_deadline(deadline)?;
         if named == sources.program() {
             return verify_link_target(path, named);
         }
@@ -237,7 +250,7 @@ fn runtime_link_target(
         let mut physical = source.clone();
         let mut logical = visible.clone();
         while let Some(component) = components.next() {
-            check_renderer_deadline(deadline)?;
+            check_verification_deadline(deadline)?;
             physical.push(component.as_os_str());
             logical.push(component.as_os_str());
             let metadata =
