@@ -296,7 +296,16 @@ renderer 版内で prepared_hash が安定し、renderer 更新による出力�
 renderer の検出は配布元名、固定 install prefix、最低 version の文字列だけで可否を決めない。
 実 executable identity と必要 runtime resource を特定・検証し、隔離内の bounded な実変換 probe で
 headless PDF 出力 capability を確認する。名称・version・配布物 digest は provenance と診断に残す。
-macOS の署名検証は有効性と実コードの binding を確認し、特定 vendor の署名だけを許可条件にしない。
+macOS は app bundle の Apple 発行コード署名と seal を全 architecture・nested code について検証し、
+署名された bundle の主実行ファイルを起動する。PATH に shell wrapper がある場合は
+`KIO_OFFICE_CONVERTER` に bundle 内の実行ファイルを指定できる。特定の Team ID や bundle ID の
+指定、追加の notarization ticket 照会は行わない。Windows は `program/soffice.exe` と同じ
+`program/` 内に `soffice.bin`・`fundamental.ini` があり、隣に `share/` がある配置を検証する。
+launcher・renderer 本体・配置内の PE image の Authenticode 署名を実ファイル上で確認する。
+Windows の trust 判定はローカル情報で行い、publisher 名やインストーラの署名は判定に使わない。
+両 OS とも検証した runtime の配置と実体を probe・変換に結び付ける。macOS の bundle 内のリンクは
+bundle の内側に閉じる。Windows の配置内では reparse point と複数の hard link を持つファイルを拒否する。
+Windows の AppContainer のアクセス制御は OS の ACL に従う。
 version 応答の形式差だけを「未導入」と扱わず、検出済みだが利用不能なら具体的な理由を表示する。
 CI の配布物 SHA pin は再現性のため維持し、製品の一般的な版許可リストにはしない。
 

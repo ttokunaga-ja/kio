@@ -3,42 +3,20 @@ use crate::{AdapterError, Result};
 use kio_process::BoundedProcessOptions;
 use quick_xml::{Reader, events::Event};
 use sha2::{Digest, Sha256};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use std::{
     ffi::OsString,
     path::{Path, PathBuf},
 };
 use tempfile::{Builder, TempDir};
 pub(crate) fn canonical_renderer_program(candidate: PathBuf) -> Option<PathBuf> {
-    let canonical = std::fs::canonicalize(&candidate).ok()?;
-    if !canonical.is_file() {
-        return None;
-    }
-    // Recognize only the known passthrough wrapper by both location and bytes.
-    // A command installed at the Homebrew name may select another application
-    // or add arguments; its name alone cannot authorize substituting this app.
-    {
-        let known_location = ["/opt/homebrew/bin/soffice", "/usr/local/bin/soffice"]
-            .into_iter()
-            .filter_map(|path| std::fs::canonicalize(path).ok())
-            .any(|path| path == canonical);
-        let known_passthrough = known_location
-            && kio_core::cas::read_bounded_regular_file(&canonical, 4096)
-                .is_ok_and(|bytes| is_macos_office_passthrough_wrapper(&bytes));
-        if known_passthrough {
-            return std::fs::canonicalize("/Applications/LibreOffice.app/Contents/MacOS/soffice")
-                .ok()
-                .filter(|program| program.is_file());
-        }
-    }
-    Some(canonical)
-}
-pub(crate) fn is_macos_office_passthrough_wrapper(bytes: &[u8]) -> bool {
-    bytes == b"#!/bin/bash\nexec \"/Applications/LibreOffice.app/Contents/MacOS/soffice\"  \"$@\"\n"
+    std::fs::canonicalize(candidate)
+        .ok()
+        .filter(|program| program.is_file())
 }
 
 pub(crate) fn macos_office_bundle_candidate(program: &Path) -> Option<PathBuf> {
-    if !program.is_absolute() || program.file_name()? != "soffice" {
+    if !program.is_absolute() {
         return None;
     }
     let macos = program.parent()?;
@@ -50,44 +28,74 @@ pub(crate) fn macos_office_bundle_candidate(program: &Path) -> Option<PathBuf> {
         .then(|| bundle.to_path_buf())
 }
 
-pub(crate) fn verify_macos_office_bundle(bundle: &Path, deadline: Instant) -> Result<()> {
-    // -R= is the codesign inline requirement syntax; no shell or ambient
-    // executable search is involved. Deep verification covers nested code,
-    // and strict verification rejects unsealed/escaping symbolic links.
-    const REQUIREMENT: &str = "-R=anchor apple generic and certificate leaf[subject.OU] = \"7P5S3ZLCN7\" and identifier \"org.libreoffice.script\"";
-    let mut command = std::process::Command::new("/usr/bin/codesign");
-    command
-        .env_clear()
-        .current_dir("/")
-        .args([
-            "--verify",
-            "--deep",
-            "--strict",
-            "--all-architectures",
-            REQUIREMENT,
-        ])
-        .arg(bundle);
+pub(crate) fn verify_macos_office_bundle(
+    bundle: &Path,
+    program: &Path,
+    deadline: Instant,
+) -> Result<()> {
+    // A valid bundle can contain more than one executable. Its sealed
+    // Info.plist determines which executable the bundle signature authorizes.
+    let main = run_signature_tool(
+        std::process::Command::new("/usr/bin/plutil")
+            .args([
+                "-extract",
+                "CFBundleExecutable",
+                "raw",
+                "-expect",
+                "string",
+                "-n",
+                "-o",
+                "-",
+            ])
+            .arg(bundle.join("Contents/Info.plist")),
+        "cannot read the Office bundle's main executable",
+        deadline,
+    )?;
+    if macos_office_bundle_candidate(program).as_deref() != Some(bundle)
+        || program.file_name() != Some(std::ffi::OsStr::new(&main))
+    {
+        return Err(AdapterError::ContractViolation(
+            "Office renderer is not the bundle's main executable".to_owned(),
+        ));
+    }
+    run_signature_tool(
+        std::process::Command::new("/usr/bin/codesign")
+            .args([
+                "--verify",
+                "--deep",
+                "--strict",
+                "--all-architectures",
+                "-R=anchor apple generic",
+            ])
+            .arg(bundle),
+        "Office bundle has no valid Apple-issued code signature",
+        deadline,
+    )?;
+    Ok(())
+}
+
+fn run_signature_tool(
+    command: &mut std::process::Command,
+    failure: &str,
+    deadline: Instant,
+) -> Result<String> {
+    command.env_clear().current_dir("/");
     crate::office_convert::check_renderer_deadline(deadline)?;
     let output = kio_process::run_bounded_command(
-        &mut command,
+        command,
         BoundedProcessOptions {
-            timeout: Duration::from_secs(60)
-                .min(deadline.saturating_duration_since(Instant::now())),
+            timeout: deadline.saturating_duration_since(Instant::now()),
             max_stdout_bytes: MAX_OFFICE_LOG_BYTES,
             max_stderr_bytes: MAX_OFFICE_LOG_BYTES,
         },
         None,
     )
-    .map_err(|_| {
-        AdapterError::ContractViolation("Office bundle signature verification failed".to_owned())
-    })?;
+    .map_err(|_| AdapterError::ContractViolation(failure.to_owned()))?;
     crate::office_convert::check_renderer_deadline(deadline)?;
     if !output.status.success() {
-        return Err(AdapterError::ContractViolation(
-            "Office bundle is not a verified LibreOffice distribution".to_owned(),
-        ));
+        return Err(AdapterError::ContractViolation(failure.to_owned()));
     }
-    Ok(())
+    Ok(output.stdout)
 }
 
 pub(crate) fn office_bundle_path_snapshot(
@@ -142,7 +150,6 @@ pub(crate) fn private_uno_catalog_for_program(
     };
     let source = bundle.join("Contents/Resources/services/services.rdb");
     let before = office_bundle_path_snapshot(&bundle, program, &source)?;
-    verify_macos_office_bundle(&bundle, deadline)?;
     let bytes = read_stable_catalog(&source, deadline)?;
     let _ = macos_spell_component_range(&bytes)?;
     if before != office_bundle_path_snapshot(&bundle, program, &source)? {
@@ -168,7 +175,7 @@ pub(crate) fn read_stable_catalog(path: &Path, deadline: Instant) -> Result<Vec<
         })
 }
 
-pub(crate) fn macos_spell_component_range(bytes: &[u8]) -> Result<(usize, usize)> {
+pub(crate) fn macos_spell_component_range(bytes: &[u8]) -> Result<Option<(usize, usize)>> {
     const IMPLEMENTATION: &[u8] = b"org.openoffice.lingu.MacOSXSpellChecker";
     const CONSTRUCTOR: &[u8] = b"lingucomponent_MacSpellChecker_get_implementation";
     let mut reader = Reader::from_reader(bytes);
@@ -353,11 +360,7 @@ pub(crate) fn macos_spell_component_range(bytes: &[u8]) -> Result<(usize, usize)
             "Office service catalog is truncated or has no closed root".to_owned(),
         ));
     }
-    match_range.ok_or_else(|| {
-        AdapterError::ContractViolation(
-            "Office service catalog has no expected macOS spell checker component".to_owned(),
-        )
-    })
+    Ok(match_range)
 }
 
 #[derive(PartialEq, Eq)]
@@ -371,7 +374,7 @@ pub(crate) struct OfficeBundlePathIdentity {
     changed: (i64, i64),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) struct PrivateUnoCatalog {
     pub(crate) source: PathBuf,
     pub(crate) bundle: PathBuf,
@@ -381,14 +384,16 @@ pub(crate) fn write_private_uno_catalog(
     catalog: &PrivateUnoCatalog,
     scratch: &Path,
     deadline: Instant,
-) -> Result<PathBuf> {
+) -> Result<Option<PathBuf>> {
     let bytes = read_stable_catalog(&catalog.source, deadline)?;
     if hex_digest(&Sha256::digest(&bytes)) != catalog.source_digest {
         return Err(AdapterError::ContractViolation(
             "Office service catalog changed after converter probe".to_owned(),
         ));
     }
-    let (start, end) = macos_spell_component_range(&bytes)?;
+    let Some((start, end)) = macos_spell_component_range(&bytes)? else {
+        return Ok(None);
+    };
     let destination = scratch.join("services-without-macos-spell.rdb");
     let directory = crate::office_convert::bind_private_scratch(scratch).map_err(|error| {
         AdapterError::ContractViolation(format!("unsafe Office service catalog scratch: {error}"))
@@ -410,7 +415,7 @@ pub(crate) fn write_private_uno_catalog(
                 "cannot write private Office service catalog: {error}"
             ))
         })?;
-    Ok(destination)
+    Ok(Some(destination))
 }
 /// Create an exclusively allocated, owner-private scratch directory.
 /// Use the short canonical parent required by LibreOffice Unix-domain sockets.
@@ -430,7 +435,7 @@ pub(crate) fn private_temp_dir() -> Result<TempDir> {
     super::super::unix::office_fs::restrict_scratch(directory.path())?;
     Ok(directory)
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) struct OfficeRuntime {
     catalog: Option<PrivateUnoCatalog>,
 }
@@ -439,6 +444,12 @@ impl OfficeRuntime {
         Ok(Self {
             catalog: private_uno_catalog_for_program(program, deadline)?,
         })
+    }
+    pub(crate) fn verify_runtime_signature(&self, program: &Path, deadline: Instant) -> Result<()> {
+        let catalog = self.catalog.as_ref().ok_or_else(|| {
+            AdapterError::ContractViolation("unsupported macOS Office runtime placement".to_owned())
+        })?;
+        verify_macos_office_bundle(&catalog.bundle, program, deadline)
     }
     pub(crate) fn catalog_digest(&self) -> Option<&str> {
         self.catalog
@@ -458,8 +469,9 @@ impl OfficeRuntime {
         environment: &mut Vec<(OsString, OsString)>,
         deadline: Instant,
     ) -> Result<()> {
-        if let Some(catalog) = self.catalog.as_ref() {
-            let private_catalog = write_private_uno_catalog(catalog, scratch, deadline)?;
+        if let Some(catalog) = self.catalog.as_ref()
+            && let Some(private_catalog) = write_private_uno_catalog(catalog, scratch, deadline)?
+        {
             environment.push((
                 OsString::from("URE_MORE_SERVICES"),
                 super::super::file_url(&private_catalog)?.into(),

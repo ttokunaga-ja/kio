@@ -43,7 +43,7 @@ tempfile = "3"
 rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys.workspace = true
+windows-sys = { workspace = true, features = ["Win32_Security_Cryptography", "Win32_Security_WinTrust", "Win32_System_SystemInformation"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

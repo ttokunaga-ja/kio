@@ -195,18 +195,30 @@ pub(crate) fn restrict_renderer_state_directory(
     )?;
     Ok(())
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct OfficeRuntime;
+#[derive(Debug, Clone)]
+pub(crate) struct OfficeRuntime {
+    package: PathBuf,
+    windows: PathBuf,
+}
 impl OfficeRuntime {
-    pub(crate) fn new(_program: &Path, _deadline: std::time::Instant) -> Result<Self> {
-        Ok(Self)
+    pub(crate) fn new(program: &Path, _deadline: std::time::Instant) -> Result<Self> {
+        Ok(Self {
+            package: installed_package(program)?,
+            windows: windows_directory()?,
+        })
+    }
+    #[cfg(test)]
+    pub(crate) fn fixture(package: PathBuf) -> Self {
+        Self {
+            package,
+            windows: windows_directory().unwrap(),
+        }
     }
     pub(crate) fn catalog_digest(&self) -> Option<&str> {
         None
     }
-    pub(crate) fn package_roots(&self, program: &Path) -> Result<Vec<PathBuf>> {
-        let program_files = program_files_directory()?;
-        Ok(vec![installed_package(&program_files, program)?])
+    pub(crate) fn package_roots(&self, _program: &Path) -> Result<Vec<PathBuf>> {
+        Ok(vec![self.package.clone()])
     }
     pub(crate) fn configure_services(
         &self,
@@ -218,68 +230,157 @@ impl OfficeRuntime {
     }
     pub(crate) fn environment(
         &self,
-        program: &Path,
+        _program: &Path,
         home: Option<&Path>,
     ) -> Vec<(OsString, OsString)> {
-        renderer_environment(program, home)
+        renderer_environment(&self.windows, home)
     }
     pub(crate) fn runtime_roots(&self, _program: &Path) -> Result<Vec<PathBuf>> {
-        let mut roots = Vec::new();
-        if let Some(root) = std::env::var_os("SystemRoot") {
-            roots.push(PathBuf::from(root));
+        Ok(vec![self.windows.clone()])
+    }
+
+    pub(crate) fn verify_runtime_signatures(
+        &self,
+        program: &Path,
+        entries: &[(&Path, std::fs::File)],
+        deadline: std::time::Instant,
+    ) -> std::io::Result<()> {
+        use std::os::windows::fs::FileExt as _;
+
+        let renderer = self.package.join("program/soffice.bin");
+        let mut launcher_verified = false;
+        let mut renderer_verified = false;
+        for &(path, ref file) in entries {
+            crate::office_runtime_identity::check_verification_deadline(deadline)?;
+            if file.metadata()?.is_dir() {
+                continue;
+            }
+            let required = path == program || path == renderer;
+            let mut header = [0; 2];
+            if file.seek_read(&mut header, 0)? == 2 && &header == b"MZ" {
+                verify_authenticode(path, file)?;
+                launcher_verified |= path == program;
+                renderer_verified |= path == renderer;
+            } else if required {
+                return Err(std::io::Error::other(format!(
+                    "Windows Office executable is not a PE image: {}",
+                    path.display()
+                )));
+            }
         }
-        Ok(roots)
+        if !launcher_verified || !renderer_verified {
+            return Err(std::io::Error::other(
+                "Windows Office runtime lacks verified executable images",
+            ));
+        }
+        Ok(())
     }
 }
-fn program_files_directory() -> Result<PathBuf> {
-    use std::os::windows::ffi::OsStringExt;
-    use windows_sys::Win32::{
-        Foundation::MAX_PATH,
-        UI::Shell::{CSIDL_PROGRAM_FILES, SHGFP_TYPE_CURRENT, SHGetFolderPathW},
-    };
 
-    let mut path = [0; MAX_PATH as usize];
-    // The API writes a NUL-terminated path into a caller-provided MAX_PATH buffer.
-    let result = unsafe {
-        SHGetFolderPathW(
-            std::ptr::null_mut(),
-            CSIDL_PROGRAM_FILES as i32,
-            std::ptr::null_mut(),
-            SHGFP_TYPE_CURRENT as u32,
-            path.as_mut_ptr(),
-        )
-    };
-    let end = path
-        .iter()
-        .position(|unit| *unit == 0)
-        .filter(|end| result >= 0 && *end > 0)
-        .ok_or_else(|| {
-            AdapterError::ContractViolation(
-            "cannot determine the Windows Program Files directory for Office runtime verification"
-                .to_owned(),
-        )
-        })?;
-    Ok(PathBuf::from(OsString::from_wide(&path[..end])))
+fn windows_directory() -> Result<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
+
+    let mut path = [0; windows_sys::Win32::Foundation::MAX_PATH as usize];
+    // The OS writes the Windows directory into the supplied UTF-16 buffer.
+    let len = unsafe { GetSystemWindowsDirectoryW(path.as_mut_ptr(), path.len() as u32) } as usize;
+    if len == 0 || len >= path.len() {
+        return Err(AdapterError::ContractViolation(
+            "cannot determine the Windows system directory for Office".to_owned(),
+        ));
+    }
+    Ok(PathBuf::from(OsString::from_wide(&path[..len])))
 }
 
-fn installed_package(program_files: &Path, program: &Path) -> Result<PathBuf> {
-    let package = program_files.join("LibreOffice");
+fn installed_package(program: &Path) -> Result<PathBuf> {
     let invalid = || {
         AdapterError::ContractViolation(format!(
-            "unsupported Windows Office runtime placement for {}",
+            "unsupported Windows Office runtime placement for {}: expected program/soffice.exe, program/soffice.bin, program/fundamental.ini and share/",
             program.display()
         ))
     };
-    if !kio_core::platform::directory_is_real(&package).map_err(|_| invalid())? {
-        return Err(invalid());
-    }
-    let package = std::fs::canonicalize(package).map_err(|_| invalid())?;
-    if package.join("program").join("soffice.exe") != program
-        || !kio_core::platform::regular_file_is_safe(program).map_err(|_| invalid())?
+
+    let binaries = program.parent().ok_or_else(invalid)?;
+    let package = binaries.parent().ok_or_else(invalid)?;
+    if package.parent().is_none()
+        || !program.is_absolute()
+        || !binaries.ends_with("program")
+        || !program.ends_with("soffice.exe")
     {
         return Err(invalid());
     }
-    Ok(package)
+    for directory in [package, binaries, &package.join("share")] {
+        if !kio_core::platform::directory_is_real(directory).map_err(|_| invalid())? {
+            return Err(invalid());
+        }
+    }
+    for file in [
+        program,
+        &binaries.join("soffice.bin"),
+        &binaries.join("fundamental.ini"),
+    ] {
+        if !kio_core::platform::regular_file_is_safe(file).map_err(|_| invalid())? {
+            return Err(invalid());
+        }
+    }
+    Ok(package.to_path_buf())
+}
+
+fn verify_authenticode(path: &Path, file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::windows::{ffi::OsStrExt as _, io::AsRawHandle as _};
+    use windows_sys::Win32::{
+        Foundation::INVALID_HANDLE_VALUE,
+        Security::WinTrust::{
+            WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_DATA_0, WINTRUST_FILE_INFO,
+            WTD_CACHE_ONLY_URL_RETRIEVAL, WTD_CHOICE_FILE, WTD_DISABLE_MD2_MD4,
+            WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY, WTD_UI_NONE, WinVerifyTrust,
+        },
+    };
+
+    let wide_path: Vec<_> = path.as_os_str().encode_wide().chain([0]).collect();
+    let mut subject = WINTRUST_FILE_INFO {
+        cbStruct: std::mem::size_of::<WINTRUST_FILE_INFO>() as u32,
+        pcwszFilePath: wide_path.as_ptr(),
+        hFile: file.as_raw_handle(),
+        ..Default::default()
+    };
+    let mut data = WINTRUST_DATA {
+        cbStruct: std::mem::size_of::<WINTRUST_DATA>() as u32,
+        dwUIChoice: WTD_UI_NONE,
+        dwUnionChoice: WTD_CHOICE_FILE,
+        Anonymous: WINTRUST_DATA_0 {
+            pFile: &raw mut subject,
+        },
+        dwStateAction: WTD_STATEACTION_VERIFY,
+        dwProvFlags: WTD_CACHE_ONLY_URL_RETRIEVAL | WTD_DISABLE_MD2_MD4,
+        ..Default::default()
+    };
+    let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    // The path, open file handle and structures stay live across VERIFY and
+    // CLOSE. WinVerifyTrust returns zero for success, not an HRESULT range.
+    let status = unsafe {
+        WinVerifyTrust(
+            INVALID_HANDLE_VALUE,
+            &raw mut action,
+            (&raw mut data).cast(),
+        )
+    };
+    data.dwStateAction = WTD_STATEACTION_CLOSE;
+    unsafe {
+        WinVerifyTrust(
+            INVALID_HANDLE_VALUE,
+            &raw mut action,
+            (&raw mut data).cast(),
+        )
+    };
+    if status != 0 {
+        return Err(std::io::Error::other(format!(
+            "Authenticode verification failed for {} (0x{:08x})",
+            path.display(),
+            status as u32
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn file_url(path: &Path) -> Result<String> {
@@ -293,22 +394,13 @@ pub(crate) fn file_url(path: &Path) -> Result<String> {
 }
 
 pub(crate) fn renderer_environment(
-    _program: &Path,
+    windows: &Path,
     home: Option<&Path>,
 ) -> Vec<(OsString, OsString)> {
-    let mut environment = Vec::new();
-    for name in ["SystemRoot", "WINDIR", "COMSPEC", "PATHEXT"] {
-        if let Some(value) = std::env::var_os(name) {
-            environment.push((OsString::from(name), value));
-        }
-    }
-    let mut paths = Vec::new();
-    if let Some(system_root) = std::env::var_os("SystemRoot") {
-        let root = PathBuf::from(system_root);
-        paths.push(root.join("System32"));
-        paths.push(root);
-    }
-    if let Ok(path) = std::env::join_paths(paths) {
+    let mut environment = ["SystemRoot", "WINDIR"]
+        .map(|name| (OsString::from(name), windows.as_os_str().to_owned()))
+        .to_vec();
+    if let Ok(path) = std::env::join_paths([windows.join("System32"), windows.to_path_buf()]) {
         environment.push((OsString::from("PATH"), path));
     }
     if let Some(home) = home {
@@ -335,27 +427,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn records_only_the_known_installation_as_package_runtime() {
+    fn authenticode_rejects_an_unsigned_image() {
         let directory = tempfile::tempdir().unwrap();
-        let package = directory.path().join("LibreOffice");
-        std::fs::create_dir(&package).unwrap();
-        let package = std::fs::canonicalize(package).unwrap();
-        let program = package.join("program").join("soffice.exe");
-        assert!(installed_package(directory.path(), &program).is_err());
-        std::fs::create_dir(program.parent().unwrap()).unwrap();
-        std::fs::write(&program, b"fixture").unwrap();
-        assert_eq!(
-            installed_package(directory.path(), &program).unwrap(),
-            package
-        );
+        let package = directory.path().canonicalize().unwrap();
+        let binaries = package.join("program");
+        std::fs::create_dir(&binaries).unwrap();
+        std::fs::create_dir(package.join("share")).unwrap();
+        std::fs::write(binaries.join("fundamental.ini"), b"bootstrap").unwrap();
+        let program = binaries.join("soffice.exe");
+        let test_image = std::env::current_exe().unwrap();
+        std::fs::copy(&test_image, &program).unwrap();
+        std::fs::copy(&test_image, binaries.join("soffice.bin")).unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let runtime = OfficeRuntime::new(&program, deadline).unwrap();
+        let sources =
+            kio_process::confinement::RenderSources::resolve(&program, [package.clone()]).unwrap();
+        let snapshot =
+            crate::office_runtime_identity::RuntimeSnapshot::new(vec![package], &sources, deadline)
+                .unwrap();
+        let pins = snapshot.pin_windows_package(deadline).unwrap();
+        let error = runtime
+            .verify_runtime_signatures(&program, &pins, deadline)
+            .unwrap_err();
         assert!(
-            installed_package(
-                directory.path(),
-                &directory.path().join("other/program/soffice.exe")
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("unsupported Windows Office runtime placement")
+            error
+                .to_string()
+                .contains("Authenticode verification failed"),
+            "{error}"
         );
+    }
+
+    #[test]
+    fn discovers_the_package_from_its_runtime_layout() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(directory.path()).unwrap();
+        let package = base.join("Alternate Office");
+        let program = package.join("program/soffice.exe");
+        std::fs::create_dir_all(program.parent().unwrap()).unwrap();
+        std::fs::create_dir(package.join("share")).unwrap();
+        std::fs::write(&program, b"launcher").unwrap();
+        assert!(installed_package(&program).is_err());
+        std::fs::write(package.join("program/soffice.bin"), b"renderer").unwrap();
+        std::fs::write(package.join("program/fundamental.ini"), b"bootstrap").unwrap();
+        assert_eq!(installed_package(&program).unwrap(), package);
     }
 }
