@@ -31,7 +31,7 @@ use windows_sys::Win32::{
     },
     Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES,
-        FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_READ_DATA, FILE_READ_EA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
         GetFileInformationByHandle, GetFileInformationByHandleEx, READ_CONTROL, SYNCHRONIZE,
     },
     System::IO::IO_STATUS_BLOCK,
@@ -165,7 +165,7 @@ fn reopen_retained_directory(directory: &File, label: &Path, desired_access: u32
     }
     Ok(operation)
 }
-fn nt_status_error(status: i32) -> std::io::Error {
+pub(in crate::platform) fn nt_status_error(status: i32) -> std::io::Error {
     std::io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) as i32 })
 }
 pub(crate) fn normalize_directory_handle(file: File, label: &Path) -> Result<File> {
@@ -366,13 +366,18 @@ pub(crate) fn open_regular_for_removal(
     relative: &Path,
     max: u64,
     label: &Path,
+    verify_stage_nonce: bool,
 ) -> Result<File> {
     let (parent, leaf) = parent(root, relative, label)?;
     let path = full(label, relative);
     let mut options = cap_fs::OpenOptions::new();
+    let mut access = FILE_READ_DATA | READ_CONTROL | DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+    if verify_stage_nonce {
+        access |= FILE_READ_EA;
+    }
     options
         .read(true)
-        .access_mode(FILE_READ_DATA | READ_CONTROL | DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE)
+        .access_mode(access)
         .share_mode(FILE_SHARE_READ)
         ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
     let file = cap_fs::open(&parent, Path::new(leaf), &options).map_err(|e| ioerr(&path, e))?;
@@ -1261,8 +1266,9 @@ mod tests {
         let source_path = directory.path().join("leaf");
         fs::write(&source_path, b"source").expect("source body");
         let root_handle = directory.root_handle();
-        let held = open_regular_for_removal(&root_handle, Path::new("leaf"), 64, directory.path())
-            .expect("retained removal handle");
+        let held =
+            open_regular_for_removal(&root_handle, Path::new("leaf"), 64, directory.path(), false)
+                .expect("retained removal handle");
 
         assert!(fs::rename(&source_path, directory.path().join("renamed")).is_err());
         assert!(OpenOptions::new().write(true).open(&source_path).is_err());

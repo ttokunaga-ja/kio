@@ -236,6 +236,7 @@ pub(crate) fn open_regular_for_removal(
     relative: &Path,
     max: u64,
     label: &Path,
+    _verify_stage_nonce: bool,
 ) -> Result<File> {
     open_regular_read(root, relative, max, label)
 }

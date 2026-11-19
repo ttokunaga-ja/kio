@@ -33,7 +33,7 @@ pub(crate) fn remove_publication_residue(workspace: &StoreDirectory, name: &Path
     };
     ensure_private_workspace(workspace)?;
     workspace.ensure_owner_private(name)?;
-    let file = workspace.open_regular_for_removal(name, u64::MAX)?;
+    let file = workspace.open_regular_for_removal(name, u64::MAX, false)?;
     super::private_fs::verify_owner_private_handle(&file)?;
     let info = FILE_DISPOSITION_INFO_EX {
         Flags: FILE_DISPOSITION_FLAG_DELETE
@@ -126,7 +126,11 @@ pub(crate) fn finish_remove_retirement(
             (source, true)
         }
         (None, true) => (
-            workspace.open_regular_for_removal(Path::new(REMOVED), intent.max_bytes)?,
+            workspace.open_regular_for_removal(
+                Path::new(REMOVED),
+                intent.max_bytes,
+                intent.stage_identity.is_some(),
+            )?,
             false,
         ),
         (None, false) => {

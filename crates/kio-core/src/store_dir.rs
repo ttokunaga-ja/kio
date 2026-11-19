@@ -246,10 +246,20 @@ impl StoreDirectory {
         platform::open_regular_read(&self.handle, relative, max_bytes, &self.logical)
     }
 
-    /// Open a retained regular leaf with the rights required to restrict a
-    /// current-user Windows quarantine object on this same handle.
-    pub(super) fn open_regular_for_removal(&self, relative: &Path, max_bytes: u64) -> Result<File> {
-        platform::open_regular_for_removal(&self.handle, relative, max_bytes, &self.logical)
+    /// Open a retained regular leaf for quarantine and optional stage nonce verification.
+    pub(super) fn open_regular_for_removal(
+        &self,
+        relative: &Path,
+        max_bytes: u64,
+        verify_stage_nonce: bool,
+    ) -> Result<File> {
+        platform::open_regular_for_removal(
+            &self.handle,
+            relative,
+            max_bytes,
+            &self.logical,
+            verify_stage_nonce,
+        )
     }
 
     pub fn read_optional(&self, relative: &Path, max_bytes: u64) -> Result<Option<Vec<u8>>> {

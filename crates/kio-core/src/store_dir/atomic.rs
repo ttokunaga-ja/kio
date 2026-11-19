@@ -459,7 +459,11 @@ pub(super) fn parent_removal(
     // Never touch a public destination during acknowledgement. A new external
     // file may have appeared since quarantine and must remain untouched.
     if workspace.contains_entry(Path::new(REMOVED))? {
-        let mut file = workspace.open_regular_for_removal(Path::new(REMOVED), intent.max_bytes)?;
+        let mut file = workspace.open_regular_for_removal(
+            Path::new(REMOVED),
+            intent.max_bytes,
+            intent.stage_identity.is_some(),
+        )?;
         if let Some(identity) = &intent.stage_identity {
             identity.verify(&file)?;
         }
@@ -698,7 +702,8 @@ pub(super) fn remove_hash_checked(
     let _ = recover_locked(owner, &workspace, &[target], false)?;
     let (parent, leaf, chain) = parent_chain(target, relative)?;
     same_volume(&workspace, &parent)?;
-    let mut source = parent.open_regular_for_removal(Path::new(&leaf), max_bytes)?;
+    let mut source =
+        parent.open_regular_for_removal(Path::new(&leaf), max_bytes, stage_identity.is_some())?;
     crate::platform::atomic_semantics::verify_removal_owner(&source)?;
     verify(&source)?;
     let source_id = file_id(&source)?;
@@ -797,7 +802,11 @@ fn recover_locked(
     }
     same_volume(workspace, &parent)?;
     let source = if parent.contains_entry(Path::new(&leaf))? {
-        Some(parent.open_regular_for_removal(Path::new(&leaf), intent.max_bytes)?)
+        Some(parent.open_regular_for_removal(
+            Path::new(&leaf),
+            intent.max_bytes,
+            intent.stage_identity.is_some(),
+        )?)
     } else {
         None
     };
