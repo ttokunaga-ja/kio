@@ -73,7 +73,7 @@ use kio_adapter::types::RawInput;
 use kio_adapter::types::UnitKind;
 use kio_core::Result;
 use kio_core::control::ControlHandle;
-use kio_core::dag::NormalizeRef;
+use kio_core::dag::{NormalizeRef, TreeObject};
 use kio_core::scope::PendingNormalizeRef;
 use kio_core::scope::Repository;
 use kio_core::scope::new_ulid;
@@ -92,6 +92,7 @@ use kio_pipeline::prepare::PrepareStageBytesRequest;
 use kio_pipeline::prepare::PreparedUnit;
 use kio_pipeline::prepare::map_units;
 use kio_pipeline::prepare::prepare_units_from_bytes_with_control;
+use kio_pipeline::prepare::unsupported_reason_for_content;
 use kio_pipeline::scan::ScanCandidate;
 use kio_pipeline::scan::ScanPreview;
 use kio_pipeline::task::RetryErrorKind;
@@ -99,9 +100,10 @@ use kio_pipeline::task::TaskStatus;
 use kio_pipeline::task::TaskStore;
 use kio_pipeline::task::TaskType;
 use kio_pipeline::unsupported::UNSUPPORTED_REASON_RESOLVED;
-use kio_pipeline::unsupported::UNSUPPORTED_REASON_UNRECOGNIZED_BINARY;
 use kio_pipeline::unsupported::UnsupportedInputDisposition;
 use kio_pipeline::unsupported::UnsupportedInputStore;
+
+use kio_pipeline::unsupported::unsupported_reason_for_path;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -186,6 +188,7 @@ pub(crate) fn index_preview_response(root: &Path, preview: &ScanPreview) -> Inde
 pub(crate) struct IndexPipelineResult {
     pub(crate) resource_limit: Option<kio_core::error::ResourceLimit>,
     pub(crate) normalize_by_path: BTreeMap<String, PendingNormalizeRef>,
+    pub(crate) unsupported_raws: BTreeMap<String, String>,
     pub(crate) network_allowed: bool,
     pub(crate) pending_online_tasks: usize,
     pub(crate) paused_tasks: usize,
@@ -552,6 +555,95 @@ pub(crate) fn test_markdown_unit(hint: &PreparedUnitHint, prefix: &str) -> Markd
     }
 }
 
+fn hash_unsupported_input(
+    repo: &Repository,
+    candidate: &ScanCandidate,
+    reason: &str,
+) -> Result<UnsupportedInputDisposition> {
+    let root = repo.bound_root_handle().ok_or_else(|| {
+        pipeline_to_kio(kio_pipeline::PipelineError::contract(
+            "KIO-E-SCOPE-BOUND-STATE-001",
+            "managed index is missing its retained scope handle",
+        ))
+    })?;
+    let identity = kio_pipeline::scan::hash_bound_verified_scan_input(
+        root,
+        &candidate.input_path,
+        candidate.size_bytes,
+    )
+    .map_err(pipeline_to_kio)?;
+    Ok(UnsupportedInputDisposition {
+        path: candidate.input_path.clone(),
+        raw_hash: identity.raw_hash,
+        media_type: candidate.media_type.clone(),
+        size_bytes: identity.size_bytes,
+        reason: reason.to_owned(),
+    })
+}
+
+#[derive(Default)]
+pub(super) struct ReindexInputClassifications {
+    pub(super) raw_by_path: BTreeMap<String, String>,
+    pub(super) unsupported_paths: BTreeSet<String>,
+}
+
+pub(super) fn record_reindex_unsupported_inputs(
+    repo: &Repository,
+    preview: &ScanPreview,
+    head_tree: &TreeObject,
+) -> Result<ReindexInputClassifications> {
+    let max_input_bytes = effective_max_input_bytes(repo)?;
+    let store = UnsupportedInputStore::new(repo.kio_dir())
+        .with_published_tree(Some(head_tree))
+        .map_err(pipeline_to_kio)?;
+    let mut observations = Vec::new();
+    let mut classified = ReindexInputClassifications::default();
+    for candidate in preview
+        .candidates
+        .iter()
+        .filter(|candidate| !candidate.ignored)
+    {
+        let disposition = if let Some(reason) =
+            unsupported_reason_for_path(Path::new(&candidate.input_path))
+        {
+            hash_unsupported_input(repo, candidate, reason)?
+        } else if candidate.media_type == "application/octet-stream"
+            && candidate.size_bytes <= max_input_bytes
+        {
+            let verified = read_repository_scan_input(repo, &candidate.input_path, max_input_bytes)
+                .map_err(pipeline_to_kio)?;
+            let Some(reason) =
+                unsupported_reason_for_content(&candidate.media_type, &verified.bytes)
+            else {
+                classified
+                    .raw_by_path
+                    .insert(candidate.input_path.clone(), verified.raw_hash);
+                continue;
+            };
+            UnsupportedInputDisposition {
+                path: candidate.input_path.clone(),
+                raw_hash: verified.raw_hash,
+                media_type: candidate.media_type.clone(),
+                size_bytes: verified.size_bytes,
+                reason: reason.to_owned(),
+            }
+        } else {
+            continue;
+        };
+        classified
+            .raw_by_path
+            .insert(disposition.path.clone(), disposition.raw_hash.clone());
+        classified
+            .unsupported_paths
+            .insert(disposition.path.clone());
+        observations.push(disposition);
+    }
+    store
+        .record_observations(observations)
+        .map_err(pipeline_to_kio)?;
+    Ok(classified)
+}
+
 pub(crate) fn run_index_pipeline(
     adapter_settings: &Arc<AdapterRuntimeSettings>,
     repo: &Repository,
@@ -649,24 +741,20 @@ pub(crate) fn run_index_pipeline(
         network_allowed,
         ..IndexPipelineResult::default()
     };
-    let unsupported_store = UnsupportedInputStore::new(repo.kio_dir());
+    let head_tree = repo
+        .head_commit_hash()?
+        .map(|head| read_head_tree_for_rebuild(repo, &head))
+        .transpose()?;
+    let unsupported_store = UnsupportedInputStore::new(repo.kio_dir())
+        .with_published_tree(head_tree.as_ref())
+        .map_err(pipeline_to_kio)?;
     let mut unsupported_by_path = unsupported_store
         .latest_by_path()
         .map_err(pipeline_to_kio)?
         .into_iter()
         .map(|entry| (entry.path.clone(), entry))
         .collect::<BTreeMap<_, _>>();
-    let mut unsupported_paths = unsupported_by_path
-        .values()
-        .filter(|entry| {
-            entry.reason == UNSUPPORTED_REASON_UNRECOGNIZED_BINARY
-                || entry.reason == kio_pipeline::unsupported::UNSUPPORTED_REASON_SOURCE_CODE
-        })
-        .map(|entry| entry.path.clone())
-        .collect::<BTreeSet<_>>();
-    // 07 §5.1: mirrors `unsupported_paths` above, scoped to the
-    // office-conversion-unavailable reason so `enqueue_online_placeholder_task`
-    // can record the resolved-transition once a converter becomes available.
+    // 07 §5.1: record the resolved transition once a converter becomes available.
     let mut office_conversion_unavailable_paths = unsupported_by_path
         .values()
         .filter(|entry| entry.reason == OFFICE_CONVERSION_UNAVAILABLE_REASON)
@@ -686,9 +774,8 @@ pub(crate) fn run_index_pipeline(
         .map(|candidate| candidate.input_path.as_str())
         .collect::<BTreeSet<_>>();
     let mut head_ocr_normalizes = BTreeMap::new();
-    if let Some(head) = repo.head_commit_hash()? {
-        let tree = read_head_tree_for_rebuild(repo, &head)?;
-        for entry in &tree.entries {
+    if let Some(head_tree) = head_tree {
+        for entry in &head_tree.entries {
             let entry = entry?;
             if candidate_paths.contains(entry.path.as_str())
                 && let Some(normalize) = entry.normalize
@@ -698,14 +785,14 @@ pub(crate) fn run_index_pipeline(
         }
     }
 
+    let mut unsupported_observations = Vec::new();
     for candidate in preview
         .candidates
         .iter()
         .filter(|candidate| !candidate.ignored && candidate.media_type != "inode/directory")
     {
-        if candidate.size_bytes > max_input_bytes
-            && !kio_pipeline::unsupported::is_source_code_path(Path::new(&candidate.input_path))
-        {
+        let unsupported_reason = unsupported_reason_for_path(Path::new(&candidate.input_path));
+        if candidate.size_bytes > max_input_bytes && unsupported_reason.is_none() {
             result.skipped_oversized_files += 1;
             repo.control().append_event_log_in_session(
                 repo.lock_session(),
@@ -731,31 +818,9 @@ pub(crate) fn run_index_pipeline(
             result.failed_files += 1;
             continue;
         }
-        if kio_pipeline::unsupported::is_source_code_path(Path::new(&candidate.input_path)) {
-            let root = repo.bound_root_handle().ok_or_else(|| {
-                pipeline_to_kio(kio_pipeline::PipelineError::contract(
-                    "KIO-E-SCOPE-BOUND-STATE-001",
-                    "managed index is missing its retained scope handle",
-                ))
-            })?;
-            let identity = kio_pipeline::scan::hash_bound_verified_scan_input(
-                root,
-                &candidate.input_path,
-                candidate.size_bytes,
-            )
-            .map_err(pipeline_to_kio)?;
-            record_unsupported_if_changed(
-                &unsupported_store,
-                &mut unsupported_by_path,
-                UnsupportedInputDisposition {
-                    path: candidate.input_path.clone(),
-                    raw_hash: identity.raw_hash,
-                    media_type: candidate.media_type.clone(),
-                    size_bytes: identity.size_bytes,
-                    reason: kio_pipeline::unsupported::UNSUPPORTED_REASON_SOURCE_CODE.to_owned(),
-                },
-            )?;
-            unsupported_paths.insert(candidate.input_path.clone());
+        if let Some(reason) = unsupported_reason {
+            let disposition = hash_unsupported_input(repo, candidate, reason)?;
+            unsupported_observations.push(disposition);
             continue;
         }
         let verified =
@@ -801,6 +866,27 @@ pub(crate) fn run_index_pipeline(
         // Reject before Prepare/Markdownize writes any derived state. The closing
         // snapshot independently rechecks every staged raw under the store lock.
         ensure_raw_ingest_allowed(repo, &raw_hash)?;
+        if let Some(reason) = unsupported_reason_for_content(&candidate.media_type, &verified.bytes)
+        {
+            result.skipped_unrecognized_binary_files += 1;
+            unsupported_observations.push(UnsupportedInputDisposition {
+                path: candidate.input_path.clone(),
+                raw_hash,
+                media_type: candidate.media_type.clone(),
+                size_bytes: verified.size_bytes,
+                reason: reason.to_owned(),
+            });
+            repo.control().append_event_log_in_session(
+                repo.lock_session(),
+                "KIO-I-INDEX-INPUT-UNRECOGNIZED-BINARY-001",
+                "binary input has no locally-extractable text and no OCR-able media type; archived but not enriched",
+                json!({
+                    "media_type": candidate.media_type,
+                    "size_bytes": candidate.size_bytes,
+                }),
+            )?;
+            continue;
+        }
         let prepare = prepare_units_from_bytes_with_control(
             PrepareStageBytesRequest {
                 raw_hash: &raw_hash,
@@ -916,60 +1002,11 @@ pub(crate) fn run_index_pipeline(
         }
 
         if prepare.prepared_units.is_empty() {
-            // R20-5: this media has no locally-extractable text — a text-layer-less/scanned
-            // PDF, or (after R20-6) an image / OOXML / unrecognized binary. It needs ONLINE
-            // OCR, so route it through the SAME enqueue path as a text-layer PDF's online
-            // enhancement: an idempotent task carrying the executable online output_ref,
-            // gated by secret / budget / network opt-in. The old branch appended a fixed
-            // "pending:scanned_pdf_without_text_layer" output_ref that NO executor consumed
-            // (`execute_pending_markdownize_tasks` filters on the online output_ref) and had
-            // no idempotency guard (04 §5.5), so it silently duplicated on every idle
-            // re-index and the file never reached OCR.
-            //
-            // R21-4: only a RECOGNIZED OCR-able medium (PDF / image / OOXML — docs/07 §5.2)
-            // is worth an online OCR task. An unrecognized `application/octet-stream` binary
-            // (a .sqlite, a .zip, a compiled blob) is not a document and can never be OCR'd,
-            // so enqueuing one only pollutes pending enrichment forever. Skip it.
-            if candidate.media_type != "application/octet-stream" {
-                if unsupported_paths.remove(&candidate.input_path) {
-                    record_unsupported_if_changed(
-                        &unsupported_store,
-                        &mut unsupported_by_path,
-                        UnsupportedInputDisposition {
-                            path: candidate.input_path.clone(),
-                            raw_hash: raw_hash.clone(),
-                            media_type: candidate.media_type.clone(),
-                            size_bytes: verified.size_bytes,
-                            reason: UNSUPPORTED_REASON_RESOLVED.to_owned(),
-                        },
-                    )?;
-                }
-                if markdown_planning_ready {
-                    enqueue_online_placeholder_task(
-                        adapter_settings,
-                        repo,
-                        &task_store,
-                        candidate,
-                        &raw_hash,
-                        network_allowed,
-                        &now,
-                        &mut result,
-                        ledger,
-                        &unsupported_store,
-                        &mut unsupported_by_path,
-                        &mut office_conversion_unavailable_paths,
-                    )?;
-                }
-            } else {
-                // R22-4: the R21-4 skip left NO trace — no task, no counter, no event — so a
-                // real document whose extension is merely missing from the MIME table (a
-                // `.bmp` / `.tiff` / `.heic` image, a legacy `.doc` / `.xls`, an `.epub`)
-                // vanished from enrichment while `index_status` still reported
-                // `enriched_ratio: 1.0` and `kio status` showed the file as `unchanged`. The
-                // bytes are archived, but nothing is searchable and no recovery command has
-                // anything to act on. Disclose it exactly the way the sibling oversized-input
-                // gate does: a counter plus an INFO event (no new error code — docs frozen).
-                result.skipped_unrecognized_binary_files += 1;
+            // Recognized media without local text may still be eligible for OCR.
+            if unsupported_by_path
+                .get(&candidate.input_path)
+                .is_some_and(UnsupportedInputDisposition::is_unsupported)
+            {
                 record_unsupported_if_changed(
                     &unsupported_store,
                     &mut unsupported_by_path,
@@ -978,23 +1015,33 @@ pub(crate) fn run_index_pipeline(
                         raw_hash: raw_hash.clone(),
                         media_type: candidate.media_type.clone(),
                         size_bytes: verified.size_bytes,
-                        reason: UNSUPPORTED_REASON_UNRECOGNIZED_BINARY.to_owned(),
+                        reason: UNSUPPORTED_REASON_RESOLVED.to_owned(),
                     },
                 )?;
-                unsupported_paths.insert(candidate.input_path.clone());
-                repo.control().append_event_log_in_session(repo.lock_session(),
-                    "KIO-I-INDEX-INPUT-UNRECOGNIZED-BINARY-001",
-                    "binary input has no locally-extractable text and no OCR-able media type; archived but not enriched",
-                    json!({
-                        "media_type": candidate.media_type,
-                        "size_bytes": candidate.size_bytes,
-                    }),
+            }
+            if markdown_planning_ready {
+                enqueue_online_placeholder_task(
+                    adapter_settings,
+                    repo,
+                    &task_store,
+                    candidate,
+                    &raw_hash,
+                    network_allowed,
+                    &now,
+                    &mut result,
+                    ledger,
+                    &unsupported_store,
+                    &mut unsupported_by_path,
+                    &mut office_conversion_unavailable_paths,
                 )?;
             }
             continue;
         }
 
-        if unsupported_paths.remove(&candidate.input_path) {
+        if unsupported_by_path
+            .get(&candidate.input_path)
+            .is_some_and(UnsupportedInputDisposition::is_unsupported)
+        {
             record_unsupported_if_changed(
                 &unsupported_store,
                 &mut unsupported_by_path,
@@ -1392,6 +1439,13 @@ pub(crate) fn run_index_pipeline(
             )?;
         }
     }
+    result.unsupported_raws = unsupported_observations
+        .iter()
+        .map(|row| (row.path.clone(), row.raw_hash.clone()))
+        .collect();
+    unsupported_store
+        .record_observations(unsupported_observations)
+        .map_err(pipeline_to_kio)?;
     // Stage 3: drain approved loopback OCR even when external networking is
     // offline. Current endpoint approval still gates the selected peer. The task is
     // created first and drained second, so a crash mid-OCR leaves a Pending task

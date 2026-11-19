@@ -109,7 +109,7 @@ pub(crate) fn run(
     // the store lock before preview/working-copy refusal so a tombstoned raw temp
     // is removed even when the requested purge cannot proceed.
     {
-        let _store_lock = repo.lock_store_in_session(repo.lock_session())?;
+        let _store_lock = repo.lock_store_for_publication()?;
         repo.ensure_no_pending_managed_restore()?;
         let state = PurgeState::open_with_control(repo.kio_dir(), repo.control().clone())?;
         if state.read_journal()?.is_some() {
@@ -562,7 +562,7 @@ fn execute_phase_machine(
     args: &PurgeArgs,
     preview: &PurgePreview,
 ) -> Result<PurgeResponse> {
-    let _store_lock = repo.lock_store_in_session(repo.lock_session())?;
+    let _store_lock = repo.lock_store_for_publication()?;
     let locked_plan = resolve_plan(repo, args)?;
     if locked_plan != preview.plan {
         return Err(KioError::new(
@@ -1284,7 +1284,15 @@ fn delete_derived_surfaces(
 
     delete_target_tasks(repo, &targets, &chunk_ids, report)?;
     report.deleted.manifest_rows = scrub_manifest(repo.kio_dir(), &targets)?;
-    report.deleted.unsupported_rows = scrub_unsupported(repo.kio_dir(), &targets)?;
+    let published_tree = repo
+        .head_commit_hash()?
+        .map(|head| {
+            repo.read_commit(&head)
+                .and_then(|commit| repo.read_tree(&commit.tree))
+        })
+        .transpose()?;
+    report.deleted.unsupported_rows =
+        scrub_unsupported(repo.kio_dir(), published_tree.as_ref(), &targets)?;
     report.deleted.quarantine_rows = scrub_quarantine(repo.kio_dir(), &plan.historical_paths)?;
     report.deleted.staging_descriptors = delete_target_staging(repo.kio_dir(), &targets)?;
 
@@ -2050,10 +2058,16 @@ fn scrub_manifest(kio_dir: &Path, targets: &BTreeSet<&str>) -> Result<u64> {
     Ok(u64::try_from(removed).unwrap_or(u64::MAX))
 }
 
-fn scrub_unsupported(kio_dir: &Path, targets: &BTreeSet<&str>) -> Result<u64> {
-    let store = kio_pipeline::unsupported::UnsupportedInputStore::new(kio_dir);
+fn scrub_unsupported(
+    kio_dir: &Path,
+    published_tree: Option<&kio_core::dag::TreeObject>,
+    targets: &BTreeSet<&str>,
+) -> Result<u64> {
+    let store = kio_pipeline::unsupported::UnsupportedInputStore::new(kio_dir)
+        .with_published_tree(published_tree)
+        .map_err(crate::object_persistence::pipeline_to_kio)?;
     let mut rows = store
-        .latest_by_path()
+        .retained_rows()
         .map_err(crate::object_persistence::pipeline_to_kio)?;
     let before = rows.len();
     rows.retain(|row| !targets.contains(row.raw_hash.as_str()));
@@ -3054,7 +3068,7 @@ mod task_retirement_tests {
         store.record(&row).unwrap();
         row.raw_hash = raw_b.clone();
         store.record(&row).unwrap();
-        scrub_unsupported(directory.path(), &BTreeSet::from([raw_a.as_str()])).unwrap();
+        scrub_unsupported(directory.path(), None, &BTreeSet::from([raw_a.as_str()])).unwrap();
         let bytes = fs::read_to_string(store.path()).unwrap();
         assert!(
             !bytes.contains(&raw_a),
@@ -3063,7 +3077,7 @@ mod task_retirement_tests {
         assert_eq!(store.latest_by_path().unwrap(), vec![row.clone()]);
         assert!(bytes.contains(&raw_b));
         // Re-running purge remains safe; purging the current B must not revive A.
-        scrub_unsupported(directory.path(), &BTreeSet::from([raw_b.as_str()])).unwrap();
+        scrub_unsupported(directory.path(), None, &BTreeSet::from([raw_b.as_str()])).unwrap();
         assert!(store.latest_by_path().unwrap().is_empty());
         assert!(fs::read(store.path()).unwrap().is_empty());
     }

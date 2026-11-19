@@ -919,10 +919,10 @@ JCS ではキー順は canonical 化時に自動決定されるため、上記�
 
 `commit_type=purged` の commit は **`purged_raws` (当該 purge の対象 raw_hash の昇順配列 — prepared 相の closure から確定、[05-runtime.md §3.5](05-runtime.md) の planned_commit) を必須 field に持つ**。marker 検証 ([10-operations.md §7.5.1](10-operations.md)) は tombstone / receipt の raw_hash がこの配列に含まれることを対照する — 他 raw の正当な purge commit を `in_commit` に流用した偽 marker が genuine missing を隠せない。他の commit_type は本 field を持たない。**本 field は store format の初版から必須であり、これを欠く `commit_type=purged` commit は存在しない** (欠落 = corruption。2026-07 の field 追加は実装・store 公開前の定義確定)。
 
-tree entry の `normalize` ブロックは **optional**。normalized instance が存在しないファイル (未 Markdownize) の
-entry では `normalize` を**省略**する (省略 = 当該ファイルの normalized / chunk は存在しない。`null` は書かない —
-§5.1 の「省略と null を識別しない」に従う)。Markdownize されていない entry は省略形、
-完了済み entry は `normalize` 付きである。
+tree entry の `normalize` ブロックは **optional**。当該 tree が normalized instance を参照する
+entry に付ける。未 Markdownize や unsupported ([04-pipeline.md §5.1](04-pipeline.md)) の entry は
+`normalize` を**省略**し、normalized instance や chunk を参照しない。`null` は書かない
+(§5.1 の「省略と null を識別しない」に従う)。
 
 `normalize` が存在する場合、tree entry の `gen` は commit 時点で参照していた normalized instance の世代 (§2.1) であり必須である。欠落は schema violation として拒否する。`kio reindex --regenerate` 後も過去 commit の tree entry はその記録済み gen を
 指し続けるため、`kio view --at` ([05-runtime.md §4.2](05-runtime.md)) と Evidence Pointer の

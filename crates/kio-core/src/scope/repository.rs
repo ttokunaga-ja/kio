@@ -125,6 +125,15 @@ impl Repository {
         Ok(())
     }
 
+    /// Enter a writer transaction whose decisions depend on the published HEAD.
+    /// An incomplete publication must be resolved through explicit recovery
+    /// before a new writer can mutate its dependencies.
+    pub fn lock_store_for_publication(&self) -> Result<RetainedStoreLock> {
+        let lock = self.lock_store_in_session(&self.lock_session)?;
+        self.ensure_no_pending_publication()?;
+        Ok(lock)
+    }
+
     /// Finish an interrupted journaled publication. The caller must hold the
     /// store lock. It refuses a changed HEAD, a missing commit, or a commit
     /// that is not the exact child named by the journal.

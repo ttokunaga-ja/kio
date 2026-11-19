@@ -4185,7 +4185,7 @@ mod tests {
                 fs::write(dir.path().join("doc.txt"), b"changed").unwrap();
             }
             let calls = std::cell::Cell::new(0);
-            let guard = || {
+            let guard = |_: &crate::dag::TreeObject| {
                 calls.set(calls.get() + 1);
                 Err(crate::KioError::invalid_usage(
                     "policy revoked before publication",

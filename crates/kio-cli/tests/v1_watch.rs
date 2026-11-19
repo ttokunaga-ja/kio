@@ -18,6 +18,7 @@ struct Fixture {
     _temp: tempfile::TempDir,
     root: PathBuf,
     home: PathBuf,
+    deterministic_embedding: bool,
 }
 impl Fixture {
     fn new() -> Self {
@@ -30,6 +31,7 @@ impl Fixture {
             _temp: temp,
             root,
             home,
+            deterministic_embedding: false,
         };
         fixture.ok(&["init"]);
         fixture
@@ -39,6 +41,9 @@ impl Fixture {
         command.env_clear();
         if let Some(value) = std::env::var_os("SystemRoot") {
             command.env("SystemRoot", value);
+        }
+        if self.deterministic_embedding {
+            command.env("KIO_EVAL_DETERMINISTIC_EMBED", "scale-v3");
         }
         command
             .current_dir(&self.root)
@@ -408,4 +413,63 @@ fn watcher_rejects_child_authority_and_unregistered_root() {
             .unwrap();
         assert!(!output.status.success(), "invalid root must be rejected");
     }
+}
+
+#[test]
+fn nc2_watch_reconciles_unsupported_at_the_same_head_path() {
+    let mut fixture = Fixture::new();
+    fixture.deterministic_embedding = true;
+    fs::write(
+        fixture.root.join("old.txt"),
+        b"watchedneedle readable text\n\xff",
+    )
+    .unwrap();
+    fs::write(fixture.root.join("keep.txt"), "supported control text\n").unwrap();
+    fixture.ok(&["index", "--yes"]);
+    let search = fixture.ok(&["search", "watchedneedle", "--mode", "vector"]);
+    assert!(
+        search["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| { row["evidence_pointer"]["path_at_commit"] == "old.txt" })
+    );
+    let search = fixture.ok(&["search", "watchedneedle", "--mode", "text"]);
+    let evidence = search["results"][0]["evidence_pointer"].clone();
+    support::bind_renamed_normalize(&fixture.root, "old.txt", "old.cfg");
+    let config = fixture.home.join("config/kio");
+    fs::create_dir_all(&config).unwrap();
+    fs::write(
+        config.join("tools.toml"),
+        "[markdown.mistral_ocr_markdownize]\nurl = 'http://127.0.0.1:1'\n",
+    )
+    .unwrap();
+
+    let process = fixture.start("300");
+    fixture.wait(|s| s["last_observation"]["last_success_ms"].is_number());
+    fixture.ok(&["watch", "stop"]);
+    process.stopped();
+
+    let status = fixture.ok(&["status"]);
+    assert_eq!(status["unsupported_inputs"][0]["path"], "old.cfg");
+    assert_eq!(
+        status["unsupported_inputs"][0]["reason"],
+        "unrecognized_binary_without_local_text"
+    );
+    let text = fixture.ok(&["search", "watchedneedle", "--mode", "text"]);
+    assert!(text["results"].as_array().unwrap().is_empty(), "{text}");
+    let vector = fixture.ok(&["search", "watchedneedle", "--mode", "vector"]);
+    let rows = vector["results"].as_array().unwrap();
+    assert!(
+        !rows.is_empty()
+            && rows
+                .iter()
+                .all(|row| { row["evidence_pointer"]["path_at_commit"] == "keep.txt" }),
+        "{vector}"
+    );
+    let view = fixture.ok(&["view", &evidence.to_string()]);
+    assert!(
+        support::view_slice(&view).contains("watchedneedle"),
+        "{view}"
+    );
 }

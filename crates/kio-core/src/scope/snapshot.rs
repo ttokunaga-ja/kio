@@ -1,5 +1,7 @@
 use super::*;
 
+type SnapshotPublicationGuard<'a> = &'a dyn Fn(&TreeObject) -> Result<()>;
+
 impl Repository {
     pub fn snapshot(
         &self,
@@ -70,7 +72,8 @@ impl Repository {
     }
 
     /// The optional read-only guard runs after immutable preparation, immediately
-    /// before publication (or noop success). It must not mutate scope state.
+    /// before publication (or noop success). It receives the captured tree
+    /// and must not mutate scope state.
     pub fn auto_snapshot_with_bound_normalize(
         &self,
         message: Option<&str>,
@@ -78,7 +81,7 @@ impl Repository {
         excluded_paths: &BTreeSet<String>,
         normalize_by_path: &BTreeMap<String, PendingNormalizeRef>,
         explicitly_allowed_tier_a_paths: &BTreeSet<String>,
-        publication_guard: Option<&dyn Fn() -> Result<()>>,
+        publication_guard: Option<SnapshotPublicationGuard<'_>>,
     ) -> Result<SnapshotOutcome> {
         self.snapshot_with_type(
             message,
@@ -598,7 +601,7 @@ impl Repository {
         expected_snapshot_policy: Option<&SnapshotAutoBinding>,
         expected_scheduled_authority: Option<&ScheduledSnapshotAuthority>,
         before_ref_publication: Option<&mut dyn FnMut() -> Result<SnapshotAutoStateBinding>>,
-        publication_guard: Option<&dyn Fn() -> Result<()>>,
+        publication_guard: Option<SnapshotPublicationGuard<'_>>,
     ) -> Result<SnapshotOutcome> {
         // A retained repository is also used by the existing child-index
         // subprocess.  Bound descriptors plus `commit_type=auto` therefore do
@@ -806,7 +809,7 @@ impl Repository {
                 }
             }
             if let Some(guard) = publication_guard {
-                guard()?;
+                guard(&working)?;
             }
             return Ok(SnapshotOutcome {
                 noop: true,
@@ -943,7 +946,7 @@ impl Repository {
             Some(self.capture_scheduled_snapshot_authority()?)
         } else {
             if let Some(guard) = publication_guard {
-                guard()?;
+                guard(&working)?;
             }
             self.publish_with_journal(parent.as_deref(), &commit_hash, &commit, manifest.clone())?;
             None

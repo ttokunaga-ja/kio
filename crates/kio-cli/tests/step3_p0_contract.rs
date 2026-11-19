@@ -1,6 +1,6 @@
 mod support;
 
-use support::canonical_tempdir;
+use support::{canonical_tempdir, view_slice};
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -108,30 +108,6 @@ fn json_failure(dir: &TempDir, args: &[&str], code: i32) -> Value {
         .stderr
         .clone();
     serde_json::from_slice(&output).unwrap()
-}
-
-/// 05 §1.7.2 / §4.2 (2026-08-11): `kio view --json` stopped returning a
-/// `text` field -- it resolves to a full-text normalized view path plus a
-/// view-local byte span instead. This is the only way left to recover
-/// chunk-adjacent text from `view`'s JSON, and exercising it (read the file,
-/// slice by the reported offsets) is what actually proves the unit-local ->
-/// view-local offset translation is correct, unlike a plain field-content
-/// assertion on the old `text` field ever did.
-fn view_slice(viewed: &Value) -> String {
-    let view_path = viewed["view_path"]
-        .as_str()
-        .unwrap_or_else(|| panic!("view_path must be a resolvable path: {viewed}"));
-    let start = viewed["view_byte_start"]
-        .as_u64()
-        .unwrap_or_else(|| panic!("view_byte_start must be present: {viewed}"))
-        as usize;
-    let end = viewed["view_byte_end"]
-        .as_u64()
-        .unwrap_or_else(|| panic!("view_byte_end must be present: {viewed}"))
-        as usize;
-    let bytes = fs::read(view_path)
-        .unwrap_or_else(|err| panic!("failed to read view_path {view_path}: {err}"));
-    String::from_utf8(bytes[start..end].to_vec()).unwrap()
 }
 
 fn json_success_path(path: &Path, data_home: &Path, args: &[&str]) -> Value {
@@ -14985,4 +14961,445 @@ fn nc_source_code_remains_unsupported_above_adapter_input_limit() {
     assert_eq!(unsupported.len(), 1, "{status}");
     assert_eq!(unsupported[0]["path"], "main.pY");
     assert_eq!(unsupported[0]["reason"], "source_code_is_not_supported");
+}
+
+#[test]
+fn nc2_current_index_drops_unsupported_bindings_and_preserves_evidence() {
+    for command in [
+        &["index", "--yes"][..],
+        &["reindex", "--regenerate", "--yes"][..],
+    ] {
+        let dir = canonical_tempdir();
+        fs::write(
+            dir.path().join("previous.txt"),
+            "historicalneedle readable text\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("binary.cfg"), "previousbinaryneedle\n").unwrap();
+        fs::write(dir.path().join("keep.txt"), "supported control text\n").unwrap();
+        kio(&dir, &["init"]).assert().success();
+        json_success_deterministic_embed(&dir, &["index", "--yes"]);
+        let search = json_success_deterministic_embed(
+            &dir,
+            &["search", "historicalneedle", "--mode", "text"],
+        );
+        let evidence = first_result(&search)["evidence_pointer"].clone();
+        let vectors = json_success_deterministic_embed(
+            &dir,
+            &["search", "historicalneedle", "--mode", "vector"],
+        );
+        assert_eq!(vectors["resolved_mode"], "vector");
+        pointer_for_path(&vectors, "previous.txt");
+
+        let repo = Repository::open(dir.path()).unwrap();
+        let previous_head = repo
+            .read_commit(evidence["commit"].as_str().unwrap())
+            .unwrap();
+        let previous_tree = repo.read_tree(&previous_head.tree).unwrap();
+        let previous = previous_tree.find_entry("previous.txt").unwrap().unwrap();
+
+        support::bind_renamed_normalize(dir.path(), "previous.txt", "previous.rs");
+        fs::write(dir.path().join("binary.cfg"), b"\0\xff").unwrap();
+
+        let result = json_success_deterministic_embed(&dir, command);
+        if command[0] == "reindex" {
+            assert_eq!(result["reindexed_files"], 1, "{result}");
+        }
+        let current_head = repo
+            .read_commit(&repo.head_commit_hash().unwrap().unwrap())
+            .unwrap();
+        let current_tree = repo.read_tree(&current_head.tree).unwrap();
+        let current = current_tree.find_entry("previous.rs").unwrap().unwrap();
+        assert_eq!(current.raw_hash, previous.raw_hash);
+        assert!(current.normalize.is_none(), "{command:?}: {current:?}");
+
+        let status = json_success(&dir, &["status"]);
+        let text_search = json_success_deterministic_embed(
+            &dir,
+            &["search", "historicalneedle", "--mode", "text"],
+        );
+        for unsupported in [
+            &status["unsupported_inputs"],
+            &text_search["index_status"]["unsupported_inputs"],
+        ] {
+            for (path, reason) in [
+                ("previous.rs", "source_code_is_not_supported"),
+                ("binary.cfg", "unrecognized_binary_without_local_text"),
+            ] {
+                assert!(
+                    unsupported
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|row| row["path"] == path && row["reason"] == reason),
+                    "{command:?}: {unsupported}"
+                );
+            }
+        }
+        assert!(
+            text_search["results"].as_array().unwrap().is_empty(),
+            "{text_search}"
+        );
+        let vector_search = json_success_deterministic_embed(
+            &dir,
+            &["search", "historicalneedle", "--mode", "vector"],
+        );
+        assert_eq!(vector_search["resolved_mode"], "vector");
+        let results = vector_search["results"].as_array().unwrap();
+        assert!(!results.is_empty(), "{vector_search}");
+        assert!(
+            results.iter().all(|row| {
+                let pointer = &row["evidence_pointer"];
+                pointer["raw_hash"] != previous.raw_hash && pointer["path_at_commit"] == "keep.txt"
+            }),
+            "{vector_search}"
+        );
+        let viewed = json_success(&dir, &["view", &evidence.to_string()]);
+        assert!(view_slice(&viewed).contains("historicalneedle"), "{viewed}");
+    }
+}
+
+#[test]
+fn nc2_binary_with_unavailable_markdown_drops_matching_head_generation() {
+    let dir = canonical_tempdir();
+    fs::write(
+        dir.path().join("old.txt"),
+        b"binaryneedle searchable text\n\xff",
+    )
+    .unwrap();
+    kio(&dir, &["init"]).assert().success();
+    json_success(&dir, &["index", "--yes", "--offline"]);
+    let search = json_success(&dir, &["search", "binaryneedle", "--mode", "text"]);
+    pointer_for_path(&search, "old.txt");
+    support::bind_renamed_normalize(dir.path(), "old.txt", "old.cfg");
+    write_tools_toml(
+        &dir,
+        "[markdown.mistral_ocr_markdownize]\nurl = 'http://127.0.0.1:1'\n",
+    );
+
+    let index = json_success(&dir, &["index", "--yes", "--offline"]);
+    assert_eq!(index["skipped_unrecognized_binary_files"], 1, "{index}");
+    let search = json_success(&dir, &["search", "binaryneedle", "--mode", "text"]);
+    assert!(search["results"].as_array().unwrap().is_empty(), "{search}");
+    let status = json_success(&dir, &["status"]);
+    assert_eq!(status["unsupported_inputs"][0]["path"], "old.cfg");
+    assert_eq!(
+        status["unsupported_inputs"][0]["reason"],
+        "unrecognized_binary_without_local_text"
+    );
+}
+
+#[test]
+fn nc2_index_status_does_not_count_old_markdownize_tasks_for_unsupported_path() {
+    let dir = canonical_tempdir();
+    let path = dir.path().join("document.cfg");
+    fs::write(&path, "taskneedle searchable text\n").unwrap();
+    kio(&dir, &["init"]).assert().success();
+    json_success(&dir, &["index", "--yes", "--offline"]);
+    let status = json_success(&dir, &["status"]);
+    assert_eq!(status["tasks"][0]["status"], "done");
+    let task_id = &status["tasks"][0]["task_id"];
+
+    fs::write(path, b"\xff").unwrap();
+    json_success(&dir, &["index", "--yes", "--offline"]);
+    let search = json_success(&dir, &["search", "taskneedle", "--mode", "text"]);
+    assert_eq!(search["index_status"]["enriched_ratio"], 0.0, "{search}");
+    let status = json_success(&dir, &["status"]);
+    assert!(
+        status["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| { task["task_id"] == *task_id && task["status"] == "done" }),
+        "{status}"
+    );
+}
+
+#[cfg(debug_assertions)]
+fn pause_nc2_command(
+    dir: &TempDir,
+    ready: &Path,
+    point: &str,
+    args: &[&str],
+) -> std::process::Child {
+    let mut command = hermetic_process_command(&assert_cmd::cargo::cargo_bin("kio"));
+    let mut child = command
+        .current_dir(dir.path())
+        .envs(support::home_env(dir.path()))
+        .env("KIO_TEST_DURABILITY_POINT", point)
+        .env("KIO_TEST_DURABILITY_READY", ready)
+        .args(args)
+        .arg("--json")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let expected = format!("point={point}\npid={}\n", child.id());
+    let deadline = Instant::now() + Duration::from_secs(25);
+    while fs::read_to_string(ready).ok().as_deref() != Some(&expected) {
+        if child.try_wait().unwrap().is_some() || Instant::now() >= deadline {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!("{args:?} did not reach checkpoint {point}: {output:?}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    child
+}
+
+#[cfg(debug_assertions)]
+const NC2_REINDEX: &[&str] = &["reindex", "--regenerate", "--yes", "--offline"];
+
+#[cfg(debug_assertions)]
+fn pause_nc2_reindex(dir: &TempDir, ready: &Path) -> std::process::Child {
+    pause_nc2_command(dir, ready, "before_index_snapshot", NC2_REINDEX)
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn nc2_reindex_aborts_when_classified_bytes_change_before_snapshot() {
+    let dir = canonical_tempdir();
+    let path = dir.path().join("document.cfg");
+    let original = b"racedneedle searchable text\n";
+    fs::write(&path, original).unwrap();
+    kio(&dir, &["init"]).assert().success();
+    json_success(&dir, &["index", "--yes", "--offline"]);
+    let kio_dir = dir.path().join(".kio");
+    let head = head_commit(&kio_dir);
+
+    fs::write(&path, b"\xff").unwrap();
+    let markers = canonical_tempdir();
+    let ready = markers.path().join("ready");
+    let child = pause_nc2_reindex(&dir, &ready);
+    fs::write(&path, original).unwrap();
+    fs::write(ready.with_extension("release"), b"release").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        !output.status.success(),
+        "raced reindex published: {output:?}"
+    );
+    assert_eq!(head_commit(&kio_dir), head);
+    let search = json_success(&dir, &["search", "racedneedle", "--mode", "text"]);
+    pointer_for_path(&search, "document.cfg");
+    json_success(&dir, &["reindex", "--regenerate", "--yes", "--offline"]);
+    let search = json_success(&dir, &["search", "racedneedle", "--mode", "text"]);
+    pointer_for_path(&search, "document.cfg");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn nc2_aborted_reindex_preserves_published_unsupported_reason() {
+    let dir = canonical_tempdir();
+    let path = dir.path().join("document.cfg");
+    fs::write(&path, b"\xff").unwrap();
+    kio(&dir, &["init"]).assert().success();
+    json_success(&dir, &["index", "--yes", "--offline"]);
+    let published = json_success(&dir, &["status"])["unsupported_inputs"].clone();
+    assert_eq!(published.as_array().unwrap().len(), 1);
+
+    // Force the replacement path: compaction must preserve the published
+    // record even when it is about to write a different raw for the same path.
+    let journal = dir.path().join(".kio/unsupported-inputs.jsonl");
+    let record = fs::read(&journal).unwrap();
+    fs::write(
+        &journal,
+        record.repeat((16 * 1024 * 1024) / record.len() + 1),
+    )
+    .unwrap();
+    fs::write(&path, b"\xfe").unwrap();
+    let markers = canonical_tempdir();
+    let mut child = pause_nc2_reindex(&dir, &markers.path().join("ready"));
+    child.kill().unwrap();
+    assert!(!child.wait().unwrap().success());
+    assert_eq!(
+        json_success(&dir, &["status"])["unsupported_inputs"],
+        published
+    );
+
+    json_success(&dir, &["reindex", "--regenerate", "--yes", "--offline"]);
+    let current = json_success(&dir, &["status"])["unsupported_inputs"].clone();
+    assert_eq!(current[0]["reason"], published[0]["reason"]);
+    assert_ne!(current[0]["raw_hash"], published[0]["raw_hash"]);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn nc2_retry_keeps_reason_for_pending_publication() {
+    for command in [&["index", "--yes", "--offline"][..], NC2_REINDEX] {
+        let dir = canonical_tempdir();
+        let path = dir.path().join("document.cfg");
+        fs::write(&path, b"\xff").unwrap();
+        json_success(&dir, &["init"]);
+        json_success(&dir, &["index", "--yes", "--offline"]);
+        fs::write(&path, b"\xfe").unwrap();
+        let markers = canonical_tempdir();
+        let mut child = pause_nc2_command(
+            &dir,
+            &markers.path().join("ready"),
+            "publication_journal",
+            command,
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        fs::write(&path, b"\xfd").unwrap();
+        kio(&dir, command).assert().failure();
+        json_success(&dir, &["init"]);
+        let status = json_success(&dir, &["status"]);
+        assert_eq!(
+            status["unsupported_inputs"][0]["raw_hash"],
+            kio_pipeline::prepare::hash_bytes(b"\xfe"),
+            "{command:?}: {status}"
+        );
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn nc2_purge_cannot_delete_raw_from_pending_publication() {
+    let dir = canonical_tempdir();
+    let path = dir.path().join("document.txt");
+    fs::write(&path, b"previous snapshot\n").unwrap();
+    json_success(&dir, &["init"]);
+    json_success(&dir, &["snapshot", "create"]);
+    let pending = b"pending snapshot\n";
+    fs::write(&path, pending).unwrap();
+    let markers = canonical_tempdir();
+    let mut child = pause_nc2_command(
+        &dir,
+        &markers.path().join("ready"),
+        "publication_journal",
+        &["snapshot", "create"],
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let raw = kio_pipeline::prepare::hash_bytes(pending);
+    fs::remove_file(path).unwrap();
+    kio(
+        &dir,
+        &["purge", "--raw-hash", &raw, "--reason", "privacy", "--yes"],
+    )
+    .assert()
+    .failure();
+
+    json_success(&dir, &["init"]);
+    let repo = Repository::open(dir.path()).unwrap();
+    let commit = repo
+        .read_commit(&repo.head_commit_hash().unwrap().unwrap())
+        .unwrap();
+    let tree = repo.read_tree(&commit.tree).unwrap();
+    assert_eq!(
+        tree.find_entry("document.txt").unwrap().unwrap().raw_hash,
+        raw
+    );
+    assert!(
+        repo.object_store()
+            .inspect_object(ObjectKind::Raw, &raw)
+            .is_ok(),
+        "recovered HEAD points to deleted raw {raw}"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn nc2_rejects_renamed_or_added_inputs_before_snapshot() {
+    for command in [NC2_REINDEX, &["index", "--yes", "--offline"][..]] {
+        for rename in [true, false] {
+            let dir = canonical_tempdir();
+            let original = dir.path().join("a.cfg");
+            let added = dir.path().join("b.cfg");
+            fs::write(&original, b"\xff").unwrap();
+            json_success(&dir, &["init"]);
+            json_success(&dir, &["index", "--yes", "--offline"]);
+            let kio_dir = dir.path().join(".kio");
+            let head = head_commit(&kio_dir);
+            let markers = canonical_tempdir();
+            let ready = markers.path().join("ready");
+            let child = pause_nc2_command(&dir, &ready, "before_index_snapshot", command);
+            if rename {
+                fs::rename(original, &added).unwrap();
+            } else {
+                fs::write(&added, b"\xfe").unwrap();
+            }
+            fs::write(ready.with_extension("release"), b"release").unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                !output.status.success(),
+                "{command:?}, rename={rename}: {output:?}"
+            );
+            assert_eq!(head_commit(&kio_dir), head);
+            json_success(&dir, command);
+            let status = json_success(&dir, &["status"]);
+            assert!(
+                status["unsupported_inputs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| {
+                        row["path"] == "b.cfg"
+                            && row["reason"] == "unrecognized_binary_without_local_text"
+                    }),
+                "{status}"
+            );
+        }
+    }
+}
+
+#[test]
+fn nc2_search_counts_raw_only_ocr_task_with_unsupported_alias() {
+    let dir = canonical_tempdir();
+    let mut scan = b"%PDF-1.4\n".to_vec();
+    scan.extend([0xff; 64]);
+    for name in ["scan.pdf", "copy.cfg"] {
+        fs::write(dir.path().join(name), &scan).unwrap();
+    }
+    json_success(&dir, &["init"]);
+    json_both_mock(&dir, &["index", "--yes", "--offline"]);
+    let status = json_success(&dir, &["status"]);
+    let task = &status["tasks"][0];
+    assert_eq!(task["input_path"], "scan.pdf", "{status}");
+    assert_eq!(task["status"], "paused", "{status}");
+    assert_eq!(status["unsupported_inputs"][0]["path"], "copy.cfg");
+    assert_eq!(
+        task["input_hash"],
+        status["unsupported_inputs"][0]["raw_hash"]
+    );
+
+    let search = json_success(&dir, &["search", "ocrneedle", "--mode", "text"]);
+    assert_eq!(
+        search["index_status"]["pending_enrichment_tasks"], 1,
+        "{search}"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn nc2_status_retries_if_head_changes_after_observation() {
+    let dir = canonical_tempdir();
+    let path = dir.path().join("document.cfg");
+    fs::write(&path, b"\xff").unwrap();
+    json_success(&dir, &["init"]);
+    json_success(&dir, &["index", "--yes", "--offline"]);
+
+    let markers = canonical_tempdir();
+    let ready = markers.path().join("ready");
+    let child = pause_nc2_command(&dir, &ready, "before_read_dispositions", &["status"]);
+    for contents in [b"\xfe", b"\xfd"] {
+        fs::write(&path, contents).unwrap();
+        json_success(&dir, NC2_REINDEX);
+    }
+    fs::write(ready.with_extension("release"), b"release").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["unsupported_inputs_complete"], true);
+    assert_eq!(
+        status["unsupported_inputs"][0]["raw_hash"],
+        kio_pipeline::prepare::hash_bytes(b"\xfd"),
+        "{status}"
+    );
+    assert_eq!(
+        status["files"][0]["raw_hash"],
+        status["unsupported_inputs"][0]["raw_hash"]
+    );
 }
