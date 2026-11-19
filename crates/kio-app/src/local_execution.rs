@@ -58,7 +58,7 @@ pub(crate) struct LocalMember {
     pub target: EmbeddingTaskTarget,
 }
 
-/// All fields which affect result acceptance are part of the digest-named key.
+/// An execution attempt's complete result binding, including its original members.
 /// For a query, `input_sha256` and `query_sha256` are digests, never query text.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -113,20 +113,36 @@ impl LocalIdentity {
                 && bounded(tool_profile) => {}
             _ => return Err(invalid("invalid local execution contract")),
         }
-        match &self.target {
-            LocalTarget::Document { scope_id, target }
-            | LocalTarget::Image { scope_id, target }
-            | LocalTarget::Ocr { scope_id, target }
-                if bounded(scope_id) && bounded(target) => {}
-            LocalTarget::Query {
-                query_sha256,
-                query_kind,
-            } if is_digest(query_sha256)
+        match (&self.target, &self.contract) {
+            (
+                LocalTarget::Document { scope_id, target },
+                LocalContract::Embedding { members, .. },
+            ) if bounded(scope_id)
+                && target.strip_prefix("sha256:") == Some(self.input_sha256.as_str())
+                && members.iter().all(|member| {
+                    matches!(&member.target, EmbeddingTaskTarget::Chunk {
+                            chunk_hash, embedding_hash, profile_hash, input_hash
+                        } if chunk_hash == &member.id
+                            && embedding_hash == target
+                            && profile_hash == &self.profile
+                            && input_hash.as_str() == members[0].target.input_hash())
+                }) => {}
+            (
+                LocalTarget::Image { scope_id, target } | LocalTarget::Ocr { scope_id, target },
+                _,
+            ) if bounded(scope_id) && bounded(target) => {}
+            (
+                LocalTarget::Query {
+                    query_sha256,
+                    query_kind,
+                },
+                LocalContract::Embedding { members, .. },
+            ) if is_digest(query_sha256)
                 && query_sha256 == &self.input_sha256
                 && bounded(query_kind)
-                && matches!(&self.contract, LocalContract::Embedding { members, .. }
-                        if members.iter().all(|member| matches!(&member.target, EmbeddingTaskTarget::Query { .. }))) =>
-                {}
+                && members
+                    .iter()
+                    .all(|member| matches!(&member.target, EmbeddingTaskTarget::Query { .. })) => {}
             _ => return Err(invalid("invalid local execution target")),
         }
         if matches!(&self.target, LocalTarget::Ocr { .. })
@@ -139,6 +155,33 @@ impl LocalIdentity {
 
     fn key(&self) -> Result<String> {
         self.validate()?;
+        if let (
+            LocalTarget::Document { .. },
+            LocalContract::Embedding {
+                dimensions,
+                distance,
+                modality,
+                members,
+            },
+        ) = (&self.target, &self.contract)
+        {
+            let bytes = serde_json::to_vec(&(
+                "kio.local-execution.document-input/v1",
+                &self.target,
+                &self.profile,
+                self.execution,
+                dimensions,
+                distance,
+                modality,
+                members[0].target.input_hash(),
+            ))
+            .map_err(|error| invalid(error.to_string()))?;
+            return Ok(hex_digest(&bytes));
+        }
+        self.result_binding()
+    }
+
+    fn result_binding(&self) -> Result<String> {
         let bytes = serde_json::to_vec(self).map_err(|error| invalid(error.to_string()))?;
         Ok(hex_digest(&bytes))
     }
@@ -214,7 +257,8 @@ impl Record {
     fn validate(&self, key: &str, identity: &LocalIdentity) -> Result<()> {
         if self.version != 1
             || self.key != key
-            || &self.identity != identity
+            || (!matches!(identity.target, LocalTarget::Document { .. })
+                && &self.identity != identity)
             || self.identity.key()? != key
             || !is_digest(&self.token)
             || self.contract_violation_count > self.attempts
@@ -542,6 +586,7 @@ impl LocalExecution {
         // New initialized records already contain their dispatch intent. An
         // existing one always rotates token and increments the attempt.
         record.attempts = record.attempts.saturating_add(1);
+        record.identity = identity.clone();
         record.token = new_token()?;
         record.phase = Phase::Intent;
         write_record(state.directory(), &record, Publication::Replace)?;
@@ -559,6 +604,13 @@ impl LocalGuard {
 
     pub(crate) fn contract_violation_count(&self) -> u32 {
         self.record.contract_violation_count
+    }
+
+    pub(crate) fn embedding_member_ids(&self) -> Result<Vec<String>> {
+        let LocalContract::Embedding { members, .. } = &self.record.identity.contract else {
+            return Err(invalid("local result lacks an embedding contract"));
+        };
+        Ok(members.iter().map(|member| member.id.clone()).collect())
     }
 
     pub(crate) fn result(&self) -> Result<Option<Vec<u8>>> {
@@ -588,7 +640,7 @@ impl LocalGuard {
         if directory.contains_entry(Path::new(RESULT))? {
             return Err(invalid("unbound local execution result must be preserved"));
         }
-        let digest = result_digest(&self.record, bytes);
+        let digest = result_digest(&self.record, bytes)?;
         let mut staging = self.record.clone();
         staging.phase = Phase::ResultStaging {
             digest: digest.clone(),
@@ -808,7 +860,8 @@ fn verify_result(directory: &StoreDirectory, record: &Record) -> Result<Vec<u8>>
     }
     // Check the retained file before allocating the full response. In
     // particular OCR may legitimately exceed the embedding artifact bound.
-    let mut first_digest = result_hasher(record);
+    let hasher = result_hasher(record)?;
+    let mut first_digest = hasher.clone();
     read_digest_exact(&mut file, actual_len, &mut first_digest, &path)?;
     if hex_hasher(first_digest) != *digest {
         return Err(invalid("local execution result digest mismatch"));
@@ -819,7 +872,7 @@ fn verify_result(directory: &StoreDirectory, record: &Record) -> Result<Vec<u8>>
     result
         .try_reserve_exact(*bytes)
         .map_err(|_| resource_limit(*bytes))?;
-    let mut second_digest = result_hasher(record);
+    let mut second_digest = hasher;
     let mut remaining = *bytes;
     let mut buffer = [0_u8; 64 * 1024];
     while remaining > 0 {
@@ -841,18 +894,18 @@ fn verify_result(directory: &StoreDirectory, record: &Record) -> Result<Vec<u8>>
     Ok(result)
 }
 
-fn result_digest(record: &Record, bytes: &[u8]) -> String {
-    let mut hasher = result_hasher(record);
+fn result_digest(record: &Record, bytes: &[u8]) -> Result<String> {
+    let mut hasher = result_hasher(record)?;
     hasher.update(bytes);
-    hex_hasher(hasher)
+    Ok(hex_hasher(hasher))
 }
 
-fn result_hasher(record: &Record) -> Sha256 {
+fn result_hasher(record: &Record) -> Result<Sha256> {
     let mut hasher = Sha256::new();
     hasher.update(b"kio.local-execution.result/v1\0");
-    hasher.update(record.key.as_bytes());
+    hasher.update(record.identity.result_binding()?.as_bytes());
     hasher.update(record.token.as_bytes());
-    hasher
+    Ok(hasher)
 }
 
 fn hex_hasher(hasher: Sha256) -> String {
@@ -939,18 +992,192 @@ mod tests {
         let mut identity = query_identity();
         identity.target = LocalTarget::Document {
             scope_id: "scope".into(),
-            target: format!("sha256:{}", hex_digest(b"document")),
+            target: format!("sha256:{}", identity.input_sha256),
         };
+        identity.profile = format!("sha256:{}", hex_digest(b"profile"));
         let LocalContract::Embedding { members, .. } = &mut identity.contract else {
             unreachable!()
         };
-        members[0].target = EmbeddingTaskTarget::Chunk {
-            chunk_hash: format!("sha256:{}", hex_digest(b"chunk")),
-            embedding_hash: format!("sha256:{}", hex_digest(b"document")),
-            profile_hash: format!("sha256:{}", hex_digest(b"profile")),
-            input_hash: format!("sha256:{}", identity.input_sha256),
-        };
+        members[0] = document_member(&identity.profile, &identity.input_sha256, b"chunk");
         identity
+    }
+
+    fn document_member(profile: &str, input: &str, chunk: &[u8]) -> LocalMember {
+        let id = format!("sha256:{}", hex_digest(chunk));
+        LocalMember {
+            target: EmbeddingTaskTarget::Chunk {
+                chunk_hash: id.clone(),
+                embedding_hash: format!("sha256:{input}"),
+                profile_hash: profile.to_owned(),
+                input_hash: format!("sha256:{}", hex_digest(b"wire input")),
+            },
+            id,
+        }
+    }
+
+    fn expanded_document_identity(identity: &LocalIdentity) -> LocalIdentity {
+        let mut expanded = identity.clone();
+        let LocalContract::Embedding { members, .. } = &mut expanded.contract else {
+            unreachable!()
+        };
+        members.push(document_member(
+            &identity.profile,
+            &identity.input_sha256,
+            b"another chunk",
+        ));
+        expanded
+    }
+
+    #[test]
+    fn document_group_changes_keep_the_contract_retry_budget() {
+        use crate::embedding::executor::fail_local_embedding_claim;
+        use crate::markdownize::execution::TaskExecutionFailure;
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = || {
+            LocalExecution::new(
+                temp.path().join("state"),
+                temp.path().to_path_buf(),
+                ControlHandle::default(),
+            )
+            .unwrap()
+        };
+        let original = document_identity();
+        let expanded = expanded_document_identity(&original);
+        let now = "2026-11-20T00:00:00Z";
+        let now_ms = kio_core::scope::parse_utc_seconds(now).unwrap() * 1000;
+        let failure = TaskExecutionFailure {
+            retry_kind: RetryErrorKind::ContractViolation,
+            retry_after_ms: None,
+            resource_limit: None,
+        };
+        let Claim::Claimed(mut first) = store().claim(&original, 0, None, 5, now_ms).unwrap()
+        else {
+            panic!("initial document attempt was not claimed");
+        };
+        assert_eq!(
+            fail_local_embedding_claim(&mut first, &failure, now, 5).unwrap(),
+            Some(now_ms)
+        );
+        drop(first);
+        let Claim::Claimed(mut retry) = store()
+            .claim(&expanded, 1, Some(now_ms), 5, now_ms)
+            .unwrap()
+        else {
+            panic!("regrouped input did not receive its one retry");
+        };
+        assert_eq!(retry.attempts(), 2);
+        assert_eq!(retry.record.identity, expanded);
+        assert_eq!(
+            fail_local_embedding_claim(&mut retry, &failure, now, 5).unwrap(),
+            None
+        );
+        drop(retry);
+        for identity in [original, expanded] {
+            assert!(matches!(
+                store().claim(&identity, 0, None, 5, now_ms).unwrap(),
+                Claim::Exhausted {
+                    attempts: 2,
+                    kind: Some(RetryErrorKind::ContractViolation)
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn document_group_changes_recover_the_saved_result_with_its_original_members() {
+        use crate::embedding::transport::decode_local_embedding_result;
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalExecution::new(
+            temp.path().join("state"),
+            temp.path().to_path_buf(),
+            ControlHandle::default(),
+        )
+        .unwrap();
+        let original = document_identity();
+        let expanded = expanded_document_identity(&original);
+        let LocalContract::Embedding { members, .. } = &original.contract else {
+            unreachable!()
+        };
+        let original_ids = vec![members[0].id.clone()];
+        let profile = kio_adapter::catalog::DeclaredEmbeddingProfile {
+            tool_id: "test".to_owned(),
+            dimensions: 3,
+            distance: "cosine".to_owned(),
+            modality: "text".to_owned(),
+            profile_hash: original.profile.clone(),
+        };
+        let completed = kio_adapter::types::EmbeddingCompleted {
+            dimensions: 3,
+            distance: profile.distance.clone(),
+            modality: profile.modality.clone(),
+            embedding_profile_hash: profile.profile_hash.clone(),
+            usage: kio_adapter::types::EmbeddingUsage::Unmetered,
+            members: vec![kio_adapter::types::EmbeddingMemberOutcome {
+                id: original_ids[0].clone(),
+                result: kio_adapter::types::EmbeddingMemberResult::Vector {
+                    vector: vec![1.0, 0.0, 0.0],
+                },
+            }],
+        };
+        let Claim::Claimed(mut first) = store.claim(&original, 0, None, 5, 0).unwrap() else {
+            panic!("initial claim")
+        };
+        first
+            .stage_result(&serde_json::to_vec(&completed).unwrap())
+            .unwrap();
+        drop(first);
+
+        let Claim::Claimed(mut recovered) = store.claim(&expanded, 1, None, 5, 0).unwrap() else {
+            panic!("recovery claim")
+        };
+        let bytes = recovered
+            .result()
+            .unwrap()
+            .expect("regrouping must recover the known result");
+        assert_eq!(recovered.attempts(), 1);
+        assert_eq!(recovered.record.identity, original);
+        assert_eq!(recovered.embedding_member_ids().unwrap(), original_ids);
+        assert_eq!(
+            decode_local_embedding_result(
+                &bytes,
+                &profile,
+                recovered.embedding_member_ids().unwrap()
+            )
+            .unwrap(),
+            completed
+        );
+        let LocalContract::Embedding { members, .. } = &expanded.contract else {
+            unreachable!()
+        };
+        assert!(
+            decode_local_embedding_result(
+                &bytes,
+                &profile,
+                members.iter().map(|member| member.id.clone()).collect()
+            )
+            .is_err()
+        );
+        recovered.publish().unwrap();
+
+        let mut changed_record = recovered.record.clone();
+        changed_record.identity = expanded.clone();
+        write_record(
+            recovered.state.directory(),
+            &changed_record,
+            Publication::Replace,
+        )
+        .unwrap();
+        drop(recovered);
+        let error = store
+            .claim(&expanded, 0, None, 5, 0)
+            .err()
+            .expect("changed member binding must fail");
+        assert!(
+            error.message().contains("result digest mismatch"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1447,7 +1674,7 @@ mod tests {
         };
         let mut staging = owner.record.clone();
         staging.phase = Phase::ResultStaging {
-            digest: result_digest(&staging, b"accepted result"),
+            digest: result_digest(&staging, b"accepted result").unwrap(),
             bytes: b"accepted result".len(),
         };
         write_record(owner.state.directory(), &staging, Publication::Replace).unwrap();
@@ -1485,7 +1712,7 @@ mod tests {
         };
         let mut staging = owner.record.clone();
         staging.phase = Phase::ResultStaging {
-            digest: result_digest(&staging, b"accepted result"),
+            digest: result_digest(&staging, b"accepted result").unwrap(),
             bytes: b"accepted result".len(),
         };
         write_record(owner.state.directory(), &staging, Publication::Replace).unwrap();

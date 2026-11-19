@@ -799,10 +799,12 @@ fn run_embedding_enrichment_for_instances(
                 let refs = tasks.iter().map(|task| task.output_ref.clone()).collect();
                 mirror_local_embedding_start(&task_store, &refs, claim.attempts(), &now)?;
                 let completed = if let Some(bytes) = recovered_bytes {
+                    // Verify the staged member list before linking the input's
+                    // vector to the currently authorized aliases below.
                     crate::embedding::transport::decode_local_embedding_result(
                         &bytes,
                         &profile,
-                        members.iter().map(|member| member.id.clone()).collect(),
+                        claim.embedding_member_ids()?,
                     )?
                 } else {
                     match send_local_embed_group(
