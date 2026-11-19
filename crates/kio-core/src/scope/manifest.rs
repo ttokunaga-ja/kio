@@ -1,6 +1,6 @@
 //! Streamed mutable manifest metadata. HEAD remains the source for live rows.
 use super::*;
-use crate::disk_records::{DiskRecords, RecordSorter, RecordWriter};
+use crate::disk_records::{DiskRecords, RecordSorter, RecordStageRoot, RecordWriter};
 use std::io::{Cursor, Read};
 
 fn present_optional<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
@@ -72,8 +72,9 @@ impl Manifest {
         }
         Ok(())
     }
-    pub(super) fn read(reader: impl Read) -> Result<Self> {
+    pub(super) fn read(root: &RecordStageRoot, reader: impl Read) -> Result<Self> {
         let manifest: Self = crate::disk_records::decode_bounded_json(
+            root,
             std::io::BufReader::with_capacity(64 * 1024, reader),
         )?;
         manifest.validate()?;
@@ -103,6 +104,7 @@ fn next_unique<I: Iterator<Item = Result<PreviousRow>>>(
     Ok(None)
 }
 pub(super) fn build_manifest(
+    root: &RecordStageRoot,
     tree: &TreeObject,
     prior_tree: Option<&TreeObject>,
     deleted: DiskRecords<ManifestRow>,
@@ -112,7 +114,7 @@ pub(super) fn build_manifest(
     if let Some(prior) = prior_tree {
         prior.validate()?;
     }
-    let mut sorter = RecordSorter::new(|left: &PreviousRow, right: &PreviousRow| {
+    let mut sorter = RecordSorter::new(root, |left: &PreviousRow, right: &PreviousRow| {
         left.path
             .as_bytes()
             .cmp(right.path.as_bytes())
@@ -143,7 +145,7 @@ pub(super) fn build_manifest(
     let mut previous = previous.iter();
     let mut last = None;
     let mut prior = next_unique(&mut previous, &mut last)?;
-    let mut rows = RecordWriter::new()?;
+    let mut rows = RecordWriter::new(root)?;
     for entry in &tree.entries {
         let entry = entry?;
         while prior
@@ -267,17 +269,34 @@ mod tests {
 
     #[test]
     fn merge_preserves_prior_tree_authority_deleted_rows_and_reappearance() {
-        let prior = build_tree(vec![entry("a", 1), entry("c", 3)]).unwrap();
-        let current = build_tree(vec![entry("a", 1), entry("b", 5), entry("d", 4)]).unwrap();
-        let old = DiskRecords::from_records([
-            deleted("e", 6),
-            deleted("a", 9),
-            deleted("b", 2),
-            deleted("e", 7),
-        ])
+        let prior = build_tree(
+            &crate::disk_records::RecordStageRoot::temporary().unwrap(),
+            vec![entry("a", 1), entry("c", 3)],
+        )
         .unwrap();
-        let manifest =
-            build_manifest(&current, Some(&prior), old, "2026-11-13T00:00:00Z".into()).unwrap();
+        let current = build_tree(
+            &crate::disk_records::RecordStageRoot::temporary().unwrap(),
+            vec![entry("a", 1), entry("b", 5), entry("d", 4)],
+        )
+        .unwrap();
+        let old = DiskRecords::from_records(
+            &crate::disk_records::RecordStageRoot::temporary().unwrap(),
+            [
+                deleted("e", 6),
+                deleted("a", 9),
+                deleted("b", 2),
+                deleted("e", 7),
+            ],
+        )
+        .unwrap();
+        let manifest = build_manifest(
+            &crate::disk_records::RecordStageRoot::temporary().unwrap(),
+            &current,
+            Some(&prior),
+            old,
+            "2026-11-13T00:00:00Z".into(),
+        )
+        .unwrap();
         let rows = manifest.files.to_vec().unwrap();
         assert_eq!(
             rows.iter()
@@ -298,13 +317,34 @@ mod tests {
             .read_to_end(&mut bytes)
             .unwrap();
         assert_eq!(bytes, serde_jcs::to_vec(&manifest).unwrap());
-        assert_eq!(Manifest::read(bytes.as_slice()).unwrap().files.len(), 5);
+        assert_eq!(
+            Manifest::read(
+                &crate::disk_records::RecordStageRoot::temporary().unwrap(),
+                bytes.as_slice()
+            )
+            .unwrap()
+            .files
+            .len(),
+            5
+        );
     }
 
     #[test]
     fn header_and_rows_preserve_strict_schema_with_optional_headers() {
-        assert!(Manifest::read(br#"{"files":[]}"#.as_slice()).is_ok());
-        assert!(Manifest::read(br#"{"schema_version":1.0,"files":[]}"#.as_slice()).is_ok());
+        assert!(
+            Manifest::read(
+                &crate::disk_records::RecordStageRoot::temporary().unwrap(),
+                br#"{"files":[]}"#.as_slice()
+            )
+            .is_ok()
+        );
+        assert!(
+            Manifest::read(
+                &crate::disk_records::RecordStageRoot::temporary().unwrap(),
+                br#"{"schema_version":1.0,"files":[]}"#.as_slice()
+            )
+            .is_ok()
+        );
         for value in [
             json!({"files":[], "schema_version": null}),
             json!({"files":[], "updated_at": null}),
@@ -316,7 +356,11 @@ mod tests {
             json!({"files":[{"path":"a/b", "raw_hash":hash(1), "status":"new"}]}),
         ] {
             assert!(
-                Manifest::read(serde_json::to_vec(&value).unwrap().as_slice()).is_err(),
+                Manifest::read(
+                    &crate::disk_records::RecordStageRoot::temporary().unwrap(),
+                    serde_json::to_vec(&value).unwrap().as_slice()
+                )
+                .is_err(),
                 "{value}"
             );
         }
@@ -324,8 +368,16 @@ mod tests {
 
     #[test]
     fn manifests_larger_than_the_config_byte_limit_stream_and_roundtrip() {
-        let config = build_tree(Vec::new()).unwrap().chunking_config_hash;
-        let mut builder = TreeBuilder::new(config);
+        let config = build_tree(
+            &crate::disk_records::RecordStageRoot::temporary().unwrap(),
+            Vec::new(),
+        )
+        .unwrap()
+        .chunking_config_hash;
+        let mut builder = TreeBuilder::new(
+            &crate::disk_records::RecordStageRoot::temporary().unwrap(),
+            config,
+        );
         for index in 0..10_001 {
             builder
                 .push(entry(&format!("{index:05}-document.txt"), 1))
@@ -333,9 +385,14 @@ mod tests {
         }
         let tree = builder.finish().unwrap();
         let manifest = build_manifest(
+            &crate::disk_records::RecordStageRoot::temporary().unwrap(),
             &tree,
             None,
-            DiskRecords::from_records([]).unwrap(),
+            DiskRecords::from_records(
+                &crate::disk_records::RecordStageRoot::temporary().unwrap(),
+                [],
+            )
+            .unwrap(),
             "2026-11-13T00:00:00Z".into(),
         )
         .unwrap();
@@ -345,7 +402,11 @@ mod tests {
         )
         .unwrap();
         assert!(bytes > MAX_BOUND_CONFIG_BYTES);
-        let reread = Manifest::read(ManifestJsonReader::new(&manifest).unwrap()).unwrap();
+        let reread = Manifest::read(
+            &crate::disk_records::RecordStageRoot::temporary().unwrap(),
+            ManifestJsonReader::new(&manifest).unwrap(),
+        )
+        .unwrap();
         assert_eq!(reread.files.len(), 10_001);
     }
 }

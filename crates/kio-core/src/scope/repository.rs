@@ -95,6 +95,7 @@ impl Repository {
         }
         let file = directory.open_regular_read(Path::new(PUBLICATION_JOURNAL_LEAF), u64::MAX)?;
         let value: PublicationJournal = crate::disk_records::decode_bounded_json(
+            &self.store.record_stages()?,
             std::io::BufReader::with_capacity(64 * 1024, file),
         )?;
         if value.version != 1
@@ -155,7 +156,7 @@ impl Repository {
             ));
         }
         let tree = self.read_tree(&commit.tree)?;
-        validate_manifest_matches_tree(&journal.manifest, &tree)?;
+        validate_manifest_matches_tree(&self.store.record_stages()?, &journal.manifest, &tree)?;
         // Prepare the manifest before advancing HEAD, as in normal publication.
         let manifest_stage = {
             let mut reader = ManifestJsonReader::new(&journal.manifest)?;
@@ -206,7 +207,7 @@ impl Repository {
             ));
         }
         let tree = self.read_tree(&commit.tree)?;
-        validate_manifest_matches_tree(&manifest, &tree)?;
+        validate_manifest_matches_tree(&self.store.record_stages()?, &manifest, &tree)?;
         // Prepare both payloads before HEAD can move. Capacity failure while
         // writing either private stage leaves the current HEAD unchanged.
         let manifest_stage = {

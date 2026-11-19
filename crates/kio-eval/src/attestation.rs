@@ -12,7 +12,7 @@ use kio_core::{
     cas::{
         MAX_CHUNK_OBJECT_BYTES, MAX_COMMIT_OBJECT_BYTES, canonical_json_bytes, hash_bytes, is_hash,
     },
-    disk_records::DiskRecords,
+    disk_records::{DiskRecords, RecordStageRoot},
     scope::KIO_FORMAT_VERSION,
 };
 use serde::{Deserialize, Deserializer, Serialize};
@@ -266,6 +266,7 @@ enum CachedObject {
 /// A fixed-map, byte-bounded attestor for the evaluator's historical hits.
 #[derive(Debug)]
 pub struct PointerAttestor {
+    record_stages: RecordStageRoot,
     /// Retained capability handles, indexed only after reading each bound
     /// scope's `scope.json` through its own `.kio` handle.
     scope_kio_dirs: HashMap<String, fs::File>,
@@ -300,6 +301,8 @@ impl PointerAttestor {
             }
         }
         Ok(Self {
+            record_stages: RecordStageRoot::temporary()
+                .map_err(|error| PointerAttestationError::new(error.to_string()))?,
             scope_kio_dirs,
             object_cache: HashMap::new(),
             verified_bytes: 0,
@@ -608,7 +611,7 @@ impl PointerAttestor {
         let before = file
             .metadata()
             .map_err(|_| PointerAttestationError::new("tree unavailable"))?;
-        let outcome = tree_stream::decode::<TreeWire>(&mut file, remaining);
+        let outcome = tree_stream::decode::<TreeWire>(&self.record_stages, &mut file, remaining);
         self.charge(outcome.consumed)?;
         if outcome.token_limit_exceeded {
             return Err(PointerAttestationError::new(
@@ -1116,14 +1119,21 @@ mod tests {
             "path": format!("{i:05}.txt"), "type": "file",
             "raw_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
         })).collect::<Vec<_>>();
-        let tree: super::TreeWire = serde_json::from_value(serde_json::json!({
+        let root = kio_core::disk_records::RecordStageRoot::temporary().unwrap();
+        let decode = |value: &Value| {
+            kio_core::disk_records::decode_json::<TreeWire>(
+                &root,
+                serde_json::to_vec(value).unwrap().as_slice(),
+            )
+            .unwrap()
+        };
+        let tree = decode(&serde_json::json!({
             "object_type": "tree", "chunking_config_hash": RAW_HASH, "entries": entries
-        }))
-        .unwrap();
+        }));
         super::validate_tree_wire(&tree).unwrap();
         let mut value = serde_json::to_value(&tree).unwrap();
         value["entries"].as_array_mut().unwrap().swap(0, 1);
-        let unsorted: TreeWire = serde_json::from_value(value).unwrap();
+        let unsorted = decode(&value);
         assert!(super::validate_tree_wire(&unsorted).is_err());
     }
 
@@ -1142,7 +1152,10 @@ mod tests {
                 TreeEntry::raw_file(format!("extra-{i:05}-{}.txt", "x".repeat(210)), RAW_HASH)
                     .unwrap()
             }));
-        let mut builder = kio_core::dag::TreeBuilder::new(tree.chunking_config_hash.clone());
+        let mut builder = kio_core::dag::TreeBuilder::new(
+            &store.record_stages().unwrap(),
+            tree.chunking_config_hash.clone(),
+        );
         for entry in entries {
             builder.push(entry).unwrap();
         }
@@ -1259,16 +1272,19 @@ mod tests {
             text: text.to_owned(),
         };
         let chunk_hash = store.write_chunk(&chunk).unwrap();
-        let tree = build_tree(vec![TreeEntry {
-            path: "old-name.md".to_owned(),
-            entry_type: "file".to_owned(),
-            raw_hash: RAW_HASH.to_owned(),
-            normalize: Some(NormalizeRef {
-                tool_profile_hash: PROFILE_HASH.to_owned(),
-                r#gen: 3,
-                manifest_hash: MANIFEST_HASH.to_owned(),
-            }),
-        }])
+        let tree = build_tree(
+            &store.record_stages().unwrap(),
+            vec![TreeEntry {
+                path: "old-name.md".to_owned(),
+                entry_type: "file".to_owned(),
+                raw_hash: RAW_HASH.to_owned(),
+                normalize: Some(NormalizeRef {
+                    tool_profile_hash: PROFILE_HASH.to_owned(),
+                    r#gen: 3,
+                    manifest_hash: MANIFEST_HASH.to_owned(),
+                }),
+            }],
+        )
         .unwrap();
         let (tree_hash, _) = store
             .write_json(ObjectKind::Tree, &serde_json::to_value(&tree).unwrap())
@@ -1336,12 +1352,15 @@ mod tests {
     fn current_chunk_text_accepts_only_the_explicit_missing_normalize_case() {
         let fixture = fixture();
         let store = ObjectStore::new(fixture.root.path().join(&fixture.scope).join(".kio"));
-        let tree = build_tree(vec![TreeEntry {
-            path: "old-name.md".to_owned(),
-            entry_type: "file".to_owned(),
-            raw_hash: RAW_HASH.to_owned(),
-            normalize: None,
-        }])
+        let tree = build_tree(
+            &store.record_stages().unwrap(),
+            vec![TreeEntry {
+                path: "old-name.md".to_owned(),
+                entry_type: "file".to_owned(),
+                raw_hash: RAW_HASH.to_owned(),
+                normalize: None,
+            }],
+        )
         .unwrap();
         let (tree_hash, _) = store
             .write_json(ObjectKind::Tree, &serde_json::to_value(&tree).unwrap())

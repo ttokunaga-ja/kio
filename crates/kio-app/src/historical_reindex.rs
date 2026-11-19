@@ -1071,7 +1071,7 @@ mod tests {
         let commit = |label: &str, path: &str, parent: Option<String>| {
             let mut entry = TreeEntry::raw_file(path, raw_hash.clone()).unwrap();
             entry.normalize = Some(normalize.clone());
-            let tree = build_tree(vec![entry]).unwrap();
+            let tree = build_tree(&store.record_stages().unwrap(), vec![entry]).unwrap();
             let tree_hash = store
                 .write_json(ObjectKind::Tree, &serde_json::to_value(tree).unwrap())
                 .unwrap()

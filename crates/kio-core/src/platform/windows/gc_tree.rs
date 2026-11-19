@@ -7,6 +7,7 @@ use crate::gc::{
 use std::path::Path;
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn retire_candidate_tree(
+    record_stages: &crate::disk_records::RecordStageRoot,
     tree_hash: &str,
     expected_size: u64,
     raw: &str,
@@ -41,7 +42,7 @@ pub(crate) fn retire_candidate_tree(
             }
             Err(error) => return Err(error),
         };
-    let (_, before) = observe_tree_handle(&victim, expected_size.max(64))?;
+    let (_, before) = observe_tree_handle(record_stages, &victim, expected_size.max(64))?;
     validate_observation(&before)?;
     if needs_move {
         // This checks any conflicting archive, including unsafe entries;
@@ -66,13 +67,14 @@ pub(crate) fn retire_candidate_tree(
             Path::new(quarantine),
         )?;
     }
-    let (_, observed) = observe_tree_handle(&victim, expected_size.max(64))?;
+    let (_, observed) = observe_tree_handle(record_stages, &victim, expected_size.max(64))?;
     if !matches_stable(&observed, &before) || observed.digest != tree_hash {
         return Err(corrupt("tree changed during GC quarantine"));
     }
     quarantine_checkpoint()?;
     before_erase()?;
-    let (_, final_observation) = observe_tree_handle(&victim, expected_size.max(64))?;
+    let (_, final_observation) =
+        observe_tree_handle(record_stages, &victim, expected_size.max(64))?;
     if !matches_stable(&final_observation, &before) {
         return Err(corrupt("tree changed immediately before GC erase"));
     }

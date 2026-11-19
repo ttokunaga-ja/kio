@@ -480,11 +480,14 @@ mod tests {
 
     #[test]
     fn inspected_tree_stream_preserves_json_and_human_contracts() {
-        let tree = kio_core::dag::build_tree([kio_core::dag::TreeEntry::raw_file(
-            "日本語.txt",
-            format!("sha256:{}", "1".repeat(64)),
+        let tree = kio_core::dag::build_tree(
+            &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+            [kio_core::dag::TreeEntry::raw_file(
+                "日本語.txt",
+                format!("sha256:{}", "1".repeat(64)),
+            )
+            .unwrap()],
         )
-        .unwrap()])
         .unwrap();
         let expected = serde_json::to_value(&tree).unwrap();
         for json_mode in [false, true] {
@@ -496,11 +499,14 @@ mod tests {
                 expected
             );
         }
-        let tree = kio_core::dag::build_tree([kio_core::dag::TreeEntry::raw_file(
-            "bidi-\u{202e}.txt",
-            format!("sha256:{}", "1".repeat(64)),
+        let tree = kio_core::dag::build_tree(
+            &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+            [kio_core::dag::TreeEntry::raw_file(
+                "bidi-\u{202e}.txt",
+                format!("sha256:{}", "1".repeat(64)),
+            )
+            .unwrap()],
         )
-        .unwrap()])
         .unwrap();
         let mut output = Vec::new();
         super::write_inspected_tree(&tree, &mut output, false).unwrap();
@@ -546,7 +552,10 @@ mod tests {
                 Ok(())
             }
         }
-        let mut records = kio_core::disk_records::RecordWriter::new().unwrap();
+        let mut records = kio_core::disk_records::RecordWriter::new(
+            &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+        )
+        .unwrap();
         for i in 0..60_000 {
             records
                 .push(
@@ -558,7 +567,11 @@ mod tests {
                 )
                 .unwrap();
         }
-        let mut tree = kio_core::dag::build_tree([]).unwrap();
+        let mut tree = kio_core::dag::build_tree(
+            &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+            [],
+        )
+        .unwrap();
         tree.entries = records.finish().unwrap();
         for json_mode in [false, true] {
             let mut output = Count {

@@ -1,4 +1,5 @@
 //! Durable, constant-sized ownership proof for private record runs.
+use super::RecordStageRoot;
 use crate::{
     Result,
     store_dir::{
@@ -39,6 +40,7 @@ pub(super) struct RunDirectory {
     journal: Journal,
     bytes: Vec<u8>,
     lease: File,
+    root: RecordStageRoot,
 }
 
 fn child(parent: &StoreDirectory, name: &Path) -> Result<StoreDirectory> {
@@ -48,72 +50,56 @@ fn child(parent: &StoreDirectory, name: &Path) -> Result<StoreDirectory> {
     Ok(directory)
 }
 
-fn containers(root: &Path, create: bool) -> Result<Option<(StoreDirectory, StoreDirectory)>> {
-    let owner = if create {
-        StoreDirectory::open_or_create_directories(root)?
-    } else {
-        // StoreDirectory's platform admission may classify an absent ancestor
-        // as unsafe. A missing optional registry is ordinary absence; existing
-        // entries still pass through retained no-follow admission below.
-        match std::fs::symlink_metadata(root) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(crate::store_dir::ioerr(root, error)),
-            Ok(_) => {}
-        }
-        match StoreDirectory::open(root) {
-            Ok(owner) => owner,
-            Err(error) if missing(&error) => return Ok(None),
-            Err(error) => return Err(error),
-        }
-    };
-    crate::private_fs::verify_private_directory_handle(&owner)?;
-    let mut result = Vec::new();
-    for name in ["stages", "identities"] {
-        let leaf = Path::new(name);
-        if create && !owner.contains_entry(leaf)? {
-            match owner.create_directory(leaf) {
-                Ok(handle) => {
-                    crate::store_dir::restrict_new_private_directory(&handle)?;
-                    owner.sync()?;
-                }
-                Err(error)
-                    if error
-                        .context()
-                        .get("io_error_kind")
-                        .and_then(serde_json::Value::as_str)
-                        == Some("already_exists") => {}
-                Err(error) => return Err(error),
-            }
-        }
-        if !owner.contains_entry(leaf)? {
+pub(super) fn container(
+    parent: &StoreDirectory,
+    name: &str,
+    create: bool,
+) -> Result<Option<StoreDirectory>> {
+    let leaf = Path::new(name);
+    if !parent.contains_entry(leaf)? {
+        if !create {
             return Ok(None);
         }
-        result.push(child(&owner, leaf)?);
+        match parent.create_directory(leaf) {
+            Ok(_) => {}
+            Err(error)
+                if error
+                    .context()
+                    .get("io_error_kind")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("already_exists") => {}
+            Err(error) => return Err(error),
+        }
     }
-    let identities = result.pop().expect("identities");
-    let stages = result.pop().expect("stages");
+    child(parent, leaf).map(Some)
+}
+
+fn containers(
+    owner: &StoreDirectory,
+    create: bool,
+) -> Result<Option<(StoreDirectory, StoreDirectory)>> {
+    let Some(stages) = container(owner, "stages", create)? else {
+        return Ok(None);
+    };
+    let Some(identities) = container(owner, "identities", create)? else {
+        return Ok(None);
+    };
     Ok(Some((stages, identities)))
 }
 
-fn missing(error: &crate::KioError) -> bool {
-    error
-        .context()
-        .get("io_error_kind")
-        .and_then(serde_json::Value::as_str)
-        == Some("not_found")
-}
-
 impl RunDirectory {
-    pub(super) fn create(root: &Path, reclaim: bool) -> Result<(Self, StageWriter)> {
-        let (parent, identities) = containers(root, true)?.expect("created containers");
+    pub(super) fn create(root: &RecordStageRoot, reclaim: bool) -> Result<(Self, StageWriter)> {
+        let registry = root.registry(true)?.expect("created registry");
+        let (parent, identities) = containers(&registry, true)?.expect("created containers");
         let gate = identities.lock_private_gate(Path::new(GATE))?;
         // The gate also serializes retirement and atomic journal recovery.
         if reclaim {
             inspect_containers(&parent, &identities, true)?;
         }
         let mut nonce = [0; 32];
-        getrandom::fill(&mut nonce)
-            .map_err(|error| crate::KioError::io(error.to_string(), root.display().to_string()))?;
+        getrandom::fill(&mut nonce).map_err(|error| {
+            crate::KioError::io(error.to_string(), registry.path().display().to_string())
+        })?;
         let leaf = PathBuf::from(format!("kio-records-{}", crate::cas::lower_hex(&nonce)));
         let (directory, identity) = parent.create_stage_directory(&leaf)?;
         // Every crash before journal publication leaves unknown residue, never
@@ -142,6 +128,7 @@ impl RunDirectory {
             journal,
             bytes,
             lease,
+            root: root.clone(),
         };
         // Explicit unlock matters when a fork has inherited the same handle.
         let _ = gate.unlock();
@@ -153,15 +140,21 @@ impl Drop for RunDirectory {
     fn drop(&mut self) {
         // No recursive/pathname fallback, even if a retained directory moved.
         if let Ok(gate) = self.identities.lock_private_gate(Path::new(GATE)) {
-            let _ = cleanup(
+            if cleanup(
                 &self.parent,
                 &self.identities,
                 &self.leaf,
                 &self.directory,
                 &self.journal,
                 &self.bytes,
-            );
+            )
+            .is_err()
+            {
+                self.root.preserve_scratch();
+            }
             let _ = gate.unlock();
+        } else {
+            self.root.preserve_scratch();
         }
         let _ = self.lease.unlock();
     }
@@ -208,7 +201,7 @@ fn cleanup(
     retire(identities, leaf, bytes)
 }
 
-pub(super) fn inspect(root: &Path, reclaim: bool) -> Result<Vec<RecordResidue>> {
+pub(super) fn inspect(root: &StoreDirectory, reclaim: bool) -> Result<Vec<RecordResidue>> {
     let Some((parent, identities)) = containers(root, false)? else {
         return Ok(Vec::new());
     };
@@ -429,14 +422,22 @@ fn valid_run_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::disk_records::test_store_root;
+
+    fn inspect_root(root: &RecordStageRoot, reclaim: bool) -> Result<Vec<RecordResidue>> {
+        match root.registry(false)? {
+            Some(registry) => inspect(&registry, reclaim),
+            None => Ok(Vec::new()),
+        }
+    }
 
     #[test]
     fn readonly_inspection_serializes_with_existing_gate_without_creating_root() {
         use std::{sync::mpsc, time::Duration};
         let fixture = tempfile::tempdir().unwrap();
-        let root = fixture.path().join("registry");
-        assert!(inspect(&root, false).unwrap().is_empty());
-        assert!(!root.exists());
+        let root = test_store_root(&fixture);
+        assert!(inspect_root(&root, false).unwrap().is_empty());
+        assert!(!fixture.path().join("internal").exists());
         let (run, writer) = RunDirectory::create(&root, true).unwrap();
         drop(writer);
         let gate = run.identities.lock_private_gate(Path::new(GATE)).unwrap();
@@ -445,7 +446,9 @@ mod tests {
         let inspected_root = root.clone();
         let worker = std::thread::spawn(move || {
             started_tx.send(()).unwrap();
-            finished_tx.send(inspect(&inspected_root, false)).unwrap();
+            finished_tx
+                .send(inspect_root(&inspected_root, false))
+                .unwrap();
         });
         started_rx.recv().unwrap();
         let observed = finished_rx.recv_timeout(Duration::from_millis(100));
@@ -468,7 +471,7 @@ mod tests {
     #[test]
     fn creating_without_reclaim_preserves_an_inactive_run() {
         let fixture = tempfile::tempdir().unwrap();
-        let root = fixture.path().join("registry");
+        let root = test_store_root(&fixture);
         let (old, writer) = RunDirectory::create(&root, true).unwrap();
         drop(writer);
         old.lease.unlock().unwrap();
@@ -487,25 +490,25 @@ mod tests {
     #[test]
     fn independent_lease_handle_skips_active_run_before_payload_inspection() {
         let fixture = tempfile::tempdir().unwrap();
-        let root = fixture.path().join("registry");
+        let root = test_store_root(&fixture);
         let (run, writer) = RunDirectory::create(&root, true).unwrap();
         drop(writer);
         run.directory.remove_file(Path::new("records")).unwrap();
         run.directory
             .create_private_file(Path::new("records"))
             .unwrap();
-        assert!(inspect(&root, false).unwrap().is_empty());
-        assert!(inspect(&root, true).unwrap().is_empty());
+        assert!(inspect_root(&root, false).unwrap().is_empty());
+        assert!(inspect_root(&root, true).unwrap().is_empty());
         let records = run.directory.path().join("records");
         drop(run);
         assert!(records.exists(), "Drop must preserve replacement payload");
-        assert!(!inspect(&root, false).unwrap().is_empty());
+        assert!(!inspect_root(&root, false).unwrap().is_empty());
     }
 
     #[test]
     fn unknown_tagged_directory_is_reported_and_preserved() {
         let fixture = tempfile::tempdir().unwrap();
-        let root = fixture.path().join("registry");
+        let root = test_store_root(&fixture);
         let (run, writer) = RunDirectory::create(&root, true).unwrap();
         let parent = run.parent.clone();
         drop(writer);
@@ -513,7 +516,7 @@ mod tests {
         let (unknown, _) = parent.create_stage_directory(Path::new("unknown")).unwrap();
         unknown.create_private_file(Path::new("keep")).unwrap();
         for reclaim in [false, true] {
-            let result = inspect(&root, reclaim).unwrap();
+            let result = inspect_root(&root, reclaim).unwrap();
             assert!(result.iter().any(|entry| entry.path.ends_with("unknown")));
             assert!(unknown.path().join("keep").exists());
         }
@@ -523,7 +526,7 @@ mod tests {
     fn empty_interrupted_retirement_and_missing_run_retire_saved_journal() {
         for remove_directory in [false, true] {
             let fixture = tempfile::tempdir().unwrap();
-            let root = fixture.path().join("registry");
+            let root = test_store_root(&fixture);
             let (run, writer) = RunDirectory::create(&root, true).unwrap();
             drop(writer);
             run.directory
@@ -540,8 +543,8 @@ mod tests {
                 )
                 .unwrap();
             }
-            assert!(!inspect(&root, false).unwrap().is_empty());
-            assert!(inspect(&root, true).unwrap().is_empty());
+            assert!(!inspect_root(&root, false).unwrap().is_empty());
+            assert!(inspect_root(&root, true).unwrap().is_empty());
             assert!(!run.identities.contains_entry(&run.leaf).unwrap());
             drop(run);
         }

@@ -87,11 +87,11 @@ impl Repository {
     }
 
     pub(super) fn validate_manifest(&self) -> Result<()> {
-        let _inspection = crate::disk_records::StageInspection::begin();
+        let root = crate::disk_records::RecordStageRoot::temporary()?;
         let file = self
             .store_directory()?
             .open_regular_read(Path::new("manifest.json"), u64::MAX)?;
-        super::manifest::Manifest::read(file).map(|_| ())
+        super::manifest::Manifest::read(&root, file).map(|_| ())
     }
 
     /// Merge the current working tree into `manifest.json`, preserving rows for
@@ -110,6 +110,7 @@ impl Repository {
         prior_tree: Option<&TreeObject>,
     ) -> Result<super::manifest::Manifest> {
         super::manifest::build_manifest(
+            &self.store.record_stages()?,
             tree,
             prior_tree,
             self.read_manifest_deleted_hashes()?,
@@ -130,10 +131,11 @@ impl Repository {
         &self,
     ) -> Result<crate::disk_records::DiskRecords<super::manifest::ManifestRow>> {
         let directory = self.store_directory()?;
-        let mut rows = crate::disk_records::RecordWriter::new()?;
+        let root = self.store.record_stages()?;
+        let mut rows = crate::disk_records::RecordWriter::new(&root)?;
         if directory.contains_entry(Path::new("manifest.json"))? {
             let file = directory.open_regular_read(Path::new("manifest.json"), u64::MAX)?;
-            let manifest = super::manifest::Manifest::read(file)?;
+            let manifest = super::manifest::Manifest::read(&root, file)?;
             for row in &manifest.files {
                 let row = row?;
                 if row.status == "deleted" {

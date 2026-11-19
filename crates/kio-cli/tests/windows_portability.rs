@@ -238,7 +238,11 @@ fn open_cache_derives_a_portable_leaf_from_hostile_logical_basename() {
     // Historical logical names are validated independently of this host's
     // materialization rules. Preserve the authentic parent chunking identity.
     entries.sort_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
-    tree.entries = kio_core::disk_records::DiskRecords::from_records(entries).unwrap();
+    tree.entries = kio_core::disk_records::DiskRecords::from_records(
+        &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+        entries,
+    )
+    .unwrap();
     tree.validate().unwrap();
     let store = ObjectStore::new(repo.kio_dir());
     let (tree_hash, _) = store

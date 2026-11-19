@@ -119,6 +119,7 @@ impl HistoryNode {
 /// A complete newest-first linear history reachable from one snapshot commit.
 #[derive(Debug, Clone)]
 pub struct LinearHistory {
+    record_stages: crate::disk_records::RecordStageRoot,
     start_commit: String,
     nodes: BTreeMap<String, HistoryNode>,
     visit_order: Vec<String>,
@@ -151,7 +152,8 @@ impl LinearHistory {
 
     /// Every binding appearance, sorted by exact identity and then commit hash.
     pub fn bindings(&self) -> Result<crate::disk_records::DiskRecords<HistoryBinding>> {
-        let mut bindings = crate::disk_records::RecordSorter::new(compare_bindings);
+        let mut bindings =
+            crate::disk_records::RecordSorter::new(&self.record_stages, compare_bindings);
         for node in self.nodes.values() {
             for entry in node.tree.entries.iter() {
                 bindings.push(node.binding(&entry?))?;
@@ -380,6 +382,7 @@ impl HistoryReader {
         let edges = parent_edges_from_nodes(&walk.nodes);
         let visit_order = linear_order(&edges, &walk.nodes, start_commit)?;
         Ok(LinearHistory {
+            record_stages: self.store.record_stages()?,
             start_commit: start_commit.to_owned(),
             nodes: walk.nodes,
             visit_order,
@@ -398,6 +401,7 @@ impl HistoryReader {
         let start_commit = linear_tip(&edges, roots)?;
         let visit_order = linear_order(&edges, &walk.nodes, &start_commit)?;
         Ok(LinearHistory {
+            record_stages: self.store.record_stages()?,
             start_commit,
             nodes: walk.nodes,
             visit_order,
@@ -438,6 +442,7 @@ impl HistoryReader {
         let visit_order = linear_order(&walk.parents, &walk.nodes, &start_commit)?;
         Ok((
             LinearHistory {
+                record_stages: self.store.record_stages()?,
                 start_commit,
                 nodes: walk.nodes,
                 visit_order,
@@ -1042,7 +1047,11 @@ mod tests {
         }
 
         fn tree(&self, entries: Vec<TreeEntry>) -> String {
-            let tree = build_tree(entries).unwrap();
+            let tree = build_tree(
+                &crate::disk_records::RecordStageRoot::temporary().unwrap(),
+                entries,
+            )
+            .unwrap();
             self.store
                 .write_json(ObjectKind::Tree, &serde_json::to_value(tree).unwrap())
                 .unwrap()

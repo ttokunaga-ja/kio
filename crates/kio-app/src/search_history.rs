@@ -480,7 +480,7 @@ mod tests {
         }
 
         fn tree(&self, entries: Vec<TreeEntry>) -> String {
-            let tree = build_tree(entries).unwrap();
+            let tree = build_tree(&self.store.record_stages().unwrap(), entries).unwrap();
             self.store
                 .write_json(ObjectKind::Tree, &serde_json::to_value(tree).unwrap())
                 .unwrap()

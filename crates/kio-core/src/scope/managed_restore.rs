@@ -418,6 +418,7 @@ impl Repository {
             });
         }
         let new_tree = build_tree_with_chunking_config(
+            &self.store.record_stages()?,
             target_entries.into_values(),
             head_tree.chunking_config_hash.clone(),
         )?;
@@ -1139,6 +1140,7 @@ impl Repository {
             }
         }
         let expected_restored = build_tree_with_chunking_config(
+            &self.store.record_stages()?,
             expected_entries.into_values(),
             expected_tree.chunking_config_hash,
         )?;
@@ -1162,7 +1164,11 @@ impl Repository {
             ));
         }
         let tree = self.read_tree(&journal.new_tree)?;
-        super::validate_manifest_matches_tree(&publication.manifest, &tree)?;
+        super::validate_manifest_matches_tree(
+            &self.store.record_stages()?,
+            &publication.manifest,
+            &tree,
+        )?;
         self.write_manifest_value(&publication.manifest)?;
         self.remove_publication_journal()?;
         Ok(())

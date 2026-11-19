@@ -74,10 +74,9 @@ fn crash_at(root: &TempDir, point: &str) {
         .env_clear()
         .env(CHILD, "1")
         .env(ROOT, root.path())
-        .env(
-            "KIO_TEST_RECORD_STAGE_ROOT",
-            root.path().join("record-stages"),
-        )
+        .env("TMPDIR", root.path())
+        .env("TMP", root.path())
+        .env("TEMP", root.path())
         .env("KIO_TEST_DURABILITY_POINT", point)
         .env("KIO_TEST_DURABILITY_READY", &ready)
         .stdin(Stdio::null())

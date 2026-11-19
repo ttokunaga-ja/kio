@@ -966,7 +966,11 @@ fn successor_with_failed_pinned_manifest(dir: &TempDir, pointer: &Value) -> Stri
         .write_content_object(ContentObjectKind::Manifest, &manifest_bytes)
         .unwrap();
 
-    let tree = build_tree(entries).unwrap();
+    let tree = build_tree(
+        &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+        entries,
+    )
+    .unwrap();
     let (tree_hash, _) = store
         .write_json(ObjectKind::Tree, &serde_json::to_value(&tree).unwrap())
         .unwrap();
@@ -1053,7 +1057,11 @@ fn pb46_same_generation_immutable_bodies_remain_commit_pinned_after_rebuild() {
     normalize.manifest_hash = store
         .write_content_object(ContentObjectKind::Manifest, &replacement_manifest_bytes)
         .unwrap();
-    let tree = build_tree(entries).unwrap();
+    let tree = build_tree(
+        &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+        entries,
+    )
+    .unwrap();
     let (tree_hash, _) = store
         .write_json(ObjectKind::Tree, &serde_json::to_value(&tree).unwrap())
         .unwrap();
@@ -2183,7 +2191,11 @@ fn pb15_finalized_partial_blocks_below_retry_limit_and_settles_at_limit() {
         .join("manifest.json");
         fs::write(&projection, &bytes).unwrap();
         let staging = prune_staging(&dir, &raw, &normalize.tool_profile_hash, true);
-        let tree = build_tree(entries).unwrap();
+        let tree = build_tree(
+            &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+            entries,
+        )
+        .unwrap();
         let (tree_hash, _) = store
             .write_json(ObjectKind::Tree, &serde_json::to_value(tree).unwrap())
             .unwrap();
@@ -2387,7 +2399,11 @@ fn historical_partial_closure_fixture(unrelated_shallow: bool) {
     )
     .join("manifest.json");
     fs::write(projection, &historical_bytes).unwrap();
-    let tree = build_tree(tree_entries).unwrap();
+    let tree = build_tree(
+        &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+        tree_entries,
+    )
+    .unwrap();
     let (tree_hash, _) = store
         .write_json(ObjectKind::Tree, &serde_json::to_value(tree).unwrap())
         .unwrap();
@@ -3770,7 +3786,11 @@ fn pb42_open_view_side_binds_to_pointer_tool_profile_hash_not_first_raw_hash_mat
 
     let mut entries = tree.entries.to_vec().unwrap();
     entries.push(alias_entry);
-    let new_tree = build_tree(entries).unwrap();
+    let new_tree = build_tree(
+        &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+        entries,
+    )
+    .unwrap();
     let store = ObjectStore::new(kio_dir(&dir));
     let (new_tree_hash, _) = store
         .write_json(ObjectKind::Tree, &serde_json::to_value(&new_tree).unwrap())

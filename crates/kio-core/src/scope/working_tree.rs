@@ -154,7 +154,8 @@ impl Repository {
                 &chunking_config_hash,
             );
         }
-        let mut entries = TreeBuilder::new(chunking_config_hash.clone());
+        let mut entries =
+            TreeBuilder::new(&self.store.record_stages()?, chunking_config_hash.clone());
         let mut consumed_scope_bytes = 0_u64;
         for candidate in candidates.iter() {
             let candidate = candidate?;
@@ -218,8 +219,9 @@ impl Repository {
     ) -> Result<WorkingTree> {
         let scheduled_bound = expected_raw_by_path.is_some() && self.bound_kio.is_some();
         self.store.cleanup_bound_raw_stages()?;
+        let record_stages = self.store.record_stages()?;
         let mut batch = ArchiveBatch {
-            records: RecordWriter::new()?,
+            records: RecordWriter::new(&record_stages)?,
             store: &self.store,
         };
         let mut consumed = 0u64;
@@ -342,7 +344,7 @@ impl Repository {
             }
             stage.detach();
         }
-        let mut entries = TreeBuilder::new(chunking_config_hash.to_owned());
+        let mut entries = TreeBuilder::new(&record_stages, chunking_config_hash.to_owned());
         for record in records.iter() {
             let record = record?;
             let mut stage = self.store.reopen_saved_stage(&record.stage)?;
@@ -370,7 +372,9 @@ impl Repository {
         enforce_tier_a: bool,
         limits: ArchiveLimits,
     ) -> Result<WorkingCandidates> {
-        let mut candidates = RecordSorter::<String>::new(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        let mut candidates = RecordSorter::<String>::new(&self.store.record_stages()?, |a, b| {
+            a.as_bytes().cmp(b.as_bytes())
+        });
         let mut count = 0usize;
         let mut declared_scope_bytes = 0_u64;
         if let Some(root) = &self.bound_root {

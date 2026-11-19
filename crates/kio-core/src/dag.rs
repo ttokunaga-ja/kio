@@ -226,19 +226,23 @@ impl TreeObject {
     }
 }
 
-pub fn build_tree(entries: impl IntoIterator<Item = TreeEntry>) -> Result<TreeObject> {
+pub fn build_tree(
+    root: &crate::disk_records::RecordStageRoot,
+    entries: impl IntoIterator<Item = TreeEntry>,
+) -> Result<TreeObject> {
     let config_hash = chunking_config_hash(DEFAULT_CHUNKING_STRATEGY, DEFAULT_CHUNKING_MAX_CHARS)?;
-    build_tree_with_chunking_config(entries, config_hash)
+    build_tree_with_chunking_config(root, entries, config_hash)
 }
 
 /// Construct a tree that pins a caller-validated chunking configuration hash.
 /// The builder validates it before serialization so no mutable configuration
 /// lookup can be substituted after the tree has been constructed.
 pub fn build_tree_with_chunking_config(
+    root: &crate::disk_records::RecordStageRoot,
     entries: impl IntoIterator<Item = TreeEntry>,
     chunking_config_hash: String,
 ) -> Result<TreeObject> {
-    let mut builder = TreeBuilder::new(chunking_config_hash);
+    let mut builder = TreeBuilder::new(root, chunking_config_hash);
     for entry in entries {
         builder.push(entry)?;
     }
@@ -250,10 +254,10 @@ pub struct TreeBuilder {
     sorter: crate::disk_records::RecordSorter<TreeEntry>,
 }
 impl TreeBuilder {
-    pub fn new(config: String) -> Self {
+    pub fn new(root: &crate::disk_records::RecordStageRoot, config: String) -> Self {
         Self {
             config,
-            sorter: crate::disk_records::RecordSorter::new(|a, b| {
+            sorter: crate::disk_records::RecordSorter::new(root, |a, b| {
                 a.path.as_bytes().cmp(b.path.as_bytes())
             }),
         }
@@ -910,11 +914,18 @@ mod tests {
         assert!(!super::is_materializable_direct_child("report:2026.md"));
     }
 
+    fn decode_tree(value: serde_json::Value) -> crate::Result<TreeObject> {
+        crate::disk_records::decode_json(
+            &crate::disk_records::RecordStageRoot::temporary()?,
+            serde_json::to_vec(&value).unwrap().as_slice(),
+        )
+    }
+
     #[test]
     fn semantic_tree_validation_accepts_portable_controls() {
         // A normalized entry names all three identity fields. Raw-only entries
         // instead omit `normalize` entirely.
-        let tree: TreeObject = serde_json::from_value(json!({
+        let tree: TreeObject = decode_tree(json!({
             "object_type": "tree",
             "chunking_config_hash": default_config_hash(),
             "entries": [{
@@ -931,12 +942,23 @@ mod tests {
         .unwrap();
 
         assert!(tree.validate().is_ok());
-        assert!(build_tree(Vec::new()).unwrap().validate().is_ok());
         assert!(
-            build_tree(vec![valid_entry("raw.txt", RAW_HASH)])
-                .unwrap()
-                .validate()
-                .is_ok()
+            build_tree(
+                &crate::disk_records::RecordStageRoot::temporary().unwrap(),
+                Vec::new()
+            )
+            .unwrap()
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            build_tree(
+                &crate::disk_records::RecordStageRoot::temporary().unwrap(),
+                vec![valid_entry("raw.txt", RAW_HASH)]
+            )
+            .unwrap()
+            .validate()
+            .is_ok()
         );
 
         for path in [".env", "a..b", "report final.txt", "C-report.txt"] {
@@ -958,7 +980,7 @@ mod tests {
             "trailing ",
             r"a\b.md",
         ] {
-            let historical: TreeObject = serde_json::from_value(json!({
+            let historical: TreeObject = decode_tree(json!({
                 "object_type": "tree",
                 "chunking_config_hash": default_config_hash(),
                 "entries": [{"path":path,"type":"file","raw_hash":RAW_HASH}]
@@ -1001,7 +1023,7 @@ mod tests {
         ];
 
         for value in invalid_cases {
-            let tree: TreeObject = serde_json::from_value(value).unwrap();
+            let tree: TreeObject = decode_tree(value).unwrap();
             assert_eq!(
                 tree.validate().unwrap_err().error_code(),
                 "KIO-E-CONFIG-SCHEMA-001"
@@ -1016,7 +1038,7 @@ mod tests {
             "nested/file.txt",
             "/etc/passwd",
         ] {
-            let tree: TreeObject = serde_json::from_value(json!({
+            let tree: TreeObject = decode_tree(json!({
                 "object_type": "tree",
                 "chunking_config_hash": default_config_hash(),
                 "entries": [{"path":path,"type":"file","raw_hash":RAW_HASH}]
@@ -1051,10 +1073,13 @@ mod tests {
                 DEFAULT_CHUNKING_MAX_CHARS,
             )
             .unwrap(),
-            entries: crate::disk_records::DiskRecords::from_records(vec![
-                valid_entry("z.txt", OTHER_RAW_HASH),
-                valid_entry("a.txt", RAW_HASH),
-            ])
+            entries: crate::disk_records::DiskRecords::from_records(
+                &crate::disk_records::RecordStageRoot::temporary().unwrap(),
+                vec![
+                    valid_entry("z.txt", OTHER_RAW_HASH),
+                    valid_entry("a.txt", RAW_HASH),
+                ],
+            )
             .unwrap(),
             object_type: "tree".to_owned(),
         };
@@ -1069,10 +1094,13 @@ mod tests {
                 DEFAULT_CHUNKING_MAX_CHARS,
             )
             .unwrap(),
-            entries: crate::disk_records::DiskRecords::from_records(vec![
-                valid_entry("same.txt", RAW_HASH),
-                valid_entry("same.txt", OTHER_RAW_HASH),
-            ])
+            entries: crate::disk_records::DiskRecords::from_records(
+                &crate::disk_records::RecordStageRoot::temporary().unwrap(),
+                vec![
+                    valid_entry("same.txt", RAW_HASH),
+                    valid_entry("same.txt", OTHER_RAW_HASH),
+                ],
+            )
             .unwrap(),
             object_type: "tree".to_owned(),
         };
@@ -1081,10 +1109,13 @@ mod tests {
             "KIO-E-STORE-DUP-001"
         );
 
-        let sorted = build_tree(vec![
-            valid_entry("z.txt", OTHER_RAW_HASH),
-            valid_entry("a.txt", RAW_HASH),
-        ])
+        let sorted = build_tree(
+            &crate::disk_records::RecordStageRoot::temporary().unwrap(),
+            vec![
+                valid_entry("z.txt", OTHER_RAW_HASH),
+                valid_entry("a.txt", RAW_HASH),
+            ],
+        )
         .unwrap();
         assert_eq!(sorted.entries.get(0).unwrap().unwrap().path, "a.txt");
         assert!(sorted.validate().is_ok());
@@ -1093,7 +1124,7 @@ mod tests {
     #[test]
     fn tree_requires_a_canonical_chunking_configuration_binding() {
         assert!(
-            serde_json::from_value::<TreeObject>(json!({
+            decode_tree(json!({
                 "object_type": "tree",
                 "entries": []
             }))
@@ -1102,7 +1133,11 @@ mod tests {
 
         let malformed = TreeObject {
             chunking_config_hash: "sha256:not-a-canonical-hash".to_owned(),
-            entries: crate::disk_records::DiskRecords::from_records(Vec::new()).unwrap(),
+            entries: crate::disk_records::DiskRecords::from_records(
+                &crate::disk_records::RecordStageRoot::temporary().unwrap(),
+                Vec::new(),
+            )
+            .unwrap(),
             object_type: "tree".to_owned(),
         };
         assert_eq!(
@@ -1113,12 +1148,20 @@ mod tests {
 
     #[test]
     fn tree_builder_pins_distinct_configurations() {
-        let default_tree = build_tree(Vec::new()).unwrap();
+        let default_tree = build_tree(
+            &crate::disk_records::RecordStageRoot::temporary().unwrap(),
+            Vec::new(),
+        )
+        .unwrap();
         assert_eq!(default_tree.chunking_config_hash, default_config_hash());
 
         let configured_hash = chunking_config_hash("heading", 40).unwrap();
-        let configured_tree =
-            build_tree_with_chunking_config(Vec::new(), configured_hash.clone()).unwrap();
+        let configured_tree = build_tree_with_chunking_config(
+            &crate::disk_records::RecordStageRoot::temporary().unwrap(),
+            Vec::new(),
+            configured_hash.clone(),
+        )
+        .unwrap();
         assert_eq!(configured_tree.chunking_config_hash, configured_hash);
         assert_ne!(configured_tree, default_tree);
     }

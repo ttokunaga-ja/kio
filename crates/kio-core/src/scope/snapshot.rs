@@ -416,7 +416,7 @@ impl Repository {
         let purge = self.purge_state()?;
         let mut promoted_tree = prior_tree.clone();
         let mut changed = false;
-        let mut updated = crate::disk_records::RecordWriter::new()?;
+        let mut updated = crate::disk_records::RecordWriter::new(&self.store.record_stages()?)?;
         for entry in &promoted_tree.entries {
             let mut entry = entry?;
             let Some(pending) = normalize_by_path.get(&entry.path) else {

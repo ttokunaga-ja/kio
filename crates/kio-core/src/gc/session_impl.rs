@@ -1015,6 +1015,7 @@ impl GcSweepSession {
         let quarantine = format!("{}-{}", marker.sweep_id, raw);
         let captured_name = format!("{}-{raw}-captured", marker.sweep_id);
         crate::platform::retire_candidate_tree(
+            &crate::disk_records::RecordStageRoot::temporary()?,
             tree_hash,
             Self::committed_tree_size(marker, tree_hash)?,
             raw,
@@ -1125,6 +1126,7 @@ impl GcSweepSession {
     }
     fn marker_tree_presence(&self, marker: &GcInProgressMarker) -> Result<(bool, bool)> {
         self.reads.charge(0)?;
+        let record_stages = crate::disk_records::RecordStageRoot::temporary()?;
         let trees = open_path(&self.kio, "objects/trees")?;
         let mut any_missing = false;
         let mut all_missing = true;
@@ -1138,6 +1140,7 @@ impl GcSweepSession {
                 Some(a) => match open_optional_dir(&a, &raw[2..4])? {
                     None => false,
                     Some(dir) => match read_cas_tree_observed(
+                        &record_stages,
                         &self.reads,
                         &dir,
                         raw,
@@ -1172,6 +1175,7 @@ impl GcSweepSession {
                 };
                 match archives.as_ref() {
                     Some(archives) => crate::platform::marker_archive_presence(
+                        &record_stages,
                         &self.reads,
                         archives,
                         &archive,

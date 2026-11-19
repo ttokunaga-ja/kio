@@ -157,6 +157,7 @@ pub(crate) fn recover_marker(
     cleanup_marker_temporaries(&markers, control)
 }
 pub(crate) fn marker_archive_presence(
+    record_stages: &crate::disk_records::RecordStageRoot,
     reads: &CasReadAccess,
     archives: &File,
     archive: &str,
@@ -165,8 +166,13 @@ pub(crate) fn marker_archive_presence(
     validate_observation: impl Fn(&FileObservation) -> Result<()>,
 ) -> Result<(bool, bool)> {
     Ok(
-        match crate::gc::read_tree_archive_observed(reads, archives, archive, expected_size.max(64))
-        {
+        match crate::gc::read_tree_archive_observed(
+            record_stages,
+            reads,
+            archives,
+            archive,
+            expected_size.max(64),
+        ) {
             Ok((Some(_), observation)) => {
                 validate_observation(&observation)?;
                 (true, false)

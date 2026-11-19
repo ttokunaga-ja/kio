@@ -2735,6 +2735,15 @@ mod tests {
         let repo = Repository::init(dir.path()).unwrap();
         let path = repo.kio_dir().join("objects/raw/.ingest-unknown");
         fs::write(&path, b"unidentified residue").unwrap();
+        let store = repo.object_store();
+        drop(
+            kio_core::disk_records::RecordWriter::<u64>::new(&store.record_stages().unwrap())
+                .unwrap(),
+        );
+        let record = repo
+            .kio_dir()
+            .join("internal/record-stages/stages/unidentified-record");
+        fs::write(&record, b"unidentified record").unwrap();
         let report = verify_objects(&repo).unwrap();
         assert!(
             report
@@ -2743,6 +2752,14 @@ mod tests {
                 .any(|finding| finding.kind == "raw_stage_residue"
                     && finding.reason.contains(".ingest-unknown"))
         );
+        assert!(
+            report
+                .remaining_findings
+                .iter()
+                .any(|finding| finding.kind == "raw_stage_residue"
+                    && finding.reason.contains("unidentified-record"))
+        );
+        assert_eq!(fs::read(record).unwrap(), b"unidentified record");
         assert!(path.exists());
     }
 
@@ -3237,22 +3254,22 @@ mod tests {
                 Some(purge_commit_hash.clone()),
             ),
         );
-        let trees =
-            BTreeMap::from([(
-                bad_tree_hash.clone(),
-                TreeObject {
-                    chunking_config_hash: chunking_config_hash(
-                        DEFAULT_CHUNKING_STRATEGY,
-                        DEFAULT_CHUNKING_MAX_CHARS,
-                    )
-                    .unwrap(),
-                    entries: kio_core::disk_records::DiskRecords::from_records([
-                        TreeEntry::raw_file("unrelated.txt", other_raw.clone()).unwrap(),
-                    ])
-                    .unwrap(),
-                    object_type: "tree".to_owned(),
-                },
-            )]);
+        let trees = BTreeMap::from([(
+            bad_tree_hash.clone(),
+            TreeObject {
+                chunking_config_hash: chunking_config_hash(
+                    DEFAULT_CHUNKING_STRATEGY,
+                    DEFAULT_CHUNKING_MAX_CHARS,
+                )
+                .unwrap(),
+                entries: kio_core::disk_records::DiskRecords::from_records(
+                    &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+                    [TreeEntry::raw_file("unrelated.txt", other_raw.clone()).unwrap()],
+                )
+                .unwrap(),
+                object_type: "tree".to_owned(),
+            },
+        )]);
         let reachable = BTreeSet::from([purge_commit_hash.clone(), bad_candidate_hash.clone()]);
         assert!(
             find_republication_commit(
@@ -3290,11 +3307,10 @@ mod tests {
                     DEFAULT_CHUNKING_MAX_CHARS,
                 )
                 .unwrap(),
-                entries: kio_core::disk_records::DiskRecords::from_records([TreeEntry::raw_file(
-                    "resurrected.txt",
-                    target_raw.clone(),
+                entries: kio_core::disk_records::DiskRecords::from_records(
+                    &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+                    [TreeEntry::raw_file("resurrected.txt", target_raw.clone()).unwrap()],
                 )
-                .unwrap()])
                 .unwrap(),
                 object_type: "tree".to_owned(),
             },
@@ -3460,7 +3476,11 @@ mod tests {
             TreeObject {
                 object_type: "tree".into(),
                 chunking_config_hash: hash('d'),
-                entries: kio_core::disk_records::DiskRecords::from_records([entry]).unwrap(),
+                entries: kio_core::disk_records::DiskRecords::from_records(
+                    &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+                    [entry],
+                )
+                .unwrap(),
             }
         };
         let mut purge_commit = purged_commit("2026-07-13T00:00:01Z", vec![raw.clone()]);
@@ -3556,7 +3576,11 @@ mod tests {
     fn tree_byte_budget_exhaustion_is_a_limit_before_payload_reads() {
         let dir = tempfile::tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
-        let tree = kio_core::dag::build_tree(Vec::new()).unwrap();
+        let tree = kio_core::dag::build_tree(
+            &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+            Vec::new(),
+        )
+        .unwrap();
         repo.object_store().write_tree(&tree).unwrap();
         let report = verify_objects_with_limits(
             &repo,
