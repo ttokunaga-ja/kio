@@ -25,7 +25,19 @@ pub struct PageExtractionProgress {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub staged_through: Option<u64>,
     pub next_page: Option<u64>,
-    pub retry: String,
+    pub retry: PageExtractionRetry,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PageExtractionRetry {
+    #[serde(rename = "index --resource-tier large")]
+    TryLarge,
+    #[serde(rename = "index")]
+    FreeStorage,
+    FreeStorageThenIndexLarge,
+    ReducePageText,
+    ReducePdfComplexity,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -61,10 +73,6 @@ impl ResourceLimit {
                     && progress.next_page
                         == (progress.extracted_through < progress.total_pages)
                             .then(|| progress.extracted_through + 1)
-                    && matches!(
-                        progress.retry.as_str(),
-                        "index --resource-tier large" | "index"
-                    )
             })
     }
 

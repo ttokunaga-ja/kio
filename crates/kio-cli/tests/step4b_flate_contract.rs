@@ -446,7 +446,15 @@ fn p1_review_cli_reports_pdf_page_ranges_and_resumes() {
     });
     assert_eq!(preview_limit["page_progress"], expected, "{preview}");
 
-    kio(&dir, &["index", "--yes", "--offline"]).assert().code(3);
+    let held = kio(&dir, &["index", "--yes", "--offline"]).assert().code(3);
+    let stderr = String::from_utf8_lossy(&held.get_output().stderr);
+    assert!(stderr.contains("Extracted pages 1–2 of 3"), "{stderr}");
+    assert!(stderr.contains("staged pages 1–2"), "{stderr}");
+    assert!(stderr.contains("next page 3"), "{stderr}");
+    assert!(
+        stderr.contains("kio index --resource-tier large"),
+        "{stderr}"
+    );
     let status = json_success(&dir, &["status"]);
     let hold = status["tasks"]
         .as_array()

@@ -1,11 +1,13 @@
 //! Resolve active cross-reference entries in PDF revisions.
 use super::{
-    AdapterError, HashMap, MAX_PROBE_OBJECTS, Objects, PackedObject, PdfDecodeBudget, PdfObject,
-    PdfRef, Result, dict_span, effective_stream, find_endobj, is_pdf_delimiter,
-    load_packed_container, member_range, parse_ref, pdf_keyword_at, probe_dict_ref,
-    probe_dict_type, probe_dict_value, skip_pdf_space_and_comments,
+    AdapterError, MAX_PROBE_OBJECTS, ObjectIndex, Objects, PackedObject, PdfDecodeBudget,
+    PdfObject, PdfRef, Result, dict_span, effective_stream, find_endobj, is_pdf_delimiter,
+    load_packed_container, member_range, parse_ref, pdf_keyword_at, pdf_name_end, probe_dict_ref,
+    probe_dict_type, probe_dict_value, skip_pdf_literal_string, skip_pdf_space_and_comments,
 };
 use std::borrow::Cow;
+use std::cell::Cell;
+use std::cmp::Reverse;
 use std::ops::Range;
 
 const MAX_XREF_SECTIONS: usize = 16;
@@ -19,14 +21,50 @@ enum Entry {
 }
 
 struct Section<'a> {
-    entries: HashMap<u32, Entry>,
+    entries: Vec<(u32, Entry)>,
     trailer: &'a [u8],
+}
+
+struct XrefRow {
+    number: u32,
+    entry: Entry,
+    revision: usize,
+    supplemental: bool,
+}
+
+fn capacity_bytes<T>(entries: &Vec<T>) -> usize {
+    entries.capacity() * std::mem::size_of::<T>()
+}
+
+/// Keep the old allocation charged until its replacement has been admitted.
+fn reserve_index<T>(
+    entries: &mut Vec<T>,
+    additional: usize,
+    budget: &mut PdfDecodeBudget,
+) -> Result<()> {
+    let needed = entries.len().checked_add(additional).ok_or_else(invalid)?;
+    if needed <= entries.capacity() {
+        return Ok(());
+    }
+    let width = std::mem::size_of::<T>();
+    let available = (budget.memory_limit - budget.retained - budget.cached_bytes()) / width;
+    let next = needed.max(entries.capacity().saturating_mul(2).min(available));
+    let bytes = next.checked_mul(width).ok_or_else(invalid)?;
+    let old = capacity_bytes(entries);
+    budget.retain(bytes)?;
+    if entries.try_reserve_exact(next - entries.len()).is_err() {
+        let error = budget.allocation_error();
+        budget.release(bytes);
+        return Err(error);
+    }
+    budget.release(old);
+    Ok(())
 }
 
 pub(super) fn probe_objects<'a>(
     pdf: &'a [u8],
     budget: &mut PdfDecodeBudget,
-) -> Result<(PdfRef, HashMap<u32, PdfObject<'a>>)> {
+) -> Result<(PdfRef, ObjectIndex<PdfObject<'a>>)> {
     let (root, objects) = load_index(pdf, budget)?;
     Ok((root, objects.direct))
 }
@@ -44,69 +82,85 @@ pub(super) fn load_index<'a>(
     let pdf = &pdf[..footer];
     let mut offset = Some(offset);
     let mut root = None;
-    let mut entries = HashMap::new();
+    let mut rows = Vec::new();
     let mut section_offsets = Vec::new();
-    let mut row_count = 0;
+    let mut revisions = Vec::new();
     while let Some(position) = offset {
         budget.visit(1)?;
-        if budget.deadline.is_some() && section_offsets.len() == MAX_XREF_SECTIONS {
-            return Err(invalid());
-        }
-        let mut section = if pdf_keyword_at(pdf, position, b"xref") {
+        push_section(&mut section_offsets, position, budget)?;
+        reserve_index(&mut revisions, 1, budget)?;
+        revisions.push(position);
+        let section = if pdf_keyword_at(pdf, position, b"xref") {
             classic_section(pdf, position, budget)?
         } else {
             stream_section(pdf, position, budget)?
         };
-        budget.reserve_vec(&mut section_offsets, 1)?;
-        section_offsets.push(position);
-        row_count += section.entries.len();
         if let Some(supplement) = optional_uint(section.trailer, b"XRefStm")? {
-            if !pdf_keyword_at(pdf, position, b"xref")
-                || supplement >= position
-                || (budget.deadline.is_some() && section_offsets.len() == MAX_XREF_SECTIONS)
-            {
+            if !pdf_keyword_at(pdf, position, b"xref") || supplement >= position {
                 return Err(invalid());
             }
+            push_section(&mut section_offsets, supplement, budget)?;
             let supplemental = stream_section(pdf, supplement, budget)?;
-            budget.reserve_vec(&mut section_offsets, 1)?;
-            section_offsets.push(supplement);
-            row_count += supplemental.entries.len();
-            // In a hybrid revision the stream's entries take precedence.
-            for (number, entry) in supplemental.entries {
-                if section.entries.insert(number, entry).is_some() {
-                    budget.release(std::mem::size_of::<(u32, Entry)>());
-                }
-            }
+            append_section(&mut rows, supplemental.entries, position, true, budget)?;
         }
         if probe_dict_value(section.trailer, b"Encrypt").is_some() {
-            return Err(invalid());
-        }
-        if budget.deadline.is_some() && row_count > MAX_PROBE_OBJECTS {
             return Err(invalid());
         }
         if root.is_none() && probe_dict_value(section.trailer, b"Root").is_some() {
             root = Some(probe_dict_ref(section.trailer, b"Root").ok_or_else(invalid)?);
         }
-        for (number, entry) in section.entries {
-            budget.visit(1)?;
-            if let std::collections::hash_map::Entry::Vacant(slot) = entries.entry(number) {
-                slot.insert(entry);
-            } else {
-                budget.release(std::mem::size_of::<(u32, Entry)>());
-            }
-        }
+        append_section(&mut rows, section.entries, position, false, budget)?;
         offset = optional_uint(section.trailer, b"Prev")?;
         if offset.is_some_and(|previous| previous >= position) {
             return Err(invalid());
         }
     }
     section_offsets.sort_unstable();
-    let objects = load_objects(pdf, &entries, &section_offsets, budget)?;
+    section_offsets.dedup();
+    revisions.reverse();
+    rows.sort_unstable_by_key(|row| (row.number, Reverse(row.revision), Reverse(row.supplemental)));
+    let objects = load_objects(pdf, &rows, &section_offsets, &revisions, budget)?;
     budget.release(
-        section_offsets.capacity() * std::mem::size_of::<usize>()
-            + entries.len() * std::mem::size_of::<(u32, Entry)>(),
+        capacity_bytes(&section_offsets) + capacity_bytes(&revisions) + capacity_bytes(&rows),
     );
     Ok((root.ok_or_else(invalid)?, objects))
+}
+
+fn push_section(
+    offsets: &mut Vec<usize>,
+    position: usize,
+    budget: &mut PdfDecodeBudget,
+) -> Result<()> {
+    if budget.deadline.is_some() && offsets.len() == MAX_XREF_SECTIONS {
+        return Err(invalid());
+    }
+    reserve_index(offsets, 1, budget)?;
+    offsets.push(position);
+    Ok(())
+}
+
+fn append_section(
+    rows: &mut Vec<XrefRow>,
+    entries: Vec<(u32, Entry)>,
+    revision: usize,
+    supplemental: bool,
+    budget: &mut PdfDecodeBudget,
+) -> Result<()> {
+    let count = entries.len();
+    let capacity = capacity_bytes(&entries);
+    if budget.deadline.is_some() && rows.len() + count > MAX_PROBE_OBJECTS {
+        return Err(invalid());
+    }
+    budget.visit(count)?;
+    reserve_index(rows, count, budget)?;
+    rows.extend(entries.into_iter().map(|(number, entry)| XrefRow {
+        number,
+        entry,
+        revision,
+        supplemental,
+    }));
+    budget.release(capacity);
+    Ok(())
 }
 
 fn startxref(pdf: &[u8]) -> Option<(usize, usize)> {
@@ -133,7 +187,7 @@ fn classic_section<'a>(
     budget: &mut PdfDecodeBudget,
 ) -> Result<Section<'a>> {
     let mut cursor = skip_pdf_space_and_comments(pdf, offset + 4);
-    let mut entries = HashMap::new();
+    let mut entries = Vec::new();
     while !pdf_keyword_at(pdf, cursor, b"trailer") {
         budget.check_deadline()?;
         let (first, next) = unsigned(pdf, cursor).ok_or_else(invalid)?;
@@ -153,7 +207,7 @@ fn classic_section<'a>(
         }
     }
     let trailer = direct_dict(pdf, cursor + 7).ok_or_else(invalid)?;
-    verify_size(trailer, &entries, budget)?;
+    verify_section(trailer, &mut entries, budget)?;
     Ok(Section { entries, trailer })
 }
 
@@ -193,14 +247,16 @@ fn stream_section<'a>(
     if !probe_dict_type(trailer, b"XRef") {
         return Err(invalid());
     }
-    let definition = object_at(
+    let (definition, _) = object_at(
         pdf,
-        start..pdf.len(),
+        start,
         reference.generation,
-        &HashMap::new(),
+        &ObjectLocations::default(),
+        usize::MAX,
         budget,
     )?;
-    let mut data = effective_stream(&definition, &HashMap::new(), budget)?.ok_or_else(invalid)?;
+    let mut data =
+        effective_stream(&definition, &ObjectIndex::default(), budget)?.ok_or_else(invalid)?;
     let widths = probe_dict_value(trailer, b"W")
         .and_then(|value| uint_array(value, 3))
         .ok_or_else(invalid)?;
@@ -215,7 +271,7 @@ fn stream_section<'a>(
     let ranges = probe_dict_value(trailer, b"Index");
     let capacity = data.capacity();
     let mut data = decode_predictor(&mut data, trailer, width, budget)?;
-    let mut entries = HashMap::new();
+    let mut entries = Vec::new();
     let mut ranges = match ranges {
         Some(value) => XrefRanges::Array(value.strip_prefix(b"[").ok_or_else(invalid)?),
         None => XrefRanges::All(Some(size)),
@@ -248,7 +304,7 @@ fn stream_section<'a>(
         return Err(invalid());
     }
     budget.release(capacity);
-    verify_size(trailer, &entries, budget)?;
+    verify_section(trailer, &mut entries, budget)?;
     Ok(Section { entries, trailer })
 }
 
@@ -320,48 +376,136 @@ fn paeth(left: u8, up: u8, upper_left: u8) -> u8 {
         .expect("three predictor candidates")
 }
 
+struct PhysicalObject {
+    offset: usize,
+    reference: PdfRef,
+    revision: usize,
+    active: bool,
+    length: Cell<Option<usize>>,
+}
+
+#[derive(Default)]
+struct ObjectLocations<'a> {
+    rows: &'a [XrefRow],
+    physical: &'a [PhysicalObject],
+}
+
+impl ObjectLocations<'_> {
+    fn find(&self, number: u32, revision: usize) -> Option<&XrefRow> {
+        let index = self.rows.partition_point(|row| {
+            row.number < number || (row.number == number && row.revision > revision)
+        });
+        self.rows.get(index).filter(|row| row.number == number)
+    }
+
+    fn physical(&self, offset: usize) -> Option<&PhysicalObject> {
+        let index = self
+            .physical
+            .binary_search_by_key(&offset, |object| object.offset)
+            .ok()?;
+        self.physical.get(index)
+    }
+}
+
 fn load_objects<'a>(
     pdf: &'a [u8],
-    entries: &HashMap<u32, Entry>,
+    rows: &[XrefRow],
     sections: &[usize],
+    revisions: &[usize],
     budget: &mut PdfDecodeBudget,
 ) -> Result<Objects<'a>> {
-    let mut direct = Vec::new();
+    let mut physical = Vec::new();
     let mut packed = Vec::new();
-    for (&number, entry) in entries {
-        budget.visit(1)?;
-        match *entry {
-            Entry::Direct { offset, generation } => {
-                budget.reserve_vec(&mut direct, 1)?;
-                direct.push((offset, PdfRef { number, generation }));
+    for group in rows.chunk_by(|left, right| left.number == right.number) {
+        for (index, row) in group.iter().enumerate() {
+            budget.visit(1)?;
+            match row.entry {
+                Entry::Direct { offset, generation } => {
+                    reserve_index(&mut physical, 1, budget)?;
+                    physical.push(PhysicalObject {
+                        offset,
+                        reference: PdfRef {
+                            number: row.number,
+                            generation,
+                        },
+                        revision: row.revision,
+                        active: index == 0,
+                        length: Cell::new(None),
+                    });
+                }
+                Entry::Packed { stream, member } if index == 0 => {
+                    reserve_index(&mut packed, 1, budget)?;
+                    packed.push((stream, row.number, member));
+                }
+                _ => {}
             }
-            Entry::Packed { stream, member } => {
-                budget.reserve_vec(&mut packed, 1)?;
-                packed.push((stream, number, member));
-            }
-            Entry::Free => {}
         }
     }
-    direct.sort_unstable_by_key(|(offset, _)| *offset);
+    physical.sort_unstable_by_key(|object| (object.offset, object.revision));
+    let mut collision = false;
+    physical.dedup_by(|later, earlier| {
+        if later.offset != earlier.offset {
+            return false;
+        }
+        collision |= later.reference != earlier.reference;
+        earlier.active |= later.active;
+        true
+    });
+    if collision {
+        return Err(invalid());
+    }
+    let locations = ObjectLocations {
+        rows,
+        physical: &physical,
+    };
     let mut objects = Objects::default();
-    for (index, &(offset, expected)) in direct.iter().enumerate() {
-        budget.visit(1)?;
-        let next_section = sections.get(sections.partition_point(|position| *position <= offset));
-        let bound = direct
-            .get(index + 1)
-            .map_or(pdf.len(), |(offset, _)| *offset)
-            .min(next_section.copied().unwrap_or(pdf.len()))
-            .min(pdf.len());
-        let (actual, start) = header(&pdf[..bound], offset).ok_or_else(invalid)?;
-        if actual != expected {
+    let mut cursor = 0;
+    let mut sections = sections.iter().copied().peekable();
+    for expected in &physical {
+        while let Some(position) = sections.next_if(|position| *position < expected.offset) {
+            cursor = scan_to_boundary(pdf, cursor, position, &locations, revisions, budget)?;
+        }
+        cursor = scan_to_boundary(pdf, cursor, expected.offset, &locations, revisions, budget)?;
+        let (actual, start) = header(pdf, cursor).ok_or_else(invalid)?;
+        if actual != expected.reference {
             return Err(invalid());
         }
-        let object = object_at(pdf, start..bound, actual.generation, entries, budget)?;
-        budget.retain(std::mem::size_of::<(u32, PdfObject<'_>)>())?;
-        objects.direct.insert(actual.number, object);
+        let (object, end) = object_at(
+            pdf,
+            start,
+            actual.generation,
+            &locations,
+            expected.revision,
+            budget,
+        )?;
+        cursor = end;
+        sections.next_if_eq(&expected.offset);
+        if expected.active {
+            // A later revision may replace an indirect Length. The active
+            // value must still describe the same physical stream range.
+            if let Some(range) = &object.stream
+                && let Some(dict) = object.dictionary()
+                && expected.revision != revisions.last().copied().unwrap_or(expected.revision)
+                && probe_dict_ref(dict, b"Length").is_some()
+                && stream_length(dict, pdf, &locations, usize::MAX, budget)? != range.len()
+            {
+                return Err(invalid());
+            }
+            reserve_index(&mut objects.direct.sorted, 1, budget)?;
+            objects.direct.sorted.push((actual.number, object));
+        }
     }
-    budget.release(direct.capacity() * std::mem::size_of::<(usize, PdfRef)>());
+    for position in sections {
+        cursor = scan_to_boundary(pdf, cursor, position, &locations, revisions, budget)?;
+    }
+    budget.release(capacity_bytes(&physical));
+    objects
+        .direct
+        .sorted
+        .sort_unstable_by_key(|(number, _)| *number);
+
     packed.sort_unstable();
+    let mut probe_members = Vec::new();
     for members in packed.chunk_by(|left, right| left.0 == right.0) {
         let stream = members[0].0;
         budget.visit(1)?;
@@ -370,9 +514,12 @@ fn load_objects<'a>(
             if budget.deadline.is_some() {
                 return Err(invalid());
             }
-            for &(_, number, _) in members {
-                objects.insert_packed(number, PackedObject::Unsupported, budget)?;
-            }
+            reserve_index(&mut objects.packed.sorted, members.len(), budget)?;
+            objects.packed.sorted.extend(
+                members
+                    .iter()
+                    .map(|&(_, number, _)| (number, PackedObject::Unsupported)),
+            );
             continue;
         };
         for &(_, number, member) in members {
@@ -386,35 +533,108 @@ fn load_objects<'a>(
                 let PackedObject::Member { start, end, .. } = range else {
                     unreachable!()
                 };
+                reserve_index(&mut probe_members, 1, budget)?;
                 budget.retain(end - start)?;
-                objects.direct.insert(
+                probe_members.push((
                     number,
                     PdfObject::new(Cow::Owned(data[start..end].to_vec()), 0, None),
-                );
+                ));
             } else {
-                objects.insert_packed(number, range, budget)?;
+                reserve_index(&mut objects.packed.sorted, 1, budget)?;
+                objects.packed.sorted.push((number, range));
             }
         }
         budget.release(data.capacity() + offsets.capacity() * std::mem::size_of::<(u32, usize)>());
     }
-    budget.release(packed.capacity() * std::mem::size_of::<(u32, u32, usize)>());
+    budget.release(capacity_bytes(&packed));
+    objects
+        .packed
+        .sorted
+        .sort_unstable_by_key(|(number, _)| *number);
+    if !probe_members.is_empty() {
+        let capacity = capacity_bytes(&probe_members);
+        reserve_index(&mut objects.direct.sorted, probe_members.len(), budget)?;
+        objects.direct.sorted.extend(probe_members);
+        budget.release(capacity);
+        objects
+            .direct
+            .sorted
+            .sort_unstable_by_key(|(number, _)| *number);
+    }
     Ok(objects)
 }
 
-fn object_at<'a>(
-    document: &'a [u8],
-    bounds: Range<usize>,
-    generation: u16,
-    entries: &HashMap<u32, Entry>,
+/// Advance over complete lexical objects, including inactive revisions. A
+/// requested offset skipped by a comment, string or stream is never a header.
+fn scan_to_boundary(
+    pdf: &[u8],
+    mut cursor: usize,
+    target: usize,
+    locations: &ObjectLocations<'_>,
+    revisions: &[usize],
     budget: &mut PdfDecodeBudget,
-) -> Result<PdfObject<'a>> {
+) -> Result<usize> {
+    if target >= pdf.len() {
+        return Err(invalid());
+    }
+    while cursor < target {
+        budget.check_deadline()?;
+        cursor = skip_pdf_space_and_comments(pdf, cursor);
+        if cursor >= target {
+            break;
+        }
+        if let Some((reference, start)) = header(pdf, cursor) {
+            let revision = revisions
+                .get(revisions.partition_point(|offset| *offset < cursor))
+                .copied()
+                .unwrap_or(usize::MAX);
+            let (_, end) = object_at(
+                pdf,
+                start,
+                reference.generation,
+                locations,
+                revision,
+                budget,
+            )?;
+            cursor = end;
+        } else {
+            cursor = match pdf[cursor] {
+                b'(' => skip_pdf_literal_string(pdf, cursor),
+                b'<' if pdf.get(cursor + 1) == Some(&b'<') => {
+                    cursor + direct_dict(pdf, cursor).ok_or_else(invalid)?.len()
+                }
+                b'<' => pdf[cursor + 1..]
+                    .iter()
+                    .position(|byte| *byte == b'>')
+                    .map_or(pdf.len(), |end| cursor + 2 + end),
+                b'/' => pdf_name_end(pdf, cursor + 1),
+                0 => cursor + 1,
+                value if is_pdf_delimiter(value) => cursor + 1,
+                _ => pdf_name_end(pdf, cursor + 1),
+            };
+        }
+    }
+    if cursor == target {
+        Ok(cursor)
+    } else {
+        Err(invalid())
+    }
+}
+
+fn object_at<'a>(
+    pdf: &'a [u8],
+    body_start: usize,
+    generation: u16,
+    locations: &ObjectLocations<'_>,
+    revision: usize,
+    budget: &mut PdfDecodeBudget,
+) -> Result<(PdfObject<'a>, usize)> {
     budget.check_deadline()?;
-    let pdf = &document[..bounds.end];
-    let start = skip_pdf_space_and_comments(pdf, bounds.start);
+    let start = skip_pdf_space_and_comments(pdf, body_start);
     let (end, stream) = if let Some(dict) = direct_dict(pdf, start) {
         let cursor = skip_pdf_space_and_comments(pdf, start + dict.len());
         if pdf_keyword_at(pdf, cursor, b"stream") {
-            let length = stream_length(dict, document, entries)?;
+            let length = stream_length(dict, pdf, locations, revision, budget)?;
             let after = pdf.get(cursor + 6..).ok_or_else(invalid)?;
             let eol = if after.starts_with(b"\r\n") {
                 2
@@ -447,27 +667,49 @@ fn object_at<'a>(
     }
     budget.check_deadline()?;
     let body = pdf.get(start..end).ok_or_else(invalid)?;
-    budget.scan(body.len())?;
-    Ok(PdfObject::new(Cow::Borrowed(body), generation, stream))
+    budget.scan(end + b"endobj".len() - body_start)?;
+    let mut object = PdfObject::new(Cow::Borrowed(body), generation, stream);
+    object.stream_length_checked = true;
+    Ok((object, end + b"endobj".len()))
 }
 
-fn stream_length(dict: &[u8], pdf: &[u8], entries: &HashMap<u32, Entry>) -> Result<usize> {
-    if let Some(reference) = probe_dict_ref(dict, b"Length") {
-        let Some(Entry::Direct { offset, generation }) = entries.get(&reference.number).copied()
-        else {
-            return Err(invalid());
-        };
-        let (actual, start) = header(pdf, offset).ok_or_else(invalid)?;
-        if actual != reference || generation != reference.generation {
-            return Err(invalid());
-        }
-        let (length, end) = unsigned(pdf, start).ok_or_else(invalid)?;
-        if !pdf_keyword_at(pdf, skip_pdf_space_and_comments(pdf, end), b"endobj") {
-            return Err(invalid());
-        }
+fn stream_length(
+    dict: &[u8],
+    pdf: &[u8],
+    locations: &ObjectLocations<'_>,
+    revision: usize,
+    budget: &mut PdfDecodeBudget,
+) -> Result<usize> {
+    let Some(reference) = probe_dict_ref(dict, b"Length") else {
+        return optional_uint(dict, b"Length")?.ok_or_else(invalid);
+    };
+    budget.visit(1)?;
+    let Some(&XrefRow {
+        entry: Entry::Direct { offset, generation },
+        ..
+    }) = locations.find(reference.number, revision)
+    else {
+        return Err(invalid());
+    };
+    let physical = locations.physical(offset).ok_or_else(invalid)?;
+    if physical.reference != reference || generation != reference.generation {
+        return Err(invalid());
+    }
+    if let Some(length) = physical.length.get() {
         return Ok(length);
     }
-    optional_uint(dict, b"Length")?.ok_or_else(invalid)
+    let (actual, start) = header(pdf, offset).ok_or_else(invalid)?;
+    if actual != reference {
+        return Err(invalid());
+    }
+    let (length, end) = unsigned(pdf, start).ok_or_else(invalid)?;
+    let terminator = skip_pdf_space_and_comments(pdf, end);
+    if !pdf_keyword_at(pdf, terminator, b"endobj") {
+        return Err(invalid());
+    }
+    budget.scan(terminator + b"endobj".len() - offset)?;
+    physical.length.set(Some(length));
+    Ok(length)
 }
 
 pub(super) fn content_references(dict: &[u8], budget: &PdfDecodeBudget) -> Result<Vec<PdfRef>> {
@@ -520,13 +762,18 @@ fn direct_dict(pdf: &[u8], from: usize) -> Option<&[u8]> {
     dict_span(tail)
 }
 
-fn verify_size(
+fn verify_section(
     trailer: &[u8],
-    entries: &HashMap<u32, Entry>,
+    entries: &mut [(u32, Entry)],
     budget: &PdfDecodeBudget,
 ) -> Result<()> {
     let size = xref_size(trailer, budget)?;
-    if entries.is_empty() || entries.keys().any(|number| *number as usize >= size) {
+    entries.sort_unstable_by_key(|(number, _)| *number);
+    if !entries
+        .last()
+        .is_some_and(|(number, _)| (*number as usize) < size)
+        || entries.windows(2).any(|pair| pair[0].0 == pair[1].0)
+    {
         return Err(invalid());
     }
     Ok(())
@@ -609,16 +856,16 @@ fn row_range(
 }
 
 fn insert(
-    entries: &mut HashMap<u32, Entry>,
+    entries: &mut Vec<(u32, Entry)>,
     number: u32,
     entry: Entry,
     budget: &mut PdfDecodeBudget,
 ) -> Result<()> {
-    if (number == 0 && !matches!(entry, Entry::Free)) || entries.contains_key(&number) {
+    if number == 0 && !matches!(entry, Entry::Free) {
         return Err(invalid());
     }
-    budget.retain(std::mem::size_of::<(u32, Entry)>())?;
-    entries.insert(number, entry);
+    reserve_index(entries, 1, budget)?;
+    entries.push((number, entry));
     Ok(())
 }
 
@@ -654,6 +901,154 @@ pub(super) fn invalid() -> AdapterError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_classic_xref(pdf: &mut Vec<u8>, offsets: &[usize]) {
+        use std::io::Write;
+        let table = pdf.len();
+        let size = offsets.len() + 1;
+        write!(pdf, "xref\n0 {size}\n0000000000 65535 f \n").unwrap();
+        for offset in offsets {
+            writeln!(pdf, "{offset:010} 00000 n ").unwrap();
+        }
+        write!(
+            pdf,
+            "trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{table}\n%%EOF\n"
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn p1_review2_xref_rejects_headers_in_comments_and_inactive_streams() {
+        for wrap_stream in [false, true] {
+            let mut pdf = b"%PDF-1.6\n".to_vec();
+            let root = pdf.len();
+            pdf.extend_from_slice(b"1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n");
+            let pages = pdf.len();
+            pdf.extend_from_slice(b"2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n");
+            let forged = b"3 0 obj << /Type /Page /Parent 2 0 R >> endobj\n";
+            if wrap_stream {
+                pdf.extend_from_slice(
+                    format!("4 0 obj << /Length {} >> stream\n", forged.len()).as_bytes(),
+                );
+            } else {
+                pdf.extend_from_slice(b"% ");
+            }
+            let page = pdf.len();
+            pdf.extend_from_slice(forged);
+            if wrap_stream {
+                pdf.extend_from_slice(b"endstream\nendobj\n");
+            }
+            write_classic_xref(&mut pdf, &[root, pages, page]);
+            assert!(
+                matches!(
+                    super::super::PdfPages::open(&pdf, kio_core::error::ResourceTier::Standard),
+                    Err(AdapterError::ContractViolation(_))
+                ),
+                "wrapped in stream: {wrap_stream}"
+            );
+        }
+    }
+
+    #[test]
+    fn xref_rejects_object_offsets_beyond_the_file() {
+        let mut pdf = b"%PDF-1.6\n".to_vec();
+        let invalid = pdf.len() + 4096;
+        write_classic_xref(&mut pdf, &[invalid]);
+        assert!(matches!(
+            super::super::PdfPages::open(&pdf, kio_core::error::ResourceTier::Standard),
+            Err(AdapterError::ContractViolation(_))
+        ));
+    }
+
+    #[test]
+    fn p1_review2_shared_length_charges_once_and_counts_each_reference() {
+        let mut pdf = b"%PDF-1.6\n".to_vec();
+        let offset = pdf.len();
+        pdf.extend_from_slice(b"3 0 obj\n%");
+        pdf.extend(std::iter::repeat_n(b'x', 4096));
+        pdf.extend_from_slice(b"\n11\nendobj\n");
+        let rows = [XrefRow {
+            number: 3,
+            entry: Entry::Direct {
+                offset,
+                generation: 0,
+            },
+            revision: 10,
+            supplemental: false,
+        }];
+        let physical = [PhysicalObject {
+            offset,
+            reference: PdfRef {
+                number: 3,
+                generation: 0,
+            },
+            revision: 10,
+            active: true,
+            length: Cell::new(None),
+        }];
+        let locations = ObjectLocations {
+            rows: &rows,
+            physical: &physical,
+        };
+        let dict = b"<< /Length 3 0 R >>";
+        let mut budget = PdfDecodeBudget {
+            work_limit: 8,
+            ..PdfDecodeBudget::default()
+        };
+        assert_eq!(
+            stream_length(dict, &pdf, &locations, 10, &mut budget).unwrap(),
+            11
+        );
+        let first = budget.work;
+        assert!(first > 4);
+        for _ in 0..2 {
+            let before = budget.work;
+            assert_eq!(
+                stream_length(dict, &pdf, &locations, 10, &mut budget).unwrap(),
+                11
+            );
+            assert_eq!(budget.work, before + 1);
+        }
+        assert!(matches!(
+            stream_length(dict, &pdf, &locations, 10, &mut budget),
+            Err(AdapterError::ResourceLimit(_))
+        ));
+    }
+
+    #[test]
+    fn p1_review2_xref_retains_allocated_index_capacity() {
+        let pdf = b"xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 1 >>\n";
+        let mut budget = PdfDecodeBudget::default();
+        let section = classic_section(pdf, 0, &mut budget).unwrap();
+        assert_eq!(
+            budget.retained,
+            section.entries.capacity() * std::mem::size_of::<(u32, Entry)>()
+        );
+    }
+
+    #[test]
+    fn p1_review2_xref_growth_admits_old_and_replacement_allocations() {
+        let width = std::mem::size_of::<(u32, Entry)>();
+        let mut budget = PdfDecodeBudget {
+            memory_limit: 4 * width,
+            ..PdfDecodeBudget::default()
+        };
+        let mut entries = Vec::new();
+        insert(&mut entries, 0, Entry::Free, &mut budget).unwrap();
+        insert(&mut entries, 1, Entry::Free, &mut budget).unwrap();
+
+        let error = insert(&mut entries, 2, Entry::Free, &mut budget).unwrap_err();
+        assert!(matches!(error, AdapterError::ResourceLimit(ref limit)
+            if limit.resource == kio_core::error::Resource::Memory
+                && limit.observed == Some((5 * width) as u64)));
+        assert_eq!(entries.capacity(), 2);
+        assert_eq!(budget.retained, 2 * width);
+
+        budget.memory_limit = 5 * width;
+        insert(&mut entries, 2, Entry::Free, &mut budget).unwrap();
+        assert_eq!(entries.capacity(), 3);
+        assert_eq!(budget.retained, 3 * width);
+    }
 
     #[test]
     fn xref_offset_must_point_to_the_start_of_the_object_number() {

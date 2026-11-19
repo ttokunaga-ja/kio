@@ -26,6 +26,7 @@ struct PdfObject<'a> {
     generation: u16,
     dictionary: Option<std::ops::Range<usize>>,
     stream: Option<std::ops::Range<usize>>,
+    stream_length_checked: bool,
 }
 
 impl<'a> PdfObject<'a> {
@@ -42,6 +43,7 @@ impl<'a> PdfObject<'a> {
             generation,
             dictionary,
             stream,
+            stream_length_checked: false,
         }
     }
 
@@ -63,8 +65,47 @@ struct PdfRef {
     generation: u16,
 }
 
+/// Xref-backed documents use sorted, capacity-accounted indexes. The
+/// xref-free literal path uses its existing mutable object-number map.
+struct ObjectIndex<T> {
+    raw: HashMap<u32, T>,
+    sorted: Vec<(u32, T)>,
+}
+
+impl<T> Default for ObjectIndex<T> {
+    fn default() -> Self {
+        Self {
+            raw: HashMap::new(),
+            sorted: Vec::new(),
+        }
+    }
+}
+
+impl<T> ObjectIndex<T> {
+    fn get(&self, number: &u32) -> Option<&T> {
+        if self.sorted.is_empty() {
+            return self.raw.get(number);
+        }
+        let index = self
+            .sorted
+            .binary_search_by_key(number, |(number, _)| *number)
+            .ok()?;
+        Some(&self.sorted[index].1)
+    }
+
+    fn len(&self) -> usize {
+        self.raw.len() + self.sorted.len()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&u32, &T)> {
+        self.raw
+            .iter()
+            .chain(self.sorted.iter().map(|(number, value)| (number, value)))
+    }
+}
+
 fn referenced_object<'a, 'pdf>(
-    objects: &'a HashMap<u32, PdfObject<'pdf>>,
+    objects: &'a ObjectIndex<PdfObject<'pdf>>,
     reference: PdfRef,
 ) -> Option<&'a PdfObject<'pdf>> {
     objects
@@ -84,8 +125,8 @@ enum PackedObject {
 
 #[derive(Default)]
 struct Objects<'a> {
-    direct: HashMap<u32, PdfObject<'a>>,
-    packed: HashMap<u32, PackedObject>,
+    direct: ObjectIndex<PdfObject<'a>>,
+    packed: ObjectIndex<PackedObject>,
 }
 
 impl<'a> Objects<'a> {
@@ -143,10 +184,10 @@ impl<'a> Objects<'a> {
         member: PackedObject,
         budget: &mut PdfDecodeBudget,
     ) -> Result<()> {
-        if !self.packed.contains_key(&number) {
+        if !self.packed.raw.contains_key(&number) {
             budget.retain(std::mem::size_of::<(u32, PackedObject)>())?;
         }
-        self.packed.insert(number, member);
+        self.packed.raw.insert(number, member);
         Ok(())
     }
 }
@@ -516,10 +557,10 @@ pub(crate) fn office_probe_page_text(
     let Some(page) = probe_page_reference(&objects, root, &budget)? else {
         return Ok(None);
     };
-    let generation = objects[&page].generation;
+    let generation = objects.get(&page).ok_or_else(xref::invalid)?.generation;
     let objects = Objects {
         direct: objects,
-        packed: HashMap::new(),
+        packed: ObjectIndex::default(),
     };
     let text = decode_indexed_page(
         &objects,
@@ -534,7 +575,7 @@ pub(crate) fn office_probe_page_text(
 }
 
 fn probe_page_reference(
-    objects: &HashMap<u32, PdfObject<'_>>,
+    objects: &ObjectIndex<PdfObject<'_>>,
     root: PdfRef,
     budget: &PdfDecodeBudget,
 ) -> Result<Option<u32>> {
@@ -680,8 +721,11 @@ fn collect_objects<'a>(bytes: &'a [u8], budget: &mut PdfDecodeBudget) -> Result<
         }
     }
     let mut index = Objects {
-        direct: objects,
-        packed: HashMap::new(),
+        direct: ObjectIndex {
+            raw: objects,
+            sorted: Vec::new(),
+        },
+        packed: ObjectIndex::default(),
     };
     index_raw_object_streams(&mut index, budget)?;
     Ok(index)
@@ -952,7 +996,7 @@ fn raw_object_end(bytes: &[u8], start: usize) -> Result<(usize, Option<std::ops:
 fn stream_data<'a>(
     payload: &'a [u8],
     dict: &[u8],
-    objects: &HashMap<u32, PdfObject<'_>>,
+    objects: &ObjectIndex<PdfObject<'_>>,
     budget: &mut PdfDecodeBudget,
 ) -> Result<&'a [u8]> {
     if budget.deadline.is_some() {
@@ -1118,7 +1162,7 @@ fn inflate_tier_stream(
 /// Effective stream bytes, following only the supported filter chain.
 fn effective_stream(
     object: &PdfObject<'_>,
-    objects: &HashMap<u32, PdfObject<'_>>,
+    objects: &ObjectIndex<PdfObject<'_>>,
     budget: &mut PdfDecodeBudget,
 ) -> Result<Option<Vec<u8>>> {
     budget.check_deadline()?;
@@ -1133,7 +1177,11 @@ fn effective_stream(
         return Ok(None);
     };
     budget.scan(dict.len())?;
-    let payload = stream_data(payload, dict, objects, budget)?;
+    let payload = if object.stream_length_checked {
+        payload
+    } else {
+        stream_data(payload, dict, objects, budget)?
+    };
     if probe_dict_type(dict, b"XObject")
         || probe_dict_value(dict, b"Subtype").is_some_and(|value| pdf_name_at(value, 0, b"Image"))
     {
@@ -1165,7 +1213,7 @@ fn effective_stream(
 
 fn index_raw_object_streams(objects: &mut Objects<'_>, budget: &mut PdfDecodeBudget) -> Result<()> {
     let mut containers = Vec::new();
-    for (&number, object) in &objects.direct {
+    for (&number, object) in objects.direct.iter() {
         budget.visit(1)?;
         if object
             .dictionary()
@@ -1189,7 +1237,7 @@ fn index_raw_object_streams(objects: &mut Objects<'_>, budget: &mut PdfDecodeBud
                 ));
             }
             let member = member_range(number, &data, &offsets, first, position, offset);
-            if let Some(previous) = objects.direct.remove(&objnum) {
+            if let Some(previous) = objects.direct.raw.remove(&objnum) {
                 budget
                     .release(previous.owned_bytes() + std::mem::size_of::<(u32, PdfObject<'_>)>());
             }
@@ -1204,7 +1252,7 @@ fn index_raw_object_streams(objects: &mut Objects<'_>, budget: &mut PdfDecodeBud
 type PackedContainer = (Vec<u8>, Vec<(u32, usize)>, usize);
 
 fn load_packed_container(
-    direct: &HashMap<u32, PdfObject<'_>>,
+    direct: &ObjectIndex<PdfObject<'_>>,
     number: u32,
     budget: &mut PdfDecodeBudget,
 ) -> Result<Option<PackedContainer>> {
@@ -2047,7 +2095,7 @@ fn push_content_refs(
 }
 
 fn append_stream(
-    objects: &HashMap<u32, PdfObject<'_>>,
+    objects: &ObjectIndex<PdfObject<'_>>,
     object: &PdfObject<'_>,
     content: &mut Vec<u8>,
     budget: &mut PdfDecodeBudget,

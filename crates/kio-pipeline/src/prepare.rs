@@ -478,22 +478,24 @@ fn page_extraction_error(
     staged_through: Option<usize>,
     tier: kio_core::error::ResourceTier,
 ) -> crate::PipelineError {
-    use kio_core::error::{PageExtractionProgress, Resource, ResourceTier};
+    use kio_core::error::{PageExtractionProgress, PageExtractionRetry, Resource, ResourceTier};
 
     let crate::PipelineError::ResourceLimit(mut limit) = error else {
         return error;
     };
-    let retry = if tier == ResourceTier::Large || limit.resource != Resource::Storage {
-        "index --resource-tier large"
-    } else {
-        "index"
+    let retry = match (limit.resource, tier) {
+        (Resource::Storage, ResourceTier::Standard) => PageExtractionRetry::FreeStorage,
+        (Resource::Storage, ResourceTier::Large) => PageExtractionRetry::FreeStorageThenIndexLarge,
+        (_, ResourceTier::Standard) => PageExtractionRetry::TryLarge,
+        (Resource::UnitText, ResourceTier::Large) => PageExtractionRetry::ReducePageText,
+        (_, ResourceTier::Large) => PageExtractionRetry::ReducePdfComplexity,
     };
     limit.page_progress = Some(Box::new(PageExtractionProgress {
         total_pages: total_pages as u64,
         extracted_through: extracted_through as u64,
         staged_through: staged_through.map(|count| count as u64),
         next_page: (extracted_through < total_pages).then(|| extracted_through as u64 + 1),
-        retry: retry.to_owned(),
+        retry,
     }));
     crate::PipelineError::ResourceLimit(limit)
 }
@@ -1032,6 +1034,28 @@ mod tests {
         .unwrap();
         assert_eq!(visited, 257);
         assert_eq!(output.prepared_units.len(), 257);
+    }
+
+    #[test]
+    fn p1_review2_large_unit_text_hold_recommends_reducing_the_page() {
+        use kio_core::error::{Resource, ResourceLimit, ResourceTier};
+        let error = crate::PipelineError::ResourceLimit(ResourceLimit {
+            resource: Resource::UnitText,
+            stage: "extract".to_owned(),
+            limit: Some(64 * 1024 * 1024),
+            observed: Some(64 * 1024 * 1024 + 1),
+            resource_tier: Some(ResourceTier::Large),
+            page_progress: None,
+        });
+        let crate::PipelineError::ResourceLimit(limit) =
+            page_extraction_error(error, 4, 2, Some(1), ResourceTier::Large)
+        else {
+            panic!("missing extraction hold");
+        };
+        assert_eq!(
+            limit.page_progress.unwrap().retry,
+            kio_core::error::PageExtractionRetry::ReducePageText
+        );
     }
 
     #[test]
