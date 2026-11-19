@@ -355,18 +355,17 @@ fn current_policy_raw_path_for_short_hash(
     };
     let commit = repo.read_commit(&head)?;
     let tree = repo.read_tree(&commit.tree)?;
-    let mut allowed = Vec::new();
-    for entry in tree
-        .entries
-        .iter()
-        .filter(|entry| entry.raw_hash == raw_hash)
-    {
+    for entry in &tree.entries {
+        let entry = entry?;
+        if entry.raw_hash != raw_hash {
+            continue;
+        }
         if policy.allows_path(&entry.path).map_err(pipeline_to_kio)? {
-            allowed.push(entry.path.clone());
+            // Validated trees are sorted by UTF-8 path bytes.
+            return Ok(Some(entry.path));
         }
     }
-    allowed.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
-    Ok(allowed.into_iter().next())
+    Ok(None)
 }
 
 /// True when a raw object with `raw_hash` is present in the working tree or the
@@ -957,11 +956,13 @@ fn resolve_pointer_for_cli(
     let (commit_shallow, entry_gen, mut entry_normalize, mut entry_path, entry_candidates) =
         match repo.read_tree(&commit.tree) {
             Ok(tree) => {
-                let raw_matches = tree
-                    .entries
-                    .iter()
-                    .filter(|entry| entry.raw_hash == pointer.raw_hash)
-                    .collect::<Vec<_>>();
+                let mut raw_matches = Vec::new();
+                for entry in &tree.entries {
+                    let entry = entry?;
+                    if entry.raw_hash == pointer.raw_hash {
+                        raw_matches.push(entry);
+                    }
+                }
                 if raw_matches.is_empty() {
                     // step 5 (tombstone) is checked before declaring not_found.
                     // This is a tree-membership failure (this pointer's commit
@@ -973,10 +974,7 @@ fn resolve_pointer_for_cli(
                     enforce_canonical_tombstone_only(&target, &pointer.raw_hash, ctx.control)?;
                     return Err(purge_not_found_error(&target, &pointer.raw_hash));
                 }
-                let entry_candidates = raw_matches
-                    .iter()
-                    .map(|entry| (*entry).clone())
-                    .collect::<Vec<_>>();
+                let entry_candidates = raw_matches.clone();
                 // M6/PB42/43 (§O, 08 §3.1 step 4): when the same raw_hash is
                 // placed at more than one path in this commit's tree (duplicate
                 // placement), select the entry whose normalize.tool_profile_hash
@@ -1001,7 +999,7 @@ fn resolve_pointer_for_cli(
                     {
                         return Err(invalid_pointer_identity_error(pointer));
                     }
-                    *single
+                    single.clone()
                 } else {
                     raw_matches
                         .into_iter()

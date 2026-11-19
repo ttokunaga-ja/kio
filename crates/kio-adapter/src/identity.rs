@@ -36,6 +36,7 @@ const PROFILE_FIELDS: &[&str] = &[
     // leaves their frozen hash vectors untouched and perturbs only the
     // embedding profile hash.
     "input_construction",
+    "embedding_semantics",
     "runtime_kind",
     "spec_version",
 ];

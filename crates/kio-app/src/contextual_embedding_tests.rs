@@ -681,7 +681,7 @@ fn new_chunk_associations_with_cached_contexts_complete_without_execution() {
     };
     assert_eq!(index_result().embedding_tasks_executed, 6);
     let repo = open_existing_managed_root(root.path(), &control).unwrap();
-    let profile = declared_embedding_profile(EmbeddingExecution::DeterministicEvaluator);
+    let profile = kio_adapter::catalog::declared_deterministic_embedding_profile();
 
     for (revision, rename, executed) in [("Vega", false, 1), ("Rigel", true, 4)] {
         let before = projection(&repo);
@@ -900,7 +900,7 @@ fn collector_missing_manifest_requires_retired_purge_for_every_introduction() {
     let latest_commit = repo.read_commit(&latest).unwrap();
     let latest_tree = repo.read_tree(&latest_commit.tree).unwrap();
     assert_eq!(
-        latest_tree.entries[0].normalize,
+        latest_tree.entries.first().unwrap().unwrap().normalize,
         Some(instance.normalize.clone())
     );
     let post_purge_retained = retained_history_instances(&repo, &latest).unwrap();
@@ -1319,7 +1319,7 @@ fn contextual_task_mixed_outcomes_crash_recovery_and_retry_are_independent() {
         ExplicitRoot::Created(repo) => repo,
         ExplicitRoot::Existing(_) => panic!("expected new fixture"),
     };
-    let profile = declared_embedding_profile(EmbeddingExecution::DeterministicEvaluator);
+    let profile = kio_adapter::catalog::declared_deterministic_embedding_profile();
     let text = "same retained chunk body";
     let candidates = [OLD_PATH, CURRENT_PATH]
         .into_iter()
@@ -1491,11 +1491,11 @@ fn persisted_embedding_consent_requires_the_exact_builtin_identity() {
         mode: None,
     };
     let builtin = entry_for(
-        declared_embedding_profile(EmbeddingExecution::DeterministicEvaluator),
+        kio_adapter::catalog::declared_deterministic_embedding_profile(),
         Some(ExecutionMode::DeterministicLibrary),
     );
     let external = entry_for(
-        declared_embedding_profile(EmbeddingExecution::Online(AdoptedEmbeddingExecution::Real)),
+        kio_adapter::catalog::declared_adopted_embedding_profile(AdoptedEmbeddingExecution::Real),
         Some(ExecutionMode::OnlineApi),
     );
     assert_ne!(external.tool_id, builtin.tool_id);
@@ -1609,7 +1609,7 @@ fn o3_fresh_local_image_claim_survives_competing_enrichment() {
     }
     let execution = embedding_execution(&settings, &control).unwrap();
     assert_eq!(execution, EmbeddingExecution::DeterministicEvaluator);
-    let profile = declared_embedding_profile(execution);
+    let profile = declared_embedding_profile(&settings, execution).unwrap();
     assert_eq!(profile.dimensions, 768);
     let locks = LockSession::default();
     let repo = Repository::open_in_session(root.path(), control.clone(), &locks).unwrap();

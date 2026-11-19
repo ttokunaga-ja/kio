@@ -246,14 +246,45 @@ impl StoreDirectory {
         platform::open_regular_read(&self.handle, relative, max_bytes, &self.logical)
     }
 
-    /// Open a retained regular leaf with the rights required to restrict a
-    /// current-user Windows quarantine object on this same handle.
-    pub(super) fn open_regular_for_removal(&self, relative: &Path, max_bytes: u64) -> Result<File> {
-        platform::open_regular_for_removal(&self.handle, relative, max_bytes, &self.logical)
+    /// Open a retained regular leaf for quarantine and optional stage nonce verification.
+    pub(super) fn open_regular_for_removal(
+        &self,
+        relative: &Path,
+        max_bytes: u64,
+        verify_stage_nonce: bool,
+    ) -> Result<File> {
+        platform::open_regular_for_removal(
+            &self.handle,
+            relative,
+            max_bytes,
+            &self.logical,
+            verify_stage_nonce,
+        )
     }
 
     pub fn read_optional(&self, relative: &Path, max_bytes: u64) -> Result<Option<Vec<u8>>> {
         platform::read_optional(&self.handle, relative, max_bytes, &self.logical)
+    }
+
+    /// Decode a retained regular file and verify that the decoder consumed the
+    /// complete, unchanged file before accepting its result.
+    pub fn read_optional_with<T>(
+        &self,
+        relative: &Path,
+        max_bytes: u64,
+        read: impl FnOnce(&mut dyn std::io::Read) -> Result<T>,
+    ) -> Result<Option<T>> {
+        platform::read_optional_with(&self.handle, relative, max_bytes, &self.logical, read)
+    }
+
+    /// Publish streamed bytes through the same synchronized atomic workspace.
+    pub fn write_atomic_with(
+        &self,
+        relative: &Path,
+        publication: Publication,
+        write: impl FnOnce(&mut dyn std::io::Write) -> std::io::Result<()>,
+    ) -> Result<()> {
+        atomic::write_with(self, self, relative, publication, write)
     }
 
     pub fn write_atomic(
@@ -410,6 +441,23 @@ impl StoreDirectory {
         max_bytes: u64,
     ) -> Result<()> {
         atomic::remove(self, self, relative, expected, max_bytes)
+    }
+
+    /// Retire self-owned metadata by exact streamed digest and length.
+    /// Like `quarantine_then_remove`, the durable removal intent is sufficient
+    /// recovery proof. Working files with parent-journal phases must instead
+    /// use `remove_hash_verified` and acknowledge only after that phase syncs.
+    pub(crate) fn quarantine_then_remove_hash(
+        &self,
+        relative: &Path,
+        hash: &str,
+        length: u64,
+    ) -> Result<()> {
+        let digest = hash
+            .strip_prefix("sha256:")
+            .filter(|_| crate::cas::is_hash(hash))
+            .ok_or_else(|| KioError::invalid_usage("invalid expected removal hash"))?;
+        atomic::remove_hash(self, self, relative, digest, length, length)
     }
 
     /// Remove an exact target using a durable intent in a separate retained
@@ -628,6 +676,46 @@ pub(crate) fn capture_matches(candidate: &Path, base: &Path) -> bool {
 
 #[cfg(test)]
 mod journal_resource_tests {
+    #[test]
+    fn metadata_hash_retirement_streams_large_body_and_rejects_mismatch() {
+        use sha2::{Digest, Sha256};
+        use std::{io::Write, path::Path};
+        let fixture = tempfile::tempdir().unwrap();
+        let directory =
+            super::StoreDirectory::open_or_create_directories(&fixture.path().join("store"))
+                .unwrap();
+        let leaf = Path::new("publication-v1.json");
+        let mut file = directory.create_private_file(leaf).unwrap();
+        let chunk = [b' '; 8192];
+        let mut digest = Sha256::new();
+        for _ in 0..4097 {
+            file.write_all(&chunk).unwrap();
+            digest.update(chunk);
+        }
+        file.sync_all().unwrap();
+        drop(file);
+        let length = chunk.len() as u64 * 4097;
+        let hash = format!("sha256:{}", crate::cas::lower_hex(&digest.finalize()));
+        assert!(
+            directory
+                .quarantine_then_remove_hash(leaf, &format!("sha256:{}", "0".repeat(64)), length,)
+                .is_err()
+        );
+        assert!(directory.contains_entry(leaf).unwrap());
+        assert_eq!(
+            directory.inspect_atomic().unwrap(),
+            super::AtomicWorkspaceState::Clean
+        );
+        directory
+            .quarantine_then_remove_hash(leaf, &hash, length)
+            .unwrap();
+        assert!(!directory.contains_entry(leaf).unwrap());
+        assert_eq!(
+            directory.inspect_atomic().unwrap(),
+            super::AtomicWorkspaceState::Clean
+        );
+    }
+
     #[test]
     fn j1_storage_exhaustion_stays_distinct_from_corruption() {
         let make_error = || std::io::Error::from(std::io::ErrorKind::StorageFull);

@@ -1,4 +1,5 @@
 use super::*;
+use crate::disk_records::RecordStageRoot;
 
 impl GcPlanner {
     pub fn plan_at(&self, now: i64) -> Result<GcPlan> {
@@ -42,12 +43,13 @@ impl GcPlanner {
         validate_commit_links(&all)?;
         validate_receipt_links(&receipts, &all)?;
         self.validate_markerless_shallow_state(&refs, &receipts, &all)?;
+        let record_stages = RecordStageRoot::temporary()?;
         let mut sizes = HashMap::new();
         for (h, c) in &all {
             if !receipts.contains_key(h) && !sizes.contains_key(&c.tree) {
                 sizes.insert(
                     c.tree.clone(),
-                    self.verify_tree(&c.tree, &mut st, &mut observations)?,
+                    self.verify_tree(&record_stages, &c.tree, &mut st, &mut observations)?,
                 );
             }
         }
@@ -89,16 +91,19 @@ impl GcPlanner {
                 .ok_or_else(|| limit("estimated bytes"))
         })?;
         before_stability_check();
-        let stability_check_stats = self.require_stable_truth(&TruthSnapshot {
-            scope_digest: scope_digest.clone(),
-            config_digest: config_digest.clone(),
-            policy: policy.clone(),
-            refs: refs.clone(),
-            receipts: receipts.clone(),
-            commits: all.clone(),
-            tree_sizes: sizes.clone(),
-            observations: observations.clone(),
-        })?;
+        let stability_check_stats = self.require_stable_truth(
+            &record_stages,
+            &TruthSnapshot {
+                scope_digest: scope_digest.clone(),
+                config_digest: config_digest.clone(),
+                policy: policy.clone(),
+                refs: refs.clone(),
+                receipts: receipts.clone(),
+                commits: all.clone(),
+                tree_sizes: sizes.clone(),
+                observations: observations.clone(),
+            },
+        )?;
         self.recheck(root_id, kio_id)?;
         let truth_digest = semantic_truth_digest(
             &scope_digest,
@@ -316,6 +321,7 @@ impl GcPlanner {
     }
     fn verify_tree(
         &self,
+        record_stages: &RecordStageRoot,
         h: &str,
         s: &mut GcPlanStats,
         observations: &mut BTreeMap<String, FileObservation>,
@@ -330,30 +336,36 @@ impl GcPlanner {
         let b = open_path(&self.kio, "objects/trees")?;
         let a = open_required_dir(&b, &raw[..2], "tree object fanout is missing")?;
         let d = open_required_dir(&a, &raw[2..4], "tree object fanout is missing")?;
-        let x = read_required_accounted_observed(
-            &self.reads,
-            (&d, raw, MAX_TREE_OBJECT_BYTES),
-            "tree object is missing",
-            s,
-            &self.limits,
-            observations,
-            &format!("tree/{}/{}/{}", &raw[..2], &raw[2..4], raw),
-        )?;
-        if hash_bytes(&x) != h {
+        let remaining = self
+            .limits
+            .max_verified_bytes
+            .saturating_sub(s.verified_bytes);
+        let (t, observation) =
+            read_cas_tree_observed(record_stages, &self.reads, &d, raw, remaining).map_err(
+                |error| {
+                    if is_io_not_found(&error) {
+                        corrupt("tree object is missing")
+                    } else {
+                        error
+                    }
+                },
+            )?;
+        if observation.digest != h {
             return Err(corrupt("tree hash mismatch"));
         }
-        let t: TreeObject =
-            serde_json::from_slice(&x).map_err(|_| corrupt("invalid tree object"))?;
-        if t.entries.len() > MAX_TREE_ENTRIES {
-            return Err(corrupt("tree entry limit exceeded"));
-        }
-        t.validate().map_err(|_| corrupt("invalid tree object"))?;
+        let size = observation.state.len;
+        account(s, size, &self.limits)?;
+        insert_observation(
+            observations,
+            format!("tree/{}/{}/{}", &raw[..2], &raw[2..4], raw),
+            observation,
+        )?;
         s.trees_verified = checked(s.trees_verified, 1, "trees")?;
         s.tree_entries = checked(s.tree_entries, t.entries.len() as u64, "tree entries")?;
         if s.tree_entries > self.limits.max_tree_entries {
             return Err(limit("tree entries"));
         }
-        Ok(x.len() as u64)
+        Ok(size)
     }
 
     /// Outside an active, strictly validated operation marker, a receipt must
@@ -388,12 +400,7 @@ impl GcPlanner {
                     None => None,
                 };
                 match second.as_ref() {
-                    Some(dir) => match read_cas_regular_observed(
-                        &self.reads,
-                        dir,
-                        raw,
-                        MAX_TREE_OBJECT_BYTES,
-                    ) {
+                    Some(dir) => match observe_cas_regular(&self.reads, dir, raw, u64::MAX) {
                         Ok(_) => true,
                         Err(error) if is_io_not_found(&error) => false,
                         Err(error) => return Err(error),
@@ -416,7 +423,11 @@ impl GcPlanner {
         Ok(())
     }
 
-    fn require_stable_truth(&self, expected: &TruthSnapshot) -> Result<GcPlanStats> {
+    fn require_stable_truth(
+        &self,
+        record_stages: &RecordStageRoot,
+        expected: &TruthSnapshot,
+    ) -> Result<GcPlanStats> {
         let mut stats = GcPlanStats::default();
         let mut observations = BTreeMap::new();
         let scope_bytes = read_accounted_observed(
@@ -451,7 +462,7 @@ impl GcPlanner {
             if !receipts.contains_key(commit_hash) && !tree_sizes.contains_key(&commit.tree) {
                 tree_sizes.insert(
                     commit.tree.clone(),
-                    self.verify_tree(&commit.tree, &mut stats, &mut observations)?,
+                    self.verify_tree(record_stages, &commit.tree, &mut stats, &mut observations)?,
                 );
             }
         }

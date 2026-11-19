@@ -2,7 +2,7 @@ use crate::batch::command::stalled_batch_status;
 use crate::commands;
 use crate::egress::quarantine_status_records;
 use crate::index::chunk_ledger::ensure_purge_epoch_initialized;
-use crate::index::command::current_unsupported_inputs;
+use crate::index::command::{read_stable_head, unsupported_inputs_at_head};
 use crate::invocation::Invocation;
 use crate::ledger_access::ledger_db_path;
 use crate::ledger_access::observe_budget;
@@ -113,15 +113,19 @@ pub(crate) fn run_status(ctx: &Invocation<'_>) -> Result<CommandResponse> {
     // R15-4: `status` is a pure read — a shallow HEAD (tree object gone)
     // degrades to listing files without a classification (`head_shallow`)
     // instead of dying on a raw KIO-E-STORE-NOT-FOUND-001.
-    let status = repo.status()?;
-    let (unsupported_inputs, unsupported_inputs_complete) = if status.head_shallow {
-        UnsupportedInputStore::new(repo.kio_dir())
-            .latest_by_path()
-            .map_err(pipeline_to_kio)?;
-        (Vec::new(), false)
-    } else {
-        (current_unsupported_inputs(&repo)?, true)
-    };
+    let (status, unsupported_inputs, unsupported_inputs_complete) =
+        read_stable_head(&repo, |head| {
+            let status = repo.status()?;
+            let (unsupported_inputs, complete) = if status.head_shallow {
+                UnsupportedInputStore::new(repo.kio_dir())
+                    .latest_by_path()
+                    .map_err(pipeline_to_kio)?;
+                (Vec::new(), false)
+            } else {
+                (unsupported_inputs_at_head(&repo, head)?, true)
+            };
+            Ok((status, unsupported_inputs, complete))
+        })?;
     let tasks = task_store.all().map_err(pipeline_to_kio)?;
     let mut budget_observation = observe_budget(&ledger_db_path(ctx.control), ctx.control);
     let stalled_batch =

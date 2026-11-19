@@ -1,17 +1,21 @@
-use super::gc_io::{directory, matches_stable, observe};
-use crate::cas::{MAX_TREE_OBJECT_BYTES, hash_bytes};
+use super::gc_io::{directory, matches_stable};
+use crate::cas::CasReadAccess;
 use crate::error::Result;
-use crate::gc::{corrupt, is_io_not_found, read_regular_observed};
+use crate::gc::{
+    FileObservation, corrupt, is_io_not_found, observe_cas_regular, observe_tree_handle,
+};
 use std::path::Path;
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn retire_candidate_tree(
+    record_stages: &crate::disk_records::RecordStageRoot,
     tree_hash: &str,
+    expected_size: u64,
     raw: &str,
     canonical_parent: &std::fs::File,
     archive_parent: &std::fs::File,
     quarantine: &str,
     _captured_name: &str,
-    validate_bytes: impl Fn(&[u8]) -> Result<()>,
+    validate_observation: impl Fn(&FileObservation) -> Result<()>,
     require_marker: impl Fn() -> Result<()>,
     before_quarantine: impl Fn() -> Result<()>,
     quarantine_checkpoint: impl Fn() -> Result<()>,
@@ -21,14 +25,14 @@ pub(crate) fn retire_candidate_tree(
 ) -> Result<bool> {
     let source = directory(canonical_parent, control)?;
     let archive = directory(archive_parent, control)?;
-    let (mut victim, needs_move) =
-        match crate::platform::open_gc_mutation(&source, Path::new(raw), MAX_TREE_OBJECT_BYTES) {
+    let (victim, needs_move) =
+        match crate::platform::open_gc_mutation(&source, Path::new(raw), expected_size.max(64)) {
             Ok(file) => (file, true),
             Err(error) if is_io_not_found(&error) => {
                 match crate::platform::open_gc_mutation(
                     &archive,
                     Path::new(quarantine),
-                    MAX_TREE_OBJECT_BYTES,
+                    expected_size.max(64),
                 ) {
                     Ok(file) => (file, false),
                     // Disposition already removed every name before interruption.
@@ -38,12 +42,17 @@ pub(crate) fn retire_candidate_tree(
             }
             Err(error) => return Err(error),
         };
-    let (bytes, before) = observe(&mut victim, MAX_TREE_OBJECT_BYTES)?;
-    validate_bytes(&bytes)?;
+    let (_, before) = observe_tree_handle(record_stages, &victim, expected_size.max(64))?;
+    validate_observation(&before)?;
     if needs_move {
         // This checks any conflicting archive, including unsafe entries;
         // the no-replace move is the final collision authority.
-        match read_regular_observed(archive_parent, quarantine, MAX_TREE_OBJECT_BYTES) {
+        match observe_cas_regular(
+            &CasReadAccess::Unmetered,
+            archive_parent,
+            quarantine,
+            expected_size.max(64),
+        ) {
             Ok(_) => return Err(corrupt("GC tree exists at canonical and archive paths")),
             Err(error) if is_io_not_found(&error) => {}
             Err(error) => return Err(error),
@@ -58,14 +67,15 @@ pub(crate) fn retire_candidate_tree(
             Path::new(quarantine),
         )?;
     }
-    let (moved, observed) = observe(&mut victim, MAX_TREE_OBJECT_BYTES)?;
-    if moved != bytes || !matches_stable(&observed, &before) || hash_bytes(&moved) != tree_hash {
+    let (_, observed) = observe_tree_handle(record_stages, &victim, expected_size.max(64))?;
+    if !matches_stable(&observed, &before) || observed.digest != tree_hash {
         return Err(corrupt("tree changed during GC quarantine"));
     }
     quarantine_checkpoint()?;
     before_erase()?;
-    let (final_bytes, final_observation) = observe(&mut victim, MAX_TREE_OBJECT_BYTES)?;
-    if final_bytes != bytes || !matches_stable(&final_observation, &before) {
+    let (_, final_observation) =
+        observe_tree_handle(record_stages, &victim, expected_size.max(64))?;
+    if !matches_stable(&final_observation, &before) {
         return Err(corrupt("tree changed immediately before GC erase"));
     }
     retirement_checkpoint()?;

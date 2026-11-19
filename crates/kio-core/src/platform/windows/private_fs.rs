@@ -389,6 +389,7 @@ pub(crate) fn read_private_file(
         path,
         max_bytes,
         &owner,
+        None,
     )
 }
 
@@ -396,6 +397,7 @@ pub(crate) fn read_private_file_at_path(
     parent: &StoreDirectory,
     name: &Path,
     max_bytes: u64,
+    deadline: Option<std::time::Instant>,
 ) -> Result<Vec<u8>> {
     let leaf = direct_leaf(name, parent.path())?;
     let owner = CurrentUserSid::current().map_err(|_| {
@@ -404,7 +406,7 @@ pub(crate) fn read_private_file_at_path(
     let handle = parent.root_handle();
     verify_real_directory(&handle, parent.path())?;
     let label = parent.path().join(leaf);
-    read_private_leaf(&handle, leaf, &label, max_bytes, &owner)
+    read_private_leaf(&handle, leaf, &label, max_bytes, &owner, deadline)
 }
 
 fn read_private_leaf(
@@ -413,7 +415,10 @@ fn read_private_leaf(
     path: &Path,
     max_bytes: u64,
     owner: &CurrentUserSid,
+    deadline: Option<std::time::Instant>,
 ) -> Result<Vec<u8>> {
+    crate::private_fs::check_read_deadline(deadline)
+        .map_err(|error| crate::KioError::io(error.to_string(), path.display().to_string()))?;
     let mut options = cap_fs::OpenOptions::new();
     options
         .read(true)
@@ -438,10 +443,18 @@ fn read_private_leaf(
     let mut body = Vec::with_capacity(
         usize::try_from(before.len()).map_err(|_| oversized_file(max_bytes, before.len(), path))?,
     );
-    file.by_ref()
-        .take(max_bytes.saturating_add(1))
-        .read_to_end(&mut body)
-        .map_err(|_| unsafe_file("cannot read private trust file", Some(path)))?;
+    crate::private_fs::read_to_end_checked(
+        file.by_ref().take(max_bytes.saturating_add(1)),
+        &mut body,
+        deadline,
+    )
+    .map_err(|error| {
+        if error.kind() == std::io::ErrorKind::TimedOut {
+            crate::KioError::io(error.to_string(), path.display().to_string())
+        } else {
+            unsafe_file("cannot read private trust file", Some(path))
+        }
+    })?;
     if body.len() as u64 > max_bytes {
         return Err(oversized_file(max_bytes, body.len() as u64, path));
     }

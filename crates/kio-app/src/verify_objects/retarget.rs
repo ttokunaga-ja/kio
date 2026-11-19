@@ -224,7 +224,7 @@ fn run_evidence_retarget_bound(
         ));
     }
     if let Some(tree) = &old_tree
-        && let Some(entry) = canonical_pointer_tree_entry(tree, pointer)
+        && let Some(entry) = canonical_pointer_tree_entry(tree, pointer)?
         && let Some(normalize) = &entry.normalize
     {
         retarget_manifest_unit_preflight(&store, &pointer.raw_hash, normalize, false)?;
@@ -246,7 +246,7 @@ fn run_evidence_retarget_bound(
             "canonical old Evidence verification accepted a missing tree",
         )
     })?;
-    let old_entry = canonical_pointer_tree_entry(&old_tree, pointer).ok_or_else(|| {
+    let old_entry = canonical_pointer_tree_entry(&old_tree, pointer)?.ok_or_else(|| {
         retarget_error(
             "KIO-E-STORE-CORRUPT-001",
             "old Evidence pointer has no canonical normalized tree entry",
@@ -282,8 +282,7 @@ fn run_evidence_retarget_bound(
     let target_tree = read_retarget_target_tree(repo, at, &target_commit)?;
     let target_entry = target_tree
         .entries
-        .iter()
-        .find(|entry| entry.path == old_entry.path && entry.raw_hash == pointer.raw_hash)
+        .find(|entry| entry.path == old_entry.path && entry.raw_hash == pointer.raw_hash)?
         .ok_or_else(retarget_not_found_error)?;
     let target_normalize = target_entry
         .normalize

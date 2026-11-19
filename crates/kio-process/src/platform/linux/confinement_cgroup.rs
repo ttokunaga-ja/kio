@@ -1,7 +1,7 @@
 //! Mandatory Linux renderer resource scope. The fixed gate executes no renderer
 //! until the parent has verified its inherited cgroup membership and limits.
 use super::confinement::NativeRenderSandbox;
-use crate::confinement::ConfinementError;
+use crate::confinement::{ConfinementError, RendererStart};
 use crate::platform::{UnixRendererMonitor, apply_unix_limits};
 use crate::{
     BoundedProcessError as Error, BoundedProcessMonitor, BoundedProcessOptions,
@@ -99,16 +99,13 @@ pub(super) fn run<I, S>(
     args: I,
     environment: &[(OsString, OsString)],
     options: BoundedProcessOptions,
+    start: RendererStart<'_>,
 ) -> Result<BoundedProcessOutput, ConfinementError>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let started = Instant::now();
-    let deadline = started
-        .checked_add(options.timeout)
-        .filter(|_| !options.timeout.is_zero())
-        .ok_or_else(|| ConfinementError::Resource(invalid("invalid renderer wall timeout")))?;
+    let deadline = start.deadline;
     let cpu_usec = sandbox
         .limits
         .cpu_seconds
@@ -121,10 +118,6 @@ where
             "invalid aggregate memory budget",
         )));
     }
-    let runtime_usec = u64::try_from(options.timeout.as_micros())
-        .ok()
-        .filter(|value| *value != 0)
-        .ok_or_else(|| ConfinementError::Resource(invalid("invalid renderer wall timeout")))?;
     validate_mounts(sandbox)?;
     let systemd_run = trusted_helper("/usr/bin/systemd-run")?;
     let systemctl = trusted_helper("/usr/bin/systemctl")?;
@@ -166,7 +159,14 @@ where
     let child_ready = duplicate_at_least(&ready_write, 64)?;
     let keep_fd = child_keep.as_raw_fd();
     let ready_fd = child_ready.as_raw_fd();
+    // Truncate the fractional microsecond once for both the scope request and
+    // its verification.
+    let runtime_usec = u64::try_from(start.remaining()?.as_micros())
+        .ok()
+        .filter(|value| *value != 0)
+        .ok_or_else(|| ConfinementError::Resource(invalid("invalid renderer wall timeout")))?;
     let mut monitor = Scope {
+        start,
         #[cfg(test)]
         test_fixture: sandbox.test_fixture.clone(),
         unit,
@@ -244,6 +244,7 @@ where
         .current_dir(&sandbox.scratch);
     apply_unix_limits(&mut command, sandbox.limits, false)?;
     configure_helper(&mut command, Some((keep_fd, ready_fd)));
+    start.remaining()?;
     monitor.launched = true;
     let result = crate::run_bounded_command_inner_impl(&mut command, options, None, &mut monitor);
     let cleanup = monitor.cleanup();
@@ -527,9 +528,13 @@ fn duration_usec(text: &str) -> io::Result<u64> {
     let mut previous_scale = u64::MAX;
     for part in text.split_whitespace() {
         let end = part
-            .find(|c: char| !c.is_ascii_digit())
+            .find(|c: char| !c.is_ascii_digit() && c != '.')
             .ok_or_else(|| invalid("missing systemd duration unit"))?;
-        let value: u64 = part[..end]
+        let (whole, fraction) = match part[..end].split_once('.') {
+            Some((whole, fraction)) => (whole, Some(fraction)),
+            None => (&part[..end], None),
+        };
+        let value: u64 = whole
             .parse()
             .map_err(|_| invalid("invalid systemd duration"))?;
         let scale = match &part[end..] {
@@ -544,18 +549,57 @@ fn duration_usec(text: &str) -> io::Result<u64> {
             return Err(invalid("ambiguous systemd duration"));
         }
         previous_scale = scale;
-        total = total
-            .checked_add(
-                value
-                    .checked_mul(scale)
-                    .ok_or_else(|| invalid("systemd duration overflow"))?,
-            )
+        let fractional_usec = if let Some(fraction) = fraction {
+            if !matches!(scale, 1_000 | 1_000_000) || !(1..=6).contains(&fraction.len()) {
+                return Err(invalid("invalid fractional systemd duration"));
+            }
+            let digits: u64 = fraction
+                .parse()
+                .map_err(|_| invalid("invalid fractional systemd duration"))?;
+            let numerator = digits * scale;
+            let denominator = 10_u64.pow(fraction.len() as u32);
+            if !numerator.is_multiple_of(denominator) {
+                return Err(invalid(
+                    "systemd duration is not an exact number of microseconds",
+                ));
+            }
+            numerator / denominator
+        } else {
+            0
+        };
+        total = value
+            .checked_mul(scale)
+            .and_then(|whole_usec| whole_usec.checked_add(fractional_usec))
+            .and_then(|part_usec| total.checked_add(part_usec))
             .ok_or_else(|| invalid("systemd duration overflow"))?;
     }
     if previous_scale == u64::MAX {
         return Err(invalid("missing systemd duration"));
     }
     Ok(total)
+}
+
+fn verify_scope_fuse(text: &str, group: &str, runtime_usec: u64) -> io::Result<()> {
+    let properties = key_values(text, '=')?;
+    if properties.get("ControlGroup") != Some(&group)
+        || properties.get("ActiveState") != Some(&"active")
+        || properties.get("KillMode") != Some(&"control-group")
+        || properties.get("KillSignal") != Some(&"9")
+        || properties.get("OOMPolicy") != Some(&"kill")
+        || duration_usec(
+            properties
+                .get("TimeoutStopUSec")
+                .ok_or_else(|| invalid("missing scope stop timeout"))?,
+        )? != 5_000_000
+        || duration_usec(
+            properties
+                .get("RuntimeMaxUSec")
+                .ok_or_else(|| invalid("missing scope runtime fuse"))?,
+        )? != runtime_usec
+    {
+        return Err(invalid("renderer scope fuse differs from requested limits"));
+    }
+    Ok(())
 }
 
 struct ManagerMonitor {
@@ -632,7 +676,8 @@ fn scope_is_empty(mount: &File, controls: &Controls) -> io::Result<bool> {
     Ok(target[..count as usize] == *expected.as_bytes())
 }
 
-struct Scope {
+struct Scope<'a> {
+    start: RendererStart<'a>,
     #[cfg(test)]
     test_fixture: ConfinementFixture,
     unit: String,
@@ -656,12 +701,10 @@ struct Scope {
     launched: bool,
     scratch: UnixRendererMonitor,
 }
-impl Scope {
-    fn manager(&self, args: &[&str], deadline: Instant) -> io::Result<BoundedProcessOutput> {
-        let timeout = deadline
-            .checked_duration_since(Instant::now())
-            .filter(|value| !value.is_zero())
-            .ok_or_else(|| invalid("renderer manager deadline expired"))?;
+impl Scope<'_> {
+    fn manager(&self, args: &[&str]) -> io::Result<BoundedProcessOutput> {
+        let timeout = self.start.remaining().map_err(io::Error::other)?;
+        let deadline = self.start.deadline;
         let mut command = Command::new(&self.systemctl);
         command
             .env_clear()
@@ -679,7 +722,7 @@ impl Scope {
             None,
             &mut ManagerMonitor { deadline },
         )
-        .map_err(|_| invalid("bounded renderer manager query failed"))
+        .map_err(io::Error::other)
     }
     fn anchor(&mut self, child: &Child) -> io::Result<bool> {
         use std::io::Read;
@@ -770,29 +813,11 @@ impl Scope {
                 ));
             }
         }
-        let output = self.manager(&["show", "--property=ControlGroup,ActiveState,KillMode,KillSignal,TimeoutStopUSec,RuntimeMaxUSec,OOMPolicy", &self.unit], self.deadline)?;
+        let output = self.manager(&["show", "--property=ControlGroup,ActiveState,KillMode,KillSignal,TimeoutStopUSec,RuntimeMaxUSec,OOMPolicy", &self.unit])?;
         if !output.status.success() {
             return Err(invalid("cannot verify owned scope fuse"));
         }
-        let properties = key_values(&output.stdout, '=')?;
-        if properties.get("ControlGroup") != Some(&group)
-            || properties.get("ActiveState") != Some(&"active")
-            || properties.get("KillMode") != Some(&"control-group")
-            || properties.get("KillSignal") != Some(&"9")
-            || properties.get("OOMPolicy") != Some(&"kill")
-            || duration_usec(
-                properties
-                    .get("TimeoutStopUSec")
-                    .ok_or_else(|| invalid("missing scope stop timeout"))?,
-            )? != 5_000_000
-            || duration_usec(
-                properties
-                    .get("RuntimeMaxUSec")
-                    .ok_or_else(|| invalid("missing scope runtime fuse"))?,
-            )? != self.runtime_usec
-        {
-            return Err(invalid("renderer scope fuse differs from requested limits"));
-        }
+        verify_scope_fuse(&output.stdout, group, self.runtime_usec)?;
         Ok(true)
     }
     fn keeper_alive(&self) -> Result<(), Error> {
@@ -823,9 +848,7 @@ impl Scope {
         }
         let mut record = Vec::new();
         loop {
-            if Instant::now() >= self.deadline {
-                return Err(isolation("renderer keeper readiness deadline expired"));
-            }
+            self.start.remaining()?;
             let mut bytes = [0_u8; 32];
             match self.ready.read(&mut bytes) {
                 Ok(0) => return Err(isolation("renderer keeper closed readiness pipe")),
@@ -993,7 +1016,17 @@ impl Scope {
         Ok(())
     }
 }
-impl BoundedProcessMonitor for Scope {
+fn startup_error(error: io::Error) -> Error {
+    // Preserve a manager timeout without making unrelated setup or cleanup
+    // failures advisory just because the probe deadline also elapsed.
+    match error.downcast::<Error>() {
+        Ok(timeout @ Error::Timeout { .. }) => timeout,
+        Ok(other) => Error::Isolation(io::Error::other(other)),
+        Err(error) => Error::Isolation(error),
+    }
+}
+
+impl BoundedProcessMonitor for Scope<'_> {
     fn needs_startup_pipe(&self) -> bool {
         true
     }
@@ -1003,13 +1036,11 @@ impl BoundedProcessMonitor for Scope {
     fn on_spawn(&mut self, child: &mut Child) -> Result<(), Error> {
         self.child_pipe_ends.take();
         loop {
-            if Instant::now() >= self.deadline {
-                return Err(isolation("renderer scope startup deadline expired"));
-            }
+            self.start.remaining()?;
             if crate::platform::child_has_exited(child).map_err(Error::Wait)? {
                 return Err(scope_startup_failure());
             }
-            if self.anchor(child).map_err(Error::Isolation)? {
+            if self.anchor(child).map_err(startup_error)? {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -1039,9 +1070,7 @@ impl BoundedProcessMonitor for Scope {
             }
             return Err(isolation("test refusal before renderer activation"));
         }
-        if Instant::now() >= self.deadline {
-            return Err(isolation("renderer deadline expired before activation"));
-        }
+        self.start.verify()?;
         let mut gate = child
             .stdin
             .take()
@@ -1114,7 +1143,7 @@ impl BoundedProcessMonitor for Scope {
         reap_before(child, deadline)
     }
 }
-impl Drop for Scope {
+impl Drop for Scope<'_> {
     fn drop(&mut self) {
         if !self.cleaned
             && let Some(controls) = &mut self.controls
@@ -1275,11 +1304,31 @@ mod tests {
         assert_eq!(counter(&file, "usage_usec").unwrap(), 123);
     }
     #[test]
+    fn scope_startup_preserves_only_typed_timeouts_for_version_probes() {
+        let timeout = startup_error(io::Error::other(Error::Timeout { timeout_ms: 42 }));
+        assert!(matches!(timeout, Error::Timeout { timeout_ms: 42 }));
+        for error in [
+            io::Error::from(io::ErrorKind::TimedOut),
+            io::Error::other(Error::RendererCleanup(io::Error::other(
+                "unverified cleanup",
+            ))),
+        ] {
+            assert!(matches!(startup_error(error), Error::Isolation(_)));
+        }
+    }
+
+    #[test]
     fn bounded_duration_parser_accepts_actual_units_only() {
         for (text, expected) in [
             ("5s", 5_000_000),
             ("1min 2s 3ms 4us", 62_003_004),
             ("250µs", 250),
+            ("10.123456s", 10_123_456),
+            ("1min 10.500000s", 70_500_000),
+            ("1.500ms", 1500),
+            ("1.000000ms", 1000),
+            ("0.000001s", 1),
+            ("18446744073709.551615s", u64::MAX),
         ] {
             assert_eq!(duration_usec(text).unwrap(), expected);
         }
@@ -1289,11 +1338,42 @@ mod tests {
             "infinity",
             "5",
             "5s 5s",
+            "1.0s 1s",
             "1ms 1s",
+            "1.5ms 1.5s",
+            "1.s",
+            ".5s",
+            "+1.5s",
+            "1.2.3s",
+            "1.0000000s",
+            "1.000001ms",
+            "1.0us",
+            "1.0µs",
+            "1.0min",
+            "1.0h",
+            "18446744073709.551616s",
             "18446744073709551615h",
         ] {
             assert!(duration_usec(text).is_err(), "{text:?}");
         }
+    }
+    #[test]
+    fn scope_fuse_verifies_fractional_runtime_at_requested_microsecond_precision() {
+        let group = "/user.slice/kio-render.scope";
+        let timeout = Duration::new(10, 123_456_789);
+        let runtime_usec = u64::try_from(timeout.as_micros()).unwrap();
+        let properties = format!(
+            "ControlGroup={group}\nActiveState=active\nKillMode=control-group\n\
+             KillSignal=9\nOOMPolicy=kill\nTimeoutStopUSec=5s\nRuntimeMaxUSec=10.123456s\n"
+        );
+        verify_scope_fuse(&properties, group, runtime_usec).unwrap();
+
+        let longer = properties.replace("10.123456s", "10.123457s");
+        let error = verify_scope_fuse(&longer, group, runtime_usec).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "renderer scope fuse differs from requested limits"
+        );
     }
     #[test]
     fn control_roots_and_parent_mounts_are_rejected() {
@@ -1558,7 +1638,7 @@ mod tests {
             ["-c", "printf ready > ready; while :; do :; done"],
             &[],
             BoundedProcessOptions {
-                timeout: Duration::from_secs(1),
+                timeout: Duration::new(1, 123_456_789),
                 ..options()
             },
         );

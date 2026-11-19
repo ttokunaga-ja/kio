@@ -289,6 +289,10 @@ trait BoundedProcessMonitor {
     fn operation_deadline(&self, deadline: Instant) -> Instant {
         deadline
     }
+    #[cfg(target_os = "macos")]
+    fn before_spawn(&mut self) -> Result<(), BoundedProcessError> {
+        Ok(())
+    }
     fn on_spawn(&mut self, _child: &mut Child) -> Result<(), BoundedProcessError> {
         Ok(())
     }
@@ -336,6 +340,8 @@ fn run_bounded_command_inner_impl<M: BoundedProcessMonitor>(
     let mut process_tree = monitor
         .process_tree()
         .map_err(BoundedProcessError::Isolation)?;
+    #[cfg(target_os = "macos")]
+    monitor.before_spawn()?;
     let mut child = command.spawn().map_err(BoundedProcessError::Spawn)?;
     if let Err(error) = process_tree.attach_and_resume(&child) {
         process_tree.terminate_attached();
@@ -524,9 +530,11 @@ fn run_bounded_command_inner_impl<M: BoundedProcessMonitor>(
     let _ = stdout_reader.join();
     let _ = stderr_reader.join();
     cleanup?;
+    // Reaping must be verified before an advisory caller can ignore a pipe
+    // limit or timeout from an otherwise retired renderer.
+    let status = waited?;
     result?;
     stdin_result?;
-    let status = waited?;
     let stdout = String::from_utf8(stdout.expect("stdout reader completed"))
         .map_err(|_| BoundedProcessError::NonUtf8 { stream: "stdout" })?;
     let stderr = String::from_utf8(stderr.expect("stderr reader completed"))
@@ -537,6 +545,38 @@ fn run_bounded_command_inner_impl<M: BoundedProcessMonitor>(
         stderr,
         duration: started.elapsed(),
     })
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn unverified_reap_is_not_reported_as_an_advisory_output_limit() {
+    struct FailingReap;
+
+    impl BoundedProcessMonitor for FailingReap {
+        fn observe(&mut self, _: &Child) -> Result<(), BoundedProcessError> {
+            Ok(())
+        }
+
+        fn reap(&mut self, child: &mut Child) -> Result<ExitStatus, BoundedProcessError> {
+            child.wait().unwrap();
+            Err(BoundedProcessError::Wait(std::io::Error::other(
+                "unverified reap",
+            )))
+        }
+    }
+
+    let options = BoundedProcessOptions {
+        max_stdout_bytes: 1,
+        ..BoundedProcessOptions::default()
+    };
+    let error = run_bounded_command_inner_impl(
+        Command::new("/bin/sh").args(["-c", "printf exceeded"]),
+        options,
+        None,
+        &mut FailingReap,
+    )
+    .unwrap_err();
+    assert!(matches!(error, BoundedProcessError::Wait(_)), "{error}");
 }
 
 #[cfg(test)]

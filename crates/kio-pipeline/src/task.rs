@@ -828,6 +828,15 @@ pub fn task_retry_kind(task: &TaskDescriptor) -> RetryErrorKind {
 
 #[must_use]
 pub fn task_retry_allowed(task: &TaskDescriptor) -> bool {
+    // The free execution record owns the contract-violation budget. Its Task
+    // projection records eligibility with the scheduled retry time.
+    if task.task_type == TaskType::Embedding
+        && task.status == TaskStatus::Failed
+        && task.reservation_claim().is_none()
+        && task.fallback_reason.as_deref() == Some("contract_violation")
+    {
+        return task.next_retry_at.is_some();
+    }
     let policy = retry_policy(task_retry_kind(task));
     policy.retryable
         && policy
@@ -1766,6 +1775,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn failed_embedding_uses_the_scheduled_contract_retry() {
+        let mut task = valid_task();
+        task.task_type = TaskType::Embedding;
+        task.status = TaskStatus::Failed;
+        task.fallback_reason = Some("contract_violation".into());
+        task.attempts = 3;
+        task.next_retry_at = Some("2026-11-20T00:00:00Z".into());
+        assert!(task_retry_allowed(&task));
+        assert!(!task_failure_is_terminal(&task));
+
+        task.next_retry_at = None;
+        assert!(task_failure_is_terminal(&task));
+    }
+
     /// QA16 (step4b-contract-tests-p3a.md §F, 07 §4 L286-290): `AdapterError`
     /// lives in `kio-adapter`, which cannot depend on `kio-pipeline`, so
     /// `AdapterError::error_code`/`error_category` independently duplicate
@@ -1789,6 +1813,10 @@ mod tests {
             (
                 AdapterError::Auth("x".to_owned()),
                 RetryErrorKind::AuthError,
+            ),
+            (
+                AdapterError::InvalidInput("x".to_owned()),
+                RetryErrorKind::InvalidInput,
             ),
             (AdapterError::rate_limit("x"), RetryErrorKind::RateLimit),
             (

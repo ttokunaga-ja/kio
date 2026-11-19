@@ -109,8 +109,11 @@ pub(crate) fn finish_remove_retirement(
         (Some(_), true) => return Err(failure("both removal source and quarantine are present")),
     }
     {
-        let mut quarantined =
-            workspace.open_regular_for_removal(Path::new(REMOVED), intent.max_bytes)?;
+        let mut quarantined = workspace.open_regular_for_removal(
+            Path::new(REMOVED),
+            intent.max_bytes,
+            intent.stage_identity.is_some(),
+        )?;
         if let Some(identity) = &intent.stage_identity {
             identity.verify(&quarantined)?;
         }

@@ -31,7 +31,7 @@ use windows_sys::Win32::{
     },
     Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES,
-        FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_READ_DATA, FILE_READ_EA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
         GetFileInformationByHandle, GetFileInformationByHandleEx, READ_CONTROL, SYNCHRONIZE,
     },
     System::IO::IO_STATUS_BLOCK,
@@ -165,7 +165,7 @@ fn reopen_retained_directory(directory: &File, label: &Path, desired_access: u32
     }
     Ok(operation)
 }
-fn nt_status_error(status: i32) -> std::io::Error {
+pub(in crate::platform) fn nt_status_error(status: i32) -> std::io::Error {
     std::io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) as i32 })
 }
 pub(crate) fn normalize_directory_handle(file: File, label: &Path) -> Result<File> {
@@ -366,13 +366,18 @@ pub(crate) fn open_regular_for_removal(
     relative: &Path,
     max: u64,
     label: &Path,
+    verify_stage_nonce: bool,
 ) -> Result<File> {
     let (parent, leaf) = parent(root, relative, label)?;
     let path = full(label, relative);
     let mut options = cap_fs::OpenOptions::new();
+    let mut access = FILE_READ_DATA | READ_CONTROL | DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+    if verify_stage_nonce {
+        access |= FILE_READ_EA;
+    }
     options
         .read(true)
-        .access_mode(FILE_READ_DATA | READ_CONTROL | DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE)
+        .access_mode(access)
         .share_mode(FILE_SHARE_READ)
         ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
     let file = cap_fs::open(&parent, Path::new(leaf), &options).map_err(|e| ioerr(&path, e))?;
@@ -489,6 +494,22 @@ pub(crate) fn read_optional(
     max: u64,
     label: &Path,
 ) -> Result<Option<Vec<u8>>> {
+    read_optional_with(root, relative, max, label, |reader| {
+        let mut bytes = Vec::new();
+        reader
+            .read_to_end(&mut bytes)
+            .map_err(|error| ioerr(&full(label, relative), error))?;
+        Ok(bytes)
+    })
+}
+
+pub(crate) fn read_optional_with<T>(
+    root: &File,
+    relative: &Path,
+    max: u64,
+    label: &Path,
+    read: impl FnOnce(&mut dyn Read) -> Result<T>,
+) -> Result<Option<T>> {
     let Some((p, n)) = parent_optional(root, relative, label)? else {
         return Ok(None);
     };
@@ -503,24 +524,23 @@ pub(crate) fn read_optional(
     if before.len() > max {
         return Err(err(&path, "store file exceeds byte limit"));
     }
-    let mut bytes = Vec::new();
-    Read::by_ref(&mut f)
-        .take(max.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|e| ioerr(&path, e))?;
+    let limit = max.saturating_add(1);
+    let mut reader = Read::by_ref(&mut f).take(limit);
+    let value = read(&mut reader)?;
+    let read_bytes = limit - reader.limit();
     let after = regular(&f, &path)?;
     let after_identity = crate::platform::regular_file_handle_identity(&f)
         .ok_or_else(|| err(&path, "store leaf changed type while being read"))?;
     let after_change = change_time(&f, &path)?;
-    if bytes.len() as u64 > max
+    if read_bytes > max
         || before_identity != after_identity
         || before.len() != after.len()
         || before_change != after_change
-        || after.len() != bytes.len() as u64
+        || after.len() != read_bytes
     {
         return Err(err(&path, "store file changed while it was read"));
     }
-    Ok(Some(bytes))
+    Ok(Some(value))
 }
 pub(crate) fn create_private_file_raw(root: &File, leaf: &Path, label: &Path) -> Result<File> {
     let leaf = direct_leaf(leaf, label)?;
@@ -1261,8 +1281,9 @@ mod tests {
         let source_path = directory.path().join("leaf");
         fs::write(&source_path, b"source").expect("source body");
         let root_handle = directory.root_handle();
-        let held = open_regular_for_removal(&root_handle, Path::new("leaf"), 64, directory.path())
-            .expect("retained removal handle");
+        let held =
+            open_regular_for_removal(&root_handle, Path::new("leaf"), 64, directory.path(), false)
+                .expect("retained removal handle");
 
         assert!(fs::rename(&source_path, directory.path().join("renamed")).is_err());
         assert!(OpenOptions::new().write(true).open(&source_path).is_err());

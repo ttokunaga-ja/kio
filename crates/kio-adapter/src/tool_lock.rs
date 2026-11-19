@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::identity::jcs_hash;
+use crate::local_embedding::{GENERIC_LOCAL_EMBEDDING_TOOL_ID, LocalEmbeddingSpec};
 use crate::types::ExecutionMode;
 use crate::{AdapterError, Result};
 
@@ -236,6 +237,19 @@ const TOOLS_ENTRY_FIELDS: &[&str] = &[
     "modality",
     "mode",
     "pricing",
+    "wire_format",
+    "model_version_pin",
+    "chat_template_hash",
+    "instruction",
+    "truncate_dimensions",
+];
+
+const LOCAL_EMBEDDING_FIELDS: &[&str] = &[
+    "wire_format",
+    "model_version_pin",
+    "chat_template_hash",
+    "instruction",
+    "truncate_dimensions",
 ];
 
 /// QA19 (step4b-contract-tests-p3a.md §F, 10 §11.3 L952): the closed
@@ -289,6 +303,15 @@ fn validate_tools_role_section(role: &str, section: &toml::Value) -> Result<()> 
             )));
         }
     }
+    if role == "embedding"
+        && table.contains_key(GENERIC_LOCAL_EMBEDDING_TOOL_ID)
+        && table.len() != 1
+    {
+        return Err(AdapterError::ConfigSchema(
+            "tools.toml must select a single embedding adapter when using local_embedding"
+                .to_owned(),
+        ));
+    }
     let has_direct_fields = table
         .keys()
         .any(|key| TOOLS_ENTRY_FIELDS.contains(&key.as_str()));
@@ -332,7 +355,7 @@ struct EmbeddingRuntimeTarget {
     /// `execution_mode` as spelled in `tools.toml`.
     kind: &'static str,
     mode: &'static str,
-    model: &'static str,
+    model: Option<&'static str>,
     dimensions: i64,
     distance: &'static str,
     modality: &'static str,
@@ -340,7 +363,7 @@ struct EmbeddingRuntimeTarget {
 
 pub(crate) const LOCAL_EMBEDDING_TOOL_ID: &str = "qwen3_vl_embedding_local";
 
-/// Dimensions stay 768 across both targets: `chunk_vec`'s sqlite-vec width is
+/// Dimensions stay 768 across embedding targets: `chunk_vec`'s sqlite-vec width is
 /// fixed at `kio_index::fts::CHUNK_VEC_DIMENSIONS` (04 §4.3), so a target
 /// declaring anything else would produce vectors vector search cannot read.
 const EMBEDDING_RUNTIME_TARGETS: &[EmbeddingRuntimeTarget] = &[
@@ -348,7 +371,7 @@ const EMBEDDING_RUNTIME_TARGETS: &[EmbeddingRuntimeTarget] = &[
         tool_id: "gemini_embedding_2",
         kind: "online_api",
         mode: "online",
-        model: "gemini-embedding-2",
+        model: Some("gemini-embedding-2"),
         dimensions: 768,
         distance: "cosine",
         modality: "multimodal",
@@ -357,7 +380,16 @@ const EMBEDDING_RUNTIME_TARGETS: &[EmbeddingRuntimeTarget] = &[
         tool_id: LOCAL_EMBEDDING_TOOL_ID,
         kind: "offline_api",
         mode: "offline",
-        model: "Qwen/Qwen3-VL-Embedding-2B",
+        model: Some("Qwen/Qwen3-VL-Embedding-2B"),
+        dimensions: 768,
+        distance: "cosine",
+        modality: "multimodal",
+    },
+    EmbeddingRuntimeTarget {
+        tool_id: GENERIC_LOCAL_EMBEDDING_TOOL_ID,
+        kind: "offline_api",
+        mode: "offline",
+        model: None,
         dimensions: 768,
         distance: "cosine",
         modality: "multimodal",
@@ -471,8 +503,8 @@ fn declared_markdown_runtime_target(
 /// A `[embedding.<tool_id>]` section names it outright. The flat `[embedding]`
 /// form cannot, so it is resolved by declared `kind`, defaulting to the online
 /// target — which is what the flat form has always meant. That resolution is
-/// unambiguous only while one target exists per kind; adding a second offline
-/// embedding implementation must make `tool_id` mandatory rather than pick one.
+/// reserved for the built-in Gemini and Qwen targets. A generic endpoint
+/// requires the explicit `[embedding.local_embedding]` section.
 fn embedding_runtime_target(
     tool_id: Option<&str>,
     table: &toml::value::Table,
@@ -494,7 +526,7 @@ fn embedding_runtime_target(
         .unwrap_or("online_api");
     EMBEDDING_RUNTIME_TARGETS
         .iter()
-        .find(|target| target.kind == kind)
+        .find(|target| target.kind == kind && target.tool_id != GENERIC_LOCAL_EMBEDDING_TOOL_ID)
         .ok_or_else(|| {
             AdapterError::ConfigSchema(format!(
                 "tools.toml `embedding.kind` must be `online_api` or `offline_api` (got `{kind}`)"
@@ -522,7 +554,7 @@ fn declared_embedding_runtime_target(
     let kind = declared.kind.as_deref().unwrap_or("online_api");
     EMBEDDING_RUNTIME_TARGETS
         .iter()
-        .find(|target| target.kind == kind)
+        .find(|target| target.kind == kind && target.tool_id != GENERIC_LOCAL_EMBEDDING_TOOL_ID)
         .ok_or_else(|| {
             AdapterError::ConfigSchema(format!(
                 "declared embedding kind `{kind}` does not match any built-in runtime"
@@ -568,6 +600,15 @@ fn validate_supported_runtime_target(
     // on both roles when the resolved target is `offline_api`, so lumping it in
     // with `cmd`/`args` would refuse the local adapters before their own arm
     // could apply D1's loopback check.
+    if (tool_id != Some(GENERIC_LOCAL_EMBEDDING_TOOL_ID) || role != "embedding")
+        && let Some(field) = LOCAL_EMBEDDING_FIELDS
+            .iter()
+            .find(|field| table.contains_key(**field))
+    {
+        return Err(AdapterError::ConfigSchema(format!(
+            "tools.toml `{field}` requires [embedding.local_embedding]"
+        )));
+    }
     match role {
         "markdown" => {
             let target = markdown_runtime_target(tool_id, table)?;
@@ -632,12 +673,16 @@ fn validate_supported_runtime_target(
                 None => {}
             }
             require_declared_kind("embedding", table, target.kind)?;
-            if let Some(model) = table.get("model").and_then(toml::Value::as_str)
-                && model != target.model
+            if target.tool_id == GENERIC_LOCAL_EMBEDDING_TOOL_ID {
+                LocalEmbeddingSpec::from_declaration(&declared_adapter(tool_id, table))?;
+            }
+            if let Some(expected_model) = target.model
+                && let Some(model) = table.get("model").and_then(toml::Value::as_str)
+                && model != expected_model
             {
                 return Err(AdapterError::ConfigSchema(format!(
                     "unsupported embedding model `{model}`; expected `{}` for `{}`",
-                    target.model, target.tool_id
+                    expected_model, target.tool_id
                 )));
             }
             if table
@@ -705,9 +750,15 @@ fn require_declared_kind(role: &str, table: &toml::value::Table, expected: &str)
 
 fn validate_tools_entry_field(context: &str, key: &str, val: &toml::Value) -> Result<()> {
     match key {
-        "kind" | "cmd" | "url" | "model" | "profile_hash" | "distance" | "modality" | "mode" => {
+        "kind" | "cmd" | "url" | "model" | "profile_hash" | "distance" | "modality" | "mode"
+        | "wire_format" | "model_version_pin" | "chat_template_hash" | "instruction" => {
             if !val.is_str() {
                 return Err(field_type_error(context, key, "a string"));
+            }
+        }
+        "truncate_dimensions" => {
+            if !val.is_bool() {
+                return Err(field_type_error(context, key, "a boolean"));
             }
         }
         "auth" => {
@@ -971,6 +1022,16 @@ pub struct DeclaredAdapter {
     pub url: Option<String>,
     pub model: Option<String>,
     pub auth: Option<String>,
+    pub local_embedding: Option<LocalEmbeddingOptions>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalEmbeddingOptions {
+    pub(crate) wire_format: Option<String>,
+    pub(crate) model_version_pin: Option<String>,
+    pub(crate) chat_template_hash: Option<String>,
+    pub(crate) instruction: Option<String>,
+    pub(crate) truncate_dimensions: bool,
 }
 
 /// R13-2: locate the declared adapter for `role` in an already-parsed `tools.toml`
@@ -987,40 +1048,36 @@ pub fn declared_adapter_for_role(value: &toml::Value, role: &str) -> Option<Decl
         .keys()
         .any(|key| TOOLS_ENTRY_FIELDS.contains(&key.as_str()));
     if has_direct_fields {
-        return Some(DeclaredAdapter {
-            tool_id: None,
-            kind: optional_string(section, "kind"),
-            cmd: optional_string(section, "cmd"),
-            args: optional_string_array(section, "args"),
-            url: optional_string(section, "url"),
-            model: section
-                .get("model")
-                .and_then(toml::Value::as_str)
-                .map(str::to_owned),
-            auth: section
-                .get("auth")
-                .and_then(toml::Value::as_str)
-                .map(str::to_owned),
-        });
+        return Some(declared_adapter(None, section));
     }
-    // `[role.tool_id]` form: take the first declared tool_id (MVP: one per role).
     let (tool_id, entry) = section.iter().next()?;
-    let entry = entry.as_table()?;
-    Some(DeclaredAdapter {
-        tool_id: Some(tool_id.clone()),
+    Some(declared_adapter(Some(tool_id), entry.as_table()?))
+}
+
+fn declared_adapter(tool_id: Option<&str>, entry: &toml::value::Table) -> DeclaredAdapter {
+    let local_embedding = LOCAL_EMBEDDING_FIELDS
+        .iter()
+        .any(|field| entry.contains_key(*field))
+        .then(|| LocalEmbeddingOptions {
+            wire_format: optional_string(entry, "wire_format"),
+            model_version_pin: optional_string(entry, "model_version_pin"),
+            chat_template_hash: optional_string(entry, "chat_template_hash"),
+            instruction: optional_string(entry, "instruction"),
+            truncate_dimensions: entry
+                .get("truncate_dimensions")
+                .and_then(toml::Value::as_bool)
+                .unwrap_or(false),
+        });
+    DeclaredAdapter {
+        tool_id: tool_id.map(str::to_owned),
         kind: optional_string(entry, "kind"),
         cmd: optional_string(entry, "cmd"),
         args: optional_string_array(entry, "args"),
         url: optional_string(entry, "url"),
-        model: entry
-            .get("model")
-            .and_then(toml::Value::as_str)
-            .map(str::to_owned),
-        auth: entry
-            .get("auth")
-            .and_then(toml::Value::as_str)
-            .map(str::to_owned),
-    })
+        model: optional_string(entry, "model"),
+        auth: optional_string(entry, "auth"),
+        local_embedding,
+    }
 }
 
 /// QA19 (step4b-contract-tests-p3a.md §F, 03 §11 L832-837): the declared
@@ -1512,15 +1569,22 @@ pub fn validate_declared_runtime_target(role: &str, declared: &DeclaredAdapter) 
             target.tool_id
         )));
     }
-    if let Some(target) = embedding_target
+    if embedding_target.is_some_and(|target| target.tool_id == GENERIC_LOCAL_EMBEDDING_TOOL_ID) {
+        LocalEmbeddingSpec::from_declaration(declared)?;
+    } else if declared.local_embedding.is_some() {
+        return Err(AdapterError::ConfigSchema(
+            "local embedding options require [embedding.local_embedding]".to_owned(),
+        ));
+    }
+    if let Some(expected_model) = embedding_target.and_then(|target| target.model)
         && declared
             .model
             .as_deref()
-            .is_some_and(|model| model != target.model)
+            .is_some_and(|model| model != expected_model)
     {
         return Err(AdapterError::ConfigSchema(format!(
             "declared embedding model does not match effective `{}` runtime",
-            target.model
+            expected_model
         )));
     }
     // The Mistral-prefixed markdown model check that used to live here is gone:

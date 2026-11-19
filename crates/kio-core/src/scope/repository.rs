@@ -89,15 +89,15 @@ impl Repository {
     }
 
     pub(super) fn publication_journal(&self) -> Result<Option<PublicationJournal>> {
-        let Some(bytes) = self.store_directory()?.read_optional(
-            Path::new(PUBLICATION_JOURNAL_LEAF),
-            MAX_PUBLICATION_JOURNAL_BYTES,
-        )?
-        else {
+        let directory = self.store_directory()?;
+        if !directory.contains_entry(Path::new(PUBLICATION_JOURNAL_LEAF))? {
             return Ok(None);
-        };
-        let value: PublicationJournal =
-            serde_json::from_slice(&bytes).map_err(|error| KioError::schema(error.to_string()))?;
+        }
+        let file = directory.open_regular_read(Path::new(PUBLICATION_JOURNAL_LEAF), u64::MAX)?;
+        let value: PublicationJournal = crate::disk_records::decode_bounded_json(
+            &self.store.record_stages()?,
+            std::io::BufReader::with_capacity(64 * 1024, file),
+        )?;
         if value.version != 1
             || !is_hash(&value.new_head)
             || value
@@ -109,7 +109,7 @@ impl Repository {
                 "publication journal has invalid authority fields",
             ));
         }
-        validate_json_schema(SchemaKind::Manifest, &value.manifest)?;
+        value.manifest.validate()?;
         Ok(Some(value))
     }
 
@@ -123,6 +123,15 @@ impl Repository {
             ));
         }
         Ok(())
+    }
+
+    /// Enter a writer transaction whose decisions depend on the published HEAD.
+    /// An incomplete publication must be resolved through explicit recovery
+    /// before a new writer can mutate its dependencies.
+    pub fn lock_store_for_publication(&self) -> Result<RetainedStoreLock> {
+        let lock = self.lock_store_in_session(&self.lock_session)?;
+        self.ensure_no_pending_publication()?;
+        Ok(lock)
     }
 
     /// Finish an interrupted journaled publication. The caller must hold the
@@ -156,24 +165,38 @@ impl Repository {
             ));
         }
         let tree = self.read_tree(&commit.tree)?;
-        validate_manifest_matches_tree(&journal.manifest, &tree)?;
+        validate_manifest_matches_tree(&self.store.record_stages()?, &journal.manifest, &tree)?;
+        // Prepare the manifest before advancing HEAD, as in normal publication.
+        let manifest_stage = {
+            let mut reader = ManifestJsonReader::new(&journal.manifest)?;
+            self.store.stage_raw_from_reader(&mut reader, u64::MAX)?
+        };
         if current.as_deref() != Some(journal.new_head.as_str()) {
             let head_bytes = format!("{}\n", journal.new_head);
             self.replace_metadata("HEAD", head_bytes.as_bytes())?;
         }
-        self.write_manifest_value(&journal.manifest)?;
+        manifest_stage.publish_metadata_to(
+            &self.store_directory()?,
+            Path::new("manifest.json"),
+            crate::store_dir::Publication::Replace,
+        )?;
         self.remove_publication_journal()?;
         Ok(true)
     }
 
     /// Finish the repository publication associated with a saved extraction
     /// retirement. An unrelated pending publication keeps its own owner.
-    pub fn recover_extraction_publication(&self, expected: &str) -> Result<bool> {
+    pub fn recover_extraction_publication(
+        &self,
+        expected: &str,
+        before_recovery: impl FnOnce() -> Result<()>,
+    ) -> Result<bool> {
         let _lock = self.lock_store_in_session(&self.lock_session)?;
         if self
             .publication_journal()?
             .is_some_and(|journal| journal.new_head == expected)
         {
+            before_recovery()?;
             return self.recover_publication();
         }
         Ok(false)
@@ -184,7 +207,7 @@ impl Repository {
         expected_head: Option<&str>,
         new_head: &str,
         commit: &CommitObject,
-        manifest: Value,
+        manifest: Manifest,
     ) -> Result<()> {
         self.ensure_no_pending_publication()?;
         if commit.parent.as_deref() != expected_head {
@@ -211,27 +234,26 @@ impl Repository {
             ));
         }
         let tree = self.read_tree(&commit.tree)?;
-        validate_manifest_matches_tree(&manifest, &tree)?;
+        validate_manifest_matches_tree(&self.store.record_stages()?, &manifest, &tree)?;
+        // Prepare both payloads before HEAD can move. Capacity failure while
+        // writing either private stage leaves the current HEAD unchanged.
+        let manifest_stage = {
+            let mut reader = ManifestJsonReader::new(&manifest)?;
+            self.store.stage_raw_from_reader(&mut reader, u64::MAX)?
+        };
         let journal = PublicationJournal {
             version: 1,
             expected_head: expected_head.map(str::to_owned),
             new_head: new_head.to_owned(),
             manifest,
         };
-        let value =
-            serde_json::to_value(&journal).map_err(|error| KioError::schema(error.to_string()))?;
-        let bytes = canonical_json_bytes(&value)?;
-        if bytes.len() as u64 > MAX_PUBLICATION_JOURNAL_BYTES {
-            return Err(KioError::schema(
-                "publication journal exceeds its durable size limit",
-            ));
-        }
-        let directory = self.store_directory()?;
-        directory.write_atomic(
-            Path::new(PUBLICATION_JOURNAL_LEAF),
-            &bytes,
+        let mut reader = publication_json_reader(&journal)?;
+        self.write_streamed_metadata(
+            PUBLICATION_JOURNAL_LEAF,
+            &mut reader,
             crate::store_dir::Publication::CreateOnly,
         )?;
+        let directory = self.store_directory()?;
         self.control()
             .checkpoint(crate::durability::DurabilityPoint::PublicationJournal)?;
         directory.write_atomic(
@@ -241,11 +263,25 @@ impl Repository {
         )?;
         self.control()
             .checkpoint(crate::durability::DurabilityPoint::PublicationHead)?;
-        self.write_manifest_value(&journal.manifest)?;
+        manifest_stage.publish_metadata_to(
+            &directory,
+            Path::new("manifest.json"),
+            crate::store_dir::Publication::Replace,
+        )?;
         self.control()
             .checkpoint(crate::durability::DurabilityPoint::PublicationManifest)?;
         self.remove_publication_journal()?;
         Ok(())
+    }
+
+    pub(super) fn write_streamed_metadata(
+        &self,
+        leaf: &str,
+        reader: &mut impl std::io::Read,
+        publication: crate::store_dir::Publication,
+    ) -> Result<()> {
+        let stage = self.store.stage_raw_from_reader(reader, u64::MAX)?;
+        stage.publish_metadata_to(&self.store_directory()?, Path::new(leaf), publication)
     }
 
     pub(super) fn remove_publication_journal(&self) -> Result<()> {
@@ -581,4 +617,24 @@ impl Repository {
             (Ok(value), Ok(())) => Ok(value),
         }
     }
+}
+
+pub(super) fn publication_json_reader(
+    journal: &PublicationJournal,
+) -> Result<impl std::io::Read + '_> {
+    let mut prefix = b"{\"expected_head\":".to_vec();
+    serde_json::to_writer(&mut prefix, &journal.expected_head)
+        .map_err(|e| KioError::schema(e.to_string()))?;
+    prefix.extend_from_slice(b",\"manifest\":");
+    let mut suffix = b",\"new_head\":".to_vec();
+    serde_json::to_writer(&mut suffix, &journal.new_head)
+        .map_err(|e| KioError::schema(e.to_string()))?;
+    suffix.extend_from_slice(b",\"version\":1}");
+    Ok(std::io::Read::chain(
+        std::io::Read::chain(
+            std::io::Cursor::new(prefix),
+            ManifestJsonReader::new(&journal.manifest)?,
+        ),
+        std::io::Cursor::new(suffix),
+    ))
 }

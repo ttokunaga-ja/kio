@@ -378,6 +378,7 @@ pub(crate) fn ensure_snapshot_tree_entries(
     }
     let mut rows: Vec<TreeEntryProjection> = Vec::new();
     for entry in &tree.entries {
+        let entry = entry?;
         let (tool_profile_hash, r#gen, manifest_hash) =
             entry
                 .normalize

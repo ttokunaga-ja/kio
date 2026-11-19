@@ -34,7 +34,7 @@ impl DirectoryHandleIdentity {
 ///
 /// The public representation is opaque. Core may encode its numeric components
 /// only in an explicitly versioned local recovery intent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RegularFileHandleIdentity {
     volume_serial_number: u32,
     file_index: u64,

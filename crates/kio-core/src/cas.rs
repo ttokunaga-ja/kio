@@ -16,6 +16,9 @@ mod image;
 pub use image::ImageStore;
 use image::write_bound_content_at;
 mod store;
+mod tree;
+#[cfg(test)]
+pub(crate) use tree::fail_next_tree_write;
 
 mod removal;
 use removal::{CasRemovalKind, bound_remove_verified, remove_verified_cas_path};
@@ -43,9 +46,38 @@ use crate::platform::cas_io::{
 };
 use crate::platform::cas_semantics;
 
+pub(crate) fn stream_error(error: std::io::Error, path: &Path) -> KioError {
+    if error.get_ref().is_some_and(|inner| inner.is::<KioError>()) {
+        return *error
+            .into_inner()
+            .expect("typed stream error")
+            .downcast::<KioError>()
+            .expect("typed stream error");
+    }
+    crate::store_dir::ioerr(path, error)
+}
+
+pub(crate) fn hash_stream(reader: &mut impl Read) -> Result<(String, u64)> {
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; CAS_STREAM_BUFFER_BYTES];
+    let mut size = 0u64;
+    loop {
+        let count = reader
+            .read(&mut buffer)
+            .map_err(|e| stream_error(e, Path::new("JSON stage")))?;
+        if count == 0 {
+            break;
+        }
+        size = size
+            .checked_add(count as u64)
+            .ok_or_else(|| KioError::schema("stream byte count overflow"))?;
+        digest.update(&buffer[..count]);
+    }
+    Ok((format!("sha256:{}", lower_hex(&digest.finalize())), size))
+}
+
 pub const CAS_STREAM_BUFFER_BYTES: usize = 64 * 1024;
 pub const MAX_CONTENT_OBJECT_BYTES: u64 = 512 * 1024 * 1024;
-pub const MAX_TREE_OBJECT_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_COMMIT_OBJECT_BYTES: u64 = 1024 * 1024;
 /// Semantic chunk objects contain bounded normalized text, never raw file bytes.
 pub const MAX_CHUNK_OBJECT_BYTES: u64 = 128 * 1024 * 1024;
@@ -533,7 +565,7 @@ impl ObjectKind {
     pub const fn max_bytes(self) -> u64 {
         match self {
             Self::Raw => u64::MAX,
-            Self::Tree => MAX_TREE_OBJECT_BYTES,
+            Self::Tree => u64::MAX,
             Self::Commit => MAX_COMMIT_OBJECT_BYTES,
         }
     }
@@ -584,6 +616,7 @@ struct BoundObjectDirs {
     manifests: Arc<Mutex<Option<Arc<File>>>>,
     toollocks: Arc<Mutex<Option<Arc<File>>>>,
     normalized_units: Arc<Mutex<Option<Arc<File>>>>,
+    stage_directories: Arc<Mutex<Option<bound::RawStageDirectories>>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -603,7 +636,25 @@ pub struct BoundRawStage {
     raw_hash: String,
     size_bytes: u64,
 }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct SavedRawStage {
+    name: String,
+    identity: crate::store_dir::StageIdentity,
+    raw_hash: String,
+    size_bytes: u64,
+}
 impl BoundRawStage {
+    pub(crate) fn saved(&self) -> SavedRawStage {
+        SavedRawStage {
+            name: self.name.clone(),
+            identity: self.identity.clone(),
+            raw_hash: self.raw_hash.clone(),
+            size_bytes: self.size_bytes,
+        }
+    }
+    pub(crate) fn detach(&mut self) {
+        self.name.clear();
+    }
     fn verify(&self) -> Result<()> {
         let mut file = self
             .directory
@@ -616,6 +667,40 @@ impl BoundRawStage {
             return Err(bound_stage_corrupt("raw stage changed before publication"));
         }
         Ok(())
+    }
+
+    pub(crate) fn publish_metadata_to(
+        mut self,
+        target: &crate::store_dir::StoreDirectory,
+        leaf: &Path,
+        publication: crate::store_dir::Publication,
+    ) -> Result<()> {
+        self.verify()?;
+        crate::store_dir::StageWriter::publish_saved_with(
+            &self.directory,
+            Path::new(&self.name),
+            &self.identity,
+            target,
+            leaf,
+            publication,
+        )?;
+        self.journals.remove_file(Path::new(&self.name))?;
+        self.name.clear();
+        Ok(())
+    }
+
+    fn publish_saved_to(
+        &mut self,
+        target: &crate::store_dir::StoreDirectory,
+        leaf: &Path,
+    ) -> Result<()> {
+        crate::store_dir::StageWriter::publish_saved(
+            &self.directory,
+            Path::new(&self.name),
+            &self.identity,
+            target,
+            leaf,
+        )
     }
 
     #[must_use]
@@ -751,7 +836,6 @@ fn bound_stream_regular(
         cas_semantics::configure_bound_read(&mut options);
         let mut file = cap_fs::open(parent, name, &options)
             .map_err(|error| bound_io_or_not_found(error, leaf))?;
-        crate::private_fs::verify_private_regular_file_handle(&file)?;
         let opened = cap_fs::Metadata::from_file(&file).kio_io(label)?;
         let named = cap_fs::stat(parent, name, cap_fs::FollowSymlinks::No)
             .map_err(|error| bound_io_or_not_found(error, leaf))?;
@@ -763,6 +847,7 @@ fn bound_stream_regular(
         {
             return Err(non_regular_object_error(label));
         }
+        crate::private_fs::verify_private_regular_file_handle(&file)?;
         if opened.len() > max {
             return Err(KioError::new(
                 "KIO-E-STORE-OBJECT-OVERSIZED-001",
@@ -795,7 +880,6 @@ fn bound_stream_regular(
             }
             consume(&buffer[..count])?;
         }
-        crate::private_fs::verify_private_regular_file_handle(&file)?;
         let finished = cap_fs::Metadata::from_file(&file).kio_io(label)?;
         let named = cap_fs::stat(parent, name, cap_fs::FollowSymlinks::No)
             .map_err(|error| bound_io_or_not_found(error, leaf))?;
@@ -815,6 +899,7 @@ fn bound_stream_regular(
                 None,
             ));
         }
+        crate::private_fs::verify_private_regular_file_handle(&file)?;
         Ok(consumed)
     })();
     (result, consumed)
@@ -1781,7 +1866,8 @@ fn read_embedding_path(
     path: &Path,
     expected_hash: &str,
 ) -> Result<EmbeddingObject> {
-    let bytes = read_bounded_regular_file_inner(path, MAX_EMBEDDING_OBJECT_BYTES, reads, true)?;
+    let bytes =
+        read_bounded_regular_file_inner(path, MAX_EMBEDDING_OBJECT_BYTES, reads, true, None)?;
     decode_embedding(&bytes, expected_hash, path)
 }
 
@@ -2183,7 +2269,33 @@ pub fn fanout_path(base: impl AsRef<Path>, hash: &str) -> Result<PathBuf> {
 /// Read a non-CAS metadata record through the same no-follow/single-link boundary
 /// as CAS objects while enforcing a caller-selected byte limit.
 pub fn read_bounded_regular_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
-    read_bounded_regular_file_inner(path, max_bytes, &CasReadAccess::Unmetered, false)
+    read_bounded_regular_file_inner(path, max_bytes, &CasReadAccess::Unmetered, false, None)
+}
+
+const BOUNDED_READ_DEADLINE: &str = "KIO-E-STORE-READ-DEADLINE-001";
+
+/// Read bounded metadata with deadline checks between physical reads.
+/// `TimedOut` identifies expiry of the supplied deadline. Other failures
+/// retain the underlying Kio error as their source.
+pub fn read_bounded_regular_file_until(
+    path: &Path,
+    max_bytes: u64,
+    deadline: std::time::Instant,
+) -> std::io::Result<Vec<u8>> {
+    read_bounded_regular_file_inner(
+        path,
+        max_bytes,
+        &CasReadAccess::Unmetered,
+        false,
+        Some(deadline),
+    )
+    .map_err(|error| {
+        if error.error_code() == BOUNDED_READ_DEADLINE {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, error)
+        } else {
+            std::io::Error::other(error)
+        }
+    })
 }
 
 /// Shared implementation for bounded metadata records and bounded CAS content
@@ -2194,7 +2306,19 @@ fn read_bounded_regular_file_inner(
     max_bytes: u64,
     reads: &CasReadAccess,
     private_cas: bool,
+    deadline: Option<std::time::Instant>,
 ) -> Result<Vec<u8>> {
+    let check_deadline = || {
+        crate::private_fs::check_read_deadline(deadline).map_err(|error| {
+            KioError::new(
+                BOUNDED_READ_DEADLINE,
+                error.to_string(),
+                serde_json::json!({ "path": path }),
+                crate::ExitCode::Failure,
+            )
+        })
+    };
+    check_deadline()?;
     reads.charge(0)?;
     let mut file = if private_cas {
         open_private_cas_file(path)?
@@ -2218,6 +2342,7 @@ fn read_bounded_regular_file_inner(
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     let mut buffer = [0_u8; CAS_STREAM_BUFFER_BYTES];
     loop {
+        check_deadline()?;
         let remaining = max_bytes
             .saturating_add(1)
             .saturating_sub(bytes.len() as u64);
@@ -2226,6 +2351,7 @@ fn read_bounded_regular_file_inner(
         }
         let read_cap = remaining.min(CAS_STREAM_BUFFER_BYTES as u64) as usize;
         let count = file.read(&mut buffer[..read_cap]).kio_io(path)?;
+        check_deadline()?;
         if count == 0 {
             break;
         }
@@ -2387,6 +2513,25 @@ mod tests {
         let path = fanout_path(repo.kio_dir().join("objects/prepared"), &hash).unwrap();
         assert_eq!(fs::metadata(path).unwrap().len(), bytes);
         assert!(!workspace.contains_entry(leaf).unwrap());
+    }
+
+    #[test]
+    fn bounded_metadata_read_distinguishes_deadline_from_open_failure() {
+        use std::{
+            io::ErrorKind,
+            time::{Duration, Instant},
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("renderer");
+        std::fs::write(&path, b"fixture").unwrap();
+        let error = read_bounded_regular_file_until(&path, 128, Instant::now()).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::TimedOut);
+        std::fs::remove_file(&path).unwrap();
+        let error =
+            read_bounded_regular_file_until(&path, 128, Instant::now() + Duration::from_secs(10))
+                .unwrap_err();
+        assert_ne!(error.kind(), ErrorKind::TimedOut);
     }
 
     #[test]
@@ -3125,34 +3270,27 @@ mod tests {
 
         let error = store.write_raw(expected).unwrap_err();
         assert_eq!(error.error_code(), "KIO-E-STORE-CORRUPT-001");
+        assert_eq!(fs::read(&path).unwrap(), expected);
+        assert_eq!(fs::read(&outside).unwrap(), expected);
     }
 
     #[test]
     fn st04_review_materializing_reads_reject_raw_without_consuming_payload() {
         let dir = tempfile::tempdir().unwrap();
         let repo = crate::scope::Repository::init(dir.path()).unwrap();
+        let ambient = ObjectStore::new(repo.kio_dir());
         let hash = hash_bytes(b"sparse mock");
-        let path = fanout_path(repo.kio_dir().join("objects/raw"), &hash).unwrap();
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            for p in [
-                path.parent().unwrap(),
-                path.parent().unwrap().parent().unwrap(),
-            ] {
-                fs::set_permissions(p, fs::Permissions::from_mode(0o700)).unwrap();
-            }
-        }
-        let file = File::create(&path).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-        }
+        ambient
+            .ensure_object_parent(ObjectKind::Raw, &hash)
+            .unwrap();
+        let path = ambient.object_path(ObjectKind::Raw, &hash).unwrap();
+        let parent = crate::store_dir::StoreDirectory::open(path.parent().unwrap()).unwrap();
+        let file = parent
+            .create_private_file(Path::new(path.file_name().unwrap()))
+            .unwrap();
         file.set_len(1 << 30).unwrap();
         drop(file);
-        for store in [repo.object_store(), ObjectStore::new(repo.kio_dir())] {
+        for store in [repo.object_store(), ambient] {
             VerifiedCasReadBudget::new()
                 .run(CAS_STREAM_BUFFER_BYTES as u64, |reads| {
                     let bound = store.with_verified_reads(reads)?;
@@ -3170,13 +3308,11 @@ mod tests {
                             .exit_code(),
                         crate::ExitCode::InvalidUsage
                     );
-                    assert_eq!(
-                        bound
-                            .read_object_accounted(ObjectKind::Raw, &hash)
-                            .unwrap_err()
-                            .consumed_bytes,
-                        0
-                    );
+                    let error = bound
+                        .read_object_accounted(ObjectKind::Raw, &hash)
+                        .unwrap_err();
+                    assert_eq!(error.error.exit_code(), crate::ExitCode::InvalidUsage);
+                    assert_eq!(error.consumed_bytes, 0);
                     assert_eq!(
                         bound.read_by_hash(&hash).unwrap_err().exit_code(),
                         crate::ExitCode::InvalidUsage
@@ -3650,8 +3786,7 @@ mod tests {
             store.repair_raw(&hash, expected).unwrap_err().error_code(),
             "KIO-E-STORE-CORRUPT-001"
         );
-        assert!(path.exists());
-        assert!(outside.exists());
+        assert_eq!(fs::read(&path).unwrap(), b"linked corrupt bytes");
         assert_eq!(fs::read(&outside).unwrap(), b"linked corrupt bytes");
     }
 
@@ -3784,7 +3919,9 @@ mod tests {
         ] {
             let hash = hash_bytes(bytes);
             store.write_object_bytes(kind, &hash, bytes).unwrap();
-            assert_eq!(store.read_object(kind, &hash).unwrap().bytes, bytes);
+            let mut copied = Vec::new();
+            store.copy_object_to(kind, &hash, &mut copied).unwrap();
+            assert_eq!(copied, bytes);
         }
         let bytes = b"bound raw publication";
         let hash = store.write_raw(bytes).unwrap();

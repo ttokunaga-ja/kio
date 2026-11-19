@@ -766,13 +766,26 @@ local crash は 0 USD で終端記録し、§5.3 の attempt 上限内で再計�
 累積 append bytes の寿命上限で利用不能にしない。保持量の整理後も未終端 task の現在状態、
 attempt / next_retry_at / ownership と unsupported の現在理由を失わない。
 現在状態の key は task が `task_id`、unsupported が scope 内の `path` であり、それぞれ最後の
-検証済み record の全フィールドを保持する。別の task ID や完了・保留・解決済みの状態を整理だけで捨てない。
+検証済み record の全フィールドを保持する。unsupported は HEAD の path と raw_hash に合う最後の record で表示する。
+次の HEAD を公開する前に理由を保存し、整理時は現在の HEAD に対応する record も保持する。
+別の task ID や完了・保留・解決済みの状態を整理だけで捨てない。
 中断・回復後も検証済みの現在状態を一意に採用し、成功や新規入力へ巻き戻さない。
 canonical path、no-follow、record schema、identity と不正 record の拒否を維持する。
 課金／秘密／送信承認の正本はこの整理の対象にしない。容量不足は §5.3 の `resource_limit` として
 破損から区別し、部分成功や必要な状態の黙った切捨てにしない。
 
 ソースコードのファイル（拡張子 `rs` / `py` / `js` / `ts` / `go` / `java` / `c` / `h` / `cpp`、大文字小文字を区別しない）は索引・抽出の対象外とし、unsupported に理由 `source_code_is_not_supported` を記録・表示する。中身がテキストでも plain text として処理しない。Markdown 内のコードブロック・インラインコードは引き続き Markdown の一部として扱う。
+
+`index`、HEAD の `reindex --regenerate`、および `watch` の再走査で unsupported と判定したファイルは、以前に索引済みでも、
+現行 tree には raw のみを記録する。走査した path の集合や、判定に使った raw_hash が公開対象と異なる場合は公開を中断する。
+status の unsupported 一覧には、公開済みの理由を表示する。読み取り中に HEAD が変わった場合は読み直す。
+検索の現行集計から該当する旧 Markdownize タスクを外し、タスク履歴は保持する。
+同じ path と raw_hash の対応する現行入力がサポートされていれば、raw のみを記録した OCR 待ちタスクも集計する。
+
+`index`、`reindex`、`watch` の再走査、`purge` は store lock の取得後に保留中の公開を確認する。
+公開ジャーナルが残っている scope では理由の書き換えや purge 計画の確定に進まず、`kio init` による公開回復を求める。
+現行検索の FTS・vector は当該ファイルの旧世代を返さない。過去の tree が参照する世代、raw、
+Evidence Pointer の解決に必要なデータは既存の履歴保持規則に従う (§4、[03-data-model.md §8](03-data-model.md))。
 
 ```json
 {
@@ -966,6 +979,12 @@ budget_exceeded    paused                KIO-E-BATCH-BUDGET-001
 resource_limit     paused                max_attempts=0 (自動 retry なし)
                                          KIO-E-RESOURCE-LIMIT-001 / exit 3
 ```
+
+無料ローカル embedding では、実行レコードで契約違反の回数を総 attempt 数と別に保持する。
+文書の再試行予算は scope・profile・埋め込み入力に紐づけ、同じ入力を共有する chunk の組が変わっても持ち越す。
+実行全体の attempt 上限内で、最初の契約違反後に同じ入力の再試行を 1 回予約する。
+Task の `next_retry_at` はその予約を反映する。
+保存済みの文書結果は保存時の member 一覧に対して検証し、同じ入力の現在の対象への公開にも current policy と所有権の検査を適用する。
 
 `resource_limit` は Task / manifest `units[]` / Adapter `failed_units[]` の閉 enum
 `error_kind` に含める。資源不足の共通記述は `resource`、`stage`（不足した処理段階）、

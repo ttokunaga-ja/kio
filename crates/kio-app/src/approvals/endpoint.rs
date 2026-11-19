@@ -54,23 +54,30 @@ fn validate_policy(repo: &Repository) -> Result<()> {
 }
 
 fn disclosure(
+    settings: &AdapterRuntimeSettings,
     role: AdapterRole,
     tool: &str,
     profile: &str,
     endpoint: &DeviceEndpointBinding,
     secrets: bool,
-) -> EndpointDisclosure {
-    EndpointDisclosure {
+) -> Result<EndpointDisclosure> {
+    let content_types = match role {
+        AdapterRole::Embedding => {
+            let mut types = vec!["query text", "document text"];
+            if tool != GENERIC_LOCAL_EMBEDDING_TOOL_ID
+                || generic_embedding_declares_images(settings)?
+            {
+                types.push("images");
+            }
+            types
+        }
+        AdapterRole::Markdown => vec!["document page images", "document text"],
+    };
+    Ok(EndpointDisclosure {
         tool_id: tool.to_owned(),
         tool_profile_hash: profile.to_owned(),
         purpose: role.as_str().to_owned(),
-        content_types: match role {
-            AdapterRole::Embedding => vec!["query text", "document text", "images"],
-            AdapterRole::Markdown => vec!["document page images", "document text"],
-        }
-        .into_iter()
-        .map(str::to_owned)
-        .collect(),
+        content_types: content_types.into_iter().map(str::to_owned).collect(),
         applies_to: "all scopes on this device".into(),
         peer_authentication: if endpoint.destination.starts_with("http://") {
             "unauthenticated"
@@ -79,7 +86,21 @@ fn disclosure(
         }
         .into(),
         send_secrets: secrets,
-    }
+    })
+}
+
+fn generic_embedding_declares_images(settings: &AdapterRuntimeSettings) -> Result<bool> {
+    use kio_adapter::catalog::{
+        active_embedding_execution_with_control, embedding_descriptor_with_control,
+    };
+    let execution = active_embedding_execution_with_control(settings, &settings.control)
+        .filter(|execution| {
+            execution.execution_mode() == kio_adapter::types::ExecutionMode::OfflineApi
+        })
+        .ok_or_else(|| denied("local embedding is no longer configured"))?;
+    let descriptor = embedding_descriptor_with_control(settings, execution, &settings.control)
+        .map_err(crate::object_persistence::adapter_to_kio)?;
+    Ok(!descriptor.capability.image_mime_types.is_empty())
 }
 
 pub(super) fn active<'a>(
@@ -92,11 +113,11 @@ pub(super) fn active<'a>(
     })
 }
 
-pub(super) fn current_bindings(
+pub(super) fn current_endpoints(
     settings: &Arc<AdapterRuntimeSettings>,
     selected: Option<&str>,
-) -> Result<Vec<DeviceEndpointBinding>> {
-    let mut bindings = Vec::new();
+) -> Result<Vec<(DeviceEndpointBinding, EndpointDisclosure)>> {
+    let mut endpoints = Vec::new();
     for role in [AdapterRole::Markdown, AdapterRole::Embedding] {
         let Some(declared) = settings.declared_adapter(role.as_str()) else {
             continue;
@@ -128,7 +149,8 @@ pub(super) fn current_bindings(
                 else {
                     continue;
                 };
-                let profile = crate::embedding::admission::declared_embedding_profile(execution);
+                let profile =
+                    crate::embedding::admission::declared_embedding_profile(settings, execution)?;
                 (profile.tool_id, profile.profile_hash)
             }
         };
@@ -141,13 +163,15 @@ pub(super) fn current_bindings(
             },
         )
         .map_err(crate::object_persistence::adapter_to_kio)?;
-        bindings.push(DeviceEndpointBinding {
+        let binding = DeviceEndpointBinding {
             destination: identity.canonical_destination,
             credential_binding: identity.credential_binding,
             trust_binding: identity.trust_binding,
-        });
+        };
+        let disclosure = disclosure(settings, role, &tool, &profile, &binding, false)?;
+        endpoints.push((binding, disclosure));
     }
-    Ok(bindings)
+    Ok(endpoints)
 }
 
 pub(super) fn approve(
@@ -166,7 +190,14 @@ pub(super) fn approve(
             .local_endpoint(role.as_str(), &expected.destination)
             .map_err(crate::object_persistence::adapter_to_kio)?;
     }
-    let disclosed = disclosure(role, tool, profile, &expected, args.send_secrets);
+    let disclosed = disclosure(
+        ctx.settings,
+        role,
+        tool,
+        profile,
+        &expected,
+        args.send_secrets,
+    )?;
     let secret_binding = args
         .send_secrets
         .then(|| {
@@ -415,4 +446,45 @@ fn approved(tool: &str, grant: Option<String>, secret: Option<String>) -> Result
         })),
         completion: Completion::Complete,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kio_adapter::tool_lock::{declared_adapter_for_role, parse_tools_toml_for_roles};
+
+    #[test]
+    fn generic_local_embedding_wire_changes_disclosure_without_changing_endpoint_approval() {
+        let endpoint = |wire| {
+            let source = format!(
+                "[embedding.local_embedding]\nkind = 'offline_api'\nurl = 'http://localhost:8080/path'\n\
+                 model = 'test-model'\nmodel_version_pin = 'sha256:{}'\n\
+                 chat_template_hash = 'sha256:{}'\ninstruction = ''\nwire_format = '{wire}'\n",
+                "a".repeat(64),
+                "b".repeat(64),
+            );
+            let value = parse_tools_toml_for_roles(source.as_bytes(), &["embedding"]).unwrap();
+            let mut settings = AdapterRuntimeSettings::default();
+            settings.declarations.insert(
+                "embedding".into(),
+                declared_adapter_for_role(&value, "embedding").unwrap(),
+            );
+            let mut endpoints =
+                current_endpoints(&Arc::new(settings), Some(GENERIC_LOCAL_EMBEDDING_TOOL_ID))
+                    .unwrap();
+            assert_eq!(endpoints.len(), 1);
+            endpoints.pop().unwrap()
+        };
+        let (input_endpoint, input) = endpoint("input");
+        let (messages_endpoint, messages) = endpoint("messages");
+        assert_eq!(input_endpoint, messages_endpoint);
+        assert_eq!(input_endpoint.destination, "http://localhost:8080/path");
+        assert_eq!(input.peer_authentication, "unauthenticated");
+        assert_eq!(input.content_types, ["query text", "document text"]);
+        assert_eq!(
+            messages.content_types,
+            ["query text", "document text", "images"]
+        );
+        assert_ne!(input.tool_profile_hash, messages.tool_profile_hash);
+    }
 }

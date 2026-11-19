@@ -332,6 +332,7 @@ fn verify_objects_with_limits(
     repo: &Repository,
     limits: VerifyLimits,
 ) -> Result<VerifyObjectsReport> {
+    let _inspection = kio_core::disk_records::StageInspection::begin();
     if repo.object_store().verified_reads()?.is_none() {
         return kio_core::cas::VerifiedCasReadBudget::new()
             .run(u64::MAX, |reads| {
@@ -641,29 +642,33 @@ fn verify_objects_with_limits(
 
     let mut trees = BTreeMap::<String, TreeObject>::new();
     for hash in &tree_hashes {
-        match store.read_object_accounted(ObjectKind::Tree, hash) {
-            Ok((object, verified_bytes)) => {
+        let remaining = state
+            .max_verified_bytes
+            .saturating_sub(state.verified_bytes);
+        match store.read_tree_accounted_with_limit(hash, remaining) {
+            Ok((tree, verified_bytes)) => {
                 state.add_bytes(verified_bytes);
                 if state.exceeded_bounds {
                     return Ok(finish_limit_report(state));
                 }
-                match serde_json::from_slice::<TreeObject>(&object.bytes)
-                    .map_err(|error| KioError::schema(error.to_string()))
-                    .and_then(|tree| {
-                        tree.validate()?;
-                        Ok(tree)
-                    }) {
-                    Ok(tree) => {
-                        state.checked.trees += 1;
-                        trees.insert(hash.clone(), tree);
-                    }
-                    Err(error) => state.finding("tree_corrupt", hash, &error.to_string(), &[]),
-                }
+                state.checked.trees += 1;
+                trees.insert(hash.clone(), tree);
             }
             Err(failure) => {
                 state.add_bytes(failure.consumed_bytes);
-                if state.exceeded_bounds {
+                if state.exceeded_bounds
+                    || matches!(
+                        failure.error.error_code(),
+                        "KIO-E-STORE-OBJECT-OVERSIZED-001" | "KIO-E-STORE-VERIFIED-BYTES-LIMIT-001"
+                    )
+                {
+                    state.exceeded_bounds = true;
                     return Ok(finish_limit_report(state));
+                }
+                // Private staging exhaustion is an operational limit, not
+                // evidence that a verified tree object is corrupt.
+                if failure.error.resource_limit().is_some() {
+                    return Err(failure.error);
                 }
                 state.finding("tree_corrupt", hash, &failure.error.to_string(), &[]);
             }
@@ -729,6 +734,7 @@ fn verify_objects_with_limits(
             continue;
         };
         for entry in &tree.entries {
+            let entry = entry?;
             let affected = raw_affected.entry(entry.raw_hash.clone()).or_default();
             if affected.len() < MAX_AFFECTED_COMMITS {
                 affected.insert(commit_hash.clone());
@@ -748,7 +754,7 @@ fn verify_objects_with_limits(
         &reachable,
         current_head.as_deref(),
         &invocation_time,
-    );
+    )?;
     // A final shallow receipt proves that a historical tree was deliberately
     // discarded, while manifests and normalized-unit CAS objects remain.  The
     // chunk ledger is mutable operational metadata, so its introduction fields
@@ -810,6 +816,7 @@ fn verify_objects_with_limits(
             continue;
         }
         for entry in &tree.entries {
+            let entry = entry?;
             if dead_raws.contains(&entry.raw_hash) {
                 continue;
             }
@@ -1023,7 +1030,7 @@ fn verify_objects_with_limits(
                         &commits,
                         &trees,
                         &reachable,
-                    ) {
+                    )? {
                         Some((republication_commit, republication_created_at)) => {
                             retirements_to_backfill.push((
                                 raw_hash.clone(),
@@ -1088,7 +1095,7 @@ fn verify_objects_with_limits(
                                 &commits,
                                 &trees,
                                 &reachable,
-                            ) {
+                            )? {
                                 Some((republication_commit, republication_created_at)) => {
                                     retirements_to_backfill.push((
                                         raw_hash.clone(),
@@ -2466,7 +2473,10 @@ fn validate_retired_event(
         );
     }
     if let Some(tree) = trees.get(&commit.tree)
-        && !tree.entries.iter().any(|entry| entry.raw_hash == raw_hash)
+        && !tree
+            .entries
+            .any(|entry| entry.raw_hash == raw_hash)
+            .map_err(|error| error.to_string())?
     {
         return Err(
             "retired event resurrection_commit tree does not contain a leaf for this raw_hash"
@@ -2528,28 +2538,26 @@ fn find_republication_commit(
     commits: &BTreeMap<String, CommitObject>,
     trees: &BTreeMap<String, TreeObject>,
     reachable: &BTreeSet<String>,
-) -> Option<(String, String)> {
-    reachable
-        .iter()
-        .filter(|candidate| {
-            candidate.as_str() != purge_in_commit
-                && commits.get(candidate.as_str()).is_some_and(|commit| {
-                    is_ancestor(commits, purge_in_commit, candidate)
-                        && trees.get(&commit.tree).is_none_or(|tree| {
-                            tree.entries.iter().any(|entry| entry.raw_hash == raw_hash)
-                        })
-                })
-        })
-        .min()
-        .cloned()
-        .map(|winner| {
-            let created_at = commits
-                .get(&winner)
-                .expect("filtered candidates are always present in `commits`")
-                .created_at
-                .clone();
-            (winner, created_at)
-        })
+) -> Result<Option<(String, String)>> {
+    // reachable is sorted, so the first qualifying hash is the canonical winner.
+    for candidate in reachable {
+        if candidate == purge_in_commit {
+            continue;
+        }
+        let Some(commit) = commits.get(candidate) else {
+            continue;
+        };
+        if !is_ancestor(commits, purge_in_commit, candidate) {
+            continue;
+        }
+        if let Some(tree) = trees.get(&commit.tree)
+            && !tree.entries.any(|entry| entry.raw_hash == raw_hash)?
+        {
+            continue;
+        }
+        return Ok(Some((candidate.clone(), commit.created_at.clone())));
+    }
+    Ok(None)
 }
 
 /// LC17: `dead_raws` (skips normalized/manifest/chunk verification for a
@@ -2727,6 +2735,15 @@ mod tests {
         let repo = Repository::init(dir.path()).unwrap();
         let path = repo.kio_dir().join("objects/raw/.ingest-unknown");
         fs::write(&path, b"unidentified residue").unwrap();
+        let store = repo.object_store();
+        drop(
+            kio_core::disk_records::RecordWriter::<u64>::new(&store.record_stages().unwrap())
+                .unwrap(),
+        );
+        let record = repo
+            .kio_dir()
+            .join("internal/record-stages/stages/unidentified-record");
+        fs::write(&record, b"unidentified record").unwrap();
         let report = verify_objects(&repo).unwrap();
         assert!(
             report
@@ -2735,6 +2752,14 @@ mod tests {
                 .any(|finding| finding.kind == "raw_stage_residue"
                     && finding.reason.contains(".ingest-unknown"))
         );
+        assert!(
+            report
+                .remaining_findings
+                .iter()
+                .any(|finding| finding.kind == "raw_stage_residue"
+                    && finding.reason.contains("unidentified-record"))
+        );
+        assert_eq!(fs::read(record).unwrap(), b"unidentified record");
         assert!(path.exists());
     }
 
@@ -3237,7 +3262,11 @@ mod tests {
                     DEFAULT_CHUNKING_MAX_CHARS,
                 )
                 .unwrap(),
-                entries: vec![TreeEntry::raw_file("unrelated.txt", other_raw.clone()).unwrap()],
+                entries: kio_core::disk_records::DiskRecords::from_records(
+                    &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+                    [TreeEntry::raw_file("unrelated.txt", other_raw.clone()).unwrap()],
+                )
+                .unwrap(),
                 object_type: "tree".to_owned(),
             },
         )]);
@@ -3250,6 +3279,7 @@ mod tests {
                 &trees,
                 &reachable,
             )
+            .unwrap()
             .is_none()
         );
 
@@ -3277,7 +3307,11 @@ mod tests {
                     DEFAULT_CHUNKING_MAX_CHARS,
                 )
                 .unwrap(),
-                entries: vec![TreeEntry::raw_file("resurrected.txt", target_raw.clone()).unwrap()],
+                entries: kio_core::disk_records::DiskRecords::from_records(
+                    &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+                    [TreeEntry::raw_file("resurrected.txt", target_raw.clone()).unwrap()],
+                )
+                .unwrap(),
                 object_type: "tree".to_owned(),
             },
         );
@@ -3293,6 +3327,7 @@ mod tests {
             &trees_with_good,
             &reachable_both,
         )
+        .unwrap()
         .expect("a valid resurrection candidate exists");
         assert_eq!(winner, good_candidate_hash);
         assert_eq!(winner_created_at, good_created_at);
@@ -3321,6 +3356,7 @@ mod tests {
             &BTreeMap::new(), // no trees inventoried -- shallow
             &reachable_shallow,
         )
+        .unwrap()
         .expect("a shallow-tree candidate is still accepted (tree absent skips the leaf check)");
         assert_eq!(winner, shallow_candidate_hash);
     }
@@ -3440,7 +3476,11 @@ mod tests {
             TreeObject {
                 object_type: "tree".into(),
                 chunking_config_hash: hash('d'),
-                entries: vec![entry],
+                entries: kio_core::disk_records::DiskRecords::from_records(
+                    &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+                    [entry],
+                )
+                .unwrap(),
             }
         };
         let mut purge_commit = purged_commit("2026-07-13T00:00:01Z", vec![raw.clone()]);
@@ -3492,6 +3532,7 @@ mod tests {
                     head,
                     "2026-07-14T00:00:00Z",
                 )
+                .unwrap()
             };
         assert!(
             classify(&commits, &trees, &reachable, Some(&resurrected))
@@ -3528,6 +3569,40 @@ mod tests {
         assert!(
             classify(&malformed, &trees, &reachable, Some(&resurrected)).is_empty(),
             "mismatched lifecycle binding cannot authorize absence"
+        );
+    }
+
+    #[test]
+    fn tree_byte_budget_exhaustion_is_a_limit_before_payload_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let tree = kio_core::dag::build_tree(
+            &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+            Vec::new(),
+        )
+        .unwrap();
+        repo.object_store().write_tree(&tree).unwrap();
+        let report = verify_objects_with_limits(
+            &repo,
+            VerifyLimits {
+                max_objects: MAX_OBJECTS,
+                max_verified_bytes: 0,
+            },
+        )
+        .unwrap();
+        assert!(
+            report
+                .remaining_findings
+                .iter()
+                .any(|finding| finding.kind == "inventory_limit")
+        );
+        assert_eq!(report.checked.trees, 0);
+        assert_eq!(report.verified_bytes, 0);
+        assert!(
+            !report
+                .remaining_findings
+                .iter()
+                .any(|finding| finding.kind == "tree_corrupt")
         );
     }
 

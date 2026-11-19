@@ -1360,7 +1360,9 @@ fn estimated_enrichment_cost_usd(
     let included: Vec<&ScanCandidate> = candidates
         .iter()
         .filter(|c| {
-            !c.ignored && !crate::unsupported::is_source_code_path(Path::new(&c.input_path))
+            !c.ignored
+                && crate::unsupported::unsupported_reason_for_path(Path::new(&c.input_path))
+                    .is_none()
         })
         .collect();
     let markdownize_bytes: u64 = included

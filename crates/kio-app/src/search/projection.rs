@@ -1441,18 +1441,25 @@ pub(crate) fn capture_ready_replica_snapshot(repo: &Repository) -> Option<ReadyR
 /// (the normal manual form) or byte-for-byte the prior reference.  Any new or
 /// changed normalization identity remains a normal unindexed snapshot and
 /// therefore stays Rebuilding.
-fn manual_snapshot_tree_matches_ready_projection(prior: &TreeObject, target: &TreeObject) -> bool {
-    prior.entries.len() == target.entries.len()
-        && prior
-            .entries
-            .iter()
-            .zip(&target.entries)
-            .all(|(prior, target)| {
-                prior.path == target.path
-                    && prior.entry_type == target.entry_type
-                    && prior.raw_hash == target.raw_hash
-                    && (target.normalize.is_none() || target.normalize == prior.normalize)
-            })
+fn manual_snapshot_tree_matches_ready_projection(
+    prior: &TreeObject,
+    target: &TreeObject,
+) -> Result<bool> {
+    if prior.entries.len() != target.entries.len() {
+        return Ok(false);
+    }
+    for (prior, target) in prior.entries.iter().zip(&target.entries) {
+        let prior = prior?;
+        let target = target?;
+        if prior.path != target.path
+            || prior.entry_type != target.entry_type
+            || prior.raw_hash != target.raw_hash
+            || !(target.normalize.is_none() || target.normalize == prior.normalize)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Read the exact current-tree relation a Ready source projection uses.  This
@@ -1492,22 +1499,21 @@ fn source_tree_entry_projections(
 /// Ready predecessor is reusable only when its source cache says exactly this
 /// relation; a fallback row inferred from mutable latest-normalize state
 /// is deliberately not promoted through a new snapshot.
-fn normalized_tree_entry_projections(tree: &TreeObject) -> Vec<TreeEntryProjection> {
-    tree.entries
-        .iter()
-        .filter_map(|entry| {
-            entry
-                .normalize
-                .as_ref()
-                .map(|normalize| TreeEntryProjection {
-                    path: entry.path.clone(),
-                    raw_hash: entry.raw_hash.clone(),
-                    tool_profile_hash: Some(normalize.tool_profile_hash.clone()),
-                    r#gen: Some(normalize.r#gen),
-                    manifest_hash: Some(normalize.manifest_hash.clone()),
-                })
-        })
-        .collect()
+fn normalized_tree_entry_projections(tree: &TreeObject) -> Result<Vec<TreeEntryProjection>> {
+    let mut rows = Vec::new();
+    for entry in &tree.entries {
+        let entry = entry?;
+        if let Some(normalize) = entry.normalize {
+            rows.push(TreeEntryProjection {
+                path: entry.path,
+                raw_hash: entry.raw_hash,
+                tool_profile_hash: Some(normalize.tool_profile_hash),
+                r#gen: Some(normalize.r#gen),
+                manifest_hash: Some(normalize.manifest_hash),
+            });
+        }
+    }
+    Ok(rows)
 }
 
 /// Reuse a just-prior Ready projection after a semantically unchanged manual
@@ -1582,7 +1588,9 @@ pub(crate) fn republish_equivalent_manual_snapshot(
     let target_tree = repo
         .read_tree(&target_commit.tree)
         .map_err(|error| format!("read target tree: {error}"))?;
-    if !manual_snapshot_tree_matches_ready_projection(&prior_tree, &target_tree) {
+    if !manual_snapshot_tree_matches_ready_projection(&prior_tree, &target_tree)
+        .map_err(|error| error.to_string())?
+    {
         return Ok(false);
     }
 
@@ -1605,7 +1613,8 @@ pub(crate) fn republish_equivalent_manual_snapshot(
         return Ok(false);
     }
 
-    let expected = normalized_tree_entry_projections(&prior_tree);
+    let expected =
+        normalized_tree_entry_projections(&prior_tree).map_err(|error| error.to_string())?;
     let source_rows = source_tree_entry_projections(&conn, &before.snapshot_commit)
         .map_err(|error| format!("read prior source tree entries: {error}"))?;
     if source_rows != expected {

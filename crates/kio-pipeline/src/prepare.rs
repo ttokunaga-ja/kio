@@ -101,7 +101,7 @@ pub struct UnitReuse {
 pub const MAX_UNIT_LCS_CELLS: usize = 2_000_000;
 
 pub fn prepare_units(request: PrepareStageRequest) -> Result<PrepareStageOutput> {
-    if crate::unsupported::is_source_code_path(Path::new(&request.input_path)) {
+    if crate::unsupported::unsupported_reason_for_path(Path::new(&request.input_path)).is_some() {
         return Ok(empty_prepare_output());
     }
     // R20-6: the local deterministic adapter only parses text (Markdown / plain text) and PDF text layers (docs/07 §7.1). A RECOGNIZED non-text-native binary (image
@@ -228,7 +228,7 @@ fn prepare_units_emitting(
     completed: &[PreparedUnit],
     emit: &mut PreparedUnitSink<'_>,
 ) -> Result<PrepareStageOutput> {
-    if crate::unsupported::is_source_code_path(Path::new(request.input_path)) {
+    if crate::unsupported::unsupported_reason_for_path(Path::new(request.input_path)).is_some() {
         return Ok(empty_prepare_output());
     }
     let media_type = request.media_type;
@@ -278,17 +278,7 @@ fn prepare_units_emitting(
             ),
         ));
     }
-    if !is_text_native
-        && !is_native_image
-        && !is_pdf
-        && !is_office
-        && !is_xlsx
-        && !bytes_are_text(bytes)
-    {
-        // Binary octet-stream (an unrecognized-extension binary blob): do NOT evidence its
-        // raw bytes as text — route to OCR like the other non-text-native media above.
-        // (Office media is binary too, but never reaches this text-passthrough check either
-        // way — the `is_office` exemption above skips it in favor of the conversion path.)
+    if unsupported_reason_for_content(media_type, bytes).is_some() {
         return Ok(empty_prepare_output());
     }
     let unit_type = unit_type_for_media_type(request.media_type);
@@ -742,6 +732,11 @@ fn bytes_are_text(bytes: &[u8]) -> bool {
         Ok(text) => is_probably_real_text(text),
         Err(_) => false,
     }
+}
+
+pub fn unsupported_reason_for_content(media_type: &str, bytes: &[u8]) -> Option<&'static str> {
+    (media_type == "application/octet-stream" && !bytes_are_text(bytes))
+        .then_some(crate::unsupported::UNSUPPORTED_REASON_UNRECOGNIZED_BINARY)
 }
 
 pub fn pdf_text_pages_bounded(bytes: &[u8]) -> Result<Vec<String>> {

@@ -1,13 +1,7 @@
 //! Native Linux renderer state and bubblewrap command.
-use crate::confinement::{ConfinementError, RenderResourceLimits, canonical_paths};
+use crate::confinement::{ConfinementError, RenderResourceLimits, RenderSources, RendererStart};
 use crate::{BoundedProcessOptions, BoundedProcessOutput};
-use std::{
-    collections::BTreeMap,
-    ffi::OsString,
-    path::{Path, PathBuf},
-    process::Command,
-    time::Duration,
-};
+use std::{collections::BTreeMap, ffi::OsString, path::PathBuf, process::Command, time::Duration};
 
 #[derive(Debug, Clone)]
 pub(crate) struct NativeRenderSandbox {
@@ -21,25 +15,23 @@ pub(crate) struct NativeRenderSandbox {
 
 impl NativeRenderSandbox {
     pub(crate) fn new(
-        program: &Path,
-        scratch: &Path,
-        runtime_roots: impl IntoIterator<Item = PathBuf>,
+        sources: &RenderSources,
+        scratch: PathBuf,
         limits: RenderResourceLimits,
-    ) -> Result<Self, ConfinementError> {
-        let paths = canonical_paths(program, scratch, runtime_roots)?;
+    ) -> Self {
         let mut mounts = BTreeMap::new();
-        for (destination, source) in paths.roots {
-            mounts.insert(destination, source);
+        for (destination, source) in &sources.roots {
+            mounts.insert(destination.clone(), source.clone());
         }
         // Selecting an executable authorizes that file, not its siblings.
         // A standalone renderer may live next to private source documents or
         // credentials; package directories must be supplied explicitly.
         mounts
-            .entry(paths.program.clone())
-            .or_insert_with(|| paths.program.clone());
-        Ok(Self {
-            program: paths.program,
-            scratch: paths.scratch,
+            .entry(sources.program.clone())
+            .or_insert_with(|| sources.program.clone());
+        Self {
+            program: sources.program.clone(),
+            scratch,
             runtime_mounts: mounts
                 .into_iter()
                 .map(|(destination, source)| (source, destination))
@@ -47,19 +39,20 @@ impl NativeRenderSandbox {
             limits,
             #[cfg(test)]
             test_fixture: Default::default(),
-        })
+        }
     }
     pub(crate) fn run<I, S>(
         &self,
         args: I,
         environment: &[(OsString, OsString)],
         options: BoundedProcessOptions,
+        start: RendererStart<'_>,
     ) -> Result<BoundedProcessOutput, ConfinementError>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<std::ffi::OsStr>,
     {
-        super::confinement_cgroup::run(self, args, environment, options)
+        super::confinement_cgroup::run(self, args, environment, options, start)
     }
 
     pub(super) fn linux_command<I, S>(&self, args: I) -> Result<Command, ConfinementError>

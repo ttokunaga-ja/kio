@@ -613,6 +613,14 @@ fn request_mistral_ocr_at_with_limits(
         .send(&body)
         .map_err(|error| match error {
             ureq::Error::Timeout(_) => OcrEvalError::Timeout(limits.global_timeout),
+            ureq::Error::Io(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                OcrEvalError::Timeout(limits.global_timeout)
+            }
             _ => OcrEvalError::Invalid("Mistral OCR network request failed"),
         })?;
     if !response.status().is_success() {

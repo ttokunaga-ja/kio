@@ -96,6 +96,7 @@ use kio_pipeline::task::TaskStatus;
 use kio_pipeline::task::TaskStore;
 use kio_pipeline::task::TaskType;
 use kio_pipeline::task::retry_policy;
+pub(crate) use kio_pipeline::task::task_retry_allowed;
 use kio_pipeline::unsupported::UNSUPPORTED_REASON_RESOLVED;
 use kio_pipeline::unsupported::UnsupportedInputDisposition;
 use kio_pipeline::unsupported::UnsupportedInputStore;
@@ -1205,16 +1206,6 @@ pub(crate) fn retry_kind_from_reason(reason: Option<&str>) -> RetryErrorKind {
         Some("budget_exceeded") => RetryErrorKind::BudgetExceeded,
         _ => RetryErrorKind::ContractViolation,
     }
-}
-
-pub(crate) fn task_retry_allowed(task: &TaskDescriptor) -> bool {
-    let kind = retry_kind_from_reason(task.fallback_reason.as_deref());
-    let policy = retry_policy(kind);
-    policy.retryable
-        && policy
-            .max_attempts
-            .map(|max| task.attempts < max)
-            .unwrap_or(true)
 }
 
 /// R19-2: an online-send failure carrying an F8 reservation (a NON-billable phantom for

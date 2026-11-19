@@ -23,19 +23,27 @@ pub(crate) fn private_temp_dir() -> Result<TempDir> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OfficeRuntime;
 impl OfficeRuntime {
-    pub(crate) fn new(_program: &Path) -> Result<Self> {
+    pub(crate) fn new(_program: &Path, _deadline: std::time::Instant) -> Result<Self> {
         Ok(Self)
     }
     pub(crate) fn catalog_digest(&self) -> Option<&str> {
         None
     }
-    pub(crate) fn validate_probe(&self, _stdout: &str) -> Result<()> {
-        Ok(())
+    pub(crate) fn package_roots(&self, program: &Path) -> Result<Vec<PathBuf>> {
+        if is_distro_renderer(program) {
+            return Ok(["/usr/lib/libreoffice", "/usr/share/libreoffice"]
+                .into_iter()
+                .map(PathBuf::from)
+                .filter(|path| path.is_dir())
+                .collect());
+        }
+        super::super::linux_package::linux_tdf_runtime_roots(program)
     }
     pub(crate) fn configure_services(
         &self,
         _scratch: &Path,
         _environment: &mut Vec<(OsString, OsString)>,
+        _deadline: std::time::Instant,
     ) -> Result<()> {
         Ok(())
     }
@@ -53,8 +61,7 @@ impl OfficeRuntime {
         roots.extend(super::super::linux_package::linux_tdf_runtime_roots(
             program,
         )?);
-        let package_program = Path::new("/usr/lib/libreoffice/program/soffice");
-        if std::fs::canonicalize(package_program).ok().as_deref() == Some(program) {
+        if is_distro_renderer(program) {
             let share = PathBuf::from("/usr/lib/libreoffice/share");
             if !share.is_dir() {
                 return Err(AdapterError::ContractViolation(
@@ -78,4 +85,9 @@ impl OfficeRuntime {
         }
         Ok(roots)
     }
+}
+
+fn is_distro_renderer(program: &Path) -> bool {
+    let distro_program = Path::new("/usr/lib/libreoffice/program/soffice");
+    std::fs::canonicalize(distro_program).ok().as_deref() == Some(program)
 }

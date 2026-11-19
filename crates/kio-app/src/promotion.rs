@@ -374,11 +374,17 @@ fn plan_online_markdownize_promotion(
         Err(error) if is_store_not_found(&error) => return Ok(None),
         Err(error) => return Err(error),
     };
-    let head_entries = head_tree
-        .entries
+    let task_paths = tasks
         .iter()
-        .map(|entry| (entry.path.as_str(), entry))
-        .collect::<BTreeMap<_, _>>();
+        .map(|task| task.input_path.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut head_entries = BTreeMap::new();
+    for entry in &head_tree.entries {
+        let entry = entry?;
+        if task_paths.contains(entry.path.as_str()) {
+            head_entries.insert(entry.path.clone(), entry);
+        }
+    }
     // Establish that the task still describes the live HEAD/working identity
     // before opening its normalized output. A corrupt output for the current
     // identity is fatal, but a stale previous generation must not break a later
@@ -552,11 +558,6 @@ fn plan_local_markdownize_promotion(
     };
     let head = repo.read_commit(&head_hash)?;
     let tree = repo.read_tree(&head.tree)?;
-    let entries = tree
-        .entries
-        .iter()
-        .map(|entry| (entry.path.as_str(), entry))
-        .collect::<BTreeMap<_, _>>();
     let mut tasks = TaskStore::new_with_control(repo.kio_dir(), repo.control().clone())
         .all()
         .map_err(pipeline_to_kio)?;
@@ -567,6 +568,17 @@ fn plan_local_markdownize_promotion(
             .then_with(|| left.created_at.cmp(&right.created_at))
             .then_with(|| left.task_id.cmp(&right.task_id))
     });
+    let task_paths = tasks
+        .iter()
+        .map(|task| task.input_path.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut entries = BTreeMap::new();
+    for entry in &tree.entries {
+        let entry = entry?;
+        if task_paths.contains(entry.path.as_str()) {
+            entries.insert(entry.path.clone(), entry);
+        }
+    }
     let mut normalize_by_path = BTreeMap::new();
     for task in tasks {
         if task.task_type != TaskType::Markdownize

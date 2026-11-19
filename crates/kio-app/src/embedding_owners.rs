@@ -302,7 +302,8 @@ pub(super) fn collect_retained_embedding_chunks(
     let mut bindings = OwnerBindings::default();
     for node in graph.nodes_in_visit_order() {
         for entry in &node.tree.entries {
-            bindings.record(entry, node.commit_hash == head);
+            let entry = entry?;
+            bindings.record(&entry, node.commit_hash == head);
         }
     }
     let mut blocked = BTreeMap::new();
