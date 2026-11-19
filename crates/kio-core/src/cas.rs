@@ -835,7 +835,6 @@ fn bound_stream_regular(
         cas_semantics::configure_bound_read(&mut options);
         let mut file = cap_fs::open(parent, name, &options)
             .map_err(|error| bound_io_or_not_found(error, leaf))?;
-        crate::private_fs::verify_private_regular_file_handle(&file)?;
         let opened = cap_fs::Metadata::from_file(&file).kio_io(label)?;
         let named = cap_fs::stat(parent, name, cap_fs::FollowSymlinks::No)
             .map_err(|error| bound_io_or_not_found(error, leaf))?;
@@ -847,6 +846,7 @@ fn bound_stream_regular(
         {
             return Err(non_regular_object_error(label));
         }
+        crate::private_fs::verify_private_regular_file_handle(&file)?;
         if opened.len() > max {
             return Err(KioError::new(
                 "KIO-E-STORE-OBJECT-OVERSIZED-001",
@@ -879,7 +879,6 @@ fn bound_stream_regular(
             }
             consume(&buffer[..count])?;
         }
-        crate::private_fs::verify_private_regular_file_handle(&file)?;
         let finished = cap_fs::Metadata::from_file(&file).kio_io(label)?;
         let named = cap_fs::stat(parent, name, cap_fs::FollowSymlinks::No)
             .map_err(|error| bound_io_or_not_found(error, leaf))?;
@@ -899,6 +898,7 @@ fn bound_stream_regular(
                 None,
             ));
         }
+        crate::private_fs::verify_private_regular_file_handle(&file)?;
         Ok(consumed)
     })();
     (result, consumed)
@@ -3230,34 +3230,27 @@ mod tests {
 
         let error = store.write_raw(expected).unwrap_err();
         assert_eq!(error.error_code(), "KIO-E-STORE-CORRUPT-001");
+        assert_eq!(fs::read(&path).unwrap(), expected);
+        assert_eq!(fs::read(&outside).unwrap(), expected);
     }
 
     #[test]
     fn st04_review_materializing_reads_reject_raw_without_consuming_payload() {
         let dir = tempfile::tempdir().unwrap();
         let repo = crate::scope::Repository::init(dir.path()).unwrap();
+        let ambient = ObjectStore::new(repo.kio_dir());
         let hash = hash_bytes(b"sparse mock");
-        let path = fanout_path(repo.kio_dir().join("objects/raw"), &hash).unwrap();
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            for p in [
-                path.parent().unwrap(),
-                path.parent().unwrap().parent().unwrap(),
-            ] {
-                fs::set_permissions(p, fs::Permissions::from_mode(0o700)).unwrap();
-            }
-        }
-        let file = File::create(&path).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-        }
+        ambient
+            .ensure_object_parent(ObjectKind::Raw, &hash)
+            .unwrap();
+        let path = ambient.object_path(ObjectKind::Raw, &hash).unwrap();
+        let parent = crate::store_dir::StoreDirectory::open(path.parent().unwrap()).unwrap();
+        let file = parent
+            .create_private_file(Path::new(path.file_name().unwrap()))
+            .unwrap();
         file.set_len(1 << 30).unwrap();
         drop(file);
-        for store in [repo.object_store(), ObjectStore::new(repo.kio_dir())] {
+        for store in [repo.object_store(), ambient] {
             VerifiedCasReadBudget::new()
                 .run(CAS_STREAM_BUFFER_BYTES as u64, |reads| {
                     let bound = store.with_verified_reads(reads)?;
@@ -3275,13 +3268,11 @@ mod tests {
                             .exit_code(),
                         crate::ExitCode::InvalidUsage
                     );
-                    assert_eq!(
-                        bound
-                            .read_object_accounted(ObjectKind::Raw, &hash)
-                            .unwrap_err()
-                            .consumed_bytes,
-                        0
-                    );
+                    let error = bound
+                        .read_object_accounted(ObjectKind::Raw, &hash)
+                        .unwrap_err();
+                    assert_eq!(error.error.exit_code(), crate::ExitCode::InvalidUsage);
+                    assert_eq!(error.consumed_bytes, 0);
                     assert_eq!(
                         bound.read_by_hash(&hash).unwrap_err().exit_code(),
                         crate::ExitCode::InvalidUsage
@@ -3755,8 +3746,7 @@ mod tests {
             store.repair_raw(&hash, expected).unwrap_err().error_code(),
             "KIO-E-STORE-CORRUPT-001"
         );
-        assert!(path.exists());
-        assert!(outside.exists());
+        assert_eq!(fs::read(&path).unwrap(), b"linked corrupt bytes");
         assert_eq!(fs::read(&outside).unwrap(), b"linked corrupt bytes");
     }
 
