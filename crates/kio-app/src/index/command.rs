@@ -768,7 +768,7 @@ fn run_index_for_repo_inner(
             crate::batch::command::recheck_resource_limit,
         )?;
     }
-    let (index_result, unsupported) =
+    let (index_result, observations) =
         run_index_pipeline(adapter_settings, repo, &preview, &args, ledger.as_ref())?;
     invocation_state.defer(repo, index_result.deferred_budget.finish()?)?;
     // A prior batch may already have produced a complete accepted online
@@ -777,11 +777,12 @@ fn run_index_for_repo_inner(
     // second promotion commit.
     let normalizes = sorted_normalizes(&stages, index_result.normalizes.finish()?)?;
     let promotion = apply_online_promotion_to_index(adapter_settings, repo, &normalizes)?;
-    let selected = if unsupported.is_empty() && promotion.is_none() {
+    let selected = if observations.is_empty() && promotion.is_none() {
         normalizes
     } else {
-        let mut unsupported_paths = SortedRecordCursor::new(unsupported.iter(), |row| &row.path);
-        let mut selected = RecordWriter::new_lazy(&stages);
+        let mut observations_by_path =
+            SortedRecordCursor::new(observations.iter(), |row| &row.path);
+        let mut selected = RecordWriter::new(&stages)?;
         let rows = kio_core::disk_records::merge_sorted_records(
             normalizes.iter(),
             promotion.iter().flat_map(|stage| stage.iter()),
@@ -796,7 +797,10 @@ fn run_index_for_repo_inner(
             {
                 continue;
             }
-            if unsupported_paths.at(&row.0)?.is_none() {
+            if !observations_by_path
+                .at(&row.0)?
+                .is_some_and(UnsupportedInputDisposition::is_unsupported)
+            {
                 selected.push(&row)?;
             }
         }
@@ -813,7 +817,7 @@ fn run_index_for_repo_inner(
             verify_snapshot_inputs(
                 tree,
                 &preview,
-                unsupported
+                observations
                     .iter()
                     .map(|row| row.map(|row| (row.path, row.raw_hash))),
             )
@@ -1706,7 +1710,7 @@ pub(crate) fn unsupported_inputs_at_head(
     head: Option<&str>,
 ) -> Result<DiskRecords<UnsupportedInputDisposition>> {
     let (_, dispositions) = dispositions_at_head(repo, head)?;
-    let mut unsupported = RecordWriter::new_lazy(&RecordStageRoot::temporary()?);
+    let mut unsupported = RecordWriter::new(&RecordStageRoot::temporary()?)?;
     for row in dispositions {
         let row = row?;
         if row.is_unsupported() {
@@ -1796,33 +1800,30 @@ fn dispositions_at_head(repo: &Repository, head: Option<&str>) -> Result<HeadDis
     Ok((Some(tree), dispositions))
 }
 
-pub(crate) fn record_unsupported_if_changed(
-    store: &UnsupportedInputStore,
+pub(crate) fn stage_unsupported_if_changed(
+    observations: &mut RecordWriter<UnsupportedInputDisposition>,
     latest: &mut Option<UnsupportedInputDisposition>,
     disposition: UnsupportedInputDisposition,
-) -> Result<bool> {
-    if latest.as_ref() == Some(&disposition) {
-        return Ok(false);
+) -> Result<()> {
+    if latest.as_ref() != Some(&disposition) {
+        observations.push(&disposition)?;
+        *latest = Some(disposition);
     }
-    store.record(&disposition).map_err(pipeline_to_kio)?;
-    *latest = Some(disposition);
-    Ok(true)
+    Ok(())
 }
 
 fn snapshot_scan_policy(
     stages: &RecordStageRoot,
     preview: &ScanPreview,
 ) -> Result<DiskRecords<ScannedPathPolicy>> {
-    let mut policy = RecordWriter::new_lazy(stages);
+    let mut policy = RecordWriter::new(stages)?;
     for candidate in &preview.candidates {
         let candidate = candidate?;
-        let allow_tier_a = !candidate.ignored
-            && candidate.quarantine_reason.as_deref() == Some("secrets_tier_a_online_hold");
-        if candidate.ignored || allow_tier_a {
+        if !candidate.ignored && candidate.media_type != "inode/directory" {
             policy.push(&ScannedPathPolicy {
                 path: candidate.input_path,
-                excluded: candidate.ignored,
-                allow_tier_a,
+                allow_tier_a: candidate.quarantine_reason.as_deref()
+                    == Some("secrets_tier_a_online_hold"),
             })?;
         }
     }
@@ -1834,20 +1835,19 @@ fn verify_snapshot_inputs(
     preview: &ScanPreview,
     classified_raws: impl Iterator<Item = Result<(String, String)>>,
 ) -> Result<()> {
-    let mut scanned_paths = preview.candidates.iter().filter_map(|row| match row {
+    let mut scanned = preview.candidates.iter().filter_map(|row| match row {
         Ok(row) if row.ignored || row.media_type == "inode/directory" => None,
-        row => Some(row.map(|row| row.input_path)),
+        row => Some(row),
     });
     let mut captured = tree.entries.iter();
     let mut classified = SortedRecordCursor::new(classified_raws, |row| &row.0);
     // Both the bound scan and the canonical tree sort by path bytes.
     loop {
-        let entry = match (
-            scanned_paths.next().transpose()?,
-            captured.next().transpose()?,
-        ) {
+        let (candidate, entry) = match (scanned.next().transpose()?, captured.next().transpose()?) {
             (None, None) => return Ok(()),
-            (Some(path), Some(entry)) if path == entry.path => entry,
+            (Some(candidate), Some(entry)) if candidate.input_path == entry.path => {
+                (candidate, entry)
+            }
             _ => {
                 return Err(pipeline_to_kio(kio_pipeline::PipelineError::contract(
                     "KIO-E-SCAN-INPUT-CHANGED-001",
@@ -1855,9 +1855,10 @@ fn verify_snapshot_inputs(
                 )));
             }
         };
-        if classified
-            .at(&entry.path)?
-            .is_some_and(|row| row.1 != entry.raw_hash)
+        if candidate.raw_hash.as_deref() != Some(entry.raw_hash.as_str())
+            || classified
+                .at(&entry.path)?
+                .is_some_and(|row| row.1 != entry.raw_hash)
         {
             return Err(pipeline_to_kio(kio_pipeline::PipelineError::contract(
                 "KIO-E-SCAN-INPUT-CHANGED-001",
@@ -1995,7 +1996,7 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
         &repo,
         ScanPreviewRequest {
             scope_path: repo.root().display().to_string(),
-            include_raw_hashes: false,
+            include_raw_hashes: true,
             require_network_approval: false,
         },
         repo.object_store().record_stages()?,
@@ -2004,7 +2005,7 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
     let scan_policy = snapshot_scan_policy(&stages, &closing_preview)?;
     let classified = record_reindex_unsupported_inputs(&repo, &closing_preview, &tree)?;
     let mut unsupported_paths = SortedRecordCursor::new(classified.iter(), |row| &row.path);
-    let mut normalizes = RecordWriter::new_lazy(&stages);
+    let mut normalizes = RecordWriter::new(&stages)?;
     let mut reindexed = 0u64;
     // R17-2: a single document's missing/corrupt normalized unit must not abort the
     // whole re-normalization — the same docs/10 §7.2 resilience R16-4 gave the shared
@@ -2013,7 +2014,7 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
     // copy). A skippable failure keeps the document's PREVIOUS gen (so the snapshot
     // still points at its last-good normalized instance and search keeps serving that
     // gen's cached chunks) and is recorded; healthy documents still re-normalize.
-    let mut reindex_skipped = RecordWriter::new_lazy(&stages);
+    let mut reindex_skipped = RecordWriter::new(&stages)?;
     for entry in &tree.entries {
         let entry = entry?;
         if unsupported_paths

@@ -4,11 +4,10 @@ use crate::egress::SECRETS_TIER_B_HOLD;
 use crate::egress::network_allowed;
 use crate::historical_reindex::pinned_manifest_is_complete;
 use crate::image_ingest;
-use crate::index::command::OFFICE_CONVERSION_UNAVAILABLE_REASON;
 use crate::index::command::read_repository_scan_input;
-use crate::index::command::record_unsupported_if_changed;
 use crate::index::command::repository_input_display_path;
 use crate::index::command::repository_scan_policy_allows_file;
+use crate::index::command::stage_unsupported_if_changed;
 use crate::index::rebuild::read_head_tree_for_rebuild;
 use crate::ledger_access::release_task_charge_if_open;
 use crate::ledger_access::task_ledger_key;
@@ -118,9 +117,9 @@ pub(crate) fn index_preview_response(
     preview: &ScanPreview,
 ) -> Result<IndexPreviewResponse> {
     let stages = RecordStageRoot::temporary()?;
-    let mut large = RecordWriter::new_lazy(&stages);
-    let mut excluded = RecordWriter::new_lazy(&stages);
-    let mut sensitive = RecordWriter::new_lazy(&stages);
+    let mut large = RecordWriter::new(&stages)?;
+    let mut excluded = RecordWriter::new(&stages)?;
+    let mut sensitive = RecordWriter::new(&stages)?;
     let mut count = 0;
     let mut bytes = 0;
     for candidate in &preview.candidates {
@@ -209,7 +208,7 @@ pub(crate) fn sorted_normalizes(
     for row in rows {
         sorter.push(row?)?;
     }
-    let mut result = RecordWriter::new_lazy(stages);
+    let mut result = RecordWriter::new(stages)?;
     let mut previous: Option<(String, PendingNormalizeRef)> = None;
     for row in sorter.finish()? {
         let (path, pending) = row?;
@@ -619,8 +618,8 @@ pub(super) fn record_reindex_unsupported_inputs(
     let store = UnsupportedInputStore::new(repo.kio_dir())
         .with_published_tree(Some(head_tree))
         .with_record_stages(stages.clone());
-    let mut observations = RecordWriter::new_lazy(&stages);
-    let mut classified = RecordWriter::new_lazy(&stages);
+    let mut observations = RecordWriter::new(&stages)?;
+    let mut classified = RecordWriter::new(&stages)?;
     for candidate in &preview.candidates {
         let candidate = &candidate?;
         if candidate.ignored {
@@ -768,7 +767,7 @@ pub(crate) fn run_index_pipeline(
 
     let stages = repo.object_store().record_stages()?;
     let mut result = IndexPipelineResult {
-        normalizes: RecordWriter::new_lazy(&stages),
+        normalizes: RecordWriter::new(&stages)?,
         network_allowed,
         resource_limit: None,
         pending_online_tasks: 0,
@@ -806,16 +805,13 @@ pub(crate) fn run_index_pipeline(
         |entry| &entry.path,
     );
 
-    let mut unsupported_observations = RecordWriter::new_lazy(&stages);
+    let mut unsupported_observations = RecordWriter::new(&stages)?;
     for candidate in &preview.candidates {
         let candidate = &candidate?;
         if candidate.ignored || candidate.media_type == "inode/directory" {
             continue;
         }
         let mut latest_unsupported = unsupported_by_path.at(&candidate.input_path)?.cloned();
-        let mut office_conversion_unavailable = latest_unsupported
-            .as_ref()
-            .is_some_and(|row| row.reason == OFFICE_CONVERSION_UNAVAILABLE_REASON);
         let unsupported_reason = unsupported_reason_for_path(Path::new(&candidate.input_path));
         if candidate.size_bytes > max_input_bytes && unsupported_reason.is_none() {
             result.skipped_oversized_files += 1;
@@ -1017,9 +1013,8 @@ pub(crate) fn run_index_pipeline(
                     &now,
                     &mut result,
                     ledger,
-                    &unsupported_store,
+                    &mut unsupported_observations,
                     &mut latest_unsupported,
-                    &mut office_conversion_unavailable,
                 )?;
             }
             continue;
@@ -1031,8 +1026,8 @@ pub(crate) fn run_index_pipeline(
                 .as_ref()
                 .is_some_and(UnsupportedInputDisposition::is_unsupported)
             {
-                record_unsupported_if_changed(
-                    &unsupported_store,
+                stage_unsupported_if_changed(
+                    &mut unsupported_observations,
                     &mut latest_unsupported,
                     UnsupportedInputDisposition {
                         path: candidate.input_path.clone(),
@@ -1054,9 +1049,8 @@ pub(crate) fn run_index_pipeline(
                     &now,
                     &mut result,
                     ledger,
-                    &unsupported_store,
+                    &mut unsupported_observations,
                     &mut latest_unsupported,
-                    &mut office_conversion_unavailable,
                 )?;
             }
             continue;
@@ -1066,8 +1060,8 @@ pub(crate) fn run_index_pipeline(
             .as_ref()
             .is_some_and(UnsupportedInputDisposition::is_unsupported)
         {
-            record_unsupported_if_changed(
-                &unsupported_store,
+            stage_unsupported_if_changed(
+                &mut unsupported_observations,
                 &mut latest_unsupported,
                 UnsupportedInputDisposition {
                     path: candidate.input_path.clone(),
@@ -1166,9 +1160,8 @@ pub(crate) fn run_index_pipeline(
                     &now,
                     &mut result,
                     ledger,
-                    &unsupported_store,
+                    &mut unsupported_observations,
                     &mut latest_unsupported,
-                    &mut office_conversion_unavailable,
                 )?;
             }
             continue;
@@ -1457,9 +1450,8 @@ pub(crate) fn run_index_pipeline(
                 &now,
                 &mut result,
                 ledger,
-                &unsupported_store,
+                &mut unsupported_observations,
                 &mut latest_unsupported,
-                &mut office_conversion_unavailable,
             )?;
         }
     }

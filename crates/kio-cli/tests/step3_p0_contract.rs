@@ -9297,28 +9297,27 @@ fn assert_published_free_record(dir: &TempDir, target: &str, task_id: &str, atte
         .into_iter()
         .find(|(_, row)| row["key"] == record["key"])
         .unwrap();
-    let bytes = fs::read(
-        dir.path()
-            .join(".test-state/kio/local-execution")
-            .join(path.parent().unwrap())
-            .join("result.bin"),
-    )
-    .unwrap();
+    let record_path = dir
+        .path()
+        .join(".test-state/kio/local-execution")
+        .join(path);
+    let bytes = fs::read(record_path.with_file_name("result.bin")).unwrap();
     assert_eq!(record["phase"]["bytes"], bytes.len());
-    // Local result integrity binds the exact job identity and claim token,
-    // as well as the bytes (docs/04 §5.4); it is not a plain CAS digest.
+    // The result binds the full recorded identity (including the original
+    // members), the claim token and the bytes. Preserve the identity's serialized
+    // field order when hashing it. The document retry key has a different scope.
+    use kio_core::cas::lower_hex;
     use sha2::{Digest, Sha256};
+    let record_bytes = fs::read(record_path).unwrap();
+    let fields: std::collections::BTreeMap<&str, &serde_json::value::RawValue> =
+        serde_json::from_slice(&record_bytes).unwrap();
+    let identity_digest = lower_hex(&Sha256::digest(fields["identity"].get().as_bytes()));
     let mut digest = Sha256::new();
     digest.update(b"kio.local-execution.result/v1\0");
-    digest.update(record["key"].as_str().unwrap().as_bytes());
+    digest.update(identity_digest.as_bytes());
     digest.update(record["token"].as_str().unwrap().as_bytes());
     digest.update(&bytes);
-    let digest = digest
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    assert_eq!(record["phase"]["digest"], digest);
+    assert_eq!(record["phase"]["digest"], lower_hex(&digest.finalize()));
 }
 fn free_trace(dir: &TempDir) -> Vec<Value> {
     fs::read_to_string(dir.path().join(".test-data/free-task.trace"))
@@ -15157,7 +15156,7 @@ fn pause_nc2_reindex(dir: &TempDir, ready: &Path) -> std::process::Child {
 
 #[cfg(debug_assertions)]
 #[test]
-fn nc2_reindex_aborts_when_classified_bytes_change_before_snapshot() {
+fn nc2_aborts_when_classified_bytes_change_before_snapshot() {
     let dir = canonical_tempdir();
     let path = dir.path().join("document.cfg");
     let original = b"racedneedle searchable text\n";
@@ -15167,36 +15166,30 @@ fn nc2_reindex_aborts_when_classified_bytes_change_before_snapshot() {
     let kio_dir = dir.path().join(".kio");
     let head = head_commit(&kio_dir);
 
-    fs::write(&path, b"\xff").unwrap();
     // Put the raced path after more than one run of classified inputs.
     for n in 0..=kio_core::disk_records::SORT_BUFFER_RECORDS {
         fs::write(dir.path().join(format!("{n:05}.rs")), "source fixture").unwrap();
     }
-    let markers = canonical_tempdir();
-    let ready = markers.path().join("ready");
-    let child = pause_nc2_reindex(&dir, &ready);
+    for command in [NC2_REINDEX, &["index", "--yes", "--offline"][..]] {
+        // Cover both directions, including a recognized text file whose
+        // classification can become stale when binary content replaces it.
+        for (before, after) in [
+            (b"\xff".as_slice(), original.as_slice()),
+            (original, b"\xff"),
+        ] {
+            fs::write(&path, before).unwrap();
+            let output = nc2_change_before_snapshot(&dir, command, || {
+                fs::write(&path, after).unwrap();
+            });
+            let error = assert_nc2_input_changed(command, &output);
+            assert!(
+                error["message"].as_str().unwrap().contains("document.cfg"),
+                "{command:?}: {error}"
+            );
+            assert_eq!(head_commit(&kio_dir), head);
+        }
+    }
     fs::write(&path, original).unwrap();
-    fs::write(ready.with_extension("release"), b"release").unwrap();
-    let output = child.wait_with_output().unwrap();
-    assert!(
-        !output.status.success(),
-        "raced reindex published: {output:?}"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let error: Value = stderr
-        .lines()
-        .rev()
-        .find_map(|line| serde_json::from_str(line).ok())
-        .unwrap_or_else(|| panic!("missing reindex error: {stderr}"));
-    assert_eq!(
-        error["error_code"], "KIO-E-SCAN-INPUT-CHANGED-001",
-        "{error}"
-    );
-    assert!(
-        error["message"].as_str().unwrap().contains("document.cfg"),
-        "{error}"
-    );
-    assert_eq!(head_commit(&kio_dir), head);
     let search = json_success(&dir, &["search", "racedneedle", "--mode", "text"]);
     pointer_for_path(&search, "document.cfg");
     json_success(&dir, &["reindex", "--regenerate", "--yes", "--offline"]);
@@ -15320,46 +15313,99 @@ fn nc2_purge_cannot_delete_raw_from_pending_publication() {
 
 #[cfg(debug_assertions)]
 #[test]
-fn nc2_rejects_renamed_or_added_inputs_before_snapshot() {
+fn nc2_rejects_renamed_inputs_before_snapshot() {
     for command in [NC2_REINDEX, &["index", "--yes", "--offline"][..]] {
-        for rename in [true, false] {
-            let dir = canonical_tempdir();
-            let original = dir.path().join("a.cfg");
-            let added = dir.path().join("b.cfg");
-            fs::write(&original, b"\xff").unwrap();
-            json_success(&dir, &["init"]);
-            json_success(&dir, &["index", "--yes", "--offline"]);
-            let kio_dir = dir.path().join(".kio");
-            let head = head_commit(&kio_dir);
-            let markers = canonical_tempdir();
-            let ready = markers.path().join("ready");
-            let child = pause_nc2_command(&dir, &ready, "before_index_snapshot", command);
-            if rename {
-                fs::rename(original, &added).unwrap();
-            } else {
-                fs::write(&added, b"\xfe").unwrap();
-            }
-            fs::write(ready.with_extension("release"), b"release").unwrap();
-            let output = child.wait_with_output().unwrap();
-            assert!(
-                !output.status.success(),
-                "{command:?}, rename={rename}: {output:?}"
-            );
-            assert_eq!(head_commit(&kio_dir), head);
-            json_success(&dir, command);
-            let status = json_success(&dir, &["status"]);
-            assert!(
-                status["unsupported_inputs"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|row| {
-                        row["path"] == "b.cfg"
-                            && row["reason"] == "unrecognized_binary_without_local_text"
-                    }),
-                "{status}"
-            );
+        let dir = canonical_tempdir();
+        let original = dir.path().join("a.cfg");
+        let renamed = dir.path().join("b.cfg");
+        fs::write(&original, b"\xff").unwrap();
+        json_success(&dir, &["init"]);
+        json_success(&dir, &["index", "--yes", "--offline"]);
+        let kio_dir = dir.path().join(".kio");
+        let head = head_commit(&kio_dir);
+        let output = nc2_change_before_snapshot(&dir, command, || {
+            fs::rename(original, &renamed).unwrap();
+        });
+        assert_nc2_input_changed(command, &output);
+        assert_eq!(head_commit(&kio_dir), head);
+        json_success(&dir, command);
+        let status = json_success(&dir, &["status"]);
+        assert_eq!(status["unsupported_inputs"][0]["path"], "b.cfg");
+        assert_eq!(
+            status["unsupported_inputs"][0]["reason"],
+            "unrecognized_binary_without_local_text"
+        );
+    }
+}
+
+#[cfg(debug_assertions)]
+fn nc2_change_before_snapshot(
+    dir: &TempDir,
+    command: &[&str],
+    change: impl FnOnce(),
+) -> std::process::Output {
+    let markers = canonical_tempdir();
+    let ready = markers.path().join("ready");
+    let child = pause_nc2_command(dir, &ready, "before_index_snapshot", command);
+    change();
+    fs::write(ready.with_extension("release"), b"release").unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[cfg(debug_assertions)]
+fn assert_nc2_input_changed(command: &[&str], output: &std::process::Output) -> Value {
+    assert!(!output.status.success(), "{command:?}: {output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let error: Value = serde_json::from_str(stderr.lines().last().unwrap_or_default())
+        .unwrap_or_else(|err| panic!("{command:?}: invalid error response ({err}): {stderr}"));
+    assert_eq!(
+        error["error_code"], "KIO-E-SCAN-INPUT-CHANGED-001",
+        "{command:?}: {stderr}"
+    );
+    error
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn nc2_defers_files_added_after_scanning() {
+    let index = &["index", "--yes", "--offline"][..];
+    for (command, additional_inputs) in [
+        (NC2_REINDEX, 0),
+        (index, kio_core::disk_records::SORT_BUFFER_RECORDS + 1),
+    ] {
+        let dir = canonical_tempdir();
+        fs::write(dir.path().join("a.md"), "# Original\n\noriginal text\n").unwrap();
+        for n in 0..additional_inputs {
+            fs::write(dir.path().join(format!("z{n:05}.rs")), "source fixture").unwrap();
         }
+        json_success(&dir, &["init"]);
+        json_success(&dir, &["index", "--yes", "--offline"]);
+        let added_raw = kio_core::cas::hash_bytes(b"\xff");
+        let output = nc2_change_before_snapshot(&dir, command, || {
+            fs::write(dir.path().join("b.cfg"), b"\xff").unwrap();
+        });
+        assert!(output.status.success(), "{command:?}: {output:?}");
+        let repo = Repository::open_read_only(dir.path()).unwrap();
+        let head = repo
+            .read_commit(&repo.head_commit_hash().unwrap().unwrap())
+            .unwrap();
+        let tree = repo.read_tree(&head.tree).unwrap();
+        assert!(tree.find_entry("a.md").unwrap().is_some());
+        assert!(tree.find_entry("b.cfg").unwrap().is_none());
+        let error = repo
+            .object_store()
+            .inspect_object(ObjectKind::Raw, &added_raw)
+            .unwrap_err();
+        assert_eq!(error.error_code(), "KIO-E-STORE-NOT-FOUND-001");
+
+        json_success(&dir, &["index", "--yes", "--offline"]);
+        let status = json_success(&dir, &["status"]);
+        assert_eq!(status["unsupported_inputs"][0]["path"], "b.cfg");
+        assert_eq!(status["unsupported_inputs"][0]["raw_hash"], added_raw);
+        assert_eq!(
+            status["unsupported_inputs"][0]["reason"],
+            "unrecognized_binary_without_local_text"
+        );
     }
 }
 

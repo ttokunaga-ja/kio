@@ -964,7 +964,7 @@ tree は entries を単一の flat 配列で持つ。スコープ境界規則 (�
   常駐させない。実資源不足は件数超過／破損と区別して理由を表示し、entry を黙って捨てない。
 - `index`（preview を含む）、`reindex`、watch、`status` の working tree 走査も、候補の列挙・照合と
   ファイルごとの結果を有界 buffer と逐次 reader で処理し、ファイル数に比例する走査メモリを確保しない。
-  一時記録には tree と同じ private disk stage を使い、store を変更しない preview は private な作業ディレクトリを使う。
+  書き出しには tree と同じ private disk stage を使う。store を変更しない preview は private な作業ディレクトリに書き出す。
 - snapshot 時に tree_hash が現在の HEAD の tree と一致する場合、auto snapshot は commit を作らない (no-op。**例外 = resurrection finalize と tool_lock_hash の変化** — no-op 判定は tree_hash と commit の tool_lock_hash の両方を比較する。正本 [05-runtime.md §8.1](05-runtime.md))。tree は CAS object なので、内容不変なら新規 object も生成されない (tree_hash は保存バイト列の content hash、§8.1)
 - 1 ファイルの変更で tree 全体 (上表のサイズ) が新 object として書かれるのは仕様どおりの挙動である。
 
@@ -984,11 +984,13 @@ file を途中まで保存して成功扱いせず、未保存 file を削除扱
 回収と残骸の報告は、有界 buffer で列挙・照合し、結果を逐次処理する。
 `status` の `stage_residues` と `repair verify-objects` の finding に、その path と理由を表示する。
 
-tree の外部 sort や逐次 reader の一時記録は、操作対象の store の private 領域
-`internal/record-stages/` に置く。store を変更しない GC の読取や manifest の検証、評価ツールでは、
-呼出し側が用意した private な作業ディレクトリを使う。
-記録を書き始める前に、run directory・記録・lease の identity を journal に保存する。
-逐次 reader は、実際に読み取った各フレームを認証してから照合や出力に渡す。
+tree の外部 sort や逐次 reader の一時記録は、run ごとの件数・byte 数と、複数の run を
+同時に保持するときの合計 byte 数に上限を設けてメモリに保持する。
+上限を超える run は、操作対象の store の private 領域 `internal/record-stages/` に書き出す。
+store を変更しない GC の読取や manifest の検証、評価ツールでは、呼出し側が用意した private な
+作業ディレクトリに書き出す。
+ディスクに記録を書き始める前に、run directory・記録・lease の identity を journal に保存する。
+逐次 reader は、ディスクから実際に読み取った各フレームを認証してから照合や出力に渡す。
 生存中の lease は回収せず、再試行時に保存した identity が一致する非稼働の記録だけを回収する。
 確定できない記録は保持する。store 内の残骸は同じ `stage_residues` と finding に表示する。
 

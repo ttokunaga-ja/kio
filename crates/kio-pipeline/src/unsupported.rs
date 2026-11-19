@@ -212,7 +212,7 @@ impl UnsupportedInputStore {
         let mut previous = String::new();
         let mut ordered = true;
         let mut sequence = 0;
-        let mut spool = RecordWriter::new_lazy(&stages);
+        let mut spool = RecordWriter::new(&stages).map_err(|e| self.stage_error(e))?;
         let old_count = self.read_bound(directory, |row| {
             ordered &= previous <= row.path;
             previous.clone_from(&row.path);
@@ -234,7 +234,7 @@ impl UnsupportedInputStore {
             }
             journal = sorter.finish().map_err(|e| self.stage_error(e))?;
         }
-        let mut additions = RecordWriter::new_lazy(&stages);
+        let mut additions = RecordWriter::new(&stages).map_err(|e| self.stage_error(e))?;
         let mut previous = String::new();
         for row in observations {
             let row = row.map_err(|e| self.stage_error(e))?;
@@ -258,9 +258,11 @@ impl UnsupportedInputStore {
                 .flat_map(|tree| tree.entries.iter()),
             |entry: &TreeEntry| &entry.path,
         );
-        let mut rows = RecordWriter::new_lazy(&stages);
+        let mut rows = RecordWriter::new(&stages).map_err(|e| self.stage_error(e))?;
         let mut retained_latest = match kind {
-            ProjectionKind::Retained => Some(RecordWriter::new_lazy(&stages)),
+            ProjectionKind::Retained => {
+                Some(RecordWriter::new(&stages).map_err(|e| self.stage_error(e))?)
+            }
             _ => None,
         };
         let mut changed = false;

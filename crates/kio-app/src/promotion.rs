@@ -449,7 +449,7 @@ fn plan_online_markdownize_promotion(
         })
         .collect::<BTreeMap<_, _>>();
 
-    let mut normalizes = RecordWriter::new_lazy(&stages);
+    let mut normalizes = RecordWriter::new(&stages)?;
     let mut current = current.finish()?.into_iter().peekable();
     let mut last_hash = None;
     let mut latest_for_policy = [None, None];
@@ -552,7 +552,7 @@ fn plan_local_markdownize_promotion(
     });
     let mut entries = SortedRecordCursor::new(tree.entries.iter(), |entry| &entry.path);
     let stages = repo.object_store().record_stages()?;
-    let mut normalizes = RecordWriter::new_lazy(&stages);
+    let mut normalizes = RecordWriter::new(&stages)?;
     let mut previous: Option<(String, PendingNormalizeRef)> = None;
     for task in tasks {
         if task.task_type != TaskType::Markdownize

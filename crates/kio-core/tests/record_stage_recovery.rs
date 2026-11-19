@@ -1,6 +1,9 @@
 //! A killed process cannot run Drop; saved stage identities must survive it.
 use kio_core::{
-    cas::ObjectStore, disk_records::RecordWriter, scope::Repository, store_dir::StoreDirectory,
+    cas::ObjectStore,
+    disk_records::{RecordWriter, SORT_BUFFER_RECORDS},
+    scope::Repository,
+    store_dir::StoreDirectory,
 };
 use std::{
     fs,
@@ -18,7 +21,7 @@ fn record_stage_crash_child() {
     let ready = PathBuf::from(ready);
     let store = ObjectStore::new(ready.parent().unwrap().join(".kio"));
     let mut writer = RecordWriter::new(&store.record_stages().unwrap()).unwrap();
-    for value in 0..512u64 {
+    for value in 0..=SORT_BUFFER_RECORDS {
         writer.push(&value).unwrap();
     }
     let records = writer.finish().unwrap();
@@ -112,7 +115,9 @@ fn killed_record_writer_is_reported_and_reclaimed_on_retry() {
     let other = Repository::init(other_fixture.path()).unwrap();
     let mut other_writer =
         RecordWriter::new(&other.object_store().record_stages().unwrap()).unwrap();
-    other_writer.push(&42u64).unwrap();
+    for value in 0..=SORT_BUFFER_RECORDS {
+        other_writer.push(&value).unwrap();
+    }
     assert!(
         other
             .object_store()

@@ -165,11 +165,10 @@ pub struct PendingNormalizeRef {
     pub normalize: NormalizeRef,
 }
 
-/// Per-path policy captured by index's sorted working-tree scan.
+/// An admitted path and its local Tier-A permission from index's sorted scan.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ScannedPathPolicy {
     pub path: String,
-    pub excluded: bool,
     pub allow_tier_a: bool,
 }
 
@@ -3153,12 +3152,7 @@ mod tests {
         fs::write(root.join("doc.md"), b"retained input").unwrap();
         let repo = Repository::init(&root).unwrap();
         let candidates = repo
-            .working_file_candidates(
-                &BTreeSet::new(),
-                &BTreeSet::new(),
-                true,
-                ArchiveLimits::default(),
-            )
+            .working_file_candidates(&|_| true, &BTreeSet::new(), true, ArchiveLimits::default())
             .unwrap();
         let candidate = candidates
             .iter()
@@ -4203,7 +4197,7 @@ mod tests {
                 .auto_snapshot_with_bound_normalize(
                     Some("guarded index"),
                     None,
-                    &BTreeSet::new(),
+                    &|_| true,
                     &BTreeMap::new(),
                     &BTreeSet::new(),
                     Some(&guard),
@@ -4248,7 +4242,7 @@ mod tests {
                 Some("scheduled test"),
                 Some("2026-08-14T00:01:00Z"),
                 CommitType::Auto,
-                &BTreeSet::new(),
+                &|_| true,
                 &BTreeMap::new(),
                 &BTreeSet::new(),
                 false,

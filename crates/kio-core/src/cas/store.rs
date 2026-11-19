@@ -85,6 +85,7 @@ impl ObjectStore {
         Self {
             control,
             reads: CasReadAccess::Unmetered,
+            record_memory: Arc::default(),
             kio_dir: Some(kio_dir.into()),
             bound: None,
         }
@@ -142,6 +143,7 @@ impl ObjectStore {
         Ok(Self {
             control,
             reads: CasReadAccess::Unmetered,
+            record_memory: Arc::default(),
             kio_dir: None,
             bound: Some(BoundObjectDirs {
                 kio: {
@@ -204,13 +206,16 @@ impl ObjectStore {
                 self.control.clone(),
             )?
         };
-        Ok(crate::disk_records::RecordStageRoot::in_store(directory))
+        Ok(crate::disk_records::RecordStageRoot::in_store(
+            directory,
+            self.record_memory.clone(),
+        ))
     }
 
     pub fn inspect_raw_stages(&self) -> Result<crate::disk_records::DiskRecords<RawStageResidue>> {
         if let Some(bound) = &self.bound {
             let scratch = crate::disk_records::RecordStageRoot::temporary()?;
-            let mut residues = crate::disk_records::RecordWriter::new_lazy(&scratch);
+            let mut residues = crate::disk_records::RecordWriter::new(&scratch)?;
             bound.visit_raw_stages(&scratch, false, |row| residues.push(&row))?;
             for row in self.record_stages()?.inspect()? {
                 residues.push(&row)?;

@@ -33,7 +33,7 @@ struct ArchiveBatch<'a> {
 }
 impl Drop for ArchiveBatch<'_> {
     fn drop(&mut self) {
-        for record in self.records.snapshot().iter() {
+        for record in self.records.iter() {
             let Ok(record) = record else {
                 break;
             };
@@ -113,7 +113,7 @@ impl Repository {
         let chunking_config_hash = self.effective_chunking_config_hash()?;
 
         let candidates = self.working_file_candidates(
-            excluded_paths,
+            &|path| !excluded_paths.contains(path),
             explicitly_allowed_tier_a_paths,
             store_raw,
             limits,
@@ -269,9 +269,8 @@ impl Repository {
                 "scheduled snapshot direct entries changed before CAS publication",
             ));
         }
-        let records = batch.records.snapshot();
         if scheduled_bound {
-            for record in records.iter() {
+            for record in batch.records.iter() {
                 let record = record?;
                 let candidate = WorkingFileCandidate {
                     path: self.canonical_root.join(&record.name),
@@ -313,7 +312,7 @@ impl Repository {
         } else {
             Some(self.purge_state()?)
         };
-        for record in records.iter() {
+        for record in batch.records.iter() {
             let record = record?;
             let mut stage = self.store.reopen_saved_stage(&record.stage)?;
             if !purge_self_targets.contains(stage.raw_hash()) {
@@ -329,7 +328,7 @@ impl Repository {
             stage.detach();
         }
         let mut entries = TreeBuilder::new(&record_stages, chunking_config_hash.to_owned());
-        for record in records.iter() {
+        for record in batch.records.iter() {
             let record = record?;
             let mut stage = self.store.reopen_saved_stage(&record.stage)?;
             if purge_self_targets.contains(stage.raw_hash()) {
@@ -351,7 +350,7 @@ impl Repository {
 
     pub(super) fn working_file_candidates(
         &self,
-        excluded_paths: &BTreeSet<String>,
+        include_path: &dyn Fn(&str) -> bool,
         explicitly_allowed_tier_a_paths: &BTreeSet<String>,
         enforce_tier_a: bool,
         limits: ArchiveLimits,
@@ -382,7 +381,7 @@ impl Repository {
                         continue;
                     }
                 };
-                if file_name == ".kio" {
+                if file_name == ".kio" || !include_path(&file_name) {
                     continue;
                 }
                 let path = self.canonical_root.join(&file_name);
@@ -394,9 +393,6 @@ impl Repository {
                 }
                 if !file_type.is_file() {
                     eprintln!("warning: skipping non-regular file: {}", path.display());
-                    continue;
-                }
-                if excluded_paths.contains(&file_name) {
                     continue;
                 }
                 if enforce_tier_a
@@ -437,7 +433,12 @@ impl Repository {
         }
         for entry in fs::read_dir(&self.root).kio_io(&self.root)? {
             let entry = entry.kio_io(&self.root)?;
-            if entry.file_name() == ".kio" {
+            let raw_file_name = entry.file_name();
+            if raw_file_name == ".kio"
+                || raw_file_name
+                    .to_str()
+                    .is_some_and(|name| !include_path(name))
+            {
                 continue;
             }
             let path = entry.path();
@@ -449,16 +450,13 @@ impl Repository {
                 eprintln!("warning: skipping non-regular file: {}", path.display());
                 continue;
             }
-            let file_name = match entry.file_name().into_string() {
+            let file_name = match raw_file_name.into_string() {
                 Ok(name) => name,
                 Err(_) => {
                     eprintln!("warning: skipping non-UTF-8 file name: {}", path.display());
                     continue;
                 }
             };
-            if excluded_paths.contains(&file_name) {
-                continue;
-            }
             if enforce_tier_a
                 && is_tier_a_secret_name(&file_name)
                 && !explicitly_allowed_tier_a_paths.contains(&file_name)
@@ -512,18 +510,17 @@ impl Repository {
         // At most one sort buffer of rules can be checked during enumeration.
         // Larger policy streams join with the externally sorted names below.
         if policy.len() <= crate::disk_records::SORT_BUFFER_RECORDS {
-            let mut excluded = BTreeSet::new();
+            let mut included = BTreeSet::new();
             let mut allowed_tier_a = BTreeSet::new();
             for rule in policy {
                 let rule = rule?;
-                if rule.excluded {
-                    excluded.insert(rule.path);
-                } else if rule.allow_tier_a {
-                    allowed_tier_a.insert(rule.path);
+                if rule.allow_tier_a {
+                    allowed_tier_a.insert(rule.path.clone());
                 }
+                included.insert(rule.path);
             }
             return self.working_file_candidates(
-                &excluded,
+                &|path| included.contains(path),
                 &allowed_tier_a,
                 true,
                 self.archive_limits,
@@ -566,12 +563,9 @@ impl Repository {
             RecordSorter::new(&stages, |a: &(usize, (String, bool)), b| a.0.cmp(&b.0));
         for row in listed.finish()? {
             let (name, position) = row?;
-            let rule = policy.at(&name)?;
-            if rule.is_some_and(|row| row.excluded) {
-                continue;
+            if let Some(rule) = policy.at(&name)? {
+                eligible.push((position, (name, rule.allow_tier_a)))?;
             }
-            let allow_tier_a = rule.is_some_and(|row| row.allow_tier_a);
-            eligible.push((position, (name, allow_tier_a)))?;
         }
         // Budget accounting follows the directory's enumeration order, as in
         // the other snapshot paths. Archive and normalization join by path.
@@ -626,7 +620,7 @@ impl Repository {
         let mut head = head.iter().flat_map(|tree| tree.entries.iter());
         let mut new = current.next().transpose()?;
         let mut old = head.next().transpose()?;
-        let mut statuses = RecordWriter::new_lazy(&self.store.record_stages()?);
+        let mut statuses = RecordWriter::new(&self.store.record_stages()?)?;
         while new.is_some() || old.is_some() {
             let order = match (&old, &new) {
                 (Some(old), Some(new)) => old.path.cmp(&new.path),
