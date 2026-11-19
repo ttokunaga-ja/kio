@@ -1609,7 +1609,7 @@ pub fn read_bound_verified_scan_input(
     input_path: &str,
     max_bytes: u64,
 ) -> Result<VerifiedScanInput> {
-    read_bound_scan_input(root, input_path, max_bytes, None)
+    read_bound_scan_input(root, input_path, max_bytes, None, false)
 }
 
 /// Read a verified parser input within the invocation's working-memory tier.
@@ -1618,6 +1618,15 @@ pub fn read_bound_extraction_input(
     input_path: &str,
     tier: kio_core::error::ResourceTier,
 ) -> Result<VerifiedScanInput> {
+    if kio_adapter::xlsx_extract::is_xlsx_media(media_type_for_path(Path::new(input_path))) {
+        return read_bound_scan_input(
+            root,
+            input_path,
+            kio_adapter::xlsx_extract::raw_zip_limit(tier),
+            Some(tier),
+            true,
+        );
+    }
     read_bound_extraction_input_at_most(root, input_path, tier, u64::MAX)
 }
 
@@ -1629,7 +1638,7 @@ pub fn read_bound_extraction_input_at_most(
     max_bytes: u64,
 ) -> Result<VerifiedScanInput> {
     let max_bytes = max_bytes.min(crate::prepare::ExtractionBudget::new(tier).memory_bytes());
-    read_bound_scan_input(root, input_path, max_bytes, Some(tier))
+    read_bound_scan_input(root, input_path, max_bytes, Some(tier), false)
 }
 
 fn read_bound_scan_input(
@@ -1637,13 +1646,18 @@ fn read_bound_scan_input(
     input_path: &str,
     max_bytes: u64,
     tier: Option<kio_core::error::ResourceTier>,
+    xlsx_zip: bool,
 ) -> Result<VerifiedScanInput> {
     let limit = |observed, bounded| {
         if tier.is_none() && bounded {
             return bound_input_oversized(input_path, observed, max_bytes);
         }
         crate::PipelineError::ResourceLimit(kio_core::error::ResourceLimit {
-            resource: kio_core::error::Resource::Memory,
+            resource: if bounded && xlsx_zip {
+                kio_core::error::Resource::RawBytes
+            } else {
+                kio_core::error::Resource::Memory
+            },
             stage: "read_extraction_input".to_owned(),
             limit: bounded.then_some(max_bytes),
             observed: Some(observed),

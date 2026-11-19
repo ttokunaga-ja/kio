@@ -1271,7 +1271,8 @@ fn preview_extraction_issues(
     control: &kio_core::control::ControlHandle,
 ) -> Vec<crate::response::index::ExtractionIssue> {
     use kio_pipeline::prepare::{
-        ExtractionBudget, PrepareStageBytesRequest, visit_prepared_units_with_budget,
+        ExtractionBudget, PrepareStageBytesRequest, XlsxExtractionProgress,
+        visit_prepared_units_with_budget,
     };
 
     let profile = kio_adapter::catalog::builtin_prepare_profile();
@@ -1288,6 +1289,7 @@ fn preview_extraction_issues(
                 .is_none()
         })
         .filter_map(|candidate| {
+            let mut progress = XlsxExtractionProgress::default();
             let result =
                 kio_pipeline::scan::read_bound_extraction_input(root, &candidate.input_path, tier)
                     .and_then(|verified| {
@@ -1302,6 +1304,7 @@ fn preview_extraction_issues(
                             },
                             control,
                             budget,
+                            &mut progress,
                             |prepared, bytes| {
                                 super::pipeline::check_preview_normalized_unit(
                                     &path,
@@ -1314,10 +1317,20 @@ fn preview_extraction_issues(
                         )
                     });
             let error = pipeline_to_kio(result.err()?);
+            let is_xlsx = kio_adapter::xlsx_extract::is_xlsx_media(&candidate.media_type);
+            let resource_limit = error.resource_limit().cloned();
+            let retry = (is_xlsx && resource_limit.is_some()).then_some(match tier {
+                kio_core::error::ResourceTier::Standard => "kio index --resource-tier large",
+                kio_core::error::ResourceTier::Large => {
+                    "Reduce the workbook and run kio index --resource-tier large"
+                }
+            });
             Some(crate::response::index::ExtractionIssue {
                 path: prefix.join(&candidate.input_path),
                 error_code: error.error_code().to_owned(),
-                resource_limit: error.resource_limit().cloned(),
+                resource_limit,
+                xlsx_progress: is_xlsx.then_some(progress),
+                retry,
             })
         })
         .collect()

@@ -38,3 +38,4 @@ base64.workspace = true
 miniz_oxide.workspace = true
 serde_jcs.workspace = true
 tempfile = "3"
+zip.workspace = true

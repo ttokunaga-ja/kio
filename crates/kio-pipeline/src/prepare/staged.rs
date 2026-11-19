@@ -1,6 +1,7 @@
 use super::{
-    ExtractionBudget, PrepareStageBytesRequest, PrepareStageOutput, PreparedUnit, hash_bytes,
-    office_preparation_profile_hash, prepare_units_emitting, resolve_prepare_converter,
+    ExtractionBudget, PrepareStageBytesRequest, PrepareStageOutput, PreparedUnit,
+    XlsxExtractionProgress, hash_bytes, office_preparation_profile_hash, prepare_units_emitting,
+    resolve_prepare_converter, xlsx_preparation_profile_hash,
 };
 #[cfg(test)]
 use crate::IoResultExt;
@@ -45,7 +46,13 @@ pub fn prepare_staged(
 ) -> Result<StagedPreparation> {
     let converter = resolve_prepare_converter(request.media_type, root.control());
     let profile = converter.as_ref().map_or_else(
-        || request.tool_profile_hash.to_owned(),
+        || {
+            if kio_adapter::xlsx_extract::is_xlsx_media(request.media_type) {
+                xlsx_preparation_profile_hash(request.tool_profile_hash)
+            } else {
+                request.tool_profile_hash.to_owned()
+            }
+        },
         |converter| {
             office_preparation_profile_hash(
                 request.tool_profile_hash,
@@ -54,7 +61,14 @@ pub fn prepare_staged(
         },
     );
     prepare_staged_with(root, request, &profile, |completed, emit| {
-        prepare_units_emitting(request, converter.as_ref(), budget, completed, emit)
+        prepare_units_emitting(
+            request,
+            converter.as_ref(),
+            budget,
+            completed,
+            &mut XlsxExtractionProgress::default(),
+            emit,
+        )
     })
 }
 

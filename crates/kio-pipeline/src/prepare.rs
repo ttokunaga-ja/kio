@@ -187,7 +187,37 @@ pub fn prepare_units_with_budget(
     control: &ControlHandle,
     budget: ExtractionBudget,
 ) -> Result<PrepareStageOutput> {
-    visit_prepared_units_with_budget(request, control, budget, |_, _| Ok(()))
+    visit_prepared_units_with_budget(
+        request,
+        control,
+        budget,
+        &mut XlsxExtractionProgress::default(),
+        |_, _| Ok(()),
+    )
+}
+
+/// Workbook-order sheet counts and original worksheet row coordinates.
+#[derive(Debug, Serialize)]
+pub struct XlsxExtractionProgress {
+    pub total_sheets: Option<usize>,
+    pub completed_sheets: usize,
+    pub first_unprocessed_sheet: usize,
+    pub current_sheet: Option<String>,
+    pub completed_through_row: u64,
+    pub first_unprocessed_row: Option<u64>,
+}
+
+impl Default for XlsxExtractionProgress {
+    fn default() -> Self {
+        Self {
+            total_sheets: None,
+            completed_sheets: 0,
+            first_unprocessed_sheet: 1,
+            current_sheet: None,
+            completed_through_row: 0,
+            first_unprocessed_row: None,
+        }
+    }
 }
 
 /// Run local extraction with the same producer used by staged persistence.
@@ -195,6 +225,7 @@ pub fn visit_prepared_units_with_budget(
     request: PrepareStageBytesRequest<'_>,
     control: &ControlHandle,
     budget: ExtractionBudget,
+    progress: &mut XlsxExtractionProgress,
     mut visit: impl FnMut(&PreparedUnit, &[u8]) -> Result<()>,
 ) -> Result<PrepareStageOutput> {
     let converter = resolve_prepare_converter(request.media_type, control);
@@ -203,6 +234,7 @@ pub fn visit_prepared_units_with_budget(
         converter.as_ref(),
         budget,
         &[],
+        progress,
         &mut PreparedUnitSink {
             declare: &mut |_| Ok(()),
             write: &mut visit,
@@ -226,6 +258,7 @@ fn prepare_units_emitting(
     converter: Option<&kio_adapter::office_convert::OfficeConverter>,
     budget: ExtractionBudget,
     completed: &[PreparedUnit],
+    progress: &mut XlsxExtractionProgress,
     emit: &mut PreparedUnitSink<'_>,
 ) -> Result<PrepareStageOutput> {
     if crate::unsupported::unsupported_reason_for_path(Path::new(request.input_path)).is_some() {
@@ -290,40 +323,49 @@ fn prepare_units_emitting(
     // extracted Markdown — the same shape the PDF branch uses for page text, so
     // an edit inside one sheet reprepares that sheet alone.
     if is_xlsx {
-        let document = kio_adapter::xlsx_extract::extract_xlsx(bytes)
-            .map_err(|err| prepare_adapter_error("KIO-E-PREPARE-XLSX-EXTRACT-001", err))?;
-        budget.check_retained_bytes(document.sheets.iter().fold(0u64, |total, sheet| {
-            total.saturating_add(sheet.markdown.len() as u64)
-        }))?;
-        let unit_keys = sheet_unit_keys(
-            &document
-                .sheets
-                .iter()
-                .map(|sheet| sheet.name.clone())
-                .collect::<Vec<_>>(),
-        );
-        emit.declare(document.sheets.len())?;
-        let mut prepared_units = Vec::with_capacity(document.sheets.len());
-        for (index, sheet) in document.sheets.into_iter().enumerate() {
+        const CODE: &str = "KIO-E-PREPARE-XLSX-EXTRACT-001";
+        *progress = XlsxExtractionProgress::default();
+        let mut workbook = kio_adapter::xlsx_extract::XlsxWorkbook::open(bytes, budget.tier)
+            .map_err(|err| prepare_adapter_error(CODE, err))?;
+        let unit_keys = sheet_unit_keys(workbook.sheet_names());
+        let total = unit_keys.len();
+        progress.total_sheets = Some(total);
+        emit.declare(total)?;
+        let preparation_profile_hash = xlsx_preparation_profile_hash(&preparation_profile_hash);
+        let mut prepared_units = Vec::with_capacity(total);
+        for (index, unit_key) in unit_keys.into_iter().enumerate() {
+            progress.current_sheet = Some(unit_key.clone());
+            progress.completed_through_row = 0;
             if let Some(unit) = completed.get(index) {
+                if unit.unit_key != unit_key {
+                    return Err(crate::PipelineError::contract(
+                        CODE,
+                        "staged worksheet identity does not match the workbook",
+                    ));
+                }
                 prepared_units.push(unit.clone());
-                continue;
+            } else {
+                let result = workbook.read_sheet(index, &mut progress.completed_through_row);
+                progress.first_unprocessed_row = progress.completed_through_row.checked_add(1);
+                let markdown = result.map_err(|err| prepare_adapter_error(CODE, err))?;
+                let markdown = markdown.as_bytes();
+                let unit = PreparedUnit {
+                    renderer: None,
+                    order: index as u64,
+                    unit_key,
+                    unit_type: UnitType::Sheet,
+                    prepared_hash: hash_bytes(markdown),
+                    preparation_profile_hash: preparation_profile_hash.clone(),
+                    fingerprint: fingerprint_for_bytes(markdown, markdown),
+                    mime: Some(request.media_type.to_owned()),
+                    page_number: None,
+                };
+                progress.first_unprocessed_row = None;
+                emit.write(&unit, markdown)?;
+                prepared_units.push(unit);
             }
-            let unit_key = unit_keys[index].clone();
-            let markdown = sheet.markdown.as_bytes();
-            let unit = PreparedUnit {
-                renderer: None,
-                order: index as u64,
-                unit_key,
-                unit_type: UnitType::Sheet,
-                prepared_hash: hash_bytes(markdown),
-                preparation_profile_hash: preparation_profile_hash.clone(),
-                fingerprint: fingerprint_for_bytes(markdown, markdown),
-                mime: Some(request.media_type.to_owned()),
-                page_number: None,
-            };
-            emit.write(&unit, markdown)?;
-            prepared_units.push(unit);
+            progress.completed_sheets += 1;
+            progress.first_unprocessed_sheet = index + 2;
         }
         return Ok(PrepareStageOutput {
             prepared_object_hashes: prepared_units
@@ -331,11 +373,6 @@ fn prepare_units_emitting(
                 .map(|unit| unit.prepared_hash.clone())
                 .collect(),
             prepared_units,
-            // An embedded chart is genuinely visual and direct extraction
-            // cannot read it. Routing those to the image → OCR lane needs an
-            // evidence identity for "image N inside sheet M" that does not
-            // exist yet, so this stays empty rather than half-wired — the
-            // extractor counts them so the gap is visible (backlog §7.2 I9).
             image_object_hashes: Vec::new(),
         });
     }
@@ -535,12 +572,16 @@ pub fn canonical_unit_key(unit_type: UnitType, selector: &str) -> String {
 /// 2nd and later sheet sharing a name take `#2`, `#3`. Suffixing first would
 /// make a real sheet named `A#2` collide with the second sheet named `A`.
 #[must_use]
-pub fn sheet_unit_keys(names: &[String]) -> Vec<String> {
-    let mut seen: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+pub fn sheet_unit_keys<I>(names: I) -> Vec<String>
+where
+    I: IntoIterator,
+    I::Item: AsRef<str>,
+{
+    let mut seen = std::collections::BTreeMap::new();
     names
-        .iter()
+        .into_iter()
         .map(|name| {
-            let base = canonical_unit_key(UnitType::Sheet, name);
+            let base = canonical_unit_key(UnitType::Sheet, name.as_ref());
             let occurrence = seen.entry(base.clone()).or_insert(0);
             *occurrence += 1;
             if *occurrence == 1 {
@@ -550,6 +591,10 @@ pub fn sheet_unit_keys(names: &[String]) -> Vec<String> {
             }
         })
         .collect()
+}
+
+fn xlsx_preparation_profile_hash(profile: &str) -> String {
+    hash_bytes(format!("{profile}\0xlsx-resource-tiers").as_bytes())
 }
 
 #[must_use]

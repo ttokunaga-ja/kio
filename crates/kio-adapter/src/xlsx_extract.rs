@@ -1,822 +1,877 @@
-//! Deterministic XLSX → Markdown extraction (07 §5.1, 2026-07-25 ruling).
-//!
-//! DOCX and PPTX unit-ize through a converted PDF because a page and a slide
-//! ARE their visual units. A sheet is not: rendering one to PDF paginates it by
-//! print area, which cuts a wide table down the middle and leaves the two
-//! halves of every row in different units with nothing to rejoin them by. That
-//! was measured on this corpus — a 10-column sheet became two pages, the
-//! header `作業区分` landing on page 1 and its value on page 2.
-//!
-//! So XLSX is extracted **directly and locally**: the cells are already
-//! structured text, and rendering them to pixels only to read them back is a
-//! lossy round trip through information that was never lost. No provider call,
-//! no cost, no batch lane, and a `prepared_hash` that is a pure function of the
-//! bytes.
-//!
-//! # Number formats are not cosmetic
-//!
-//! A cell holding `0.5` under a `0%` format means **50%**, and every file in
-//! the dogfood corpus declares custom `numFmt` entries. Emitting the raw stored
-//! value would put `0.5` in the index where the document says `50%` — a
-//! retrieval-poisoning wrong answer, not a formatting nicety. [`format_cell`]
-//! applies the format; dates are the same problem (a date is stored as a serial
-//! day count, so the raw value indexes as `45678`).
-//!
-//! # Container
-//!
-//! The ZIP layer is shared with Office package validation. It refuses malformed
-//! archive metadata before opening the maintained ZIP parser and bounds every
-//! decompressed read. The XML inside is parsed with
-//! `quick-xml` — namespaced OOXML with entity escaping is where a hand-rolled
-//! reader fails *silently*, and silent wrongness is the failure mode this
-//! module must not have.
+//! Local XLSX extraction with one worksheet per prepared unit.
 
-use std::collections::BTreeMap;
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+};
 
-use quick_xml::Reader;
-use quick_xml::events::Event;
+use kio_core::error::ResourceTier;
+use quick_xml::events::{BytesStart, Event};
 
 use crate::{
     AdapterError, Result,
-    ooxml_package::{BoundedZip, BoundedZipLimits},
+    ooxml_package::{BoundedZip, BoundedZipLimits, xml as opc},
 };
 
-/// Sheets extracted from one workbook. A workbook past this is a contract
-/// violation rather than a truncation — a silently half-read spreadsheet is
-/// exactly the "looks complete, is not" failure this crate keeps out.
-pub const MAX_XLSX_SHEETS: usize = 256;
+mod budget;
+mod xml;
 
-/// Rows read per sheet.
-pub const MAX_XLSX_ROWS_PER_SHEET: usize = 50_000;
+use budget::Budget;
+use xml::{DOCUMENT_REL_NS, Xml, reference_text};
 
-/// Columns read per row.
-pub const MAX_XLSX_COLUMNS: usize = 1_024;
+const XLSX_MEDIA: &str = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+const WORKBOOK_CONTENT: &str =
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml";
+const SHEET_CONTENT: &str =
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml";
+const WORKSHEET_REL: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet";
+const SHARED_REL: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings";
+const STYLES_REL: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles";
+const MANIFEST: &str = "[Content_Types].xml";
+const ROOT_RELS: &str = "_rels/.rels";
 
-/// Cells materialized across a complete workbook, including the empty cells
-/// introduced to preserve a sparse row's column positions.
-pub const MAX_XLSX_CELLS_PER_WORKBOOK: usize = 1_000_000;
-
-/// Text bytes materialized into cells across a complete workbook.
-pub const MAX_XLSX_CELL_TEXT_BYTES: usize = 16 * 1024 * 1024;
-
-/// Markdown bytes rendered across a complete workbook.
-pub const MAX_XLSX_MARKDOWN_BYTES: usize = 16 * 1024 * 1024;
-
-/// Ceiling on any single inflated ZIP member. `xl/worksheets/sheetN.xml` is the
-/// large one; 64 MB of sheet XML is far past any real document and stops a ZIP
-/// bomb from being decompressed into memory.
-pub const MAX_XLSX_MEMBER_BYTES: usize = 64 * 1024 * 1024;
-
-/// Total uncompressed bytes materialized from one workbook.
-const MAX_XLSX_TOTAL_READ_BYTES: usize = 256 * 1024 * 1024;
-
-/// Maximum nesting accepted in one OOXML XML member. This bounds the parser's
-/// end-tag tracking before a deeply nested member can consume its input cap.
-const MAX_XLSX_XML_DEPTH: usize = 256;
-
-/// Maximum attributes on one OOXML XML element. OOXML uses only a handful;
-/// this is a structural safety bound, not a schema requirement.
-const MAX_XLSX_XML_ATTRIBUTES: usize = 1_024;
-
-// Metadata can be tiny on disk but expensive as owned collection entries.
-// One million shared strings matches the admitted workbook cell count;
-// 65,536 styles/custom formats exceeds ordinary Excel style usage, and
-// 16,384 relationships leaves ample room beyond the 256 admitted sheets.
-const MAX_XLSX_SHARED_STRINGS: usize = MAX_XLSX_CELLS_PER_WORKBOOK;
-const MAX_XLSX_RELATIONSHIPS: usize = 16_384;
-const MAX_XLSX_FORMAT_RECORDS: usize = 65_536;
-const MAX_XLSX_METADATA_STRING_BYTES: usize = 16 * 1024 * 1024;
-
-struct MetadataBudget {
-    records: usize,
-    bytes: usize,
-    record_limit: usize,
-    byte_limit: usize,
-}
-
-impl MetadataBudget {
-    fn new(record_limit: usize) -> Self {
-        Self {
-            records: 0,
-            bytes: 0,
-            record_limit,
-            byte_limit: MAX_XLSX_METADATA_STRING_BYTES,
-        }
-    }
-
-    fn admit(counter: &mut usize, amount: usize, limit: usize) -> Result<()> {
-        let next = counter
-            .checked_add(amount)
-            .filter(|next| *next <= limit)
-            .ok_or_else(|| {
-                AdapterError::ContractViolation("XLSX metadata admission bound exceeded".to_owned())
-            })?;
-        *counter = next;
-        Ok(())
-    }
-
-    fn record(&mut self) -> Result<()> {
-        Self::admit(&mut self.records, 1, self.record_limit)
-    }
-
-    fn string_bytes(&mut self, amount: usize) -> Result<()> {
-        Self::admit(&mut self.bytes, amount, self.byte_limit)
-    }
-
-    fn attribute(
-        &mut self,
-        event: &quick_xml::events::BytesStart<'_>,
-        wanted: &str,
-    ) -> Result<Option<String>> {
-        // XML's predefined/numeric escapes never expand past their source
-        // byte length. Charge before unescaping or making an owned string.
-        for attr in event.attributes().with_checks(true) {
-            let attr = attr.map_err(xml_error)?;
-            if local_name(attr.key.as_ref()) == wanted.as_bytes() {
-                self.string_bytes(attr.value.len())?;
-            }
-        }
-        attribute(event, wanted)
-    }
-}
-
-/// One worksheet, already rendered to Markdown.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct XlsxSheet {
-    /// Sheet name as authored, NFC-normalized by the caller's unit-key rule.
-    pub name: String,
-    /// Markdown table (plus any leading single-cell lines).
-    pub markdown: String,
-}
-
-/// One workbook.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct XlsxDocument {
-    pub sheets: Vec<XlsxSheet>,
-    /// `xl/media/*` entries found in the container.
-    ///
-    /// A chart or picture embedded in a sheet is genuinely visual and direct
-    /// extraction cannot read it. Routing those to the image → OCR lane needs
-    /// an evidence-pointer identity for "image N inside sheet M", which does
-    /// not exist yet (`image_object_hashes` is declared on `PrepareStageOutput`
-    /// and `PrepareResponse` but nothing populates or reads it). Counting them
-    /// here keeps the gap VISIBLE instead of dropping the images silently —
-    /// see tasks/step4b-backlog.md (git 56a6831) §7.2 I9.
-    pub media_paths: Vec<String>,
-}
-
-/// Extract every worksheet of an XLSX as Markdown.
-///
-/// Errors are contract violations: a workbook we cannot read must not
-/// degrade into an empty-but-successful extraction, which would index the file
-/// as "present with no content".
-pub fn extract_xlsx(bytes: &[u8]) -> Result<XlsxDocument> {
-    let mut archive = BoundedZip::open(
-        bytes,
-        BoundedZipLimits::new(
-            "XLSX",
-            100 * 1024 * 1024,
-            MAX_XLSX_MEMBER_BYTES,
-            MAX_XLSX_TOTAL_READ_BYTES,
-        ),
-    )?;
-
-    let workbook_xml = archive.read_required("xl/workbook.xml")?;
-    let sheet_refs = parse_workbook_sheets(&workbook_xml)?;
-    if sheet_refs.len() > MAX_XLSX_SHEETS {
-        return Err(AdapterError::ContractViolation(format!(
-            "XLSX declares {} sheets, over the {MAX_XLSX_SHEETS} bound",
-            sheet_refs.len()
-        )));
-    }
-
-    let rels = match archive.read_optional("xl/_rels/workbook.xml.rels")? {
-        Some(xml) => parse_relationships(&xml)?,
-        None => BTreeMap::new(),
-    };
-    let shared = match archive.read_optional("xl/sharedStrings.xml")? {
-        Some(xml) => parse_shared_strings(&xml)?,
-        None => Vec::new(),
-    };
-    let formats = match archive.read_optional("xl/styles.xml")? {
-        Some(xml) => parse_styles(&xml)?,
-        None => CellFormats::default(),
-    };
-
-    let mut sheets = Vec::with_capacity(sheet_refs.len());
-    let mut materialized_cells = 0;
-    let mut materialized_cell_text_bytes = 0;
-    let mut rendered_markdown_bytes = 0;
-    for (index, sheet_ref) in sheet_refs.iter().enumerate() {
-        // Resolve through the relationship id when it is present; fall back to
-        // positional `sheetN.xml`, which is what every writer emits anyway.
-        let target = sheet_ref
-            .rel_id
-            .as_deref()
-            .and_then(|id| rels.get(id))
-            .map(|target| normalize_rel_target(target))
-            .unwrap_or_else(|| format!("xl/worksheets/sheet{}.xml", index + 1));
-        if !archive.contains(&target) {
-            return Err(AdapterError::ContractViolation(format!(
-                "XLSX sheet `{}` points at missing part {target}",
-                sheet_ref.name
-            )));
-        }
-        let grid = parse_sheet(
-            &archive.read_required(&target)?,
-            &shared,
-            &formats,
-            &mut materialized_cells,
-            &mut materialized_cell_text_bytes,
-        )?;
-        let markdown =
-            grid_to_markdown_with_limit(&grid, MAX_XLSX_MARKDOWN_BYTES - rendered_markdown_bytes)?;
-        rendered_markdown_bytes += markdown.len();
-        sheets.push(XlsxSheet {
-            name: sheet_ref.name.clone(),
-            markdown,
-        });
-    }
-
-    let media_paths = archive
-        .member_names()
-        .iter()
-        .filter(|name| name.starts_with("xl/media/"))
-        .cloned()
-        .collect();
-
-    Ok(XlsxDocument {
-        sheets,
-        media_paths,
-    })
-}
-
-/// True for the OOXML spreadsheet mime, and ONLY that one.
-///
-/// `application/vnd.ms-excel` (the legacy `.xls`) is deliberately excluded: it
-/// is an OLE2 compound file, not a ZIP, so this extractor would refuse it — and
-/// because an unreadable workbook is a hard error here (by design, so a file
-/// cannot vanish silently), accepting `.xls` would turn "we don't support this
-/// format" into a failed `kio index`. Nothing maps a `.xls` extension to that
-/// mime today; this keeps it that way if something ever does.
 #[must_use]
 pub fn is_xlsx_media(media_type: &str) -> bool {
-    media_type == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    media_type == XLSX_MEDIA
 }
 
-/// `../media/x.png` and `worksheets/sheet1.xml` are both relative to `xl/`.
-fn normalize_rel_target(target: &str) -> String {
-    let trimmed = target.trim_start_matches('/');
-    if let Some(rest) = trimmed.strip_prefix("../") {
-        return rest.to_owned();
-    }
-    if trimmed.starts_with("xl/") {
-        return trimmed.to_owned();
-    }
-    format!("xl/{trimmed}")
+#[must_use]
+pub fn raw_zip_limit(tier: ResourceTier) -> u64 {
+    BoundedZipLimits::xlsx(tier).raw_bytes()
 }
 
-// ---------------------------------------------------------------------------
-// OOXML
-// ---------------------------------------------------------------------------
+pub(super) fn check_raw_zip_size(tier: ResourceTier, bytes: u64) -> Result<()> {
+    BoundedZipLimits::xlsx(tier).check_raw_bytes(bytes)
+}
 
 struct SheetRef {
     name: String,
-    rel_id: Option<String>,
+    target: String,
 }
 
-/// Local name of an element, with any namespace prefix dropped. Writers differ:
-/// this corpus's files use `<x:sheet>` while Excel itself writes `<sheet>`.
-fn local_name(raw: &[u8]) -> &[u8] {
-    match raw.iter().position(|byte| *byte == b':') {
-        Some(index) => &raw[index + 1..],
-        None => raw,
-    }
+/// Workbook metadata and a cursor over the ZIP. Only the worksheet requested by
+/// the caller is expanded and rendered. A verified durable prefix can be skipped.
+pub struct XlsxWorkbook<'a> {
+    archive: BoundedZip<'a>,
+    budget: Budget,
+    sheets: Vec<SheetRef>,
+    shared: Vec<String>,
+    formats: CellFormats,
 }
 
-fn attribute(event: &quick_xml::events::BytesStart<'_>, wanted: &str) -> Result<Option<String>> {
-    let mut found = None;
-    for attribute in event.attributes().with_checks(true) {
-        let attribute = attribute.map_err(xml_error)?;
-        if local_name(attribute.key.as_ref()) == wanted.as_bytes() {
-            let value = std::str::from_utf8(&attribute.value).map_err(|error| {
-                AdapterError::ContractViolation(format!("XLSX XML attribute is malformed: {error}"))
-            })?;
-            let value = quick_xml::escape::unescape(value)
-                .map(|value| value.into_owned())
-                .map_err(|error| {
-                    AdapterError::ContractViolation(format!(
-                        "XLSX XML attribute is malformed: {error}"
-                    ))
-                })?;
-            if found.replace(value).is_some() {
-                return Err(AdapterError::ContractViolation(format!(
-                    "XLSX XML element has duplicate `{wanted}` attributes"
-                )));
-            }
+impl<'a> XlsxWorkbook<'a> {
+    pub fn open(bytes: &'a [u8], tier: ResourceTier) -> Result<Self> {
+        let mut budget = Budget::new(tier);
+        let mut archive = BoundedZip::open_accounted(
+            bytes,
+            BoundedZipLimits::xlsx(budget.tier),
+            |directory, entries| {
+                budget.visit()?;
+                budget.expand(directory)?;
+                // Allow for the archive's index, its copies of variable-length
+                // header fields, and the paths kept for package validation.
+                budget.retain(directory * 4 + entries * 512)
+            },
+        )?;
+        let metadata_start = budget.retained();
+        let main = with_part(&mut archive, &mut budget, ROOT_RELS, |bytes, budget| {
+            Xml::validate(bytes)?;
+            opc::office_document_target(bytes, |size| retain_record(budget, size))
+        })?;
+        let content = with_part(&mut archive, &mut budget, MANIFEST, |bytes, budget| {
+            Xml::validate(bytes)?;
+            opc::content_types(bytes, |size| retain_record(budget, size))
+        })?;
+        if content
+            .overrides
+            .get(&format!("/{main}"))
+            .map(String::as_str)
+            != Some(WORKBOOK_CONTENT)
+        {
+            return Err(invalid("workbook part has no XLSX content type"));
         }
-    }
-    Ok(found)
-}
+        let pending = with_part(&mut archive, &mut budget, &main, parse_workbook_sheets)?;
+        let relations_part = relationship_part(&main);
+        let mut worksheets = HashMap::new();
+        let mut shared_part = None;
+        let mut styles_part = None;
+        with_part(
+            &mut archive,
+            &mut budget,
+            &relations_part,
+            |bytes, budget| {
+                Xml::validate(bytes)?;
+                opc::relationships(
+                    bytes,
+                    |size| retain_record(budget, 2 * size + 2 * main.len()),
+                    |id, kind, target, mode| {
+                        let slot = match kind {
+                            WORKSHEET_REL => {
+                                if mode != "Internal" {
+                                    return Err(invalid("worksheet relationship is external"));
+                                }
+                                worksheets.insert(id.to_owned(), resolve_target(&main, target)?);
+                                return Ok(());
+                            }
+                            SHARED_REL => &mut shared_part,
+                            STYLES_REL => &mut styles_part,
+                            _ => return Ok(()),
+                        };
+                        if mode != "Internal" || slot.is_some() {
+                            return Err(invalid(
+                                "shared strings or styles relationship is ambiguous or external",
+                            ));
+                        }
+                        *slot = Some(resolve_target(&main, target)?);
+                        Ok(())
+                    },
+                )
+            },
+        )?;
 
-fn reader_for(xml: &[u8]) -> Reader<&[u8]> {
-    let mut reader = Reader::from_reader(xml);
-    reader.config_mut().trim_text(false);
-    reader
-}
-
-/// Verify every OOXML XML member before its semantic reader starts consuming
-/// it. The semantic readers intentionally only understand their narrow OOXML
-/// vocabulary, so they must not also be responsible for proving that ignored
-/// elements, attributes, or trailing bytes were structurally well-formed.
-fn validate_xml_member(xml: &[u8]) -> Result<()> {
-    let mut reader = reader_for(xml);
-    let mut buf = Vec::new();
-    let mut open_elements = 0usize;
-    loop {
-        match reader.read_event_into(&mut buf).map_err(xml_error)? {
-            Event::Start(event) => {
-                if open_elements >= MAX_XLSX_XML_DEPTH {
-                    return Err(AdapterError::ContractViolation(format!(
-                        "XLSX XML exceeds the {MAX_XLSX_XML_DEPTH}-element nesting bound"
-                    )));
-                }
-                validate_xml_attributes(&event, reader.decoder())?;
-                open_elements += 1;
-            }
-            Event::Empty(event) => validate_xml_attributes(&event, reader.decoder())?,
-            Event::End(_) => {
-                open_elements = open_elements.checked_sub(1).ok_or_else(|| {
-                    AdapterError::ContractViolation(
-                        "XLSX XML has an unmatched end element".to_owned(),
-                    )
-                })?;
-            }
-            Event::Text(text) => {
-                text.decode().map_err(|error| {
-                    AdapterError::ContractViolation(format!("XLSX XML is malformed: {error}"))
-                })?;
-            }
-            Event::CData(text) => {
-                text.decode().map_err(|error| {
-                    AdapterError::ContractViolation(format!("XLSX XML is malformed: {error}"))
-                })?;
-            }
-            Event::GeneralRef(reference) => {
-                let _ = decoded_reference(&reference)?;
-            }
-            Event::DocType(_) => {
-                return Err(AdapterError::ContractViolation(
-                    "XLSX XML must not declare a DTD or entity definitions".to_owned(),
+        let mut targets = HashSet::new();
+        let mut sheets = Vec::new();
+        let mut sheets_memory = 0;
+        for (name, id) in pending {
+            budget.visit()?;
+            let target = worksheets
+                .remove(&id)
+                .ok_or_else(|| invalid("sheet has no matching worksheet relationship"))?;
+            if content.for_part(&target) != Some(SHEET_CONTENT) || !archive.contains(&target) {
+                return Err(invalid(
+                    "worksheet part is missing or has the wrong content type",
                 ));
             }
-            Event::Eof => {
-                if open_elements != 0 {
-                    return Err(AdapterError::ContractViolation(
-                        "XLSX XML ends with unclosed elements".to_owned(),
-                    ));
-                }
-                return Ok(());
+            let charge = name.len() + target.len() + RECORD_BYTES;
+            budget.retain(charge)?;
+            sheets_memory += charge;
+            sheets.push(SheetRef { name, target });
+        }
+        for sheet in &sheets {
+            if !targets.insert(sheet.target.as_str()) {
+                return Err(invalid("multiple sheets refer to the same worksheet part"));
             }
-            _ => {}
         }
-        buf.clear();
-    }
-}
+        drop(worksheets);
+        drop(content);
 
-fn validate_xml_attributes(
-    event: &quick_xml::events::BytesStart<'_>,
-    decoder: quick_xml::Decoder,
-) -> Result<()> {
-    for (attribute_count, attribute) in event.attributes().with_checks(true).enumerate() {
-        if attribute_count >= MAX_XLSX_XML_ATTRIBUTES {
-            return Err(AdapterError::ContractViolation(format!(
-                "XLSX XML element exceeds the {MAX_XLSX_XML_ATTRIBUTES}-attribute bound"
-            )));
+        // Check all other members through CRC-checked reads. XML outside the
+        // extraction vocabulary is still checked for well-formedness.
+        targets.extend([MANIFEST, ROOT_RELS, &main, &relations_part]);
+        targets.extend(shared_part.as_deref());
+        targets.extend(styles_part.as_deref());
+        for index in 0..archive.member_names().len() {
+            let name = archive.member_names()[index].clone();
+            if targets.contains(name.as_str()) {
+                continue;
+            }
+            if name.ends_with(".xml") || name.ends_with(".rels") {
+                with_part(&mut archive, &mut budget, &name, |bytes, _| {
+                    Xml::validate(bytes)
+                })?;
+            } else {
+                archive.consume(&name, false, |length| {
+                    budget.visit()?;
+                    budget.expand(length)
+                })?;
+            }
         }
-        let attribute = attribute.map_err(xml_error)?;
-        attribute
-            .decoded_and_normalized_value(quick_xml::XmlVersion::Implicit1_0, decoder)
-            .map_err(xml_error)?;
-    }
-    Ok(())
-}
-
-fn validated_reader_for(xml: &[u8]) -> Result<Reader<&[u8]>> {
-    validate_xml_member(xml)?;
-    Ok(reader_for(xml))
-}
-
-fn xml_error(err: impl std::fmt::Display) -> AdapterError {
-    AdapterError::ContractViolation(format!("XLSX XML is malformed: {err}"))
-}
-
-fn decoded_text(text: &quick_xml::events::BytesText<'_>) -> Result<String> {
-    let decoded = text.decode().map_err(|error| {
-        AdapterError::ContractViolation(format!("XLSX XML text is malformed: {error}"))
-    })?;
-    quick_xml::escape::unescape(&decoded)
-        .map(|value| value.into_owned())
-        .map_err(|error| {
-            AdapterError::ContractViolation(format!("XLSX XML text is malformed: {error}"))
+        drop(targets);
+        drop(main);
+        drop(relations_part);
+        // Retire the bookkeeping for the manifest and temporary relationships.
+        // The remaining part names are short-lived and already charged above.
+        budget.release(budget.retained() - metadata_start - sheets_memory);
+        let shared = match shared_part {
+            Some(part) => with_part(&mut archive, &mut budget, &part, parse_shared_strings)?,
+            None => Vec::new(),
+        };
+        let formats = match styles_part {
+            Some(part) => with_part(&mut archive, &mut budget, &part, parse_styles)?,
+            None => CellFormats::default(),
+        };
+        Ok(Self {
+            archive,
+            budget,
+            sheets,
+            shared,
+            formats,
         })
-}
-
-/// quick-xml 0.41 surfaces references as their own event instead of folding
-/// them into text. Resolve only XML's predefined/numeric entities; user-defined
-/// entities have no OOXML-safe definition in this parser and must not become
-/// silently missing text.
-fn decoded_reference(reference: &quick_xml::events::BytesRef<'_>) -> Result<String> {
-    if let Some(character) = reference.resolve_char_ref().map_err(|error| {
-        AdapterError::ContractViolation(format!("XLSX XML text is malformed: {error}"))
-    })? {
-        return Ok(character.to_string());
     }
-    let name = reference.decode().map_err(|error| {
-        AdapterError::ContractViolation(format!("XLSX XML text is malformed: {error}"))
-    })?;
-    quick_xml::escape::resolve_predefined_entity(&name)
-        .map(str::to_owned)
-        .ok_or_else(|| {
-            AdapterError::ContractViolation(format!(
-                "XLSX XML contains unsupported entity reference `&{name};`"
-            ))
-        })
+
+    pub fn sheet_names(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.sheets.iter().map(|sheet| sheet.name.as_str())
+    }
+
+    /// Embedded media is reported separately from extracted worksheet text.
+    pub fn media_paths(&self) -> impl Iterator<Item = &str> {
+        self.archive
+            .member_names()
+            .iter()
+            .map(String::as_str)
+            .filter(|name| name.starts_with("xl/media/") && !name.ends_with('/'))
+    }
+
+    /// Render one sheet. On exhaustion, the cursor identifies the last source
+    /// row processed in that sheet. No partial Markdown is returned.
+    pub fn read_sheet(&mut self, index: usize, through_row: &mut u64) -> Result<String> {
+        *through_row = 0;
+        let sheet = self
+            .sheets
+            .get(index)
+            .ok_or_else(|| invalid("worksheet index is out of range"))?;
+        let before = self.budget.retained();
+        let result = with_part(
+            &mut self.archive,
+            &mut self.budget,
+            &sheet.target,
+            |bytes, budget| parse_sheet(bytes, &self.shared, &self.formats, budget, through_row),
+        );
+        self.budget.release(self.budget.retained() - before);
+        result
+    }
 }
 
-fn parse_workbook_sheets(xml: &[u8]) -> Result<Vec<SheetRef>> {
-    parse_workbook_sheets_with_budget(xml, &mut MetadataBudget::new(MAX_XLSX_SHEETS))
+// Covers the owned strings' collection slots and index nodes.
+const RECORD_BYTES: usize = 128;
+
+fn retain_record(budget: &mut Budget, bytes: usize) -> Result<()> {
+    budget.visit()?;
+    budget.retain(RECORD_BYTES + bytes)
 }
 
-fn parse_workbook_sheets_with_budget(
-    xml: &[u8],
-    budget: &mut MetadataBudget,
-) -> Result<Vec<SheetRef>> {
-    let mut reader = validated_reader_for(xml)?;
-    let mut buf = Vec::new();
+fn with_part<T>(
+    archive: &mut BoundedZip<'_>,
+    budget: &mut Budget,
+    name: &str,
+    parse: impl FnOnce(&[u8], &mut Budget) -> Result<T>,
+) -> Result<T> {
+    let part = archive
+        .consume(name, true, |length| {
+            budget.visit()?;
+            budget.expand(length)?;
+            // The source stays resident while the parser uses namespace and
+            // attribute scratch space. Events otherwise borrow the source bytes.
+            budget.retain(part_memory(length))
+        })?
+        .ok_or_else(|| invalid("required part is missing"))?;
+    let result = parse(&part, budget);
+    budget.release(part_memory(part.len()));
+    result
+}
+
+fn part_memory(length: usize) -> usize {
+    length * 2 + 128 * 1024
+}
+
+fn relationship_part(part: &str) -> String {
+    part.rsplit_once('/').map_or_else(
+        || format!("_rels/{part}.rels"),
+        |(directory, file)| format!("{directory}/_rels/{file}.rels"),
+    )
+}
+
+fn resolve_target(base: &str, target: &str) -> Result<String> {
+    if target.contains(['\\', ':', '?', '#']) {
+        return Err(invalid("relationship target is not an internal part path"));
+    }
+    let (parent, path) = match target.strip_prefix('/') {
+        Some(absolute) => ("", absolute),
+        None => (
+            base.rsplit_once('/').map_or("", |(directory, _)| directory),
+            target,
+        ),
+    };
+    let mut resolved = parent.to_owned();
+    for component in path.split('/') {
+        match component {
+            ".." if !resolved.is_empty() => {
+                resolved.truncate(resolved.rfind('/').unwrap_or(0));
+            }
+            "" | "." | ".." => return Err(invalid("relationship target has an invalid path")),
+            _ => {
+                if !resolved.is_empty() {
+                    resolved.push('/');
+                }
+                resolved.push_str(component);
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+fn invalid(detail: &str) -> AdapterError {
+    AdapterError::ContractViolation(format!("XLSX {detail}"))
+}
+
+fn xml_error(error: impl std::fmt::Display) -> AdapterError {
+    AdapterError::ContractViolation(format!("XLSX XML is malformed: {error}"))
+}
+
+fn parse_workbook_sheets(bytes: &[u8], budget: &mut Budget) -> Result<Vec<(String, String)>> {
+    let mut xml = Xml::new(bytes, Some(b"workbook"))?;
     let mut sheets = Vec::new();
+    let mut in_sheets = false;
     loop {
-        match reader.read_event_into(&mut buf).map_err(xml_error)? {
-            Event::Empty(event) | Event::Start(event)
-                if local_name(event.name().as_ref()) == b"sheet" =>
-            {
-                budget.record()?;
-                let Some(name) = budget.attribute(&event, "name")? else {
-                    return Err(AdapterError::ContractViolation(
-                        "XLSX workbook declares a sheet with no name".to_owned(),
-                    ));
-                };
-                sheets.push(SheetRef {
-                    name,
-                    rel_id: budget.attribute(&event, "id")?,
-                });
+        match xml.next()? {
+            (1, Event::Start(tag)) if xml.sheet_element(tag.name(), b"sheets") => {
+                in_sheets = true;
             }
-            Event::Eof => break,
+            (1, Event::End(_)) => in_sheets = false,
+            (2, Event::Start(tag) | Event::Empty(tag))
+                if in_sheets && xml.sheet_element(tag.name(), b"sheet") =>
+            {
+                let name = xml
+                    .attribute(&tag, b"", b"name")?
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| invalid("sheet has no name"))?;
+                let id = xml
+                    .attribute(&tag, DOCUMENT_REL_NS, b"id")?
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| invalid("sheet has no relationship id"))?;
+                retain_record(budget, name.len() + id.len())?;
+                sheets.push((name, id));
+            }
+            (_, Event::Eof) if sheets.is_empty() => {
+                return Err(invalid("workbook declares no sheets"));
+            }
+            (_, Event::Eof) => return Ok(sheets),
             _ => {}
         }
-        buf.clear();
     }
-    if sheets.is_empty() {
-        return Err(AdapterError::ContractViolation(
-            "XLSX workbook declares no sheets".to_owned(),
-        ));
-    }
-    Ok(sheets)
 }
 
-fn parse_relationships(xml: &[u8]) -> Result<BTreeMap<String, String>> {
-    parse_relationships_with_budget(xml, &mut MetadataBudget::new(MAX_XLSX_RELATIONSHIPS))
-}
-
-fn parse_relationships_with_budget(
-    xml: &[u8],
-    budget: &mut MetadataBudget,
-) -> Result<BTreeMap<String, String>> {
-    let mut reader = validated_reader_for(xml)?;
-    let mut buf = Vec::new();
-    let mut map = BTreeMap::new();
-    loop {
-        match reader.read_event_into(&mut buf).map_err(xml_error)? {
-            Event::Empty(event) | Event::Start(event)
-                if local_name(event.name().as_ref()) == b"Relationship" =>
-            {
-                budget.record()?;
-                if let (Some(id), Some(target)) = (
-                    budget.attribute(&event, "Id")?,
-                    budget.attribute(&event, "Target")?,
-                ) {
-                    map.insert(id, target);
-                }
-            }
-            Event::Eof => break,
-            _ => {}
-        }
-        buf.clear();
-    }
-    Ok(map)
-}
-
-/// `sharedStrings.xml` is an ordered table; a cell with `t="s"` holds an index.
-/// Rich-text runs split one string across several `<t>` children, so the
-/// concatenation is per `<si>`, not per `<t>`.
-fn parse_shared_strings(xml: &[u8]) -> Result<Vec<String>> {
-    parse_shared_strings_with_budget(xml, &mut MetadataBudget::new(MAX_XLSX_SHARED_STRINGS))
-}
-
-fn parse_shared_strings_with_budget(
-    xml: &[u8],
-    budget: &mut MetadataBudget,
-) -> Result<Vec<String>> {
-    let mut reader = validated_reader_for(xml)?;
-    let mut buf = Vec::new();
+fn parse_shared_strings(bytes: &[u8], budget: &mut Budget) -> Result<Vec<String>> {
+    let mut xml = Xml::new(bytes, Some(b"sst"))?;
     let mut strings = Vec::new();
-    let mut current: Option<String> = None;
-    let mut in_text = false;
+    let mut current = String::new();
+    let mut in_item = false;
+    let mut run = false;
+    let mut text_depth = None;
     loop {
-        match reader.read_event_into(&mut buf).map_err(xml_error)? {
-            Event::Start(event) => match local_name(event.name().as_ref()) {
-                b"si" => {
-                    budget.record()?;
-                    current = Some(String::new());
-                }
-                b"t" => in_text = true,
-                _ => {}
-            },
-            Event::Empty(event) if local_name(event.name().as_ref()) == b"si" => {
-                budget.record()?;
-                strings.push(String::new());
-            }
-            Event::End(event) => match local_name(event.name().as_ref()) {
-                b"si" => strings.push(current.take().unwrap_or_default()),
-                b"t" => in_text = false,
-                _ => {}
-            },
-            Event::Text(text) if in_text => {
-                if let Some(buffer) = current.as_mut() {
-                    let encoded: &[u8] = text.as_ref();
-                    budget.string_bytes(encoded.len())?;
-                    buffer.push_str(&decoded_text(&text)?);
+        let (depth, event) = xml.next()?;
+        if let Some(text) = text_content(&event, depth, text_depth)? {
+            budget.retain(text.len() * 2)?;
+            current.push_str(&text);
+            continue;
+        }
+        let empty = matches!(event, Event::Empty(_));
+        match event {
+            Event::Start(tag) | Event::Empty(tag)
+                if depth == 1 && xml.sheet_element(tag.name(), b"si") =>
+            {
+                retain_record(budget, 0)?;
+                if empty {
+                    strings.push(String::new());
+                } else {
+                    in_item = true;
                 }
             }
-            Event::GeneralRef(reference) if in_text => {
-                if let Some(buffer) = current.as_mut() {
-                    budget.string_bytes(4)?;
-                    buffer.push_str(&decoded_reference(&reference)?);
+            Event::Start(tag) if in_item && depth == 2 && xml.sheet_element(tag.name(), b"r") => {
+                run = true
+            }
+            Event::Start(tag)
+                if in_item
+                    && (depth == 2 || (depth == 3 && run))
+                    && xml.sheet_element(tag.name(), b"t") =>
+            {
+                text_depth = Some(depth + 1);
+            }
+            Event::End(_) if depth == 1 && in_item => {
+                strings.push(std::mem::take(&mut current));
+                in_item = false;
+            }
+            Event::End(_) => {
+                if text_depth == Some(depth + 1) {
+                    text_depth = None;
+                }
+                if depth == 2 {
+                    run = false;
                 }
             }
-            Event::Eof => break,
+            Event::Eof => return Ok(strings),
             _ => {}
         }
-        buf.clear();
     }
-    Ok(strings)
 }
 
-/// The `numFmt` code each `cellXfs` style index resolves to.
-#[derive(Debug, Default)]
+fn text_content<'a>(
+    event: &'a Event<'_>,
+    depth: usize,
+    scope: Option<usize>,
+) -> Result<Option<Cow<'a, str>>> {
+    if scope != Some(depth) {
+        return Ok(None);
+    }
+    match event {
+        Event::Text(text) => text.decode().map(Some).map_err(xml_error),
+        Event::CData(text) => text.decode().map(Some).map_err(xml_error),
+        Event::GeneralRef(reference) => reference_text(reference).map(Some),
+        _ => Ok(None),
+    }
+}
+
+#[derive(Default)]
 struct CellFormats {
-    /// style index → numFmtId
     style_formats: Vec<u32>,
-    /// numFmtId → format code, for the custom (≥164) ids
     custom: BTreeMap<u32, String>,
 }
 
 impl CellFormats {
     fn code_for_style(&self, style_index: Option<usize>) -> Option<&str> {
         let id = *self.style_formats.get(style_index?)?;
-        if let Some(code) = self.custom.get(&id) {
-            return Some(code.as_str());
-        }
-        builtin_number_format(id)
+        self.custom
+            .get(&id)
+            .map(String::as_str)
+            .or_else(|| builtin_number_format(id))
     }
 }
 
-fn parse_styles(xml: &[u8]) -> Result<CellFormats> {
-    parse_styles_with_budget(xml, &mut MetadataBudget::new(MAX_XLSX_FORMAT_RECORDS))
-}
-
-fn parse_styles_with_budget(xml: &[u8], budget: &mut MetadataBudget) -> Result<CellFormats> {
-    let mut reader = validated_reader_for(xml)?;
-    let mut buf = Vec::new();
+fn parse_styles(bytes: &[u8], budget: &mut Budget) -> Result<CellFormats> {
+    let mut xml = Xml::new(bytes, Some(b"styleSheet"))?;
     let mut formats = CellFormats::default();
+    let mut in_custom = false;
     let mut in_cell_xfs = false;
     loop {
-        match reader.read_event_into(&mut buf).map_err(xml_error)? {
-            Event::Start(event) | Event::Empty(event) => {
-                match local_name(event.name().as_ref()) {
-                    b"numFmt" => {
-                        budget.record()?;
-                        if let (Some(id), Some(code)) = (
-                            budget
-                                .attribute(&event, "numFmtId")?
-                                .and_then(|v| v.parse::<u32>().ok()),
-                            budget.attribute(&event, "formatCode")?,
-                        ) {
-                            formats.custom.insert(id, code);
+        let (depth, event) = xml.next()?;
+        match event {
+            Event::Start(tag) if depth == 1 => {
+                in_custom = xml.sheet_element(tag.name(), b"numFmts");
+                in_cell_xfs = xml.sheet_element(tag.name(), b"cellXfs");
+            }
+            Event::End(_) if depth == 1 => {
+                in_custom = false;
+                in_cell_xfs = false;
+            }
+            Event::Start(tag) | Event::Empty(tag) if depth == 2 => {
+                if in_custom && xml.sheet_element(tag.name(), b"numFmt") {
+                    let id =
+                        format_id(&xml, &tag)?.ok_or_else(|| invalid("custom format has no id"))?;
+                    let code = xml
+                        .attribute(&tag, b"", b"formatCode")?
+                        .ok_or_else(|| invalid("custom format has no code"))?;
+                    retain_record(budget, code.len())?;
+                    if formats.custom.insert(id, code).is_some() {
+                        return Err(invalid("duplicate custom format id"));
+                    }
+                } else if in_cell_xfs && xml.sheet_element(tag.name(), b"xf") {
+                    budget.visit()?;
+                    budget.retain(2 * size_of::<u32>())?;
+                    formats
+                        .style_formats
+                        .push(format_id(&xml, &tag)?.unwrap_or(0));
+                }
+            }
+            Event::Eof => return Ok(formats),
+            _ => {}
+        }
+    }
+}
+
+fn format_id(xml: &Xml<'_>, tag: &BytesStart<'_>) -> Result<Option<u32>> {
+    xml.attribute(tag, b"", b"numFmtId")?
+        .map(|id| id.parse().map_err(xml_error))
+        .transpose()
+}
+
+struct Row<'a> {
+    number: u64,
+    next_column: usize,
+    cells: Vec<(usize, Cow<'a, str>)>,
+}
+
+impl Row<'_> {
+    fn new(number: u64) -> Self {
+        Self {
+            number,
+            next_column: 0,
+            cells: Vec::new(),
+        }
+    }
+}
+
+struct Cell {
+    column: usize,
+    kind: Option<String>,
+    style: Option<usize>,
+    text: String,
+    text_bytes: usize,
+}
+
+impl Cell {
+    fn new(xml: &Xml<'_>, tag: &BytesStart<'_>, row: &Row<'_>) -> Result<Self> {
+        let column = match xml.attribute(tag, b"", b"r")? {
+            Some(reference) => {
+                let (column, number) = cell_reference(&reference)?;
+                if number != row.number {
+                    return Err(invalid("cell reference does not match its row"));
+                }
+                column
+            }
+            None => row.next_column,
+        };
+        if column < row.next_column {
+            return Err(invalid("row has duplicate or backwards cell references"));
+        }
+        Ok(Self {
+            column,
+            kind: xml.attribute(tag, b"", b"t")?,
+            style: xml
+                .attribute(tag, b"", b"s")?
+                .map(|s| s.parse().map_err(xml_error))
+                .transpose()?,
+            text: String::new(),
+            text_bytes: 0,
+        })
+    }
+
+    fn append(&mut self, value: &str, budget: &mut Budget) -> Result<()> {
+        let bytes = value.len() * 2;
+        budget.retain(bytes)?;
+        self.text_bytes += bytes;
+        self.text.push_str(value);
+        Ok(())
+    }
+
+    fn finish<'a>(
+        self,
+        row: &mut Row<'a>,
+        shared: &'a [String],
+        formats: &CellFormats,
+        budget: &mut Budget,
+    ) -> Result<usize> {
+        row.next_column = self
+            .column
+            .checked_add(1)
+            .ok_or_else(|| invalid("column overflows"))?;
+        let raw = self.text.trim();
+        if raw.is_empty() {
+            budget.release(self.text_bytes);
+            return Ok(0);
+        }
+        let (value, bytes) = match self.kind.as_deref() {
+            Some("s") => {
+                budget.visit()?;
+                let index = raw.parse::<usize>().map_err(xml_error)?;
+                let value = shared
+                    .get(index)
+                    .ok_or_else(|| invalid("cell references an absent shared string"))?;
+                budget.expand(value.len())?;
+                (Cow::Borrowed(value.as_str()), 0)
+            }
+            Some("inlineStr" | "str" | "e" | "d") => {
+                budget.retain(raw.len())?;
+                (Cow::Owned(raw.to_owned()), raw.len())
+            }
+            Some("b") => (Cow::Borrowed(if raw == "1" { "TRUE" } else { "FALSE" }), 0),
+            _ => {
+                let format = formats.code_for_style(self.style);
+                let format_bytes = format.map_or(0, str::len);
+                budget.expand(format_bytes)?;
+                // f64 formatting may add a sign, punctuation, and up to 309
+                // integral digits. Precision is bounded by the format string.
+                let bound = (raw.len() + format_bytes + 320) * 2;
+                budget.retain(bound)?;
+                let value = format_cell(raw, format);
+                let size = value.capacity();
+                if size > bound {
+                    return Err(invalid("numeric format exceeds its render bound"));
+                }
+                budget.release(bound - size);
+                (Cow::Owned(value), size)
+            }
+        };
+        budget.release(self.text_bytes);
+        if value.trim().is_empty() {
+            budget.release(bytes);
+            return Ok(0);
+        }
+        let charge = bytes + 2 * size_of::<(usize, Cow<'_, str>)>() + 64;
+        budget.retain(charge - bytes)?;
+        row.cells.push((self.column, value));
+        Ok(charge)
+    }
+}
+
+fn cell_reference(reference: &str) -> Result<(usize, u64)> {
+    let split = reference
+        .bytes()
+        .take_while(u8::is_ascii_alphabetic)
+        .count();
+    let (letters, digits) = reference.split_at(split);
+    let mut column = 0usize;
+    for letter in letters.bytes() {
+        column = column
+            .checked_mul(26)
+            .and_then(|value| {
+                value.checked_add(usize::from(letter.to_ascii_uppercase() - b'A' + 1))
+            })
+            .ok_or_else(|| invalid("column reference overflows"))?;
+    }
+    let row = positive_row(digits)?;
+    if column == 0 {
+        return Err(invalid("cell reference has no column"));
+    }
+    Ok((column - 1, row))
+}
+
+fn positive_row(text: &str) -> Result<u64> {
+    if !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid("invalid source row number"));
+    }
+    text.parse::<u64>()
+        .ok()
+        .filter(|&number| number != 0)
+        .ok_or_else(|| invalid("invalid source row number"))
+}
+
+fn parse_sheet(
+    bytes: &[u8],
+    shared: &[String],
+    formats: &CellFormats,
+    budget: &mut Budget,
+    through_row: &mut u64,
+) -> Result<String> {
+    let mut xml = Xml::new(bytes, Some(b"worksheet"))?;
+    let mut out = String::new();
+    let mut region = Region::default();
+    let mut row = None;
+    let mut cell = None;
+    let mut text_depth = None;
+    let mut inline = false;
+    let mut run = false;
+    let mut sheet_data = false;
+    let mut saw_sheet_data = false;
+    loop {
+        let (depth, event) = xml.next()?;
+        if let Some(text) = text_content(&event, depth, text_depth)? {
+            if let Some(cell) = &mut cell {
+                Cell::append(cell, &text, budget)?;
+            }
+            continue;
+        }
+        let empty = matches!(event, Event::Empty(_));
+        match event {
+            Event::Start(tag) | Event::Empty(tag)
+                if depth == 1 && xml.sheet_element(tag.name(), b"sheetData") =>
+            {
+                if saw_sheet_data {
+                    return Err(invalid("worksheet repeats sheetData"));
+                }
+                saw_sheet_data = true;
+                sheet_data = !empty;
+            }
+            Event::End(_) if depth == 1 => sheet_data = false,
+            Event::Start(tag) | Event::Empty(tag)
+                if sheet_data && depth == 2 && xml.sheet_element(tag.name(), b"row") =>
+            {
+                budget.visit()?;
+                let next = through_row
+                    .checked_add(1)
+                    .ok_or_else(|| invalid("row number overflows"))?;
+                let number = match xml.attribute(&tag, b"", b"r")? {
+                    Some(number) => positive_row(&number)?,
+                    None => next,
+                };
+                if number < next {
+                    return Err(invalid("worksheet has duplicate or backwards row numbers"));
+                }
+                if number > next || empty {
+                    region.flush(&mut out, budget, through_row)?;
+                    *through_row = number - 1;
+                }
+                if empty {
+                    *through_row = number;
+                } else {
+                    row = Some(Row::new(number));
+                }
+            }
+            Event::Start(tag) | Event::Empty(tag)
+                if depth == 3 && row.is_some() && xml.sheet_element(tag.name(), b"c") =>
+            {
+                budget.visit()?;
+                let row = row.as_mut().expect("matched row");
+                let next = Cell::new(&xml, &tag, row)?;
+                if empty {
+                    region.bytes += next.finish(row, shared, formats, budget)?;
+                } else {
+                    cell = Some(next);
+                }
+            }
+            Event::Start(tag) | Event::Empty(tag)
+                if sheet_data
+                    && (xml.sheet_element(tag.name(), b"row")
+                        || xml.sheet_element(tag.name(), b"c")) =>
+            {
+                return Err(invalid("worksheet has a nested row or an out-of-row cell"));
+            }
+            Event::Start(tag) if cell.is_some() && depth == 4 => {
+                inline = xml.sheet_element(tag.name(), b"is");
+                if xml.sheet_element(tag.name(), b"v") {
+                    text_depth = Some(depth + 1);
+                }
+            }
+            Event::Start(tag) if inline && depth == 5 => {
+                run = xml.sheet_element(tag.name(), b"r");
+                if xml.sheet_element(tag.name(), b"t") {
+                    text_depth = Some(depth + 1);
+                }
+            }
+            Event::Start(tag) if run && depth == 6 && xml.sheet_element(tag.name(), b"t") => {
+                text_depth = Some(depth + 1);
+            }
+            Event::End(_) => {
+                if text_depth == Some(depth + 1) {
+                    text_depth = None;
+                }
+                match depth {
+                    5 => run = false,
+                    4 => inline = false,
+                    3 => {
+                        if let (Some(cell), Some(row)) = (cell.take(), &mut row) {
+                            region.bytes += cell.finish(row, shared, formats, budget)?;
                         }
                     }
-                    b"cellXfs" => in_cell_xfs = true,
-                    // `cellStyleXfs` also contains `<xf>` elements; only the
-                    // `cellXfs` ones are what a cell's `s=` indexes into.
-                    b"xf" if in_cell_xfs => {
-                        budget.record()?;
-                        formats.style_formats.push(
-                            budget
-                                .attribute(&event, "numFmtId")?
-                                .and_then(|v| v.parse::<u32>().ok())
-                                .unwrap_or(0),
-                        );
+                    2 => {
+                        if let Some(row) = row.take() {
+                            let number = row.number;
+                            if row.cells.is_empty() {
+                                region.flush(&mut out, budget, through_row)?;
+                            } else {
+                                region.push(row, *through_row, budget)?;
+                            }
+                            *through_row = number;
+                        }
                     }
                     _ => {}
                 }
             }
-            Event::End(event) if local_name(event.name().as_ref()) == b"cellXfs" => {
-                in_cell_xfs = false;
-            }
-            Event::Eof => break,
-            _ => {}
-        }
-        buf.clear();
-    }
-    Ok(formats)
-}
-
-fn parse_sheet(
-    xml: &[u8],
-    shared: &[String],
-    formats: &CellFormats,
-    materialized_cells: &mut usize,
-    materialized_cell_text_bytes: &mut usize,
-) -> Result<Vec<Vec<String>>> {
-    let mut reader = validated_reader_for(xml)?;
-    let mut buf = Vec::new();
-    let mut grid: Vec<Vec<String>> = Vec::new();
-    let mut row: Vec<String> = Vec::new();
-    let mut in_row = false;
-    let mut cell: Option<CellState> = None;
-    let mut text = String::new();
-    let mut in_value = false;
-    let mut in_inline_text = false;
-
-    /// Place a finished cell at the column its `r` reference names, padding
-    /// over the columns the writer omitted because they were empty. Without
-    /// the padding a sparse row would shift left and a Markdown column would
-    /// stop meaning one spreadsheet column.
-    fn place(
-        row: &mut Vec<String>,
-        column: usize,
-        value: String,
-        materialized_cells: &mut usize,
-    ) -> Result<()> {
-        if column >= MAX_XLSX_COLUMNS {
-            return Err(AdapterError::ContractViolation(format!(
-                "XLSX row references column {}, over the {MAX_XLSX_COLUMNS}-column bound",
-                column + 1
-            )));
-        }
-        if column < row.len() {
-            return Err(AdapterError::ContractViolation(
-                "XLSX row has duplicate or backwards cell references".to_owned(),
-            ));
-        }
-        let additions = column + 1 - row.len();
-        if materialized_cells.saturating_add(additions) > MAX_XLSX_CELLS_PER_WORKBOOK {
-            return Err(AdapterError::ContractViolation(format!(
-                "XLSX workbook exceeds the {MAX_XLSX_CELLS_PER_WORKBOOK}-cell bound"
-            )));
-        }
-        row.reserve(additions);
-        row.resize_with(column, String::new);
-        row.push(value);
-        *materialized_cells += additions;
-        Ok(())
-    }
-
-    fn admit_row(grid: &[Vec<String>], in_row: bool, cell: &Option<CellState>) -> Result<()> {
-        if in_row || cell.is_some() {
-            return Err(AdapterError::ContractViolation(
-                "XLSX sheet has nested rows".to_owned(),
-            ));
-        }
-        if grid.len() >= MAX_XLSX_ROWS_PER_SHEET {
-            return Err(AdapterError::ContractViolation(format!(
-                "XLSX sheet exceeds the {MAX_XLSX_ROWS_PER_SHEET}-row bound"
-            )));
-        }
-        Ok(())
-    }
-
-    loop {
-        match reader.read_event_into(&mut buf).map_err(xml_error)? {
-            Event::Start(event) => match local_name(event.name().as_ref()) {
-                b"row" => {
-                    admit_row(&grid, in_row, &cell)?;
-                    in_row = true;
-                    row = Vec::new();
-                }
-                b"c" => {
-                    if !in_row || cell.is_some() {
-                        return Err(AdapterError::ContractViolation(
-                            "XLSX sheet has nested or out-of-row cells".to_owned(),
-                        ));
-                    }
-                    text.clear();
-                    cell = Some(CellState::from(&event, row.len())?);
-                }
-                b"v" => in_value = true,
-                // `<is><t>` — an inline string, used by writers that skip the
-                // shared table.
-                b"t" => in_inline_text = true,
-                _ => {}
-            },
-            // `<row/>` and `<c r="B2" s="4"/>` are self-closing: a styled but
-            // empty cell is extremely common, and it never sees an `End`.
-            Event::Empty(event) => match local_name(event.name().as_ref()) {
-                b"row" => {
-                    admit_row(&grid, in_row, &cell)?;
-                    grid.push(Vec::new());
-                }
-                b"c" => {
-                    if !in_row || cell.is_some() {
-                        return Err(AdapterError::ContractViolation(
-                            "XLSX sheet has nested or out-of-row cells".to_owned(),
-                        ));
-                    }
-                    let state = CellState::from(&event, row.len())?;
-                    place(&mut row, state.column, String::new(), materialized_cells)?;
-                }
-                _ => {}
-            },
-            Event::End(event) => match local_name(event.name().as_ref()) {
-                b"row" => {
-                    if !in_row || cell.is_some() {
-                        return Err(AdapterError::ContractViolation(
-                            "XLSX sheet has an unmatched row boundary".to_owned(),
-                        ));
-                    }
-                    grid.push(std::mem::take(&mut row));
-                    in_row = false;
-                }
-                b"c" => {
-                    let state = cell.take().ok_or_else(|| {
-                        AdapterError::ContractViolation(
-                            "XLSX sheet has an unmatched cell boundary".to_owned(),
-                        )
-                    })?;
-                    let value =
-                        resolve_cell(&text, &state, shared, formats, materialized_cell_text_bytes)?;
-                    place(&mut row, state.column, value, materialized_cells)?;
-                    text.clear();
-                }
-                b"v" => in_value = false,
-                b"t" => in_inline_text = false,
-                _ => {}
-            },
-            Event::Text(content) if in_value || in_inline_text => {
-                text.push_str(&decoded_text(&content)?);
-            }
-            Event::GeneralRef(reference) if in_value || in_inline_text => {
-                text.push_str(&decoded_reference(&reference)?);
-            }
             Event::Eof => {
-                if in_row || cell.is_some() {
-                    return Err(AdapterError::ContractViolation(
-                        "XLSX sheet ends inside a row or cell".to_owned(),
-                    ));
+                if !saw_sheet_data {
+                    return Err(invalid("worksheet has no sheetData"));
                 }
-                break;
+                region.flush(&mut out, budget, through_row)?;
+                return Ok(out);
             }
             _ => {}
         }
-        buf.clear();
     }
-    Ok(grid)
 }
 
-struct CellState {
-    column: usize,
-    kind: Option<String>,
-    style: Option<usize>,
+#[derive(Default)]
+struct Region<'a> {
+    rows: Vec<Row<'a>>,
+    bytes: usize,
+    before: u64,
 }
 
-impl CellState {
-    fn from(event: &quick_xml::events::BytesStart<'_>, fallback_column: usize) -> Result<Self> {
-        let column = match attribute(event, "r")? {
-            Some(reference) => column_index_from_ref_checked(&reference)?,
-            None => fallback_column,
-        };
-        if column >= MAX_XLSX_COLUMNS {
-            return Err(AdapterError::ContractViolation(format!(
-                "XLSX row references column {}, over the {MAX_XLSX_COLUMNS}-column bound",
-                column + 1
-            )));
+impl<'a> Region<'a> {
+    fn push(&mut self, row: Row<'a>, before: u64, budget: &mut Budget) -> Result<()> {
+        if self.rows.is_empty() {
+            self.before = before;
         }
-        Ok(Self {
-            column,
-            kind: attribute(event, "t")?,
-            style: attribute(event, "s")?.and_then(|value| value.parse::<usize>().ok()),
-        })
+        let charge = 2 * size_of::<Row<'_>>();
+        budget.retain(charge)?;
+        self.bytes += charge;
+        self.rows.push(row);
+        Ok(())
     }
+
+    fn flush(
+        &mut self,
+        out: &mut String,
+        budget: &mut Budget,
+        through_row: &mut u64,
+    ) -> Result<()> {
+        if self.rows.is_empty() {
+            return Ok(());
+        }
+        *through_row = self.before;
+        // Rendering uses the union of populated columns of each table. No
+        // vector is indexed by the largest referenced column.
+        let header = self.rows.iter().position(|row| row.cells.len() >= 2);
+        let (notes, table) = self.rows.split_at(header.unwrap_or(self.rows.len()));
+        let mut columns = BTreeSet::new();
+        for row in table {
+            for &(column, _) in &row.cells {
+                if !columns.contains(&column) {
+                    budget.retain(64)?;
+                    self.bytes += 64;
+                    columns.insert(column);
+                }
+            }
+        }
+        for row in notes {
+            separate(out, "\n\n", budget)?;
+            push(out, row.cells[0].1.trim(), budget)?;
+            *through_row = row.number;
+        }
+        if !table.is_empty() {
+            separate(out, "\n\n", budget)?;
+        }
+        for (index, row) in table.iter().enumerate() {
+            if index != 0 {
+                push(out, "\n", budget)?;
+            }
+            push(out, "|", budget)?;
+            let mut cells = row.cells.iter().peekable();
+            for column in &columns {
+                push(out, " ", budget)?;
+                if let Some((_, value)) = cells.next_if(|(index, _)| index == column) {
+                    escape_cell(out, value.trim(), budget)?;
+                }
+                push(out, " |", budget)?;
+            }
+            if index == 0 {
+                push(out, "\n|", budget)?;
+                for _ in &columns {
+                    push(out, " --- |", budget)?;
+                }
+            }
+            *through_row = row.number;
+        }
+        drop(columns);
+        self.rows = Vec::new();
+        budget.release(std::mem::take(&mut self.bytes));
+        Ok(())
+    }
+}
+
+fn separate(out: &mut String, separator: &str, budget: &mut Budget) -> Result<()> {
+    if !out.is_empty() {
+        push(out, separator, budget)?;
+    }
+    Ok(())
+}
+
+fn escape_cell(out: &mut String, value: &str, budget: &mut Budget) -> Result<()> {
+    budget.check_unit((out.len() as u64).checked_add(value.len() as u64))?;
+    let escapes = value.bytes().filter(|&byte| byte == b'|').count();
+    admit_output(out, value.len() + escapes, budget)?;
+    let mut parts = value.split('|');
+    out.push_str(parts.next().unwrap_or_default());
+    for part in parts {
+        out.push_str("\\|");
+        out.push_str(part);
+    }
+    Ok(())
+}
+
+fn push(out: &mut String, value: &str, budget: &mut Budget) -> Result<()> {
+    admit_output(out, value.len(), budget)?;
+    out.push_str(value);
+    Ok(())
+}
+
+fn admit_output(out: &str, bytes: usize, budget: &mut Budget) -> Result<()> {
+    let length = out.len().checked_add(bytes);
+    budget.check_unit(length.map(|size| size as u64))?;
+    budget.expand(bytes)?;
+    // Account for amortized String growth and its old buffer during growth.
+    budget.retain(bytes * 3)
 }
 
 /// ECMA-376 §18.8.30's implied `numFmt` codes. Ids at or above 164 are custom
@@ -853,81 +908,6 @@ fn builtin_number_format(id: u32) -> Option<&'static str> {
         49 => "@",
         _ => return None,
     })
-}
-
-fn resolve_cell(
-    raw: &str,
-    state: &CellState,
-    shared: &[String],
-    formats: &CellFormats,
-    materialized_cell_text_bytes: &mut usize,
-) -> Result<String> {
-    fn admit_text_bytes(used: &mut usize, bytes: usize) -> Result<()> {
-        if used.saturating_add(bytes) > MAX_XLSX_CELL_TEXT_BYTES {
-            return Err(AdapterError::ContractViolation(format!(
-                "XLSX workbook exceeds the {MAX_XLSX_CELL_TEXT_BYTES}-byte cell-text bound"
-            )));
-        }
-        *used += bytes;
-        Ok(())
-    }
-
-    fn formatted_value_bound(raw: &str, format_code: Option<&str>) -> usize {
-        // A finite f64 needs at most 309 integral digits, a sign, decimal
-        // separator, and the percent/date punctuation. The custom code bounds
-        // the requested decimal places, so its byte length covers the only
-        // unbounded part of the rendered numeric representation.
-        raw.len()
-            .saturating_add(format_code.map_or(0, str::len))
-            .saturating_add(320)
-    }
-
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return Ok(String::new());
-    }
-    match state.kind.as_deref() {
-        Some("s") => {
-            let index: usize = raw.parse().map_err(|_| {
-                AdapterError::ContractViolation(format!(
-                    "XLSX shared-string cell holds a non-numeric index `{raw}`"
-                ))
-            })?;
-            let value = shared.get(index).ok_or_else(|| {
-                AdapterError::ContractViolation(format!(
-                    "XLSX cell references shared string {index}, past the {} in the table",
-                    shared.len()
-                ))
-            })?;
-            admit_text_bytes(materialized_cell_text_bytes, value.len())?;
-            Ok(value.clone())
-        }
-        // Inline string, boolean, error, formula-string: already text.
-        Some("inlineStr") | Some("str") | Some("e") => {
-            admit_text_bytes(materialized_cell_text_bytes, raw.len())?;
-            Ok(raw.to_owned())
-        }
-        Some("b") => {
-            let value = if raw == "1" { "TRUE" } else { "FALSE" };
-            admit_text_bytes(materialized_cell_text_bytes, value.len())?;
-            Ok(value.to_owned())
-        }
-        // Numeric (`t` absent or `n`) — the branch where the stored value and
-        // the document's meaning diverge.
-        _ => {
-            let format_code = formats.code_for_style(state.style);
-            let reserved = formatted_value_bound(raw, format_code);
-            admit_text_bytes(materialized_cell_text_bytes, reserved)?;
-            let value = format_cell(raw, format_code);
-            if value.len() > reserved {
-                return Err(AdapterError::ContractViolation(
-                    "XLSX numeric cell exceeds its checked render bound".to_owned(),
-                ));
-            }
-            *materialized_cell_text_bytes -= reserved - value.len();
-            Ok(value)
-        }
-    }
 }
 
 /// Render a stored numeric value the way the sheet displays it.
@@ -1110,189 +1090,6 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-fn column_index_from_ref_checked(cell_ref: &str) -> Result<usize> {
-    let mut index = 0usize;
-    let mut saw_column = false;
-    for ch in cell_ref.chars() {
-        if !ch.is_ascii_alphabetic() {
-            break;
-        }
-        saw_column = true;
-        index = index
-            .checked_mul(26)
-            .and_then(|value| {
-                value.checked_add(ch.to_ascii_uppercase() as usize - 'A' as usize + 1)
-            })
-            .ok_or_else(|| {
-                AdapterError::ContractViolation("XLSX cell reference column overflows".to_owned())
-            })?;
-        if index > MAX_XLSX_COLUMNS {
-            return Err(AdapterError::ContractViolation(format!(
-                "XLSX row references column {index}, over the {MAX_XLSX_COLUMNS}-column bound"
-            )));
-        }
-    }
-    if !saw_column {
-        return Err(AdapterError::ContractViolation(
-            "XLSX cell reference has no column".to_owned(),
-        ));
-    }
-    Ok(index - 1)
-}
-
-// ---------------------------------------------------------------------------
-// Markdown
-// ---------------------------------------------------------------------------
-
-fn populated(row: &[String]) -> usize {
-    row.iter().filter(|cell| !cell.trim().is_empty()).count()
-}
-
-/// Render a sheet as Markdown.
-///
-/// A sheet is rarely one clean table. The corpus's files hold a title block, a
-/// summary strip and the real table in a single sheet, separated by blank rows
-/// — and the blocks do not share a column layout. Rendering the whole grid as
-/// one table forces the widest block's columns onto every other one, so the
-/// summary strip comes out as `| 対象項目 |  | 確認済 |  | …`: the header no
-/// longer sits above its value.
-///
-/// So a blank row ends a region, and each region is rendered on its own terms:
-/// its own header row and its own column trimming.
-fn grid_to_markdown_with_limit(grid: &[Vec<String>], limit: usize) -> Result<String> {
-    let mut out = BoundedMarkdown::new(limit);
-    let mut has_block = false;
-    for region in grid.split(|row| populated(row) == 0) {
-        if region.is_empty() {
-            continue;
-        }
-        if !region.iter().any(|row| populated(row) != 0) {
-            continue;
-        }
-        if has_block {
-            out.push_str("\n\n")?;
-        }
-        region_to_markdown(region, &mut out)?;
-        out.trim_end();
-        has_block = true;
-    }
-    out.trim_end();
-    Ok(out.into_string())
-}
-
-struct BoundedMarkdown {
-    out: String,
-    limit: usize,
-}
-
-impl BoundedMarkdown {
-    fn new(limit: usize) -> Self {
-        Self {
-            out: String::new(),
-            limit,
-        }
-    }
-
-    fn push_str(&mut self, value: &str) -> Result<()> {
-        let length = self.out.len().checked_add(value.len()).ok_or_else(|| {
-            AdapterError::ContractViolation("XLSX Markdown length overflows".to_owned())
-        })?;
-        if length > self.limit {
-            return Err(AdapterError::ContractViolation(format!(
-                "XLSX workbook Markdown exceeds the {MAX_XLSX_MARKDOWN_BYTES}-byte bound"
-            )));
-        }
-        self.out.push_str(value);
-        Ok(())
-    }
-
-    fn push_cell(&mut self, value: &str) -> Result<()> {
-        let mut parts = value.split('|').peekable();
-        while let Some(part) = parts.next() {
-            self.push_str(part)?;
-            if parts.peek().is_some() {
-                self.push_str("\\|")?;
-            }
-        }
-        Ok(())
-    }
-
-    fn trim_end(&mut self) {
-        let length = self.out.trim_end().len();
-        self.out.truncate(length);
-    }
-
-    fn into_string(self) -> String {
-        self.out
-    }
-}
-
-/// One blank-row-delimited region. A region whose rows never reach two
-/// populated cells is prose (a title, a trailing note), not a table.
-fn region_to_markdown(region: &[Vec<String>], out: &mut BoundedMarkdown) -> Result<()> {
-    let width = region.iter().map(Vec::len).max().unwrap_or(0);
-    if width == 0 {
-        return Ok(());
-    }
-    let header_at = region.iter().position(|row| populated(row) >= 2);
-
-    let preamble_end = header_at.unwrap_or(region.len());
-    for row in &region[..preamble_end] {
-        let mut has_cell = false;
-        for cell in row
-            .iter()
-            .map(|cell| cell.trim())
-            .filter(|cell| !cell.is_empty())
-        {
-            if has_cell {
-                out.push_str(" ")?;
-            }
-            out.push_str(cell)?;
-            has_cell = true;
-        }
-        if has_cell {
-            out.push_str("\n\n")?;
-        }
-    }
-    let Some(header_at) = header_at else {
-        return Ok(());
-    };
-
-    let table = &region[header_at..];
-    // Drop columns empty across this region: a writer emits a cell for every
-    // column it has ever styled, and the spacer columns between a summary
-    // strip's fields are exactly that.
-    let keep: Vec<usize> = (0..width)
-        .filter(|column| {
-            table
-                .iter()
-                .any(|row| row.get(*column).is_some_and(|cell| !cell.trim().is_empty()))
-        })
-        .collect();
-    if keep.is_empty() {
-        return Ok(());
-    }
-    for (index, row) in table.iter().enumerate() {
-        out.push_str("|")?;
-        for column in &keep {
-            out.push_str(" ")?;
-            if let Some(cell) = row.get(*column) {
-                out.push_cell(cell.trim())?;
-            }
-            out.push_str(" |")?;
-        }
-        out.push_str("\n")?;
-        if index == 0 {
-            out.push_str("|")?;
-            for _ in &keep {
-                out.push_str(" --- |")?;
-            }
-            out.push_str("\n")?;
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::io::Write;
@@ -1300,94 +1097,47 @@ mod tests {
     use super::*;
     use zip::{ZipWriter, write::SimpleFileOptions};
 
-    fn metadata_budget(records: usize, bytes: usize) -> MetadataBudget {
-        MetadataBudget {
-            records: 0,
-            bytes: 0,
-            record_limit: records,
-            byte_limit: bytes,
-        }
+    use kio_core::error::Resource;
+    use xml::{MAX_XML_ATTRIBUTES, MAX_XML_DEPTH};
+
+    fn standard() -> Budget {
+        Budget::new(ResourceTier::Standard)
+    }
+
+    fn sheet_xml(rows: &str) -> String {
+        format!(
+            r#"<worksheet xmlns="{}"><sheetData>{rows}</sheetData></worksheet>"#,
+            std::str::from_utf8(xml::SPREADSHEET_NS).unwrap()
+        )
+    }
+
+    fn render(rows: &str) -> String {
+        parse_sheet(
+            sheet_xml(rows).as_bytes(),
+            &[],
+            &CellFormats::default(),
+            &mut standard(),
+            &mut 0,
+        )
+        .unwrap()
     }
 
     #[test]
-    fn workbook_sheet_limit_is_checked_inside_metadata_parser() {
-        let exact = format!(
-            "<workbook>{}</workbook>",
-            "<sheet name=\"a\"/>".repeat(MAX_XLSX_SHEETS)
-        );
+    fn metadata_memory_is_checked_before_growing_the_string_table() {
+        let namespace = std::str::from_utf8(xml::SPREADSHEET_NS).unwrap();
+        let input = format!(r#"<sst xmlns="{namespace}"><si/><si><t>x</t></si></sst>"#);
+        let mut budget = standard();
+        budget.memory_limit = (2 * RECORD_BYTES + 2) as u64;
         assert_eq!(
-            parse_workbook_sheets(exact.as_bytes()).unwrap().len(),
-            MAX_XLSX_SHEETS
+            parse_shared_strings(input.as_bytes(), &mut budget).unwrap(),
+            ["", "x"]
         );
-        let over = format!(
-            "<workbook>{}</workbook>",
-            "<sheet name=\"a\"/>".repeat(MAX_XLSX_SHEETS + 1)
+        let mut budget = standard();
+        budget.memory_limit = (2 * RECORD_BYTES + 1) as u64;
+        assert!(
+            matches!(parse_shared_strings(input.as_bytes(), &mut budget),
+            Err(AdapterError::ResourceLimit(limit)) if limit.resource == Resource::Memory)
         );
-        assert!(matches!(
-            parse_workbook_sheets(over.as_bytes()),
-            Err(AdapterError::ContractViolation(_))
-        ));
-    }
-
-    #[test]
-    fn metadata_record_limits_count_duplicate_ids_and_empty_records() {
-        let workbook = br#"<workbook><sheet name="a"/><sheet name="b"/></workbook>"#;
-        assert!(parse_workbook_sheets_with_budget(workbook, &mut metadata_budget(2, 100)).is_ok());
-        assert!(parse_workbook_sheets_with_budget(workbook, &mut metadata_budget(1, 100)).is_err());
-        let rels = br#"<Relationships><Relationship Id="a" Target="x"/><Relationship Id="a" Target="y"/></Relationships>"#;
-        assert_eq!(
-            parse_relationships_with_budget(rels, &mut metadata_budget(2, 100))
-                .unwrap()
-                .len(),
-            1
-        );
-        assert!(parse_relationships_with_budget(rels, &mut metadata_budget(1, 100)).is_err());
-        let shared = b"<sst><si/><si><t>x</t></si></sst>";
-        assert_eq!(
-            parse_shared_strings_with_budget(shared, &mut metadata_budget(2, 100)).unwrap(),
-            vec!["", "x"]
-        );
-        assert!(parse_shared_strings_with_budget(shared, &mut metadata_budget(1, 100)).is_err());
-        let custom = br#"<styleSheet><numFmt numFmtId="164" formatCode="0%"/><numFmt numFmtId="164" formatCode="0%"/></styleSheet>"#;
-        assert_eq!(
-            parse_styles_with_budget(custom, &mut metadata_budget(2, 100))
-                .unwrap()
-                .custom
-                .len(),
-            1
-        );
-        assert!(parse_styles_with_budget(custom, &mut metadata_budget(1, 100)).is_err());
-        let styles = b"<styleSheet><cellXfs><xf/><xf/></cellXfs></styleSheet>";
-        assert_eq!(
-            parse_styles_with_budget(styles, &mut metadata_budget(2, 100))
-                .unwrap()
-                .style_formats
-                .len(),
-            2
-        );
-        assert!(parse_styles_with_budget(styles, &mut metadata_budget(1, 100)).is_err());
-    }
-
-    #[test]
-    fn metadata_string_bytes_are_admitted_at_exact_boundary() {
-        let workbook = br#"<workbook><sheet name="abc"/></workbook>"#;
-        assert!(parse_workbook_sheets_with_budget(workbook, &mut metadata_budget(1, 3)).is_ok());
-        assert!(parse_workbook_sheets_with_budget(workbook, &mut metadata_budget(1, 2)).is_err());
-        let shared = b"<sst><si><t>abc</t><t>def</t></si></sst>";
-        assert_eq!(
-            parse_shared_strings_with_budget(shared, &mut metadata_budget(1, 6)).unwrap(),
-            vec!["abcdef"]
-        );
-        assert!(parse_shared_strings_with_budget(shared, &mut metadata_budget(1, 5)).is_err());
-        let rels = br#"<Relationships><Relationship Id="a" Target="bc"/></Relationships>"#;
-        assert!(parse_relationships_with_budget(rels, &mut metadata_budget(1, 3)).is_ok());
-        assert!(parse_relationships_with_budget(rels, &mut metadata_budget(1, 2)).is_err());
-        let custom = br#"<styleSheet><numFmt numFmtId="164" formatCode="0%"/></styleSheet>"#;
-        assert!(parse_styles_with_budget(custom, &mut metadata_budget(1, 5)).is_ok());
-        assert!(parse_styles_with_budget(custom, &mut metadata_budget(1, 4)).is_err());
-        let mut budget = metadata_budget(usize::MAX, usize::MAX);
-        budget.bytes = usize::MAX;
-        assert!(budget.string_bytes(1).is_err());
     }
 
     // ---- number formats --------------------------------------------------
@@ -1446,252 +1196,105 @@ mod tests {
         assert_eq!(format_cell("not a number", Some("0%")), "not a number");
     }
 
-    // ---- refs ------------------------------------------------------------
-
     #[test]
-    fn a_cell_reference_resolves_to_its_column() {
-        assert_eq!(column_index_from_ref_checked("A1").unwrap(), 0);
-        assert_eq!(column_index_from_ref_checked("C2").unwrap(), 2);
-        assert_eq!(column_index_from_ref_checked("Z9").unwrap(), 25);
-        assert_eq!(column_index_from_ref_checked("AA1").unwrap(), 26);
+    fn a_cell_reference_preserves_its_column_and_row() {
+        assert_eq!(cell_reference("A1").unwrap(), (0, 1));
+        assert_eq!(cell_reference("C2").unwrap(), (2, 2));
+        assert_eq!(cell_reference("Z9").unwrap(), (25, 9));
+        assert_eq!(cell_reference("AA1").unwrap(), (26, 1));
+        assert!(cell_reference("A0").is_err());
+        assert!(cell_reference("AA").is_err());
+        assert!(cell_reference("ZZZZZZZZZZZZZZZZZZZZZZ1").is_err());
     }
 
     #[test]
-    fn self_closing_rows_and_cells_share_the_same_bounds_as_start_events() {
-        let mut cells = 0;
-        let mut text_bytes = 0;
-        let self_closing_row = b"<worksheet><sheetData><row/></sheetData></worksheet>";
-        let grid = parse_sheet(
-            self_closing_row,
-            &[],
-            &CellFormats::default(),
-            &mut cells,
-            &mut text_bytes,
-        )
-        .expect("self-closing row");
-        assert_eq!(grid, vec![Vec::<String>::new()]);
-
-        let overflow = b"<worksheet><sheetData><row><c r=\"AMK1\"/></row></sheetData></worksheet>";
-        assert!(
-            parse_sheet(
-                overflow,
-                &[],
-                &CellFormats::default(),
-                &mut cells,
-                &mut text_bytes,
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn self_closing_rows_and_cells_cannot_bypass_cardinality_limits() {
-        let mut rows = String::from("<worksheet><sheetData>");
-        for _ in 0..=MAX_XLSX_ROWS_PER_SHEET {
-            rows.push_str("<row/>");
+    fn backwards_and_inconsistent_references_are_refused() {
+        for rows in [
+            r#"<row><c r="B1"/><c r="A1"/></row>"#,
+            r#"<row r="4"><c r="B5"/></row>"#,
+            r#"<row r="4"/><row r="2"/>"#,
+        ] {
+            assert!(
+                parse_sheet(
+                    sheet_xml(rows).as_bytes(),
+                    &[],
+                    &CellFormats::default(),
+                    &mut standard(),
+                    &mut 0
+                )
+                .is_err()
+            );
         }
-        rows.push_str("</sheetData></worksheet>");
-        let mut cells = 0;
-        let mut text_bytes = 0;
-        assert!(
-            parse_sheet(
-                rows.as_bytes(),
-                &[],
-                &CellFormats::default(),
-                &mut cells,
-                &mut text_bytes,
-            )
-            .is_err()
-        );
-
-        let mut repeated_cells = String::from("<worksheet><sheetData><row>");
-        for _ in 0..=MAX_XLSX_COLUMNS {
-            repeated_cells.push_str("<c/>");
-        }
-        repeated_cells.push_str("</row></sheetData></worksheet>");
-        let mut cells = 0;
-        let mut text_bytes = 0;
-        assert!(
-            parse_sheet(
-                repeated_cells.as_bytes(),
-                &[],
-                &CellFormats::default(),
-                &mut cells,
-                &mut text_bytes,
-            )
-            .is_err()
-        );
     }
 
     #[test]
-    fn sparse_huge_and_backwards_references_are_refused_before_padding() {
-        let mut cells = 0;
-        let mut text_bytes = 0;
-        let huge = b"<worksheet><sheetData><row><c r=\"ZZZ1\"/></row></sheetData></worksheet>";
-        assert!(
-            parse_sheet(
-                huge,
-                &[],
-                &CellFormats::default(),
-                &mut cells,
-                &mut text_bytes
-            )
-            .is_err()
-        );
-
-        let backwards =
-            b"<worksheet><sheetData><row><c r=\"B1\"/><c r=\"A1\"/></row></sheetData></worksheet>";
-        assert!(
-            parse_sheet(
-                backwards,
-                &[],
-                &CellFormats::default(),
-                &mut cells,
-                &mut text_bytes
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn mixed_start_and_empty_cells_preserve_sparse_columns() {
-        let mut cells = 0;
-        let mut text_bytes = 0;
-        let xml = b"<worksheet><sheetData><row><c r=\"A1\"/><c r=\"C1\"><v>value</v></c></row><row/></sheetData></worksheet>";
-        let grid = parse_sheet(
-            xml,
-            &[],
-            &CellFormats::default(),
-            &mut cells,
-            &mut text_bytes,
-        )
-        .expect("parse");
-        assert_eq!(
-            grid[0],
-            vec![String::new(), String::new(), "value".to_owned()]
-        );
-        assert_eq!(grid[1], Vec::<String>::new());
-        assert_eq!(cells, 3);
-    }
-
-    #[test]
-    fn workbook_cell_and_markdown_budgets_are_checked_before_growth() {
-        let mut cells = MAX_XLSX_CELLS_PER_WORKBOOK - 1;
-        let mut text_bytes = 0;
-        let xml =
-            b"<worksheet><sheetData><row><c r=\"A1\"/><c r=\"B1\"/></row></sheetData></worksheet>";
-        assert!(
-            parse_sheet(
-                xml,
-                &[],
-                &CellFormats::default(),
-                &mut cells,
-                &mut text_bytes
-            )
-            .is_err()
-        );
-
-        let mut cells = 0;
-        let mut text_bytes = MAX_XLSX_CELL_TEXT_BYTES;
-        let shared = vec!["x".repeat(1024)];
-        let shared_cell =
-            b"<worksheet><sheetData><row><c r=\"A1\" t=\"s\"><v>0</v></c></row></sheetData></worksheet>";
-        assert!(
-            parse_sheet(
-                shared_cell,
-                &shared,
-                &CellFormats::default(),
-                &mut cells,
-                &mut text_bytes,
-            )
-            .is_err()
-        );
-
-        let grid = vec![vec!["a|b".to_owned(), "c".to_owned()]];
-        assert!(grid_to_markdown_with_limit(&grid, 5).is_err());
-    }
-
-    // ---- markdown --------------------------------------------------------
-
-    #[test]
-    fn a_grid_renders_as_a_table_with_the_first_multi_cell_row_as_header() {
-        let grid = vec![
-            vec!["タイトル".into(), String::new()],
-            vec!["対象領域".into(), "状態".into()],
-            vec!["決済ルーティング".into(), "確認済".into()],
-        ];
-        let md = grid_to_markdown_with_limit(&grid, MAX_XLSX_MARKDOWN_BYTES).expect("render");
+    fn markdown_retains_tables_notes_and_escaped_values_in_sparse_columns() {
+        let md = render(concat!(
+            r#"<row><c t="str"><v>タイトル</v></c></row>"#,
+            r#"<row><c t="str"><v>対象領域</v></c><c r="C2" t="str"><v>状態</v></c></row>"#,
+            r#"<row><c t="str"><v>Kio|v1</v></c><c r="B3"/><c r="C3" t="str"><v>確認済</v></c></row>"#,
+            r#"<row/><row><c t="str"><v>メモ</v></c></row>"#,
+        ));
         assert_eq!(
             md,
-            "タイトル\n\n| 対象領域 | 状態 |\n| --- | --- |\n| 決済ルーティング | 確認済 |"
+            "タイトル\n\n| 対象領域 | 状態 |\n| --- | --- |\n| Kio\\|v1 | 確認済 |\n\nメモ"
         );
-    }
-
-    #[test]
-    fn a_pipe_in_a_cell_cannot_break_the_table() {
-        let grid = vec![vec!["a|b".into(), "c".into()], vec!["d".into(), "e".into()]];
-        assert!(
-            grid_to_markdown_with_limit(&grid, MAX_XLSX_MARKDOWN_BYTES)
-                .expect("render")
-                .contains("a\\|b")
-        );
-    }
-
-    #[test]
-    fn a_normal_sparse_table_still_renders_with_escaped_cells() {
-        let grid = vec![
-            vec!["title".into(), String::new(), "state".into()],
-            vec!["Kio|v1".into(), String::new(), "ready".into()],
-        ];
-        assert_eq!(
-            grid_to_markdown_with_limit(&grid, MAX_XLSX_MARKDOWN_BYTES).expect("render"),
-            "| title | state |\n| --- | --- |\n| Kio\\|v1 | ready |"
-        );
-    }
-
-    #[test]
-    fn columns_empty_across_the_whole_sheet_are_dropped() {
-        // Writers emit a cell for every styled column; a 10-column sheet
-        // routinely carries several that hold nothing.
-        let grid = vec![
-            vec!["h1".into(), String::new(), "h2".into()],
-            vec!["v1".into(), String::new(), "v2".into()],
-        ];
-        let md = grid_to_markdown_with_limit(&grid, MAX_XLSX_MARKDOWN_BYTES).expect("render");
-        assert_eq!(md, "| h1 | h2 |\n| --- | --- |\n| v1 | v2 |");
     }
 
     #[test]
     fn a_blank_row_starts_a_new_region_with_its_own_columns() {
-        // The corpus shape: a two-field summary strip with spacer columns,
-        // then a blank row, then a three-column table. Rendered as ONE table
-        // the strip's header would be pushed off its value by the wider
-        // block's columns.
-        let grid = vec![
-            vec!["確認率".into(), String::new(), "影響行".into()],
-            vec!["50%".into(), String::new(), "74".into()],
-            vec![String::new(), String::new(), String::new()],
-            vec!["領域".into(), "状態".into(), "担当".into()],
-            vec!["決済".into(), "確認済".into(), "Platform".into()],
-        ];
-        let md = grid_to_markdown_with_limit(&grid, MAX_XLSX_MARKDOWN_BYTES).expect("render");
+        let md = render(concat!(
+            r#"<row><c t="str"><v>確認率</v></c><c r="C1" t="str"><v>影響行</v></c></row>"#,
+            r#"<row><c t="str"><v>50%</v></c><c r="C2"><v>74</v></c></row>"#,
+            r#"<row/><row><c t="str"><v>領域</v></c><c t="str"><v>状態</v></c><c t="str"><v>担当</v></c></row>"#,
+            r#"<row><c t="str"><v>決済</v></c><c t="str"><v>確認済</v></c><c t="str"><v>Platform</v></c></row>"#,
+        ));
         assert_eq!(
             md,
-            "| 確認率 | 影響行 |\n| --- | --- |\n| 50% | 74 |\n\n\
-             | 領域 | 状態 | 担当 |\n| --- | --- | --- |\n| 決済 | 確認済 | Platform |"
+            "| 確認率 | 影響行 |\n| --- | --- |\n| 50% | 74 |\n\n| 領域 | 状態 | 担当 |\n| --- | --- | --- |\n| 決済 | 確認済 | Platform |"
         );
     }
 
     #[test]
-    fn a_trailing_note_row_stays_prose_instead_of_becoming_a_one_cell_table() {
-        let grid = vec![
-            vec!["a".into(), "b".into()],
-            vec![String::new(), String::new()],
-            vec!["メモ：状態を更新してから統合判断へ進みます。".into()],
-        ];
-        let md = grid_to_markdown_with_limit(&grid, MAX_XLSX_MARKDOWN_BYTES).expect("render");
-        assert!(md.ends_with("メモ：状態を更新してから統合判断へ進みます。"));
-        assert!(!md.contains("| メモ"));
+    fn p2_shared_references_and_escaped_output_are_charged() {
+        let xml = sheet_xml(concat!(
+            r#"<row r="99"><c r="A99" t="s"><v>0</v></c><c r="XFD99"><v>2</v></c></row>"#,
+            r#"<row r="100"><c r="A100" t="s"><v>0</v></c></row>"#,
+        ));
+        let shared = ["a|b".to_owned()];
+        let extract = |budget: &mut Budget, row: &mut u64| {
+            parse_sheet(
+                xml.as_bytes(),
+                &shared,
+                &CellFormats::default(),
+                budget,
+                row,
+            )
+        };
+        let expected = "| a\\|b | 2 |\n| --- | --- |\n| a\\|b |  |";
+        let mut exact = standard();
+        exact.unit_limit = expected.len() as u64;
+        let mut row = 0;
+        assert_eq!(extract(&mut exact, &mut row).unwrap(), expected);
+        assert_eq!(row, 100);
+        let mut short = standard();
+        short.unit_limit = expected.len() as u64 - 1;
+        row = 0;
+        assert!(
+            matches!(extract(&mut short, &mut row), Err(AdapterError::ResourceLimit(limit))
+            if limit.resource == Resource::UnitText && limit.observed == Some(expected.len() as u64))
+        );
+        assert_eq!(row, 99);
+
+        let xml = sheet_xml(r#"<row><c t="s"><v>0</v></c><c t="s"><v>0</v></c></row>"#);
+        let shared = ["x".repeat(1024)];
+        let mut budget = standard();
+        budget.work_limit = 6; // one row, two cells, two references and 2 KiB
+        assert!(
+            matches!(parse_sheet(xml.as_bytes(), &shared, &CellFormats::default(),
+            &mut budget, &mut 0), Err(AdapterError::ResourceLimit(limit))
+            if limit.resource == Resource::Work && limit.observed == Some(7))
+        );
     }
 
     // ---- container -------------------------------------------------------
@@ -1719,15 +1322,19 @@ mod tests {
 
     /// Namespace-prefixed, like the writer this corpus was produced with —
     /// Excel itself writes the same elements unprefixed, and both must parse.
-    const WORKBOOK: &str = r#"<?xml version="1.0"?><x:workbook xmlns:x="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><x:sheets><x:sheet name="summary" sheetId="1" r:id="rId1"/></x:sheets></x:workbook>"#;
-    const RELS: &str = r#"<?xml version="1.0"?><Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>"#;
-    const SHARED: &str = r#"<?xml version="1.0"?><sst><si><t>対象領域</t></si><si><t>確認率</t></si><si><t>決済 &amp; 照合</t></si></sst>"#;
+    const TYPES: &str = r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Default Extension="xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>"#;
+    const ROOT: &str = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#;
+    const WORKBOOK: &str = r#"<?xml version="1.0"?><x:workbook xmlns:x="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><x:sheets><x:sheet name="summary" sheetId="1" r:id="rId1"/></x:sheets></x:workbook>"#;
+    const RELS: &str = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>"#;
+    const SHARED: &str = r#"<?xml version="1.0"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><si><t>対象領域</t></si><si><t>確認率</t></si><si><t>決済 &amp; 照合</t></si></sst>"#;
     // Style 1 is `0%`; style 0 is General.
-    const STYLES: &str = r#"<?xml version="1.0"?><styleSheet><numFmts><numFmt numFmtId="164" formatCode="0%"/></numFmts><cellStyleXfs><xf numFmtId="0"/></cellStyleXfs><cellXfs><xf numFmtId="0"/><xf numFmtId="164"/></cellXfs></styleSheet>"#;
+    const STYLES: &str = r#"<?xml version="1.0"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts><numFmt numFmtId="164" formatCode="0%"/></numFmts><cellStyleXfs><xf numFmtId="0"/></cellStyleXfs><cellXfs><xf numFmtId="0"/><xf numFmtId="164"/></cellXfs></styleSheet>"#;
     const SHEET: &str = r#"<?xml version="1.0"?><x:worksheet xmlns:x="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><x:sheetData><x:row r="1"><x:c r="A1" t="s"><x:v>0</x:v></x:c><x:c r="B1" t="s"><x:v>1</x:v></x:c></x:row><x:row r="2"><x:c r="A2" t="s"><x:v>2</x:v></x:c><x:c r="B2" s="1"><x:v>0.5</x:v></x:c></x:row></x:sheetData></x:worksheet>"#;
 
     fn workbook_fixture() -> Vec<u8> {
         zip_of(&[
+            (MANIFEST, TYPES.as_bytes()),
+            (ROOT_RELS, ROOT.as_bytes()),
             ("xl/workbook.xml", WORKBOOK.as_bytes()),
             ("xl/_rels/workbook.xml.rels", RELS.as_bytes()),
             ("xl/sharedStrings.xml", SHARED.as_bytes()),
@@ -1739,6 +1346,8 @@ mod tests {
 
     fn workbook_fixture_replacing(member: &str, replacement: &[u8]) -> Vec<u8> {
         let members = [
+            (MANIFEST, TYPES.as_bytes()),
+            (ROOT_RELS, ROOT.as_bytes()),
             ("xl/workbook.xml", WORKBOOK.as_bytes()),
             ("xl/_rels/workbook.xml.rels", RELS.as_bytes()),
             ("xl/sharedStrings.xml", SHARED.as_bytes()),
@@ -1758,13 +1367,139 @@ mod tests {
         zip_of(&members)
     }
 
+    #[derive(Debug)]
+    struct Extracted {
+        names: Vec<String>,
+        sheets: Vec<String>,
+        media_paths: Vec<String>,
+    }
+
+    fn extract_xlsx(input: &[u8]) -> Result<Extracted> {
+        let mut workbook = XlsxWorkbook::open(input, ResourceTier::Standard)?;
+        let names: Vec<_> = workbook.sheet_names().map(str::to_owned).collect();
+        let media_paths = workbook.media_paths().map(str::to_owned).collect();
+        let sheets = (0..names.len())
+            .map(|index| workbook.read_sheet(index, &mut 0))
+            .collect::<Result<_>>()?;
+        Ok(Extracted {
+            names,
+            sheets,
+            media_paths,
+        })
+    }
+
+    #[test]
+    fn p2_workbook_can_exceed_the_old_sheet_limit() {
+        use std::fmt::Write as _;
+        let mut workbook = WORKBOOK.split_once("<x:sheet ").unwrap().0.to_owned();
+        let (rel_start, _) = RELS.split_once("<Relationship ").unwrap();
+        let mut rels = rel_start.to_owned();
+        let mut names = Vec::new();
+        for number in 1..=257 {
+            write!(
+                workbook,
+                r#"<x:sheet name="sheet {number}" sheetId="{number}" r:id="rId{number}"/>"#
+            )
+            .unwrap();
+            write!(rels, r#"<Relationship Id="rId{number}" Type="{WORKSHEET_REL}" Target="worksheets/sheet{number}.xml"/>"#).unwrap();
+            names.push(format!("xl/worksheets/sheet{number}.xml"));
+        }
+        workbook.push_str("</x:sheets></x:workbook>");
+        rels.push_str("</Relationships>");
+        let sheet = sheet_xml(r#"<row><c><v>1</v></c></row>"#);
+        let mut members = vec![
+            (MANIFEST, TYPES.as_bytes()),
+            (ROOT_RELS, ROOT.as_bytes()),
+            ("xl/workbook.xml", workbook.as_bytes()),
+            ("xl/_rels/workbook.xml.rels", rels.as_bytes()),
+        ];
+        members.extend(names.iter().map(|name| (name.as_str(), sheet.as_bytes())));
+        let output = extract_xlsx(&zip_of(&members)).unwrap();
+        assert_eq!(output.sheets.len(), 257);
+        assert_eq!(output.names[256], "sheet 257");
+        assert_eq!(output.sheets[256], "1");
+    }
+
+    #[test]
+    fn p2_missing_package_authority_is_rejected() {
+        let input = zip_of(&[
+            ("xl/workbook.xml", WORKBOOK.as_bytes()),
+            ("xl/_rels/workbook.xml.rels", RELS.as_bytes()),
+            ("xl/worksheets/sheet1.xml", SHEET.as_bytes()),
+            ("xl/sharedStrings.xml", SHARED.as_bytes()),
+        ]);
+        assert!(matches!(
+            extract_xlsx(&input),
+            Err(AdapterError::ContractViolation(_))
+        ));
+    }
+
+    #[test]
+    fn p2_sparse_rows_and_columns_exceed_the_old_limits() {
+        let mut rows = String::new();
+        for row in 1..=50_001 {
+            use std::fmt::Write as _;
+            write!(
+                rows,
+                "<row r='{row}'><c r='A{row}'><v>1</v></c><c r='XFD{row}'><v>2</v></c></row>"
+            )
+            .unwrap();
+        }
+        let input =
+            workbook_fixture_replacing("xl/worksheets/sheet1.xml", sheet_xml(&rows).as_bytes());
+        let output = extract_xlsx(&input).unwrap();
+        assert_eq!(output.sheets[0].lines().count(), 50_002);
+        assert!(output.sheets[0].ends_with("| 1 | 2 |"));
+    }
+
+    #[test]
+    fn p2_package_authorities_must_match_through_eof() {
+        for (part, content) in [
+            (MANIFEST, TYPES.replace(WORKBOOK_CONTENT, "application/xml")),
+            (
+                ROOT_RELS,
+                ROOT.replace("Target=", "TargetMode='External' Target="),
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                RELS.replace(WORKSHEET_REL, STYLES_REL),
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                RELS.replace("sheet1.xml", "missing.xml"),
+            ),
+            (
+                "xl/worksheets/sheet1.xml",
+                SHEET.replace("spreadsheetml/2006/main", "not-spreadsheetml"),
+            ),
+            ("xl/worksheets/sheet1.xml", format!("{SHEET}<another/>")),
+        ] {
+            assert!(
+                matches!(
+                    extract_xlsx(&workbook_fixture_replacing(part, content.as_bytes())),
+                    Err(AdapterError::ContractViolation(_))
+                ),
+                "{part}: {content}"
+            );
+        }
+    }
+
+    #[test]
+    fn p2_extracts_the_office_acceptance_fixture() {
+        let input =
+            include_bytes!("../../kio-eval/acceptance-fixtures/v1/office-public/table.xlsx");
+        let output = extract_xlsx(input).unwrap();
+        assert_eq!(output.names, ["Fixture"]);
+        assert!(!output.sheets[0].is_empty());
+    }
+
     #[test]
     fn a_workbook_extracts_to_a_markdown_table_with_formats_applied() {
         let document = extract_xlsx(&workbook_fixture()).expect("extract");
         assert_eq!(document.sheets.len(), 1);
-        assert_eq!(document.sheets[0].name, "summary");
+        assert_eq!(document.names[0], "summary");
         assert_eq!(
-            document.sheets[0].markdown,
+            document.sheets[0],
             "| 対象領域 | 確認率 |\n| --- | --- |\n| 決済 & 照合 | 50% |"
         );
     }
@@ -1774,8 +1509,8 @@ mod tests {
         // `&amp;` must reach the index as `&` — the class of bug a hand-rolled
         // XML reader produces silently.
         let document = extract_xlsx(&workbook_fixture()).expect("extract");
-        assert!(document.sheets[0].markdown.contains("決済 & 照合"));
-        assert!(!document.sheets[0].markdown.contains("&amp;"));
+        assert!(document.sheets[0].contains("決済 & 照合"));
+        assert!(!document.sheets[0].contains("&amp;"));
     }
 
     #[test]
@@ -1788,10 +1523,8 @@ mod tests {
 
     #[test]
     fn a_workbook_with_no_sheets_is_refused() {
-        let empty = zip_of(&[(
-            "xl/workbook.xml",
-            br#"<?xml version="1.0"?><workbook><sheets/></workbook>"# as &[u8],
-        )]);
+        let empty = workbook_fixture_replacing("xl/workbook.xml",
+            br#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheets/></workbook>"#);
         assert!(extract_xlsx(&empty).is_err());
     }
 
@@ -1800,7 +1533,7 @@ mod tests {
         let malformed_members = [
             (
                 "xl/workbook.xml",
-                br#"<?xml version="1.0"?><workbook><sheets></workbook>"# as &[u8],
+                br#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheets></workbook>"# as &[u8],
             ),
             (
                 "xl/sharedStrings.xml",
@@ -1808,11 +1541,11 @@ mod tests {
             ),
             (
                 "xl/worksheets/sheet1.xml",
-                br#"<worksheet><sheetData><row><c x:r="A1" y:r="B1"><v>1</v></c></row></sheetData></worksheet>"#,
+                br#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:x="urn:same" xmlns:y="urn:same"><sheetData><row><c x:r="A1" y:r="B1"><v>1</v></c></row></sheetData></worksheet>"#,
             ),
             (
                 "xl/worksheets/sheet1.xml",
-                br#"<worksheet><sheetData><row><c r="A1"><v>1</v></c>"#,
+                br#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row><c r="A1"><v>1</v></c>"#,
             ),
         ];
         for (member, malformed) in malformed_members {
@@ -1824,10 +1557,8 @@ mod tests {
 
     #[test]
     fn xml_structural_limits_reject_deep_or_attribute_dense_members() {
-        let nested = format!(
-            "<worksheet>{}</worksheet>",
-            "<level>".repeat(MAX_XLSX_XML_DEPTH) + &"</level>".repeat(MAX_XLSX_XML_DEPTH),
-        );
+        let nested =
+            sheet_xml(&("<level>".repeat(MAX_XML_DEPTH) + &"</level>".repeat(MAX_XML_DEPTH)));
         let error = extract_xlsx(&workbook_fixture_replacing(
             "xl/worksheets/sheet1.xml",
             nested.as_bytes(),
@@ -1835,10 +1566,10 @@ mod tests {
         .expect_err("over-deep XML member must reject the workbook");
         assert!(matches!(error, AdapterError::ContractViolation(_)));
 
-        let attributes = (0..=MAX_XLSX_XML_ATTRIBUTES)
+        let attributes = (0..=MAX_XML_ATTRIBUTES)
             .map(|index| format!(" a{index}=\"value\""))
             .collect::<String>();
-        let dense = format!("<worksheet{attributes}/>");
+        let dense = sheet_xml(&format!("<row{attributes}/>"));
         let error = extract_xlsx(&workbook_fixture_replacing(
             "xl/worksheets/sheet1.xml",
             dense.as_bytes(),

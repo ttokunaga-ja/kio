@@ -375,7 +375,7 @@ preview は完了 sheet/row、未処理範囲とその理由を表示する。�
 - **sheet に埋め込まれた chart / 画像は本追記の対象外。** これは真に視覚的で直接抽出では読めないが、
   「file X の sheet M の中の image N」という evidence 上の同一性が未定義であり、
   `image_object_hashes` は 3 つの構造体に**宣言があるだけで書き手も読み手も無い**。
-  半端に配線せず、抽出器が**件数を報告して穴を可視に保つ** (`XlsxDocument::media_paths`)。
+  半端に配線せず、抽出器が**件数を報告して穴を可視に保つ** (`XlsxWorkbook::media_paths`)。
 
 ### PDF / XLSX の抽出資源 tier
 

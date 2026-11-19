@@ -8,6 +8,7 @@ use crate::types::{
 };
 use crate::{AdapterError, Result};
 use serde_json::json;
+use std::io::Read;
 use unicode_normalization::UnicodeNormalization;
 
 pub const MAX_DETERMINISTIC_PDF_PAGES: usize = 256;
@@ -142,17 +143,30 @@ impl MarkdownizeAdapter for DeterministicAdapter {
     }
 
     fn markdownize(&self, request: MarkdownizeRequest) -> Result<MarkdownizeResponse> {
-        let source = match request.raw.path.as_deref() {
-            Some(path) => {
-                let bytes = std::fs::read(path).map_err(|err| AdapterError::Io {
-                    path: path.to_owned(),
-                    message: err.to_string(),
-                })?;
-                Some(source_document_from_verified_bytes(&request, &bytes)?)
-            }
-            None => None,
-        };
-        markdownize_with_source(request, source.as_ref())
+        if let Some(path) = request.raw.path.as_deref() {
+            let io_error = |err: std::io::Error| AdapterError::Io {
+                path: path.to_owned(),
+                message: err.to_string(),
+            };
+            let bytes = if crate::xlsx_extract::is_xlsx_media(&request.media_type) {
+                let tier = kio_core::error::ResourceTier::Standard;
+                let file = std::fs::File::open(path).map_err(io_error)?;
+                crate::xlsx_extract::check_raw_zip_size(
+                    tier,
+                    file.metadata().map_err(io_error)?.len(),
+                )?;
+                let mut bytes = Vec::new();
+                file.take(crate::xlsx_extract::raw_zip_limit(tier) + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(io_error)?;
+                crate::xlsx_extract::check_raw_zip_size(tier, bytes.len() as u64)?;
+                bytes
+            } else {
+                std::fs::read(path).map_err(io_error)?
+            };
+            return markdownize_from_bytes(request, &bytes);
+        }
+        markdownize_with_source(request, None)
     }
 }
 
@@ -162,6 +176,36 @@ pub fn markdownize_from_bytes(
     request: MarkdownizeRequest,
     verified_raw_bytes: &[u8],
 ) -> Result<MarkdownizeResponse> {
+    let actual_hash = crate::identity::hash_bytes(verified_raw_bytes);
+    if actual_hash != request.raw.raw_hash {
+        return Err(AdapterError::ContractViolation(format!(
+            "deterministic input identity changed: expected {}, got {actual_hash}",
+            request.raw.raw_hash
+        )));
+    }
+    if crate::xlsx_extract::is_xlsx_media(&request.media_type) {
+        let mut workbook = crate::xlsx_extract::XlsxWorkbook::open(
+            verified_raw_bytes,
+            kio_core::error::ResourceTier::Standard,
+        )?;
+        let mut rendered = std::collections::BTreeSet::new();
+        let response = markdownize_with_units(&request, |hint| {
+            let index = usize::try_from(hint.order).map_err(|_| {
+                AdapterError::ContractViolation("XLSX sheet order overflows".to_owned())
+            })?;
+            let mut markdown = workbook.read_sheet(index, &mut 0)?;
+            rendered.insert(index);
+            markdown.push('\n');
+            Ok(finish_markdown_unit(hint, markdown))
+        })?;
+        let sheet_count = workbook.sheet_names().len();
+        for index in 0..sheet_count {
+            if !rendered.contains(&index) {
+                workbook.read_sheet(index, &mut 0)?;
+            }
+        }
+        return Ok(response);
+    }
     let source = source_document_from_verified_bytes(&request, verified_raw_bytes)?;
     markdownize_with_source(request, Some(&source))
 }
@@ -229,40 +273,15 @@ fn office_unit_hints(pages: &[String], unit_kind: UnitKind) -> Vec<PreparedUnitH
 enum SourceDocument {
     Text(String),
     PdfPages(Vec<String>),
-    /// XLSX worksheets, already rendered to Markdown by
-    /// [`crate::xlsx_extract`], in workbook order. A `sheet:` unit resolves by
-    /// ORDER rather than by name: the unit key carries QB27's escaping and
-    /// duplicate-occurrence suffix, so matching the raw sheet name against it
-    /// would need that transform reapplied here — and the prepare stage
-    /// already emitted the units in this exact order.
-    Sheets(Vec<String>),
 }
 
 fn source_document_from_verified_bytes(
     request: &MarkdownizeRequest,
     bytes: &[u8],
 ) -> Result<SourceDocument> {
-    let actual_hash = crate::identity::hash_bytes(bytes);
-    if actual_hash != request.raw.raw_hash {
-        return Err(AdapterError::ContractViolation(format!(
-            "deterministic input identity changed: expected {}, got {actual_hash}",
-            request.raw.raw_hash
-        )));
-    }
     if request.media_type == "application/pdf" {
         return extract_pdf_text_pages_bounded(bytes, MAX_DETERMINISTIC_PDF_PAGES)
             .map(SourceDocument::PdfPages);
-    }
-    if crate::xlsx_extract::is_xlsx_media(&request.media_type) {
-        return crate::xlsx_extract::extract_xlsx(bytes).map(|document| {
-            SourceDocument::Sheets(
-                document
-                    .sheets
-                    .into_iter()
-                    .map(|sheet| sheet.markdown)
-                    .collect(),
-            )
-        });
     }
     let text = String::from_utf8_lossy(bytes).into_owned();
     let text = text
@@ -275,6 +294,15 @@ fn source_document_from_verified_bytes(
 fn markdownize_with_source(
     request: MarkdownizeRequest,
     source: Option<&SourceDocument>,
+) -> Result<MarkdownizeResponse> {
+    markdownize_with_units(&request, |hint| {
+        Ok(markdown_unit_from_hint(hint, &request, source))
+    })
+}
+
+fn markdownize_with_units(
+    request: &MarkdownizeRequest,
+    mut render: impl FnMut(&PreparedUnitHint) -> Result<MarkdownUnit>,
 ) -> Result<MarkdownizeResponse> {
     let hints = request
         .prepared_unit_hint
@@ -295,14 +323,14 @@ fn markdownize_with_source(
             updated_units: hints
                 .iter()
                 .filter(|hint| changed.contains(&hint.unit_key))
-                .map(|hint| markdown_unit_from_hint(hint, &request, source))
-                .collect(),
+                .map(&mut render)
+                .collect::<Result<_>>()?,
             unchanged_unit_keys: Vec::new(),
             added_units: hints
                 .iter()
                 .filter(|hint| added.contains(&hint.unit_key))
-                .map(|hint| markdown_unit_from_hint(hint, &request, source))
-                .collect(),
+                .map(&mut render)
+                .collect::<Result<_>>()?,
             removed_unit_keys: incremental
                 .map(|hints| hints.removed_unit_keys)
                 .unwrap_or_default(),
@@ -317,10 +345,7 @@ fn markdownize_with_source(
 
     Ok(MarkdownizeResponse {
         mode_used: MarkdownizeMode::Full,
-        updated_units: hints
-            .iter()
-            .map(|hint| markdown_unit_from_hint(hint, &request, source))
-            .collect(),
+        updated_units: hints.iter().map(render).collect::<Result<_>>()?,
         unchanged_unit_keys: Vec::new(),
         added_units: Vec::new(),
         removed_unit_keys: Vec::new(),
@@ -378,10 +403,6 @@ fn markdown_unit_from_hint(
             let page_index =
                 page_index_from_unit_key(&hint.unit_key).unwrap_or(hint.order as usize);
             page_markdown(pages.get(page_index).map_or("", String::as_str))
-        }
-        Some(SourceDocument::Sheets(sheets)) => {
-            let sheet = sheets.get(hint.order as usize).map_or("", String::as_str);
-            format!("{}\n", sheet.trim())
         }
         // text/plain and sniffed octet-stream TEXT (R20-6 passthrough:
         // .xml/.html/.eml/.csv/...) — preserve it as literal text. Raw

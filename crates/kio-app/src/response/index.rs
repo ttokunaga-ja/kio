@@ -50,6 +50,10 @@ pub struct ExtractionIssue {
     pub error_code: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_limit: Option<kio_core::error::ResourceLimit>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub xlsx_progress: Option<kio_pipeline::prepare::XlsxExtractionProgress>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]

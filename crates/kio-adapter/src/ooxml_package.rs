@@ -15,10 +15,12 @@ use zip::{
 
 use crate::{AdapterError, Result};
 
-mod xml;
+pub(crate) mod xml;
+
+use kio_core::error::{Resource, ResourceLimit, ResourceTier};
 
 const MAX_ZIP_ENTRIES: usize = 4_096;
-const MAX_ZIP_DECLARED_BYTES: usize = 256 * 1024 * 1024;
+const MAX_ZIP_DECLARED_BYTES: u64 = 256 * 1024 * 1024;
 const EOCD_LEN: usize = 22;
 const MAX_ZIP_COMMENT_BYTES: usize = u16::MAX as usize;
 const EOCD_SIGNATURE: &[u8; 4] = b"PK\x05\x06";
@@ -31,7 +33,10 @@ pub(crate) struct BoundedZipLimits {
     label: &'static str,
     max_input_bytes: usize,
     max_member_bytes: usize,
-    max_total_read_bytes: usize,
+    max_total_read_bytes: u64,
+    max_declared_bytes: u64,
+    max_entries: usize,
+    tier: Option<ResourceTier>,
 }
 
 impl BoundedZipLimits {
@@ -39,14 +44,61 @@ impl BoundedZipLimits {
         label: &'static str,
         max_input_bytes: usize,
         max_member_bytes: usize,
-        max_total_read_bytes: usize,
+        max_total_read_bytes: u64,
     ) -> Self {
         Self {
             label,
             max_input_bytes,
             max_member_bytes,
             max_total_read_bytes,
+            max_declared_bytes: MAX_ZIP_DECLARED_BYTES,
+            max_entries: MAX_ZIP_ENTRIES,
+            tier: None,
         }
+    }
+
+    pub(crate) const fn xlsx(tier: ResourceTier) -> Self {
+        const MIB: usize = 1024 * 1024;
+        let (raw, member, aggregate) = match tier {
+            ResourceTier::Standard => (100 * MIB, 64 * MIB, 256 * MIB as u64),
+            ResourceTier::Large => (1024 * MIB, 256 * MIB, 4096 * MIB as u64),
+        };
+        Self {
+            label: "XLSX",
+            max_input_bytes: raw,
+            max_member_bytes: member,
+            max_total_read_bytes: aggregate,
+            max_declared_bytes: aggregate,
+            max_entries: u16::MAX as usize - 1,
+            tier: Some(tier),
+        }
+    }
+
+    pub(crate) const fn raw_bytes(self) -> u64 {
+        self.max_input_bytes as u64
+    }
+
+    pub(crate) fn check_raw_bytes(self, bytes: u64) -> Result<()> {
+        self.check(Resource::RawBytes, self.raw_bytes(), bytes)
+    }
+
+    fn check(self, resource: Resource, limit: u64, observed: u64) -> Result<()> {
+        if observed > limit {
+            return Err(match self.tier {
+                Some(tier) => AdapterError::ResourceLimit(ResourceLimit {
+                    resource,
+                    stage: "xlsx_zip".to_owned(),
+                    limit: Some(limit),
+                    observed: Some(observed),
+                    resource_tier: Some(tier),
+                }),
+                None => contract(
+                    self.label,
+                    format!("ZIP {resource:?} {observed} exceeds {limit}"),
+                ),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -56,12 +108,20 @@ pub(crate) struct BoundedZip<'a> {
     archive: ZipArchive<Cursor<&'a [u8]>>,
     names: Vec<String>,
     limits: BoundedZipLimits,
-    total_read_bytes: usize,
+    total_read_bytes: u64,
 }
 
 impl<'a> BoundedZip<'a> {
     pub(crate) fn open(bytes: &'a [u8], limits: BoundedZipLimits) -> Result<Self> {
-        validate_zip_envelope(bytes, limits)?;
+        Self::open_accounted(bytes, limits, |_, _| Ok(()))
+    }
+
+    pub(crate) fn open_accounted(
+        bytes: &'a [u8],
+        limits: BoundedZipLimits,
+        admit_index: impl FnOnce(usize, usize) -> Result<()>,
+    ) -> Result<Self> {
+        validate_zip_envelope(bytes, limits, admit_index)?;
         let config = Config {
             archive_offset: ArchiveOffset::Known(0),
         };
@@ -71,16 +131,6 @@ impl<'a> BoundedZip<'a> {
                 format!("ZIP central directory is invalid: {err}"),
             )
         })?;
-        if archive.len() > MAX_ZIP_ENTRIES {
-            return Err(contract(
-                limits.label,
-                format!(
-                    "declares {} ZIP entries, over the {MAX_ZIP_ENTRIES} bound",
-                    archive.len()
-                ),
-            ));
-        }
-
         let mut names = Vec::with_capacity(archive.len());
         let mut seen = HashSet::with_capacity(archive.len());
         for index in 0..archive.len() {
@@ -122,16 +172,6 @@ impl<'a> BoundedZip<'a> {
                     format!("ZIP member `{name}` uses unsupported compression"),
                 ));
             }
-            if file.size() > limits.max_member_bytes as u64 {
-                return Err(contract(
-                    limits.label,
-                    format!(
-                        "ZIP member `{name}` declares {} bytes, over the {} byte bound",
-                        file.size(),
-                        limits.max_member_bytes
-                    ),
-                ));
-            }
             names.push(name.to_owned());
         }
 
@@ -144,7 +184,7 @@ impl<'a> BoundedZip<'a> {
     }
 
     pub(crate) fn contains(&self, name: &str) -> bool {
-        self.names.iter().any(|member| member == name)
+        self.archive.index_for_name(name).is_some()
     }
 
     pub(crate) fn member_names(&self) -> &[String] {
@@ -158,7 +198,7 @@ impl<'a> BoundedZip<'a> {
                 format!("has no required ZIP member `{name}`"),
             ));
         }
-        self.read_member(name)?.ok_or_else(|| {
+        self.consume(name, true, |_| Ok(()))?.ok_or_else(|| {
             contract(
                 self.limits.label,
                 format!("has no required ZIP member `{name}`"),
@@ -166,65 +206,79 @@ impl<'a> BoundedZip<'a> {
         })
     }
 
-    pub(crate) fn read_optional(&mut self, name: &str) -> Result<Option<Vec<u8>>> {
-        if !self.contains(name) {
-            return Ok(None);
-        }
-        self.read_member(name)
-    }
-
-    fn read_member(&mut self, name: &str) -> Result<Option<Vec<u8>>> {
-        let file = self.archive.by_name(name).map_err(|err| {
+    /// Check the decompressed size before admitting parser storage and work.
+    /// When the caller only needs integrity, read into a fixed buffer.
+    pub(crate) fn consume(
+        &mut self,
+        name: &str,
+        retain: bool,
+        admit: impl FnOnce(usize) -> Result<()>,
+    ) -> Result<Option<Vec<u8>>> {
+        let mut file = self.archive.by_name(name).map_err(|err| {
             contract(
                 self.limits.label,
                 format!("ZIP member `{name}` cannot be opened: {err}"),
             )
         })?;
-        if file.is_dir() {
+        if file.is_dir() && self.limits.tier.is_none() {
             return Ok(None);
         }
-        let declared = usize::try_from(file.size()).map_err(|_| {
-            contract(
-                self.limits.label,
-                format!("ZIP member `{name}` has an unrepresentable size"),
-            )
-        })?;
+        let declared = file.size();
+        self.limits.check(
+            Resource::MemberBytes,
+            self.limits.max_member_bytes as u64,
+            declared,
+        )?;
         let next_total = self
             .total_read_bytes
             .checked_add(declared)
-            .ok_or_else(|| contract(self.limits.label, "ZIP read total overflows".to_owned()))?;
-        if next_total > self.limits.max_total_read_bytes {
-            return Err(contract(
-                self.limits.label,
-                format!(
-                    "ZIP reads would exceed the {} byte aggregate bound",
-                    self.limits.max_total_read_bytes
-                ),
-            ));
-        }
-        let mut bytes = Vec::with_capacity(declared);
-        let mut bounded = file.take(u64::try_from(declared).expect("usize always fits u64") + 1);
-        bounded.read_to_end(&mut bytes).map_err(|err| {
+            .ok_or_else(|| contract(self.limits.label, "ZIP read total overflows"))?;
+        self.limits.check(
+            Resource::AggregateBytes,
+            self.limits.max_total_read_bytes,
+            next_total,
+        )?;
+        let length = usize::try_from(declared)
+            .map_err(|_| contract(self.limits.label, "ZIP member size is unrepresentable"))?;
+        admit(length)?;
+
+        let read_error = |err| {
             contract(
                 self.limits.label,
                 format!("ZIP member `{name}` failed CRC-checked read: {err}"),
             )
-        })?;
-        if bytes.len() != declared {
+        };
+        let bytes = if retain {
+            let mut bytes = vec![0; length];
+            file.read_exact(&mut bytes).map_err(read_error)?;
+            Some(bytes)
+        } else {
+            let mut remaining = length;
+            let mut buffer = [0; 16 * 1024];
+            while remaining > 0 {
+                let chunk = remaining.min(buffer.len());
+                file.read_exact(&mut buffer[..chunk]).map_err(read_error)?;
+                remaining -= chunk;
+            }
+            None
+        };
+        // The read past the declared length verifies CRC and detects expansion
+        // beyond the header without allocating or decoding the rest of it.
+        if file.read(&mut [0]).map_err(read_error)? != 0 {
             return Err(contract(
                 self.limits.label,
                 format!("ZIP member `{name}` did not match its declared size"),
             ));
         }
         self.total_read_bytes = next_total;
-        Ok(Some(bytes))
+        Ok(bytes)
     }
 }
 
 /// Validate a DOCX or PPTX package before handing it to a real renderer.
 pub(crate) fn validate_real_office_package(input: &[u8], media_type: &str) -> Result<()> {
     const MAX_OFFICE_MEMBER_BYTES: usize = 32 * 1024 * 1024;
-    const MAX_OFFICE_REQUIRED_READ_BYTES: usize = 6 * 1024 * 1024;
+    const MAX_OFFICE_REQUIRED_READ_BYTES: u64 = 6 * 1024 * 1024;
     const DOCX: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
     const PPTX: &str = "application/vnd.openxmlformats-officedocument.presentationml.presentation";
 
@@ -265,18 +319,13 @@ pub(crate) fn validate_real_office_package(input: &[u8], media_type: &str) -> Re
     xml::validate_xml_root(&main_xml, root_name, root_namespace, main_part)
 }
 
-fn validate_zip_envelope(bytes: &[u8], limits: BoundedZipLimits) -> Result<()> {
+fn validate_zip_envelope(
+    bytes: &[u8],
+    limits: BoundedZipLimits,
+    admit_index: impl FnOnce(usize, usize) -> Result<()>,
+) -> Result<()> {
     let label = limits.label;
-    if bytes.len() > limits.max_input_bytes {
-        return Err(contract(
-            label,
-            format!(
-                "ZIP input is {} bytes, over the {} byte bound",
-                bytes.len(),
-                limits.max_input_bytes
-            ),
-        ));
-    }
+    limits.check_raw_bytes(bytes.len() as u64)?;
     if bytes.len() < EOCD_LEN || !bytes.starts_with(b"PK") {
         return Err(contract(label, "is not a ZIP container".to_owned()));
     }
@@ -307,10 +356,13 @@ fn validate_zip_envelope(bytes: &[u8], limits: BoundedZipLimits) -> Result<()> {
             "uses unsupported ZIP64 metadata".to_owned(),
         ));
     }
-    if total_entries as usize > MAX_ZIP_ENTRIES {
+    if total_entries as usize > limits.max_entries {
         return Err(contract(
             label,
-            format!("declares {total_entries} ZIP entries, over the {MAX_ZIP_ENTRIES} bound"),
+            format!(
+                "declares {total_entries} ZIP entries, over the {} bound",
+                limits.max_entries
+            ),
         ));
     }
     if eocd >= 20 && bytes[eocd - 20..eocd - 16] == *ZIP64_LOCATOR_SIGNATURE {
@@ -335,6 +387,7 @@ fn validate_zip_envelope(bytes: &[u8], limits: BoundedZipLimits) -> Result<()> {
             "central directory is not contiguous with the end record".to_owned(),
         ));
     }
+    admit_index(central_size as usize, total_entries as usize)?;
     validate_central_metadata(
         bytes,
         central_offset as usize,
@@ -358,7 +411,9 @@ fn validate_central_metadata(
     const CENTRAL_HEADER_LEN: usize = 46;
     let mut cursor = central_offset;
     let mut names = HashSet::with_capacity(entry_count);
-    let mut declared_total = 0usize;
+    let mut declared_total = 0u64;
+    let mut largest_member = 0u64;
+    let mut member_ranges = Vec::new();
     for _ in 0..entry_count {
         if bytes.get(cursor..cursor + 4) != Some(&b"PK\x01\x02"[..]) {
             return Err(contract(
@@ -382,7 +437,7 @@ fn validate_central_metadata(
                 "uses unsupported ZIP64 member metadata",
             ));
         }
-        if flags & 1 != 0 || disk_start != 0 {
+        if flags & (1 | (1 << 6) | (1 << 13)) != 0 || disk_start != 0 {
             return Err(contract(
                 limits.label,
                 "uses encrypted or split ZIP members",
@@ -394,24 +449,10 @@ fn validate_central_metadata(
                 format!("ZIP member uses unsupported compression method {compression}"),
             ));
         }
-        if uncompressed_size as usize > limits.max_member_bytes {
-            return Err(contract(
-                limits.label,
-                format!(
-                    "ZIP member declares {uncompressed_size} bytes, over the {} byte bound",
-                    limits.max_member_bytes
-                ),
-            ));
-        }
+        largest_member = largest_member.max(u64::from(uncompressed_size));
         declared_total = declared_total
-            .checked_add(uncompressed_size as usize)
+            .checked_add(u64::from(uncompressed_size))
             .ok_or_else(|| contract(limits.label, "ZIP declared size total overflows"))?;
-        if declared_total > MAX_ZIP_DECLARED_BYTES {
-            return Err(contract(
-                limits.label,
-                "ZIP declared size total exceeds the 256 MiB bound",
-            ));
-        }
         let name_start = cursor + CENTRAL_HEADER_LEN;
         let name_end = name_start.checked_add(name_len).ok_or_else(|| {
             contract(
@@ -426,13 +467,13 @@ fn validate_central_metadata(
         )
         .map_err(|_| contract(limits.label, "ZIP member name is not UTF-8"))?;
         validate_part_name(name, limits.label)?;
-        if !names.insert(name.to_owned()) {
+        if !names.insert(name) {
             return Err(contract(
                 limits.label,
                 format!("ZIP contains duplicate member `{name}`"),
             ));
         }
-        validate_local_header(
+        let member_end = validate_local_header(
             bytes,
             local_offset,
             name.as_bytes(),
@@ -442,11 +483,26 @@ fn validate_central_metadata(
             compressed_size,
             uncompressed_size,
             central_offset,
-            limits.label,
+            limits,
         )?;
-        cursor = name_end
+        let extra_end = name_end
             .checked_add(extra_len)
-            .and_then(|offset| offset.checked_add(comment_len))
+            .filter(|end| *end <= central_end)
+            .ok_or_else(|| {
+                contract(limits.label, "central directory extra fields are truncated")
+            })?;
+        if limits.tier.is_some() {
+            validate_extra(&bytes[name_end..extra_end], name.as_bytes(), limits.label)?;
+            if name.contains(':') || name.chars().any(char::is_control) {
+                return Err(contract(
+                    limits.label,
+                    "ZIP part name contains an unsafe character",
+                ));
+            }
+            member_ranges.push((local_offset, member_end));
+        }
+        cursor = extra_end
+            .checked_add(comment_len)
             .ok_or_else(|| contract(limits.label, "central directory offset overflows"))?;
     }
     if cursor != central_end {
@@ -455,7 +511,20 @@ fn validate_central_metadata(
             "central directory entry count does not match its size",
         ));
     }
-    Ok(())
+    member_ranges.sort_unstable();
+    if member_ranges.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+        return Err(contract(limits.label, "ZIP members overlap"));
+    }
+    limits.check(
+        Resource::MemberBytes,
+        limits.max_member_bytes as u64,
+        largest_member,
+    )?;
+    limits.check(
+        Resource::AggregateBytes,
+        limits.max_declared_bytes,
+        declared_total,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -469,8 +538,9 @@ fn validate_local_header(
     central_compressed_size: u32,
     central_uncompressed_size: u32,
     central_offset: usize,
-    label: &str,
-) -> Result<()> {
+    limits: BoundedZipLimits,
+) -> Result<usize> {
+    let label = limits.label;
     const LOCAL_HEADER_LEN: usize = 30;
     if local_offset >= bytes.len() {
         return Err(contract(label, "ZIP member local header is out of bounds"));
@@ -513,15 +583,75 @@ fn validate_local_header(
             "ZIP member data overlaps the central directory",
         ));
     }
-    if flags & (1 << 3) == 0
-        && (crc != central_crc
-            || compressed_size != central_compressed_size
-            || uncompressed_size != central_uncompressed_size)
+    let uses_descriptor = flags & (1 << 3) != 0;
+    let local = [crc, compressed_size, uncompressed_size];
+    let central = [
+        central_crc,
+        central_compressed_size,
+        central_uncompressed_size,
+    ];
+    if !uses_descriptor && local != central {
+        return Err(contract(
+            label,
+            "ZIP central and local member sizes or CRC disagree",
+        ));
+    }
+    if limits.tier.is_none() {
+        return Ok(data_end);
+    }
+    validate_extra(&bytes[local_name_end..data_start], central_name, label)?;
+    if !uses_descriptor {
+        return Ok(data_end);
+    }
+    if local
+        .iter()
+        .zip(central)
+        .any(|(&value, expected)| value != 0 && value != expected)
     {
         return Err(contract(
             label,
-            "ZIP central and local member sizes disagree",
+            "ZIP local header disagrees with its data descriptor",
         ));
+    }
+    // The ZIP descriptor signature is optional. A CRC can itself equal the
+    // signature, so recognize either exact, bounded descriptor layout.
+    for offset in [
+        Some(data_end),
+        (bytes.get(data_end..data_end + 4) == Some(&b"PK\x07\x08"[..])).then_some(data_end + 4),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if offset + 12 <= central_offset
+            && read_u32(bytes, offset, label)? == central_crc
+            && read_u32(bytes, offset + 4, label)? == central_compressed_size
+            && read_u32(bytes, offset + 8, label)? == central_uncompressed_size
+        {
+            return Ok(offset + 12);
+        }
+    }
+    Err(contract(
+        label,
+        "ZIP data descriptor disagrees with the central directory",
+    ))
+}
+
+fn validate_extra(mut extra: &[u8], name: &[u8], label: &str) -> Result<()> {
+    while !extra.is_empty() {
+        let id = read_u16(extra, 0, label)?;
+        let len = usize::from(read_u16(extra, 2, label)?);
+        if id == 1 {
+            return Err(contract(label, "uses unsupported ZIP64 extra fields"));
+        }
+        if id == 0x7075 && extra.get(9..4 + len) != Some(name) {
+            return Err(contract(
+                label,
+                "ZIP Unicode path changes the UTF-8 member name",
+            ));
+        }
+        extra = extra
+            .get(4 + len..)
+            .ok_or_else(|| contract(label, "ZIP extra field is truncated"))?;
     }
     Ok(())
 }
@@ -570,6 +700,96 @@ mod tests {
 
     use super::*;
     use zip::{ZipWriter, write::SimpleFileOptions};
+
+    #[test]
+    fn xlsx_zip_budgets_admit_exact_boundaries() {
+        let input = zip_of(&[("a", b"1234"), ("b", b"567")]);
+        let exact = BoundedZipLimits {
+            max_input_bytes: input.len(),
+            max_member_bytes: 4,
+            max_declared_bytes: 7,
+            max_total_read_bytes: 7,
+            ..BoundedZipLimits::xlsx(ResourceTier::Standard)
+        };
+        let mut archive = BoundedZip::open(&input, exact).unwrap();
+        assert_eq!(archive.read_required("a").unwrap(), b"1234");
+        assert_eq!(archive.read_required("b").unwrap(), b"567");
+        assert!(
+            matches!(archive.read_required("b"), Err(AdapterError::ResourceLimit(limit))
+            if limit.resource == Resource::AggregateBytes && limit.observed == Some(10))
+        );
+
+        for (limits, resource, observed) in [
+            (
+                BoundedZipLimits {
+                    max_input_bytes: input.len() - 1,
+                    ..exact
+                },
+                Resource::RawBytes,
+                input.len() as u64,
+            ),
+            (
+                BoundedZipLimits {
+                    max_member_bytes: 3,
+                    ..exact
+                },
+                Resource::MemberBytes,
+                4,
+            ),
+            (
+                BoundedZipLimits {
+                    max_declared_bytes: 6,
+                    ..exact
+                },
+                Resource::AggregateBytes,
+                7,
+            ),
+        ] {
+            assert!(
+                matches!(BoundedZip::open(&input, limits), Err(AdapterError::ResourceLimit(limit))
+                if limit.resource == resource && limit.observed == Some(observed))
+            );
+        }
+    }
+
+    #[test]
+    fn xlsx_zip_checks_streaming_descriptors_and_payload_crc() {
+        let mut writer = ZipWriter::new_stream(Vec::new());
+        writer
+            .start_file(
+                "member",
+                SimpleFileOptions::default().compression_method(CompressionMethod::Stored),
+            )
+            .unwrap();
+        writer.write_all(b"member-body").unwrap();
+        let input = writer.finish().unwrap().into_inner();
+        let limits = BoundedZipLimits::xlsx(ResourceTier::Standard);
+        let mut archive = BoundedZip::open(&input, limits).unwrap();
+        assert_eq!(archive.read_required("member").unwrap(), b"member-body");
+
+        let mut wrong_crc = input.clone();
+        let offset = input
+            .windows(b"member-body".len())
+            .position(|b| b == b"member-body")
+            .unwrap();
+        wrong_crc[offset] ^= 1;
+        let mut archive = BoundedZip::open(&wrong_crc, limits).unwrap();
+        assert!(matches!(
+            archive.consume("member", false, |_| Ok(())),
+            Err(AdapterError::ContractViolation(_))
+        ));
+
+        let mut wrong_descriptor = input;
+        let offset = wrong_descriptor
+            .windows(4)
+            .position(|b| b == b"PK\x07\x08")
+            .unwrap();
+        wrong_descriptor[offset + 4] ^= 1;
+        assert!(matches!(
+            BoundedZip::open(&wrong_descriptor, limits),
+            Err(AdapterError::ContractViolation(_))
+        ));
+    }
 
     const DOCX: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
     const PPTX: &str = "application/vnd.openxmlformats-officedocument.presentationml.presentation";

@@ -1276,3 +1276,219 @@ fn p0_renderer_drift_storage_failure_is_resumable() {
             .is_empty()
     );
 }
+
+fn p2_xlsx_workbook() -> Vec<u8> {
+    use std::fmt::Write as _;
+    use std::io::{Cursor, Write as _};
+    use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
+
+    const MAIN: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const OFFICE_REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    const PKG_REL: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
+    const TYPES: &str = concat!(
+        "<Types xmlns='http://schemas.openxmlformats.org/package/2006/content-types'>",
+        "<Override PartName='/xl/workbook.xml' ContentType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml'/>",
+        "<Default Extension='xml' ContentType='application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml'/>",
+        "</Types>",
+    );
+    let workbook = format!(
+        "<workbook xmlns='{MAIN}' xmlns:r='{OFFICE_REL}'><sheets>\
+         <sheet name='A#2' sheetId='1' r:id='s1'/><sheet name='A' sheetId='2' r:id='s2'/>\
+         <sheet name='A' sheetId='3' r:id='s3'/></sheets></workbook>",
+    );
+    let root = format!(
+        "<Relationships xmlns='{PKG_REL}'><Relationship Id='r1' Type='{OFFICE_REL}/officeDocument' Target='xl/workbook.xml'/></Relationships>",
+    );
+    let mut relationships = format!("<Relationships xmlns='{PKG_REL}'>");
+    for index in 1..=3 {
+        write!(
+            relationships,
+            "<Relationship Id='s{index}' Type='{OFFICE_REL}/worksheet' Target='s{index}.xml'/>"
+        )
+        .unwrap();
+    }
+    write!(relationships, "<Relationship Id='sst' Type='{OFFICE_REL}/sharedStrings' Target='shared.xml'/></Relationships>").unwrap();
+    // Fill the prepared text budget with whitespace that Markdown normalization
+    // removes before indexing, so the test exercises extraction at this size.
+    let padding = " ".repeat(132_000 - "row marker\n\nrow end".len());
+    let shared =
+        format!("<sst xmlns='{MAIN}'><si><t>row marker\n{padding}\nrow end</t></si></sst>");
+    let first = format!(
+        "<worksheet xmlns='{MAIN}'><sheetData><row r='9'><c r='A9' t='str'><v>first marker</v></c></row></sheetData></worksheet>",
+    );
+    let third = first.replace("first marker", "third marker");
+    let mut second = format!("<worksheet xmlns='{MAIN}'><sheetData>");
+    // At 132,000 bytes per row, row 900 + 127 is the first to exceed 16 MiB.
+    for number in 900..=1028 {
+        write!(
+            second,
+            "<row r='{number}'><c r='XFD{number}' t='s'><v>0</v></c></row>"
+        )
+        .unwrap();
+    }
+    second.push_str("</sheetData></worksheet>");
+
+    let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    for (name, content) in [
+        ("[Content_Types].xml", TYPES),
+        ("_rels/.rels", &root),
+        ("xl/workbook.xml", &workbook),
+        ("xl/_rels/workbook.xml.rels", &relationships),
+        ("xl/shared.xml", &shared),
+        ("xl/s1.xml", &first),
+        ("xl/s2.xml", &second),
+        ("xl/s3.xml", &third),
+    ] {
+        zip.start_file(name, options).unwrap();
+        zip.write_all(content.as_bytes()).unwrap();
+    }
+    zip.finish().unwrap().into_inner()
+}
+
+#[test]
+fn p2_preparation_emits_a_prefix_and_keeps_source_coordinates_across_tiers() {
+    use kio_core::{
+        control::ControlHandle,
+        error::{Resource, ResourceTier},
+    };
+    use kio_pipeline::{
+        PipelineError,
+        prepare::{
+            ExtractionBudget, PrepareStageBytesRequest, XlsxExtractionProgress, hash_bytes,
+            visit_prepared_units_with_budget,
+        },
+    };
+
+    let input = p2_xlsx_workbook();
+    let hash = hash_bytes(&input);
+    let profile = kio_adapter::catalog::builtin_prepare_profile();
+    let request = PrepareStageBytesRequest {
+        input_path: "ranges.xlsx",
+        raw_hash: &hash,
+        bytes: &input,
+        media_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        tool_profile_hash: &profile.tool_profile_hash,
+    };
+    let control = ControlHandle::default();
+    let mut progress = XlsxExtractionProgress::default();
+    let mut prefix = Vec::new();
+    let error = visit_prepared_units_with_budget(
+        request,
+        &control,
+        ExtractionBudget::new(ResourceTier::Standard),
+        &mut progress,
+        |unit, bytes| {
+            assert_eq!(bytes, b"first marker");
+            prefix.push(unit.clone());
+            Ok(())
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(error, PipelineError::ResourceLimit(limit)
+        if limit.resource == Resource::UnitText && limit.limit == Some(16 * 1024 * 1024)));
+    assert_eq!(prefix.len(), 1);
+    assert_eq!(progress.total_sheets, Some(3));
+    assert_eq!(progress.completed_sheets, 1);
+    assert_eq!(progress.first_unprocessed_sheet, 2);
+    assert_eq!(progress.current_sheet.as_deref(), Some("sheet:A"));
+    assert_eq!(progress.completed_through_row, 1026);
+    assert_eq!(progress.first_unprocessed_row, Some(1027));
+
+    let result = visit_prepared_units_with_budget(
+        request,
+        &control,
+        ExtractionBudget::new(ResourceTier::Large),
+        &mut progress,
+        |unit, bytes| {
+            if unit.order == 1 {
+                assert_eq!(
+                    std::str::from_utf8(bytes)
+                        .unwrap()
+                        .lines()
+                        .filter(|line| *line == "row marker")
+                        .count(),
+                    129
+                );
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(result.prepared_units[0], prefix[0]);
+    assert_eq!(result.prepared_units[0].unit_key, "sheet:A##2");
+    assert_eq!(result.prepared_units[2].unit_key, "sheet:A#2");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[test]
+fn p2_preview_and_staged_resume_report_the_same_sheet_and_row() {
+    use kio_core::error::ResourceTier;
+    use kio_pipeline::prepare::{
+        ExtractionBudget, PrepareStageBytesRequest, hash_bytes, prepare_staged,
+    };
+
+    let dir = canonical_tempdir();
+    init(&dir);
+    let input = p2_xlsx_workbook();
+    fs::write(dir.path().join("ranges.xlsx"), &input).unwrap();
+    let preview = json_success(&dir, &["index", "--preview"]);
+    let issue = &preview["extraction_issues"][0];
+    assert_eq!(issue["path"], "ranges.xlsx");
+    assert_eq!(issue["resource_limit"]["resource"], "unit_text");
+    assert_eq!(issue["xlsx_progress"]["first_unprocessed_sheet"], 2);
+    assert_eq!(issue["xlsx_progress"]["first_unprocessed_row"], 1027);
+    assert_eq!(issue["retry"], "kio index --resource-tier large");
+    assert!(!dir.path().join(".kio/extraction-stages").exists());
+
+    let root = kio_core::store_dir::StoreDirectory::open(&dir.path().join(".kio")).unwrap();
+    let hash = hash_bytes(&input);
+    let profile = kio_adapter::catalog::builtin_prepare_profile();
+    let request = PrepareStageBytesRequest {
+        input_path: "ranges.xlsx",
+        raw_hash: &hash,
+        bytes: &input,
+        media_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        tool_profile_hash: &profile.tool_profile_hash,
+    };
+    let stopped = kio(&dir, &["index", "--offline"])
+        .arg("--json")
+        .assert()
+        .code(3)
+        .get_output()
+        .stderr
+        .clone();
+    let error: Value = serde_json::from_slice(&stopped).unwrap();
+    assert_eq!(error["context"]["resource"], "unit_text", "{error}");
+    assert_eq!(
+        json_success(&dir, &["status"])["paused_by_hold_reason"]["resource_limit"],
+        1
+    );
+    let stages = dir
+        .path()
+        .join(".kio/extraction-stages/prepared")
+        .join(hash.trim_start_matches("sha256:"));
+    let workspace = fs::read_dir(stages)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let first = fs::read(workspace.join("unit-0.json")).unwrap();
+    assert!(!workspace.join("complete.json").exists());
+    assert!(!workspace.join("unit-1.json").exists());
+    let staged =
+        prepare_staged(&root, request, ExtractionBudget::new(ResourceTier::Large)).unwrap();
+    assert_eq!(fs::read(workspace.join("unit-0.json")).unwrap(), first);
+    assert!(workspace.join("complete.json").exists());
+    assert_eq!(staged.output.prepared_units[0].unit_key, "sheet:A##2");
+    assert_eq!(staged.output.prepared_units[1].unit_key, "sheet:A");
+    assert_eq!(staged.output.prepared_units[2].unit_key, "sheet:A#2");
+    kio(&dir, &["index", "--offline", "--resource-tier", "large"])
+        .assert()
+        .success();
+    assert_eq!(
+        json_success(&dir, &["status"])["paused_by_hold_reason"]["resource_limit"],
+        0
+    );
+}

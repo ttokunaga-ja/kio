@@ -1060,6 +1060,7 @@ dependencies = [
  "toml",
  "toml_edit",
  "windows-sys 0.61.2",
+ "zip",
 ]
 
 [[package]]
