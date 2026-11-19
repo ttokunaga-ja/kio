@@ -14890,3 +14890,95 @@ mod o3_image_failure_matrix;
 
 #[path = "step3_p0_contract/o3_image_publication_recovery.rs"]
 mod o3_image_publication_recovery;
+
+#[test]
+fn nc_source_code_is_unsupported_and_markdown_code_remains_searchable() {
+    let dir = canonical_tempdir();
+    for ext in ["rs", "py", "js", "ts", "go", "java", "c", "h", "cpp"] {
+        for (case, ext) in [
+            ("lower", ext.to_owned()),
+            ("upper", ext.to_ascii_uppercase()),
+        ] {
+            fs::write(
+                dir.path().join(format!("main.{case}.{ext}")),
+                "sourceonlyneedle readable text\n",
+            )
+            .unwrap();
+        }
+    }
+    fs::write(
+        dir.path().join("note.md"),
+        "# Note\n\n```rs\nmarkdowncodeneedle\n```\n\n`inlinecodeneedle`\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("settings.cfg"),
+        "unknowntextneedle readable text\n",
+    )
+    .unwrap();
+    kio(&dir, &["init"]).assert().success();
+    let index = json_success(&dir, &["index", "--yes"]);
+    assert_eq!(index["normalized_files"], 2, "{index}");
+    let status = json_success(&dir, &["status"]);
+    let unsupported = status["unsupported_inputs"].as_array().unwrap();
+    assert_eq!(unsupported.len(), 18, "{status}");
+    for row in unsupported {
+        assert_eq!(row["reason"], "source_code_is_not_supported");
+    }
+    assert!(
+        json_success(&dir, &["search", "sourceonlyneedle"])["results"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    for needle in [
+        "markdowncodeneedle",
+        "inlinecodeneedle",
+        "unknowntextneedle",
+    ] {
+        let search = json_success(&dir, &["search", needle]);
+        assert!(
+            !search["results"].as_array().unwrap().is_empty(),
+            "{needle}: {search}"
+        );
+    }
+    let store = dir.path().join(".kio/unsupported-inputs.jsonl");
+    let before = fs::read(&store).unwrap();
+    json_success(&dir, &["index", "--yes"]);
+    assert_eq!(before, fs::read(store).unwrap());
+    assert!(
+        json_success(&dir, &["status"])["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|task| !task["input_path"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("main."))
+    );
+}
+
+#[test]
+fn nc_source_code_remains_unsupported_above_adapter_input_limit() {
+    let dir = canonical_tempdir();
+    kio(&dir, &["init"]).assert().success();
+    let cfg = dir.path().join(".kio/config.toml");
+    let mut document = fs::read_to_string(&cfg)
+        .unwrap()
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap();
+    document["adapter"]["policy"]["max_input_bytes"] = toml_edit::value(1);
+    fs::write(&cfg, document.to_string()).unwrap();
+    fs::write(
+        dir.path().join("main.pY"),
+        "sourceonlyneedle readable text\n",
+    )
+    .unwrap();
+    let index = json_success(&dir, &["index", "--yes"]);
+    assert_eq!(index["normalized_files"], 0);
+    let status = json_success(&dir, &["status"]);
+    let unsupported = status["unsupported_inputs"].as_array().unwrap();
+    assert_eq!(unsupported.len(), 1, "{status}");
+    assert_eq!(unsupported[0]["path"], "main.pY");
+    assert_eq!(unsupported[0]["reason"], "source_code_is_not_supported");
+}

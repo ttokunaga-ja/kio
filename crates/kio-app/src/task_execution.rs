@@ -1353,7 +1353,7 @@ pub(crate) fn estimate_online_markdownize_cost(
 
 pub(crate) fn media_type_for_cli_path(path: &Path) -> &'static str {
     // R21-4: lowercase the extension so an uppercase-extension text-native file
-    // (`README.MD`, `NOTE.TXT`, `MAIN.RS`) is recognized as text/markdown/plain/code and
+    // (`README.MD`, `NOTE.TXT`) is recognized as text/markdown/plain and
     // handled locally — not folded to octet-stream and shipped to online OCR (R9-2).
     match path
         .extension()
@@ -1364,7 +1364,6 @@ pub(crate) fn media_type_for_cli_path(path: &Path) -> &'static str {
     {
         "md" | "markdown" => "text/markdown",
         "txt" => "text/plain",
-        "rs" | "py" | "js" | "ts" | "go" | "java" | "c" | "h" | "cpp" => "text/x-code",
         "pdf" => "application/pdf",
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
@@ -1412,7 +1411,7 @@ pub(crate) fn paused_tasks_by_hold_reason(tasks: &[TaskDescriptor]) -> PausedTas
     }
 }
 
-/// R9-2: whether `media_type` is text-native (Markdown / plain text / code) — the
+/// R9-2: whether `media_type` is text-native (Markdown / plain text) — the
 /// deterministic Adapter's domain (docs/07 §2.1). Text-native files are
 /// markdownized locally and must never enqueue an online Mistral-OCR task: docs/07
 /// §5.2 scopes the standard online Adapter to *non*-text-native PDF / DOCX / PPTX /
@@ -1420,7 +1419,7 @@ pub(crate) fn paused_tasks_by_hold_reason(tasks: &[TaskDescriptor]) -> PausedTas
 /// (privacy) and billed ~10x the baseline for work the deterministic pass already
 /// did (redundant, and orphaned by F6).
 pub(crate) fn is_text_native_media(media_type: &str) -> bool {
-    matches!(media_type, "text/markdown" | "text/plain" | "text/x-code")
+    matches!(media_type, "text/markdown" | "text/plain")
 }
 
 pub(crate) fn budget_status(
@@ -1501,7 +1500,7 @@ pub(crate) fn enqueue_online_placeholder_task(
     unsupported_by_path: &mut BTreeMap<String, UnsupportedInputDisposition>,
     office_conversion_unavailable_paths: &mut BTreeSet<String>,
 ) -> Result<()> {
-    // R9-2: text-native files (Markdown / plain text / code) are fully handled by
+    // R9-2: text-native files (Markdown / plain text) are fully handled by
     // the deterministic Adapter (07 §2.1) and must never enqueue an online OCR task
     // (07 §5.2 scopes Mistral OCR to non-text-native PDF/DOCX/PPTX/images). Gate at
     // enqueue so a routine `index` never creates a redundant, privacy-leaking,

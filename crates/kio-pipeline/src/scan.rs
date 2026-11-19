@@ -1351,13 +1351,18 @@ fn estimated_enrichment_cost_usd(
 ) -> (f64, f64) {
     // Mirrors `kio-cli`'s `is_text_native_media` exactly (docs/04 §2: text-
     // native files skip Markdownize/OCR and are indexed as-is).
-    const TEXT_NATIVE_MEDIA_TYPES: [&str; 3] = ["text/markdown", "text/plain", "text/x-code"];
+    const TEXT_NATIVE_MEDIA_TYPES: [&str; 2] = ["text/markdown", "text/plain"];
     // Rough, order-of-magnitude assumptions for THIS preview estimate only
     // (10 §1's own framing — not a precision requirement).
     const ESTIMATED_BYTES_PER_PAGE: f64 = 3_000.0;
     const ESTIMATED_BYTES_PER_TOKEN: f64 = 4.0;
 
-    let included: Vec<&ScanCandidate> = candidates.iter().filter(|c| !c.ignored).collect();
+    let included: Vec<&ScanCandidate> = candidates
+        .iter()
+        .filter(|c| {
+            !c.ignored && !crate::unsupported::is_source_code_path(Path::new(&c.input_path))
+        })
+        .collect();
     let markdownize_bytes: u64 = included
         .iter()
         .filter(|c| !TEXT_NATIVE_MEDIA_TYPES.contains(&c.media_type.as_str()))
@@ -2452,7 +2457,7 @@ fn glob_budget_error() -> crate::PipelineError {
 
 fn media_type_for_path(path: &Path) -> &'static str {
     // R21-4: lowercase the extension so an uppercase-extension text-native file
-    // (`README.MD`, `NOTE.TXT`, `MAIN.RS`) is recognized as text/markdown/plain/code and
+    // (`README.MD`, `NOTE.TXT`) is recognized as text/markdown/plain and
     // handled locally — not folded to octet-stream and shipped to online OCR (R9-2).
     match path
         .extension()
@@ -2463,7 +2468,6 @@ fn media_type_for_path(path: &Path) -> &'static str {
     {
         "md" | "markdown" => "text/markdown",
         "txt" => "text/plain",
-        "rs" | "py" | "js" | "ts" | "go" | "java" | "c" | "h" | "cpp" => "text/x-code",
         "pdf" => "application/pdf",
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",

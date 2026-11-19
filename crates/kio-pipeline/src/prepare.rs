@@ -101,15 +101,17 @@ pub struct UnitReuse {
 pub const MAX_UNIT_LCS_CELLS: usize = 2_000_000;
 
 pub fn prepare_units(request: PrepareStageRequest) -> Result<PrepareStageOutput> {
-    // R20-6: the local deterministic adapter only parses text (Markdown / plain text /
-    // code) and PDF text layers (docs/07 §7.1). A RECOGNIZED non-text-native binary (image
+    if crate::unsupported::is_source_code_path(Path::new(&request.input_path)) {
+        return Ok(empty_prepare_output());
+    }
+    // R20-6: the local deterministic adapter only parses text (Markdown / plain text) and PDF text layers (docs/07 §7.1). A RECOGNIZED non-text-native binary (image
     // / OOXML office document) is never locally parseable — a raw-bytes "passthrough" unit
     // evidences its bytes (a ZIP's PK header, an image's pixels) as searchable garbage.
     // Route it to online OCR (empty prepared_units → the R20-5 path). `octet-stream`
     // (unrecognized extension) is content-sniffed below: it may be a TEXT file with an
     // unknown extension (`.env`, `.cfg`) — still passthrough'd locally — or a binary blob.
     let media_type = request.media_type.as_str();
-    let is_text_native = matches!(media_type, "text/markdown" | "text/plain" | "text/x-code");
+    let is_text_native = matches!(media_type, "text/markdown" | "text/plain");
     let is_pdf = media_type == "application/pdf";
     if !is_text_native && !is_pdf && media_type != "application/octet-stream" {
         return Ok(empty_prepare_output());
@@ -136,8 +138,11 @@ pub fn prepare_units_from_bytes_with_control(
     request: PrepareStageBytesRequest<'_>,
     control: &ControlHandle,
 ) -> Result<PrepareStageOutput> {
+    if crate::unsupported::is_source_code_path(Path::new(request.input_path)) {
+        return Ok(empty_prepare_output());
+    }
     let media_type = request.media_type;
-    let is_text_native = matches!(media_type, "text/markdown" | "text/plain" | "text/x-code");
+    let is_text_native = matches!(media_type, "text/markdown" | "text/plain");
     let is_pdf = media_type == "application/pdf";
     // 07 §5.1 (2026-07-23 addendum): DOCX/PPTX route through the Office
     // converter below instead of the octet-stream/text gates — they are
@@ -699,6 +704,39 @@ fn prepare_adapter_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_code_extensions_never_prepare_as_sniffed_text() {
+        let bytes = b"sourceonlyneedle readable text\n";
+        let raw_hash = hash_bytes(bytes);
+        for ext in ["rs", "py", "js", "ts", "go", "java", "c", "h", "cpp"] {
+            for ext in [ext.to_owned(), ext.to_ascii_uppercase()] {
+                let input_path = format!("main.{ext}");
+                for media_type in ["application/octet-stream", "text/plain"] {
+                    let output = prepare_units_from_bytes(PrepareStageBytesRequest {
+                        raw_hash: &raw_hash,
+                        media_type,
+                        input_path: &input_path,
+                        tool_profile_hash: "sha256:test",
+                        bytes,
+                    })
+                    .unwrap();
+                    assert!(
+                        output.prepared_units.is_empty(),
+                        "{input_path}: {media_type}"
+                    );
+                    let output = prepare_units(PrepareStageRequest {
+                        raw_hash: raw_hash.clone(),
+                        media_type: media_type.to_owned(),
+                        input_path: input_path.clone(),
+                        tool_profile_hash: "sha256:test".to_owned(),
+                    })
+                    .unwrap();
+                    assert!(output.prepared_units.is_empty());
+                }
+            }
+        }
+    }
 
     fn prepared_page(order: u64, key: &str, fp: &str) -> PreparedUnit {
         PreparedUnit {

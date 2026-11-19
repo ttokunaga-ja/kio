@@ -16,6 +16,19 @@ use crate::{IoResultExt, PipelineError, Result};
 
 pub const UNSUPPORTED_INPUTS_FILE: &str = "unsupported-inputs.jsonl";
 pub const UNSUPPORTED_REASON_UNRECOGNIZED_BINARY: &str = "unrecognized_binary_without_local_text";
+pub const UNSUPPORTED_REASON_SOURCE_CODE: &str = "source_code_is_not_supported";
+
+pub fn is_source_code_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "rs" | "py" | "js" | "ts" | "go" | "java" | "c" | "h" | "cpp"
+            )
+        })
+}
+
 pub const UNSUPPORTED_REASON_RESOLVED: &str = "resolved";
 
 /// A compaction trigger, never a lifetime or projection size limit.

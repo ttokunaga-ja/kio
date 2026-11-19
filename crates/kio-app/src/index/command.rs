@@ -1535,6 +1535,8 @@ pub(crate) fn compute_index_status(
                             .into_iter()
                             .filter(|disposition| {
                                 disposition.reason == UNSUPPORTED_REASON_UNRECOGNIZED_BINARY
+                                    || disposition.reason
+                                        == kio_pipeline::unsupported::UNSUPPORTED_REASON_SOURCE_CODE
                             })
                             .collect();
                         total = total.saturating_add(unsupported.len() as u64);
@@ -1675,7 +1677,10 @@ pub(crate) fn current_unsupported_inputs(
 ) -> Result<Vec<UnsupportedInputDisposition>> {
     Ok(current_dispositions(repo)?
         .into_iter()
-        .filter(|disposition| disposition.reason == UNSUPPORTED_REASON_UNRECOGNIZED_BINARY)
+        .filter(|disposition| {
+            disposition.reason == UNSUPPORTED_REASON_UNRECOGNIZED_BINARY
+                || disposition.reason == kio_pipeline::unsupported::UNSUPPORTED_REASON_SOURCE_CODE
+        })
         .collect())
 }
 

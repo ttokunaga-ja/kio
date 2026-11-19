@@ -82,7 +82,7 @@ Kio core
 
 ## 2.1 同梱 deterministic Adapter (ベースライン index)
 
-Kio は `deterministic_library` の Prepare / Markdownize Adapter を同梱する。対象: plain text / Markdown / コード、PDF text layer 抽出。OCR・レイアウト解析・画像理解は行わない。**出力は単純な passthrough ではなく、Normalized Markdown v1 (§5.2.1) への決定的正規化**である — 少なくとも Setext 見出し → ATX 変換・生 HTML block の fenced text 化・改行 / 空白 / fence の正規化を行う (§5.2.1 準拠が受け入れ検査 V5 の通過条件のため、passthrough では通常の Markdown (Setext 等) がオフライン基線 index で全滅する)。
+Kio は `deterministic_library` の Prepare / Markdownize Adapter を同梱する。対象: plain text / Markdown、PDF text layer 抽出。OCR・レイアウト解析・画像理解は行わない。**出力は単純な passthrough ではなく、Normalized Markdown v1 (§5.2.1) への決定的正規化**である — 少なくとも Setext 見出し → ATX 変換・生 HTML block の fenced text 化・改行 / 空白 / fence の正規化を行う (§5.2.1 準拠が受け入れ検査 V5 の通過条件のため、passthrough では通常の Markdown (Setext 等) がオフライン基線 index で全滅する)。
 
 > **PDF text layer 抽出の範囲 (実装フィードバック 2026-07-23)**: 実世界の text-layer PDF
 > (TeX / LibreOffice 出力) は FlateDecode 圧縮 content stream + subset font の glyph index +
