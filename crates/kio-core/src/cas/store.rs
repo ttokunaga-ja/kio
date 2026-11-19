@@ -85,6 +85,7 @@ impl ObjectStore {
         Self {
             control,
             reads: CasReadAccess::Unmetered,
+            record_memory: Arc::default(),
             kio_dir: Some(kio_dir.into()),
             bound: None,
         }
@@ -142,6 +143,7 @@ impl ObjectStore {
         Ok(Self {
             control,
             reads: CasReadAccess::Unmetered,
+            record_memory: Arc::default(),
             kio_dir: None,
             bound: Some(BoundObjectDirs {
                 kio: {
@@ -204,7 +206,10 @@ impl ObjectStore {
                 self.control.clone(),
             )?
         };
-        Ok(crate::disk_records::RecordStageRoot::in_store(directory))
+        Ok(crate::disk_records::RecordStageRoot::in_store(
+            directory,
+            self.record_memory.clone(),
+        ))
     }
 
     pub fn inspect_raw_stages(&self) -> Result<Vec<RawStageResidue>> {
