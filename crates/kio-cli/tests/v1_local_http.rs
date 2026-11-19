@@ -19,6 +19,7 @@ use std::{
 use tempfile::TempDir;
 
 const TOOL: &str = "qwen3_vl_embedding_local";
+const GENERIC_TOOL: &str = "local_embedding";
 const MAX_BODY: usize = 2 * 1024 * 1024;
 const SECRET_A: &str = "C_TEST_PRIVATE_SECRET_SCOPE_A_9271";
 const SECRET_B: &str = "C_TEST_PRIVATE_SECRET_SCOPE_B_5824";
@@ -27,6 +28,9 @@ const WATCH_TEXT: &str = "C_TEST_WATCH_LOCAL_HTTP_7163";
 #[derive(Clone)]
 enum Reply {
     Embedding,
+    WrongIndex,
+    WrongWidthOnce,
+    Reject,
     Redirect(String),
 }
 #[derive(Clone)]
@@ -179,15 +183,24 @@ fn serve(mut stream: TcpStream, reply: &Reply, seen: &Arc<Mutex<Vec<Request>>>) 
         }
     };
     let _: Value = serde_json::from_slice(&body).expect("embedding request JSON");
-    seen.lock().unwrap().push(Request { path, body });
+    let request_count = {
+        let mut seen = seen.lock().unwrap();
+        seen.push(Request { path, body });
+        seen.len()
+    };
     match reply {
-        Reply::Embedding => {
-            let mut vector = vec![0.0_f32; 768];
+        Reply::Embedding | Reply::WrongIndex | Reply::WrongWidthOnce => {
+            let wrong_width = matches!(reply, Reply::WrongWidthOnce) && request_count == 1;
+            let mut vector = vec![0.0_f32; if wrong_width { 767 } else { 768 }];
             vector[0] = 1.0;
-            let body = json!({"data":[{"embedding":vector}]}).to_string();
+            let index = usize::from(matches!(reply, Reply::WrongIndex));
+            let body = json!({"data":[{"index":index,"embedding":vector}]}).to_string();
             write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(), body).unwrap();
         }
+        Reply::Reject => write!(stream,
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        ).unwrap(),
         Reply::Redirect(target) => write!(stream,
             "HTTP/1.1 302 Found\r\nLocation: {target}/v1/embeddings\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
         ).unwrap(),
@@ -286,6 +299,14 @@ impl Device {
     fn embedding_url(&self, url: &str) {
         self.tools_text(&format!(
             "[embedding.{TOOL}]\nkind = \"offline_api\"\nurl = \"{url}\"\nmodel = \"Qwen/Qwen3-VL-Embedding-2B\"\n"
+        ));
+    }
+    fn generic_embedding_url(&self, url: &str, wire: &str, instruction: &str) {
+        self.tools_text(&format!(
+            "[embedding.{GENERIC_TOOL}]\nkind = 'offline_api'\nurl = '{url}'\n\
+             model = 'test-model'\nmodel_version_pin = 'sha256:{}'\n\
+             chat_template_hash = 'sha256:{}'\ninstruction = '{instruction}'\nwire_format = '{wire}'\n",
+            "a".repeat(64), "b".repeat(64),
         ));
     }
 }
@@ -692,4 +713,371 @@ fn configured_unapproved_http_peer_status_is_unauthenticated_without_scope() {
         peer.requests().is_empty(),
         "status must not contact the HTTP endpoint"
     );
+}
+
+#[test]
+fn generic_local_embedding_cli_skips_input_images_and_discloses_wire_changes() {
+    let temp = support::canonical_tempdir();
+    let device = Device::new(&temp);
+    let root = support::create_private_child_dir(temp.path(), "scope");
+    const URL: &str = "http://127.0.0.1:8080/base";
+    fs::write(
+        root.join("figure.png"),
+        include_bytes!("fixtures/o2_golden/png-original-control.png"),
+    )
+    .unwrap();
+    device.success(&root, &["init"]);
+    device.generic_embedding_url(URL, "input", "");
+
+    device.success(&root, &["index", "--offline"]);
+    let status = device.success(&root, &["status"]);
+    assert!(
+        status["tasks"].as_array().unwrap().iter().any(|task| {
+            task["embedding_target"]["kind"] == "image"
+                && task["status"] == "skipped"
+                && task["fallback_reason"] == "image_capability_unavailable"
+        }),
+        "{status}"
+    );
+
+    let preview = device.success(&root, &["adapter", "approve", GENERIC_TOOL, "--preview"]);
+    assert_eq!(
+        preview["device_endpoints"][0]["binding"]["destination"],
+        URL
+    );
+    assert_eq!(
+        preview["device_endpoints"][0]["disclosure"]["content_types"],
+        json!(["query text", "document text"]),
+    );
+    device.success(&root, &["adapter", "approve", GENERIC_TOOL, "--yes"]);
+    device.generic_embedding_url(URL, "messages", "");
+
+    let status = device.success(&device.home, &["adapter", "status", GENERIC_TOOL]);
+    assert_eq!(status["effective"][0]["permitted"], true, "{status}");
+    assert_eq!(
+        status["device_endpoints"][0]["configured_disclosures"][0]["content_types"],
+        json!(["query text", "document text", "images"]),
+    );
+    assert_eq!(
+        status["grants"][0]["disclosure"]["content_types"],
+        json!(["query text", "document text"]),
+    );
+    device.success(&device.home, &["adapter", "revoke", GENERIC_TOOL]);
+    let status = device.success(&device.home, &["adapter", "status", GENERIC_TOOL]);
+    assert_eq!(status["effective"][0]["permitted"], false, "{status}");
+}
+
+#[test]
+fn generic_local_embedding_cli_uses_selected_wire_for_index_images_and_query() {
+    let temp = support::canonical_tempdir();
+    let device = Device::new(&temp);
+    let peer = Peer::start(Reply::Embedding);
+    let mut profile_hashes = Vec::new();
+    for wire in ["input", "messages"] {
+        let root = support::create_private_child_dir(temp.path(), wire);
+        fs::write(root.join("notes.md"), "# Notes\n\nwire-document-needle\n").unwrap();
+        fs::write(
+            root.join("figure.png"),
+            include_bytes!("fixtures/o2_golden/png-original-control.png"),
+        )
+        .unwrap();
+        device.tools_text("");
+        device.success(&root, &["init"]);
+        let instruction = if wire == "messages" {
+            "Represent this."
+        } else {
+            ""
+        };
+        device.generic_embedding_url(&peer.url(), wire, instruction);
+        let before = peer.requests().len();
+        if wire == "input" {
+            device.success(&root, &["index", "--offline"]);
+            assert_eq!(peer.requests().len(), before);
+            let preview = device.success(&root, &["adapter", "approve", GENERIC_TOOL, "--preview"]);
+            let disclosure = preview["device_endpoints"][0].to_string();
+            assert!(disclosure.contains("document text"), "{preview}");
+            assert!(!disclosure.contains("\"images\""), "{preview}");
+            device.success(&root, &["adapter", "approve", GENERIC_TOOL, "--yes"]);
+        }
+        // The second profile uses the same device endpoint approval.
+        device.success(&root, &["index", "--offline"]);
+        assert_chunk_vectors(&root);
+        let after_index = peer.requests().len();
+        device.success(&root, &["index", "--offline"]);
+        assert_eq!(
+            peer.requests().len(),
+            after_index,
+            "reuse stored vectors across processes"
+        );
+
+        let adapter_status = device.success(&root, &["adapter", "status", GENERIC_TOOL]);
+        let disclosure = &adapter_status["device_endpoints"][0]["configured_disclosures"][0];
+        assert_eq!(disclosure["tool_id"], GENERIC_TOOL, "{adapter_status}");
+        assert_eq!(
+            disclosure["content_types"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("images")),
+            wire == "messages",
+        );
+        let query = "wire-query-needle";
+        // Both wire profiles share a device registry. Select the scope that
+        // was indexed with the active profile for this wire assertion.
+        let search = device.success(
+            &root,
+            &[
+                "search",
+                query,
+                "--scope",
+                ".",
+                "--mode",
+                "vector",
+                "--offline",
+            ],
+        );
+        assert_eq!(search["resolved_mode"], "vector", "{search}");
+        assert_eq!(
+            search["searched_scopes"].as_array().unwrap().len(),
+            1,
+            "{search}"
+        );
+        assert_eq!(search["excluded_scopes"], json!([]), "{search}");
+
+        let status = device.success(&root, &["status"]);
+        let image_tasks: Vec<_> = status["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|task| {
+                task["type"] == "embedding" && task["embedding_target"]["kind"] == "image"
+            })
+            .collect();
+        assert_eq!(image_tasks.len(), 1, "{status}");
+        profile_hashes.push(image_tasks[0]["embedding_target"]["profile_hash"].clone());
+        if wire == "input" {
+            assert_eq!(image_tasks[0]["status"], "skipped");
+            assert_eq!(
+                image_tasks[0]["fallback_reason"],
+                "image_capability_unavailable"
+            );
+        } else {
+            assert_eq!(image_tasks[0]["status"], "done", "{status}");
+        }
+        let requests = peer.requests();
+        let mut images = 0;
+        for request in &requests[before..] {
+            assert_eq!(request.path, "/v1/embeddings");
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["model"], "test-model");
+            assert_eq!(body["dimensions"], 768);
+            if wire == "input" {
+                assert!(body["input"].is_string(), "{body}");
+                assert!(body.get("messages").is_none(), "{body}");
+            } else {
+                assert!(body.get("input").is_none(), "{body}");
+                assert_eq!(body["messages"].as_array().unwrap().len(), 2);
+                assert_eq!(
+                    body["messages"][0],
+                    json!({"role": "system", "content": instruction})
+                );
+                assert_eq!(body["messages"][1]["role"], "user");
+                let parts = body["messages"][1]["content"].as_array().unwrap();
+                assert_eq!(parts.len(), 1);
+                if parts[0]["type"] == "image_url" {
+                    assert!(
+                        parts[0]["image_url"]["url"]
+                            .as_str()
+                            .unwrap()
+                            .starts_with("data:image/png;base64,")
+                    );
+                    images += 1;
+                } else {
+                    assert_eq!(parts[0]["type"], "text");
+                }
+            }
+        }
+        assert_eq!(images, usize::from(wire == "messages"));
+        for needle in ["wire-document-needle", query] {
+            assert!(
+                requests[before..]
+                    .iter()
+                    .any(|r| String::from_utf8_lossy(&r.body).contains(needle))
+            );
+        }
+    }
+    assert!(profile_hashes.iter().all(Value::is_string));
+    assert_ne!(profile_hashes[0], profile_hashes[1]);
+}
+
+fn approved_generic_document(device: &Device, root: &Path, peer: &Peer) {
+    device.success(root, &["init"]);
+    fs::write(
+        root.join("notes.md"),
+        "# Notes\n\nlocal review embedding fixture\n",
+    )
+    .unwrap();
+    device.generic_embedding_url(&peer.url(), "input", "");
+    device.success(root, &["adapter", "approve", GENERIC_TOOL, "--yes"]);
+}
+
+#[test]
+fn generic_local_embedding_rejects_wrong_response_index_without_publishing() {
+    let temp = support::canonical_tempdir();
+    let device = Device::new(&temp);
+    let root = support::create_private_child_dir(temp.path(), "scope");
+    let peer = Peer::start(Reply::WrongIndex);
+    approved_generic_document(&device, &root, &peer);
+    device.output(&root, &["index", "--offline"]);
+    assert_eq!(peer.requests().len(), 1);
+    assert_eq!(chunk_vector_count(&root), 0);
+    let status = device.success(&root, &["status"]);
+    assert!(
+        status["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| task["type"] == "embedding"
+                && task["status"] == "failed"
+                && task["fallback_reason"] == "contract_violation"
+                && task["attempts"] == 1
+                && task["next_retry_at"].is_string()),
+        "{status}"
+    );
+}
+
+#[test]
+fn generic_local_embedding_retries_a_dimension_violation_in_the_next_process() {
+    let temp = support::canonical_tempdir();
+    let device = Device::new(&temp);
+    let root = support::create_private_child_dir(temp.path(), "scope");
+    let peer = Peer::start(Reply::WrongWidthOnce);
+    approved_generic_document(&device, &root, &peer);
+    device.output(&root, &["index", "--offline"]);
+    assert_eq!(peer.requests().len(), 1);
+    assert_eq!(chunk_vector_count(&root), 0);
+    let status = device.success(&root, &["status"]);
+    assert!(
+        status["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| task["type"] == "embedding"
+                && task["status"] == "failed"
+                && task["fallback_reason"] == "contract_violation"
+                && task["attempts"] == 1
+                && task["next_retry_at"].is_string()),
+        "{status}"
+    );
+
+    device.success(&root, &["index", "--offline"]);
+    assert_eq!(peer.requests().len(), 2);
+    assert_chunk_vectors(&root);
+}
+
+#[test]
+fn generic_local_embedding_does_not_retry_an_http_400() {
+    let temp = support::canonical_tempdir();
+    let device = Device::new(&temp);
+    let root = support::create_private_child_dir(temp.path(), "scope");
+    let peer = Peer::start(Reply::Reject);
+    approved_generic_document(&device, &root, &peer);
+    device.output(&root, &["index", "--offline"]);
+    assert_eq!(peer.requests().len(), 1);
+    let status = device.success(&root, &["status"]);
+    assert!(
+        status["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| task["type"] == "embedding"
+                && task["status"] == "failed"
+                && task["fallback_reason"] == "invalid_input"
+                && task["next_retry_at"].is_null()),
+        "{status}"
+    );
+    device.output(&root, &["index", "--offline"]);
+    assert_eq!(peer.requests().len(), 1);
+    assert_eq!(chunk_vector_count(&root), 0);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn generic_local_embedding_recovers_a_staged_result_without_http_or_billing() {
+    for kind in ["chunk", "image"] {
+        let temp = support::canonical_tempdir();
+        let device = Device::new(&temp);
+        let root = support::create_private_child_dir(temp.path(), "scope");
+        let peer = Peer::start(Reply::Embedding);
+        device.success(&root, &["init"]);
+        if kind == "chunk" {
+            fs::write(root.join("notes.md"), "# Notes\n\nlocal recovery fixture\n").unwrap();
+        } else {
+            fs::write(
+                root.join("figure.png"),
+                include_bytes!("fixtures/o2_golden/png-original-control.png"),
+            )
+            .unwrap();
+        }
+        device.generic_embedding_url(&peer.url(), "messages", "");
+        device.success(&root, &["adapter", "approve", GENERIC_TOOL, "--yes"]);
+
+        let first = device
+            .command(&root, &["index", "--offline"])
+            .env(
+                "KIO_TEST_EMBEDDING_PUBLICATION_FAULT",
+                "before_source_write",
+            )
+            .output()
+            .unwrap();
+        assert!(!first.status.success(), "{kind}");
+        let requests_for_target = || {
+            peer.requests()
+                .into_iter()
+                .filter(|request| {
+                    let body: Value = serde_json::from_slice(&request.body).unwrap();
+                    let is_image = body["messages"][0]["content"][0]["type"] == "image_url";
+                    is_image == (kind == "image")
+                })
+                .count()
+        };
+        let vector_count = || {
+            support::immutable_sqlite(root.join(".kio/index/sqlite.db"))
+                .query_row(
+                    "SELECT COUNT(*) FROM embeddings WHERE target_type=?1",
+                    [kind],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(requests_for_target(), 1, "{kind}");
+        assert_eq!(vector_count(), 0, "{kind}");
+        let records = fs::read_dir(device.state.join("kio/local-execution"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path().join("record.json"))
+            .filter(|path| path.is_file());
+        let staged = records
+            .map(|path| serde_json::from_slice::<Value>(&fs::read(path).unwrap()).unwrap())
+            .any(|record| {
+                record["phase"]["phase"] == "result_ready"
+                    && record["identity"]["target"]["kind"]
+                        == if kind == "chunk" { "document" } else { "image" }
+            });
+        assert!(staged, "no staged result for {kind}");
+        let billing_absent = || {
+            let entries = fs::read_dir(device.data.join("kio")).unwrap();
+            for entry in entries {
+                let name = entry.unwrap().file_name();
+                let name = name.to_string_lossy();
+                assert!(
+                    !name.starts_with("cost-ledger.sqlite") && name != "ledger.lifecycle.lock",
+                    "{name}"
+                );
+            }
+        };
+        billing_absent();
+        device.success(&root, &["index", "--offline"]);
+        assert_eq!(requests_for_target(), 1, "{kind} was sent again");
+        assert!(vector_count() > 0, "{kind} was not published");
+        billing_absent();
+    }
 }

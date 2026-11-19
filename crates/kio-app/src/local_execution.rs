@@ -205,6 +205,8 @@ struct Record {
     identity: LocalIdentity,
     token: String,
     attempts: u32,
+    #[serde(default)]
+    contract_violation_count: u32,
     phase: Phase,
 }
 
@@ -215,6 +217,7 @@ impl Record {
             || &self.identity != identity
             || self.identity.key()? != key
             || !is_digest(&self.token)
+            || self.contract_violation_count > self.attempts
             || (self.attempts == 0 && !matches!(self.phase, Phase::Failed { .. } | Phase::Unsent))
         {
             return Err(invalid("local execution record binding mismatch"));
@@ -325,6 +328,7 @@ impl LocalExecution {
                     identity: identity.clone(),
                     token: new_token()?,
                     attempts: floor_attempts.saturating_add(1),
+                    contract_violation_count: 0,
                     phase: Phase::Intent,
                 };
                 if floor_attempts >= max_attempts {
@@ -457,6 +461,7 @@ impl LocalExecution {
         {
             archive_terminal(state.directory(), &record)?;
             record.attempts = 0;
+            record.contract_violation_count = 0;
             record.phase = Phase::Unsent;
             write_record(state.directory(), &record, Publication::Replace)?;
         }
@@ -503,6 +508,7 @@ impl LocalExecution {
                 return Err(invalid("retired local execution has an unexpected result"));
             }
             record.attempts = floor_attempts;
+            record.contract_violation_count = 0;
         }
         let kind = match record.phase {
             Phase::Failed { kind, .. } => Some(kind),
@@ -549,6 +555,10 @@ impl LocalGuard {
     }
     pub(crate) fn attempts(&self) -> u32 {
         self.record.attempts
+    }
+
+    pub(crate) fn contract_violation_count(&self) -> u32 {
+        self.record.contract_violation_count
     }
 
     pub(crate) fn result(&self) -> Result<Option<Vec<u8>>> {
@@ -632,6 +642,15 @@ impl LocalGuard {
             // Rate-limit and pre-admission failures may preserve the retry
             // budget while the dispatch sequence remains durably recorded.
             self.record.attempts = self.record.attempts.saturating_sub(1);
+        }
+        if consume_attempt
+            && kind == RetryErrorKind::ContractViolation
+            && matches!(
+                self.record.identity.contract,
+                LocalContract::Embedding { .. }
+            )
+        {
+            self.record.contract_violation_count += 1;
         }
         self.record.phase = Phase::Failed {
             kind,
@@ -932,6 +951,71 @@ mod tests {
             input_hash: format!("sha256:{}", identity.input_sha256),
         };
         identity
+    }
+
+    #[test]
+    fn local_embedding_retries_only_the_first_contract_violation() {
+        use crate::embedding::executor::fail_local_embedding_claim;
+        use crate::markdownize::execution::TaskExecutionFailure;
+
+        let now = "2026-11-20T00:00:00Z";
+        let now_ms = kio_core::scope::parse_utc_seconds(now).unwrap() * 1000;
+        let failure = |retry_kind| TaskExecutionFailure {
+            retry_kind,
+            retry_after_ms: None,
+            resource_limit: None,
+        };
+        for identity in [document_identity(), query_identity()] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = || {
+                LocalExecution::new(
+                    temp.path().join("state"),
+                    temp.path().to_path_buf(),
+                    ControlHandle::default(),
+                )
+                .unwrap()
+            };
+            let claim = || match store().claim(&identity, 0, None, 5, now_ms).unwrap() {
+                Claim::Claimed(owner) => owner,
+                _ => panic!("expected dispatch claim"),
+            };
+            let mut first = claim();
+            assert_eq!(
+                fail_local_embedding_claim(
+                    &mut first,
+                    &failure(RetryErrorKind::ContractViolation),
+                    now,
+                    5
+                )
+                .unwrap(),
+                Some(now_ms)
+            );
+            drop(first);
+
+            // An unrelated failure may replace the current failure reason but
+            // must preserve the contract-violation budget across new owners.
+            let mut second = claim();
+            second
+                .fail(RetryErrorKind::NetworkError, Some(now_ms), true, false)
+                .unwrap();
+            drop(second);
+            let mut third = claim();
+            assert_eq!(third.attempts(), 3);
+            assert_eq!(
+                fail_local_embedding_claim(
+                    &mut third,
+                    &failure(RetryErrorKind::ContractViolation),
+                    now,
+                    5
+                )
+                .unwrap(),
+                None
+            );
+            assert!(matches!(
+                third.record.phase,
+                Phase::Failed { terminal: true, .. }
+            ));
+        }
     }
 
     #[test]

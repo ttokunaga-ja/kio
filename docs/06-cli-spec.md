@@ -214,6 +214,9 @@ model/adapter status の typed fields は `selected_profile`、`profile_hash`、
 Task の Skipped は理由別件数、資源待ちは `resource_busy` として表示する。
 local HTTP peer には `peer_authenticated=false` を表示し、承認確認にも未認証と明示する。
 HTTPS の trust 状態は既存の managed CA status に従う。producer の認定状態は設けない。
+汎用 endpoint の設定は [07-adapter-spec.md §5.3](07-adapter-spec.md) に従う。
+`kio adapter status local_embedding` は現在の用途と送信内容を
+`device_endpoints[].configured_disclosures` に、承認時の確認内容を `grants` に表示する。
 
 ### Device-global ledger recovery
 

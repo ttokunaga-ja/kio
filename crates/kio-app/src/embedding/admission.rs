@@ -78,9 +78,10 @@ pub(crate) fn embedding_execution(
 }
 
 pub(crate) fn declared_embedding_profile(
+    settings: &AdapterRuntimeSettings,
     execution: EmbeddingExecution,
-) -> DeclaredEmbeddingProfile {
-    declared_embedding_profile_for(execution)
+) -> Result<DeclaredEmbeddingProfile> {
+    declared_embedding_profile_for(settings, execution).map_err(adapter_to_kio)
 }
 
 /// Whether the active embedding execution is the remote, billable API lane
@@ -119,7 +120,7 @@ pub(crate) fn embedding_tool_lock_entry(
     let Some(execution) = embedding_execution(adapter_settings, control) else {
         return Ok(None);
     };
-    let profile = declared_embedding_profile(execution);
+    let profile = declared_embedding_profile(adapter_settings, execution)?;
     // `kind`/`mode` used to be literals, which recorded an offline adapter as
     // having run online. They are properties of the adapter, so they come from
     // its profile — the lock is provenance, and provenance that always says

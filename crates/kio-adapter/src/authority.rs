@@ -9,6 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::local_embedding::GENERIC_LOCAL_EMBEDDING_TOOL_ID;
 use crate::tool_lock::{self, AdapterRuntimeSettings, DeclaredAdapter};
 use crate::{AdapterError, Result};
 
@@ -112,7 +113,9 @@ fn embedding_identity(
             );
             online_identity(request, tool_id, declared, &destination)
         }
-        "qwen3_vl_embedding_local" => local_identity(settings, request, tool_id, declared),
+        "qwen3_vl_embedding_local" | GENERIC_LOCAL_EMBEDDING_TOOL_ID => {
+            local_identity(settings, request, tool_id, declared)
+        }
         _ => Err(schema("declared embedding target is unsupported")),
     }
 }

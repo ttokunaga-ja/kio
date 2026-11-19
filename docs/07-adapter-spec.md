@@ -25,7 +25,7 @@ R23 の同梱 runtime が実行できる online target は `mistral_ocr_markdown
 `url` による実行先の差し替えを受理せず、宣言された model と built-in target の一致を
 その role を利用するコマンドの設定読取り時と実行直前に検証する。未使用 role は起動条件にしない
 ([操作別前提条件](14-v1-runtime-contracts.md#operation-specific-prerequisites))。
-上記の実行設定フィールドは現在の built-in role では受理しない。
+利用者管理のローカル endpoint の送信境界は §3.1、embedding endpoint の設定は §5.3 に従う。
 
 認証情報の保存規約:
 
@@ -615,9 +615,34 @@ local crash の再計算・0 USD 回復は [04-pipeline.md §5](04-pipeline.md) 
 | OpenAI 互換 input | text のみ（Ollama / LM Studio 等）。image capability は宣言せず、image は Skipped(image_capability_unavailable) |
 | vLLM chat-form messages | text と image。同 profile の text/query も messages を使う。image は data URI 付き user message、1 item/request |
 
-wire 形式・model・重み pin・chat template/instruction を意味的 profile に固定する。
-空 instruction も固定し、同一 profile で input/messages を混用しない。
-出力は768次元を要求し、形式が許す場合だけ余剰次元を切り詰めて正規化し、そうでなければ明示拒否する。
+端末の `tools.toml` で設定する。次は messages 形式の例である。二つの SHA-256 は利用する重みと、
+サーバーが使う chat template の値に置き換える。
+
+```toml
+[embedding.local_embedding]
+kind = "offline_api"
+url = "http://127.0.0.1:8000"
+wire_format = "messages"
+model = "my-embedding-model"
+model_version_pin = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+chat_template_hash = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+instruction = ""
+```
+
+`wire_format` は `input` または `messages` を明示する。model・重み pin・chat template の SHA-256・
+instruction（空文字列を含む）も必須で、wire 形式とともに意味的 profile に固定する。
+template を使わないサーバーでは空の template の SHA-256 を記録する。重みと template の pin は
+利用者が管理するサーバーの構成を宣言する値である。同一 profile で input/messages を混用しない。
+`messages` で空でない instruction は system message として送る。
+`input` では instruction の文字列を本文の直前に連結し、必要な区切りも設定値に含める。
+
+リクエストの `dimensions` は 768 とする。利用するモデルが先頭次元の切り詰めをサポートする場合に
+のみ `truncate_dimensions = true` を設定できる。この設定も profile に固定する。余剰次元は
+この設定時だけ切り詰めて L2 正規化する。寸法不足と、設定なしでの超過は契約違反として拒否する。
+`kio adapter approve local_embedding --preview` で送信内容を確認し、
+`kio adapter approve local_embedding --yes` で宛先を承認する。
+応答の `data` は 1 要素で、入力に対応する整数の `index: 0` を要求する。
+HTTP 4xx の要求拒否は `invalid_input` とする。408 と 429 には通信障害と rate limit の再試行規則を適用する。
 窓は同じ Task・無料 local execution state・member 受入・回復契約を使う。Kio は endpoint server を起動・管理しない。
 HTTP/HTTPS の送信境界は §3.1 に従い、別の実行 pipeline や管理 server 選択肢は設けない。
 

@@ -967,6 +967,10 @@ resource_limit     paused                max_attempts=0 (自動 retry なし)
                                          KIO-E-RESOURCE-LIMIT-001 / exit 3
 ```
 
+無料ローカル embedding では、実行レコードで契約違反の回数を総 attempt 数と別に保持する。
+実行全体の attempt 上限内で、最初の契約違反後に同じ入力の再試行を 1 回予約する。
+Task の `next_retry_at` はその予約を反映する。
+
 `resource_limit` は Task / manifest `units[]` / Adapter `failed_units[]` の閉 enum
 `error_kind` に含める。資源不足の共通記述は `resource`、`stage`（不足した処理段階）、
 `limit`、`observed`、`resource_tier` を持ち、該当する Task / manifest unit / failed unit の

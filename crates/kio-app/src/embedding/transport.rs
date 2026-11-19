@@ -123,7 +123,8 @@ fn run_embedding_adapter_unclassified(
             .open(path)
             .and_then(|mut file| file.write_all(line.as_bytes()));
     }
-    let profile = declared_embedding_profile(execution);
+    let profile = kio_adapter::catalog::declared_embedding_profile_for(adapter_settings, execution)
+        .map_err(EmbeddingRunError::BeforeDispatch)?;
     let expected = EmbeddingAcceptance {
         dimensions: u32::try_from(profile.dimensions).map_err(|_| {
             EmbeddingRunError::BeforeDispatch(AdapterError::ContractViolation(
@@ -364,7 +365,7 @@ pub(crate) fn compute_query_embedding_page1(
     if !embedding_transport_allowed(execution, offline) {
         return Ok(None);
     }
-    let profile = declared_embedding_profile(execution);
+    let profile = declared_embedding_profile(adapter_settings, execution)?;
 
     // PC6: the final authorization check is deliberately before *any* writable
     // source ledger action. A revoked auto/hybrid candidate therefore resolves to its
@@ -432,7 +433,7 @@ fn run_query_embedding_job(
     authorizing_repo: Option<&Repository>,
 ) -> Result<Option<QueryEmbeddingOutcome>> {
     let adapter_settings = invocation.settings;
-    let profile = declared_embedding_profile(execution);
+    let profile = declared_embedding_profile(adapter_settings, execution)?;
     let descriptor =
         embedding_descriptor_with_control(adapter_settings, execution, invocation.control)
             .map_err(crate::object_persistence::adapter_to_kio)?;
@@ -653,7 +654,7 @@ fn run_free_query_embedding_job(
     authorizing_repo: Option<&Repository>,
 ) -> Result<Option<QueryEmbeddingOutcome>> {
     use crate::local_execution::{Claim, LocalExecution, LocalTarget};
-    let profile = declared_embedding_profile(execution);
+    let profile = declared_embedding_profile(invocation.settings, execution)?;
     let input_hash = device_input_hash(query);
     let identity = local_embedding_identity(
         LocalTarget::Query {
@@ -718,37 +719,11 @@ fn run_free_query_embedding_job(
                 completed
             }
             Err(LocalEmbeddingRunFailure::Classified(failure)) => {
-                let policy = kio_pipeline::task::retry_policy(failure.retry_kind);
-                let now = invocation.control.now_utc_seconds();
-                let next = if failure.retry_kind == RetryErrorKind::RateLimit {
-                    Some(crate::task_execution::rate_limit_retry_at(
-                        &now,
-                        failure.retry_after_ms,
-                    ))
-                } else if policy.retryable
-                    && policy.max_attempts.is_none_or(|max| claim.attempts() < max)
-                {
-                    Some(crate::task_execution::scheduled_retry_at(
-                        &now,
-                        &policy.backoff,
-                        claim.attempts(),
-                    ))
-                } else {
-                    None
-                };
-                claim.fail(
-                    failure.retry_kind,
-                    next.as_deref()
-                        .and_then(kio_core::scope::parse_utc_seconds)
-                        .map(|seconds| seconds * 1000),
-                    !matches!(
-                        failure.retry_kind,
-                        RetryErrorKind::RateLimit
-                            | RetryErrorKind::AuthError
-                            | RetryErrorKind::ResourceLimit
-                    ),
-                    failure.retry_kind != RetryErrorKind::AuthError
-                        && (!policy.retryable || next.is_none()),
+                crate::embedding::executor::fail_local_embedding_claim(
+                    &mut claim,
+                    &failure,
+                    &invocation.control.now_utc_seconds(),
+                    local_max_attempts(execution),
                 )?;
                 if let Some(limit) = failure.resource_limit {
                     return Err(limit.into_error("query embedding resource exhausted"));
@@ -819,7 +794,8 @@ pub(crate) fn run_local_embedding_adapter(
                 "loopback embedding dispatch has no authorizing scope",
             ))
         })?;
-        let profile = declared_embedding_profile(execution);
+        let profile = declared_embedding_profile(settings, execution)
+            .map_err(LocalEmbeddingRunFailure::Admission)?;
         Some(
             approvals::endpoint_dispatch_lease(
                 settings,

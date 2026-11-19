@@ -626,8 +626,10 @@ fn embedding_grants_require_the_explicit_current_role_and_profile() {
     {
         let adapter_settings = &std::sync::Arc::new(settings);
         let profile = crate::embedding::admission::declared_embedding_profile(
+            adapter_settings,
             crate::embedding::admission::embedding_execution(adapter_settings, control).unwrap(),
-        );
+        )
+        .unwrap();
         let target = AdapterTarget::Tool(profile.tool_id.clone());
         let preview = fixture
             .in_context(adapter_settings, |ctx| {
@@ -741,8 +743,10 @@ fn embedding_grants_require_the_explicit_current_role_and_profile() {
             let drift = ControlHandle::new(control);
             let drift_repo = fixture.repo.rebind_with_control(drift.clone());
             let current = crate::embedding::admission::declared_embedding_profile(
+                adapter_settings,
                 crate::embedding::admission::embedding_execution(adapter_settings, &drift).unwrap(),
-            );
+            )
+            .unwrap();
             assert_ne!(current.profile_hash, profile.profile_hash);
             for operation in [GrantOperation::Network, GrantOperation::SendSecrets] {
                 assert!(
@@ -1270,9 +1274,11 @@ fn loopback_endpoint_grant_reuses_device_authority_across_scopes_and_revokes_eve
     let fixture = Fixture::new();
     let settings = loopback_settings(&fixture);
     let profile = crate::embedding::admission::declared_embedding_profile(
+        &settings,
         crate::embedding::admission::embedding_execution(&settings, fixture.repo.control())
             .expect("configured local embedding execution"),
-    );
+    )
+    .unwrap();
     let target = AdapterTarget::Tool(profile.tool_id.clone());
     let interrupted = fixture.approve_with_control(
         &settings,
@@ -1413,9 +1419,11 @@ fn endpoint_secret_confirmation_is_scoped_resumable_and_requires_live_parent() {
     let settings = loopback_settings(&fixture);
     let tool = "qwen3_vl_embedding_local";
     let profile = crate::embedding::admission::declared_embedding_profile(
+        &settings,
         crate::embedding::admission::embedding_execution(&settings, fixture.repo.control())
             .unwrap(),
-    );
+    )
+    .unwrap();
     fixture
         .approve_with(&settings, AdapterTarget::Tool(tool.into()), None, false)
         .unwrap();
@@ -1604,9 +1612,11 @@ fn unused_missing_https_trust_with_unrelated_device_grants_is_optional_readiness
     settings.local_peer_trust_binding = None;
     let settings = Arc::new(settings);
     let profile = crate::embedding::admission::declared_embedding_profile(
+        &settings,
         crate::embedding::admission::embedding_execution(&settings, fixture.repo.control())
             .unwrap(),
-    );
+    )
+    .unwrap();
     let before = fixture.metadata_snapshot();
     let allowed = super::approvals::allowed(
         &settings,
@@ -1699,7 +1709,8 @@ fn assert_dispatch_grant_directory_binding(active_original: bool) {
     let execution =
         crate::embedding::admission::embedding_execution(&settings, fixture.repo.control())
             .unwrap();
-    let profile = crate::embedding::admission::declared_embedding_profile(execution);
+    let profile =
+        crate::embedding::admission::declared_embedding_profile(&settings, execution).unwrap();
     fixture
         .approve_with(
             &settings,
@@ -1912,7 +1923,8 @@ fn assert_retired_child_secret_is_revalidated_under_dispatch_lease() {
     let execution =
         crate::embedding::admission::embedding_execution(&settings, fixture.repo.control())
             .unwrap();
-    let profile = crate::embedding::admission::declared_embedding_profile(execution);
+    let profile =
+        crate::embedding::admission::declared_embedding_profile(&settings, execution).unwrap();
     let child_path = fixture.root.join("secret-child");
     fs::create_dir(&child_path).unwrap();
     let child =
@@ -2038,7 +2050,8 @@ fn final_endpoint_lease_checks_secret_pair_without_invalidating_normal_scope_aut
     let execution =
         crate::embedding::admission::embedding_execution(&settings, fixture.repo.control())
             .unwrap();
-    let profile = crate::embedding::admission::declared_embedding_profile(execution);
+    let profile =
+        crate::embedding::admission::declared_embedding_profile(&settings, execution).unwrap();
     fixture
         .approve_with(
             &settings,

@@ -37,6 +37,8 @@ pub enum AdapterError {
     ResourceLimit(kio_core::error::ResourceLimit),
     #[error("adapter contract violation: {0}")]
     ContractViolation(String),
+    #[error("adapter input rejected: {0}")]
+    InvalidInput(String),
     #[error("adapter auth error: {0}")]
     Auth(String),
     /// The configured local endpoint did not authenticate as the peer bound to
@@ -118,7 +120,7 @@ impl AdapterError {
         match self {
             Self::ResourceLimit(_) => "KIO-E-RESOURCE-LIMIT-001",
             Self::Auth(_) => "KIO-E-BATCH-AUTH-001",
-            Self::RuntimeConfiguration { .. } => "KIO-E-BATCH-INPUT-001",
+            Self::InvalidInput(_) | Self::RuntimeConfiguration { .. } => "KIO-E-BATCH-INPUT-001",
             Self::LocalPeerAuth(_) => "KIO-E-LOCAL-PEER-AUTH-001",
             Self::LocalPeerConfig { .. } | Self::RuntimeTrust(_) => "KIO-E-LOCAL-PEER-CONFIG-001",
             Self::RateLimit { .. } => "KIO-E-BATCH-RATE-001",
@@ -143,7 +145,9 @@ impl AdapterError {
             Self::ResourceLimit(_) => ErrorCategory::Permanent,
             Self::RateLimit { .. } => ErrorCategory::RateLimit,
             // Non-retryable in 04 §5.3's table (auth_error has max_attempts=0).
-            Self::Auth(_) | Self::RuntimeConfiguration { .. } => ErrorCategory::Permanent,
+            Self::Auth(_) | Self::InvalidInput(_) | Self::RuntimeConfiguration { .. } => {
+                ErrorCategory::Permanent
+            }
             Self::LocalPeerAuth(_) | Self::LocalPeerConfig { .. } | Self::RuntimeTrust(_) => {
                 ErrorCategory::Permanent
             }

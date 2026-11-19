@@ -1,6 +1,8 @@
 //! Explicit device grants paired with the current scope's approval references.
+
 use crate::response::adapter::*;
 use crate::response::{CommandResponse, Completion, ResponseBody};
+use kio_adapter::catalog::GENERIC_LOCAL_EMBEDDING_TOOL_ID;
 use kio_adapter::tool_lock::AdapterRuntimeSettings;
 use kio_core::control::ControlHandle;
 use std::sync::Arc;
@@ -42,6 +44,16 @@ pub(crate) fn store_path(control: &ControlHandle) -> PathBuf {
     crate::settings::data_home(control).join("kio/grants/grants.json")
 }
 
+fn tool_role(tool: &str) -> Option<AdapterRole> {
+    match tool {
+        "gemini_embedding_2" | "qwen3_vl_embedding_local" | GENERIC_LOCAL_EMBEDDING_TOOL_ID => {
+            Some(AdapterRole::Embedding)
+        }
+        "mistral_ocr_markdownize" | "paddleocr_vl_local" => Some(AdapterRole::Markdown),
+        _ => None,
+    }
+}
+
 fn selected_tool(target: &AdapterTarget) -> Result<Option<&str>> {
     match target {
         AdapterTarget::All => Ok(None),
@@ -70,14 +82,7 @@ pub(crate) fn approve(
     let repo = ctx.open_recovery_repository()?;
     let mut targets = Vec::new();
     for role in [AdapterRole::Markdown, AdapterRole::Embedding] {
-        if selected.is_some_and(|tool| match role {
-            AdapterRole::Embedding => {
-                !matches!(tool, "gemini_embedding_2" | "qwen3_vl_embedding_local")
-            }
-            AdapterRole::Markdown => {
-                !matches!(tool, "mistral_ocr_markdownize" | "paddleocr_vl_local")
-            }
-        }) {
+        if selected.is_some_and(|tool| tool_role(tool) != Some(role)) {
             continue;
         }
         if let Some((tool, profile)) = configured_profile(ctx.settings, &repo, role)?
@@ -234,7 +239,10 @@ fn configured_profile(
             if crate::embedding::admission::embedding_is_deterministic(execution) {
                 return Ok(None);
             }
-            let profile = crate::embedding::admission::declared_embedding_profile(execution);
+            let profile = crate::embedding::admission::declared_embedding_profile(
+                adapter_settings,
+                execution,
+            )?;
             (profile.tool_id, profile.profile_hash)
         }
     };
@@ -260,15 +268,11 @@ fn configured_bindings(
 ) -> Result<Vec<(AdapterRole, ScopedGrantBinding)>> {
     let mut bindings = Vec::new();
     for role in [AdapterRole::Markdown, AdapterRole::Embedding] {
-        if let Some(selected) = selected {
-            let target_role = match selected {
-                "gemini_embedding_2" | "qwen3_vl_embedding_local" => Some(AdapterRole::Embedding),
-                "mistral_ocr_markdownize" | "paddleocr_vl_local" => Some(AdapterRole::Markdown),
-                _ => None,
-            };
-            if target_role.is_some_and(|target| target != role) {
-                continue;
-            }
+        if selected
+            .and_then(tool_role)
+            .is_some_and(|target| target != role)
+        {
+            continue;
         }
         let Some((tool_id, profile)) = configured_profile(adapter_settings, repo, role)? else {
             continue;
@@ -618,16 +622,7 @@ fn approve_scoped(
             "preview conflicts with --yes; --resume requires one adapter",
         ));
     }
-    let matches_target = |role: AdapterRole| {
-        tool.is_none_or(|tool| match role {
-            AdapterRole::Embedding => {
-                matches!(tool, "gemini_embedding_2" | "qwen3_vl_embedding_local")
-            }
-            AdapterRole::Markdown => {
-                matches!(tool, "mistral_ocr_markdownize" | "paddleocr_vl_local")
-            }
-        })
-    };
+    let matches_target = |role| tool.is_none_or(|tool| tool_role(tool) == Some(role));
     for role in [AdapterRole::Markdown, AdapterRole::Embedding] {
         if matches_target(role) {
             adapter_settings
@@ -863,16 +858,16 @@ pub(crate) fn revoke(
         .map(|repo| repo.lock_store_in_session(repo.lock_session()))
         .transpose()?;
     let now = control.now_utc_seconds();
-    let roles: &[&str] = match tool {
-        Some("qwen3_vl_embedding_local" | "gemini_embedding_2") => &["embedding"],
-        Some("paddleocr_vl_local" | "mistral_ocr_markdownize") => &["markdown"],
-        _ => &["markdown", "embedding"],
+    let roles: &[&str] = match tool.and_then(tool_role) {
+        Some(AdapterRole::Embedding) => &["embedding"],
+        Some(AdapterRole::Markdown) => &["markdown"],
+        None => &["markdown", "embedding"],
     };
     let mut settings = crate::settings::adapter_runtime_settings_for_roles(control, roles)?;
     settings.managed_local_trust = Some(Arc::new(crate::trust::RuntimeTrustProvider::new(
         control.clone(),
     )));
-    let current = endpoint::current_bindings(&Arc::new(settings), tool);
+    let current = endpoint::current_endpoints(&Arc::new(settings), tool);
     let mut revoked = Vec::new();
     if let Some(snapshot) = PrivateGrantStore::open_readonly(
         &store_path(control),
@@ -889,9 +884,9 @@ pub(crate) fn revoke(
                             .disclosure
                             .as_ref()
                             .is_some_and(|d| Some(d.tool_id.as_str()) == tool)
-                        || current
-                            .as_ref()
-                            .is_ok_and(|bindings| bindings.contains(binding)) =>
+                        || current.as_ref().is_ok_and(|bindings| {
+                            bindings.iter().any(|(current, _)| current == binding)
+                        }) =>
                 {
                     Some(binding.clone())
                 }
@@ -945,7 +940,7 @@ pub(crate) fn status(
         &crate::settings::data_home(ctx.control),
         ctx.control,
     )?;
-    let current = endpoint::current_bindings(ctx.settings, args.tool_id.as_deref());
+    let current = endpoint::current_endpoints(ctx.settings, args.tool_id.as_deref());
     let mut records = Vec::new();
     let mut effective = Vec::new();
     let rows = repo
@@ -980,14 +975,15 @@ pub(crate) fn status(
                         .is_none_or(|d| &d.tool_id != tool)
                 }) && !current
                     .as_ref()
-                    .is_ok_and(|bindings| bindings.contains(binding))
+                    .is_ok_and(|bindings| bindings.iter().any(|(current, _)| current == binding))
                 {
                     continue;
                 }
                 current
                     .as_ref()
                     .map(|bindings| {
-                        record.state == GrantState::Active && bindings.contains(binding)
+                        record.state == GrantState::Active
+                            && bindings.iter().any(|(current, _)| current == binding)
                     })
                     .map_err(|e| e.error_code().to_owned())
             }
@@ -1041,7 +1037,7 @@ pub(crate) fn status(
     // admission authority and never creates a grant or probes the peer.
     let mut bindings = Vec::new();
     if let Ok(current) = &current {
-        for binding in current {
+        for (binding, _) in current {
             if !bindings.contains(binding) {
                 bindings.push(binding.clone());
             }
@@ -1058,6 +1054,13 @@ pub(crate) fn status(
         .into_iter()
         .map(|binding| EndpointPeerStatus {
             peer_authenticated: binding.destination.starts_with("https://"),
+            configured_disclosures: current
+                .as_ref()
+                .into_iter()
+                .flatten()
+                .filter(|(configured, _)| configured == &binding)
+                .map(|(_, disclosure)| disclosure.clone())
+                .collect(),
             binding,
         })
         .collect();
