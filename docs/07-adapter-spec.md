@@ -98,6 +98,8 @@ Kio は `deterministic_library` の Prepare / Markdownize Adapter を同梱す�
 > 変更は deterministic profile の `model_version_pin` 1.0.0 → 1.1.0 として**新
 > `tool_profile_hash`** に載せた (§9 / [03-data-model.md §5.1](03-data-model.md) — 既存
 > instance 内の prepared_hash drift ではなく新 identity としての基線再構築)。
+> PDF の資源 tier 対応では、ページごとのフォント解決と unsupported filter の空抽出を
+> Prepare 1.3.0 / Markdownize 1.4.0 の identity に載せる。
 
 - online Adapter が未設定または network 未承認のとき、Markdownize タスクは同梱 deterministic Adapter で実行する (タスクを止めない)。Embedding はモデル準備済みなら既定の EG2 を使い、未準備なら理由を表示して text fallback する ([05-runtime.md §1](05-runtime.md))
 - この状態を **ベースライン index** と呼ぶ。`init → index --yes → search → open <pointer>` の最低体験ライン ([01-positioning.md §3](01-positioning.md)) はベースライン index のみで成立しなければならない
@@ -390,6 +392,10 @@ invocation 限定の資源選択で、省略時は standard。永続的な安全
 | XLSX raw ZIP / file | 100 MiB | 1 GiB |
 | XLSX 1 member の展開 bytes | 64 MiB | 256 MiB |
 | XLSX 全 member の declared / 実読取り展開 bytes 合計 / file | 256 MiB | 4 GiB |
+
+PDF の parser work には、object / reference の訪問、入力の走査、実際に展開した bytes を数える。
+展開 bytes はファイル全体で累積し、累計を 1 KiB 単位へ切り上げるため、展開の chunk 分割によって
+消費量は変わらない。content stream、CMap、出力 text はページごとに解放し、object index は処理中に保持する。
 
 XLSX の容量値は選択 tier に対応し、declared size と実読取りの両方に適用する。
 member / aggregate の容量枠は streaming で消費する総量であり、同時保持 memory 枠の拡張ではない。

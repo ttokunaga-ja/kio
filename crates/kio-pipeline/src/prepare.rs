@@ -371,115 +371,84 @@ fn prepare_units_emitting(
     } else {
         None
     };
-    // Page AND Slide are both "paginated" unit types once Office conversion
-    // is in the mix (previously only Page was — Slide's unit_count was
-    // hardcoded to 1, which was moot before this change because PPTX never
-    // reached this far: the very first gate above always returned empty for
-    // it). `pdf_pages` below is populated for either a native PDF or a
-    // successfully-converted Office document; per-unit hashes/fingerprints
-    // downstream key off `paginated`, not `unit_type == UnitType::Page`.
-    let paginated = matches!(unit_type, UnitType::Page | UnitType::Slide);
-    let pdf_pages = if is_pdf {
-        let pages = pdf_text_pages_bounded(bytes)?;
-        // R20-4: `pdf_has_text_layer` and the stream/literal extractors match on raw
-        // (undecompressed) bytes, so a scanned PDF's compressed image streams yield garbage
-        // "text" (a chance `BT` plus random `(...)` literals). If every recovered page is
-        // empty or mostly non-printable, there is no real text layer — treat it as scanned
-        // and route to OCR rather than persisting the garbage as a searchable unit. (An
-        // empty `pages` — the honest no-text-layer result — also lands here vacuously.)
-        if pages.iter().all(|page| !is_probably_real_text(page)) {
-            return Ok(empty_prepare_output());
+    if is_pdf || is_office {
+        let pdf = office_converted_pdf.as_deref().unwrap_or(bytes);
+        let pdf_error = |err| prepare_adapter_error("KIO-E-PREPARE-PDF-EXTRACT-001", err);
+        let mut pages =
+            kio_adapter::pdf_decode::PdfPages::open(pdf, budget.tier).map_err(pdf_error)?;
+        let count = pages.len();
+        let mut prepared_units = completed.to_vec();
+        let mut declared = !completed.is_empty();
+        if declared {
+            emit.declare(count)?;
         }
-        // R21-5: for a MIXED PDF (a real text page + a scanned image page) the per-page
-        // suppression of a scanned page's garbage is applied in the deterministic
-        // markdownize adapter (`read_pdf_page_text`), which is what actually produces the
-        // page markdown / chunk text — `prepare_units` only builds the unit skeleton.
-        pages
-    } else if let Some(converted_pdf) = office_converted_pdf.as_deref() {
-        let pages = pdf_text_pages_bounded(converted_pdf)?;
-        // Same R20-4 garbage-suppression gate as the native-PDF branch above,
-        // applied to the CONVERTED PDF's text layer instead of the raw
-        // office bytes.
-        if pages.iter().all(|page| !is_probably_real_text(page)) {
-            return Ok(empty_prepare_output());
+        for index in completed.len()..count {
+            let page = pages.read_page(index).map_err(pdf_error)?;
+            let real = is_probably_real_text(&page);
+            if !declared {
+                if !real {
+                    continue;
+                }
+                emit.declare(count)?;
+                declared = true;
+            }
+            // Once there is a text layer, preserve blank pages and slides as
+            // units. Scanned documents with no text layer leave an empty stage.
+            for order in prepared_units.len()..=index {
+                let body = if order == index && real {
+                    page.as_bytes()
+                } else {
+                    b""
+                };
+                let page_number = order as u64 + 1;
+                let unit = PreparedUnit {
+                    renderer: renderer.clone(),
+                    order: order as u64,
+                    unit_key: canonical_unit_key(unit_type, &page_number.to_string()),
+                    unit_type,
+                    prepared_hash: hash_bytes(body),
+                    preparation_profile_hash: preparation_profile_hash.clone(),
+                    fingerprint: fingerprint_for_bytes(body, body),
+                    mime: Some(media_type.to_owned()),
+                    page_number: (unit_type == UnitType::Page).then_some(page_number),
+                };
+                emit.write(&unit, body)?;
+                prepared_units.push(unit);
+            }
         }
-        pages
-    } else {
-        Vec::new()
-    };
-    if paginated {
-        budget.check_retained_bytes(
-            pdf_pages
+        return Ok(PrepareStageOutput {
+            prepared_object_hashes: prepared_units
                 .iter()
-                .fold(0u64, |total, page| total.saturating_add(page.len() as u64)),
-        )?;
-    } else {
-        budget.check_retained_bytes(bytes.len() as u64)?;
+                .map(|unit| unit.prepared_hash.clone())
+                .collect(),
+            prepared_units,
+            image_object_hashes: Vec::new(),
+        });
     }
-    let unit_count = if paginated { pdf_pages.len().max(1) } else { 1 };
-    emit.declare(unit_count)?;
-    let mut prepared_units = Vec::new();
-    let mut pages = pdf_pages.into_iter();
-    for index in 0..unit_count {
-        let selector = match unit_type {
-            UnitType::Page | UnitType::Slide => (index + 1).to_string(),
-            UnitType::Sheet => "Sheet1".to_owned(),
-            UnitType::Image => index.to_string(),
-            UnitType::File | UnitType::HeadingSection | UnitType::Symbol => "1".to_owned(),
-        };
-        let unit_key = canonical_unit_key(unit_type, &selector);
-        let page = pages.next();
-        if let Some(unit) = completed.get(index) {
-            prepared_units.push(unit.clone());
-            continue;
-        }
-        let page_bytes = page.as_deref().map_or(bytes, str::as_bytes);
-        // `paginated` (Page OR Slide) hashes/fingerprints off the PAGE bytes —
-        // for is_pdf that is the native PDF's own page text; for is_office it is
-        // the CONVERTED page text, so renderer drift changes prepared_hash (03
-        // §2.1's prepare-profile/renderer-driven gen+1 path is what absorbs
-        // that). mime stays the ORIGINAL office media type either way (below).
-        let unit_prepared_hash = if paginated {
-            hash_bytes(page_bytes)
-        } else if unit_count == 1 {
-            prepared_hash.clone()
-        } else {
-            hash_bytes(format!("{prepared_hash}\0{unit_key}").as_bytes())
-        };
-        let fingerprint = if paginated {
-            fingerprint_for_bytes(page_bytes, page_bytes)
-        } else {
-            fingerprint_for_bytes(bytes, unit_prepared_hash.as_bytes())
-        };
-        let unit = PreparedUnit {
-            renderer: renderer.clone(),
-            order: index as u64,
-            unit_key,
+    budget.check_retained_bytes(bytes.len() as u64)?;
+    emit.declare(1)?;
+    let unit = PreparedUnit {
+        renderer: None,
+        order: 0,
+        unit_key: canonical_unit_key(
             unit_type,
-            prepared_hash: unit_prepared_hash,
-            preparation_profile_hash: preparation_profile_hash.clone(),
-            fingerprint,
-            mime: Some(request.media_type.to_owned()),
-            // Only Page carries page_number, unchanged from before this
-            // change (Slide never did either, for the same PPTX-via-`_`
-            // reason DOCX now no longer falls into). Kept that way here too:
-            // `page_number`'s only downstream reader is the PDF-page-image
-            // path (07 §5.1's `metadata: unit_kind, page_number, ...`,
-            // scoped to `page` unit_kind), and 04 §2's unit table gives
-            // Slide its own `slide:N` identity — a redundant page_number
-            // would just restate the `slide:N` ordinal under a PDF-specific
-            // name.
-            page_number: (unit_type == UnitType::Page).then_some(index as u64 + 1),
-        };
-        emit.write(&unit, page_bytes)?;
-        prepared_units.push(unit);
-    }
+            if unit_type == UnitType::Image {
+                "0"
+            } else {
+                "1"
+            },
+        ),
+        unit_type,
+        fingerprint: fingerprint_for_bytes(bytes, prepared_hash.as_bytes()),
+        prepared_hash: prepared_hash.clone(),
+        preparation_profile_hash,
+        mime: Some(media_type.to_owned()),
+        page_number: None,
+    };
+    emit.write(&unit, bytes)?;
     Ok(PrepareStageOutput {
-        prepared_object_hashes: prepared_units
-            .iter()
-            .map(|unit| unit.prepared_hash.clone())
-            .collect(),
-        prepared_units,
+        prepared_object_hashes: vec![prepared_hash],
+        prepared_units: vec![unit],
         image_object_hashes: Vec::new(),
     })
 }
@@ -689,17 +658,6 @@ fn unit_type_for_media_type(media_type: &str) -> UnitType {
     }
 }
 
-fn pdf_has_text_layer(bytes: &[u8]) -> bool {
-    !bytes.starts_with(b"%PDF")
-        || bytes.windows(2).any(|window| window == b"BT")
-        // 07 §2.1 (2026-07-23 FlateDecode addendum): a compressed text-layer
-        // PDF (TeX / LibreOffice output) has no literal `BT` in its raw
-        // bytes — the probe inflates FlateDecode streams (bounded) and asks
-        // the graph decoder whether they carry real, ToUnicode-mappable
-        // text. Scanned/image-only PDFs stay `false` and keep OCR routing.
-        || kio_adapter::pdf_decode::pdf_compressed_text_probe(bytes)
-}
-
 /// R20-4: heuristic for whether extracted PDF text is REAL text vs binary garbage
 /// lossy-decoded from a scanned PDF's compressed streams. Real text is overwhelmingly
 /// printable; garbage is dense with U+FFFD replacement characters and control bytes.
@@ -737,20 +695,6 @@ fn bytes_are_text(bytes: &[u8]) -> bool {
 pub fn unsupported_reason_for_content(media_type: &str, bytes: &[u8]) -> Option<&'static str> {
     (media_type == "application/octet-stream" && !bytes_are_text(bytes))
         .then_some(crate::unsupported::UNSUPPORTED_REASON_UNRECOGNIZED_BINARY)
-}
-
-pub fn pdf_text_pages_bounded(bytes: &[u8]) -> Result<Vec<String>> {
-    if !bytes.starts_with(b"%PDF") {
-        return Ok(vec![String::from_utf8_lossy(bytes).into_owned()]);
-    }
-    if !pdf_has_text_layer(bytes) {
-        return Ok(Vec::new());
-    }
-    kio_adapter::deterministic::extract_pdf_text_pages_bounded(
-        bytes,
-        kio_adapter::deterministic::MAX_DETERMINISTIC_PDF_PAGES,
-    )
-    .map_err(|err| prepare_adapter_error("KIO-E-PREPARE-PDF-LIMIT-001", err))
 }
 
 fn align_changed_interval(
@@ -1009,21 +953,115 @@ mod tests {
     }
 
     #[test]
-    fn r23_cand_006_prepare_rejects_pdf_page_count_over_limit() {
-        let mut pdf = b"%PDF-1.4\nBT\n".to_vec();
-        for id in 1..=kio_adapter::deterministic::MAX_DETERMINISTIC_PDF_PAGES + 1 {
-            pdf.extend_from_slice(format!("{id} 0 obj << /Type /Page >> endobj\n").as_bytes());
+    fn pdf_prepare_visits_text_beyond_the_old_page_and_object_limits() {
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        for id in 1..=257 {
+            pdf.extend_from_slice(
+                format!("{id} 0 obj << /Type /Page /Contents 258 0 R >> endobj\n").as_bytes(),
+            );
         }
-        let raw_hash = hash_bytes(&pdf);
-        let error = prepare_units_from_bytes(PrepareStageBytesRequest {
-            raw_hash: &raw_hash,
+        pdf.extend_from_slice(
+            b"258 0 obj << /Length 17 >> stream\nBT (page text) Tj\nendstream\nendobj\n",
+        );
+        for id in 259..=8193 {
+            pdf.extend_from_slice(format!("{id} 0 obj null endobj\n").as_bytes());
+        }
+        let mut visited = 0;
+        let output = visit_prepared_units_with_budget(
+            PrepareStageBytesRequest {
+                raw_hash: &hash_bytes(&pdf),
+                media_type: "application/pdf",
+                input_path: "many-pages.pdf",
+                tool_profile_hash: "sha256:test",
+                bytes: &pdf,
+            },
+            &ControlHandle::default(),
+            ExtractionBudget::new(kio_core::error::ResourceTier::Standard),
+            |unit, bytes| {
+                visited += 1;
+                assert_eq!(unit.page_number, Some(visited));
+                assert_eq!(bytes, b"page text");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(visited, 257);
+        assert_eq!(output.prepared_units.len(), 257);
+    }
+
+    #[test]
+    fn pdf_prepare_limits_unit_text_and_emits_prefix_before_failure() {
+        use kio_core::error::{Resource, ResourceTier};
+        const STANDARD_TEXT: usize = 16 * 1024 * 1024;
+        for (length, tier, accepted) in [
+            (STANDARD_TEXT, ResourceTier::Standard, true),
+            (STANDARD_TEXT + 1, ResourceTier::Standard, false),
+            (STANDARD_TEXT + 1, ResourceTier::Large, true),
+        ] {
+            let mut pdf = b"%PDF-1.4\n1 0 obj << /Type /Page >> stream\nBT (first) Tj\nendstream\nendobj\n2 0 obj << /Type /Page /Contents 3 0 R >> endobj\n".to_vec();
+            pdf.extend_from_slice(
+                format!("3 0 obj << /Length {} >> stream\nBT (", length + 8).as_bytes(),
+            );
+            pdf.resize(pdf.len() + length, b'x');
+            pdf.extend_from_slice(b") Tj\nendstream\nendobj\n");
+            let mut lengths = Vec::new();
+            let result = visit_prepared_units_with_budget(
+                PrepareStageBytesRequest {
+                    raw_hash: &hash_bytes(&pdf),
+                    media_type: "application/pdf",
+                    input_path: "text-budget.pdf",
+                    tool_profile_hash: "sha256:test",
+                    bytes: &pdf,
+                },
+                &ControlHandle::default(),
+                ExtractionBudget::new(tier),
+                |_, bytes| {
+                    lengths.push(bytes.len());
+                    Ok(())
+                },
+            );
+            if accepted {
+                assert_eq!(result.unwrap().prepared_units.len(), 2);
+                assert_eq!(lengths, [5, length]);
+            } else {
+                let Err(crate::PipelineError::ResourceLimit(limit)) = result else {
+                    panic!("expected the unit text resource limit, got {result:?}");
+                };
+                assert_eq!(limit.resource, Resource::UnitText);
+                assert_eq!(limit.resource_tier, Some(tier));
+                assert_eq!(limit.limit, Some(STANDARD_TEXT as u64));
+                assert_eq!(limit.observed, Some(length as u64));
+                assert_eq!(lengths, [5]);
+            }
+        }
+    }
+
+    #[test]
+    fn pdf_prepare_keeps_unsupported_filter_empty() {
+        let pdf = b"%PDF-1.4\n1 0 obj << /Type /Page /Contents 2 0 R >> endobj\n2 0 obj << /Length 21 /Filter /DCTDecode >> stream\nBT (foreign bytes) Tj\nendstream\nendobj\n";
+        let output = prepare_units_from_bytes(PrepareStageBytesRequest {
+            raw_hash: &hash_bytes(pdf),
             media_type: "application/pdf",
-            input_path: "oversized.pdf",
+            input_path: "unsupported-filter.pdf",
             tool_profile_hash: "sha256:test",
-            bytes: &pdf,
+            bytes: pdf,
+        })
+        .unwrap();
+        assert!(output.prepared_units.is_empty());
+    }
+
+    #[test]
+    fn pdf_prepare_reports_a_cyclic_page_tree_as_malformed() {
+        let pdf = b"%PDF-1.4\n1 0 obj << /Type /Pages /Kids [2 0 R] >> endobj\n2 0 obj << /Type /Pages /Kids [1 0 R] >> endobj\n";
+        let error = prepare_units_from_bytes(PrepareStageBytesRequest {
+            raw_hash: &hash_bytes(pdf),
+            media_type: "application/pdf",
+            input_path: "cyclic.pdf",
+            tool_profile_hash: "sha256:test",
+            bytes: pdf,
         })
         .unwrap_err();
-        assert!(error.to_string().contains("KIO-E-PREPARE-PDF-LIMIT-001"));
+        assert!(error.to_string().contains("cycle"), "{error}");
     }
 
     #[test]
@@ -1059,7 +1097,6 @@ mod tests {
 
     /// Mirrors the hand-crafted uncompressed pseudo-PDF style the existing
     /// PDF-path tests above already use (e.g.
-    /// `r23_cand_006_prepare_rejects_pdf_page_count_over_limit`,
     /// `kio-adapter`'s `verified_pdf_bytes_are_reused_for_all_hints`) — a
     /// structural `/Type /Page` marker per page plus a literal `(text) Tj`
     /// content stream the deterministic extractor can read directly.
@@ -1080,6 +1117,48 @@ mod tests {
             );
         }
         pdf
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn pdf_prepare_streams_large_converted_office_documents() {
+        let _lock = kio_core::test_control::test_env_lock().lock().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("converted.pdf");
+        std::fs::write(&path, multi_page_fixture_pdf(&["Converted page"; 257])).unwrap();
+        let _seam = kio_core::test_control::TestEnvGuard::set(
+            "KIO_TEST_OFFICE_CONVERT",
+            path.display().to_string(),
+        );
+        let control = ControlHandle::new(kio_core::test_control::DebugTestControl::from_env());
+        for (media_type, input_path, unit_type, final_key) in [
+            (DOCX_MEDIA_TYPE, "large.docx", UnitType::Page, "page:257"),
+            (PPTX_MEDIA_TYPE, "large.pptx", UnitType::Slide, "slide:257"),
+        ] {
+            let bytes = b"input handled by the renderer seam";
+            let mut count = 0;
+            let output = visit_prepared_units_with_budget(
+                PrepareStageBytesRequest {
+                    raw_hash: &hash_bytes(bytes),
+                    media_type,
+                    input_path,
+                    tool_profile_hash: "sha256:test",
+                    bytes,
+                },
+                &control,
+                ExtractionBudget::new(kio_core::error::ResourceTier::Standard),
+                |unit, bytes| {
+                    assert_eq!(unit.order, count);
+                    assert_eq!(unit.unit_type, unit_type);
+                    assert_eq!(bytes, b"Converted page");
+                    count += 1;
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(count, 257);
+            assert_eq!(output.prepared_units.last().unwrap().unit_key, final_key);
+        }
     }
 
     #[cfg(debug_assertions)]

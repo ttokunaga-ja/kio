@@ -1,5 +1,6 @@
 //! Built-in deterministic adapter skeleton.
 
+use crate::pdf_decode::PdfPages;
 use crate::traits::{MarkdownizeAdapter, PrepareAdapter};
 use crate::types::{
     AdapterKind, AdapterProfile, ExecutionMode, MarkdownUnit, MarkdownizeMode, MarkdownizeRequest,
@@ -7,10 +8,9 @@ use crate::types::{
     UnitFingerprint, UnitKind,
 };
 use crate::{AdapterError, Result};
+use kio_core::error::ResourceTier;
 use serde_json::json;
 use unicode_normalization::UnicodeNormalization;
-
-pub const MAX_DETERMINISTIC_PDF_PAGES: usize = 256;
 
 #[derive(Debug, Clone, Default)]
 pub struct DeterministicAdapter;
@@ -74,11 +74,12 @@ pub fn deterministic_markdown_profile_value() -> serde_json::Value {
     // v1 "raw HTML forbidden" acceptance for XML/HTML corpus files.
     // 1.3.0 (2026-07-23, same day): multi-page markdown follows the graph
     // decoder's page authority (ObjStm-aware) — see the prepare 1.2.0 note.
+    // 1.4.0: use page-local fonts and the resource-tiered PDF decoder.
     json!({
         "adapter_kind": "markdownize",
         "adapter_role": "text",
         "model_or_tool_family": "kio-deterministic-text",
-        "model_version_pin": "1.3.0",
+        "model_version_pin": "1.4.0",
         "output_schema": "kio-markdown-v1",
         "runtime_kind": "local",
         "spec_version": 1
@@ -91,11 +92,12 @@ pub fn deterministic_prepare_profile_value() -> serde_json::Value {
     // the page authority — the raw structural scan is ObjStm-blind and
     // truncated multi-page TeX PDFs to one prepared unit. Unit cardinality
     // changes => prepare identity moves (07 §9).
+    // 1.3.0: use resource-tiered PDF extraction and fail empty on unsupported filters.
     json!({
         "adapter_kind": "prepare",
         "adapter_role": "text",
         "model_or_tool_family": "kio-deterministic-prepare",
-        "model_version_pin": "1.2.0",
+        "model_version_pin": "1.3.0",
         "runtime_kind": "local",
         "spec_version": 1
     })
@@ -142,17 +144,16 @@ impl MarkdownizeAdapter for DeterministicAdapter {
     }
 
     fn markdownize(&self, request: MarkdownizeRequest) -> Result<MarkdownizeResponse> {
-        let source = match request.raw.path.as_deref() {
+        match request.raw.path.as_deref() {
             Some(path) => {
                 let bytes = std::fs::read(path).map_err(|err| AdapterError::Io {
                     path: path.to_owned(),
                     message: err.to_string(),
                 })?;
-                Some(source_document_from_verified_bytes(&request, &bytes)?)
+                markdownize_from_bytes(request, &bytes)
             }
-            None => None,
-        };
-        markdownize_with_source(request, source.as_ref())
+            None => markdownize_with_source(request, None),
+        }
     }
 }
 
@@ -163,72 +164,28 @@ pub fn markdownize_from_bytes(
     verified_raw_bytes: &[u8],
 ) -> Result<MarkdownizeResponse> {
     let source = source_document_from_verified_bytes(&request, verified_raw_bytes)?;
-    markdownize_with_source(request, Some(&source))
+    markdownize_with_source(request, Some(source))
 }
 
-/// Markdownize a converted-PDF intermediate for an Office document
-/// (DOCX/PPTX — [07-adapter-spec.md §5.1](../../../docs/07-adapter-spec.md)).
-/// `converted_pdf` is the deterministically-normalized output of
-/// [`crate::office_convert::OfficeConverter::convert_to_pdf`] — NOT the
-/// original raw office bytes — so unlike [`markdownize_from_bytes`] this
-/// does NOT run `source_document_from_verified_bytes`'s raw_hash check:
-/// `request.raw.raw_hash` identifies the ORIGINAL office file, not this
-/// derived converted-PDF artifact, so comparing the two would always
-/// (correctly, but uselessly) fail.
-///
-/// `unit_kind` is `Page` (DOCX) or `Slide` (PPTX): when
-/// `request.prepared_unit_hint` is absent this mints one hint per converted
-/// page, keyed `page:N` / `slide:N` accordingly. When hints ARE supplied
-/// (the expected shape once the caller wires this to real prepared units —
-/// 07 §5.1 / 04 §2's unit table), they are used as-is. Either way, the
-/// page-to-markdown production itself reuses the SAME PDF text-layer path
-/// used for `application/pdf` (`extract_pdf_text_pages_bounded` feeding
-/// `markdown_unit_from_hint`'s `SourceDocument::PdfPages` branch) — it is
-/// not forked; only `page_index_from_unit_key`'s prefix recognition was
-/// generalized (`page:` and `slide:` both resolve to a 1-based page index)
-/// to keep that single code path correct for both unit kinds.
+/// Markdownize a converted PDF using the same page reader as native PDF.
 pub fn markdownize_converted_office(
-    mut request: MarkdownizeRequest,
+    request: MarkdownizeRequest,
     converted_pdf: &[u8],
     unit_kind: UnitKind,
 ) -> Result<MarkdownizeResponse> {
-    let pages = extract_pdf_text_pages_bounded(converted_pdf, MAX_DETERMINISTIC_PDF_PAGES)?;
-    if request.prepared_unit_hint.is_none() {
-        request.prepared_unit_hint = Some(office_unit_hints(&pages, unit_kind));
-    }
-    let source = SourceDocument::PdfPages(pages);
-    markdownize_with_source(request, Some(&source))
-}
-
-/// One hint per converted-PDF page, keyed `page:N` / `slide:N` per
-/// `unit_kind`. Used by [`markdownize_converted_office`] only when the
-/// caller did not already supply `prepared_unit_hint` (the real pipeline
-/// wiring is expected to pass hints derived from the actual `PreparedUnit`
-/// list instead — this is the self-sufficient fallback).
-fn office_unit_hints(pages: &[String], unit_kind: UnitKind) -> Vec<PreparedUnitHint> {
-    let prefix = if unit_kind == UnitKind::Slide {
-        "slide"
-    } else {
-        "page"
+    let source = SourceDocument::Pdf {
+        pages: PdfPages::open(converted_pdf, ResourceTier::Standard)?,
+        office_kind: Some(unit_kind),
     };
-    let count = pages.len().max(1);
-    (0..count)
-        .map(|index| {
-            let text = pages.get(index).map(String::as_str).unwrap_or("");
-            PreparedUnitHint {
-                unit_key: format!("{prefix}:{}", index + 1),
-                prepared_hash: crate::identity::hash_bytes(text.as_bytes()),
-                unit_kind,
-                order: index as u64,
-            }
-        })
-        .collect()
+    markdownize_with_source(request, Some(source))
 }
 
-#[derive(Debug, Clone)]
-enum SourceDocument {
+enum SourceDocument<'a> {
     Text(String),
-    PdfPages(Vec<String>),
+    Pdf {
+        pages: PdfPages<'a>,
+        office_kind: Option<UnitKind>,
+    },
     /// XLSX worksheets, already rendered to Markdown by
     /// [`crate::xlsx_extract`], in workbook order. A `sheet:` unit resolves by
     /// ORDER rather than by name: the unit key carries QB27's escaping and
@@ -238,10 +195,10 @@ enum SourceDocument {
     Sheets(Vec<String>),
 }
 
-fn source_document_from_verified_bytes(
+fn source_document_from_verified_bytes<'a>(
     request: &MarkdownizeRequest,
-    bytes: &[u8],
-) -> Result<SourceDocument> {
+    bytes: &'a [u8],
+) -> Result<SourceDocument<'a>> {
     let actual_hash = crate::identity::hash_bytes(bytes);
     if actual_hash != request.raw.raw_hash {
         return Err(AdapterError::ContractViolation(format!(
@@ -250,8 +207,10 @@ fn source_document_from_verified_bytes(
         )));
     }
     if request.media_type == "application/pdf" {
-        return extract_pdf_text_pages_bounded(bytes, MAX_DETERMINISTIC_PDF_PAGES)
-            .map(SourceDocument::PdfPages);
+        return Ok(SourceDocument::Pdf {
+            pages: PdfPages::open(bytes, ResourceTier::Standard)?,
+            office_kind: None,
+        });
     }
     if crate::xlsx_extract::is_xlsx_media(&request.media_type) {
         return crate::xlsx_extract::extract_xlsx(bytes).map(|document| {
@@ -274,12 +233,31 @@ fn source_document_from_verified_bytes(
 
 fn markdownize_with_source(
     request: MarkdownizeRequest,
-    source: Option<&SourceDocument>,
+    mut source: Option<SourceDocument<'_>>,
 ) -> Result<MarkdownizeResponse> {
-    let hints = request
-        .prepared_unit_hint
-        .clone()
-        .unwrap_or_else(|| vec![default_hint(&request.raw.raw_hash)]);
+    let hints = request.prepared_unit_hint.clone().unwrap_or_else(|| {
+        if let Some(SourceDocument::Pdf {
+            pages,
+            office_kind: Some(kind),
+        }) = &source
+        {
+            let prefix = if *kind == UnitKind::Slide {
+                "slide"
+            } else {
+                "page"
+            };
+            (0..pages.len().max(1))
+                .map(|index| PreparedUnitHint {
+                    unit_key: format!("{prefix}:{}", index + 1),
+                    prepared_hash: String::new(),
+                    unit_kind: *kind,
+                    order: index as u64,
+                })
+                .collect()
+        } else {
+            vec![default_hint(&request.raw.raw_hash)]
+        }
+    });
     if request.mode == MarkdownizeMode::Incremental {
         let incremental = request.hints.clone();
         let changed = incremental
@@ -295,14 +273,14 @@ fn markdownize_with_source(
             updated_units: hints
                 .iter()
                 .filter(|hint| changed.contains(&hint.unit_key))
-                .map(|hint| markdown_unit_from_hint(hint, &request, source))
-                .collect(),
+                .map(|hint| markdown_unit_from_hint(hint, &request, source.as_mut()))
+                .collect::<Result<_>>()?,
             unchanged_unit_keys: Vec::new(),
             added_units: hints
                 .iter()
                 .filter(|hint| added.contains(&hint.unit_key))
-                .map(|hint| markdown_unit_from_hint(hint, &request, source))
-                .collect(),
+                .map(|hint| markdown_unit_from_hint(hint, &request, source.as_mut()))
+                .collect::<Result<_>>()?,
             removed_unit_keys: incremental
                 .map(|hints| hints.removed_unit_keys)
                 .unwrap_or_default(),
@@ -319,8 +297,8 @@ fn markdownize_with_source(
         mode_used: MarkdownizeMode::Full,
         updated_units: hints
             .iter()
-            .map(|hint| markdown_unit_from_hint(hint, &request, source))
-            .collect(),
+            .map(|hint| markdown_unit_from_hint(hint, &request, source.as_mut()))
+            .collect::<Result<_>>()?,
         unchanged_unit_keys: Vec::new(),
         added_units: Vec::new(),
         removed_unit_keys: Vec::new(),
@@ -368,16 +346,28 @@ fn baseline_placeholder(unit_key: &str, prepared_hash: &str) -> String {
 fn markdown_unit_from_hint(
     hint: &PreparedUnitHint,
     request: &MarkdownizeRequest,
-    source: Option<&SourceDocument>,
-) -> MarkdownUnit {
+    source: Option<&mut SourceDocument<'_>>,
+) -> Result<MarkdownUnit> {
     let markdown = match source {
         Some(SourceDocument::Text(text)) if request.media_type == "text/markdown" => {
             text.to_owned()
         }
-        Some(SourceDocument::PdfPages(pages)) => {
-            let page_index =
-                page_index_from_unit_key(&hint.unit_key).unwrap_or(hint.order as usize);
-            page_markdown(pages.get(page_index).map_or("", String::as_str))
+        Some(SourceDocument::Pdf { pages, office_kind }) => {
+            let index = page_index_from_unit_key(&hint.unit_key).unwrap_or(hint.order as usize);
+            let page = pages.read_page(index)?;
+            let auto_hint;
+            let hint = if office_kind.is_some() && request.prepared_unit_hint.is_none() {
+                auto_hint = PreparedUnitHint {
+                    prepared_hash: crate::identity::hash_bytes(page.as_bytes()),
+                    ..hint.clone()
+                };
+                &auto_hint
+            } else {
+                hint
+            };
+            let unit = finish_markdown_unit(hint, page_markdown(&page));
+            pages.retain_output(unit.markdown.len())?;
+            return Ok(unit);
         }
         Some(SourceDocument::Sheets(sheets)) => {
             let sheet = sheets.get(hint.order as usize).map_or("", String::as_str);
@@ -395,7 +385,7 @@ fn markdown_unit_from_hint(
         Some(SourceDocument::Text(text)) => fence_literal_text(text, request.raw.path.as_deref()),
         None => baseline_placeholder(&hint.unit_key, &hint.prepared_hash),
     };
-    finish_markdown_unit(hint, markdown)
+    Ok(finish_markdown_unit(hint, markdown))
 }
 
 /// Format one verified prepared unit without decoding the original again.
@@ -554,317 +544,6 @@ fn fence_literal_text(text: &str, path: Option<&str>) -> String {
     format!("{fence}{lang}\n{}\n{fence}\n", text.trim_end())
 }
 
-pub fn extract_pdf_text_pages_bounded(bytes: &[u8], max_pages: usize) -> Result<Vec<String>> {
-    if max_pages == 0 {
-        return Err(AdapterError::ContractViolation(
-            "deterministic PDF page limit must be positive".to_owned(),
-        ));
-    }
-    if !bytes.starts_with(b"%PDF") {
-        return Ok(vec![String::from_utf8_lossy(bytes).into_owned()]);
-    }
-    let structural_count = structural_pdf_page_count(bytes, max_pages)?;
-    // 07 §2.1 (2026-07-23 FlateDecode addendum): real-world text-layer PDFs
-    // (TeX / LibreOffice output) carry compressed content streams and CID
-    // glyph indices; the graph decoder inflates and maps them through each
-    // font's ToUnicode CMap. It declines (`None`) on anything it cannot decode
-    // confidently, then the bounded conservative scanner below handles the
-    // supported raw-literal subset without treating it as page authority.
-    if let Some(pages) = crate::pdf_decode::decode_pdf_pages(bytes, max_pages)? {
-        // Graph pages ARE the page authority: the decoder enumerates
-        // /Type /Page objects INCLUDING those packed inside compressed
-        // /Type /ObjStm containers, while `structural_pdf_page_count` below
-        // scans raw bytes only and is ObjStm-blind. Normalizing graph output
-        // to the raw count truncated real multi-page TeX Live documents to
-        // page:1 (pages 2+ silently lost from the offline index) — caught
-        // 2026-07-23 by the Batch collect bijection rejecting "OCR 3 pages
-        // vs requested 1" on all 69 multi-page text PDFs of the fixture.
-        return Ok(pages);
-    }
-    let stream_pages = pdf_stream_text_pages_bounded(bytes, max_pages)?;
-    // A missing structural page tree is malformed/ambiguous. Keep a single
-    // conservative document unit instead of letting arbitrary stream count
-    // become derived page authority.
-    let page_count = structural_count.max(1);
-    if !stream_pages.is_empty() {
-        return Ok(normalize_pdf_page_count(stream_pages, page_count));
-    }
-    let strings = pdf_literal_strings(bytes);
-    if strings.is_empty() {
-        return Ok(vec![pdf_text_fallback(bytes)]);
-    }
-    if strings.len() == page_count {
-        return Ok(strings);
-    }
-    let mut pages = strings;
-    while pages.len() < page_count {
-        pages.push(String::new());
-    }
-    pages.truncate(page_count);
-    Ok(pages)
-}
-
-fn normalize_pdf_page_count(mut pages: Vec<String>, page_count: usize) -> Vec<String> {
-    while pages.len() < page_count {
-        pages.push(String::new());
-    }
-    pages.truncate(page_count);
-    pages
-}
-
-/// Split a PDF's content streams into per-page text.
-///
-/// Canonical implementation shared with `kio-pipeline` (which depends on this
-/// crate). The stream terminator is located with [`find_endstream_boundary`] so
-/// that a literal occurrence of the word "endstream" inside page text — e.g. a
-/// document that discusses PDF internals — is not mistaken for the real stream
-/// boundary and does not truncate the page to empty markdown (Step2c I3).
-pub fn pdf_stream_text_pages_bounded(bytes: &[u8], max_pages: usize) -> Result<Vec<String>> {
-    let text = String::from_utf8_lossy(bytes);
-    let mut rest = text.as_ref();
-    let mut pages = Vec::new();
-    while let Some(stream_start) = rest.find("stream") {
-        let mut after_stream = &rest[stream_start + "stream".len()..];
-        after_stream = after_stream
-            .strip_prefix("\r\n")
-            .or_else(|| after_stream.strip_prefix('\n'))
-            .or_else(|| after_stream.strip_prefix('\r'))
-            .unwrap_or(after_stream);
-        let Some(stream_end) = find_endstream_boundary(after_stream) else {
-            break;
-        };
-        let stream = &after_stream[..stream_end];
-        let strings = pdf_literal_strings_in_text(stream);
-        if !strings.is_empty() {
-            pages.push(strings.join("\n"));
-        } else if stream.contains("BT") {
-            pages.push(String::new());
-        }
-        if pages.len() > max_pages {
-            return Err(AdapterError::ContractViolation(format!(
-                "deterministic PDF has more than {max_pages} text streams"
-            )));
-        }
-        rest = &after_stream[stream_end + "endstream".len()..];
-    }
-    Ok(pages)
-}
-
-/// Offset of the next `endstream` keyword that terminates a PDF content stream:
-/// it must begin a line (immediately preceded by `\n`/`\r`, or sit at the very
-/// start of the slice for an empty stream) and be followed by whitespace or the
-/// end of input. A mid-line "endstream" inside page text is ignored (Step2c I3).
-fn find_endstream_boundary(text: &str) -> Option<usize> {
-    const TOKEN: &str = "endstream";
-    let bytes = text.as_bytes();
-    let mut from = 0;
-    while let Some(offset) = text[from..].find(TOKEN) {
-        let index = from + offset;
-        let at_line_start = index == 0 || matches!(bytes[index - 1], b'\n' | b'\r');
-        let terminated = bytes
-            .get(index + TOKEN.len())
-            .is_none_or(|byte| byte.is_ascii_whitespace());
-        if at_line_start && terminated {
-            return Some(index);
-        }
-        from = index + TOKEN.len();
-    }
-    None
-}
-
-fn pdf_literal_strings(bytes: &[u8]) -> Vec<String> {
-    let text = String::from_utf8_lossy(bytes);
-    pdf_literal_strings_in_text(&text)
-}
-
-/// Extract PDF literal `( … )` strings from a text slice. Canonical
-/// implementation shared with `kio-pipeline` (Step2c I3).
-#[must_use]
-pub fn pdf_literal_strings_in_text(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut rest = text;
-    while let Some(start) = rest.find('(') {
-        rest = &rest[start + 1..];
-        let Some(end) = rest.find(')') else {
-            break;
-        };
-        let candidate = rest[..end]
-            .replace("\\(", "(")
-            .replace("\\)", ")")
-            .replace("\\n", "\n");
-        if candidate
-            .chars()
-            .any(|char| char.is_alphanumeric() || !char.is_ascii())
-        {
-            out.push(candidate);
-        }
-        rest = &rest[end + 1..];
-    }
-    out
-}
-
-fn pdf_text_fallback(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes)
-        .lines()
-        .filter(|line| !line.trim_start().starts_with('%'))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Conservative compatibility helper for the pipeline. It counts exact
-/// `/Type /Page` name pairs, ignores strings and streams, and saturates at one
-/// over the deterministic limit. New callers should use
-/// [`extract_pdf_text_pages_bounded`] so excess cardinality is an error.
-pub fn pdf_page_count_in_text(text: &str) -> usize {
-    structural_pdf_page_count(text.as_bytes(), MAX_DETERMINISTIC_PDF_PAGES)
-        .unwrap_or(MAX_DETERMINISTIC_PDF_PAGES + 1)
-}
-
-fn structural_pdf_page_count(bytes: &[u8], max_pages: usize) -> Result<usize> {
-    let mut index = 0_usize;
-    let mut page_count = 0_usize;
-    let mut dictionary_depth = 0_usize;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'%' => {
-                index = bytes[index..]
-                    .iter()
-                    .position(|byte| matches!(byte, b'\n' | b'\r'))
-                    .map(|offset| index + offset + 1)
-                    .unwrap_or(bytes.len());
-            }
-            b'(' => index = skip_pdf_literal_string(bytes, index),
-            b'<' if bytes.get(index + 1) == Some(&b'<') => {
-                dictionary_depth = dictionary_depth.saturating_add(1);
-                index += 2;
-            }
-            b'<' if bytes.get(index + 1) != Some(&b'<') => {
-                index = bytes[index + 1..]
-                    .iter()
-                    .position(|byte| *byte == b'>')
-                    .map(|offset| index + offset + 2)
-                    .unwrap_or(bytes.len());
-            }
-            b'>' if bytes.get(index + 1) == Some(&b'>') => {
-                dictionary_depth = dictionary_depth.saturating_sub(1);
-                index += 2;
-            }
-            b's' if pdf_keyword_at(bytes, index, b"stream") => {
-                index = find_endstream_bytes(bytes, index + b"stream".len()).unwrap_or(bytes.len());
-            }
-            b'/' if dictionary_depth > 0 && pdf_name_at(bytes, index, b"Type") => {
-                let next = skip_pdf_space_and_comments(bytes, index + b"/Type".len());
-                if pdf_name_at(bytes, next, b"Page") {
-                    page_count = page_count.checked_add(1).ok_or_else(|| {
-                        AdapterError::ContractViolation("PDF page count overflow".to_owned())
-                    })?;
-                    if page_count > max_pages {
-                        return Err(AdapterError::ContractViolation(format!(
-                            "deterministic PDF page count exceeds {max_pages}"
-                        )));
-                    }
-                }
-                index = next.saturating_add(1);
-            }
-            _ => index += 1,
-        }
-    }
-    Ok(page_count)
-}
-
-pub(crate) fn skip_pdf_literal_string(bytes: &[u8], start: usize) -> usize {
-    skip_pdf_literal_string_checked(bytes, start, |_| Ok::<(), std::convert::Infallible>(()))
-        .expect("infallible scan")
-}
-
-pub(crate) fn skip_pdf_literal_string_checked<E>(
-    bytes: &[u8],
-    start: usize,
-    mut check: impl FnMut(usize) -> std::result::Result<(), E>,
-) -> std::result::Result<usize, E> {
-    let mut index = start + 1;
-    let mut depth = 1_usize;
-    while index < bytes.len() {
-        check(index)?;
-        match bytes[index] {
-            b'\\' => index = (index + 2).min(bytes.len()),
-            b'(' => {
-                depth += 1;
-                index += 1;
-            }
-            b')' => {
-                depth -= 1;
-                index += 1;
-                if depth == 0 {
-                    break;
-                }
-            }
-            _ => index += 1,
-        }
-    }
-    Ok(index)
-}
-
-pub(crate) fn skip_pdf_space_and_comments(bytes: &[u8], mut index: usize) -> usize {
-    loop {
-        while bytes
-            .get(index)
-            .is_some_and(|byte| byte.is_ascii_whitespace())
-        {
-            index += 1;
-        }
-        if bytes.get(index) != Some(&b'%') {
-            return index;
-        }
-        index = bytes[index..]
-            .iter()
-            .position(|byte| matches!(byte, b'\n' | b'\r'))
-            .map(|offset| index + offset + 1)
-            .unwrap_or(bytes.len());
-    }
-}
-
-pub(crate) fn pdf_name_at(bytes: &[u8], index: usize, name: &[u8]) -> bool {
-    bytes.get(index) == Some(&b'/')
-        && bytes.get(index + 1..index + 1 + name.len()) == Some(name)
-        && bytes
-            .get(index + 1 + name.len())
-            .is_none_or(|byte| is_pdf_delimiter(*byte))
-}
-
-pub(crate) fn pdf_keyword_at(bytes: &[u8], index: usize, keyword: &[u8]) -> bool {
-    bytes.get(index..index + keyword.len()) == Some(keyword)
-        && (index == 0 || is_pdf_delimiter(bytes[index - 1]))
-        && bytes
-            .get(index + keyword.len())
-            .is_none_or(|byte| is_pdf_delimiter(*byte))
-}
-
-pub(crate) fn is_pdf_delimiter(byte: u8) -> bool {
-    byte.is_ascii_whitespace()
-        || matches!(
-            byte,
-            b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
-        )
-}
-
-pub(crate) fn find_endstream_bytes(bytes: &[u8], from: usize) -> Option<usize> {
-    const TOKEN: &[u8] = b"endstream";
-    let mut index = from;
-    while index + TOKEN.len() <= bytes.len() {
-        if bytes.get(index..index + TOKEN.len()) == Some(TOKEN)
-            && (index == 0 || matches!(bytes[index - 1], b'\n' | b'\r'))
-            && bytes
-                .get(index + TOKEN.len())
-                .is_none_or(u8::is_ascii_whitespace)
-        {
-            return Some(index + TOKEN.len());
-        }
-        index += 1;
-    }
-    None
-}
-
 /// The 0-based page index a `page:N` OR `slide:N` unit key refers to (both
 /// prefixes share the same 1-based-decimal selector convention — 04 §2's
 /// unit_key rule — so both resolve identically here; the `slide:` case
@@ -1010,14 +689,23 @@ mod tests {
     fn o4_pdf_page_count_survives_multibyte_char_boundary() {
         // Prefixes such as `/PageX` are not structural page names.
         assert_eq!(
-            pdf_page_count_in_text("/PageXあ padding to extend length"),
+            PdfPages::open(
+                "%PDF-1.4\n/PageXあ padding to extend length".as_bytes(),
+                ResourceTier::Standard
+            )
+            .unwrap()
+            .len(),
             0
         );
         // "あ" straddles the +32 byte window measured from "/Type" (no panic).
         let type_case = format!("/Type{}あ/Pages", "y".repeat(26));
-        let _ = pdf_page_count_in_text(&type_case);
+        let _ = PdfPages::open(type_case.as_bytes(), ResourceTier::Standard);
         // Genuine /Pages still suppresses the count.
-        assert_eq!(pdf_page_count_in_text("/Type /Pages catalog"), 0);
+        assert!(
+            PdfPages::open(b"%PDF-1.4\n/Type /Pages catalog", ResourceTier::Standard)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     // Q5: a leading UTF-8 BOM (Windows Notepad / Excel / PowerShell default) used
@@ -1057,48 +745,14 @@ mod tests {
     }
 
     #[test]
-    fn structural_pdf_count_ignores_markers_in_strings_and_streams() {
+    fn pdf_page_index_ignores_markers_inside_strings_and_streams() {
         let pdf = b"%PDF-1.4\n\
 1 0 obj << /Type /Pages /Count 1 >> endobj\n\
 2 0 obj << /Type /Page /Parent 1 0 R /Note (/Type /Page /PageX) >>\n\
 stream\nBT (/Type /Page and /PageX) Tj ET\nendstream\nendobj\n";
-        assert_eq!(structural_pdf_page_count(pdf, 8).unwrap(), 1);
-        assert_eq!(extract_pdf_text_pages_bounded(pdf, 8).unwrap().len(), 1);
-        assert_eq!(
-            structural_pdf_page_count(b"%PDF-1.4\n/Type /Page\n", 8).unwrap(),
-            0
-        );
-    }
-
-    #[test]
-    fn bounded_pdf_scanner_recovers_literal_text_when_graph_declines() {
-        // This supported raw-literal subset has a structural page and a bounded
-        // uncompressed stream, but no `/Contents` reference for the graph
-        // decoder to follow. The scanner may recover its literal text without
-        // promoting a stream count to page authority.
-        let pdf = b"%PDF-1.4\n\
-1 0 obj << /Type /Pages /Count 1 >> endobj\n\
-2 0 obj << /Type /Page /Parent 1 0 R >>\n\
-stream\nBT (scanner-only literal page text) Tj ET\nendstream\nendobj\n";
-        assert!(
-            crate::pdf_decode::decode_pdf_pages(pdf, 8)
-                .expect("graph decode")
-                .is_none()
-        );
-        assert_eq!(
-            extract_pdf_text_pages_bounded(pdf, 8).expect("bounded scanner"),
-            vec!["scanner-only literal page text".to_owned()]
-        );
-    }
-
-    #[test]
-    fn structural_pdf_page_limit_rejects_before_padding() {
-        let mut pdf = b"%PDF-1.4\n".to_vec();
-        for id in 1..=4 {
-            pdf.extend_from_slice(format!("{id} 0 obj << /Type /Page >> endobj\n").as_bytes());
-        }
-        let err = extract_pdf_text_pages_bounded(&pdf, 3).unwrap_err();
-        assert!(err.to_string().contains("page count exceeds 3"));
+        let mut pages = PdfPages::open(pdf, ResourceTier::Standard).unwrap();
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages.read_page(0).unwrap(), "/Type /Page and /PageX");
     }
 
     #[test]

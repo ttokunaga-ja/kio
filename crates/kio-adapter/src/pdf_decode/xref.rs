@@ -1,14 +1,14 @@
 //! Resolve the small, self-contained PDFs emitted for Office capability probes.
 use super::{
-    AdapterError, HashMap, MAX_PDF_OBJECTS, PdfDecodeBudget, PdfObject, PdfRef, Result, dict_span,
-    effective_stream, find_endobj, object_stream_offsets, parse_ref, pdf_keyword_at,
+    AdapterError, HashMap, MAX_PROBE_OBJECTS, PdfDecodeBudget, PdfObject, PdfRef, Result,
+    dict_span, effective_stream, find_endobj, object_stream_offsets, parse_ref, pdf_keyword_at,
     probe_dict_ref, probe_dict_type, probe_dict_value, skip_pdf_space_and_comments,
 };
+use std::borrow::Cow;
 use std::ops::Range;
 
 const MAX_XREF_SECTIONS: usize = 16;
 const MAX_XREF_FIELD_BYTES: usize = 8;
-const MAX_PROBE_STREAM_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
 enum Entry {
@@ -22,10 +22,10 @@ struct Section<'a> {
     trailer: &'a [u8],
 }
 
-pub(super) fn probe_objects(
-    pdf: &[u8],
+pub(super) fn probe_objects<'a>(
+    pdf: &'a [u8],
     budget: &mut PdfDecodeBudget,
-) -> Result<(PdfRef, HashMap<u32, PdfObject>)> {
+) -> Result<(PdfRef, HashMap<u32, PdfObject<'a>>)> {
     let (offset, footer) = startxref(pdf).ok_or_else(invalid)?;
     let pdf = &pdf[..footer];
     let mut offset = Some(offset);
@@ -61,7 +61,7 @@ pub(super) fn probe_objects(
         if probe_dict_value(section.trailer, b"Encrypt").is_some() {
             return Err(invalid());
         }
-        if row_count > MAX_PDF_OBJECTS {
+        if row_count > MAX_PROBE_OBJECTS {
             return Err(invalid());
         }
         if root.is_none() && probe_dict_value(section.trailer, b"Root").is_some() {
@@ -172,8 +172,7 @@ fn stream_section<'a>(
         &HashMap::new(),
         budget,
     )?;
-    let mut data =
-        effective_stream(&definition, budget, MAX_PROBE_STREAM_BYTES)?.ok_or_else(invalid)?;
+    let mut data = effective_stream(&definition, &HashMap::new(), budget)?.ok_or_else(invalid)?;
     let widths = probe_dict_value(trailer, b"W")
         .and_then(|value| uint_array(value, 3))
         .ok_or_else(invalid)?;
@@ -186,7 +185,7 @@ fn stream_section<'a>(
     }
     let size = xref_size(trailer)?;
     let ranges = match probe_dict_value(trailer, b"Index") {
-        Some(value) => uint_array(value, 2 * MAX_PDF_OBJECTS).ok_or_else(invalid)?,
+        Some(value) => uint_array(value, 2 * MAX_PROBE_OBJECTS).ok_or_else(invalid)?,
         None => vec![0, size],
     };
     let mut data = decode_predictor(&mut data, trailer, width, budget)?;
@@ -293,12 +292,12 @@ fn paeth(left: u8, up: u8, upper_left: u8) -> u8 {
         .expect("three predictor candidates")
 }
 
-fn load_objects(
-    pdf: &[u8],
+fn load_objects<'a>(
+    pdf: &'a [u8],
     entries: &HashMap<u32, Entry>,
     sections: &[usize],
     budget: &mut PdfDecodeBudget,
-) -> Result<HashMap<u32, PdfObject>> {
+) -> Result<HashMap<u32, PdfObject<'a>>> {
     let mut direct: Vec<_> = entries
         .iter()
         .filter_map(|(&number, entry)| {
@@ -339,14 +338,13 @@ fn load_objects(
     for (stream, members) in by_stream {
         budget.check_deadline()?;
         let container = objects.get(&stream).ok_or_else(invalid)?;
-        let dict = dict_span(&container.body).ok_or_else(invalid)?;
+        let dict = container.dictionary().ok_or_else(invalid)?;
         if !probe_dict_type(dict, b"ObjStm") {
             return Err(invalid());
         }
         let count = optional_uint(dict, b"N")?.ok_or_else(invalid)?;
         let first = optional_uint(dict, b"First")?.ok_or_else(invalid)?;
-        let data =
-            effective_stream(container, budget, MAX_PROBE_STREAM_BYTES)?.ok_or_else(invalid)?;
+        let data = effective_stream(container, &objects, budget)?.ok_or_else(invalid)?;
         let offsets = object_stream_offsets(&data, count, first, budget)?;
         for (number, member) in members {
             budget.check_deadline()?;
@@ -358,27 +356,20 @@ fn load_objects(
                 .get(member + 1)
                 .map_or(data.len(), |(_, next)| first + next);
             let body = &data[first + offset..end];
-            budget.reserve_materialized_object(body.len())?;
-            objects.insert(
-                number,
-                PdfObject {
-                    body: body.to_vec(),
-                    generation: Some(0),
-                    stream: None,
-                },
-            );
+            budget.retain(body.len())?;
+            objects.insert(number, PdfObject::new(Cow::Owned(body.to_vec()), 0, None));
         }
     }
     Ok(objects)
 }
 
-fn object_at(
-    document: &[u8],
+fn object_at<'a>(
+    document: &'a [u8],
     bounds: Range<usize>,
     generation: u16,
     entries: &HashMap<u32, Entry>,
     budget: &mut PdfDecodeBudget,
-) -> Result<PdfObject> {
+) -> Result<PdfObject<'a>> {
     budget.check_deadline()?;
     let pdf = &document[..bounds.end];
     let start = skip_pdf_space_and_comments(pdf, bounds.start);
@@ -418,12 +409,8 @@ fn object_at(
     }
     budget.check_deadline()?;
     let body = pdf.get(start..end).ok_or_else(invalid)?;
-    budget.reserve_materialized_object(body.len())?;
-    Ok(PdfObject {
-        body: body.to_vec(),
-        generation: Some(generation),
-        stream,
-    })
+    budget.retain(body.len())?;
+    Ok(PdfObject::new(Cow::Borrowed(body), generation, stream))
 }
 
 fn stream_length(dict: &[u8], pdf: &[u8], entries: &HashMap<u32, Entry>) -> Result<usize> {
@@ -458,7 +445,7 @@ pub(super) fn content_references(dict: &[u8], budget: &PdfDecodeBudget) -> Resul
     let mut references = Vec::new();
     while array.get(cursor) != Some(&b']') {
         budget.check_deadline()?;
-        if references.len() == MAX_PDF_OBJECTS {
+        if references.len() == MAX_PROBE_OBJECTS {
             return Err(invalid());
         }
         let (reference, next) = parse_ref(array, cursor).ok_or_else(invalid)?;
@@ -505,7 +492,7 @@ fn verify_size(trailer: &[u8], entries: &HashMap<u32, Entry>) -> Result<()> {
 
 fn xref_size(trailer: &[u8]) -> Result<usize> {
     optional_uint(trailer, b"Size")?
-        .filter(|size| (1..=MAX_PDF_OBJECTS).contains(size))
+        .filter(|size| (1..=MAX_PROBE_OBJECTS).contains(size))
         .ok_or_else(invalid)
 }
 
@@ -537,9 +524,9 @@ fn uint_array(bytes: &[u8], limit: usize) -> Option<Vec<usize>> {
 fn row_range(first: usize, count: usize, loaded: usize) -> Result<Range<u32>> {
     let end = first
         .checked_add(count)
-        .filter(|end| *end <= MAX_PDF_OBJECTS)
+        .filter(|end| *end <= MAX_PROBE_OBJECTS)
         .ok_or_else(invalid)?;
-    if count == 0 || count > MAX_PDF_OBJECTS - loaded {
+    if count == 0 || count > MAX_PROBE_OBJECTS - loaded {
         return Err(invalid());
     }
     Ok(first as u32..end as u32)

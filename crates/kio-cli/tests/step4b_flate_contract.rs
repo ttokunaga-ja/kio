@@ -319,7 +319,7 @@ fn flate_03_chance_bt_raster_pdf_routes_to_ocr_without_schema_error() {
     ));
     pdf.extend(stream_obj(
         3,
-        "<< /Length 28 >>",
+        "<< /Length 30 >>",
         b"q 100 0 0 100 0 0 cm /Im0 Do Q",
     ));
     pdf.extend(stream_obj(
@@ -336,12 +336,25 @@ fn flate_03_chance_bt_raster_pdf_routes_to_ocr_without_schema_error() {
     ));
     pdf.extend_from_slice(b"%%EOF\n");
     fs::write(dir.path().join("scan-like.pdf"), pdf).unwrap();
+    let mut filtered = b"%PDF-1.4\n".to_vec();
+    filtered.extend(obj(1, b"<< /Type /Page /Contents 2 0 R >>"));
+    let payload = b"BT (foreign bytes) Tj ET";
+    filtered.extend(stream_obj(
+        2,
+        &format!("<< /Length {} /Filter /DCTDecode >>", payload.len()),
+        payload,
+    ));
+    fs::write(dir.path().join("unsupported-filter.pdf"), filtered).unwrap();
     init(&dir);
 
+    let trace = dir.path().join(".kio/ocr-egress.txt");
     kio(&dir, &["index", "--yes"])
+        .env("KIO_TEST_MISTRAL_OCR", "mock")
+        .env("KIO_TEST_CAPTURE_SENT_MEDIA", &trace)
         .arg("--json")
         .assert()
         .success();
+    assert!(!trace.exists(), "unapproved OCR reached the provider");
     kio(&dir, &["adapter", "approve", "--all", "--yes"])
         .assert()
         .success();
@@ -351,13 +364,15 @@ fn flate_03_chance_bt_raster_pdf_routes_to_ocr_without_schema_error() {
     let units_root = dir.path().join(".kio/objects/normalized_units");
     assert!(gen_dirs_under(&units_root).is_empty());
     let status = json_success(&dir, &["status"]);
-    let online_task = online_markdownize_task_for(&status, "scan-like.pdf")
-        .unwrap_or_else(|| panic!("OCR placeholder missing: {status}"));
-    assert_eq!(online_task["status"], "paused", "{status}");
-    assert_eq!(
-        online_task["hold_reason"], "ledger_initialization_required",
-        "{status}"
-    );
+    for file in ["scan-like.pdf", "unsupported-filter.pdf"] {
+        let online_task = online_markdownize_task_for(&status, file)
+            .unwrap_or_else(|| panic!("OCR placeholder missing for {file}: {status}"));
+        assert_eq!(online_task["status"], "paused", "{status}");
+        assert_eq!(
+            online_task["hold_reason"], "ledger_initialization_required",
+            "{status}"
+        );
+    }
     assert!(
         !dir.path()
             .join(".test-data/kio/cost-ledger.sqlite")
