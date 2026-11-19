@@ -49,11 +49,11 @@ impl Repository {
     /// Publication repeats this check against the final working-tree state.
     pub fn validate_archive_budget(
         &self,
-        excluded_paths: &BTreeSet<String>,
+        include_path: &dyn Fn(&str) -> bool,
         explicitly_allowed_tier_a_paths: &BTreeSet<String>,
     ) -> Result<()> {
         self.working_file_candidates(
-            excluded_paths,
+            include_path,
             explicitly_allowed_tier_a_paths,
             true,
             self.archive_limits,
@@ -129,7 +129,7 @@ impl Repository {
         let chunking_config_hash = self.effective_chunking_config_hash()?;
 
         let candidates = self.working_file_candidates(
-            excluded_paths,
+            &|path| !excluded_paths.contains(path),
             explicitly_allowed_tier_a_paths,
             store_raw,
             limits,
@@ -367,7 +367,7 @@ impl Repository {
 
     pub(super) fn working_file_candidates(
         &self,
-        excluded_paths: &BTreeSet<String>,
+        include_path: &dyn Fn(&str) -> bool,
         explicitly_allowed_tier_a_paths: &BTreeSet<String>,
         enforce_tier_a: bool,
         limits: ArchiveLimits,
@@ -398,7 +398,7 @@ impl Repository {
                         continue;
                     }
                 };
-                if file_name == ".kio" {
+                if file_name == ".kio" || !include_path(&file_name) {
                     continue;
                 }
                 let path = self.canonical_root.join(&file_name);
@@ -410,9 +410,6 @@ impl Repository {
                 }
                 if !file_type.is_file() {
                     eprintln!("warning: skipping non-regular file: {}", path.display());
-                    continue;
-                }
-                if excluded_paths.contains(&file_name) {
                     continue;
                 }
                 if enforce_tier_a
@@ -453,7 +450,12 @@ impl Repository {
         }
         for entry in fs::read_dir(&self.root).kio_io(&self.root)? {
             let entry = entry.kio_io(&self.root)?;
-            if entry.file_name() == ".kio" {
+            let raw_file_name = entry.file_name();
+            if raw_file_name == ".kio"
+                || raw_file_name
+                    .to_str()
+                    .is_some_and(|name| !include_path(name))
+            {
                 continue;
             }
             let path = entry.path();
@@ -465,16 +467,13 @@ impl Repository {
                 eprintln!("warning: skipping non-regular file: {}", path.display());
                 continue;
             }
-            let file_name = match entry.file_name().into_string() {
+            let file_name = match raw_file_name.into_string() {
                 Ok(name) => name,
                 Err(_) => {
                     eprintln!("warning: skipping non-UTF-8 file name: {}", path.display());
                     continue;
                 }
             };
-            if excluded_paths.contains(&file_name) {
-                continue;
-            }
             if enforce_tier_a
                 && is_tier_a_secret_name(&file_name)
                 && !explicitly_allowed_tier_a_paths.contains(&file_name)

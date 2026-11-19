@@ -3145,12 +3145,7 @@ mod tests {
         fs::write(root.join("doc.md"), b"retained input").unwrap();
         let repo = Repository::init(&root).unwrap();
         let candidates = repo
-            .working_file_candidates(
-                &BTreeSet::new(),
-                &BTreeSet::new(),
-                true,
-                ArchiveLimits::default(),
-            )
+            .working_file_candidates(&|_| true, &BTreeSet::new(), true, ArchiveLimits::default())
             .unwrap();
         let candidate = candidates
             .iter()
@@ -4195,7 +4190,7 @@ mod tests {
                 .auto_snapshot_with_bound_normalize(
                     Some("guarded index"),
                     None,
-                    &BTreeSet::new(),
+                    &|_| true,
                     &BTreeMap::new(),
                     &BTreeSet::new(),
                     Some(&guard),
@@ -4240,7 +4235,7 @@ mod tests {
                 Some("scheduled test"),
                 Some("2026-08-14T00:01:00Z"),
                 CommitType::Auto,
-                &BTreeSet::new(),
+                &|_| true,
                 &BTreeMap::new(),
                 &BTreeSet::new(),
                 false,

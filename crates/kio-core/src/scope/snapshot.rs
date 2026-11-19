@@ -34,7 +34,7 @@ impl Repository {
             message,
             fixed_now,
             CommitType::Manual,
-            excluded_paths,
+            &|path| !excluded_paths.contains(path),
             &BTreeMap::new(),
             explicitly_allowed_tier_a_paths,
             false,
@@ -64,13 +64,14 @@ impl Repository {
         self.auto_snapshot_with_bound_normalize(
             message,
             fixed_now,
-            excluded_paths,
+            &|path| !excluded_paths.contains(path),
             &BTreeMap::new(),
             &BTreeSet::new(),
             None,
         )
     }
 
+    /// Only paths accepted by `include_path` are considered for capture.
     /// The optional read-only guard runs after immutable preparation, immediately
     /// before publication (or noop success). It receives the captured tree
     /// and must not mutate scope state.
@@ -78,7 +79,7 @@ impl Repository {
         &self,
         message: Option<&str>,
         fixed_now: Option<&str>,
-        excluded_paths: &BTreeSet<String>,
+        include_path: &dyn Fn(&str) -> bool,
         normalize_by_path: &BTreeMap<String, PendingNormalizeRef>,
         explicitly_allowed_tier_a_paths: &BTreeSet<String>,
         publication_guard: Option<SnapshotPublicationGuard<'_>>,
@@ -87,7 +88,7 @@ impl Repository {
             message,
             fixed_now,
             CommitType::Auto,
-            excluded_paths,
+            include_path,
             normalize_by_path,
             explicitly_allowed_tier_a_paths,
             false,
@@ -320,7 +321,7 @@ impl Repository {
             Some("scheduled auto snapshot"),
             Some(fixed_now),
             CommitType::Auto,
-            excluded_paths,
+            &|path| !excluded_paths.contains(path),
             &normalize_by_path,
             explicitly_allowed_tier_a_paths,
             false,
@@ -531,7 +532,7 @@ impl Repository {
             Some(reason),
             fixed_now,
             CommitType::Purged,
-            &BTreeSet::new(),
+            &|_| true,
             &normalize_by_path,
             &BTreeSet::new(),
             true,
@@ -590,7 +591,7 @@ impl Repository {
         message: Option<&str>,
         fixed_now: Option<&str>,
         commit_type: CommitType,
-        excluded_paths: &BTreeSet<String>,
+        include_path: &dyn Fn(&str) -> bool,
         normalize_by_path: &BTreeMap<String, PendingNormalizeRef>,
         explicitly_allowed_tier_a_paths: &BTreeSet<String>,
         force_commit: bool,
@@ -685,7 +686,7 @@ impl Repository {
             BTreeSet::new()
         };
         let working_candidates = self.working_file_candidates(
-            excluded_paths,
+            include_path,
             explicitly_allowed_tier_a_paths,
             true,
             self.archive_limits,
