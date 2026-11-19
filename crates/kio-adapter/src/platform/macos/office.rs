@@ -74,10 +74,87 @@ pub(crate) fn verify_macos_office_bundle(
     Ok(())
 }
 
+fn verify_macos_nested_code<'a>(
+    bundle: &Path,
+    seals: impl IntoIterator<Item = &'a Path>,
+    deadline: Instant,
+) -> Result<()> {
+    use std::collections::BTreeSet;
+
+    let mut nested = BTreeSet::new();
+    let mut main_seal = false;
+    for seal in seals {
+        if !std::fs::symlink_metadata(seal).is_ok_and(|metadata| metadata.is_file()) {
+            return Err(AdapterError::ContractViolation(
+                "unsafe macOS code resource seal".to_owned(),
+            ));
+        }
+        let base = seal
+            .parent()
+            .and_then(Path::parent)
+            .expect("resource seal has a base");
+        // Standard bundles seal paths relative to Contents; versioned
+        // frameworks use the version directory itself as the signing base.
+        let code = if base.ends_with("Contents") {
+            base.parent().expect("bundle Contents has a parent")
+        } else {
+            base
+        };
+        if code == bundle {
+            main_seal = true;
+        } else {
+            nested.insert(code.to_path_buf());
+        }
+        let files = run_signature_tool_with_limit(
+            std::process::Command::new("/usr/bin/plutil")
+                .args(["-extract", "files2", "xml1", "-o", "-"])
+                .arg(seal),
+            "cannot read the Office bundle's code resource seal",
+            deadline,
+            16 * 1024 * 1024,
+        )?;
+        let paths = crate::office_macos_seal::nested_code_paths(&files)
+            .map_err(|error| AdapterError::ContractViolation(error.to_string()))?;
+        nested.extend(paths.into_iter().map(|path| base.join(path)));
+    }
+    if !main_seal {
+        return Err(AdapterError::ContractViolation(
+            "Office bundle lacks a modern code resource seal".to_owned(),
+        ));
+    }
+    // --deep validated the seal's own nested requirements. Each path here
+    // becomes an explicit subject of our Apple anchor requirement.
+    let nested: Vec<_> = nested.into_iter().collect();
+    for batch in nested.chunks(64) {
+        run_signature_tool(
+            std::process::Command::new("/usr/bin/codesign")
+                .args([
+                    "--verify",
+                    "--strict",
+                    "--all-architectures",
+                    "-R=anchor apple generic",
+                ])
+                .args(batch),
+            "Office bundle nested code has no valid Apple-issued code signature",
+            deadline,
+        )?;
+    }
+    Ok(())
+}
+
 fn run_signature_tool(
     command: &mut std::process::Command,
     failure: &str,
     deadline: Instant,
+) -> Result<String> {
+    run_signature_tool_with_limit(command, failure, deadline, MAX_OFFICE_LOG_BYTES)
+}
+
+fn run_signature_tool_with_limit(
+    command: &mut std::process::Command,
+    failure: &str,
+    deadline: Instant,
+    max_stdout_bytes: usize,
 ) -> Result<String> {
     command.env_clear().current_dir("/");
     crate::office_convert::check_renderer_deadline(deadline)?;
@@ -85,7 +162,7 @@ fn run_signature_tool(
         command,
         BoundedProcessOptions {
             timeout: deadline.saturating_duration_since(Instant::now()),
-            max_stdout_bytes: MAX_OFFICE_LOG_BYTES,
+            max_stdout_bytes,
             max_stderr_bytes: MAX_OFFICE_LOG_BYTES,
         },
         None,
@@ -445,11 +522,17 @@ impl OfficeRuntime {
             catalog: private_uno_catalog_for_program(program, deadline)?,
         })
     }
-    pub(crate) fn verify_runtime_signature(&self, program: &Path, deadline: Instant) -> Result<()> {
+    pub(crate) fn verify_runtime_signature(
+        &self,
+        program: &Path,
+        snapshot: &crate::office_runtime_identity::RuntimeSnapshot,
+        deadline: Instant,
+    ) -> Result<()> {
         let catalog = self.catalog.as_ref().ok_or_else(|| {
             AdapterError::ContractViolation("unsupported macOS Office runtime placement".to_owned())
         })?;
-        verify_macos_office_bundle(&catalog.bundle, program, deadline)
+        verify_macos_office_bundle(&catalog.bundle, program, deadline)?;
+        verify_macos_nested_code(&catalog.bundle, snapshot.macos_code_resources(), deadline)
     }
     pub(crate) fn catalog_digest(&self) -> Option<&str> {
         self.catalog
@@ -531,6 +614,63 @@ pub(crate) fn renderer_environment(
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn macos_outer_requirement_does_not_authorize_an_ad_hoc_helper() {
+        let scratch = tempfile::tempdir().unwrap();
+        let bundle = scratch.path().canonicalize().unwrap().join("Fixture.app");
+        let binaries = bundle.join("Contents/MacOS");
+        let helper = bundle.join("Contents/Frameworks/helper");
+        std::fs::create_dir_all(&binaries).unwrap();
+        std::fs::create_dir_all(helper.parent().unwrap()).unwrap();
+        let main = binaries.join("main");
+        std::fs::copy("/usr/bin/true", &main).unwrap();
+        std::fs::copy("/usr/bin/true", &helper).unwrap();
+        std::fs::write(
+            bundle.join("Contents/Info.plist"),
+            br#"<?xml version="1.0"?><plist version="1.0"><dict>
+            <key>CFBundleIdentifier</key><string>org.kio.test-parent</string>
+            <key>CFBundleExecutable</key><string>main</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            </dict></plist>"#,
+        )
+        .unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        for item in [&helper, &bundle] {
+            run_signature_tool(
+                std::process::Command::new("/usr/bin/codesign")
+                    .args(["--force", "--sign", "-", "--timestamp=none"])
+                    .arg(item),
+                "cannot sign test fixture",
+                deadline,
+            )
+            .unwrap();
+        }
+        // CI lacks a distribution identity. Verify an explicit requirement
+        // satisfied by the outer fixture, then apply the real Apple anchor to its helper.
+        run_signature_tool(
+            std::process::Command::new("/usr/bin/codesign")
+                .args([
+                    "--verify",
+                    "--strict",
+                    "--deep",
+                    "--all-architectures",
+                    "-R=identifier \"org.kio.test-parent\"",
+                ])
+                .arg(&bundle),
+            "fixture must pass deep verification with an outer requirement",
+            deadline,
+        )
+        .unwrap();
+        let seal = bundle.join("Contents/_CodeSignature/CodeResources");
+        let error = verify_macos_nested_code(&bundle, [seal.as_path()], deadline).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("nested code has no valid Apple-issued"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn snapshot_scope_is_the_verified_bundle() {

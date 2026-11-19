@@ -258,7 +258,15 @@ impl OfficeRuntime {
             let required = path == program || path == renderer;
             let mut header = [0; 2];
             if file.seek_read(&mut header, 0)? == 2 && &header == b"MZ" {
-                verify_authenticode(path, file)?;
+                verify_authenticode_until(path, file, deadline).map_err(|error| {
+                    std::io::Error::new(
+                        error.kind(),
+                        format!(
+                            "Authenticode verification failed for {}: {error}",
+                            path.display()
+                        ),
+                    )
+                })?;
                 launcher_verified |= path == program;
                 renderer_verified |= path == renderer;
             } else if required {
@@ -326,6 +334,21 @@ fn installed_package(program: &Path) -> Result<PathBuf> {
     Ok(package.to_path_buf())
 }
 
+fn verify_authenticode_until(
+    path: &Path,
+    file: &std::fs::File,
+    deadline: std::time::Instant,
+) -> std::io::Result<()> {
+    static BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let path = path.to_path_buf();
+    let file = file.try_clone()?;
+    // The worker owns only the active image's duplicate. The snapshot's
+    // other pins stay with the caller and are dropped if this wait times out.
+    crate::office_signature_worker::verify_until(&BUSY, deadline, move || {
+        verify_authenticode(&path, &file)
+    })
+}
+
 fn verify_authenticode(path: &Path, file: &std::fs::File) -> std::io::Result<()> {
     use std::os::windows::{ffi::OsStrExt as _, io::AsRawHandle as _};
     use windows_sys::Win32::{
@@ -374,11 +397,7 @@ fn verify_authenticode(path: &Path, file: &std::fs::File) -> std::io::Result<()>
         )
     };
     if status != 0 {
-        return Err(std::io::Error::other(format!(
-            "Authenticode verification failed for {} (0x{:08x})",
-            path.display(),
-            status as u32
-        )));
+        return Err(std::io::Error::from_raw_os_error(status));
     }
     Ok(())
 }
@@ -427,7 +446,112 @@ mod tests {
     use super::*;
 
     #[test]
+    fn authenticode_accepts_the_system_pe_and_rejects_modified_code() {
+        use std::{
+            os::windows::fs::{FileExt as _, OpenOptionsExt as _},
+            time::{Duration, Instant},
+        };
+        use windows_sys::Win32::{
+            Foundation::TRUST_E_BAD_DIGEST, Storage::FileSystem::FILE_SHARE_READ,
+        };
+
+        let _lock = kio_core::test_control::test_env_lock().lock().unwrap();
+        let system_image = windows_directory().unwrap().join("System32/ntoskrnl.exe");
+        let directory = tempfile::tempdir().unwrap();
+        let renderer = directory.path().canonicalize().unwrap().join("soffice.bin");
+        let mut bytes = std::fs::read(system_image).unwrap();
+        std::fs::write(&renderer, &bytes).unwrap();
+        let verify = || {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ)
+                .open(&renderer)
+                .unwrap();
+            let mut magic = [0; 2];
+            assert_eq!(file.seek_read(&mut magic, 0).unwrap(), 2);
+            assert_eq!(&magic, b"MZ");
+            verify_authenticode_until(&renderer, &file, Instant::now() + Duration::from_secs(10))
+        };
+        verify().expect(
+            "an unchanged embedded-signed Windows kernel PE is accepted under the renderer name",
+        );
+
+        let pe = u32::from_le_bytes(bytes[0x3c..0x40].try_into().unwrap()) as usize;
+        assert_eq!(&bytes[pe..pe + 4], b"PE\0\0");
+        let fields = &bytes[pe + 4..pe + 24];
+        let sections = usize::from(u16::from_le_bytes(fields[2..4].try_into().unwrap()));
+        let optional_size = usize::from(u16::from_le_bytes(fields[16..18].try_into().unwrap()));
+        let table = pe + 24 + optional_size;
+        let text = bytes[table..table + sections * 40]
+            .as_chunks::<40>()
+            .0
+            .iter()
+            .find(|section| section.starts_with(b".text\0"))
+            .expect("Windows kernel has a .text section");
+        let offset = u32::from_le_bytes(text[20..24].try_into().unwrap()) as usize;
+        bytes[offset] ^= 1;
+        std::fs::write(&renderer, &bytes).unwrap();
+        let error = verify().unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(TRUST_E_BAD_DIGEST), "{error}");
+    }
+
+    #[test]
+    fn timed_out_verification_retains_only_the_worker_file_until_it_returns() {
+        use std::{
+            os::windows::fs::OpenOptionsExt as _,
+            sync::{
+                atomic::{AtomicBool, Ordering},
+                mpsc,
+            },
+            time::{Duration, Instant},
+        };
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+        static BUSY: AtomicBool = AtomicBool::new(false);
+        let directory = tempfile::tempdir().unwrap();
+        let active = directory.path().join("active.dll");
+        let other = directory.path().join("other.dll");
+        for path in [&active, &other] {
+            std::fs::write(path, b"fixture").unwrap();
+        }
+        let pin = |path: &Path| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ)
+                .open(path)
+                .unwrap()
+        };
+        let active_pin = pin(&active);
+        let other_pin = pin(&other);
+        let worker_pin = active_pin.try_clone().unwrap();
+        let (release, blocked) = mpsc::channel();
+        let error = crate::office_signature_worker::verify_until(
+            &BUSY,
+            Instant::now() + Duration::from_millis(250),
+            move || {
+                let _ = blocked.recv();
+                drop(worker_pin);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        drop((active_pin, other_pin));
+        let write = |path: &Path| std::fs::OpenOptions::new().write(true).open(path);
+        assert!(write(&other).is_ok());
+        assert!(write(&active).is_err());
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while BUSY.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(write(&active).is_ok());
+    }
+
+    #[test]
     fn authenticode_rejects_an_unsigned_image() {
+        let _lock = kio_core::test_control::test_env_lock().lock().unwrap();
         let directory = tempfile::tempdir().unwrap();
         let package = directory.path().canonicalize().unwrap();
         let binaries = package.join("program");
@@ -454,6 +578,13 @@ mod tests {
             error
                 .to_string()
                 .contains("Authenticode verification failed"),
+            "{error}"
+        );
+        let unsigned = std::fs::File::open(&program).unwrap();
+        let error = verify_authenticode(&program, &unsigned).unwrap_err();
+        assert_eq!(
+            error.raw_os_error(),
+            Some(windows_sys::Win32::Foundation::TRUST_E_NOSIGNATURE),
             "{error}"
         );
     }

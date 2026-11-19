@@ -244,6 +244,14 @@ impl RuntimeSnapshot {
         self.verify(sources, "during signature verification", deadline)
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) fn macos_code_resources(&self) -> impl Iterator<Item = &Path> {
+        self.entries
+            .keys()
+            .map(PathBuf::as_path)
+            .filter(|path| path.ends_with("_CodeSignature/CodeResources"))
+    }
+
     #[cfg(windows)]
     pub(crate) fn pin_windows_package(&self, deadline: Instant) -> Result<Vec<(&Path, fs::File)>> {
         use std::os::windows::fs::OpenOptionsExt as _;
@@ -602,6 +610,71 @@ mod tests {
         let exe = std::env::current_exe().unwrap();
         let sources = RenderSources::resolve(&exe, []).unwrap();
         assert!(RuntimeSnapshot::new(vec![], &sources, deadline()).is_err());
+    }
+
+    #[test]
+    fn runtime_snapshot_includes_uno_service_catalogs_and_bootstrap_configuration() {
+        let scratch = tempfile::tempdir().unwrap();
+        let package = scratch.path().canonicalize().unwrap().join("package");
+        fs::create_dir_all(package.join("program/services")).unwrap();
+        fs::create_dir_all(package.join("share/uno")).unwrap();
+        let program = package.join("program/renderer");
+        fs::write(&program, b"renderer").unwrap();
+        let sources = RenderSources::resolve(&program, [package.clone()]).unwrap();
+        for relative in [
+            "program/fundamental.ini",
+            "program/services/services.rdb",
+            "share/uno/services.rdb",
+        ] {
+            let configuration = package.join(relative);
+            fs::write(&configuration, b"original configuration").unwrap();
+            let snapshot =
+                RuntimeSnapshot::new(vec![package.clone()], &sources, deadline()).unwrap();
+            fs::write(
+                &configuration,
+                b"modified configuration with a different size",
+            )
+            .unwrap();
+            assert!(
+                snapshot
+                    .verify(&sources, "before launch", deadline())
+                    .is_err(),
+                "{relative}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_runtime_rejects_a_junction_to_an_external_service_directory() {
+        let scratch = tempfile::tempdir().unwrap();
+        let package = scratch.path().join("package");
+        let outside = scratch.path().join("outside");
+        fs::create_dir_all(package.join("share")).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("services.rdb"), b"external settings").unwrap();
+        let junction = package.join("share/services");
+        let result = std::process::Command::new("cmd.exe")
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&outside)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let package = package.canonicalize().unwrap();
+        let program = package.join("renderer.exe");
+        fs::write(&program, b"renderer").unwrap();
+        let sources = RenderSources::resolve(&program, [package.clone()]).unwrap();
+        let error = RuntimeSnapshot::new(vec![package], &sources, deadline()).unwrap_err();
+        fs::remove_dir(junction).unwrap();
+        assert!(
+            error.to_string().contains("alias") || error.to_string().contains("reparse"),
+            "{error}"
+        );
     }
 
     #[cfg(windows)]

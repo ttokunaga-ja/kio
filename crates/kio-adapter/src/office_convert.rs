@@ -387,7 +387,7 @@ impl RealRenderer {
             .verify_signatures(&self.sources, deadline, || {
                 #[cfg(target_os = "macos")]
                 self.runtime
-                    .verify_runtime_signature(program, deadline)
+                    .verify_runtime_signature(program, &self.runtime_snapshot, deadline)
                     .map_err(std::io::Error::other)?;
                 #[cfg(windows)]
                 self.runtime.verify_runtime_signatures(
@@ -1614,10 +1614,13 @@ mod tests {
         )
         .unwrap();
         assert!(verify_macos_office_bundle(&bundle, &program, test_deadline()).is_err());
+        let deadline = test_deadline();
+        let runtime = OfficeRuntime::new(&program, deadline).unwrap();
+        let sources = RenderSources::resolve(&program, [bundle.clone()]).unwrap();
+        let snapshot = RuntimeSnapshot::new(vec![bundle], &sources, deadline).unwrap();
         assert!(
-            OfficeRuntime::new(&program, test_deadline())
-                .unwrap()
-                .verify_runtime_signature(&program, test_deadline())
+            runtime
+                .verify_runtime_signature(&program, &snapshot, deadline)
                 .is_err()
         );
     }
