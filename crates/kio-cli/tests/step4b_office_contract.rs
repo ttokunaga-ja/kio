@@ -552,19 +552,23 @@ fn office_unavailable_reports_reason_and_keeps_text_search() {
             .stdout
             .clone();
         let value: Value = serde_json::from_slice(&output).unwrap();
-        let readiness = if args[0] == "status" {
-            &value["office_readiness"]
+        if args[0] == "status" {
+            let readiness = &value["office_readiness"];
+            assert_eq!(readiness["state"], "missing", "{value}");
+            assert!(
+                readiness["alternatives"]
+                    .as_str()
+                    .unwrap()
+                    .contains("search")
+            );
         } else {
-            &value["index_status"]["office_readiness"]
-        };
-        assert_eq!(readiness["state"], "missing", "{value}");
-        assert!(
-            readiness["alternatives"]
-                .as_str()
-                .unwrap()
-                .contains("search")
-        );
-        if args[0] == "search" {
+            assert!(
+                value["index_status"].get("office_readiness").is_none(),
+                "{value}"
+            );
+            let unavailable = &value["index_status"]["office_conversion_unavailable"];
+            assert_eq!(unavailable["count"], 1, "{value}");
+            assert_eq!(unavailable["files"][0]["path"], "report.docx", "{value}");
             assert!(!value["results"].as_array().unwrap().is_empty(), "{value}");
         }
         let output = kio(&dir, args)
@@ -575,10 +579,14 @@ fn office_unavailable_reports_reason_and_keeps_text_search() {
             .stdout
             .clone();
         let text = String::from_utf8(output).unwrap();
-        assert!(
-            text.contains("Office: missing") && text.contains("searchable"),
-            "{text}"
-        );
+        if args[0] == "status" {
+            assert!(
+                text.contains("Office: missing") && text.contains("searchable"),
+                "{text}"
+            );
+        } else {
+            assert!(!text.contains("Office:"), "{text}");
+        }
     }
 }
 
@@ -676,26 +684,28 @@ fn office_isolation_component_faults_reach_cli_without_blocking_extraction_or_se
                     }
                     let output = command.assert().success().get_output().stdout.clone();
                     let text = String::from_utf8(output).unwrap();
-                    assert!(
-                        text.contains(&format!("{expected} is {state}")),
-                        "{fault}: {text}"
-                    );
-                    assert!(
-                        text.contains("PDF text layer")
-                            && text.contains("XLSX")
-                            && text.contains("searchable"),
-                        "{text}"
-                    );
+                    if args[0] == "status" {
+                        assert!(
+                            text.contains(&format!("{expected} is {state}")),
+                            "{fault}: {text}"
+                        );
+                        assert!(
+                            text.contains("PDF text layer")
+                                && text.contains("XLSX")
+                                && text.contains("searchable"),
+                            "{text}"
+                        );
+                    } else {
+                        assert!(
+                            !text.contains(&format!("{expected} is {state}")),
+                            "{fault}: {text}"
+                        );
+                    }
                     if json {
                         let value: Value = serde_json::from_str(&text).unwrap();
-                        let readiness = if args[0] == "status" {
-                            &value["office_readiness"]
-                        } else {
-                            &value["index_status"]["office_readiness"]
-                        };
-                        // The renderer was found; its required isolation component is unavailable.
-                        assert_eq!(readiness["state"], "unusable", "{value}");
                         if args[0] == "status" {
+                            // The renderer was found; its required isolation component is unavailable.
+                            assert_eq!(value["office_readiness"]["state"], "unusable", "{value}");
                             assert!(
                                 markdownize_tasks_for(&value, "report.docx").is_empty(),
                                 "{value}"
@@ -708,6 +718,10 @@ fn office_isolation_component_faults_reach_cli_without_blocking_extraction_or_se
                             );
                         }
                         if args[0] == "search" {
+                            assert!(
+                                value["index_status"].get("office_readiness").is_none(),
+                                "{value}"
+                            );
                             assert_eq!(
                                 value["index_status"]["office_conversion_unavailable"]["count"], 1,
                                 "{value}"

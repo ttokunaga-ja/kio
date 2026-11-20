@@ -414,11 +414,7 @@ fn print_output(value: Value, json_mode: bool) {
             print_deferred_inputs(child, child["path"].as_str());
         }
     }
-    if let Some(readiness) = value.get("office_readiness").or_else(|| {
-        value
-            .get("index_status")
-            .and_then(|status| status.get("office_readiness"))
-    }) {
+    if let Some(readiness) = value.get("office_readiness") {
         let rendered = format!(
             "Office: {} — {}. {}",
             readiness["state"].as_str().unwrap_or("unavailable"),
