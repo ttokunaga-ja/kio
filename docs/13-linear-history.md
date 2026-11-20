@@ -76,7 +76,7 @@ working bytes・identity を再検証する。`--expected-head` は preview 時�
 原本は有界メモリで扱い、64 MiB/file・512 MiB/operation の固定拒否を設けない。
 変更前に、同一ファイルシステム内の private stage の実体・digest・長さ、前後の状態と進行段階を
 回復用 journal に耐久記録する。journal に本文は埋め込まない。
-中断後は全 bytes と digest を検証できた stage だけを再使用し、検証済みの進行段階から再開または巻き戻す。
+stage は全 bytes と digest の検証後にだけ使用する。中断後も同じ検証を通った stage だけを再使用し、検証済みの進行段階から再開または巻き戻す。
 置換・削除は保持済み実体に限定し、リンクをたどらない。作業ファイルの件数・bytes と耐久化済み段階を表示する。
 適用中の読み取りでは該当 scope を除外するか busy とし、古い検索結果を最新版として返さない。
 

@@ -323,8 +323,8 @@ portable では、信頼できる配布物のファイル一覧を展開先直�
 
 renderer scratch は [Kio 作成物の保護](10-operations.md#43-kio-created-object-boundary) に従う。
 
-変換は利用者の LibreOffice profile や導入済みの配布物を変更せず、隔離した実行環境と private scratch を
-使う。関連のない private file とネットワークへのアクセスを禁止する。隔離できなければ変換を拒否する。
+変換は利用者の LibreOffice profile や導入済みの配布物を変更せず、隔離した実行環境、明示的に指定した環境変数だけの環境、
+private scratch を使う。関連のない private file とネットワークへのアクセスを禁止する。隔離できなければ変換を拒否する。
 Office 入力は 100 MiB、PDF 出力は 250 MiB とする。変換の wall-clock と CPU 時間の上限は各 300 秒、
 対応環境のアドレス空間・Job メモリの上限は 2 GiB とする。scratch 増加の監視はカーネルの disk quota を
 提供しない。終了時はプロセスツリーを後始末する。

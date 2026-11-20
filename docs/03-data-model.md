@@ -737,7 +737,7 @@ image_hash    = "sha256:" + base16(sha256(抽出画像のバイト列))
 - commit は単一の `parent` を必須とする。genesis は `null`、それ以外は直前の HEAD の commit hash を格納する。
   [線形形式の不変条件](13-linear-history.md#3-線形形式の不変条件) に従う。
 - timestamp は UTC ISO8601 + `Z` ([06-cli-spec.md §11](06-cli-spec.md))。
-- `HEAD` / `refs/heads/*` / `refs/tags-v1/tag-*` の値は commit_hash (`refs/tags-v1/names.jsonl` は ref ではなく論理名 ledger — この規則の対象外)。
+- `HEAD` / `refs/tags-v1/tag-*` の値は commit_hash (`refs/tags-v1/names.jsonl` は ref ではなく論理名 ledger — この規則の対象外)。
 
 **manifest** — canonical JSON の content hash (§2.1):
 
@@ -1040,7 +1040,7 @@ mutable projection/cacheである `objects/normalized/` と `objects/normalized_
 到達edgeは次の正本だけから構成する。SQLite table/rowはedgeを追加も削除もしない。
 
 ```text
-HEAD / refs/heads/* / refs/tags-v1/tag-* → commit
+HEAD / refs/tags-v1/tag-*            → commit
 commit.parent                          → 親 commit（genesis の null は辺なし）
 commit.tree                            → tree
 commit.tool_lock_hash                  → toollock
