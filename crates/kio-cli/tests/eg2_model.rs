@@ -143,7 +143,9 @@ fn offline_import_and_read_only_status_are_device_local() {
     assert_eq!(fs::read(&source).unwrap(), BYTES);
     let artifact = fixture.artifact();
     assert_eq!(fs::read(&artifact).unwrap(), BYTES);
-    assert_eq!(fixture.status()["readiness"], "ready");
+    let status = fixture.status();
+    assert_eq!(status["readiness"], "ready");
+    assert_eq!(status["runtime_version"], "0.19.1");
 
     #[cfg(unix)]
     let inode = {

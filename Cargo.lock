@@ -1063,6 +1063,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "thiserror",
  "toml",
  "toml_edit",
  "unicode-normalization",
@@ -1101,6 +1102,7 @@ dependencies = [
  "tempfile",
  "toml",
  "toml_edit",
+ "ureq",
  "windows-sys 0.61.2",
  "zip",
 ]

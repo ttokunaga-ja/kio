@@ -10,6 +10,7 @@ pub mod gc;
 pub mod history;
 #[doc(hidden)]
 pub mod identity_serde;
+pub mod litert;
 pub mod management;
 pub mod platform;
 pub mod portable;

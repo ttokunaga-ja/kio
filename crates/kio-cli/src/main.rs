@@ -16,6 +16,16 @@ use kio_core::{ExitCode, KioError, Result};
 use serde_json::{Value, json};
 
 fn main() {
+    let mut worker_args = std::env::args_os().skip(1);
+    if worker_args.next().as_deref() == Some(kio_app::eg2::WORKER_ARGUMENT.as_ref()) {
+        let slot = worker_args.next();
+        let valid = worker_args.next().is_none()
+            && slot
+                .as_deref()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|slot| kio_app::eg2::run_worker(slot).is_ok());
+        process::exit(i32::from(!valid));
+    }
     #[cfg(debug_assertions)]
     scan_heap::start();
     release_binding::retain();

@@ -92,6 +92,7 @@ mod watch_service;
 
 pub mod commands;
 pub mod context;
+pub mod eg2;
 pub mod response;
 
 pub fn execute(ctx: &AppContext, command: Command) -> Result<CommandResponse> {

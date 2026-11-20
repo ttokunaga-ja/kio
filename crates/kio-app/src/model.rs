@@ -53,6 +53,7 @@ impl Pin {
         path: &Path,
         readiness: ModelReadiness,
         reason: &'static str,
+        runtime_version: Option<String>,
     ) -> CommandResponse {
         CommandResponse {
             body: ResponseBody::Model(ModelResponse {
@@ -61,7 +62,7 @@ impl Pin {
                 profile_hash: None,
                 model_revision: REVISION,
                 model_hash: self.sha256,
-                runtime_version: None,
+                runtime_version,
                 readiness,
                 reason,
                 path: path.display().to_string(),
@@ -71,6 +72,24 @@ impl Pin {
             }),
             completion: Completion::Complete,
         }
+    }
+
+    fn open_installed(
+        &self,
+        base: &Path,
+        control: &ControlHandle,
+    ) -> Result<Option<(File, Option<ModelMismatch>)>> {
+        let directory = self.directory(base);
+        let Some(installed) = crate::private_state::open_readonly(&directory, base, control)?
+        else {
+            return Ok(None);
+        };
+        if !installed.contains_entry(Path::new(ARTIFACT))? {
+            return Ok(None);
+        }
+        let mut file = verified_model_file(&installed)?;
+        let mismatch = self.mismatch(&mut file, &directory.join(ARTIFACT))?;
+        Ok(Some((file, mismatch)))
     }
 
     /// Returns a mismatch reason for a regular file whose bytes fail the pin.
@@ -99,18 +118,36 @@ pub(crate) fn run(
     let path = directory.join(ARTIFACT);
     match command {
         ModelCommand::Status => {
-            let installed = crate::private_state::open_readonly(&directory, &base, control)?;
-            let Some(installed) = installed else {
+            use crate::eg2::WorkerError;
+            let Some((_, mismatch)) = pin.open_installed(&base, control)? else {
                 return Ok(missing(&pin, &path));
             };
-            let leaf = Path::new(ARTIFACT);
-            if !installed.contains_entry(leaf)? {
-                return Ok(missing(&pin, &path));
+            if let Some(mismatch) = mismatch {
+                return Ok(pin.response(
+                    &path,
+                    ModelReadiness::HashMismatch,
+                    mismatch.message(),
+                    None,
+                ));
             }
-            let mut file = verified_model_file(&installed)?;
-            if let Some(mismatch) = pin.mismatch(&mut file, &path)? {
-                return Ok(pin.response(&path, ModelReadiness::HashMismatch, mismatch.message()));
-            }
+            let (readiness, reason, version) = match crate::eg2::verify_runtime() {
+                Ok(()) => (
+                    ModelReadiness::Ready,
+                    "model and runtime SHA-256 verified",
+                    Some(kio_core::litert::VERSION.to_owned()),
+                ),
+                Err(WorkerError::RuntimeMissing) => {
+                    (ModelReadiness::Missing, "runtime_missing", None)
+                }
+                Err(WorkerError::RuntimeHashMismatch) => {
+                    (ModelReadiness::HashMismatch, "runtime_hash_mismatch", None)
+                }
+                Err(WorkerError::RuntimeUnsupported) => {
+                    (ModelReadiness::Missing, "runtime_unsupported_target", None)
+                }
+                Err(_) => (ModelReadiness::Missing, "runtime_unavailable", None),
+            };
+            return Ok(pin.response(&path, readiness, reason, version));
         }
         ModelCommand::Install { from, yes, offline } => {
             if offline && from.is_none() {
@@ -152,7 +189,27 @@ pub(crate) fn run(
         &path,
         ModelReadiness::Ready,
         "model size and SHA-256 verified",
+        None,
     ))
+}
+
+pub(crate) fn open_engine_model(
+    control: &ControlHandle,
+) -> std::result::Result<(PathBuf, File), crate::eg2::WorkerError> {
+    use crate::eg2::WorkerError;
+    let base = crate::settings::data_home(control);
+    if !base.is_absolute() {
+        return Err(WorkerError::ModelUnavailable);
+    }
+    let pin = Pin::current(control);
+    let (file, mismatch) = pin
+        .open_installed(&base, control)
+        .map_err(|_| WorkerError::ModelUnavailable)?
+        .ok_or(WorkerError::ModelMissing)?;
+    if mismatch.is_some() {
+        return Err(WorkerError::ModelHashMismatch);
+    }
+    Ok((pin.directory(&base).join(ARTIFACT), file))
 }
 
 fn confirm(
@@ -195,6 +252,7 @@ fn missing(pin: &Pin, path: &Path) -> CommandResponse {
         path,
         ModelReadiness::Missing,
         "model is not installed; run kio model install embeddinggemma-2",
+        None,
     )
 }
 

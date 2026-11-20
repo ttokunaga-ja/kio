@@ -486,11 +486,20 @@ task journal の normalized output はこの physical path ではなく `normali
 
 ## 5.1 EG2 のモデル・runtime 配置と取得
 
-runtime library は Kio release 所有の `lib/litert-lm/0.18.0/<target>/` に同梱し、配布 manifest の
+runtime library は Kio release 所有の `lib/litert-lm/0.19.1/<target>/` に同梱し、配布 manifest の
  target ごとの SHA-256 と照合する。macOS arm64 / Windows x64 / Linux x64 の各配布物は library、
 必要 export、依存関係と license/third-party NOTICE を固定し、検証済みとして配布する。
 未検証の path/hash を推測せず、`.kio`、repo、current directory、PATH から native library を探索しない。
 利用者による Python 導入、runtime download、自動 update は要求しない。
+
+runtime は LiteRT-LM v0.19.1 の C API 1.0.0 に固定する。Kio CLI の build は
+[固定 release の ZIP](https://github.com/google-ai-edge/LiteRT-LM/releases/download/v0.19.1/litert_lm_c_api-1.0.0.zip)
+を取得し、123,469,788 バイトと SHA-256
+`1d430d80eaf536f696a4922270ba55eb3d112189ac198c3066d487a45e3b4d4c`
+を検証してから、対象 target の library と license を配置する。offline build では
+`CARGO_NET_OFFLINE=true` と `KIO_LITERT_C_API_ZIP=<取得済み ZIP の絶対パス>` を渡す。配布物の `bin/kio` は
+同じ配布ルートの `lib` を参照する。Cargo の開発 build は profile ディレクトリと同じ階層に
+`lib` を配置する。
 
 モデルだけを明示取得または file import する。固定 artifact は次のとおり。
 
@@ -509,7 +518,7 @@ runtime library は Kio release 所有の `lib/litert-lm/0.18.0/<target>/` に�
 `.kio` の共有・履歴・restore 対象にしない。cache は device cache 配下とする。
 取得/import は temp で size/SHA-256 を検証してから atomic publish し、利用者の import 元を変更しない。
 hash 不一致・disk 不足・中断は既存 valid model を保持し、ready と報告しない。
-推論時、watch 起動時、通常の build 時に暗黙取得せず、モデル欠落は理由付き未準備とする。
+モデルは推論時、watch 起動時、build 時に暗黙取得せず、欠落は理由付き未準備とする。
 取得確認は device 状態であり、scope の送信同意とは独立する。旧 store の migration や backfill は作らず、
 current-format 検査と明示再 index の境界を維持する。
 

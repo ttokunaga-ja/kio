@@ -550,6 +550,25 @@ pub fn package_candidate(
         (provenance, 0o644),
     );
     payload.insert(format!("{root}/release/sbom.cdx.json"), (sbom, 0o644));
+    let runtime = kio_core::litert::Bundle::for_target(&binding.target)
+        .ok_or_else(|| ReleaseError::Invalid("unsupported LiteRT-LM target".into()))?;
+    let runtime_root = options
+        .binary
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| ReleaseError::Invalid("candidate binary has no distribution root".into()))?;
+    for name in runtime.names() {
+        let relative = format!("{}/{name}", runtime.directory());
+        let bytes = bounded_bytes(&runtime_root.join(&relative), MAX_ENTRY)?;
+        if let Some(library) = runtime.libraries().find(|library| library.name() == name)
+            && digest(&bytes) != library.sha256
+        {
+            return Err(ReleaseError::Verify(format!(
+                "LiteRT-LM SHA-256 mismatch for {relative}"
+            )));
+        }
+        payload.insert(format!("{root}/{relative}"), (bytes, 0o644));
+    }
     let internal = internal_checksums(&payload)?;
     payload.insert(format!("{root}/release/checksums.json"), (internal, 0o644));
     let archive = options.output_dir.join(format!("{root}.tar.gz"));
@@ -646,7 +665,7 @@ pub fn verify_candidate(options: &VerifyCandidateOptions) -> Result<VerifySummar
             "archive root does not bind version and target".into(),
         ));
     }
-    let expected = expected_names(&root, binary_name_for_target(&binding.target));
+    let expected = expected_names(&root, &binding.target);
     if files.keys().collect::<Vec<_>>() != expected.iter().collect::<Vec<_>>() {
         return Err(ReleaseError::Verify(
             "archive entries are not the fixed canonical layout".into(),
@@ -2710,10 +2729,10 @@ fn archive_root(files: &BTreeMap<String, Vec<u8>>) -> Result<String, ReleaseErro
     }
     Ok(root.into())
 }
-fn expected_names(root: &str, binary: &str) -> BTreeSet<String> {
+fn expected_names(root: &str, target: &str) -> BTreeSet<String> {
     let mut s = BTreeSet::new();
     for suffix in [
-        format!("bin/{binary}"),
+        format!("bin/{}", binary_name_for_target(target)),
         "LICENSE.md".into(),
         "NOTICE.txt".into(),
         "OPERATIONS.md".into(),
@@ -2725,6 +2744,13 @@ fn expected_names(root: &str, binary: &str) -> BTreeSet<String> {
         "release/sbom.cdx.json".into(),
     ] {
         s.insert(format!("{root}/{suffix}"));
+    }
+    if let Some(runtime) = kio_core::litert::Bundle::for_target(target) {
+        s.extend(
+            runtime
+                .names()
+                .map(|name| format!("{root}/{}/{name}", runtime.directory())),
+        );
     }
     s
 }
@@ -3895,7 +3921,7 @@ mod tests {
     fn payload() -> BTreeMap<String, (Vec<u8>, u32)> {
         let root = root();
         let mut p = BTreeMap::new();
-        for name in expected_names(&root, binary_name_for_target("x86_64-unknown-linux-gnu")) {
+        for name in expected_names(&root, "x86_64-unknown-linux-gnu") {
             if name.ends_with("/release/checksums.json") {
                 continue;
             }

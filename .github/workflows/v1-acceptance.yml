@@ -79,6 +79,9 @@ jobs:
             --locked --all-features --format-version 1 \
             --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" >/dev/null
 
+      - name: Prefetch LiteRT-LM for offline builds
+        run: bash scripts/ci/fetch-litert-runtime.sh
+
       - name: Build two isolated, reproducible release archives bound to the candidate
         env:
           CANDIDATE_SHA: ${{ inputs.candidate_sha }}
