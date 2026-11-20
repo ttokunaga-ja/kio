@@ -10,11 +10,11 @@ mod windows;
 #[cfg(target_os = "linux")]
 pub(crate) use linux::clear_errno;
 #[cfg(target_os = "linux")]
-pub(crate) use linux::confinement::{NativeRenderSandbox, default_render_resource_limits};
+pub(crate) use linux::confinement::NativeRenderSandbox;
 #[cfg(target_os = "macos")]
 pub(crate) use macos::clear_errno;
 #[cfg(target_os = "macos")]
-pub(crate) use macos::confinement::{NativeRenderSandbox, default_render_resource_limits};
+pub(crate) use macos::confinement::NativeRenderSandbox;
 #[cfg(target_os = "macos")]
 pub(crate) use macos::monitor::run_bounded_command_with_unix_renderer_limits;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -28,7 +28,7 @@ pub(crate) use unix::process::{
     ProcessTree, child_has_exited, configure_process_isolation, terminate_process_tree,
 };
 #[cfg(target_os = "windows")]
-pub(crate) use windows::confinement::{NativeRenderSandbox, default_render_resource_limits};
+pub(crate) use windows::confinement::NativeRenderSandbox;
 #[cfg(target_os = "windows")]
 pub(crate) use windows::io::{StdinPump, read_stream};
 #[cfg(all(test, target_os = "windows"))]
@@ -50,4 +50,11 @@ pub use windows::process::{
 pub(crate) use linux::monitor::UnixRendererMonitor;
 
 #[cfg(all(debug_assertions, target_os = "linux"))]
-pub(crate) use linux::confinement_cgroup::injected_isolation_failure;
+pub use linux::confinement_cgroup::injected_linux_isolation_failure_for_test;
+
+#[cfg(target_os = "linux")]
+pub(crate) use linux::confinement::{RENDER_ADDRESS_SPACE_BYTES, RENDER_PHYSICAL_MEMORY_BYTES};
+#[cfg(target_os = "macos")]
+pub(crate) use macos::confinement::{RENDER_ADDRESS_SPACE_BYTES, RENDER_PHYSICAL_MEMORY_BYTES};
+#[cfg(windows)]
+pub(crate) use windows::confinement::{RENDER_ADDRESS_SPACE_BYTES, RENDER_PHYSICAL_MEMORY_BYTES};

@@ -7,7 +7,7 @@ use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus};
 use std::thread::JoinHandle;
 
-pub(in crate::eg2) fn configure_command(command: &mut Command, memory_bytes: u64) {
+pub(crate) fn configure_command(command: &mut Command, memory_bytes: u64) {
     command.process_group(0);
     for (name, _) in std::env::vars_os() {
         let name_bytes = name.as_encoded_bytes();
@@ -45,13 +45,10 @@ pub(in crate::eg2) fn configure_command(command: &mut Command, memory_bytes: u64
     }
 }
 
-pub(in crate::eg2) fn configure_worker(slot: EngineSlot) -> Result<(), WorkerError> {
-    // SAFETY: these calls act on the calling worker only.
+pub(crate) fn configure_worker(slot: EngineSlot) -> Result<(), WorkerError> {
+    crate::platform::configure_eg2_worker_privacy()?;
+    // SAFETY: this call acts on the calling worker only.
     unsafe {
-        #[cfg(target_os = "linux")]
-        if libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0 {
-            return Err(WorkerError::Startup);
-        }
         if slot == EngineSlot::Index && libc::setpriority(libc::PRIO_PROCESS, 0, 10) != 0 {
             return Err(WorkerError::Startup);
         }
@@ -59,7 +56,7 @@ pub(in crate::eg2) fn configure_worker(slot: EngineSlot) -> Result<(), WorkerErr
     Ok(())
 }
 
-pub(in crate::eg2) fn private_output(
+pub(crate) fn private_output(
     capture_diagnostics: bool,
 ) -> Result<(File, Option<File>), WorkerError> {
     let null = File::options()
@@ -89,19 +86,19 @@ pub(in crate::eg2) fn private_output(
     }
 }
 
-pub(in crate::eg2) struct ProcessLimits;
+pub(crate) struct ProcessLimits;
 
 impl ProcessLimits {
-    pub(in crate::eg2) fn attach(_: &Child, _: u64) -> Result<Self, WorkerError> {
+    pub(crate) fn attach(_: &Child, _: u64) -> Result<Self, WorkerError> {
         Ok(Self)
     }
 
-    pub(in crate::eg2) fn check(&self) -> Result<(), WorkerError> {
+    pub(crate) fn check(&self) -> Result<(), WorkerError> {
         Ok(())
     }
 }
 
-pub(in crate::eg2) fn peek_exit(child: &mut Child) -> io::Result<Option<ExitStatus>> {
+pub(crate) fn peek_exit(child: &mut Child) -> io::Result<Option<ExitStatus>> {
     // Keep the leader's PID reserved until stop() has signalled its group.
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     if unsafe {
@@ -127,12 +124,12 @@ pub(in crate::eg2) fn peek_exit(child: &mut Child) -> io::Result<Option<ExitStat
     Ok(Some(ExitStatus::from_raw(raw)))
 }
 
-pub(in crate::eg2) fn terminate_group(child: &Child) {
+pub(crate) fn terminate_group(child: &Child) {
     // SAFETY: the unreaped child's PID is the process group ID set at spawn.
     unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
 }
 
-pub(in crate::eg2) fn configure_pipes(stdin: &ChildStdin, stdout: &ChildStdout) -> io::Result<()> {
+pub(crate) fn configure_pipes(stdin: &ChildStdin, stdout: &ChildStdout) -> io::Result<()> {
     for fd in [stdin.as_raw_fd(), stdout.as_raw_fd()] {
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
         if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
@@ -142,27 +139,25 @@ pub(in crate::eg2) fn configure_pipes(stdin: &ChildStdin, stdout: &ChildStdout) 
     Ok(())
 }
 
-pub(in crate::eg2) fn interrupt_io(_: &JoinHandle<()>) {}
+pub(crate) fn interrupt_io(_: &JoinHandle<()>) {}
 
-pub(in crate::eg2) fn memory_exit(_: ExitStatus) -> bool {
+pub(crate) fn memory_exit(_: ExitStatus) -> bool {
     // Unix signals alone do not identify the cause of an abort. The C API
     // reports resource exhaustion when a failed allocation is recoverable.
     false
 }
 
-pub(in crate::eg2) struct SlotGate(File);
+pub(crate) struct SlotGate(File);
 
 impl SlotGate {
-    pub(in crate::eg2) fn open(slot: EngineSlot) -> Result<Self, WorkerError> {
+    pub(crate) fn open(slot: EngineSlot) -> Result<Self, WorkerError> {
         // Fixed machine-wide sticky directory. These empty coordination files
         // outlive individual workers and are never unlinked. Anyone may open
         // them read-only and take a kernel lock, independent of HOME or XDG.
         #[cfg(test)]
         let root = std::env::temp_dir();
-        #[cfg(all(not(test), target_os = "macos"))]
-        let root = "/private/tmp";
-        #[cfg(all(not(test), not(target_os = "macos")))]
-        let root = "/tmp";
+        #[cfg(not(test))]
+        let root = crate::platform::EG2_SLOT_ROOT;
         let path = std::path::Path::new(&root).join(format!("kio-eg2-engine-{}.lock", slot.name()));
         let flags = libc::O_NOFOLLOW | libc::O_NONBLOCK;
         let open = || File::options().read(true).custom_flags(flags).open(&path);
@@ -199,7 +194,7 @@ impl SlotGate {
         Ok(Self(file))
     }
 
-    pub(in crate::eg2) fn try_acquire(&mut self) -> Result<bool, WorkerError> {
+    pub(crate) fn try_acquire(&mut self) -> Result<bool, WorkerError> {
         match self.0.try_lock() {
             Ok(()) => Ok(true),
             Err(std::fs::TryLockError::WouldBlock) => Ok(false),
@@ -208,7 +203,7 @@ impl SlotGate {
     }
 }
 
-pub(in crate::eg2) fn exit_worker(code: i32) -> ! {
+pub(crate) fn exit_worker(code: i32) -> ! {
     // SAFETY: exit immediately even if a native thread holds a C runtime lock.
     unsafe { libc::_exit(code) }
 }

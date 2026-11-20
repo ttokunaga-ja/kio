@@ -75,6 +75,7 @@
 ### D-20261018-01 共通コードの行数の上限
 
 - **内容**：共通コードの上限は、2026-10-10 の決定で 100,000 行から 106,000 行に一度引き上げた（`284c836`）。embedding の作業（EG2 まで）が終わった時点の実測から、もう一度だけ引き上げる。
+- **実行結果**：2026-11-20、EG2 完了時の実測 139,211 行をもとに、上限を 140,000 行に引き上げた。
 - **理由**：型付きの response や明示的な context を、行数を減らすために崩さないため。EG2 は別の機能の追加で、既存の上限を超えるため。
 - **関係する資料**：`docs/09-mvp-scope.md`、`crates/kio-ci/src/code_limits.rs`。`tasks/v1-plan.md` の F1。
 
@@ -247,3 +248,9 @@
 - **内容**：EG2 の runtime の固定を、LiteRT-LM 0.18.0 から v0.19.1 の C API 1.0.0（公式 release の `litert_lm_c_api-1.0.0.zip`、SHA-256 `1d430d80eaf536f696a4922270ba55eb3d112189ac198c3066d487a45e3b4d4c`）に変える。同梱の置き場所は `lib/litert-lm/0.19.1/<target>/`。
 - **理由**：0.18.0 の release には、Linux・Windows 向けのビルド済みの C API の library がない（Apple 向けの xcframework だけ）。v0.19.1 の C API 1.0.0 の zip には Linux x64・macOS arm64・Windows x64 の共有 library と `embedding_engine.h` があり、release の記載の hash と一致した（2026-11-20、統括が確認）。自前で 3 OS 向けに build するより単純である。利用者が選んだ。C API 1.0.0 は 0.18.0 と互換のない変更を含むが、EG2 の実装はまだない。
 - **関係する資料**：`docs/10-operations.md` §5.1、`docs/03-data-model.md` の embedding の producer の例、D-20261120-01、`tasks/v1-plan.md` §3.4 の G1。
+
+### D-20261120-03 Linux 固有コードの行数の上限
+
+- **内容**：F1 で Linux 固有コードの上限を 4,000 行から 4,500 行に一度だけ引き上げる。
+- **理由**：EG2 完了時の実測が 4,372 行だったため。利用者が 2026-11-20 に決定した。
+- **関係する資料**：`docs/09-mvp-scope.md` §3、`crates/kio-ci/src/code_limits.rs`、`tasks/v1-plan.md` §3.5 の F1。

@@ -197,20 +197,7 @@ fn stream_named(
     Ok(result)
 }
 
-#[cfg(windows)]
-pub(crate) fn observe_tree_handle(
-    root: &RecordStageRoot,
-    file: &std::fs::File,
-    max: u64,
-) -> Result<(crate::dag::TreeObject, FileObservation)> {
-    let (tree, observation) = stream_handle(Some(root), &CasReadAccess::Unmetered, file, max)?;
-    Ok((
-        tree.ok_or_else(|| corrupt("invalid tree object"))?,
-        observation,
-    ))
-}
-
-fn stream_handle(
+pub(crate) fn stream_handle(
     root: Option<&RecordStageRoot>,
     reads: &CasReadAccess,
     file: &std::fs::File,

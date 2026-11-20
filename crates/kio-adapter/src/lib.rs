@@ -20,11 +20,7 @@ pub mod local_rerank;
 mod mistral_ocr;
 pub mod model_download;
 pub mod office_convert;
-#[cfg(any(target_os = "macos", test))]
-mod office_macos_seal;
 mod office_runtime_identity;
-#[cfg(any(windows, test))]
-mod office_signature_worker;
 mod ooxml_package;
 pub mod pdf_decode;
 mod platform;

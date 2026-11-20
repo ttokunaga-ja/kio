@@ -1,5 +1,17 @@
 use crate::{AdapterError, Result};
 use std::{ffi::OsString, path::Path};
+pub(crate) fn private_office_scratch(
+    directory: std::io::Result<tempfile::TempDir>,
+) -> Result<tempfile::TempDir> {
+    let directory = directory.map_err(|error| {
+        AdapterError::ContractViolation(format!(
+            "failed to create private office scratch directory: {error}"
+        ))
+    })?;
+    restrict_scratch(directory.path())?;
+    Ok(directory)
+}
+
 pub(crate) fn restrict_scratch(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(|error| {
@@ -68,6 +80,12 @@ pub(crate) fn finish_scratch(scratch: tempfile::TempDir) -> Result<()> {
     scratch.close().map_err(|error| {
         AdapterError::ContractViolation(format!("failed to remove private Office scratch: {error}"))
     })
+}
+
+pub(crate) const DEFAULT_OFFICE_CONVERTER_PROGRAM: &str = "soffice";
+
+pub(crate) fn office_package_launch_roots(_: &[std::path::PathBuf]) -> &[std::path::PathBuf] {
+    &[]
 }
 
 #[cfg(test)]

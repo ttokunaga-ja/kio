@@ -353,16 +353,7 @@ fn open_import(path: &Path) -> Result<(File, u64)> {
     {
         return Err(regular_only());
     }
-    let mut options = File::options();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
-    }
-    let file = options
-        .open(path)
-        .map_err(|error| file_error(path, error))?;
+    let file = crate::platform::open_model_import(path).map_err(|error| file_error(path, error))?;
     let metadata = file.metadata().map_err(|error| file_error(path, error))?;
     if !metadata.is_file() {
         return Err(regular_only());

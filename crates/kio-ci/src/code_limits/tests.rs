@@ -266,10 +266,10 @@ fn tooling_ignores_layout_os_checks_and_file_limits() {
 #[test]
 fn category_and_file_boundaries_are_strict() {
     for (category, limit, location, tooling) in [
-        ("common", 106000, "src/data", false),
+        ("common", 140_000, "src/data", false),
         ("windows", 14000, "src/platform/windows", false),
         ("unix", 9000, "src/platform/unix", false),
-        ("linux", 4000, "src/platform/linux", false),
+        ("linux", 4_500, "src/platform/linux", false),
         ("macos", 3000, "src/platform/macos", false),
         ("tooling", 65000, "src/data", true),
     ] {

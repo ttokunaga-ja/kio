@@ -289,7 +289,6 @@ trait BoundedProcessMonitor {
     fn operation_deadline(&self, deadline: Instant) -> Instant {
         deadline
     }
-    #[cfg(target_os = "macos")]
     fn before_spawn(&mut self) -> Result<(), BoundedProcessError> {
         Ok(())
     }
@@ -340,7 +339,6 @@ fn run_bounded_command_inner_impl<M: BoundedProcessMonitor>(
     let mut process_tree = monitor
         .process_tree()
         .map_err(BoundedProcessError::Isolation)?;
-    #[cfg(target_os = "macos")]
     monitor.before_spawn()?;
     let mut child = command.spawn().map_err(BoundedProcessError::Spawn)?;
     if let Err(error) = process_tree.attach_and_resume(&child) {

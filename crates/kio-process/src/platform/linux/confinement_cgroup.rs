@@ -60,8 +60,10 @@ fn component_error(component: &str, error: io::Error) -> io::Error {
     io::Error::new(error.kind(), format!("{component} is {state}: {error}"))
 }
 // Fault injection only produces rejection and shares production diagnostics.
+/// Inject an unavailable Linux isolation component at the diagnostic boundary.
+/// This debug-only entry point always rejects.
 #[cfg(debug_assertions)]
-pub(crate) fn injected_isolation_failure(selector: &str) -> ConfinementError {
+pub fn injected_linux_isolation_failure_for_test(selector: &str) -> ConfinementError {
     if selector == "startup" {
         return ConfinementError::Process(scope_startup_failure());
     }
@@ -229,7 +231,7 @@ where
         .arg(keep_fd.to_string())
         .arg(ready_fd.to_string())
         .arg(bwrap);
-    let bubblewrap = sandbox.linux_command(args)?;
+    let bubblewrap = sandbox.linux_command(args);
     command.arg("--clearenv");
     for (name, value) in environment {
         if name.is_empty() || name.as_encoded_bytes().contains(&b'=') {

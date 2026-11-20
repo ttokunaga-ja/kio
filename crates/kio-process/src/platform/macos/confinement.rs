@@ -8,7 +8,6 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
-    time::Duration,
 };
 
 #[derive(Debug, Clone)]
@@ -101,16 +100,8 @@ impl NativeRenderSandbox {
     }
 }
 
-pub(crate) fn default_render_resource_limits() -> RenderResourceLimits {
-    RenderResourceLimits {
-        wall_timeout: Duration::from_secs(300),
-        cpu_seconds: 300,
-        max_aggregate_memory_bytes: 2 * 1024 * 1024 * 1024,
-        max_address_space_bytes: 0,
-        max_physical_memory_bytes: 2 * 1024 * 1024 * 1024,
-        max_file_bytes: 250 * 1024 * 1024,
-    }
-}
+pub(crate) const RENDER_ADDRESS_SPACE_BYTES: u64 = 0;
+pub(crate) const RENDER_PHYSICAL_MEMORY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 fn macos_profile(scratch: &Path, runtime_roots: &[PathBuf]) -> String {
     let mut profile = String::from(

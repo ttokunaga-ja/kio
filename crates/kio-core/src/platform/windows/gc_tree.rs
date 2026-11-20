@@ -1,9 +1,7 @@
 use super::gc_io::{directory, matches_stable};
 use crate::cas::CasReadAccess;
 use crate::error::Result;
-use crate::gc::{
-    FileObservation, corrupt, is_io_not_found, observe_cas_regular, observe_tree_handle,
-};
+use crate::gc::{FileObservation, corrupt, is_io_not_found, observe_cas_regular};
 use std::path::Path;
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn retire_candidate_tree(
@@ -81,4 +79,18 @@ pub(crate) fn retire_candidate_tree(
     retirement_checkpoint()?;
     crate::platform::retire_gc_handle(&archive, &victim)?;
     Ok(true)
+}
+
+fn observe_tree_handle(
+    root: &crate::disk_records::RecordStageRoot,
+    file: &std::fs::File,
+    max: u64,
+) -> Result<(crate::dag::TreeObject, FileObservation)> {
+    use crate::gc::observed_read::stream_handle;
+
+    let (tree, observation) = stream_handle(Some(root), &CasReadAccess::Unmetered, file, max)?;
+    Ok((
+        tree.ok_or_else(|| corrupt("invalid tree object"))?,
+        observation,
+    ))
 }

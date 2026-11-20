@@ -34,7 +34,7 @@ use crate::office_runtime_identity::{
     ExecutableFingerprint, RuntimeSnapshot, check_verification_deadline,
 };
 use crate::platform::{
-    OfficeRuntime, canonical_renderer_program, file_url, finish_scratch, private_temp_dir,
+    DEFAULT_OFFICE_CONVERTER_PROGRAM, OfficeRuntime, file_url, finish_scratch, private_temp_dir,
     restrict_renderer_state_directory, scratch_recovery_note,
 };
 use crate::{AdapterError, Result};
@@ -48,11 +48,6 @@ use crate::{AdapterError, Result};
 pub const TEST_OFFICE_CONVERT_ENV: &str = "KIO_TEST_OFFICE_CONVERT";
 /// Explicit converter binary path, checked before the `soffice` PATH lookup.
 pub const OFFICE_CONVERTER_ENV: &str = "KIO_OFFICE_CONVERTER";
-/// The PATH-resolved program name probed as the last resolution step.
-#[cfg(not(windows))]
-const DEFAULT_OFFICE_CONVERTER_PROGRAM: &str = "soffice";
-#[cfg(windows)]
-const DEFAULT_OFFICE_CONVERTER_PROGRAM: &str = "soffice.exe";
 pub(crate) const MAX_OFFICE_PROBE_PDF_BYTES: usize = 2 * 1024 * 1024;
 const MAX_OFFICE_PROBE_SCRATCH_BYTES: u64 = 8 * 1024 * 1024;
 const OFFICE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -258,12 +253,17 @@ pub fn resolve_office_converter_with_control(
             ),
         });
     };
-    #[cfg(all(debug_assertions, target_os = "linux"))]
-    if let Some(fault) = control.debug().adapters.office_isolation_failure.known() {
+    #[cfg(debug_assertions)]
+    if let Some(error) = control
+        .debug()
+        .adapters
+        .office_isolation_failure
+        .known()
+        .and_then(|selector| crate::platform::office_isolation_fault(selector))
+    {
         return Err(OfficeUnavailable {
             state: "unusable",
-            reason: kio_process::confinement::injected_linux_isolation_failure_for_test(fault)
-                .to_string(),
+            reason: error.to_string(),
         });
     }
     probe_real_converter_diagnostic(program, control, deadline).map_err(unusable)
@@ -277,7 +277,10 @@ fn renderer_candidate_exists(program: &Path, deadline: Instant) -> Result<bool> 
 }
 
 fn resolve_program(program: &Path, deadline: Instant) -> Result<Option<PathBuf>> {
-    find_program_candidate(program, deadline, canonical_renderer_program)
+    find_program_candidate(program, deadline, |candidate| {
+        let canonical = std::fs::canonicalize(candidate).ok()?;
+        canonical.is_file().then_some(canonical)
+    })
 }
 
 /// Discover candidates and inspect each one against the same probe deadline.
@@ -320,8 +323,7 @@ fn probe_real_converter_diagnostic(
         control,
         deadline,
     )?;
-    #[cfg(not(target_os = "linux"))]
-    renderer.verify_runtime_signatures(deadline)?;
+    renderer.verify_initial_runtime(deadline)?;
     let version = probe_renderer_capability(
         || renderer.renderer_version(deadline),
         |fixture, media_type| {
@@ -345,15 +347,13 @@ impl RealRenderer {
         deadline: Instant,
     ) -> Result<Self> {
         check_renderer_deadline(deadline)?;
-        // On Windows these roots are checked for existence by the launcher.
-        // The AppContainer still depends on the package's pre-existing ACLs.
-        #[cfg(windows)]
-        let runtime_roots = runtime_roots
-            .into_iter()
-            .chain(package_roots.iter().cloned());
-        let sources = RenderSources::resolve(program, runtime_roots)
+        let launch_roots = runtime_roots.into_iter().chain(
+            crate::platform::office_package_launch_roots(&package_roots)
+                .iter()
+                .cloned(),
+        );
+        let sources = RenderSources::resolve(program, launch_roots)
             .map_err(|error| AdapterError::ContractViolation(error.to_string()))?;
-        #[cfg(target_os = "linux")]
         let sources = runtime.bind_runtime(sources)?;
         if sources.program() != program {
             return Err(AdapterError::ContractViolation(
@@ -362,13 +362,9 @@ impl RealRenderer {
         }
         let program_fingerprint =
             ExecutableFingerprint::new(sources.program(), deadline).map_err(verification_error)?;
-        #[cfg(target_os = "linux")]
         let runtime_snapshot = runtime
             .snapshot(package_roots, &sources, deadline)
             .map_err(verification_error)?;
-        #[cfg(not(target_os = "linux"))]
-        let runtime_snapshot =
-            RuntimeSnapshot::new(package_roots, &sources, deadline).map_err(verification_error)?;
         Ok(Self {
             sources,
             program_fingerprint,
@@ -380,25 +376,13 @@ impl RealRenderer {
         })
     }
 
-    #[cfg(not(target_os = "linux"))]
-    fn verify_runtime_signatures(&self, deadline: Instant) -> Result<()> {
-        let program = self.sources.program();
-        self.runtime_snapshot
-            .verify_signatures(&self.sources, deadline, || {
-                #[cfg(target_os = "macos")]
-                self.runtime
-                    .verify_runtime_signature(program, &self.runtime_snapshot, deadline)
-                    .map_err(std::io::Error::other)?;
-                #[cfg(windows)]
-                self.runtime.verify_runtime_signatures(
-                    program,
-                    &self.runtime_snapshot.pin_windows_package(deadline)?,
-                    deadline,
-                )?;
-                self.program_fingerprint
-                    .verify(program, "during signature verification", deadline)
-            })
-            .map_err(verification_error)
+    fn verify_initial_runtime(&self, deadline: Instant) -> Result<()> {
+        self.runtime.verify_initial_runtime(
+            &self.sources,
+            &self.runtime_snapshot,
+            &self.program_fingerprint,
+            deadline,
+        )
     }
 
     fn renderer_version(&self, deadline: Instant) -> Result<String> {
@@ -423,10 +407,9 @@ impl RealRenderer {
             .environment(self.sources.program(), Some(&profile_dir));
         self.runtime
             .configure_services(scratch.path(), &mut environment, deadline)?;
-        #[cfg(windows)]
         let _runtime_pins = self
             .runtime_snapshot
-            .pin_windows_package(deadline)
+            .pin_before_launch(deadline)
             .map_err(verification_error)?;
         let result = sandbox.run_checked_until(
             [
@@ -458,7 +441,6 @@ impl RealRenderer {
         check_verification_deadline(deadline)?;
         self.program_fingerprint
             .verify(self.sources.program(), stage, deadline)?;
-        #[cfg(target_os = "linux")]
         self.runtime.verify_roots(deadline)?;
         self.runtime_snapshot.verify(&self.sources, stage, deadline)
     }
@@ -728,10 +710,9 @@ impl RealRenderer {
             ));
         }
         runtime.configure_services(workdir, &mut environment, deadline)?;
-        #[cfg(windows)]
         let _runtime_pins = self
             .runtime_snapshot
-            .pin_windows_package(deadline)
+            .pin_before_launch(deadline)
             .map_err(verification_error)?;
         let output = match sandbox.run_checked_until(
             arguments,
@@ -1127,7 +1108,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let program = directory.path().join("soffice");
         executable_script(&program, "#!/bin/sh\nexit 0\n");
-        let canonical = canonical_renderer_program(program.clone()).unwrap();
+        let canonical = resolve_program(&program, test_deadline()).unwrap().unwrap();
         assert_eq!(canonical, program.canonicalize().unwrap());
         assert!(macos_office_bundle_candidate(&canonical).is_none());
     }
@@ -2464,7 +2445,7 @@ mod tests {
         )
         .unwrap();
         renderer
-            .verify_runtime_signatures(deadline)
+            .verify_initial_runtime(deadline)
             .expect("verify copied bundle signature");
         let converter = OfficeConverter {
             backend: ConverterBackend::Real(renderer),

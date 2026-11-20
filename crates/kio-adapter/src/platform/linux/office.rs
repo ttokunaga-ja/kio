@@ -4,7 +4,9 @@ use super::{
 };
 use crate::{
     AdapterError, Result,
-    office_runtime_identity::{RuntimeSnapshot, check_verification_deadline},
+    office_runtime_identity::{
+        ExecutableFingerprint, RuntimeSnapshot, check_verification_deadline, optional_metadata,
+    },
 };
 use kio_process::confinement::RenderSources;
 use std::{
@@ -17,19 +19,8 @@ use std::{
 };
 use tempfile::{Builder, TempDir};
 
-pub(crate) fn canonical_renderer_program(candidate: PathBuf) -> Option<PathBuf> {
-    let canonical = fs::canonicalize(candidate).ok()?;
-    canonical.is_file().then_some(canonical)
-}
-
 pub(crate) fn private_temp_dir() -> Result<TempDir> {
-    let directory = Builder::new().prefix("kio-").tempdir().map_err(|error| {
-        AdapterError::ContractViolation(format!(
-            "failed to create private office scratch directory: {error}"
-        ))
-    })?;
-    super::super::unix::office_fs::restrict_scratch(directory.path())?;
-    Ok(directory)
+    super::super::unix::office_fs::private_office_scratch(Builder::new().prefix("kio-").tempdir())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +65,17 @@ fn tdf_version<'a>(bundle: &'a Path, system: &Path) -> Option<&'a str> {
 }
 
 impl OfficeRuntime {
+    pub(crate) fn verify_initial_runtime(
+        &self,
+        _: &RenderSources,
+        _: &RuntimeSnapshot,
+        _: &ExecutableFingerprint,
+        _: Instant,
+    ) -> Result<()> {
+        // Package evidence was verified while capturing the snapshot.
+        Ok(())
+    }
+
     pub(crate) fn new(program: &Path, deadline: Instant) -> Result<Self> {
         // SAFETY: geteuid takes no arguments and has no memory preconditions.
         let uid = unsafe { libc::geteuid() };
@@ -400,16 +402,15 @@ impl RuntimeTrust {
     }
 }
 
-pub(super) fn optional_metadata(path: &Path) -> io::Result<Option<Metadata>> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => Ok(Some(metadata)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
 fn contract_error(error: impl std::fmt::Display) -> AdapterError {
     AdapterError::ContractViolation(error.to_string())
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn office_isolation_fault(
+    selector: &str,
+) -> Option<kio_process::confinement::ConfinementError> {
+    Some(kio_process::platform::injected_linux_isolation_failure_for_test(selector))
 }
 
 #[cfg(test)]

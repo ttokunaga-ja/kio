@@ -75,6 +75,9 @@ mod child_token;
 mod scratch_access;
 use scratch_access::ScratchGrant;
 
+pub(crate) const RENDER_ADDRESS_SPACE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+pub(crate) const RENDER_PHYSICAL_MEMORY_BYTES: u64 = 0;
+
 #[derive(Debug, Clone)]
 pub(crate) struct NativeRenderSandbox {
     program: PathBuf,
@@ -131,17 +134,6 @@ impl NativeRenderSandbox {
     }
     pub(crate) fn runtime_roots(&self) -> &[PathBuf] {
         &self.runtime_roots
-    }
-}
-
-pub(crate) fn default_render_resource_limits() -> RenderResourceLimits {
-    RenderResourceLimits {
-        wall_timeout: Duration::from_secs(300),
-        cpu_seconds: 300,
-        max_aggregate_memory_bytes: 2 * 1024 * 1024 * 1024,
-        max_address_space_bytes: 2 * 1024 * 1024 * 1024,
-        max_physical_memory_bytes: 0,
-        max_file_bytes: 250 * 1024 * 1024,
     }
 }
 

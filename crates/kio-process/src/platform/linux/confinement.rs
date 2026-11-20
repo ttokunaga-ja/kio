@@ -1,7 +1,15 @@
 //! Native Linux renderer state and bubblewrap command.
 use crate::confinement::{ConfinementError, RenderResourceLimits, RenderSources, RendererStart};
 use crate::{BoundedProcessOptions, BoundedProcessOutput};
-use std::{collections::BTreeMap, ffi::OsString, path::PathBuf, process::Command, time::Duration};
+use std::{
+    collections::BTreeMap,
+    ffi::OsString,
+    path::{Path, PathBuf},
+    process::Command,
+};
+
+pub(crate) const RENDER_ADDRESS_SPACE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+pub(crate) const RENDER_PHYSICAL_MEMORY_BYTES: u64 = 0;
 
 #[derive(Debug, Clone)]
 pub(crate) struct NativeRenderSandbox {
@@ -59,25 +67,20 @@ impl NativeRenderSandbox {
         super::confinement_cgroup::run(self, args, environment, options, start)
     }
 
-    pub(super) fn linux_command<I, S>(&self, args: I) -> Result<Command, ConfinementError>
+    pub(super) fn linux_command<I, S>(&self, args: I) -> Command
     where
         I: IntoIterator<Item = S>,
         S: AsRef<std::ffi::OsStr>,
     {
         let mut command = Command::new("/usr/bin/bwrap");
-        command
-            .arg("--unshare-net")
-            // A procfs mount without a private PID namespace exposes host
-            // processes, including same-user environments and proc/root links.
-            .arg("--unshare-pid")
-            .arg("--die-with-parent")
-            .arg("--new-session")
-            .arg("--proc")
-            .arg("/proc")
-            .arg("--dev")
-            .arg("/dev")
-            .arg("--tmpfs")
-            .arg("/tmp");
+        // A private PID namespace keeps host processes out of the procfs mount.
+        command.args([
+            "--unshare-net",
+            "--unshare-pid",
+            "--die-with-parent",
+            "--new-session",
+        ]);
+        command.args(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]);
         for (source, destination) in &self.runtime_mounts {
             command.arg("--ro-bind").arg(source).arg(destination);
         }
@@ -97,18 +100,14 @@ impl NativeRenderSandbox {
             .arg("--")
             .arg(&self.program)
             .args(args);
-        Ok(command)
+        command
     }
 }
 
-pub(crate) fn default_render_resource_limits() -> RenderResourceLimits {
-    RenderResourceLimits {
-        wall_timeout: Duration::from_secs(300),
-        cpu_seconds: 300,
-        max_aggregate_memory_bytes: 2 * 1024 * 1024 * 1024,
-        max_address_space_bytes: 2 * 1024 * 1024 * 1024,
-        max_physical_memory_bytes: 0,
-        max_file_bytes: 250 * 1024 * 1024,
+impl RenderSources {
+    /// Overlay an empty read-only directory at each Linux bind of the backing path.
+    pub fn with_masked_runtime_directory(self, path: &Path) -> Result<Self, ConfinementError> {
+        Self::checked(self.program, self.roots, Some(path))
     }
 }
 
@@ -136,8 +135,8 @@ mod tests {
         );
 
         let sources = sources.with_masked_runtime_directory(&cache).unwrap();
-        let sandbox = NativeRenderSandbox::new(&sources, root, default_render_resource_limits());
-        let command = sandbox.linux_command([] as [&str; 0]).unwrap();
+        let sandbox = NativeRenderSandbox::new(&sources, root, RenderResourceLimits::default());
+        let command = sandbox.linux_command([] as [&str; 0]);
         let args: Vec<_> = command.get_args().collect();
         let mount = args
             .windows(3)
