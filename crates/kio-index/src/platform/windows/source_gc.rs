@@ -367,7 +367,7 @@ mod tests {
         fn new() -> Self {
             let directory = tempfile::tempdir().unwrap();
             let kio_path = directory.path().join(".kio");
-            // docs/14: .kio and index are Kio-created objects, while the
+            // docs/10 §4.3: .kio and index are Kio-created objects, while the
             // enclosing TempDir is only an external fixture parent.
             let index_directory =
                 StoreDirectory::open_or_create_directories(&kio_path.join("index")).unwrap();

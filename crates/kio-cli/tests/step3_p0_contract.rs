@@ -9185,7 +9185,7 @@ fn logs_retention_days_is_rejected_in_scope_config() {
     assert_eq!(error["error_code"], "KIO-E-CONFIG-SCHEMA-001");
 }
 
-/// docs/14 operation preconditions: only consumed logging policy is validated.
+/// docs/10 §11.3: only consumed logging policy is validated.
 #[test]
 fn consumed_observability_retention_days_is_rejected_in_user_config() {
     let dir = indexed_scope();

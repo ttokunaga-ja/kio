@@ -1,7 +1,5 @@
 # 04 Pipeline
 
-統合元: 旧 `research/diff.md` (units / 差分判定) + 旧 `research/db.md` (SQLite schema / 検索バックエンド) + 旧 `research/batch.md` (タスク実行 / retry / budget)。いずれも正本ではなく、2026-07-18 に docs から撤去 (経緯は git 履歴で参照可)。
-
 ---
 
 # 1. パイプライン全体
@@ -32,7 +30,7 @@ SQLite (FTS5 + sqlite-vec, query acceleration)
 
 ## 1.1 ingest / スキャンの安全規則
 
-working tree の読み取りは次の規則に従う (出典: 旧 `research/folder-history-sqlite-design.md` §20 の監査済み規範の Kio 適応 — 2026-07-18 撤去、git 履歴で参照可):
+working tree の読み取りは次の規則に従う。
 
 - **単一 open**: raw_hash の計算と保存する bytes は**同一の open・同一のストリーム**から得る。hash 用と
   保存用に 2 回 open すると、その間の書き換えで「hash A の名前に内容 B」が保存され得る (CAS の破壊)
@@ -136,7 +134,7 @@ normalized 全文 (`report.pdf.md`) は **生成物 (view)** で、unit を決�
 (組み立て規則は [03-data-model.md §2.1](03-data-model.md))。確定 manifest の done entry が指す
 `normalized_unit_object` CAS 群が immutable な正本であり、path-named instance は current working projection に過ぎない。
 
-**unit_key の正準生成規則** (2026-07-03 確定、step2a §C-3):
+**unit_key の正準生成規則**:
 
 ```text
 unit_key = "<unit_kind>:<selector>"
@@ -173,7 +171,7 @@ tool_profile_hash が変わった
 
 page fingerprint は `(perceptual_hash, text_hash, visual_hash)` の三つ組であり、現在はいずれも完全一致だけを扱う。
 
-**MVP (Step 2) の具体アルゴリズム** (2026-07-03 確定、step2a §C-1):
+**再利用の条件**:
 
 ```text
 text_hash       = sha256(unit のテキスト層バイト列)。テキスト層が無い unit は空バイト列の sha256
@@ -184,7 +182,7 @@ visual_hash     = perceptual_hash と同値
 
 完全一致方式の不一致は当該 unit を full 再処理する。
 
-**prepared のバイト列決定性** (2026-07-03 確定、step2a §C-2): prepared のレンダリングパラメータ
+**prepared のバイト列決定性**: prepared のレンダリングパラメータ
 (renderer 名 / version / DPI / 色空間 / 出力フォーマット) は prepare Adapter の tool_profile
 ([07-adapter-spec.md §5.1](07-adapter-spec.md)) に含め、**同一入力ページ × 同一 profile のレンダリングは
 バイト安定であること**を prepare Adapter の採用要件とする。プラットフォーム間のバイト差は許容する
@@ -314,7 +312,7 @@ raw / prepared → normalized。非 text-native は文書処理 API 系 Adapter 
 }
 ```
 
-Adapter 側に「軽微とは言えない」拒否権あり (`fallback_to_full=true`)。受理側の扱いは §3.2 の**制御応答規則** — unit 検査に先立ち評価し、mode=full で再発行する。
+Adapter 側に「軽微とは言えない」拒否権あり (`fallback_to_full=true`)。受理側の扱いは §3.2 の**制御応答規則** — unit 検査に先立ち評価する。同期有料送信の扱いは [同期結果不明の回復](10-operations.md#同期結果不明の回復) に従う。
 
 **identity 不変性**: incremental/full で出力が異なっても identity は `(raw_hash, tool_profile_hash)` のまま。`tool_profile_hash` 計算入力に incremental flag は含めない。
 
@@ -371,7 +369,7 @@ full / incremental / retry 合成のいずれも、合成後の集合に対し�
 検査する)。衝突があれば persist 先 `<unit_ref>.json` が競合するため当該応答を whole-response
 reject とする (実用上は起こらない 64bit 衝突の防衛線 — 検査は persist 前の V 検査と同時に行う)。
 
-**制御応答 (fallback_to_full=true)**: validatorはV1〜V6より先に制御応答を識別する。unit配列・unchanged・removedは空であり、Full要求に対する同制御応答は契約違反とする。制御応答は正規化本文として保存しない。外部送信前の適用可否判定や、送信を行わない再利用の判定ではFullへ切り替えられる。同期の有料incremental要求を送信した後は、同じ予約でFullを再送しない。現行の同期Adapterは受信結果の耐久再取得を提供しないため、受理・保存できない応答は§5.4の`result_unknown`として停止する。`batch retry --resend-unknown <selector> --yes`で追加試行を承認すると、次のonline実行は新しい予約でFull要求を行う（既存の失敗unit subsetがある場合はそのsubsetを維持）。この承認も現在のpolicy、Adapter grant、予算判定を省略しない。
+**制御応答 (fallback_to_full=true)**: validatorはV1〜V6より先に制御応答を識別する。unit配列・unchanged・removedは空であり、Full要求に対する同制御応答は契約違反とする。制御応答は正規化本文として保存しない。外部送信前の適用可否判定や、送信を行わない再利用の判定ではFullへ切り替えられる。同期の有料incremental要求を送信した後は、同じ予約でFullを再送しない。現行の同期Adapterは受信結果の耐久再取得を提供しないため、受理・保存できない応答は§5.4の`result_unknown`として停止する。`batch retry --resend-unknown <selector> --yes`で追加試行を承認すると、次のonline実行は新しい予約でFull要求を行う（既存の失敗unit subsetがある場合はそのsubsetを維持）。この承認も現在のpolicy、Adapter grant、予算判定を省略しない。Batch の有効な制御応答は §5.8 の記帳・Full 開始の規則に従う。
 
 違反時の挙動:
 
@@ -452,7 +450,7 @@ CREATE TABLE chunk_config_generations (
 
 `chunk_id` (PRIMARY KEY) の値は chunk object の `chunk_hash` と同一文字列とする。`unit_content_hash` は exact Markdown bytes の安定 hash で chunk identity 入力。同一 gen の本文変更を分離する一方、generated_at 等だけが違う同一本文の再取り込みでは旧 pointer identity を維持する。exact immutable object の `unit_object_hash` は tree-pinned manifest entry が保持し、chunk row/object へは複製しない。
 
-**chunk 境界の正準規則** (2026-07-03 確定、step3a §C-1 の決定性論点解消。chunk_hash の入力である heading_path / section_id / span を実装非依存にする):
+**chunk 境界の正準規則**:
 
 ```text
 1. 入力は normalized instance の unit 列 (03 §2.1 の順序)。chunk は unit 境界を跨がない
@@ -504,9 +502,7 @@ CREATE VIRTUAL TABLE chunk_fts USING fts5(
                               --  literal 実行は parse error — 掲載 DDL は常に実行可能形とする)
 ```
 
-`chunk_id` 列は FTS 側に **持たない** (2026-07-14 実装準拠へ更新 — 旧 spec の `chunk_id UNINDEXED` 列は
-廃止)。外部 content モードでは hit の rowid で `chunks` と join でき、chunk_id と metadata は
-`chunks` 側から取得する。
+FTS は `chunk_id` 列を持たない。外部 content の hit は rowid で `chunks` に対応し、chunk ID と metadata は対応する chunk を参照する。
 
 trigger で chunks との同期を自動保守:
 
@@ -556,8 +552,6 @@ CREATE VIRTUAL TABLE chunk_vec USING vec0(
   embedding float[768] distance_metric=cosine
 );
 
--- 2026-07-26: 画像埋め込み用。embeddings.target_type は当初から 'image' を許容していたが、
--- KNN 検索できる vec0 テーブルが chunk 用しか無く、画像ベクトルを引く経路が存在しなかった。
 -- image_id = objects/image/ の image_hash (07-adapter-spec.md §5.2 の画像参照置換が用いる値)
 CREATE VIRTUAL TABLE image_vec USING vec0(
   image_id TEXT PRIMARY KEY,
@@ -567,7 +561,7 @@ CREATE VIRTUAL TABLE image_vec USING vec0(
 
 `chunk_vec` / `image_vec` の次元は採用 profile の **768 / cosine に固定** する ([07-adapter-spec.md §5.3](07-adapter-spec.md))。**両者は同一のベクトル空間である** — [03-data-model.md §7](03-data-model.md) の profile 互換性と、[07-adapter-spec.md §5.3](07-adapter-spec.md) が単一 Adapter による多モダリティの単一空間写像を要求しているため、物理テーブルの分割は sqlite-vec の制約 (1 テーブル 1 主キー型) に由来するものであって、意味的な分離ではない。したがって chunk ベクトルと image ベクトルの cosine は直接比較可能であり、検索側は両者を 1 つのランキングへ統合してよい ([05-runtime.md §1.4](05-runtime.md))。保存 vector と query vector はいずれも L2 正規化済みのため、cosine distance の順位は厳密に一致する。
 
-`embeddings` テーブル (メタデータ + vector BLOB) と `chunk_vec` / `image_vec` (vec0 virtual table) は、いずれも `objects/` から再構築可能な加速層であり、真実は `objects/` にある (§4 冒頭)。これらの間では **`embeddings` テーブルを正** とし、`chunk_vec` / `image_vec` は `embeddings` からの導出物として扱う。不整合を検出した場合および `kio repair rebuild-db` では、`objects/` → `embeddings` → `chunk_vec` → `image_vec` の順に再構築する。**`objects/embeddings/` への書き出しは vector を persist する経路が行い、SQLite 行より先に書く** (2026-07-26、R25-6)
+`embeddings` テーブル (メタデータ + vector BLOB) と `chunk_vec` / `image_vec` (vec0 virtual table) は、いずれも `objects/` から再構築可能な加速層であり、真実は `objects/` にある (§4 冒頭)。これらの間では **`embeddings` テーブルを正** とし、`chunk_vec` / `image_vec` は `embeddings` からの導出物として扱う。不整合を検出した場合および `kio repair rebuild-db` では、`objects/` → `embeddings` → `chunk_vec` → `image_vec` の順に再構築する。**`objects/embeddings/` への書き出しは vector を persist する経路が行い、SQLite 行より先に書く**
 — 両者の間で crash した場合、object があって行が無い状態は次の rebuild が復元できるが、行があって object が無い状態は
 `rebuild-db` が復元できない vector になる。
 
@@ -634,7 +628,7 @@ job・credential・入力の binding に基づいて source CAS に保存・課�
 
 `image_vec` の導出は同型だが**結合が要らない**点だけが異なる — 結合対象は **`target_type='image'` の行のみ**で、`embeddings.target_id` がそのまま `image_vec.image_id` (= `objects/image/` の `image_hash`) になる。chunk 側の `chunks.text_hash` 結合は「その本文を今どの chunk 行が担っているか」を再導出するためのものだが、画像は content-addressed object そのものが target であり、担い手を探す必要が無いためである （typed image context と現行入力 identity は [03-data-model.md §8.1](03-data-model.md) に従う）。**現行 tool-lock の embedding profile への限定は chunk 側と同一**に適用し、現行 `(image_hash, profile, input identity)` ごとに候補が 0 件または 1 件であることを検証する (0 件 = 未 enrichment で行を作らない。2 件以上は corruption)。
 
-query-vector cache の storage 保護は [14 の正本](14-v1-runtime-contracts.md#protection-of-kio-created-objects) に従う。
+query-vector cache の storage 保護は [Kio 作成物の保護](10-operations.md#43-kio-created-object-boundary) に従う。
 best-effort は cache 保存の可用性を指し、保護検証を省略する意味ではない。
 
 **cursor replay の query-vector cache**: page 1 の query vector は source `embeddings` 表に入れず、`${XDG_CACHE_HOME:-$HOME/.cache}/kio/search-query-cache/<query_vector_digest>` の device-local file に best-effort で保存する ([03-data-model.md §4.1](03-data-model.md)、[05-runtime.md §1.5](05-runtime.md))。`query_vector_digest` は canonical な float32 little-endian bytes（L2 正規化済み）の sha256 であり、query 本文・text_hash は保存しない。replay は file bytes の digest を再検証し、欠落・破損・不一致なら `KIO-E-SEARCH-CURSOR-001` で拒否する。`kio repair rebuild-db` はこの cache を読まず、purge closure にも含めない（文書 lifecycle と無関係）。
@@ -703,11 +697,9 @@ CREATE INDEX idx_tree_entries_ident ON tree_entries(commit_hash, raw_hash, tool_
 
 ## 4.7 prepared_units (論理台帳 — SQLite テーブル非採用)
 
-prepare 結果の台帳は **SQLite に永続化しない** (2026-07-14 実装準拠へ更新 — 旧 `CREATE TABLE
-prepared_units` は未実装のまま廃止)。prepare は決定論的 (§2) であり、raw object (CAS) からいつでも
-同一結果を再導出できるため、台帳はパイプライン実行時の in-memory 構造 (kio-pipeline の
-`PreparedUnit` 列) として持てば足りる。incremental Markdownize の unit fingerprint 比較 (§3) も、
-previous instance の manifest / unit object と、新 raw の再 prepare 結果の突き合わせで行う。
+prepare の結果は raw object から再導出できるため、prepare 台帳は SQLite に永続化しない。
+incremental Markdownize の再利用判定は、以前の
+manifest / unit object と新たな prepare の結果を比較する。
 
 レコードの論理形 (再導出結果の形状契約):
 
@@ -933,9 +925,8 @@ resource_limit がない受理応答で要求した全 unit が `failed_units` �
     再投入 — **この full 再投入は下記「持たない場合」の分岐と同一規範に従う**: `mode=full` でも
     request の prepared input は失敗 unit subset のみとし、V6 の母集合もその request に渡した subset とする。
     既 done unit を全 manifest の出力として再要求・再検査しない。既 done の unit は first-instance-wins で
-    保持して、失敗 unit の成功出力だけを immutable manifest へ併合する。**この full 再投入は §5.2 の retry の一部であり、attempts は通常規則
-    (task 側の retry budget — §5.3) を消費する** — §3.2 の「attempts 不算入」は Adapter 発の正常な
-    制御応答 (fallback_to_full) 起因の full にのみ適用する)。
+    保持して、失敗 unit の成功出力だけを immutable manifest へ併合する。この Full 再試行には §5.3 の通常の retry budget を適用する。Batch の有効な
+    `fallback_to_full` 制御応答を受けて開始する Full は、この task retry の attempts に算入しない)。
     **合成 hints の残余 field は `added_unit_keys = []`・`removed_unit_keys = []` と定める** — 元 run で
     added だった失敗 unit も retry では changed として再投入し、成功出力は `updated_units` 側で返る。
     §3.2 の V1〜V6 (V2 の removed 完全一致・V4 の added 集合式を含む) はこの合成値に対して評価する。
@@ -1078,7 +1069,7 @@ monthly_usd_cap = 10.0
 - 新規requestの予約条件は、当月の確定・推定課金と未終端予約の合計にcandidateを加えた額が、device、folder、device専用per-adapterの全capを下回ること。adapter_kindは`markdownize` / `embedding`の閉enumとし、未知キーはschema errorとする。candidate=0の無償処理はcap判定の対象外。判定と相1の予約は同じ`BEGIN IMMEDIATE` transactionで行う。
 - 同期requestの相1は`batch_requests`に新しいintent token、submission sequence、見積額、開始時刻、stale期限を保存する。この時点以降は送信された可能性がある。予約は一つの実送信の直前に作り、未送信の後続groupを先取りして予約しない。`cost_ledger`は追記専用であり、終端の課金記録とstate更新を同じtransactionで確定する。
 - 成功は報告usageを使い、usageが使えない場合は予約見積を使う。明示的な認証・rate limit・quota拒否は`submit_rejected`、課金0で終端する。再試行が許可される既知の拒否でも、次の実送信には新しいcap判定・予約が必要となる。
-- 同期OCRの回復は [14-v1-runtime-contracts.md](14-v1-runtime-contracts.md) の既存契約に従う。同期document embeddingの応答そのものが不明なら、見積額を`unknown_settled`として一度精算し、taskを非自動再試行の`result_unknown`にする。既存の未終端sync行は再送せず、保存されたstale期限に従って回収する。現行Adapterは同期要求の結果を後から取得するAPIを提供していないため、回収から出力の成功を推測しない。
+- 同期OCRの回復は [同期結果不明の回復](10-operations.md#同期結果不明の回復) に従う。同期document embeddingの応答そのものが不明なら、見積額を`unknown_settled`として一度精算し、taskを非自動再試行の`result_unknown`にする。既存の未終端sync行は再送せず、保存されたstale期限に従って回収する。現行Adapterは同期要求の結果を後から取得するAPIを提供していないため、回収から出力の成功を推測しない。
 - 同期embeddingの応答が既知で publication だけが失敗した場合は、受信結果を回復可能に保持して受入検査・精算・再公開を完了する。一般的なネットワーク retry や `result_unknown` に変換せず、新しい有料送信を行わない。既知の受入違反は contract_violation として精算する。
 - `result_unknown`の追加試行は、`kio batch retry --resend-unknown <selector> --yes`で一つのrequest identityを明示承認する。これは送信操作ではなく、現在のscopeに属する対象を再びqueueへ載せる操作である。既存課金を保持し、端末台帳の`unknown_resend_authorized`を一度だけ新しい相1へ消費する。次のonline実行は通常のscope/policy/Adapter承認と予算を再検証する。承認なしのlane切替、task再生成、再起動、月境界でこの制約を迂回できない。unknownと承認待ちのtask行は通常のdevice行剪定で削除しない。
 - Batchは既知のjob/outputを再取得する回復経路を持つ。結果のローカル保存失敗ではjobと予約を保持し、同じoutputを再収集する。新規job作成を結果回収の代わりに行わない。Batchのupload/jobの掃除は§5.8に従う。
@@ -1270,15 +1261,15 @@ member の descriptor による見積り**を対象とし、再利用 chunk (API
 Batch 型 online Adapter ([07-adapter-spec.md §5.5](07-adapter-spec.md)) は「upload → job 作成 →
 collect」の各段の間にクラッシュ窓があり、provider 側に課金・機密の実体 (upload・job) が残る。
 §5.5 の done 短絡はローカル出力の重複を防ぐだけで、**provider 側に作成済みの job を Kio が知らない
-状態 (無記録の in-flight)** は防げない。二重課金防止は次の 2 相プロトコルを正本とする (設計出典:
-旧 `research/folder-history-sqlite-design.md` §9 の多エンジン監査 r8〜r20 で固めた機構の Kio 適応 —
-2026-07-18 撤去、git 履歴で参照可。原則 = **外部に副作用を起こす前に意図を耐久記録する**。課金の
-記録喪失は有界だが、無記録の in-flight job は無制限に残る)。
+状態 (無記録の in-flight)** は防げない。二重課金防止は次の 2 相プロトコルを正本とする。外部に副作用を起こす前に、回復に必要な意図を耐久記録する。
 
 **記録の正本**: `cost-ledger.sqlite` の `batch_requests` 行 (DDL は §5.4 が SQL 正本)。tasks.jsonl は
 喪失許容 (§5.7) のため、in-flight Batch の回復は batch_requests だけで可能でなければならない。各段の
-記録は同 DB の単一 Tx で行う。cost-ledger.sqlite ごと喪失した場合の最終回収線は、provider job 一覧の
-metadata から intent_token 規約に一致する job を全走査することである (帰属は metadata の (scope_id, adapter_kind, input_hash, tool_profile_hash) と出力 JSONL の custom_id が担う — 新規 UUIDv7 の token 単独では帰属できない)。tasks.jsonl の task 記述子 (mode / unit_keys / output_ref) は喪失しうるが、**確定先と対象 unit は決定論的に再導出できる**: 出力の取り込み先はタスクキー (input_hash = raw、tool_profile_hash) と gen 規則から (**gen 規則 = 当該タスクキーの最新 instance の未完了 unit を補完する、に固定** — 当該 attempt が `--force` 由来かは再導出不能のため、force の意図は tasks.jsonl 喪失で失われ得る (再実行で回復)。誤 gen への上書き・二重課金は first-instance-wins と記帳の冪等性が防ぐ)、対象 unit は provider 出力 JSONL の custom_id (= unit_key) から復元し (**失敗 unit は出力に現れない — 期待 unit 集合は prepared units (raw から決定論的に再導出) との差集合で判定する**)、mode が不明な場合は full として扱う (§5.7 の安全側規定と同型)。**この full 扱いの受け入れ検査では、差集合の unit を当該 job の failed_units と見なして §3.2 (V6 を含む) を評価する** — 部分 retry 由来の sparse な正当出力を V6 の全集合違反として reject しない (既 done unit への影響は first-instance-wins が遮断する)。**合成する failed_units の error_kind は `network_error` (retryable — §5.3) に固定する** — 回復時は転送欠落と provider 明示の unit 失敗を区別できないため安全側 (再試行) に倒す (合成失敗 unit は通常の retry 経路で回復し、既 done unit は first-instance-wins が保全する)。この回復経路の V6 は差集合の定義により被覆を構造的に満たす — 検証強度は mode 既知の通常経路より意図的に低く、転送欠落の検出は retry の自己回復に委ねる。**この差集合 → failed_units 合成は Markdownize の回復規則である**。
+記録は同 DB の単一 Tx で行う。台帳全体の喪失は [台帳のライフサイクル](10-operations.md#デバイス課金台帳のライフサイクル) に従って扱う。
+provider job の回収は一覧から規約に一致する job を列挙し、metadata の
+`scope_id`・`adapter_kind`・`input_hash`・`tool_profile_hash` と出力 JSONL の `custom_id` で帰属を確かめる。
+intent token 単独で帰属を認めず、provider 一覧単独で台帳の正常性や支出額を確定しない。
+tasks.jsonl の task 記述子 (mode / unit_keys / output_ref) は喪失しうるが、**確定先と対象 unit は決定論的に再導出できる**: 出力の取り込み先はタスクキー (input_hash = raw、tool_profile_hash) と gen 規則から (**gen 規則 = 当該タスクキーの最新 instance の未完了 unit を補完する、に固定** — 当該 attempt が `--force` 由来かは再導出不能のため、force の意図は tasks.jsonl 喪失で失われ得る (再実行で回復)。誤 gen への上書き・二重課金は first-instance-wins と記帳の冪等性が防ぐ)、対象 unit は provider 出力 JSONL の custom_id (= unit_key) から復元し (**失敗 unit は出力に現れない — 期待 unit 集合は prepared units (raw から決定論的に再導出) との差集合で判定する**)、mode が不明な場合は full として扱う (§5.7 の安全側規定と同型)。**この full 扱いの受け入れ検査では、差集合の unit を当該 job の failed_units と見なして §3.2 (V6 を含む) を評価する** — 部分 retry 由来の sparse な正当出力を V6 の全集合違反として reject しない (既 done unit への影響は first-instance-wins が遮断する)。**合成する failed_units の error_kind は `network_error` (retryable — §5.3) に固定する** — 回復時は転送欠落と provider 明示の unit 失敗を区別できないため安全側 (再試行) に倒す (合成失敗 unit は通常の retry 経路で回復し、既 done unit は first-instance-wins が保全する)。この回復経路の V6 は差集合の定義により被覆を構造的に満たす — 検証強度は mode 既知の通常経路より意図的に低く、転送欠落の検出は retry の自己回復に委ねる。**この差集合 → failed_units 合成は Markdownize の回復規則である**。
 Embedding は保存済み job の入力 binding を正本とし、現在の chunk 集合や不完全な応答から元 member を推測しない。
 member の対応を検証できる応答では、§5.1 の受入検査に通る member だけを公開し、失敗 member だけを後続対象にする。
 対応を確立できない応答だけを全体拒否する。欠落/不正を成功扱いせず、不完全な usage は保守的に精算する。
@@ -1372,8 +1363,9 @@ UNIQUE 衝突し、実課金が DO NOTHING に黙って吸収される)。この
 正常完了 = `succeeded` / §3.2 reject 終端 = `contract_violation` / expired 終端 = `expired` /
 abandon = `abandoned` / 拒否課金 provider の submit 拒否 = `submit_rejected` / purge 起因の
 terminal 化 (error='purged') = `purged` / 回復期限超過・照会不能の estimated 確定 = `unknown_settled` /
-正常な制御応答 (`fallback_to_full=true`、§3.2) の request 終端 = `fallback_to_full` (task 非終端 —
-同 Tx 群の完了後に `mode=full` の新 request を相 1 で開始する)。
+有効な Batch 制御応答 (`fallback_to_full=true`、§3.2) は request の終端を `outcome='fallback_to_full'` とし、
+task は非終端に保つ。終端 transaction の完了後に `mode=full` の新 request を相 1 から開始する。
+同期の有料要求を送信済みの場合の制御応答は [同期結果不明の回復](10-operations.md#同期結果不明の回復) に従う。
 
 **記帳値の事前検証**: Adapter 報告値は INSERT 前に検証する — `usd` は有限・非負の数値。
 `billable_units` は **1 要素以上の配列で、各要素の `count` が有限・非負の整数、`kind` が閉 enum・
@@ -1389,7 +1381,7 @@ provider の reject 等) の usage 欠落は正当であり、確定額 0 (`usd=
 表の欠落) も「欠落」と同じ estimated 縮退 + warning とする** (終端 Tx を止めない。0 円確定にはしない —
 billable Adapter の pricing 被覆は送信前に検査される ([10-operations.md §11.3](10-operations.md))
 ため、この経路は途中で表が壊れた場合の防衛線)。**課金 field 単独の不良は応答の受否・outcome・`contract_violation_count` を
-変えない** — 成功は成功のまま、正常な制御応答は `outcome='fallback_to_full'` のまま (構造違反 (§3.2、
+変えない** — 成功は成功のまま、有効な Batch 制御応答は `outcome='fallback_to_full'` のまま (構造違反 (§3.2、
 Embedding は §5.1 の受入検査) だけが contract violation。
 課金 field の不良は warning log で可視化する —
 [07-adapter-spec.md §7](07-adapter-spec.md) の `usage_validation` / `billing_source` field と

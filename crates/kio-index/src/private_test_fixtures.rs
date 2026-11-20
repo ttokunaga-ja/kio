@@ -1,4 +1,4 @@
-// Included only inside unit-test modules. docs/14 protects Kio-created objects;
+// Included only inside unit-test modules. docs/10 §4.3 protects Kio-created objects;
 // a TempDir itself is an external parent, not automatically private storage.
 struct PrivateTestDirectory {
     _temporary: tempfile::TempDir,

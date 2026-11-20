@@ -1,7 +1,5 @@
 # 09 MVP Scope
 
-統合元: 旧 `north-star-scenarios.md` + 旧 `design-homework.md` + 旧 `consolidation-plan.md` の Phase plan + `01-positioning.md` から MVP/Phase 部分の抜粋 (research 検討メモは 2026-07-18 に撤去 — git 履歴で参照可)。
-
 > 本書は MVP の範囲、実装 Step、コード規模と構造の上限、北極星シナリオと評価規約、決定済みの設計論点を定める。
 
 ---
@@ -98,10 +96,6 @@ Step 4: export + --at + time-travel + purge 最小形 (tombstone) + evidence ver
 Step は Phase 1〜3 の実装順序の記録である。現在の v1 工程は
 [v1 plan](../tasks/v1-plan.md) を参照する。
 
-2026-10-05 に旧上限 (テスト除き 11,000〜16,000 行、ripgrep 以下) を廃止した。v1 は 3 OS の
-handle-bound 保存、送信承認、課金台帳、回復、監視を含み、旧上限の前提を外れた。上限は実測した
-現状規模を基準に置き、OS 共通ロジックと OS 固有層を分けて管理する。
-
 **前提: OS 共通ロジックと OS 固有層の分離**
 
 - OS 固有の処理は各製品 crate の `src/platform/` に置く。`platform/mod.rs` は OS 非依存の型と関数
@@ -139,32 +133,24 @@ symbolic link、UTF-8 でない file、`platform/` の規定外の file、この
 
 **上限**
 
-| 区分 | 上限 (コード行) | 2026-10-05 の推定値 |
-| --- | ---: | ---: |
-| OS 共通の製品ロジック | 106,000 | 約 101,000 |
-| OS 固有層: Windows | 14,000 | 約 11,000 |
-| OS 固有層: Unix 共通 | 9,000 | 約 7,600 |
-| OS 固有層: Linux | 4,000 | 約 2,300 |
-| OS 固有層: macOS | 3,000 | 約 1,300 |
-| 検証 tooling | 65,000 | 約 63,000 |
-| 製品 crate の 1 ファイル | 3,000 | 超過 5 本 |
-
-1 ファイルの超過は `kio-app/src/lib.rs` (約 21,500)、`kio-core/src/scope.rs` (約 6,800)、
-`kio-core/src/gc.rs` (約 4,800)、`kio-core/src/cas.rs` (約 4,700)、`kio-app/src/verify_objects.rs`
-(約 3,800) である。推定値は OS 条件付きの item と OS 名を持つファイルを走査した近似であり、
-OS 固有層を分離する前の値である。
-
-2026-10-14 に OS 共通の製品ロジックの上限を 100,000 から 106,000 に引き上げた (2026-10-10 利用者承認)。
-R2 で 98,084 行に収めた後、R3 の型付き response と、thread-local をやめて明示した実行 context・debug/test
-制御で 105,725 行になったためである。response を JSON 値の包みにして行数を節約することはしない。
+| 区分 | 上限 (コード行) |
+| --- | ---: |
+| OS 共通の製品ロジック | 106,000 |
+| OS 固有層: Windows | 14,000 |
+| OS 固有層: Unix 共通 | 9,000 |
+| OS 固有層: Linux | 4,000 |
+| OS 固有層: macOS | 3,000 |
+| 検証 tooling | 65,000 |
+| 製品 crate の 1 ファイル | 3,000 |
 
 **運用**
 
 - 上限と分離規則は `kio-ci` の `kio-code-limits` で計測し、CI で検査する。終了値は違反なしで 0、
   違反ありで 1、計測失敗で 2 とする。R 工程の途中の扱いは
   [v1 plan](../tasks/v1-plan.md) に従う。
-- 上限を超える変更は、同じ変更の中で削減する。上限自体の変更は利用者の承認を得て、理由と日付を本節に記録する。
+- 上限を超える変更は、同じ変更の中で削減する。上限自体の変更は利用者の承認を得て、決定と理由は [決定記録](decisions.md) に残す。
 - 上限は設計肥大化の検知に使う。行数を減らすために必要な検証、エラー処理、回復処理を削らない。
+  行数削減を目的に型付き response を汎用 JSON 値へ置き換えない。
 
 ## 3.1 機能 × Step 割当表
 
@@ -374,7 +360,7 @@ Phase 1 着手前に確定した論点の結論と正本である。
 
 | 論点 | 結論 | 正本 |
 | --- | --- | --- |
-| Markdown 非決定性 | first-instance-wins。gen+1 は `kio reindex --regenerate` か prepared_hash の変化に限る | [03-data-model.md §6](03-data-model.md) / [04-pipeline.md §5.5](04-pipeline.md) |
+| Markdown 非決定性 | first-instance-wins。gen+1 は `kio reindex --regenerate` か準備の identity の変化に限る | [03-data-model.md §6](03-data-model.md) / [04-pipeline.md §5.5](04-pipeline.md) |
 | Dead Evidence Pointer | 既定は tombstone。`--erase-tombstone` は法的要件のある場合だけ。`kio evidence verify` は 6 値の status を返す | [08-evidence-pointer-spec.md §4](08-evidence-pointer-spec.md) / [05-runtime.md §3](05-runtime.md) |
 | Incremental Markdownize の規約 | 入出力 schema は Kio が固定し、プロンプト規約 5 項に従う | [07-adapter-spec.md §8](07-adapter-spec.md) / [04-pipeline.md §3.1](04-pipeline.md) |
 | 検索評価ハーネス | 合成コーパス、履歴 fixture、凍結したゴールデンクエリで計測する | §4.3 / [eval/README.md](../eval/README.md) |

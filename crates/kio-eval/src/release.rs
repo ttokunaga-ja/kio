@@ -3530,7 +3530,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let temp = smoke_test_tempdir();
         let base = temp.path().canonicalize().unwrap();
-        // docs/14: external work directories and ancestors retain their mode;
+        // docs/10 §4.3: external work directories and ancestors retain their mode;
         // only the fixture's own created children require owner-only access.
         for nested in [false, true] {
             let shared = base.join(if nested {

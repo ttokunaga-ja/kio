@@ -22,18 +22,28 @@ OS 通知、起動時照合、既定 300 秒ごとの完全照合を、手動 `i
 強制終了後は OS lock が解放され、再起動時に完全照合して未処理変更を回復する。
 OS のログインユーザー service への登録・起動は実装済みだが、native scheduler の実機 lifecycle acceptance は OS ごとに別途必要である。
 
-`service install` は明示初期化済みの root だけを検証して、現在のログインユーザーの native scheduler 登録を device-private manifest とともに作成する。manifest には絶対・UTF-8 の `HOME`、`USERPROFILE`、`XDG_CONFIG_HOME`、`XDG_DATA_HOME`、`XDG_CACHE_HOME` を固定する。macOS と systemd は native definition がその値を child watcher に明示する。Windows Task Scheduler は環境変数を definition の説明欄へ保存せず、絶対 manifest locator だけを hidden runner に渡す。runner は private manifest、現在の executable、managed root/scope、Task Scheduler の定義を照合してから、子 watcher の `Command` にだけこの環境を設定する。Windows の runner は kill-on-close Job Object に子を参加させるため、scheduler が runner を終了しても watcher を孤立させない。登録は login 時に有効だが、この操作自体は実行を開始しない。service ID ごとの private OS lock は install/start/stop/uninstall と manifest 更新を直列化し、install の途中で中断されても保存済みの installing intent を同じ定義だけで回復できる。`installed` 済みで定義が同一なら冪等成功とする。自身が登録した service の executable / 環境 / interval を
-更新する場合は `service install --replace` で旧／新の差分と再起動影響を表示し、端末確認または
-`--yes` 後に停止・置換・再検証する。private intent に旧／新 definition と段階を保持し、
-中断時は一致した自分の定義だけを回復する。foreign な scheduler 登録・変更は上書きしない。
-更新する executable / installation path にも同じ trust 検証を行う。`start` は実際の watcher instance lock が稼働中なら、同じ scheduler 登録の再起動も拒否する。`start` と `stop` は scheduler の登録状態を変更してから開始／停止し、`stop` は再起動を無効化して foreground watcher の通常の停止要求とは別に扱う。`status` は scheduler の登録状態と watcher の OS instance lock による実際の稼働状態を別々に表示する。root が後で削除されても `status` は device-private watcher lock を照合し、`uninstall` は manifest と完全一致する登録だけを削除して queue を残す。native service 名または definition が foreign に変わった場合は lifecycle 操作を拒否する。
+`service install` は明示初期化済みの root だけを対象とし、現在のログインユーザーの scheduler に
+device-private manifest とともに登録する。登録時点での絶対・UTF-8 の `HOME`、`USERPROFILE`、
+`XDG_CONFIG_HOME`、`XDG_DATA_HOME`、`XDG_CACHE_HOME` を固定して watcher に適用する。
+Windows の scheduler 定義には環境値を格納せず、絶対 manifest locator を runner に渡す。
+runner は manifest、実行ファイル、managed root/scope、scheduler 定義を照合してから、
+子 watcher に限って環境を設定する。scheduler が runner を終了したときは watcher の孤立を防ぐ。
+登録はログイン時に有効になり、登録操作自体では起動しない。
 
-scheduler executable と installation path の trust、および service の private storage は
-[14 の watch 契約](14-v1-runtime-contracts.md#watching-defaults) に従う。
-native scheduler の実機 lifecycle acceptance は OS ごとに別途実施する。service は `watch run` と同じ offline local reconciliation を起動し、egress、budget、secret の承認を追加しない。
+service ID ごとの private OS lock で install/start/stop/uninstall と manifest 更新を直列化する。
+中断した install は同一の記録済み定義でだけ回復し、登録済みで定義が同じなら冪等成功とする。
+自身が登録した service の実行ファイル・環境・間隔を更新するときは `service install --replace` で
+旧／新の差分と再起動への影響を表示する。端末確認または `--yes` の後に停止・置換・再検証する。
+中断時は記録済みの旧／新の定義と進行段階に一致する自身の登録だけを回復する。
 
-詳細: [変更検知](12-change-detection.md)、[実装契約](14-v1-runtime-contracts.md)、
-[検証状況](../tasks/v1-plan.md)。
+`start` は watcher の OS instance lock が稼働中なら同じ scheduler 登録の再起動も拒否する。
+`start` と `stop` は scheduler の登録状態を変えてから開始／停止する。`stop` は再起動を無効にし、
+foreground の停止要求とは別に扱う。`status` は scheduler の登録状態と watcher の OS lock による
+稼働を別々に表示し、root が失われても稼働を確認する。`uninstall` は manifest と完全一致する登録だけを削除し、
+queue を保持する。外部の登録や外部から変更された service 名・定義への lifecycle 操作は拒否する。
+
+service は `watch run` と同じ offline 照合を行い、egress・予算・秘密送信の承認を付与しない。
+置換時も実行ファイルと配置を検証する。実行時の信頼条件と保護は [変更検知](12-change-detection.md#4-再照合と中断からの復旧) に従う。
 
 Kio の現在の CLI 契約。
 
@@ -165,11 +175,9 @@ kio tag --delete <name>                 # canonical ref を .kio/.lock 下で at
 kio purge <path|--raw-hash <h>> --reason <reason> [--erase-tombstone] [--yes]  # 詳細 §6 (確認プロンプト必須 — --yes で省略)
 kio reindex [--regenerate] [--at <commit>] [--yes] [--online|--offline] [--realtime|--batch]  # --at = 過去 snapshot の embedding 再生成 (05-runtime.md §1)。
                                         # --regenerate = 新 gen で再 normalize / 再 embedding (Step 3)。
-                                        # (2026-07-24 改名: 旧名 `--force` は `export --force` = 出力先の上書き、という別軸の同名だった。
-                                        #  Stable 前のため alias は残さず削除)。
                                         # --regenerate は first-instance-wins の
                                         # 明示経路で gen+1 の新 instance を作る (07-adapter-spec.md §9。もう 1 つの合法経路 =
-                                        # prepared_hash 変化起因の自動 gen+1 — 03-data-model.md §2.1)。
+                                        # 準備の出力または profile 変化による自動 gen+1 — 03-data-model.md §2.1)。
                                         # HEAD が指す確定 manifest や unit が破損・欠落した文書は旧 gen の参照を保持し、
                                         # skipped_units に報告する。残りの文書は再 normalize し、検証できた内容をテキスト検索に公開する。
                                         # 上書きチェーンは manifest の parent_gen (同一 raw 内) / parent_instance
@@ -182,7 +190,7 @@ kio evidence retarget <pointer> --at <commit> # exact-only read-only retarget。
 
 本表はコマンド全量の spec である。MVP での採否・実装 Step の正本は [09-mvp-scope.md §1 / §3.1](09-mvp-scope.md)。
 
-2026-10-03の開発版で `tag --delete` をcore・app・CLIへ接続した。削除時のcommit指定は
+`tag --delete` への commit 指定は
 `KIO-E-CONFIG-USAGE-001` / exit 2で拒否する。存在しないtagは
 `KIO-E-STORE-NOT-FOUND-001` / exit 4であり、成功no-opにはしない。成功時のJSONは
 `{ "operation": "tag_delete", "status": "deleted", "tag": <name>, "commit_hash": <removed target>, "path": <canonical ref path> }`。
@@ -243,7 +251,7 @@ write がある間の通常 write は fail-closed であり、operator は `ledg
 state の組だけを受理する。authority/schema の不一致、破損、未知の状態は blocked のままにする。
 回復は checkpoint の巻戻しまたは publication/finalization だけを行い、SQL replay、送信の再実行、
 unknown cost の返金を行わない。backup/restore の artifact 契約は
-[10-operations.md §7.5.2](10-operations.md) を正本とする。
+[台帳のライフサイクル](10-operations.md#デバイス課金台帳のライフサイクル) を正本とする。
 
 `snapshot` は action を必須とする。`kio snapshot`、`kio snapshot -m ...`、`kio commit ...` は旧surfaceであり usage error (exit 2) で拒否する。`create` だけが manual message を受け取り、`auto` はmessage引数を受け取らない。
 
@@ -316,12 +324,12 @@ stateを残し、ref不達objectを履歴authorityとして扱わない。
 read-only command は初期化残骸を cleanup しない。
 
 `init --independent` の関係変更 preview・確認・journal・親 enrollment の扱いは
-[14 の root bootstrap 契約](14-v1-runtime-contracts.md#atomic-crash-recovery-and-explicit-root-bootstrap) に従う。
+[root 初期化の契約](10-operations.md#42-atomic-publication-と-explicit-root-bootstrap) に従う。
 通常の `init` / child discovery に独立 root 化の暗黙副作用を加えない。
 
 ### Kio-created object protection
 
-全 command の storage 保護は [14 の正本](14-v1-runtime-contracts.md#protection-of-kio-created-objects) に従う。
+全 command の storage 保護は [Kio 作成物の保護](10-operations.md#43-kio-created-object-boundary) に従う。
 `KIO-E-MANAGEMENT-ROOT-UNSAFE-001` / exit 4 は、管理 store の Kio 作成 object の owner / private protection 不一致、
 期待した object の symlink / reparse point、または root / store の検出済み replacement を mutation 前に拒否するために使う。
 利用者が選んだ scope root や Kio が作っていない ancestor の ACL / mode だけを理由には返さない。
@@ -331,36 +339,30 @@ credential、trust、ledger 等の個別 error 契約は各 command のまま維
 
 `kio root register [path] --preview` は、指定 root（省略時 cwd）の live management record と enrolled subtree を
 read-only で検査し、detach の有無、対象 scope 数、rebind 先、grant revoke を表示する。registry が無い場合も
-cache miss として扱い、作成・repair・row upsert をしない。preview 出力や過去の出力は mutation authority にならない。
+cache miss として扱い、作成・repair・row upsert をしない。read-only planner は lock・archive を作らない。
+preview 出力や過去の出力は mutation authority にならない。
 
 `--yes` は subtree 全体を一つの明示 operation として再登録する。対象が moved Child ならその scope を独立 Root に
 detach し、配下の Child は reciprocal enrollment token と parent 関係を保ったまま新しい root_scope_id に束縛する。
-旧 root path と registry の各旧 row を実地検査し、同じ scope_id の live duplicate があれば拒否する。cross-volume の
+現在の OS で旧 path と registry を検査し、同じ scope_id の live duplicate があれば拒否する。
+別 OS の記録は履歴として扱い、実ファイルの存在・不在の根拠に使わない。cross-volume の
 移動もこの明示 operation だけが扱える。通常 discovery/index は cross-volume の child を採用せず、再登録を暗黙に
 開始しない。
 
 操作は知識 object、HEAD、scope approval を変更せず保持する。各 management record の
 `registration_generation` を必ず 1 増やし、path / directory identity / root authority を更新する。送信 authority は
-持ち越さず、対象 subtree の device-global central grant を revoke し、registry は atomic rebind 後に unindexed として
-再登録する。pending marker と root journal は phase ごとに相互照合する。中断時は marker、journal、before/after
+持ち越さない。新レコードの公開前に全対象 scope に一致する pending marker を置き、対象 subtree の旧
+device-global central grant を失効させる。新レコード公開後に registry の検証済み旧行を unindexed の新行へ
+原子的に置換する。pending marker と root journal は phase ごとに相互照合する。中断時は marker、journal、before/after
 record、旧 path、現在 identity のいずれかが一致しなければ fail-closed であり、`--yes --resume <OPERATION_ID>` 以外は
 回復を進めない。current v2 management record より古い形式、missing `registration_generation`、または unknown field は
 互換読取りせず拒否する。
 
 本操作は v1 の単一 authority subtree に限る。multi-authority の統合・継承・移送を定義しない。
 
-root register は active な root/child 初期化 operation、cancellation marker、または未回復の atomic state を
-含む root を拒否する。通常の planner は read-only で、lock や archive を作成せず、残骸を cleanup しない。子の pending 初期化は current Ignore により
-inert になっても他の child を妨げず、後に同じ planned identity が policy admission を満たす場合だけ再開する。
-取消は未公開かつ親 private の exact stage だけを対象とし、child root や user file を削除しない。stage を
-退役する前に、その stage の verified exact case probe だけを cleanup する。公開済みの pending `.kio` は cancel
-できず、Ignore が外れた後に通常の recovery で再開する。
-
-子 scope 経路を含む v1 platform support policy の正本は [09-mvp-scope.md §1.2](09-mvp-scope.md)
-である。macOS / Linux / Windows の自動管理は、retained directory capability から child を検証し、
-保持済み Repository を共通 app 層へ渡す。public pathname の再解決や `current_dir(path)` 型 handoff
-は使わない。現行 policy・所属・identity の検証に失敗した child は採用しない。各 OS の native Actions
-受入は別途必要である。
+`root register` は未完了の初期化・取消・atomic recovery がある root を拒否する。
+子の中断と取消は [Child initialization](10-operations.md#41-child-initialization-の中断取消)、
+対応 OS は [platform support](09-mvp-scope.md#12-v1-automatic-child-implementation-boundary) に従う。
 
 公開 `index` の JSON は `child_scopes` と `child_scope_discovery` を含む。通常実行の discovery は
 `page_size` (現在 128)、`has_more`、`continuation_committed`、`restarted_from_root`、`rows_total`、
@@ -502,7 +504,7 @@ kio search "..." --all-scopes
 kio search "..."              # 実効 [search].default_mode (既定 auto = hybrid → text fallback — 05 §1.8)
 kio search "..." --mode <auto|text|image|vector|hybrid>   # 当該実行の上書き。config の同名 enum と 1 対 1。
                               #   text   = text only
-                              #   image  = 候補を画像に限定 (2026-08-11 追加、05 §1.1)。
+                              #   image  = 候補を画像に限定 (05 §1.1)。
                               #            text と対になる軸。ベクトル不可時は error
                               #   vector = vector only。失敗時は error
                               #   hybrid = hybrid 強制。失敗時は fail_behavior 設定に従う
@@ -806,7 +808,7 @@ search / scope status / 無料 local index の予算観測では、この code �
 
 `DOMAIN` は code を発行する subsystem の名前であり、spec に閉じた一覧を置かない。
 code の一覧の正本は実装の発行箇所である。spec は、利用者や外部 Agent が分岐に使う code と
-exit を、その振る舞いを定める節 (03〜08、12〜14) で定義する。本節は、他の節に置き場のない
+exit を、その振る舞いを定める節 (03〜08、10、12〜13) で定義する。本節は、他の節に置き場のない
 CLI 横断の code だけを定める。
 
 embedding のモデル準備・実行に対する public code/exit は本節だけを正本とする。
@@ -889,7 +891,7 @@ Adapter 種別と契約は [07-adapter-spec.md](07-adapter-spec.md)。
 
 設定ファイルは、そのコマンドが利用する依存を読むときに JSON Schema (TOML は JSON 等価表現)
 で validate する。未使用設定を CLI 全体の起動条件にしない。利用範囲と readiness の扱いは
-[操作別前提条件の正本](14-v1-runtime-contracts.md#operation-specific-prerequisites) に従う:
+[操作別前提条件の正本](10-operations.md#113-設定ファイル-schema-validation) に従う:
 
 ```
 ~/.config/kio/tools.toml          tools.schema.json

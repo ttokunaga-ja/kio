@@ -1,7 +1,6 @@
 # 11 Product Requirements
 
-本書は Kio の製品要件の正本である。01〜10 の設計・RC・Phase・CLI 契約は、実装済みの範囲または
-提案を記録し得る。製品要件との矛盾は本書を優先するが、未決の transaction、CLI、schema を
+本書は Kio の製品要件の正本である。01〜10、12〜13 は関連する設計・運用・CLI 契約を定める。製品要件との矛盾は本書を優先するが、未決の transaction、CLI、schema を
 本書から導入してはならない。
 
 ## 1. v1 の到達要求
@@ -20,28 +19,26 @@
   空フォルダも対象に含む。exact debounce/SLA と、一般的でない filesystem の対応範囲は未決である。
 
 変更検出は root からの native OS event を契機に reconciliation し、手動 `kio index` は同じ engine を使う。
-起動・再接続・event overflow の後と定期 fallback では rescan し、取りこぼしから回復する。event stream は
-最適化であって consent を与えず、directory の size/mtime も再帰的な完全性の証明にはならない。この方針は
-2026-09-07 に承認済みであり、開発版には監視・共通reconciliation・永続queue・user serviceの実装がある。
-実装の存在はv1全体の充足や3 OS受入完了を意味しない。対応と後続改善は
-[12-change-detection.md](12-change-detection.md)、候補別の検証は
-[実装進捗](../tasks/v1-plan.md) を参照する。
+起動・再接続・event overflow の後と定期照合で通知の欠落から回復する。
+通知だけで送信を許可せず、directory の size/mtime を内容の証明に使わない。
+詳細は [変更検知](12-change-detection.md) に従う。
 
 ## 2. 正本と復旧
 
-knowledge、scope 設定、送信承認は folder-local `.kio` に置く。device/central operational state は
-課金台帳、in-flight intent、provider 回復・照合記録などの knowledge ではない正本を置ける。
+知識と履歴、scope の所属・設定・承認の scope 側記録は folder-local `.kio` を正本とする。
+device の送信承認・実行設定・trust は端末の明示的な操作で設定する。registry と watcher queue は
+scope と作業ツリーから再構築できる。課金台帳、in-flight intent、provider 回復・照合記録の正本は端末に置く。
 この運用正本は再構築不能であり、`.kio` restore から reset せず、別途 backup と reconcile を行う。
 現行の backup 手順は [10-operations.md §7.5.2](10-operations.md) にある。
 
-## 3. 現状と検証
+## 3. 受入
 
 本書は v1 の充足を表明しない。RC.3 の child scope 自動 mutation は macOS/Linux の限定経路であり、
 Windows の自動 child mutation は RC で未対応である。RC の platform matrix は [09-mvp-scope.md §1.2](09-mvp-scope.md)。
 
-v1 の受入では macOS、Linux、Windows の 3 OS で機能的 CI を行い、実際の converter と provider 接続経路の
-証拠を確認する。converter/provider を実行しない skip を pass と数えず、証拠がない経路を CI 成功だけで
-充足と扱わない。
+v1 の受入では macOS、Linux、Windows の 3 OS で機能的 CI を行い、実際の Office renderer とローカル TLS の試験を行う。
+有料 provider の利用と native scheduler の lifecycle は別々に実機の証拠を確認する。
+前提不足による skip は受入の証拠に含めない。
 
 EG2 の受入では、背景/対話の両 engine を含む親＋worker の同時 resident peak を
 8,000,000,000 bytes 以下とし、7 GB で中断する余裕値、低空き memory 時の load 前 pause を設ける。
@@ -58,7 +55,7 @@ security、recovery の受入を不要にするものではない。
 
 v2 は GUI で CLI の全機能を提供し、履歴選択と最新版への復元を提供する。v3 は cloud sharing、
 collaboration、複数利用者と user/group ACL を扱う。ブランチを持たず現在の HEAD の子として過去状態を復元する
-方針は 2026-09-07 に承認済みである。transaction、CLI、schema の詳細は実装契約として別途固定する。
+方針を維持する。
 設計は [13-linear-history.md](13-linear-history.md)、工程と受入条件の提案は
 [tasks/v1-plan.md](../tasks/v1-plan.md) に記録する。
 
@@ -66,7 +63,7 @@ collaboration、複数利用者と user/group ACL を扱う。ブランチを持
 reject し、曖昧な読み替えをしない。ただし、breaking code は knowledge や利用者ファイルを破棄する
 権限ではない。既存の user files と `.kio` 内の knowledge は明示的な操作なしに破壊しない。
 
-## 5. 保存・復元・引用保持の追加方針 — 2026-10-03承認
+## 5. 保存・復元・引用保持の追加方針
 
 既存v1の完成・受入条件とv2/v3の境界を維持し、v1受入後の改善を次の順に進める。
 詳細工程・追加受入ケースU01〜U12は

@@ -2975,7 +2975,7 @@ mod tests {
         let error = source
             .recheck_source_identity()
             .expect_err("replacement must invalidate retained source identity");
-        // docs/14: a replaced Kio object must fail closed. The retained
+        // docs/10 §4.3: a replaced Kio object must fail closed. The retained
         // unlinked inode fails the private single-link check before the later
         // named-leaf identity comparison can run.
         match error {

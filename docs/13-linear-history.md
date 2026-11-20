@@ -1,14 +1,7 @@
-# 13 Linear History and Restore — design direction and current status
+# 13 Linear History and Restore
 
-本書の線形履歴・復元の設計方針は 2026-09-07 に承認済みである。
-現在の実装は storage format `3.0.0`、必須の単一 `parent`、唯一の可変参照 `HEAD`、条件付き公開 journal を使う。
-2.0.0で導入した恒久的な `.kio/.store-gate` を維持し、3.0.0ではtag名のUnicode identityを是正する。
-保存形式は製品v2/v3やCargo/release versionとは独立する。旧storeは書き換えず拒否し、移行機能は提供しない。
-旧 `parents` 配列と旧 format の移行・read/write 互換経路は置かない。別出力先への `export` と
-管理対象への `restore` は分離され、作業ファイルを含む journal 付き復元、preview、明示 recovery は実装済みである。
-以下の当初の設計理由・将来案と現行契約は区別し、CLI の詳細は [06-cli-spec.md](06-cli-spec.md) を正本とする。
-実装・試験の状況は [進捗記録](../tasks/v1-plan.md)、最終 3 OS 受入と次の改善は
-[実装計画](../tasks/knowledge-ux-implementation-plan-2026-10-03.md) を参照する。
+線形履歴と管理対象の復元を定める。保存形式は [データモデル](03-data-model.md#2-kio-物理レイアウト)、
+操作の詳細は [CLI 契約](06-cli-spec.md#5-export) に従う。
 
 ## 1. 過去の状態を新しい commit として採用する
 
@@ -58,11 +51,10 @@ working bytes・identity を再検証する。`--expected-head` は preview 時�
 
 ## 3. 線形形式の不変条件
 
-- genesis の parent はなし。それ以降の公開 commit は親が一つで、公開時に観測した current HEAD と等しい。
-  現行 schema は単一 `parent` を表す。
-- 可変の current HEAD は一つの正本であり、branch は持たない。
-- tag は一本の chain 上の commit を指す論理名である。2026-10-03の開発版で
-  `tag --delete` と削除後の同名再作成を接続した。削除はrefだけを解除し、HEAD・CASと名前の監査行を保持する。
+- commit は単一の `parent` を必須とする。genesis は `null`、それ以外は公開時に観測した current HEAD を指す。
+- HEAD は唯一の可変履歴参照である。最初の snapshot 前は `unborn` と LF、それ以降は commit hash と LF を保存する。
+  欠落、空、不正な HEAD はエラーとし、他の参照や CAS から推測して補わない。
+- tag は一本の chain 上の commit を指す論理名である。削除は ref だけを解除し、HEAD・CAS と名前の監査行を保持する。
   切断した別履歴を新しい公開 root として認めない。タグ作成・取り込んだタグの読取・台帳由来の
   rebuild root は、現在の HEAD から parent を逆にたどって到達できることを検証する。
   未公開の子 commit と unborn HEAD に残ったタグも拒否し、タグから HEAD を推測して復旧しない。
@@ -72,30 +64,31 @@ working bytes・identity を再検証する。`--expected-head` は preview 時�
 - 「親としてたどる辺」と「監査のための参照」を区別する。復元元への参照を無期限の GC pin とすると
   purge/retention を壊す。復元 provenance は元の引用を保持する pin ではない。
   HEAD/tag の tip は retention GC の shallow 候補外だが、明示的な purge/erase を防がない。
-- 旧 DAG 形式は version を区別して明示的に reject する。旧形式の reader や互換 alias は要件にしない。
+- 旧形式と `parents` 配列は変更前に拒否する。旧形式の reader や互換 alias は要件にしない。
   ただし旧 `.kio` や利用者ファイルを自動削除しない。必要な知識の export/import は明示操作として扱う。
 
 ## 4. 復元 transaction
 
-複数の普通のファイルを別々に置換する操作は、他アプリから見て一斉に切り替わる filesystem transaction
-ではない。現行実装は journal と段階的な検証で中断回復を行う。以下は復元時の主要な不変条件であり、
-操作 ID を一覧する履歴 UI や永続的な操作ログの提供まで実装済みとみなさない。
+復元は現在の HEAD、source closure、raw object の存在と hash、purge、policy、対象ファイルの変更や衝突を
+検証して、scope 直下の管理対象だけを確定する。適用時は scope lock 下で HEAD と対象の実体を再検証する。
+複数の作業ファイルが他のアプリから同時に切り替わることは保証しない。
 
-1. current HEAD、source closure、raw bytes の存在と hash、purge 状態、現在の policy、
-   変更・削除・衝突予定を検証する。scope 直下の管理対象だけを plan に固定する。
-2. scope lock 下で HEAD と対象 identity を再検証し、before/after と進行段階、
-   復旧に必要な情報を journal に永続化する。新しい tree/commit を耐久化してから公開する。
-   raw bytes は有界 buffer で stage/hash し、journal は private stage の identity / digest / 長さと
-   before/after を参照する。64 MiB/file・512 MiB/operation の固定拒否と journal への本文埋込みは
-   廃止する。stage は全 bytes と digest の検証後にだけ使用する。分割進行の file 数・bytes と
-   durable phase を表示し、crash 復旧は検証済み phase から再開／巻戻しする。
-3. 同一 filesystem の stage と journal を使い、no-follow/handle-bound な置換・削除を行う。
-   Kio の読み手は適用中の scope を除外または busy と表示し、古い検索結果を最新版として提供しない。
-4. 唯一の HEAD を expected-value 付きで公開する。復元済み原本と検索 projection の状態を分けて報告し、
-   projection 再構築が失敗した場合も復元済み HEAD を巻き戻さず、検索の利用不可を明示する。
-   adapter や外部送信を伴う再処理を暗黙に開始しない。
-5. crash 復旧は `kio repair recover-restore` が journal と現行 HEAD を照合して判断する。
-   journal が残る間は通常操作を拒否し、途中までの bytes から復元完了と推測しない。
+原本は有界メモリで扱い、64 MiB/file・512 MiB/operation の固定拒否を設けない。
+変更前に、同一ファイルシステム内の private stage の実体・digest・長さ、前後の状態と進行段階を
+回復用 journal に耐久記録する。journal に本文は埋め込まない。
+中断後は全 bytes と digest を検証できた stage だけを再使用し、検証済みの進行段階から再開または巻き戻す。
+置換・削除は保持済み実体に限定し、リンクをたどらない。作業ファイルの件数・bytes と耐久化済み段階を表示する。
+適用中の読み取りでは該当 scope を除外するか busy とし、古い検索結果を最新版として返さない。
+
+通常の履歴公開も、immutable object と回復用 journal を耐久化してから、観測した親を条件に HEAD を進める。
+HEAD 公開後に manifest を反映し、その後に journal を外す。中断時は記録した親と commit を照合し、
+読み取り専用操作は公開を修復しない。復元の中断は `kio repair recover-restore` が journal と現行 HEAD を
+照合して処理する。journal が残る間は通常操作を拒否し、部分的に置換された作業ファイルから完了を推測しない。
+
+復元済みの原本・履歴と、再構築できる SQLite・検索 replica の状態を分けて報告する。
+派生索引が失敗しても公開済み HEAD を巻き戻さず、検索不能な状態を明示する。
+復元を理由に Adapter や外部送信を使う再処理を暗黙に始めない。
+`export` と `restore` は `.kio`、`.kioignore`、管理・承認・設定・課金状態を原本として適用しない。
 
 過去の raw 内容を採用しても、現在の ignore、送信承認、tool 設定、予算、課金台帳、保留タスクを巻き戻さない。
 device の model/runtime/取得同意は knowledge snapshot から継承・復元しない
@@ -120,14 +113,9 @@ v3 でも canonical history を一本に保つことは可能である。サー�
 証拠にせず、復元・検索・replication のすべてで所属と可視性を確認する。共有された `.kio` の承認記録だけで
 受信側端末の外部送信許可を成立させない。
 
-## 6. 導入順序
+## 6. 復元の受入
 
-線形 schema・単一 HEAD・policy と履歴の分離、および CLI の管理対象 restore は実装済みである。
-まず現行候補のローカル検証と同一 SHA の 3 OS 受入を完了する。続いて既存 tag を利用した
-「重要な版を保持する」導線、GC・tag 解除・purge の影響表示、原本復元と検索準備状態の区別を改善する。
-引用自体は可変の tag 名ではなく不変の Evidence Pointer に固定する。引用群の保持、持ち出し bundle、
-操作 ID を追える利用者向け履歴は追加設計として [実装計画](../tasks/knowledge-ux-implementation-plan-2026-10-03.md)
-で扱う。v2 の GUI は export と管理中の状態復元を区別して表示し、CLI と同じ plan・競合・復旧結果を利用する。
-
-検証には、複数親/別 head の拒否、current-only file の既定保持と明示削除、選択復元の非選択パス保持、未保存変更、元にないパス、
-purge、derived-state 不整合、policy 非復活、HEAD 競合、各 stage での crash を含める。
+同一候補をローカルと 3 OS で検証する。複数親・別 HEAD の拒否、復元元にないファイルの既定保持と
+明示削除、非選択パスの保持、未保存変更、復元元にない選択パス、purge、派生索引の不整合、policy の非復活、
+HEAD の競合、各段階での中断と回復を含める。
+v2 GUI は export と管理中の状態復元を区別して表示し、CLI と同じ計画・競合・回復結果を利用する。

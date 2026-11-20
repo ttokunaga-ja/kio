@@ -1,7 +1,5 @@
 # 03 Data Model
 
-統合元: 旧 `research/git_kio.md` (CAS / DAG) + 旧 `research/kio.md` (.kio layout) + 旧 `research/hash.md` (identity) + 旧 `research/read_only.md` (write boundary)。いずれも正本ではなく、2026-07-18 に docs から撤去 (経緯は git 履歴で参照可)。
-
 > 本書は現行 format / 実装契約を定める。v1 の製品到達要求と RC の未充足事項は
 > [11-product-requirements.md](11-product-requirements.md) を正本とする。本書の詳細な RC 制約は、
 > v1 の実装済み表明ではない。
@@ -26,7 +24,7 @@ Object 種別:
   chunk        normalized から見出し単位で切り出し
   embedding    chunk のベクトル表現
   tree         path → object_hash のスナップショット
-  commit       tree + parents + metadata
+  commit       tree + parent + metadata
 ```
 
 raw / prepared / image / normalized_unit_object / chunk / embedding / manifest / toollock / tree / commit は **CAS object** として `objects/<type>/ab/cd/<digest64>` に保存。hash の算出は object 種別ごとに §8.1 で規定する: raw / prepared / image は**バイト列そのものの content hash**、normalized_unit_object / manifest / toollock / tree / commit は **canonical JCS JSON 保存バイト列の content hash**、chunk / embedding は **identity タプルから導出する identity hash**。`normalized_units/` の path-named instance は current working projection / cache として残してよいが、履歴の正本ではない (§2.1)。ファイル全文の normalized Markdown も unit を決定論的に結合した **view (再生成可能な cache)** であり、正本ではない。
@@ -144,15 +142,11 @@ names.jsonl で digest を解決する。対応行の無い canonical ref は fs
 names 行は残す [06-cli-spec.md §1](06-cli-spec.md))。同一 digest の複数行は最終行を表示名とする
 (NFC + simple case folding が同じ名前は同一 slot — 表記ゆれの上書きは append で表現)。
 
-2026-10-03に、以前のUnicode小文字化を同梱UCD16.0.0によるsimple case foldingへ是正し、
-同UCDの未割当tag文字を拒否する。sigmaの `Σ` / `σ` / `ς` は同じslotになり、`ß` と `ss` は
-別slotである。Turkic foldingや複数文字へ展開するfull foldingは使わない。
-保存先hashが変わる名前があるため、保存形式3.0.0で旧規則と区別する。
-是正と最終候補の検証状態は [実行記録](../tasks/v1-plan.md) を参照する。
+同梱 UCD 16.0.0 の simple case folding では、`Σ` / `σ` / `ς` は同じ slot、
+`ß` と `ss` は別 slot になる。
 
-**format_version**: 旧称 `VERSION 0.1.0` (旧 research/kio.md) は `kio_format_version` に統一。semver は [10-operations.md §11.5](10-operations.md) 参照。**保存場所 = `.kio/scope.json` の必須 `kio_format_version` フィールド** (init 時に current version を記録する)。現在の保存形式は `KIO_FORMAT_VERSION = "3.0.0"`。これは製品の release/Cargo version や製品v2/v3の到達状態とは独立した storage format である。3.0.0はtagのUnicode identity是正を含む。current reader は `KIO_FORMAT_VERSION` と**完全一致**する string だけを受理する。2.0.0を含む旧形式、欠落、非 string、非 parseable、older/newer、未知を含む任意の不一致は current schema ではなく **incompatible format** として、`KIO-E-STORE-VERSION-001` / exit 8 で store bytes を変更せず fail-closed にする。**この完全一致判定は scope.json の schema validation より先に評価する**。reader / search / repair / historical を含む全 command に read-only、migration、old-reader の例外はなく、multi-scope search も当該 scope を除外して partial success を返さず command 全体を停止する。具体挙動は [10-operations.md §11.5](10-operations.md) が正本。
-
-**store gate（2.0.0で導入、3.0.0でも必須）**: `.kio/.store-gate` は init が全 OS で作成する必須の空 regular file であり、内容と identity を不変に保つ。削除・置換・遅延作成・repair による補完はしない。Windows の reader/writer coordination はこの恒久 gate を共有する。旧 Windows writer が gate を迂回して書き込むことを防ぐため、保存形式を 1.0.0 から 2.0.0 に変更した。旧 store は gate の有無によらず version 判定を先に行って exit 8 で拒否し、current store の gate 欠落・非 regular・非空も fail-closed とする。移行経路や旧形式の read/write 互換経路は置かない。
+`.kio/scope.json` の必須 field `kio_format_version` と `.kio/.store-gate` は
+[保存形式の境界](10-operations.md#115-current-format-boundary) に従う。
 
 ## 2.1 normalized instance と全文 view
 
@@ -234,12 +228,15 @@ manifest schema:
 `{ "raw_hash": "sha256:old...", "gen": 0, "unit_key": "page:11" }`。再利用時も新 instance 用の
 full NormalizedUnitObject を JCS CAS として確定する (per-.kio 重複容認、§9)。
 `owned_image_hashes` は、この unit の処理で取得・検証した画像の content hash を保持する必須配列である。
-重複のない昇順の SHA-256 hash を格納し、画像がなければ `[]` を明示する。通常の Markdown リンクは
+重複のない昇順の SHA-256 hash を最大 256 件格納し、画像がなければ `[]` を明示する。通常の Markdown リンクは
 画像の所有関係を作らない。OCR Adapter は受け取った画像バイトから計算した hash だけを返し、Kio は
-単体画像の検証済み原本 hash を追加する。unchanged unit では従前の集合をそのまま引き継ぐ。
+単体画像の検証済み原本 hash を追加する。unchanged unit では以前の Markdown 本文と画像所有集合をそのまま引き継ぐ。
 画像の読み出し・送信・検索 projection は、現在の管理境界で許可される所有元をこの immutable field から
 検証する。本文や metadata に同じ hash を書いても所有関係は成立しない。field 欠落を空集合へ読み替える
-旧形式互換や暗黙の移行は行わない。
+旧形式互換や暗黙の移行は行わない。単体画像の正規化は、OCR がテキストだけを返しても、検証済みの
+原本画像を CAS に保存し、scope ID と検証済み hash による画像参照を Markdown に保持する。
+画像リンクは宣言された scope の現在の policy と認証済み所有元に従って解決する。
+所有元に秘密の扱いが残る場合、その画像の送信には別の secret-send 承認が必要である。
 `metadata` は current schema の **required object** であり、page/bbox/confidence と Step 4 の bounded
 `bbox_annotations` を保持する。内容が無い場合は空 object `{}` を明示する。field 全体の欠落を `{}` に
 読み替える旧 reader / default は置かず reject する。検索用 annotation block は同じ unit の `markdown` にも
@@ -252,15 +249,16 @@ full NormalizedUnitObject を JCS CAS として確定する (per-.kio 重複容�
   field 欠落、done の null、failed の non-null は current schema violation として fail-closed にする。旧 shape を
   default / migration で読む経路は置かない。
 - **各 manifest entry の `preparation_profile_hash` は必須の SHA-256 identity** である。prepared bytes の
-  content address (`prepared_hash`) には混ぜず、unit 再利用と raw 不変時の gen 判定では両方を照合する。欠落・
-  不正 hash は current-schema corruption として fail-closed にし、旧 shape を読む default / migration は置かない。
+  content address (`prepared_hash`) は出力 bytes の SHA-256 とし、再利用・gen 判定では双方の identity を照合する。
+  準備の identity は基礎 prepare profile に結び付く。Office では renderer fingerprint、platform、PDF 正規化規則、
+  適用する private UNO service catalog/filter も束縛する。表示用の renderer 名・版は provenance とする。
+  profile の欠落・不正 hash は current-schema corruption として fail-closed にし、旧 shape を読む default / migration は置かない。
 - path-named `<unit_ref>.json` は current loader がこの CAS object から再 materialize できる mutable working
   projection であり、履歴、`--at`、Evidence Pointer は決してこれや同 gen の「最新」body を読まない。
 - manifest の `units[].error_kind` は [04-pipeline.md §5.3](04-pipeline.md) の閉 enum (フリーテキストではない) —
   unit 単位の retry 可否の機械判定に使う ([10-operations.md §11.1](10-operations.md) の明示例外)
 - manifest の `units[].status` の遷移は `failed → done` の一方向のみ (部分失敗の再開、§6)。
-  done unit の差し替えは新 gen 作成のみ (`kio reindex --regenerate`、または prepared_hash 変化起因の
-  自動 gen+1 — 下記 gen 段落の例外)
+  done unit の差し替えは新 gen 作成時だけ可能である (下記の gen 規則)
 - **manifest の各確定版は immutable object として保存する**: manifest の finalize (初回確定と、partial retry で
   `failed → done` を反映した各確定) のたびに、canonical JCS bytes を `objects/manifests/ab/cd/<manifest64>` へ
   content-addressed で書く (post-write verify 対象)。path-named `manifest.json` は**最新版の作業コピー**であり、
@@ -272,13 +270,13 @@ full NormalizedUnitObject を JCS CAS として確定する (per-.kio 重複容�
 
 **gen (generation)**: 同一 `(raw_hash, tool_profile_hash)` に対する instance の世代番号 (0 起点の整数)。
 通常は `g0` のみ存在する。`gen = 現最大 + 1` の新 instance を作れるのは `kio reindex --regenerate` と、
-**prepare profile / renderer 変更による `prepared_hash` 変化が駆動する再 Markdownize** (§6 — first-instance-wins の
+**既存 unit の `prepared_hash` または `preparation_profile_hash` が変わった場合の再 Markdownize** (§6 — first-instance-wins の
 第二の合法経路) だけであり、
 既存 instance は保全する ([07-adapter-spec.md §9](07-adapter-spec.md))。identity はあくまで
 `(raw_hash, tool_profile_hash)` であり、gen は同一 identity 配下の instance の区別にのみ使う。
 **normalized_hash の代替ではない** (§5: Markdown の content hash は計算・保存・比較しない)。
 新規参照 (新規 commit の tree entry / 新規 chunk) は常に最新 gen を使う。
-ローカル前処理の出力変化は手動 index / watch とも追加確認なしで新 gen を作り、raw、旧 gen と
+ローカル前処理の出力または profile の変化は手動 index / watch とも追加確認なしで新 gen を作り、raw、旧 gen と
 その Evidence を保全する。新旧 prepared hash、prepare profile、renderer の名称／版と producer を
 由来として記録する。保存先は immutable manifest CAS の required `preparation_provenance`
 （renderer_name / renderer_version は非 renderer 経路なら null、producer_os / producer_arch は必須）と、
@@ -307,8 +305,15 @@ view の存在は使わない。
 各 `.kio` が管理するのは **その `.kio` が配置されたフォルダ直下のファイルのみ** である。この規則は次の 3 点で一意に定まる:
 
 1. 管理対象は scope フォルダ **直下** のファイルに限る。サブフォルダ配下のファイルは、そのサブフォルダに `.kio` が存在するか否かに関わらず、親 `.kio` の管理対象に **ならない** (再帰包含は行わない)。
-2. サブフォルダは常に独立スコープの候補である。v1 の管理 root に対する `kio index` は、下記の policy 境界内にある全子フォルダ（空フォルダと全ファイルが ignore されたフォルダを含む）を探索し、子 `.kio` の生成と各 scope の index を行う。watch も OS 通知と定期照合から同じ処理を使う。独立した子作成 debounce/SLA は定義せず、照合間隔は `watch run --reconcile-interval-seconds`（既定 300 秒）で指定する。macOS / Linux / Windows の実装と native Actions 受入の完了は区別する ([06-cli-spec.md §1](06-cli-spec.md), [09-mvp-scope.md §1.2](09-mvp-scope.md), [10-operations.md §4](10-operations.md))。ignore されたサブツリーには子 `.kio` を生成しない。親で有効な config ignore → `.kioignore` は子の直下スキャン、孫の探索、後日の child-only `index` / task 再検査にも同じ順序で適用される。実装は子 `.kio/config.toml` の strict な生成済み親ポリシーとして prefix 付きで保持し、子固有の config / `.kioignore` はその後に評価する。preview は親直下だけでなく各 planned child の直下件数・bytes と全 scope 合計を表示する。**VCS リポジトリ root (`.git` 等の VCS 管理ディレクトリを持つフォルダ) とその配下にも既定では子 `.kio` を生成しない** (skip + status 表示。`[scope] index_vcs_repos = true` で opt-in) — リポジトリの履歴は VCS 自身が持ち、`.kio` の自動生成はリポジトリを汚す ([01-positioning.md §8](01-positioning.md) の方針の機械化)。既存子 scope を grandfather する分岐は置かない。
-   v1 の platform support level と子 scope 経路の対象範囲は [09-mvp-scope.md §1.2](09-mvp-scope.md) が正本である。macOS / Linux / Windows で retained parent handle から child を検証し、共通 app 層へ保持済み Repository を渡す自動管理経路を実装している。public pathname の再解決や `current_dir(path)` への handoff は使わない。独立 root、現行 policy の除外、identity 不一致、symlink / junction / reparse point は採用しない。実装済みという状態と、同一候補に対する native Actions 受入完了は別である。
+2. サブフォルダは独立 scope の候補である。管理 root の index と watch は、現行 policy の範囲で
+   空の子や直下の全ファイルが Ignore された子も含め、対象の全子フォルダに独立 scope を作り、各 scope を索引する。
+   子作成専用の debounce/SLA は設けず、完全照合の間隔は `watch run --reconcile-interval-seconds` で指定する。
+   独立 root、除外済み subtree、identity 不一致、
+   symlink / junction / reparse point は子に採用しない。preview は親と作成予定の各 child の
+   直下件数・bytes と全 scope 合計を表示する。VCS 管理ディレクトリのある root とその配下は
+   `[scope] index_vcs_repos = true` の明示設定がない限り除外し、status に理由を表示する。既存の子にも適用する。
+   現行 policy、管理の許可と再照合は [運用契約](10-operations.md#4-フォルダごとの-kio-運用) と
+   [変更検知](12-change-detection.md) に従う。
 3. したがって tree entry の `path`、Evidence Pointer の `path_at_commit`、task の `input_path` は **パス区切り (`/`) を含まないファイル名** である。`/` を含む path を持つ tree / pointer は schema violation (`KIO-E-STORE-PATH-001`) として拒否する。同様に `\` ・単独の `.` / `..`・NUL・control 文字を含む path、および **well-formed UTF-8 でない byte 列の path** も拒否する (tag の portable leaf 規則と同水準 — §2。JCS 直列化と UTF-8 バイト列昇順ソート (§8.1・§8) は well-formed UTF-8 を前提とするため、不正 byte 列は可逆に表現できない)。restore 等の物理化は canonical join 後に対象ディレクトリ配下であることを検査する ([06-cli-spec.md §5](06-cli-spec.md))。この検証は read/write を問わず current canonical object に適用する。区切りを含む旧 tree/path や raw-name pointer を読取専用で受理・安全名 mapping・legacy warning に落とす分岐は持たない。
 
 ファイルの位置は `scope_path` (正本 `.kio` の絶対パス) + ファイル名で一意に表現される。「フォルダ木を横断してファイルを探す」体験は、個々の `.kio` の再帰包含ではなく、scope_registry が列挙し aggregator が採点する横断検索 ([05-runtime.md §1.8](05-runtime.md)) が担う。
@@ -338,22 +343,18 @@ in-flight intent、回復・照合に必要な運用記録は knowledge では�
 実体が分裂しない — runtime と backup が同じ path 解決を共有する)。
 
 `aggregator` 保存先: `${XDG_CACHE_HOME:-$HOME/.cache}/kio/aggregator.sqlite` (**cache root** —
-全内容が各 `.kio` から再構築可能なので data root には置かない)。横断検索は 2026-07-25 に
-scatter-gather から **replication** へ変更した ([05-runtime.md §1.8](05-runtime.md))。428 scope の
-device では `.kio` ごとに独立した BM25 コーパスができ、コーパス統計 (N / df / avgdl) が index ごとに
-異なるため text 順位が scope 間で比較不能になる — 実測で正解が自フォルダ内 1 位でありながら横断 38 位に
-沈んだ。**コーパスを 1 つにすればこの問題は定義上消える**ため、採点と候補選択を単一 replica の上で行う。
+各 `.kio` から再構築可能)。横断検索は [05 の検索契約](05-runtime.md#18-複数-scope-横断検索-multi-scope-search) に従う。
 
 不変条件:
 
 ```
 1. scope_registry / aggregator のみで .kio の状態を変える実装は禁止。
-   **反映順序は必ず「各 scope の索引 → aggregator」とする (2026-08-11)** —
+   **反映順序は必ず「各 scope の索引 → aggregator」とする** —
    逆順は「検索に出るのに開けない結果」を作る。検索は aggregator しか
    読まないので、replica の先行はそのまま利用者に見える (05 §1.8
    「書き込み順序」)
 2. scope_registry / aggregator 喪失は再構築可能 (各 .kio を rescan)。
-   **「再構築可能」であって「欠損中も動作」ではない** (2026-08-11 明確化) —
+   **「再構築可能」であって「欠損中も動作」ではない** —
    aggregator を失った検索の正しい挙動は、検索を fail-closed とし、次の
    `kio index` / `kio reindex` / `kio repair` が全射影を完了するまで待つこと
    であり、第 2 の検索実装や読取り時の lazy refresh を持つことではない。
@@ -375,7 +376,7 @@ device では `.kio` ごとに独立した BM25 コーパスができ、コー�
 7. aggregator は候補の「選択と採点」を担い、liveness 判定を再実装しない。
    writer / repair の完全射影時に scope resolver が解決した selector / snapshot ごとの結果を
    `agg_bindings` として持つ。binding は chunk identity と `path_at_commit` /
-   `pointer_commit` を結ぶ relation であり、config 切替、DAG の分岐・再導入、
+   `pointer_commit` を結ぶ relation であり、config 切替、履歴での再導入、
    同一 chunk の複数 alias を scope 側の答えどおりに表す。replica は scalar provenance
    metadata から eligibility を推定しない。検索時は binding から作る eligible 集合を
    `WHERE` で参照する。fresh current 検索は durable binding を使う一方、履歴 selector
@@ -395,11 +396,8 @@ device では `.kio` ごとに独立した BM25 コーパスができ、コー�
 不変条件 6-8 の理由。**6**: replica の staleness をそのまま信じると「purge 中の scope を読む」に化ける。
 かといって毎回全 scope を開けば replication の意味が無い。結果を出した scope だけ検証すれば
 コストは `O(結果ページの distinct scope 数)` で scope 総数に依存しない。
-**初版は「消えたはずの chunk を返す」も理由に挙げ、`kio_format_version` と `index_generation` の
-返却直前再確認まで求めていた。2026-08-11 に取り下げた** — この 2 値は入口ガードで足りる。
-ただし候補 scope の purge journal / epoch / lifecycle barrier は別であり、応答境界直前の `recheck()` を
-維持する。前者を再確認して守れるのは検索 1 回分の窓にすぎず、その窓で古い行が残っても、pointer は
-参照解決時に完全な安全確認を通り、結果行は本文を持たない ([05-runtime.md §1.8](05-runtime.md) 手順 3)。
+`kio_format_version` と `index_generation` は入口で、purge journal / epoch / lifecycle barrier は
+応答直前にも検証する。Evidence Pointer の解決でも現在の権限と参照先を検証する。
 purge を残すのは法務・秘匿の操作であり**文書名だけでも意味を持つ**ためである。
 **7**: `chunk_config_generations` / `tree_entries` / publication / ancestry を aggregator 側で
 組み直すと liveness 判定が 2 箇所になり、必ず乖離する。生テーブルではなく **scope 側の既存 resolver が
@@ -408,7 +406,7 @@ purge を残すのは法務・秘匿の操作であり**文書名だけでも意
 
 ## 4.1 永続ストア一覧 (technology × truth/cache)
 
-各永続ストアの実装技術と喪失時の扱いの正本表 (2026-07-14 実装準拠で確定)。個別 schema の正本は右端の参照先に置く。
+各永続ストアの実装技術と喪失時の扱いの正本表。個別 schema の正本は右端の参照先に置く。
 
 | ストア | 技術 | 区分 | 喪失時 | schema 正本 |
 |---|---|---|---|---|
@@ -423,7 +421,7 @@ purge を残すのは法務・秘匿の操作であり**文書名だけでも意
 | `.kio/manifest.json` | JSON (schema 検証) | working-state cache (永続的真実は tree/commit object) | rescan で再構築 | §8 files |
 | `.kio/tasks.jsonl` | JSONL (append-only) | 運用データ | 喪失許容 ([04-pipeline.md §5.7](04-pipeline.md)) | [04-pipeline.md §5.1](04-pipeline.md) |
 | `.kio/chunks.jsonl` | JSONL (append-only) | **truth** (chunk の世代 association / created_at / 生成時点 path / tagged publication events — chunk object には含めない §8) | 復旧不能 (SQLite rebuild の入力) | §8 / [04-pipeline.md §4.1](04-pipeline.md) |
-| `.kio/index/sqlite.db` (**検索面ではないが aggregator の複製元である** — 2026-08-12。`kio search` は引かず、読むのは writer / repair による完全射影と scope 内保守。`.kio` 内にあることでフォルダごと移動しても移動先で再導出でなく射影で済む。[05-runtime.md §1.8](05-runtime.md)) | **SQLite** (public logical object は chunks / chunk_config_generations / chunk_publications / embeddings / tree_entries / index_metadata の 6 表、および chunk_fts / chunk_vec / image_vec の 3 virtual table、計 9。FTS5 / sqlite-vec の shadow table は含めない) | cache | 単一 scope は `kio repair rebuild-db`、device 全体は `kio repair all` (`-a`) | [04-pipeline.md §4](04-pipeline.md) |
+| `.kio/index/sqlite.db` (**検索面ではないが aggregator の複製元である**。`kio search` は引かず、読むのは writer / repair による完全射影と scope 内保守。`.kio` 内にあることでフォルダごと移動しても移動先で再導出でなく射影で済む。[05-runtime.md §1.8](05-runtime.md)) | **SQLite** (public logical object は chunks / chunk_config_generations / chunk_publications / embeddings / tree_entries / index_metadata の 6 表、および chunk_fts / chunk_vec / image_vec の 3 virtual table、計 9。FTS5 / sqlite-vec の shadow table は含めない) | cache | 単一 scope は `kio repair rebuild-db`、device 全体は `kio repair all` (`-a`) | [04-pipeline.md §4](04-pipeline.md) |
 | `~/.local/share/kio/scope-registry.sqlite` | **SQLite** (`scopes` 1 表) | cache | 各 `.kio` の rescan | [10-operations.md §3](10-operations.md) |
 | `~/.cache/kio/aggregator.sqlite` | **SQLite** (`agg_scopes` / `agg_chunks` / `agg_fts` / `agg_embeddings` / `agg_image_embeddings` / `agg_image_refs` / `agg_bindings` / `agg_projection_markers` の 8 表) | cache | writer の完全再射影、または device-global の `kio repair replica` (`-r`)。source SQLite も含めて検証・再構築する場合は `kio repair all` (`-a`)。欠落・不完全時は `kio search` が source index を読まず fail-closed | [05-runtime.md §1.8](05-runtime.md) |
 | `${XDG_CACHE_HOME:-$HOME/.cache}/kio/search-query-cache/<query_vector_digest>` | file (canonical float32 little-endian vector) | device-local cursor replay cache（query 本文は保存しない） | 欠落・digest 不一致は当該 cursor を `KIO-E-SEARCH-CURSOR-001` で拒否。再 embedding や source SQLite 読みには戻らない | [05-runtime.md §1.5](05-runtime.md) |
@@ -516,7 +514,6 @@ null フィールドは hash 入力に含めない (省略と null を識別し�
 5. UTF-8 バイト列に対し sha256, "sha256:" プレフィックス
 ```
 
-手順 1-2 の対象文字集合と単独 CR の扱いは 2026-07-03 に確定 (契約テスト設計 step2a §C-4 の決定性論点解消)。
 
 `spec_version` の bump は breaking change 扱い。current reader は選択された current version だけを受理し、migration / old-version read-only reader は置かない。
 
@@ -594,7 +591,7 @@ elif any(u.status == "failed" for u in inst.units):
                      # done + 残り全 permanent は 04-pipeline.md §5.2 の settled partial として terminal)
 else:
     up_to_date
-# prepare profile の変更は 04 §2.1 の prepared_hash 変化として再投入を駆動する — 本判定は instance の
+# 準備の出力または profile の変更は 04 §2.1 に従って再投入を駆動する — 本判定は instance の
 # 存在のみを見るが、§2.1 の差分判定が上流で新 run を積むため up_to_date に留まらない
 ```
 
@@ -652,7 +649,7 @@ model/file、prompt/context、windowing、次元、正規化・集約、runtime 
 ## files (working state) — 実体は manifest.json (SQLite テーブル非採用)
 
 working state の実体は `.kio/manifest.json` の `files` 配列であり、**SQLite に `files` テーブルは
-作らない** (§4.1。2026-07-14 実装準拠へ更新 — 旧 `CREATE TABLE files` 定義は未実装のまま廃止)。
+作らない** (§4.1)。
 schema は `kio-core/schemas/manifest.schema.json` (JSON Schema、[10-operations.md §11.3](10-operations.md))
 で検証する:
 
@@ -680,7 +677,7 @@ schema は `kio-core/schemas/manifest.schema.json` (JSON Schema、[10-operations
 ## normalization_runs — 実体は normalized instance manifest (SQLite テーブル非採用)
 
 normalization run の正本は normalized instance の `manifest.json` (§2.1) であり、**SQLite に
-`normalization_runs` テーブルは作らない** (§4.1。2026-07-14 実装準拠へ更新)。run 状態は独立永続化
+`normalization_runs` テーブルは作らない** (§4.1)。run 状態は独立永続化
 せず、manifest + unit object の存在から導出する (§6、[04-pipeline.md §5.7](04-pipeline.md))。
 
 run レコード (パイプライン内部表現。manifest へは provenance として `run_id` / `parent_gen` を記録):
@@ -737,7 +734,8 @@ image_hash    = "sha256:" + base16(sha256(抽出画像のバイト列))
 - `tree_hash` / `commit_hash` = 保存バイト列の sha256。検証は再ハッシュのみで足りる。
 - 種別誤認防止のため object 本体に `"object_type": "tree" | "commit"` を必須で含める (Git の object header 相当)。
 - tree の `entries` は `path` の UTF-8 バイト列昇順で一意にソートする。同一 `path` の重複 entry は禁止し、`KIO-E-STORE-DUP-001` で拒否する (`/` を含む path の `KIO-E-STORE-PATH-001` とは区別する)。
-- commit の `parents` は commit_hash の配列。第一要素は直前 HEAD (first parent)。
+- commit は単一の `parent` を必須とする。genesis は `null`、それ以外は直前の HEAD の commit hash を格納する。
+  [線形形式の不変条件](13-linear-history.md#3-線形形式の不変条件) に従う。
 - timestamp は UTC ISO8601 + `Z` ([06-cli-spec.md §11](06-cli-spec.md))。
 - `HEAD` / `refs/heads/*` / `refs/tags-v1/tag-*` の値は commit_hash (`refs/tags-v1/names.jsonl` は ref ではなく論理名 ledger — この規則の対象外)。
 
@@ -907,7 +905,7 @@ metadata digest、producer/profile/artifact set、receipt/context/source hash/MI
 {
   "object_type": "commit",
   "tree": "sha256:3f9a...",
-  "parents": ["sha256:71bd..."],
+  "parent": "sha256:71bd...",
   "created_at": "2026-04-29T12:00:00Z",
   "message": "snapshot after indexing docs",
   "tool_lock_hash": "sha256:...",
@@ -1043,7 +1041,7 @@ mutable projection/cacheである `objects/normalized/` と `objects/normalized_
 
 ```text
 HEAD / refs/heads/* / refs/tags-v1/tag-* → commit
-commit.parents                         → commit
+commit.parent                          → 親 commit（genesis の null は辺なし）
 commit.tree                            → tree
 commit.tool_lock_hash                  → toollock
 tree.entries[].normalize.manifest_hash → manifest
@@ -1186,7 +1184,7 @@ Skipped(images_excluded_from_external_send) にし、local の画像処理と既
 `manual_only` は `idle_threshold_seconds` と `max_runtime_seconds` を禁止、`after_index` は
 `max_runtime_seconds` を必須・`idle_threshold_seconds` を禁止、`on_idle` は両方を必須とする。
 
-## 11.1 .kioignore 文法 (2026-07-03 追記)
+## 11.1 .kioignore 文法
 
 `.kioignore` は scope ルート (`.kio` と同階層) に置く。`kio index` の探索全体 — 直下ファイルの取り込み判定と、サブフォルダへの子 `.kio` 自動生成の対象判定 ([06-cli-spec.md §1](06-cli-spec.md)) — に適用する。文法は **gitignore 互換サブセット**:
 

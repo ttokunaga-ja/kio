@@ -257,7 +257,7 @@ cache = aggregator
 ~/.local/share/kio/scope-registry.sqlite
 ```
 
-schema (本節が正本。2026-07-14 実装準拠で確定):
+registry schema:
 
 ```sql
 CREATE TABLE scopes (
@@ -336,25 +336,24 @@ CREATE TABLE scopes (
   registry は cache なので削除は解決系には安全 (live scope は自分を再登録する)。**ただし live 重複の
   検出 (DUP gate) も registry に依存するため、削除直後は gate が一時的に盲目になる** — 各 clone の
   次回使用で再登録され次第回復する既知の窓 (削除を dedupe の手段にしない)
-- device data / cache / state の保護は [14 の正本](14-v1-runtime-contracts.md#protection-of-kio-created-objects) に従う。
+- device data / cache / state の保護は [Kio 作成物の保護](#43-kio-created-object-boundary) に従う。
   registry / cost-ledger / logs は利用パターンとスコープ地図を含む。
 
 
 ### 不変条件 (cache vs truth)
 
 ```text
-1. scope_registry / aggregator のみを更新して `.kio` の状態が変わる実装は禁止。**反映順序は「各 scope の索引 → aggregator」** — 逆順は検索に出るのに開けない結果を作る (2026-08-11、05-runtime.md §1.8)。
+1. scope_registry / aggregator のみを更新して `.kio` の状態が変わる実装は禁止。**反映順序は「各 scope の索引 → aggregator」** — 逆順は検索に出るのに開けない結果を作る ([05 の検索契約](05-runtime.md#18-複数-scope-横断検索-multi-scope-search))。
 2. scope_registry / aggregator 喪失は再構築可能 (各 `.kio` を rescan)。**「欠損中も動作」は要求しない** — 正しい挙動は検索を fail-closed とし、次の writer / repair が完全射影を再公開することである (03-data-model.md §4 不変条件 2)。読取り時の lazy refresh は行わない。
 3. `.kio` 喪失は復旧不能 (registry・aggregator には正本データがない)。
 4. 検索結果メタには「正本の `.kio` パス」を必ず含める。
 5. raw object の所有権・dedup は scope_registry でグローバル化しない。
    各 `.kio/objects` 内に閉じる (横断 dedup を諦めた帰結。03-data-model.md §3)。
 6. aggregator は安全性判定の最終権限を持たない (05-runtime.md §1.8 手順 3)。
-7. aggregator は liveness 判定を再実装しない (解決済みの答えだけを複製する)。**検索が読む索引は aggregator ただ 1 つ** — scope 数によらず各フォルダの `.kio/index/sqlite.db` を `kio search` が引くことはない (2026-08-11)。**射影の範囲は live + 過去の全 chunk** であり、生存で絞るのは `WHERE` 句である (2026-08-11 — 03-data-model.md §4 不変条件 7)。
+7. aggregator は liveness 判定を再実装しない (解決済みの答えだけを複製する)。**検索が読む索引は aggregator ただ 1 つ** — scope 数によらず各フォルダの `.kio/index/sqlite.db` を `kio search` が引くことはない。**射影の範囲は live + 過去の全 chunk** であり、生存で絞るのは `WHERE` 句である。
 8. 権限の書き込みは常に `.kio` へ。aggregator は投影のみ。
 ```
 
-不変条件 6-8 は 2026-07-25 の replication 化で追加した ([03-data-model.md §4](03-data-model.md) が正本)。
 **aggregator は cache root (`$XDG_CACHE_HOME/kio/aggregator.sqlite`) に置く** — data root ではない。
 バックアップ対象外でよく、消しても writer / repair が各 `.kio` から再射影できる (§7.5.2 の backup 例に含めない)。欠損中の `kio search` は source SQLite に fallback しない。
 
@@ -362,14 +361,27 @@ scope registry は共有 `.kio` の正本ではない。フォルダ移動や外
 
 ---
 
+現行 policy の判断では、scope と各祖先の設定・`.kioignore` を保持済み directory handle から読み、
+各 scope 内の規則順を適用する。祖先による拒否を子の
+negation で解除できない。除外された subtree の既存行や保留タスクにも現在の拒否を適用する。
+`index`（preview を含む）と両モードの `reindex` は、scope が許可されない場合、write recovery や索引変更の
+前に停止し、既存の HEAD・manifest・履歴を保つ。通常のファイル単位の Ignore は対象ファイルだけを除外する。
+index と再生成 reindex は journal・HEAD・manifest の公開直前と no-op 成功直前にも policy を検証する。
+変更を検出したら公開せず、既に準備した immutable object は到達不能のまま残り得る。
+検索では現在の policy で絞ってから候補数を制限し、policy が変わった cursor の再利用を拒否する。
+policy の同一性は scope の所属、設定・Ignore の内容、秘密と制御パスの規則、ファイルシステムの
+大文字小文字の扱いで判定する。
+OCR、document/query embedding、rerank は送信 admission の直前に、watcher の処理を待たず
+[Adapter の送信境界](07-adapter-spec.md#3-ネットワーク送信原則と-opt-in-正本) に従って現在の権限を検証する。外部エディタによる検証後の policy 変更との原子性は保証しない。
+
 # 4. フォルダごとの `.kio` 運用
 
 v1 の到達要求は、ignore されない全子フォルダ（空フォルダを含む）を自動発見し、`.kio` を自動作成して
 独立 scope として管理できることである。root からの native OS event を契機に reconciliation し、手動
 `kio index` は同じ engine を使う。起動・再接続・event overflow の後と定期 fallback は rescan して
 取りこぼしから回復する。event stream は最適化であり egress grant を与えず、directory size/mtime は再帰的な
-完全性の証明ではない。exact debounce/SLA と一般的でない filesystem の対応範囲は未決であり、現行挙動から
-確定済みと扱わない。
+完全性の証明ではない。子作成専用の遅延保証と一般的でない filesystem の対応範囲は未確定である。
+照合の既定値は [変更検知](12-change-detection.md#4-再照合と中断からの復旧) を参照する。
 
 `.kio` は明示 root と、管理済み親が retained handle で発見・検証した直接の子にだけ作る。discovery は空フォルダも
 対象にし、各 child はその直接の親だけが enrollment する。
@@ -383,53 +395,78 @@ kio index / watch の reconciliation は、空を含む eligible な直接 child
 child の管理開始は egress grant を作らない
 ```
 
+親のローカル管理許可は、空を含む将来の非除外の子にも適用する。子の管理可否は、明示 root までの
+直接の親子関係、双方の enrollment token、scope ID、元の canonical path と実体が一致する場合に
+確定する。registry は欠落した親の代わりに使えない。独立 root、移動・コピー・失効・中断等により
+所属が確定しない child を自動採用せず、別 volume は明示 root として管理する。
+大文字小文字の扱いは管理を許可したファイルシステムの実体に結び付ける。search と preview は probe を作らない。
+
+管理・回復レコードの物理 ID は JSON の固定幅小文字 hexadecimal string とする。
+`device`、`inode`、`file_index` は 16 桁、`volume_serial_number` は 8 桁とする。
+数値、符号付き、大文字、幅の異なる表現を拒否する。
+
 ### 4.1 Child initialization の中断・取消
 
-以下は現行 revision の実装契約であり、候補全体の検証は未完了である。親 `.kio` は child 初期化を
-`child-initializations/<ULID>.json` に一 basename 一 operation として保持する。ULID は operation ごとの
-識別子で、最大 **1024** 件、総量 **8 MiB**、各 journal **64 KiB** を超えない private state とする。
+親は child の basename ごとに一件の未完了初期化を `child-initializations/<ULID>.json` に保持する。
+private journal の上限は 1,024 件、
+合計 8 MiB、一件 64 KiB である。現在の Ignore が対象を拒否している間はその child を保留し、
+他の child は処理できる。再開には現在の policy に加え、元の child、enrollment と private stage の
+一致が必要である。stage が失われたり置き換えられたりした場合は拒否する。
 
-current Ignore で pending child が不許可になった場合、その journal は inert であり、他 child の discovery・
-reconciliation・retirement を止めない。後に policy admission が復帰しても、同じ planned directory identity、
-basename、scope/enrollment plan が一致する場合だけ再開する。pinned stage が消失または identity 不一致なら
-新規 stage を割り当てず fail-closed とする。
-
-retirement は parent index を一度読み、対象 child ごとに独立して処理する。all-child retirement を child ごとに
-繰り返してはならない。`repair cancel-child-initialization` は explicit operation の未公開 private stage だけを
-取消でき、child root と user file は削除しない。取消 marker の `Prepared`、`Quarantined`、`Removed` 各 phase は
-耐久化し、automatic replay は既に存在する explicit cancellation intent にだけ行う。published pending `.kio` は
-取消対象外で、Ignore が外れれば通常 recovery が再開する。root register は未完了 operation または cancellation
-marker を含む root を拒否し、read-only planner は lock / archive を作成しない。
+`repair cancel-child-initialization` が退役できるのは指定した operation ID の未公開かつ親所有の private stage
+だけである。stage の退役前にその stage の検証済み case probe だけを除く。child root や利用者のファイルは
+削除しない。取消の `Prepared`・`Quarantined`・`Removed` を耐久記録し、中断後の自動回復は明示済みの取消だけを続ける。
+child の退役は親の索引を一度参照し、対象ごとに独立して行う。
+公開済みの pending `.kio` は取消対象外で、現行 policy が許すときに通常の初期化を再開できる。
 
 ### 4.2 Atomic publication と explicit root bootstrap
 
-以下も現行 revision の実装契約であり、候補全体の検証は未完了である。一-file publication / removal の
-owner-private `.kio-atomic` は `.kio` または pinned private stage owner の下だけに置き、user folder に作らない。
-未公開 write の残骸は discard だけを許し、hardlink は受理せず、publish は no-replace rename 規約を守る。removal は
-対象を quarantine する前に、exact bytes、physical owner / target、parent-chain identity を結び付けた durable intent を
-置く。一致しない residue は回復も削除もせず fail-closed とする。Windows の foreign owner working-file removal は
-name を変更する前に拒否する。既存 user file の ACL は removal のために書き換えない。
-working-tree restore は明示した `.kio` owner からだけこの回復を行う。
+一ファイルの公開・削除に使う owner-private の `.kio-atomic` と恒久 gate は、
+`.kio` または固定済みの private stage の下に限る。
+未公開 write の残骸は破棄だけを許し、hardlink を拒否する。create-only の公開は既存ファイルを上書きしない。
+削除では、対象を隔離する前に所有者・対象・親チェーン・元ファイルの物理 ID と正確な内容を結び付ける意図を
+耐久記録する。再開時に実体と内容を照合し、不一致なら変更せず拒否する。Windows では他の利用者が所有する
+作業ファイルの削除を名前の変更前に拒否し、既存ファイルの ACL を変更しない。
+作業ツリー復元の回復は、その操作が指定した `.kio` owner に限る。
+読み取り専用の検査は回復領域の作成・lock の取得・後片付けを行わない。
 
-明示 root の bootstrap は `.root-init-journal.json` と permanent `.root-init-gate` により直列化する。新規 retry は
-pre-marker 時の空の `.kio` にだけ許し、record を検証するまで通常の root-pending gate を維持する。直近 parent だけを
-認証して lease を保持し、parent enrollment が残る同じ child で `.kio` を失った場合は独立 root を作り直さない。
-有効な既存 Child は冪等に開く。既存の unknown、old-format、or unmanaged な non-empty store は変更しないで拒否する。
-`.kio-case-probe` は retained scope root に置く唯一の transient leaf で、fixed exact bytes だけを再開可能とする。
-child initialization の cancel は private stage を退役する前に verified exact probe を cleanup する。それ以外の probe
-residue は fail-closed とする。read-only operation は atomic state、bootstrap、probe のいずれも作成・lock・cleanup しない。
+明示 root の初期化は `.root-init-journal.json` と恒久の `.root-init-gate` で直列化し、
+正確な記録を検証できるまで通常の管理操作を拒否する。通常の初期化は直近の親だけを認証し、その lease を保持する。
+初期化前の状態からやり直せるのは初期化記録のない空の新規 store だけである。
+保持済みの scope root 上の一時ファイルは固定名 `.kio-case-probe` のみに限る。固定内容と一致する場合に
+限って再使用し、別の内容の probe 残骸は fail-closed とする。読み取り専用操作は初期化用の状態や probe を
+作成・lock・cleanup しない。
+既存の不明な store・旧形式・非空の unmanaged store はそのまま拒否する。
+
+新しい root の `init --independent` は、観測した直近の親との関係を示して確認を求める。
+親が読めない場合や enrollment が不明な場合は、その不確かさを表示する。確認済みの独立 root は
+親の変更権限を取得せず、親の enrollment・bytes・履歴を保つ。通常の探索で child として取り込まれない。既存 Child の切離しや失われた child store
+の回復で親の enrollment を変更する場合は、元の enrollment と親の権限を排他的に確認する。
+切離しは親の lease を保持し、その enrollment だけを退役させ、独立した identity を記録する。
+詳細は [root registration](06-cli-spec.md#root-registration) に従う。
+不一致や不明な関係は修復を求めて拒否する。子・親の利用者ファイルを削除しない。
 
 ### 4.3 Kio-created object boundary
 
-storage の owner / permission、検証対象、拒否条件、scope root と外部 ancestor の扱いは
-[14 の正本](14-v1-runtime-contracts.md#protection-of-kio-created-objects) に従う。
-利用者向け error は [06 の CLI 契約](06-cli-spec.md#kio-created-object-protection) を参照する。
+Kio が作成する `.kio` とその内容、device data・cache・state、credential・trust・台帳・backup、
+一時ファイル・query cache・renderer scratch は、現在の利用者が所有する private storage とする。
+Unix では作成時にディレクトリを `0700`、ファイルを `0600` とし、検証時にも owner-only を要求する。
+追加の ACL でこの保護を弱めない。OS 管理者の権限を理由に別所有者の Kio 作成物を受理しない。
+Windows では owner-only の保護された DACL を要求する。隔離した renderer の一時領域に限り、
+当該 invocation の AppContainer SID へのアクセスをその寿命中に許可する。
+owner、DACL、SID、対象の identity を検証し、終了・回復時にこの追加権限を退役させる。
 
-子 scope 経路を含む v1 実装境界は [09-mvp-scope.md §1.2](09-mvp-scope.md) を正本とする。macOS、Linux、
-Windows のいずれも pathname fallback を使わず、同じ retained-handle 境界で child mutation を行う。native
-Actions の同一候補受入は別の未完了 gate であり、実装済みという記述を acceptance pass と読まない。
+読み取り専用操作も、使用前に所有者・アクセス権・実体を検証する。別の所有者、他の利用者に書込み・
+削除・権限変更を許すアクセス、symlink / reparse point、検出したすり替えは拒否する。private file は
+単一リンクでなければならない。
+root の binding、保持済み実体からの no-follow open、identity の再検証を通じ、管理開始時に指定した
+root と同じツリーにアクセスを限定する。検出した差替え先はたどらない。利用者のフォルダや Kio が作成して
+いない祖先の ACL・mode・owner だけで可否を決めず、それらの権限は変更しない。
+同一 OS アカウントによる操作や、書込み可能な祖先での他者による削除に対する保護は範囲外である。
+service や renderer の実行コードと置換防止には、個別の trust 条件が適用される。
+CLI の拒否コードは [Kio-created object protection](06-cli-spec.md#kio-created-object-protection) を参照する。
 
-走査境界の既定 (2026-07-18 確定 — いずれも安全側。緩和は config で明示的に行う):
+走査境界の既定は以下のとおり。緩和は設定で明示する。
 
 ```text
 symlink               lstat 基準で検出し、**追跡しない** (skip + status 表示)。scope 外への
@@ -849,7 +886,7 @@ credential rotation 前に pending job と terminal cleanup を drain する。�
 明示 `kio batch abandon` で未解決行を扱う。残骸 cleanup が未確認の行は引き続き保持されるため、
 abandon 自体を鍵再生成の許可とみなさない。旧 constant scope と新 scope は自動 rebind しない。
 
-この節はすでに現行の backup / restore-reconcile 手順を定めている。知識の `.kio` backup と、
+知識の `.kio` backup と、
 device/central operational truth の backup は別物であり、後者を `.kio` restore で初期化・上書きしてはならない。
 
 知識の `.kio` backup は次のコピー手順に従う。device-global ledger はこのコピーの
@@ -871,22 +908,46 @@ device/central operational truth の backup は別物であり、後者を `.kio
 
 ```
 
-device-global ledger は `kio ledger backup --to <absolute-directory>` で lifecycle lock 下に
-coherent な create-only artifact を作る。`kio ledger restore --from <absolute-directory>` は、
-surviving authority/checkpoint と private proof が同じ ledger ID、era、sequence、SQLite digest を
-示す場合に限り、**missing database** を復元する。既存 database を上書きせず、pending write が
-あれば拒否する。backup より後に発生した支出を推測して reconciliation する経路はない。
+### デバイス課金台帳のライフサイクル
 
-中断した ledger write は `kio ledger recover` だけが扱う。これは device-global で config や scope に
-依存せず、private journal の exact sequence と旧/新 security token、authority、checkpoint、database
-state が一致する場合だけ checkpoint を復元・公開するか committed state を finalize する。成功 JSON は
-`status="ready"`、snake_case の `recovery`、`path` を返す。`no_pending`、`aborted`、
-`restored_before_checkpoint`、`finalized_committed`、`published_after_checkpoint` 以外は成功値ではない。
-通常の status/search は recovery を起動せず、pending write 中の通常 write は fail-closed である。
-authority/schema mismatch、corruption、または exact state 外は blocked のままにする。SQL replay、
-送信の再実行、unknown cost の返金は行わない。
+`kio ledger init` は central ledger を明示的に作成する。モデルの取得・import、scope 初期化、
+offline indexing、全文検索は台帳を初期化しない。モデル準備は台帳を照会・修復しない。
+初期化前の支出は不明であり、有料処理を新規に許可する根拠にはできない。
+無料実行と予算観測の扱いは [04 の予算契約](04-pipeline.md#54-cost-guardrail--kill-switch) に従う。
 
-復元後は `kio repair verify-objects` で整合性を確認する。外部ドライブ・クラウド
+台帳の正本は `cost-ledger.sqlite` と、その ledger ID・era に結び付いた private authority と checkpoint である。
+台帳の保護は、存在する場合の SQLite WAL 調整ファイル、`cost-ledger.sqlite.authority.json`、
+`cost-ledger.sqlite.checkpoint.json`、private backup proof、恒久の `ledger.lifecycle.lock` にも適用する。
+checkpoint は単調増加する 64-bit 符号付きの sequence で書き込み世代を特定する。
+通常操作と provider 照合は欠けた checkpoint の作成、schema 修復、sequence の巻戻し、
+別 era の採用を行わない。初期化の中断は `ledger init --resume` で、同じ pending identity と
+空の課金履歴が検証できる場合だけ再開する。初期化の pending record は DB より前に耐久化し、
+既存の完全・部分 artifact は `ledger init` で置き換えない。
+
+台帳の各書込みは、実際に使う SQLite 接続の検証、transaction、次の checkpoint の耐久公開から
+COMMIT まで端末の lifecycle lock を保持する。checkpoint は COMMIT より先に公開し、間の中断で
+不一致が生じたら後続の有料処理を止める。古い backup を会計の基準にできない。
+保持済み directory/file handle と no-follow 検査で危険な差替えを拒否し、保護は §4.3 に従う。
+
+`ledger status` は private snapshot を用い、元の SQLite を書込み用に開かない。
+snapshot と backup は同じ lifecycle lock と identity の検証の下で、bounded streaming または SQLite
+online backup で扱う。旧来の固定 database/copy byte 上限だけでは拒否しない。完全な DB と WAL 整合性、
+authority、checkpoint を検証してから結果を利用・公開する。
+`ledger backup --to <absolute-directory>` は世代を固定する private proof を記録し、owner-private の
+成果物を create-only で公開する。元の bytes と権限は変更せず、不完全な backup を完成品として公開しない。
+資源不足と破損を区別し、いずれの場合も台帳不明のまま有料処理を送信しない。
+
+`ledger restore --from <absolute-directory>` の対象は欠損した database に限る。restore journal または DB
+の公開前に、既存の private authority・checkpoint・backup proof が同一の ledger ID、era、sequence、
+正確な SQLite image を指すことを照合する。既存 DB、pending write、古い世代、変更された artifact、
+欠けた証明は拒否する。台帳 backup/restore で scope の知識、承認、device trust は復元しない。
+
+書込みが中断し整合性が確定するまで後続の書込み・有料処理を止める。回復は
+[ledger recover](06-cli-spec.md#device-global-ledger-recovery) の明示実行に限る。provider 側の
+job 一覧が取得できても、失われた、または照会できない依頼の費用を確定したことにはならない。
+課金状態を確認できる証拠がそろうまで、不明状態を表示して新規の有料処理を止める。
+
+知識の backup を戻した後は `kio repair verify-objects` で整合性を確認する。外部ドライブ・クラウド
 ストレージの placeholder file 上の `.kio` は破損リスクが高いため、§4 の境界方針の確定
 までは推奨しない。
 
@@ -901,7 +962,7 @@ sqlite.db / scope-registry.sqlite / aggregator.sqlite は正本から再構築�
 rename、**JSONL cutover 用** marker、列 default/backfill を用いる後方互換 migration は置かない。current
 `schema_migrations` の historical restore marker は拒否 artifact として読むだけで、通常操作が clear / repair する経路は持たない。
 
-台帳を利用する操作でのみ ([操作別前提条件](14-v1-runtime-contracts.md#operation-specific-prerequisites))、
+台帳を利用する操作でのみ ([操作別前提条件](#113-設定ファイル-schema-validation))、
 `cost_ledger` / `batch_requests` / `schema_migrations` / `ledger_metadata` の **4 表すべて**の table 定義、および
 `idx_cost_ledger_month` / `idx_batch_requests_inflight` を canonical DDL と比較する。明示 init で完全に空の artifact set
 だけを current schema で初期化できる。既存 ledger が不一致・欠損・読取不能なら、**bytes を保存した
@@ -1027,10 +1088,18 @@ kio batch resume --online
 前者は監査を記録して、その current policy / profile / 入力でなお送信可能な対象だけに一度の新しい相 1 を
 許可する。provider 送信はしない。後者が current policy、Adapter grant、secret grant、予算を再検査して
 fresh reservation で初めて送信する。OCR の送信は Full を選ぶが、partial task では既に失敗した unit subset
-だけを対象にし、既存の immutable done unit を置換しない。以前の `unknown_settled` 課金は保持する。
+だけを対象にし、既存の immutable done unit を置換しない。以前の `unknown_settled` 課金は保持する。embedding では明示した入力の content group を単位とする。
 
 これは既知 Batch job の結果再収集とは別である。Batch job / output が既知でローカル保存だけが失敗した場合は
-`kio batch resume --online` で同じ output を再収集し、新しい job・予約・`--resend-unknown` 承認は作らない。
+`kio batch resume --online` で同じ output を再収集し、新しい job・予約・`--resend-unknown` 承認は作らない。Mistral OCR の sync と Batch は同じ画像・応答の
+受入条件に従う。既知 Batch 結果の画像 CAS 保存に失敗した場合は、provider 応答の拒否と区別して
+`KIO-E-BATCH-RESULT-STORE-001` を返し、job と予約を保つ。
+
+同期 OCR は結果の事後照会ができない。送信中断、送信後の transport・応答契約・結果公開の
+失敗、送信済み incremental OCR の `fallback_to_full` は、予約を保守的に一度精算し
+`result_unknown` とする。認証・rate limit・quota の明示的な拒否で未課金と確定した場合は、
+新しい予約で通常の回復ができる。自動で Full を選べるのは incremental の不適用が送信前に
+確定した場合に限る。document embedding の同期応答が不明な場合も、結果不明の精算を行う。
 
 設定上書き例 (`.kio/config.toml`):
 
@@ -1077,7 +1146,14 @@ exit code の一覧と割当規則の正本は [06-cli-spec.md §7](06-cli-spec.
 
 ## 11.3 設定ファイル schema validation
 
-すべての設定ファイルは JSON Schema (TOML は JSON 等価表現に変換して同 schema で validate) を持ち、[14 の操作別前提条件](14-v1-runtime-contracts.md#operation-specific-prerequisites) に従い、その操作が使う設定を schema-driven validation する。schema は Kio 本体に同梱する。
+JSON Schema は本体に同梱し、TOML は JSON 等価表現として検証する。
+操作が利用する設定・権限だけを検証する。ローカルの status、全文検索、init、export、restore、index は、
+未使用の Adapter 設定や managed CA の欠落・未承認・不正・安全性の不備だけでは停止しない。
+選択済みの依存が利用できない場合は、その操作で理由を報告する。設定を自動修復せず、
+別の設定済み宛先には切り替えない。Adapter の readiness と理由はローカルの処理結果と区別して表示する。
+credential を使う前にその保護を確認する。managed CA の取得・検証は選択した HTTPS 送信に限り、
+[ローカル窓の送信境界](07-adapter-spec.md#31-ローカル窓の送信境界) の dispatch までの lock 保持に従う。
+ローカル policy、内容の整合性、コード実行の安全性に必要な前提は各操作で引き続き検証する。
 
 ```text
 ~/.config/kio/tools.toml          → schemas/tools.schema.json
@@ -1118,7 +1194,8 @@ profile hash の canonical whitelist と対応 schema に明示的に含める�
 
 ## 11.5 current-format boundary
 
-現在の保存形式は `KIO_FORMAT_VERSION = "3.0.0"` である。これは product/Cargo/release version や製品v2/v3の到達状態とは独立する。2.0.0で導入した必須の恒久 `.kio/.store-gate` を維持し、3.0.0ではtag名のNFC + Unicode simple case foldingと未割当文字拒否を是正する。旧小文字化で作られたtagのhashを新規則で読み替えないためのstorage MAJOR bumpである。旧storeのbytesを変更する移行処理は設けない。
+現在の保存形式は `KIO_FORMAT_VERSION = "3.0.0"` である。製品や配布物の version とは独立する。
+tag 名の identity は [データモデル](03-data-model.md#2-kio-物理レイアウト) に従う。
 
 current reader は `KIO_FORMAT_VERSION` と**完全一致**する string の `kio_format_version` だけを受理する。この判定は、すべての incompatible store に安定した `KIO-E-STORE-VERSION-001` / exit 8 を返すためだけに current schema validation より先に行う。missing、non-string、malformed、older、newer、unknown を含む任意の non-current 値は拒否し、いかなる command も拒否前に store bytes を変更してはならない。
 
@@ -1130,10 +1207,7 @@ current-format の recovery は別契約である。fresh / missing derived SQLi
 
 format change が新しい `KIO_FORMAT_VERSION` を選択した時点で、旧 version は直ちに non-current となる。semver / CHANGELOG は変更を記録するが、migration、dual-read、read-only compatibility を認可しない。独立して version を持つ他の interface はそれぞれの validation 規約に従う。
 
-**tree schema v2/v3 (2026-07-18 確定)**: tree entry へ `normalize.manifest_hash`、tree object へ
-`chunking_config_hash` (v2) と `chunk_set_hash` (v3 — 公開 chunk 集合の digest) を追加した
-([03-data-model.md §8](03-data-model.md)) — hash/identity 規約の変更だが、
-**実装・store 公開前の schema 確定であり MAJOR bump ではない**。current tree ではこれらの field は必須であり、欠落は legacy semantics へ縮退せず corruption / incompatible format として fail-closed にする。Step 1-2 実装の tree hashing は v2/v3 対応の rework が必要 ([09-mvp-scope.md](09-mvp-scope.md))。
+tree と commit の必須 field は [03 の object schema](03-data-model.md#tree--commit-object) に従う。
 
 **Adapter 入出力の `spec_version` bump 規約**: `tool-lock.json` の `spec_version` および Adapter 入出力 schema ([04-pipeline.md §3.1](04-pipeline.md)) の `spec_version` は単調増加の整数とする。bump するのは、フィールドの削除・必須化・意味変更など**旧 Adapter が誤動作しうる変更のみ** (MAJOR 相当。該当 spec と CHANGELOG への明示記載必須)。optional フィールドの追加では bump せず、代わりに Adapter は未知フィールドを無視しなければならない (MUST ignore unknown fields)。不一致時の挙動は分業する: Adapter 側は `invalid_input` として失敗する ([07-adapter-spec.md §8.1](07-adapter-spec.md))。**full fallback が有効なのは incremental capability だけが非互換な場合に限る** — spec_version 自体の非互換は full で呼び直しても同じ拒否を再生するため、当該 online Adapter のタスクを failed permanent (Adapter 更新が必要) とし、同梱 deterministic Adapter のベースラインは影響なく継続する ([07-adapter-spec.md §8.1](07-adapter-spec.md) と同旨)。index 全体の停止を引き起こさないという保証は、このベースライン継続が担う。
 
@@ -1176,29 +1250,7 @@ context   必須 field (空 object 可) — 値は JSON object (tool_profile_has
 `context` の `query`, `path`, `prompt` 等の機微フィールドを、nested な値も含めて同一 policy でマスクする (`message` は上記のとおり非機微テンプレート限定 — マスク対象の値を含めない)。
 false への変更は明示設定のみで行える。
 
-## 11.7 命名リネーム表 (旧 → 新)
-
-過去メモから現行設計への移行で発生した renaming を一覧化する。実装者はこの表を grep して旧称残置を排除する。
-(出所列の research/*.md は 2026-07-18 に docs から撤去済み — git 履歴で参照可)
-
-```text
-旧称                            | 現行                                | 出所
--------------------------------- | ----------------------------------- | ----
-folder.json                      | scope.json                          | research/kio.md §6
-folder_id                        | scope_id                            | 10-operations.md §3
-normalized_hash                  | (廃止)                               | research/hash.md §9
-canonical_text_hash              | (廃止)                               | research/diff.md §8
-canonical_hash                   | (廃止)                               | research/diff.md §17
-markdown_hash                    | (廃止)                               | research/diff.md §3
-Normalized-Hash: <Markdown header> | Tool-Profile-Hash: <Markdown header> | research/read_only.md §2
-.kio/normalized/<path>.md        | manifest CAS → normalized_unit_object CAS (正本。`normalized_units/` は current projection) | research/kio.md §11
-unit_id                          | unit_key / unit_ref                 | 03-data-model.md §2.1
-last_indexed_git_commit          | (廃止: Git 連携は持たない)             | research/kio.md §10
-output_hash (in normalization_runs) | (廃止)                            | research/hash.md §3
-cost-ledger.jsonl (+ -reservations / -reclaimed / .lock) | cost-ledger.sqlite (cost_ledger / batch_requests / schema_migrations / ledger_metadata の 4 表) | 04-pipeline.md §5.4
-```
-
-## 11.8 推奨 Reading Path
+## 11.7 推奨 Reading Path
 
 Reading Path の正本は [README.md §1](README.md)。docs/ 直下のファイル名の数字プレフィックスがそのまま読む順番であり、本書で別の順序を定義しない。
 
