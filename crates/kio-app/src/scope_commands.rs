@@ -107,24 +107,26 @@ pub(crate) fn run_init(ctx: &Invocation<'_>, args: commands::InitArgs) -> Result
 }
 
 pub(crate) fn run_status(ctx: &Invocation<'_>) -> Result<CommandResponse> {
+    let _inspection = kio_core::disk_records::StageInspection::begin();
     let repo = ctx.open_recovery_repository()?;
     validate_repo_tool_lock(&repo)?;
     let task_store = TaskStore::new_with_control(repo.kio_dir(), repo.control().clone());
     // R15-4: `status` is a pure read — a shallow HEAD (tree object gone)
     // degrades to listing files without a classification (`head_shallow`)
     // instead of dying on a raw KIO-E-STORE-NOT-FOUND-001.
-    let (status, unsupported_inputs, unsupported_inputs_complete) =
+    let (status, unsupported_inputs, unsupported_inputs_complete, deferred_inputs) =
         read_stable_head(&repo, |head| {
-            let status = repo.status()?;
+            let deferred = repo.index_deferrals_at_head(head)?;
+            let status = repo.status_with_deferred(&deferred)?;
             let (unsupported_inputs, complete) = if status.head_shallow {
                 UnsupportedInputStore::new(repo.kio_dir())
                     .latest_by_path()
                     .map_err(pipeline_to_kio)?;
-                (Vec::new(), false)
+                (kio_core::disk_records::DiskRecords::empty(), false)
             } else {
                 (unsupported_inputs_at_head(&repo, head)?, true)
             };
-            Ok((status, unsupported_inputs, complete))
+            Ok((status, unsupported_inputs, complete, deferred))
         })?;
     let tasks = task_store.all().map_err(pipeline_to_kio)?;
     let mut budget_observation = observe_budget(&ledger_db_path(ctx.control), ctx.control);
@@ -152,6 +154,7 @@ pub(crate) fn run_status(ctx: &Invocation<'_>) -> Result<CommandResponse> {
             quarantine: quarantine_status_records(&repo)?,
             unsupported_inputs,
             unsupported_inputs_complete,
+            deferred_inputs,
             budget: budget_status(&repo, &budget_observation)?,
             // CL37/CL68: permanently-stalled (settled but residue-cleanup-
             // pending) cost-ledger.sqlite batch_requests rows, device-global

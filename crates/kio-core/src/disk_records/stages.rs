@@ -88,14 +88,10 @@ fn containers(
 }
 
 impl RunDirectory {
-    pub(super) fn create(root: &RecordStageRoot, reclaim: bool) -> Result<(Self, StageWriter)> {
+    pub(super) fn create(root: &RecordStageRoot) -> Result<(Self, StageWriter)> {
         let registry = root.registry(true)?.expect("created registry");
         let (parent, identities) = containers(&registry, true)?.expect("created containers");
         let gate = identities.lock_private_gate(Path::new(GATE))?;
-        // The gate also serializes retirement and atomic journal recovery.
-        if reclaim {
-            inspect_containers(&parent, &identities, true)?;
-        }
         let mut nonce = [0; 32];
         getrandom::fill(&mut nonce).map_err(|error| {
             crate::KioError::io(error.to_string(), registry.path().display().to_string())
@@ -422,7 +418,7 @@ fn valid_run_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::disk_records::test_store_root;
+    use crate::disk_records::{test_store_directory, test_store_root};
 
     fn inspect_root(root: &RecordStageRoot, reclaim: bool) -> Result<Vec<RecordResidue>> {
         match root.registry(false)? {
@@ -437,8 +433,8 @@ mod tests {
         let fixture = tempfile::tempdir().unwrap();
         let root = test_store_root(&fixture);
         assert!(inspect_root(&root, false).unwrap().is_empty());
-        assert!(!fixture.path().join("internal").exists());
-        let (run, writer) = RunDirectory::create(&root, true).unwrap();
+        assert!(!test_store_directory(&root).path().join("internal").exists());
+        let (run, writer) = RunDirectory::create(&root).unwrap();
         drop(writer);
         let gate = run.identities.lock_private_gate(Path::new(GATE)).unwrap();
         let (started_tx, started_rx) = mpsc::channel();
@@ -469,29 +465,32 @@ mod tests {
     }
 
     #[test]
-    fn creating_without_reclaim_preserves_an_inactive_run() {
+    fn inspection_does_not_reclaim_an_inactive_run() {
         let fixture = tempfile::tempdir().unwrap();
         let root = test_store_root(&fixture);
-        let (old, writer) = RunDirectory::create(&root, true).unwrap();
+        let (old, writer) = RunDirectory::create(&root).unwrap();
         drop(writer);
         old.lease.unlock().unwrap();
-        let (new, writer) = RunDirectory::create(&root, false).unwrap();
-        assert!(old.parent.contains_entry(&old.leaf).unwrap());
-        assert!(old.identities.contains_entry(&old.leaf).unwrap());
-        drop(writer);
-        drop(new);
-        let (new, writer) = RunDirectory::create(&root, true).unwrap();
+        {
+            let _inspection = crate::disk_records::StageInspection::begin();
+            let _new = crate::disk_records::DiskRecords::from_records(
+                &root,
+                0..=crate::disk_records::SORT_BUFFER_RECORDS,
+            )
+            .unwrap();
+            assert!(old.parent.contains_entry(&old.leaf).unwrap());
+            assert!(old.identities.contains_entry(&old.leaf).unwrap());
+        }
+        crate::disk_records::RecordWriter::<u64>::new(&root).unwrap();
         assert!(!old.parent.contains_entry(&old.leaf).unwrap());
-        drop(writer);
-        drop(new);
-        drop(old);
+        assert!(!old.identities.contains_entry(&old.leaf).unwrap());
     }
 
     #[test]
     fn independent_lease_handle_skips_active_run_before_payload_inspection() {
         let fixture = tempfile::tempdir().unwrap();
         let root = test_store_root(&fixture);
-        let (run, writer) = RunDirectory::create(&root, true).unwrap();
+        let (run, writer) = RunDirectory::create(&root).unwrap();
         drop(writer);
         run.directory.remove_file(Path::new("records")).unwrap();
         run.directory
@@ -509,7 +508,7 @@ mod tests {
     fn unknown_tagged_directory_is_reported_and_preserved() {
         let fixture = tempfile::tempdir().unwrap();
         let root = test_store_root(&fixture);
-        let (run, writer) = RunDirectory::create(&root, true).unwrap();
+        let (run, writer) = RunDirectory::create(&root).unwrap();
         let parent = run.parent.clone();
         drop(writer);
         drop(run);
@@ -527,7 +526,7 @@ mod tests {
         for remove_directory in [false, true] {
             let fixture = tempfile::tempdir().unwrap();
             let root = test_store_root(&fixture);
-            let (run, writer) = RunDirectory::create(&root, true).unwrap();
+            let (run, writer) = RunDirectory::create(&root).unwrap();
             drop(writer);
             run.directory
                 .discard_stage(Path::new("records"), &run.journal.records)

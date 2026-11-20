@@ -2072,11 +2072,11 @@ fn scrub_unsupported(
     targets: &BTreeSet<&str>,
 ) -> Result<u64> {
     let store = kio_pipeline::unsupported::UnsupportedInputStore::new(kio_dir)
-        .with_published_tree(published_tree)
-        .map_err(crate::object_persistence::pipeline_to_kio)?;
+        .with_published_tree(published_tree);
     let mut rows = store
         .retained_rows()
-        .map_err(crate::object_persistence::pipeline_to_kio)?;
+        .map_err(crate::object_persistence::pipeline_to_kio)?
+        .to_vec()?;
     let before = rows.len();
     rows.retain(|row| !targets.contains(row.raw_hash.as_str()));
     let removed = before.saturating_sub(rows.len());
@@ -3082,7 +3082,10 @@ mod task_retirement_tests {
             !bytes.contains(&raw_a),
             "purged raw remains in an old journal row"
         );
-        assert_eq!(store.latest_by_path().unwrap(), vec![row.clone()]);
+        assert_eq!(
+            store.latest_by_path().unwrap().to_vec().unwrap(),
+            vec![row.clone()]
+        );
         assert!(bytes.contains(&raw_b));
         // Re-running purge remains safe; purging the current B must not revive A.
         scrub_unsupported(directory.path(), None, &BTreeSet::from([raw_b.as_str()])).unwrap();

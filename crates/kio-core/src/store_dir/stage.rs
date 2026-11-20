@@ -555,6 +555,15 @@ pub struct StageInspectionEntry {
     pub state: StageEntryState,
 }
 impl StoreDirectory {
+    pub(crate) fn verify_named_file_stage(
+        &self,
+        leaf: &Path,
+        identity: &StageIdentity,
+    ) -> Result<()> {
+        self.ensure_owner_private(leaf)?;
+        identity.verify(&self.open_regular_read(leaf, u64::MAX)?)
+    }
+
     /// Inspect a dedicated large-stage directory against the caller's saved
     /// journal identities. Unknown, unsafe and mismatching entries are reported
     /// with a reason; missing expected entries are included as well. This API
@@ -628,10 +637,9 @@ impl StoreDirectory {
             }
             let verification = match expected.remove(&name) {
                 None => Err(failure("no saved stage identity; residue preserved")),
-                Some(Expected::File(identity)) => (|| {
-                    self.ensure_owner_private(Path::new(&name))?;
-                    identity.verify(&self.open_regular_read(Path::new(&name), u64::MAX)?)
-                })(),
+                Some(Expected::File(identity)) => {
+                    self.verify_named_file_stage(Path::new(&name), identity)
+                }
                 Some(Expected::Directory(identity)) => (|| {
                     let directory = StoreDirectory::from_retained_with_control(
                         self.open_directory(Path::new(&name))?,

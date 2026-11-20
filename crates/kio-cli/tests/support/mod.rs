@@ -171,7 +171,7 @@ pub fn bind_renamed_normalize(root: &std::path::Path, old_name: &str, new_name: 
     repo.auto_snapshot_with_bound_normalize(
         None,
         None,
-        &BTreeSet::new(),
+        &|_| true,
         &references,
         &BTreeSet::new(),
         None,

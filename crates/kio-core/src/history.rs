@@ -382,7 +382,7 @@ impl HistoryReader {
         let edges = parent_edges_from_nodes(&walk.nodes);
         let visit_order = linear_order(&edges, &walk.nodes, start_commit)?;
         Ok(LinearHistory {
-            record_stages: self.store.record_stages()?,
+            record_stages: self.store.record_read_stages()?,
             start_commit: start_commit.to_owned(),
             nodes: walk.nodes,
             visit_order,
@@ -401,7 +401,7 @@ impl HistoryReader {
         let start_commit = linear_tip(&edges, roots)?;
         let visit_order = linear_order(&edges, &walk.nodes, &start_commit)?;
         Ok(LinearHistory {
-            record_stages: self.store.record_stages()?,
+            record_stages: self.store.record_read_stages()?,
             start_commit,
             nodes: walk.nodes,
             visit_order,
@@ -442,7 +442,7 @@ impl HistoryReader {
         let visit_order = linear_order(&walk.parents, &walk.nodes, &start_commit)?;
         Ok((
             LinearHistory {
-                record_stages: self.store.record_stages()?,
+                record_stages: self.store.record_read_stages()?,
                 start_commit,
                 nodes: walk.nodes,
                 visit_order,

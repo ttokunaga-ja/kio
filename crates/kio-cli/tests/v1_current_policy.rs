@@ -21,6 +21,62 @@ struct Fixture {
     home: PathBuf,
 }
 
+#[test]
+fn search_uses_committed_state_when_the_working_manifest_is_unreadable() {
+    let fixture = Fixture::new();
+    let manifest = fixture.child.join(".kio/manifest.json");
+    for flags in [&[][..], &["--all-history"][..], &["--include-deleted"][..]] {
+        let expected = fixture.search(flags);
+        let original = fs::read(&manifest).unwrap();
+        fs::write(&manifest, b"invalid manifest").unwrap();
+        let actual = fixture.search(flags);
+        assert_eq!(actual["results"], expected["results"]);
+        assert!(
+            actual["results"]
+                .as_array()
+                .is_some_and(|rows| !rows.is_empty())
+        );
+        fs::write(&manifest, original).unwrap();
+    }
+}
+
+#[test]
+fn current_text_search_reads_only_the_selected_tree() {
+    use kio_core::cas::{ObjectKind, ObjectStore};
+    use kio_core::scope::Repository;
+
+    let fixture = Fixture::new();
+    let first_head = fixture.head();
+    let repo = Repository::open(&fixture.child).unwrap();
+    let first_tree = repo.read_commit(&first_head).unwrap().tree;
+    fs::write(fixture.child.join("later.md"), "# Later\n\nAn orchid.\n").unwrap();
+    fixture.ok_at(&fixture.root, &["index", "--offline"]);
+    assert_ne!(fixture.head(), first_head);
+    let first_tree_path = ObjectStore::new(repo.kio_dir())
+        .object_path(ObjectKind::Tree, &first_tree)
+        .unwrap();
+    let expected = fixture.search(&[]);
+    fs::write(&first_tree_path, b"invalid tree").unwrap();
+    assert_eq!(fixture.search(&[])["results"], expected["results"]);
+    let history = fixture
+        .command(
+            &fixture.child,
+            &[
+                "search",
+                "orchid",
+                "--scope",
+                ".",
+                "--mode",
+                "text",
+                "--all-history",
+            ],
+        )
+        .output()
+        .unwrap();
+    assert!(!history.status.success());
+    assert!(String::from_utf8_lossy(&history.stderr).contains("store_corrupt"));
+}
+
 impl Fixture {
     fn new() -> Self {
         let temp = canonical_tempdir();
