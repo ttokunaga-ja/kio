@@ -2,11 +2,11 @@
 //! prepared input at a time and can publish only a validated complete vector.
 
 mod input;
-mod interrupt;
+pub(crate) mod interrupt;
 pub use interrupt::cancellation;
 mod native;
-mod platform;
-mod runtime;
+use crate::platform::eg2_worker as platform;
+pub(crate) mod runtime;
 mod supervisor;
 #[cfg(test)]
 mod tests;
@@ -45,7 +45,7 @@ pub enum EngineSlot {
 }
 
 impl EngineSlot {
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Index => "index",
             Self::Query => "query",

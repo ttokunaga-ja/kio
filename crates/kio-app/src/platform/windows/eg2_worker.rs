@@ -30,11 +30,11 @@ use windows_sys::Win32::System::Threading::{
     MUTEX_MODIFY_STATE, ReleaseMutex, SetPriorityClass, TerminateProcess, WaitForSingleObject,
 };
 
-pub(in crate::eg2) fn configure_command(command: &mut Command, _: u64) {
+pub(crate) fn configure_command(command: &mut Command, _: u64) {
     command.creation_flags(CREATE_NEW_PROCESS_GROUP);
 }
 
-pub(in crate::eg2) fn configure_worker(slot: EngineSlot) -> Result<(), WorkerError> {
+pub(crate) fn configure_worker(slot: EngineSlot) -> Result<(), WorkerError> {
     // SAFETY: the pseudo-handle refers to this worker.
     unsafe {
         SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
@@ -47,7 +47,7 @@ pub(in crate::eg2) fn configure_worker(slot: EngineSlot) -> Result<(), WorkerErr
     Ok(())
 }
 
-pub(in crate::eg2) fn private_output(
+pub(crate) fn private_output(
     capture_diagnostics: bool,
 ) -> Result<(File, Option<File>), WorkerError> {
     let null_output = File::options()
@@ -101,13 +101,13 @@ pub(in crate::eg2) fn private_output(
     }
 }
 
-pub(in crate::eg2) struct ProcessLimits {
+pub(crate) struct ProcessLimits {
     job: OwnedHandle,
     bytes: u64,
 }
 
 impl ProcessLimits {
-    pub(in crate::eg2) fn attach(child: &Child, memory_bytes: u64) -> Result<Self, WorkerError> {
+    pub(crate) fn attach(child: &Child, memory_bytes: u64) -> Result<Self, WorkerError> {
         // SAFETY: the job handle is transferred to OwnedHandle and its limit
         // structure is passed with the matching information class and size.
         unsafe {
@@ -139,7 +139,7 @@ impl ProcessLimits {
         }
     }
 
-    pub(in crate::eg2) fn check(&self) -> Result<(), WorkerError> {
+    pub(crate) fn check(&self) -> Result<(), WorkerError> {
         // SAFETY: the job is live, and the info class matches the output struct.
         let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         if unsafe {
@@ -161,31 +161,31 @@ impl ProcessLimits {
     }
 }
 
-pub(in crate::eg2) fn peek_exit(child: &mut Child) -> io::Result<Option<ExitStatus>> {
+pub(crate) fn peek_exit(child: &mut Child) -> io::Result<Option<ExitStatus>> {
     child.try_wait()
 }
 
-pub(in crate::eg2) fn terminate_group(_: &Child) {
+pub(crate) fn terminate_group(_: &Child) {
     // Dropping ProcessLimits closes the job and terminates its descendants.
 }
 
-pub(in crate::eg2) fn configure_pipes(_: &ChildStdin, _: &ChildStdout) -> io::Result<()> {
+pub(crate) fn configure_pipes(_: &ChildStdin, _: &ChildStdout) -> io::Result<()> {
     Ok(())
 }
 
-pub(in crate::eg2) fn interrupt_io(thread: &JoinHandle<()>) {
+pub(crate) fn interrupt_io(thread: &JoinHandle<()>) {
     // Cancellation can race with entry into a syscall. The supervisor polls
     // until the thread exits, and the pipe wrapper checks its stop flag.
     unsafe { CancelSynchronousIo(thread.as_raw_handle()) };
 }
 
-pub(in crate::eg2) struct SlotGate {
+pub(crate) struct SlotGate {
     mutex: OwnedHandle,
     acquired: bool,
 }
 
 impl SlotGate {
-    pub(in crate::eg2) fn open(slot: EngineSlot) -> Result<Self, WorkerError> {
+    pub(crate) fn open(slot: EngineSlot) -> Result<Self, WorkerError> {
         let name: Vec<_> = format!("Global\\Kio-EG2-Engine-{}", slot.name())
             .encode_utf16()
             .chain([0])
@@ -229,7 +229,7 @@ impl SlotGate {
         })
     }
 
-    pub(in crate::eg2) fn try_acquire(&mut self) -> Result<bool, WorkerError> {
+    pub(crate) fn try_acquire(&mut self) -> Result<bool, WorkerError> {
         match unsafe { WaitForSingleObject(self.mutex.as_raw_handle(), 0) } {
             WAIT_OBJECT_0 | WAIT_ABANDONED => {
                 self.acquired = true;
@@ -249,7 +249,7 @@ impl Drop for SlotGate {
     }
 }
 
-pub(in crate::eg2) fn memory_exit(status: ExitStatus) -> bool {
+pub(crate) fn memory_exit(status: ExitStatus) -> bool {
     // STATUS_NO_MEMORY and STATUS_COMMITMENT_LIMIT.
     matches!(
         status.code().map(|code| code as u32),
@@ -257,7 +257,7 @@ pub(in crate::eg2) fn memory_exit(status: ExitStatus) -> bool {
     )
 }
 
-pub(in crate::eg2) fn exit_worker(code: i32) -> ! {
+pub(crate) fn exit_worker(code: i32) -> ! {
     // SAFETY: the pseudo-handle points to this worker; bypass DLL shutdown.
     unsafe { TerminateProcess(GetCurrentProcess(), code as u32) };
     std::process::abort()

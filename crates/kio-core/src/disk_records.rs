@@ -127,7 +127,7 @@ impl Drop for ScratchDirectory {
     }
 }
 
-fn scratch_name() -> Result<PathBuf> {
+pub(crate) fn scratch_name() -> Result<PathBuf> {
     let mut nonce = [0; 32];
     getrandom::fill(&mut nonce)
         .map_err(|error| KioError::io(error.to_string(), "record scratch"))?;
@@ -137,7 +137,7 @@ fn scratch_name() -> Result<PathBuf> {
     )))
 }
 
-fn scratch_parent() -> Result<StoreDirectory> {
+pub(crate) fn scratch_parent() -> Result<StoreDirectory> {
     let path = std::path::absolute(std::env::temp_dir()).map_err(scratch_io)?;
     crate::private_fs::retain_external_directory(&path)
 }
@@ -759,7 +759,7 @@ impl RecordStageRoot {
                 Ok(WriterStorage::Disk(Box::new(writer)))
             }
             RecordLocation::Anonymous => {
-                let file = scratch_file()?;
+                let file = crate::platform::record_scratch_file()?;
                 let mut writer = BufWriter::with_capacity(RECORD_BYTES, file);
                 writer.write_all(bytes).map_err(scratch_io)?;
                 Ok(WriterStorage::Scratch(writer))
@@ -768,24 +768,8 @@ impl RecordStageRoot {
     }
 }
 
-fn scratch_io(error: std::io::Error) -> KioError {
+pub(crate) fn scratch_io(error: std::io::Error) -> KioError {
     crate::store_dir::ioerr(Path::new("record scratch"), error)
-}
-
-#[cfg(unix)]
-fn scratch_file() -> Result<File> {
-    tempfile::tempfile().map_err(scratch_io)
-}
-
-#[cfg(windows)]
-fn scratch_file() -> Result<File> {
-    use crate::platform::private_fs::{NewPrivateObjectKind, create_new_private_at};
-    create_new_private_at(
-        &scratch_parent()?.root_handle(),
-        scratch_name()?.as_os_str(),
-        NewPrivateObjectKind::ScratchFile,
-    )
-    .map_err(scratch_io)
 }
 
 impl WriterStorage {

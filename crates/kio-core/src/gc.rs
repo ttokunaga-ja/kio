@@ -26,9 +26,7 @@ pub use control::{
     validated_final_shallow_receipts,
 };
 pub mod exchange;
-mod observed_read;
-#[cfg(windows)]
-pub(crate) use observed_read::observe_tree_handle;
+pub(crate) mod observed_read;
 use observed_read::read_user_regular_observed;
 pub(crate) use observed_read::{
     observe_cas_regular, read_cas_tree_observed, read_regular_observed, read_tree_archive_observed,

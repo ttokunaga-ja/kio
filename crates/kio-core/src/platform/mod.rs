@@ -281,3 +281,8 @@ pub fn producer_platform() -> (&'static str, &'static str) {
 pub(crate) use unix::durability_tests::sync_directory;
 #[cfg(all(test, target_os = "windows"))]
 pub(crate) use windows::durability_tests::sync_directory;
+
+#[cfg(unix)]
+pub(crate) use unix::record_scratch_file;
+#[cfg(windows)]
+pub(crate) use windows::record_scratch_file;

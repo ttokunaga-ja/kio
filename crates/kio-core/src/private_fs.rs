@@ -336,10 +336,7 @@ pub fn verify_trusted_system_tool(path: &Path) -> Result<std::path::PathBuf> {
     let canonical = path
         .canonicalize()
         .map_err(|_| unsafe_file("cannot resolve OS scheduler tool", Some(path)))?;
-    #[cfg(windows)]
     native::verify_trusted_system_tool(&canonical)?;
-    #[cfg(not(windows))]
-    native::verify_trusted_executable(&canonical)?;
     Ok(canonical)
 }
 

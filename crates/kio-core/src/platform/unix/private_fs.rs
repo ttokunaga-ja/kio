@@ -580,6 +580,8 @@ fn path_components(path: &Path) -> Result<Vec<&std::ffi::OsStr>> {
     Ok(components)
 }
 
+pub(crate) use verify_trusted_executable as verify_trusted_system_tool;
+
 #[cfg(test)]
 mod own_objects_host_paths_tests {
     use super::*;

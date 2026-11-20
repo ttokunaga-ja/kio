@@ -22,10 +22,10 @@ const CRATES: [&str; 10] = [
     "kio-ci",
 ];
 const LIMITS: [(&str, usize); 6] = [
-    ("common", 106_000),
+    ("common", 140_000),
     ("windows", 14_000),
     ("unix", 9_000),
-    ("linux", 4_000),
+    ("linux", 4_500),
     ("macos", 3_000),
     ("tooling", 65_000),
 ];

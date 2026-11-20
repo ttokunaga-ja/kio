@@ -3,10 +3,12 @@
 
 use super::runtime::VerifiedLibrary;
 use super::{DIMENSIONS, TOKEN_CAP, WireInput, WorkerError, valid_vector};
-use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::ffi::{CStr, c_char, c_int, c_void};
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
+
+use crate::platform::{Eg2Library as Library, eg2_c_path as c_path};
 use std::ptr::{null, null_mut};
 
 type Handle = *mut c_void;
@@ -308,122 +310,4 @@ fn is_input_overflow(bytes: &[u8]) -> bool {
         .filter(|digits| digits.bytes().all(|byte| byte.is_ascii_digit()))
         .and_then(|digits| digits.parse::<u64>().ok())
         .is_some_and(|length| length > u64::from(TOKEN_CAP))
-}
-
-fn c_path(path: &Path) -> Result<CString, WorkerError> {
-    #[cfg(unix)]
-    let bytes = path.as_os_str().as_encoded_bytes();
-    #[cfg(windows)]
-    let bytes = path.to_str().ok_or(WorkerError::Startup)?.as_bytes();
-    CString::new(bytes).map_err(|_| WorkerError::Startup)
-}
-
-struct Library {
-    handle: *mut c_void,
-    _verified: VerifiedLibrary,
-}
-
-impl Library {
-    #[cfg(unix)]
-    fn open(verified: VerifiedLibrary) -> Result<Self, WorkerError> {
-        #[cfg(target_os = "linux")]
-        let path = {
-            use std::os::fd::AsRawFd;
-            use std::os::unix::fs::MetadataExt;
-            // Confirm the verified file is still the distribution entry and
-            // load that retained descriptor, even if the name is replaced.
-            let bound = verified
-                .file
-                .metadata()
-                .map_err(|_| WorkerError::RuntimeUnavailable)?;
-            let named = verified
-                .path
-                .symlink_metadata()
-                .map_err(|_| WorkerError::RuntimeUnavailable)?;
-            if bound.dev() != named.dev() || bound.ino() != named.ino() {
-                return Err(WorkerError::RuntimeUnavailable);
-            }
-            std::path::PathBuf::from(format!("/proc/self/fd/{}", verified.file.as_raw_fd()))
-        };
-        #[cfg(not(target_os = "linux"))]
-        let path = {
-            use std::os::unix::fs::MetadataExt;
-            let bound = verified
-                .file
-                .metadata()
-                .map_err(|_| WorkerError::RuntimeUnavailable)?;
-            let named = verified
-                .path
-                .symlink_metadata()
-                .map_err(|_| WorkerError::RuntimeUnavailable)?;
-            if bound.dev() != named.dev() || bound.ino() != named.ino() {
-                return Err(WorkerError::RuntimeUnavailable);
-            }
-            verified.path.clone()
-        };
-        let path = c_path(&path)?;
-        // SAFETY: path is a live C string for the verified image.
-        let handle = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
-        if handle.is_null() {
-            return Err(WorkerError::RuntimeUnavailable);
-        }
-        Ok(Self {
-            handle,
-            _verified: verified,
-        })
-    }
-
-    #[cfg(windows)]
-    fn open(verified: VerifiedLibrary) -> Result<Self, WorkerError> {
-        use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::System::LibraryLoader::{
-            LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
-        };
-
-        let path: Vec<_> = verified.path.as_os_str().encode_wide().chain([0]).collect();
-        // SAFETY: path is fully qualified and NUL-terminated. The verification
-        // handle denies writes/deletion; dependent libraries resolve in System32.
-        let handle =
-            unsafe { LoadLibraryExW(path.as_ptr(), null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32) };
-        if handle.is_null() {
-            return Err(WorkerError::RuntimeUnavailable);
-        }
-        Ok(Self {
-            handle,
-            _verified: verified,
-        })
-    }
-
-    fn symbol(&self, name: &CStr) -> Result<*mut c_void, WorkerError> {
-        // SAFETY: the loaded image and terminated export name are both live.
-        #[cfg(unix)]
-        let ptr = unsafe { libc::dlsym(self.handle, name.as_ptr()) };
-        #[cfg(windows)]
-        let ptr = unsafe {
-            windows_sys::Win32::System::LibraryLoader::GetProcAddress(
-                self.handle,
-                name.as_ptr().cast(),
-            )
-            .map_or(null_mut(), |symbol| symbol as *mut c_void)
-        };
-        if ptr.is_null() {
-            Err(WorkerError::RuntimeUnavailable)
-        } else {
-            Ok(ptr)
-        }
-    }
-}
-
-impl Drop for Library {
-    fn drop(&mut self) {
-        // SAFETY: Library owns one loader reference to a non-null image.
-        #[cfg(unix)]
-        unsafe {
-            libc::dlclose(self.handle);
-        }
-        #[cfg(windows)]
-        unsafe {
-            windows_sys::Win32::Foundation::FreeLibrary(self.handle);
-        }
-    }
 }

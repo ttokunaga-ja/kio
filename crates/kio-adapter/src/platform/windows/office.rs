@@ -1,16 +1,10 @@
+use crate::office_runtime_identity::RuntimeSnapshot;
 use crate::{AdapterError, Result};
 use std::{
     ffi::OsString,
     path::{Path, PathBuf},
 };
 use tempfile::Builder;
-pub(crate) fn canonical_renderer_program(candidate: PathBuf) -> Option<PathBuf> {
-    let canonical = std::fs::canonicalize(&candidate).ok()?;
-    if !canonical.is_file() {
-        return None;
-    }
-    Some(canonical)
-}
 pub(crate) struct PrivateOfficeScratch {
     original: std::sync::Arc<std::fs::File>,
     pin: Option<std::fs::File>,
@@ -201,6 +195,15 @@ pub(crate) struct OfficeRuntime {
     windows: PathBuf,
 }
 impl OfficeRuntime {
+    pub(crate) fn verify_captured_signature(
+        &self,
+        program: &Path,
+        snapshot: &RuntimeSnapshot,
+        deadline: std::time::Instant,
+    ) -> std::io::Result<()> {
+        self.verify_runtime_signatures(program, &snapshot.pin_before_launch(deadline)?, deadline)
+    }
+
     pub(crate) fn new(program: &Path, _deadline: std::time::Instant) -> Result<Self> {
         Ok(Self {
             package: installed_package(program)?,
@@ -344,7 +347,7 @@ fn verify_authenticode_until(
     let file = file.try_clone()?;
     // The worker owns only the active image's duplicate. The snapshot's
     // other pins stay with the caller and are dropped if this wait times out.
-    crate::office_signature_worker::verify_until(&BUSY, deadline, move || {
+    crate::platform::office_signature_worker::verify_until(&BUSY, deadline, move || {
         verify_authenticode(&path, &file)
     })
 }
@@ -441,6 +444,12 @@ pub(crate) fn finish_scratch(scratch: PrivateOfficeScratch) -> Result<()> {
     scratch.close()
 }
 
+pub(crate) fn office_package_launch_roots(roots: &[PathBuf]) -> &[PathBuf] {
+    // The launcher checks these roots exist. The AppContainer still
+    // depends on the package's pre-existing ACLs.
+    roots
+}
+
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
@@ -525,7 +534,7 @@ mod tests {
         let other_pin = pin(&other);
         let worker_pin = active_pin.try_clone().unwrap();
         let (release, blocked) = mpsc::channel();
-        let error = crate::office_signature_worker::verify_until(
+        let error = crate::platform::office_signature_worker::verify_until(
             &BUSY,
             Instant::now() + Duration::from_millis(250),
             move || {
@@ -570,7 +579,7 @@ mod tests {
         let snapshot =
             crate::office_runtime_identity::RuntimeSnapshot::new(vec![package], &sources, deadline)
                 .unwrap();
-        let pins = snapshot.pin_windows_package(deadline).unwrap();
+        let pins = snapshot.pin_before_launch(deadline).unwrap();
         let error = runtime
             .verify_runtime_signatures(&program, &pins, deadline)
             .unwrap_err();
@@ -604,3 +613,5 @@ mod tests {
         assert_eq!(installed_package(&program).unwrap(), package);
     }
 }
+
+pub(crate) const DEFAULT_OFFICE_CONVERTER_PROGRAM: &str = "soffice.exe";

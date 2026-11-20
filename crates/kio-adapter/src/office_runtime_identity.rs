@@ -11,6 +11,7 @@ use kio_process::confinement::RenderSources;
 use sha2::{Digest, Sha256};
 
 use crate::office_convert::hex_digest;
+use crate::platform::{EntryIdentity, entry_identity, runtime_link_target};
 
 pub(crate) fn check_verification_deadline(deadline: Instant) -> Result<()> {
     if Instant::now() >= deadline {
@@ -87,28 +88,18 @@ pub(crate) const MAX_PACKAGE_ENTRIES: usize = 32_768;
 #[derive(Debug, Clone)]
 pub(crate) struct RuntimeSnapshot {
     roots: Vec<PathBuf>,
-    entries: BTreeMap<PathBuf, EntryIdentity>,
+    pub(crate) entries: BTreeMap<PathBuf, EntryIdentity>,
     mounts: Vec<EntryIdentity>,
     excluded: Option<PathBuf>,
-    #[cfg(target_os = "linux")]
-    records: RecordSnapshot,
+    pub(crate) records: RecordSnapshot,
 }
 
 /// Metadata for the package evidence and its database directories, including
 /// optional records whose appearance would change the meaning of the evidence.
-#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Default)]
-pub(crate) struct RecordSnapshot(BTreeMap<PathBuf, Option<EntryIdentity>>);
+pub(crate) struct RecordSnapshot(pub(crate) BTreeMap<PathBuf, Option<EntryIdentity>>);
 
-#[cfg(target_os = "linux")]
 impl RecordSnapshot {
-    pub(crate) fn observe(&mut self, path: &Path) -> Result<()> {
-        if !self.0.contains_key(path) {
-            self.0.insert(path.to_path_buf(), Self::identity(path)?);
-        }
-        Ok(())
-    }
-
     pub(crate) fn verify(&self, deadline: Instant) -> Result<()> {
         for (path, before) in &self.0 {
             check_verification_deadline(deadline)?;
@@ -122,27 +113,24 @@ impl RecordSnapshot {
         Ok(())
     }
 
-    fn identity(path: &Path) -> Result<Option<EntryIdentity>> {
-        match fs::symlink_metadata(path) {
-            Ok(metadata) => entry_identity(path, &metadata).map(Some),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error),
-        }
+    pub(crate) fn identity(path: &Path) -> Result<Option<EntryIdentity>> {
+        optional_metadata(path)?
+            .map(|metadata| entry_identity(path, &metadata))
+            .transpose()
     }
 }
 
-type EntryCheck<'a> = dyn Fn(&Path, &Metadata) -> Result<()> + 'a;
+pub(crate) fn optional_metadata(path: &Path) -> io::Result<Option<Metadata>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) type EntryCheck<'a> = dyn Fn(&Path, &Metadata) -> Result<()> + 'a;
 
 impl RuntimeSnapshot {
-    #[cfg(any(test, not(target_os = "linux")))]
-    pub(crate) fn new(
-        roots: Vec<PathBuf>,
-        sources: &RenderSources,
-        deadline: Instant,
-    ) -> Result<Self> {
-        Self::new_checked(roots, sources, None, &|_, _| Ok(()), deadline)
-    }
-
     pub(crate) fn new_checked(
         roots: Vec<PathBuf>,
         sources: &RenderSources,
@@ -157,25 +145,8 @@ impl RuntimeSnapshot {
             entries,
             mounts,
             excluded,
-            #[cfg(target_os = "linux")]
             records: RecordSnapshot::default(),
         })
-    }
-
-    #[cfg(target_os = "linux")]
-    pub(crate) fn with_records(
-        mut self,
-        records: RecordSnapshot,
-        deadline: Instant,
-    ) -> Result<Self> {
-        records.verify(deadline)?;
-        self.records = records;
-        Ok(self)
-    }
-
-    #[cfg(target_os = "linux")]
-    pub(crate) fn contains_entry(&self, path: &Path) -> bool {
-        self.entries.contains_key(path)
     }
 
     fn read(
@@ -211,28 +182,20 @@ impl RuntimeSnapshot {
             check_entry(&path, &metadata)?;
             entries.insert(path.clone(), identity);
             if metadata.is_symlink() {
-                #[cfg(windows)]
-                return Err(error(io::Error::other("Office runtime is a reparse point")));
-                #[cfg(unix)]
-                {
-                    #[cfg(target_os = "linux")]
-                    let target =
-                        runtime_link_target(&path, sources, check_entry, deadline, &mut entries)?;
-                    #[cfg(target_os = "macos")]
-                    let target = macos_runtime_link_target(
-                        &path,
-                        roots,
-                        check_entry,
-                        deadline,
-                        &mut entries,
-                    )?;
-                    if excluded.is_some_and(|excluded| target.starts_with(excluded)) {
-                        return Err(error(io::Error::other(
-                            "link points outside the verified Office runtime",
-                        )));
-                    }
-                    pending.push(target);
+                let target = runtime_link_target(
+                    &path,
+                    sources,
+                    roots,
+                    check_entry,
+                    deadline,
+                    &mut entries,
+                )?;
+                if excluded.is_some_and(|excluded| target.starts_with(excluded)) {
+                    return Err(error(io::Error::other(
+                        "link points outside the verified Office runtime",
+                    )));
                 }
+                pending.push(target);
             } else if metadata.is_dir() {
                 for child in fs::read_dir(&path).map_err(error)? {
                     check_verification_deadline(deadline)?;
@@ -272,7 +235,6 @@ impl RuntimeSnapshot {
             }
             Ok(())
         };
-        #[cfg(target_os = "linux")]
         if sources.masked_runtime_directory() != self.excluded.as_deref() {
             return Err(changed());
         }
@@ -287,67 +249,12 @@ impl RuntimeSnapshot {
         {
             return Err(changed());
         }
-        #[cfg(target_os = "linux")]
         self.records.verify(deadline)?;
         check_verification_deadline(deadline)
     }
-
-    #[cfg(any(test, not(target_os = "linux")))]
-    pub(crate) fn verify_signatures(
-        &self,
-        sources: &RenderSources,
-        deadline: Instant,
-        verify: impl FnOnce() -> Result<()>,
-    ) -> Result<()> {
-        check_verification_deadline(deadline)?;
-        verify()?;
-        self.verify(sources, "during signature verification", deadline)
-    }
-
-    #[cfg(target_os = "macos")]
-    pub(crate) fn macos_code_resources(&self) -> impl Iterator<Item = &Path> {
-        self.entries
-            .keys()
-            .map(PathBuf::as_path)
-            .filter(|path| path.ends_with("_CodeSignature/CodeResources"))
-    }
-
-    #[cfg(windows)]
-    pub(crate) fn pin_windows_package(&self, deadline: Instant) -> Result<Vec<(&Path, fs::File)>> {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        use windows_sys::Win32::Storage::FileSystem::{
-            FILE_ATTRIBUTE_DIRECTORY, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-            FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
-        };
-
-        // Hold the captured paths against write/delete access through the
-        // signature check or the entire invocation, including child loads.
-        self.entries
-            .iter()
-            .map(|(path, expected)| {
-                check_verification_deadline(deadline)?;
-                let mut options = fs::OpenOptions::new();
-                options
-                    .share_mode(FILE_SHARE_READ)
-                    .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS);
-                if expected.information.file_attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
-                    options.access_mode(FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES);
-                } else {
-                    options.read(true);
-                }
-                let file = options
-                    .open(path)
-                    .map_err(|error| path_error(path, error))?;
-                if windows_entry_identity(&file)? != *expected {
-                    return Err(path_error(path, io::Error::other("Office runtime changed")));
-                }
-                Ok((path.as_path(), file))
-            })
-            .collect()
-    }
 }
 
-fn path_error(path: &Path, cause: io::Error) -> io::Error {
+pub(crate) fn path_error(path: &Path, cause: io::Error) -> io::Error {
     io::Error::other(format!(
         "cannot verify Office runtime path {}: {cause}",
         path.display()
@@ -383,277 +290,6 @@ fn in_runtime_sources(path: &Path, sources: &RenderSources) -> bool {
             .roots()
             .iter()
             .any(|(_, source)| path.starts_with(source))
-}
-
-#[cfg(target_os = "linux")]
-fn runtime_link_target(
-    path: &Path,
-    sources: &RenderSources,
-    check_entry: &EntryCheck<'_>,
-    deadline: Instant,
-    entries: &mut BTreeMap<PathBuf, EntryIdentity>,
-) -> Result<PathBuf> {
-    use std::{collections::VecDeque, ffi::OsString, path::Component};
-
-    let outside = |target: &Path| {
-        path_error(
-            path,
-            io::Error::other(format!(
-                "runtime link target is outside the renderer sandbox and outside the verified Office runtime: {}",
-                target.display()
-            )),
-        )
-    };
-    let components = |target: &Path| -> VecDeque<OsString> {
-        target
-            .components()
-            .map(|part| part.as_os_str().to_owned())
-            .collect()
-    };
-    let mounted = |named: &Path| {
-        if named == sources.program() {
-            return Some(named.to_path_buf());
-        }
-        sources
-            .roots()
-            .iter()
-            .filter_map(|(destination, source)| {
-                named
-                    .strip_prefix(destination)
-                    .ok()
-                    .map(|suffix| (destination, source, suffix))
-            })
-            .max_by_key(|(destination, _, _)| destination.as_os_str().len())
-            .map(|(_, source, suffix)| {
-                if suffix.as_os_str().is_empty() {
-                    source.clone()
-                } else {
-                    source.join(suffix)
-                }
-            })
-    };
-
-    let mut named = path
-        .parent()
-        .expect("runtime link has a parent")
-        .to_path_buf();
-    let mut pending = components(&fs::read_link(path).map_err(|error| path_error(path, error))?);
-    let mut hops = 0;
-    while let Some(part) = pending.pop_front() {
-        check_verification_deadline(deadline)?;
-        match Path::new(&part).components().next() {
-            Some(Component::RootDir) => named = PathBuf::from("/"),
-            Some(Component::ParentDir) => {
-                named.pop();
-            }
-            Some(Component::Normal(_)) => {
-                named.push(&part);
-                let Some(physical) = mounted(&named) else {
-                    // Bubblewrap creates these ancestors for file and directory mounts.
-                    if sources.program().starts_with(&named)
-                        || sources
-                            .roots()
-                            .iter()
-                            .any(|(destination, _)| destination.starts_with(&named))
-                    {
-                        continue;
-                    }
-                    return Err(outside(&named));
-                };
-                let metadata = fs::symlink_metadata(&physical)
-                    .map_err(|error| path_error(&physical, error))?;
-                if metadata.is_symlink() {
-                    hops += 1;
-                    if hops >= 40 {
-                        return Err(path_error(
-                            path,
-                            io::Error::other("too many Office runtime link hops"),
-                        ));
-                    }
-                    check_entry(&physical, &metadata)?;
-                    entries.insert(physical.clone(), entry_identity(&physical, &metadata)?);
-                    let mut target = components(
-                        &fs::read_link(&physical).map_err(|error| path_error(&physical, error))?,
-                    );
-                    target.append(&mut pending);
-                    pending = target;
-                    named.pop();
-                } else if !metadata.is_dir() && !pending.is_empty() {
-                    return Err(path_error(
-                        &physical,
-                        io::Error::other("expected an Office runtime directory"),
-                    ));
-                }
-            }
-            _ => {}
-        }
-    }
-    verify_link_target(path, mounted(&named).ok_or_else(|| outside(&named))?)
-}
-
-#[cfg(any(target_os = "macos", all(test, target_os = "linux")))]
-fn macos_runtime_link_target(
-    path: &Path,
-    package_roots: &[PathBuf],
-    check_entry: &EntryCheck<'_>,
-    deadline: Instant,
-    entries: &mut BTreeMap<PathBuf, EntryIdentity>,
-) -> Result<PathBuf> {
-    use std::{collections::VecDeque, ffi::OsString, path::Component};
-
-    let outside = || {
-        path_error(
-            path,
-            io::Error::other("runtime link target is outside the renderer sandbox package"),
-        )
-    };
-    let read_target = |link: &Path| -> Result<(PathBuf, VecDeque<OsString>)> {
-        let target = fs::read_link(link).map_err(|error| path_error(link, error))?;
-        let (base, suffix) = if target.is_absolute() {
-            let root = package_roots
-                .iter()
-                .find(|root| target.starts_with(root))
-                .ok_or_else(outside)?;
-            (
-                root.clone(),
-                target.strip_prefix(root).expect("matched package prefix"),
-            )
-        } else {
-            (
-                link.parent()
-                    .expect("package link has a parent")
-                    .to_path_buf(),
-                target.as_path(),
-            )
-        };
-        let pending = suffix
-            .components()
-            .map(|part| part.as_os_str().to_owned())
-            .collect();
-        Ok((base, pending))
-    };
-
-    // Walk each hop without collapsing parents before resolving symlinks.
-    // The OS's separate sandbox roots do not extend the sealed bundle.
-    let (mut physical, mut pending) = read_target(path)?;
-    let mut hops = 0;
-    while let Some(part) = pending.pop_front() {
-        check_verification_deadline(deadline)?;
-        if Path::new(&part).components().next() == Some(Component::ParentDir) {
-            physical.pop();
-            if !package_roots.iter().any(|root| physical.starts_with(root)) {
-                return Err(outside());
-            }
-            continue;
-        }
-        physical.push(part);
-        let metadata =
-            fs::symlink_metadata(&physical).map_err(|error| path_error(&physical, error))?;
-        if metadata.is_symlink() {
-            hops += 1;
-            if hops >= 40 {
-                return Err(path_error(
-                    path,
-                    io::Error::other("too many Office runtime link hops"),
-                ));
-            }
-            check_entry(&physical, &metadata)?;
-            entries.insert(physical.clone(), entry_identity(&physical, &metadata)?);
-            let (base, mut target) = read_target(&physical)?;
-            physical = base;
-            target.append(&mut pending);
-            pending = target;
-        } else if !metadata.is_dir() && !pending.is_empty() {
-            return Err(path_error(
-                &physical,
-                io::Error::other("expected an Office runtime directory"),
-            ));
-        }
-    }
-    verify_link_target(path, physical)
-}
-
-#[cfg(unix)]
-fn verify_link_target(path: &Path, physical: PathBuf) -> Result<PathBuf> {
-    // Reject paths that have different targets on the host and in the
-    // sandbox, for example when traversing a separate mount alias.
-    let actual = fs::canonicalize(path).map_err(|error| path_error(path, error))?;
-    if actual != physical {
-        return Err(path_error(
-            path,
-            io::Error::other("runtime link resolves differently in the renderer sandbox"),
-        ));
-    }
-    Ok(physical)
-}
-
-#[cfg(unix)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct EntryIdentity {
-    device: u64,
-    inode: u64,
-    mode: u32,
-    uid: u32,
-    gid: u32,
-    len: u64,
-    modification: (i64, i64),
-    change: (i64, i64),
-}
-
-#[cfg(unix)]
-fn entry_identity(_path: &Path, metadata: &Metadata) -> io::Result<EntryIdentity> {
-    use std::os::unix::fs::MetadataExt;
-    let kind = metadata.file_type();
-    if !(kind.is_file() || kind.is_dir() || kind.is_symlink()) {
-        return Err(io::Error::other("unexpected Office runtime file type"));
-    }
-    Ok(EntryIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-        mode: metadata.mode(),
-        uid: metadata.uid(),
-        gid: metadata.gid(),
-        len: metadata.len(),
-        modification: (metadata.mtime(), metadata.mtime_nsec()),
-        change: (metadata.ctime(), metadata.ctime_nsec()),
-    })
-}
-
-#[cfg(windows)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct EntryIdentity {
-    information: kio_core::platform::FileInformation,
-    changed: i64,
-}
-
-#[cfg(windows)]
-fn entry_identity(path: &Path, metadata: &Metadata) -> io::Result<EntryIdentity> {
-    use kio_core::platform::open_metadata_nofollow;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
-    };
-
-    let identity = windows_entry_identity(&open_metadata_nofollow(path)?)?;
-    let information = identity.information;
-    if information.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
-        || (information.file_attributes & FILE_ATTRIBUTE_DIRECTORY != 0) != metadata.is_dir()
-        || (!metadata.is_dir() && information.number_of_links != 1)
-    {
-        return Err(io::Error::other(
-            "Office runtime path is an alias or changed type",
-        ));
-    }
-    Ok(identity)
-}
-
-#[cfg(windows)]
-fn windows_entry_identity(file: &fs::File) -> io::Result<EntryIdentity> {
-    use kio_core::platform::{file_change_time, file_information};
-
-    Ok(EntryIdentity {
-        information: file_information(file)?,
-        changed: file_change_time(file)?,
-    })
 }
 
 #[cfg(test)]
@@ -818,7 +454,7 @@ mod tests {
         symlink("A", bundle.join("Versions/Current")).unwrap();
         symlink("Versions/Current/library", &link).unwrap();
         let resolve = || {
-            macos_runtime_link_target(
+            crate::platform::macos_runtime_link_target(
                 &link,
                 std::slice::from_ref(&bundle),
                 &|_, _| Ok(()),

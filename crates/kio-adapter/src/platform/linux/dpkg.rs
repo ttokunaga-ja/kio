@@ -1,6 +1,8 @@
 //! Local package-manager evidence for the Debian/Ubuntu Office runtime.
-use super::office::{RuntimeTrust, optional_metadata};
-use crate::office_runtime_identity::{RecordSnapshot, check_verification_deadline};
+use super::office::RuntimeTrust;
+use crate::office_runtime_identity::{
+    RecordSnapshot, check_verification_deadline, optional_metadata,
+};
 use md5::{Digest, Md5};
 use std::{
     collections::BTreeMap,

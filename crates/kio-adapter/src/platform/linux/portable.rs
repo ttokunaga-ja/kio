@@ -190,7 +190,7 @@ impl PortableCatalog {
     ) -> io::Result<()> {
         for path in self.members.keys() {
             check_verification_deadline(deadline)?;
-            if !snapshot.contains_entry(path) {
+            if !snapshot.entries.contains_key(path) {
                 return Err(invalid(path, "missing portable Office runtime member"));
             }
         }

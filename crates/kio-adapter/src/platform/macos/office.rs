@@ -1,4 +1,5 @@
 use crate::office_convert::{MAX_OFFICE_LOG_BYTES, hex_digest};
+use crate::office_runtime_identity::RuntimeSnapshot;
 use crate::{AdapterError, Result};
 use kio_process::BoundedProcessOptions;
 use quick_xml::{Reader, events::Event};
@@ -9,12 +10,6 @@ use std::{
     path::{Path, PathBuf},
 };
 use tempfile::{Builder, TempDir};
-pub(crate) fn canonical_renderer_program(candidate: PathBuf) -> Option<PathBuf> {
-    std::fs::canonicalize(candidate)
-        .ok()
-        .filter(|program| program.is_file())
-}
-
 pub(crate) fn macos_office_bundle_candidate(program: &Path) -> Option<PathBuf> {
     if !program.is_absolute() {
         return None;
@@ -113,7 +108,7 @@ fn verify_macos_nested_code<'a>(
             deadline,
             16 * 1024 * 1024,
         )?;
-        let paths = crate::office_macos_seal::nested_code_paths(&files)
+        let paths = crate::platform::office_macos_seal::nested_code_paths(&files)
             .map_err(|error| AdapterError::ContractViolation(error.to_string()))?;
         nested.extend(paths.into_iter().map(|path| base.join(path)));
     }
@@ -504,19 +499,23 @@ pub(crate) fn private_temp_dir() -> Result<TempDir> {
             "failed to resolve private Office socket root: {error}"
         ))
     })?;
-    let directory = builder.tempdir_in(socket_root).map_err(|error| {
-        AdapterError::ContractViolation(format!(
-            "failed to create private office scratch directory: {error}"
-        ))
-    })?;
-    super::super::unix::office_fs::restrict_scratch(directory.path())?;
-    Ok(directory)
+    super::super::unix::office_fs::private_office_scratch(builder.tempdir_in(socket_root))
 }
 #[derive(Debug, Clone)]
 pub(crate) struct OfficeRuntime {
     catalog: Option<PrivateUnoCatalog>,
 }
 impl OfficeRuntime {
+    pub(crate) fn verify_captured_signature(
+        &self,
+        program: &Path,
+        snapshot: &RuntimeSnapshot,
+        deadline: Instant,
+    ) -> std::io::Result<()> {
+        self.verify_runtime_signature(program, snapshot, deadline)
+            .map_err(std::io::Error::other)
+    }
+
     pub(crate) fn new(program: &Path, deadline: Instant) -> Result<Self> {
         Ok(Self {
             catalog: private_uno_catalog_for_program(program, deadline)?,

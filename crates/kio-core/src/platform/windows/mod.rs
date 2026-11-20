@@ -55,3 +55,15 @@ pub(crate) mod storage_semantics;
 pub(crate) mod store;
 #[cfg(windows)]
 pub(crate) mod store_gate;
+
+#[cfg(windows)]
+pub(crate) fn record_scratch_file() -> crate::Result<std::fs::File> {
+    use self::private_fs::{NewPrivateObjectKind, create_new_private_at};
+    use crate::disk_records::{scratch_io, scratch_name, scratch_parent};
+    create_new_private_at(
+        &scratch_parent()?.root_handle(),
+        scratch_name()?.as_os_str(),
+        NewPrivateObjectKind::ScratchFile,
+    )
+    .map_err(scratch_io)
+}

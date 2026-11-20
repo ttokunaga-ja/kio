@@ -13,7 +13,9 @@ use std::{
 };
 
 use crate::BoundedProcessError;
-use crate::platform::{NativeRenderSandbox, default_render_resource_limits};
+use crate::platform::{
+    NativeRenderSandbox, RENDER_ADDRESS_SPACE_BYTES, RENDER_PHYSICAL_MEMORY_BYTES,
+};
 use crate::{BoundedProcessOptions, BoundedProcessOutput};
 use thiserror::Error;
 
@@ -33,7 +35,14 @@ pub struct RenderResourceLimits {
 
 impl Default for RenderResourceLimits {
     fn default() -> Self {
-        default_render_resource_limits()
+        Self {
+            wall_timeout: Duration::from_secs(300),
+            cpu_seconds: 300,
+            max_aggregate_memory_bytes: 2 * 1024 * 1024 * 1024,
+            max_address_space_bytes: RENDER_ADDRESS_SPACE_BYTES,
+            max_physical_memory_bytes: RENDER_PHYSICAL_MEMORY_BYTES,
+            max_file_bytes: 250 * 1024 * 1024,
+        }
     }
 }
 
@@ -187,8 +196,7 @@ impl RendererStart<'_> {
 pub struct RenderSources {
     pub(crate) program: PathBuf,
     pub(crate) roots: Vec<(PathBuf, PathBuf)>,
-    #[cfg(target_os = "linux")]
-    pub(crate) masked_runtime_directory: Option<PathBuf>,
+    masked_runtime_directory: Option<PathBuf>,
 }
 
 impl RenderSources {
@@ -210,58 +218,57 @@ impl RenderSources {
             }
             roots.push((root, source));
         }
-        Ok(Self {
+        Self::checked(program, roots, None)
+    }
+
+    // An exclusion applies to every destination backed by the directory. Validate
+    // the source and destination projections against the same declared mappings.
+    pub(crate) fn checked(
+        program: PathBuf,
+        roots: Vec<(PathBuf, PathBuf)>,
+        exclusion: Option<&Path>,
+    ) -> Result<Self, ConfinementError> {
+        let sources = Self {
             program,
             roots,
-            #[cfg(target_os = "linux")]
-            masked_runtime_directory: None,
-        })
+            masked_runtime_directory: exclusion.map(Path::to_path_buf),
+        };
+        if let Some(path) = exclusion {
+            if !is_normal_absolute_path(path)
+                || canonical_directory(path).as_deref() != Some(path)
+                || sources.program.starts_with(path)
+                || sources
+                    .roots
+                    .iter()
+                    .any(|(_, source)| source != path && source.starts_with(path))
+            {
+                return Err(ConfinementError::Runtime(path.into()));
+            }
+            let destinations = sources.runtime_mask_destinations();
+            if destinations.is_empty()
+                || destinations.iter().any(|mask| {
+                    sources.program.starts_with(mask)
+                        || sources.roots.iter().any(|(destination, source)| {
+                            destination.starts_with(mask) && (destination != mask || source != path)
+                        })
+                })
+            {
+                return Err(ConfinementError::Runtime(path.into()));
+            }
+        }
+        Ok(sources)
     }
 
-    /// Overlay an empty read-only directory at each Linux bind of the backing path.
-    #[cfg(target_os = "linux")]
-    pub fn with_masked_runtime_directory(mut self, path: &Path) -> Result<Self, ConfinementError> {
-        if !is_normal_absolute_path(path)
-            || canonical_directory(path).as_deref() != Some(path)
-            || self.program.starts_with(path)
-            || self
-                .roots
-                .iter()
-                .any(|(_, source)| source != path && source.starts_with(path))
-        {
-            return Err(ConfinementError::Runtime(path.into()));
-        }
-
-        self.masked_runtime_directory = Some(path.into());
-        let destinations = self.runtime_mask_destinations();
-        if destinations.is_empty()
-            || destinations.iter().any(|mask| {
-                self.program.starts_with(mask)
-                    || self.roots.iter().any(|(destination, source)| {
-                        destination.starts_with(mask) && (destination != mask || source != path)
-                    })
-            })
-        {
-            return Err(ConfinementError::Runtime(path.into()));
-        }
-        Ok(self)
-    }
-
-    #[cfg(target_os = "linux")]
     pub(crate) fn runtime_mask_destinations(&self) -> Vec<PathBuf> {
-        let Some(path) = &self.masked_runtime_directory else {
+        let Some(path) = self.masked_runtime_directory() else {
             return Vec::new();
         };
         let mut destinations: Vec<_> = self
             .roots
             .iter()
             .filter_map(|(destination, source)| {
-                let relative = path.strip_prefix(source).ok()?;
-                if relative.as_os_str().is_empty() {
-                    Some(destination.clone())
-                } else {
-                    Some(destination.join(relative))
-                }
+                let suffix = path.strip_prefix(source).ok()?;
+                Some(project_path(destination, suffix))
             })
             .collect();
         destinations.sort_unstable();
@@ -269,10 +276,34 @@ impl RenderSources {
         destinations
     }
 
-    #[cfg(target_os = "linux")]
     #[must_use]
     pub fn masked_runtime_directory(&self) -> Option<&Path> {
         self.masked_runtime_directory.as_deref()
+    }
+
+    /// Resolve a sandbox path against the declared file and directory mappings.
+    /// For nested mappings the most specific destination takes precedence.
+    pub fn sandbox_path_source(&self, path: &Path) -> Option<PathBuf> {
+        if path == self.program {
+            return Some(path.to_path_buf());
+        }
+        self.roots
+            .iter()
+            .filter_map(|(destination, source)| {
+                let suffix = path.strip_prefix(destination).ok()?;
+                Some((destination, source, suffix))
+            })
+            .max_by_key(|(destination, _, _)| destination.as_os_str().len())
+            .map(|(_, source, suffix)| project_path(source, suffix))
+    }
+
+    /// Whether a sandbox path is at or above one of the declared destinations.
+    pub fn contains_sandbox_destination(&self, path: &Path) -> bool {
+        self.program.starts_with(path)
+            || self
+                .roots
+                .iter()
+                .any(|(destination, _)| destination.starts_with(path))
     }
 
     #[must_use]
@@ -283,6 +314,14 @@ impl RenderSources {
     #[must_use]
     pub fn roots(&self) -> &[(PathBuf, PathBuf)] {
         &self.roots
+    }
+}
+
+fn project_path(root: &Path, suffix: &Path) -> PathBuf {
+    if suffix.as_os_str().is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(suffix)
     }
 }
 
@@ -307,13 +346,6 @@ fn canonical_directory(path: &Path) -> Option<PathBuf> {
     path.is_absolute()
         .then_some(path)
         .filter(|path| path.is_dir())
-}
-
-/// Inject an unavailable Linux isolation component at the diagnostic boundary.
-/// Debug builds only; this always rejects and cannot authorize a renderer.
-#[cfg(all(debug_assertions, target_os = "linux"))]
-pub fn injected_linux_isolation_failure_for_test(selector: &str) -> ConfinementError {
-    crate::platform::injected_isolation_failure(selector)
 }
 
 #[cfg(test)]

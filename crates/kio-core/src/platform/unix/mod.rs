@@ -22,3 +22,8 @@ pub(crate) mod scope_io;
 pub(crate) mod scope_semantics;
 pub(crate) mod storage_semantics;
 pub(crate) mod store;
+
+pub(crate) fn record_scratch_file() -> crate::Result<std::fs::File> {
+    use crate::disk_records::scratch_io;
+    tempfile::tempfile().map_err(scratch_io)
+}
