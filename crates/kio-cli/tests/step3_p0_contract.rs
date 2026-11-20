@@ -4479,6 +4479,8 @@ fn ct3_replica_007_regenerate_head_advance_fails_closed_before_source_rebuild() 
 #[test]
 fn ct3_replica_005_same_content_snapshot_republishes_ready_projection() {
     let dir = indexed_scope();
+    fs::write(dir.path().join("scan.pdf"), fake_pdf(&[""])).unwrap();
+    json_success(&dir, &["index", "--yes", "--offline"]);
     let scope_id = read_scope_id(dir.path());
     let replica_path = dir.path().join(".test-cache/kio/aggregator.sqlite");
     let head_before = fs::read_to_string(dir.path().join(".kio/HEAD")).unwrap();
@@ -4499,6 +4501,19 @@ fn ct3_replica_005_same_content_snapshot_republishes_ready_projection() {
     assert!(
         prior_tree_rows > 0,
         "indexed predecessor must have tree rows"
+    );
+    let raw_only_rows: i64 = Connection::open(dir.path().join(".kio/index/sqlite.db"))
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM tree_entries WHERE commit_hash = ?1 AND path = 'scan.pdf'
+             AND tool_profile_hash IS NULL AND gen IS NULL AND manifest_hash IS NULL",
+            rusqlite::params![head_before.trim()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        raw_only_rows, 1,
+        "the PDF must be archived without normalization"
     );
 
     let snapshot = json_success(
