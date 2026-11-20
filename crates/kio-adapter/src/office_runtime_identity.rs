@@ -713,7 +713,8 @@ mod tests {
         fs::create_dir_all(package.join("share")).unwrap();
         fs::create_dir(&outside).unwrap();
         fs::write(outside.join("services.rdb"), b"external settings").unwrap();
-        let junction = package.join("share/services");
+        // mklink treats a forward slash in this argument as a switch.
+        let junction = package.join("share").join("services");
         let result = std::process::Command::new("cmd.exe")
             .args(["/D", "/C", "mklink", "/J"])
             .arg(&junction)
