@@ -236,7 +236,7 @@ pub(crate) enum OnlineMarkdownizePrecondition {
     PolicyUnavailable(KioError),
     /// File present, unchanged, within the input cap, non-text-native, with locally
     /// extracted units to enhance — ready to send.
-    Send(PreparedOnlineMarkdownizeInput),
+    Send(Box<PreparedOnlineMarkdownizeInput>),
     /// Genuine failure — retire the task (file gone / edited-since-enqueue / text-native /
     /// oversize). The recovery is a fresh re-index, not a retry.
     Retire,
@@ -315,7 +315,7 @@ pub(crate) fn classify_online_markdownize_precondition(
         Err(error) => return OnlineMarkdownizePrecondition::PolicyUnavailable(error),
     };
     let mut input = match classify_markdownize_source_for_admission(repo, task, Some(max)) {
-        OnlineMarkdownizePrecondition::Send(input) => input,
+        OnlineMarkdownizePrecondition::Send(input) => *input,
         other => return other,
     };
     if is_office_media(&input.media_type) {
@@ -334,7 +334,7 @@ pub(crate) fn classify_online_markdownize_precondition(
     if input.adapter_input().1.len() as u64 > max {
         return OnlineMarkdownizePrecondition::OversizedPreparedInput;
     }
-    OnlineMarkdownizePrecondition::Send(input)
+    OnlineMarkdownizePrecondition::Send(Box::new(input))
 }
 
 fn read_current_adapter_source(
@@ -469,13 +469,13 @@ fn classify_markdownize_source_for_admission(
         if !retry_unit_subset_is_valid(task, &prepared_units) {
             return OnlineMarkdownizePrecondition::Retire;
         }
-        return OnlineMarkdownizePrecondition::Send(PreparedOnlineMarkdownizeInput {
+        return OnlineMarkdownizePrecondition::Send(Box::new(PreparedOnlineMarkdownizeInput {
             path,
             media_type,
             bytes: verified.bytes,
             prepared_units,
             converted_pdf: None,
-        });
+        }));
     }
     // R22-5: retire a stale task for octet-stream TEXT. The recovery is a re-index (which
     // no longer enqueues it), not a retry — the deterministic pass already handled the file.
@@ -485,13 +485,13 @@ fn classify_markdownize_source_for_admission(
     if !retry_unit_subset_is_valid(task, &prepare.prepared_units) {
         return OnlineMarkdownizePrecondition::Retire;
     }
-    OnlineMarkdownizePrecondition::Send(PreparedOnlineMarkdownizeInput {
+    OnlineMarkdownizePrecondition::Send(Box::new(PreparedOnlineMarkdownizeInput {
         path,
         media_type,
         bytes: verified.bytes,
         prepared_units: prepare.prepared_units,
         converted_pdf: None,
-    })
+    }))
 }
 
 /// Run every Pending local-HTTP markdownize task this pass.
@@ -560,7 +560,7 @@ pub(crate) fn execute_pending_offline_markdownize_tasks(
                 counts.resource_limit = Some(limit);
                 continue;
             }
-            OnlineMarkdownizePrecondition::Send(prepared_input) => prepared_input,
+            OnlineMarkdownizePrecondition::Send(prepared_input) => *prepared_input,
             OnlineMarkdownizePrecondition::PolicyUnavailable(error) => return Err(error),
             OnlineMarkdownizePrecondition::OversizedPreparedInput => {
                 retire_offline_markdownize_task(store, &task.task_id, "invalid_input")?;

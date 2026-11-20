@@ -897,7 +897,7 @@ fn collect_batch_markdownize_output(
                 ..ExecOutcome::default()
             }));
         }
-        OnlineMarkdownizePrecondition::Send(prepared_input) => prepared_input,
+        OnlineMarkdownizePrecondition::Send(prepared_input) => *prepared_input,
         OnlineMarkdownizePrecondition::PolicyUnavailable(error) => return Err(error),
         OnlineMarkdownizePrecondition::OversizedPreparedInput => {
             unreachable!("collect has no send admission")
