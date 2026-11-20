@@ -1481,21 +1481,7 @@ fn scan_derived_inventory(
             .ok_or_else(|| {
                 store_corrupt(&manifest_path, "normalized instance manifest is missing")
             })?;
-        let limit = MAX_NORMALIZED_MANIFEST_OBJECT_BYTES + 1;
-        let mut source = file.take(limit);
-        let manifest: NormalizedInstanceManifest =
-            serde_json::from_reader(std::io::BufReader::new(&mut source)).map_err(|error| {
-                store_corrupt(
-                    &manifest_path,
-                    &format!("invalid normalized manifest: {error}"),
-                )
-            })?;
-        if source.limit() == 0 {
-            return Err(store_corrupt(
-                &manifest_path,
-                "normalized manifest exceeds its byte bound",
-            ));
-        }
+        let manifest = decode_normalized_manifest(&manifest_path, file)?;
         validate_instance_leaf(&leaf, &manifest)?;
         let identity = (
             manifest.raw_hash.clone(),
@@ -1549,6 +1535,56 @@ fn scan_derived_inventory(
         }
     }
     Ok(inventory)
+}
+
+fn decode_normalized_manifest(
+    path: &Path,
+    reader: impl Read,
+) -> Result<NormalizedInstanceManifest> {
+    let mut source = reader.take(MAX_NORMALIZED_MANIFEST_OBJECT_BYTES + 1);
+    let manifest =
+        serde_json::from_reader(std::io::BufReader::new(&mut source)).map_err(|error| {
+            if error.io_error_kind().is_some() {
+                KioError::io(
+                    std::io::Error::from(error).to_string(),
+                    path.display().to_string(),
+                )
+            } else {
+                store_corrupt(path, &format!("invalid normalized manifest: {error}"))
+            }
+        })?;
+    if source.limit() == 0 {
+        return Err(store_corrupt(
+            path,
+            "normalized manifest exceeds its byte bound",
+        ));
+    }
+    Ok(manifest)
+}
+
+#[cfg(test)]
+#[test]
+fn normalized_manifest_read_failure_is_io() {
+    struct FailingReader;
+    impl Read for FailingReader {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "manifest read failed",
+            ))
+        }
+    }
+
+    let path = Path::new("manifest.json");
+    let reader = b"{".as_slice().chain(FailingReader);
+    let error = decode_normalized_manifest(path, reader).unwrap_err();
+    assert_eq!(error.error_code(), "KIO-E-STORE-IO-001");
+    assert_eq!(error.message(), "manifest read failed");
+    assert_eq!(error.context()["path"], "manifest.json");
+    for invalid_json in ["{", "{!", "{}"] {
+        let error = decode_normalized_manifest(path, invalid_json.as_bytes()).unwrap_err();
+        assert_eq!(error.error_code(), "KIO-E-STORE-CORRUPT-001");
+    }
 }
 
 /// Add every immutable normalized manifest/unit closure that remains reachable

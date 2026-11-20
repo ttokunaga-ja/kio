@@ -821,16 +821,33 @@ pub fn read_normalized_instance_manifest(
         &manifest_path,
         MAX_NORMALIZED_MANIFEST_BYTES,
     )?;
+    let (manifest, consumed) = decode_normalized_instance_manifest(&manifest_path, file)?;
+    validate_normalized_manifest(&manifest_path, &identity, &manifest)?;
+    Ok((manifest, consumed))
+}
+
+fn decode_normalized_instance_manifest(
+    manifest_path: &Path,
+    reader: impl Read,
+) -> Result<(NormalizedInstanceManifest, u64)> {
     let limit = MAX_NORMALIZED_MANIFEST_BYTES + 1;
-    let mut input = file.take(limit);
+    let mut input = reader.take(limit);
     let manifest = serde_json::from_reader(std::io::BufReader::with_capacity(
         kio_core::cas::CAS_STREAM_BUFFER_BYTES,
         &mut input,
     ))
-    .map_err(|error| normalized_corrupt(&manifest_path, error.to_string()))?;
+    .map_err(|error| {
+        if error.io_error_kind().is_some() {
+            PipelineError::Io {
+                path: manifest_path.display().to_string(),
+                message: std::io::Error::from(error).to_string(),
+            }
+        } else {
+            normalized_corrupt(manifest_path, error.to_string())
+        }
+    })?;
     let consumed = limit - input.limit();
-    checked_manifest_size(&manifest_path, consumed, NORMALIZED_SIZE_LIMITS)?;
-    validate_normalized_manifest(&manifest_path, &identity, &manifest)?;
+    checked_manifest_size(manifest_path, consumed, NORMALIZED_SIZE_LIMITS)?;
     Ok((manifest, consumed))
 }
 
@@ -2546,6 +2563,33 @@ fn contract_violation(message: &str) -> PipelineError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalized_manifest_read_failure_is_io() {
+        struct FailingReader;
+        impl Read for FailingReader {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "manifest read failed",
+                ))
+            }
+        }
+
+        let path = Path::new("manifest.json");
+        let reader = b"{".as_slice().chain(FailingReader);
+        let error = decode_normalized_instance_manifest(path, reader).unwrap_err();
+        assert!(
+            matches!(&error, PipelineError::Io { path, message }
+                if path == "manifest.json" && message == "manifest read failed"),
+            "{error}"
+        );
+        for invalid_json in ["{", "{!", "{}"] {
+            let error =
+                decode_normalized_instance_manifest(path, invalid_json.as_bytes()).unwrap_err();
+            assert!(matches!(error, PipelineError::Corrupt { .. }), "{error}");
+        }
+    }
 
     #[test]
     fn preparation_provenance_is_required_and_complete() {
