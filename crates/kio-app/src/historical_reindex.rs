@@ -273,14 +273,16 @@ fn retained_history_instances_from_graph(
 ) -> Result<Vec<RetainedNormalizedInstance>> {
     let mut all_paths_by_raw = BTreeMap::<String, BTreeSet<String>>::new();
     let mut exact_bindings = BTreeSet::<TreeBinding>::new();
-    for appearance in graph.bindings()? {
-        let binding = appearance?.binding;
-        all_paths_by_raw
-            .entry(binding.raw_hash.clone())
-            .or_default()
-            .insert(binding.path.clone());
-        if binding.normalize.is_some() {
-            exact_bindings.insert(binding);
+    for node in graph.nodes_in_visit_order() {
+        for entry in &node.tree.entries {
+            let binding = TreeBinding::from(&entry?);
+            all_paths_by_raw
+                .entry(binding.raw_hash.clone())
+                .or_default()
+                .insert(binding.path.clone());
+            if binding.normalize.is_some() {
+                exact_bindings.insert(binding);
+            }
         }
     }
     // PC37/PC41/PC43 (05 §1.6 L265-266): collect EVERY ancestor-most

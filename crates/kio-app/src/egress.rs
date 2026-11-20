@@ -14,7 +14,6 @@ use crate::ledger_access::RETIRED_NON_LIVE;
 use crate::object_persistence::adapter_to_kio;
 use crate::object_persistence::atomic_overwrite_file;
 use crate::object_persistence::pipeline_to_kio;
-use crate::search::scope::ExecScope;
 use crate::search::scope::current_embedding_policy;
 use crate::task_execution::task_retry_allowed;
 use kio_adapter::catalog::DeclaredEmbeddingProfile;
@@ -172,30 +171,11 @@ pub(crate) fn embedding_secrets_allowed(
     )
 }
 
-fn persistent_network_allowed_for_kio_dir(
-    adapter_settings: &Arc<AdapterRuntimeSettings>,
-    kio_dir: &Path,
-    role: approvals::AdapterRole,
-    tool_id: &str,
-    profile: &str,
-    control: &kio_core::control::ControlHandle,
-) -> Result<bool> {
-    approvals::allowed_at(
-        adapter_settings,
-        kio_dir,
-        role,
-        tool_id,
-        profile,
-        grants::GrantOperation::Network,
-        control,
-    )
-}
-
 /// Query text is supplied by this invocation. One currently authorized eligible
 /// scope may admit its single embedding request; --online does not create a grant.
-pub(crate) fn embedding_opt_in_for_scopes(
+pub(crate) fn embedding_opt_in_for_scopes<'a>(
     adapter_settings: &Arc<AdapterRuntimeSettings>,
-    exec_scopes: &[ExecScope],
+    repositories: impl IntoIterator<Item = &'a Repository>,
     tool_id: &str,
     tool_profile_hash: &str,
     offline: bool,
@@ -210,14 +190,13 @@ pub(crate) fn embedding_opt_in_for_scopes(
     if embedding_is_deterministic(execution) {
         return Ok(true);
     }
-    for exec in exec_scopes {
-        if persistent_network_allowed_for_kio_dir(
+    for repo in repositories {
+        if persistent_network_allowed_for(
             adapter_settings,
-            &exec.target.kio_dir,
+            repo,
             approvals::AdapterRole::Embedding,
             tool_id,
             tool_profile_hash,
-            control,
         )? {
             return Ok(true);
         }

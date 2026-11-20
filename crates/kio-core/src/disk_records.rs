@@ -11,11 +11,11 @@ use sha2::{Digest, Sha256};
 use std::{
     cmp::Ordering,
     fs::File,
-    io::{BufRead, BufReader, Read, Seek, SeekFrom},
+    io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     marker::PhantomData,
     path::Path,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering::Relaxed},
     },
 };
@@ -243,10 +243,29 @@ impl DiskRun {
     }
     fn reader(&self) -> Result<RecordReader> {
         Ok(RecordReader::Disk {
-            reader: self.open()?,
-            _run: self.run.clone(),
+            reader: Box::new(self.open()?),
+            _run: Some(self.run.clone()),
             buffer: Vec::new(),
         })
+    }
+}
+
+// Each iterator owns its cursor. Seek and read under the same lock so cloned
+// records and interleaved iterators can share the anonymous scratch handle.
+struct ScratchReader {
+    file: Arc<Mutex<File>>,
+    offset: u64,
+}
+impl Read for ScratchReader {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| std::io::Error::other("record scratch lock poisoned"))?;
+        file.seek(SeekFrom::Start(self.offset))?;
+        let count = file.read(bytes)?;
+        self.offset += count as u64;
+        Ok(count)
     }
 }
 
@@ -254,6 +273,7 @@ impl DiskRun {
 enum RecordStorage {
     Memory(Arc<MemoryRun>),
     Disk(DiskRun),
+    Scratch(Arc<Mutex<File>>),
 }
 
 /// Repeatable, bounded storage for a sequence of private records.
@@ -289,6 +309,17 @@ impl<T> DiskRecords<T> {
         let reader = match &self.storage {
             RecordStorage::Memory(bytes) => Ok(RecordReader::memory(bytes)),
             RecordStorage::Disk(run) => run.reader(),
+            RecordStorage::Scratch(file) => Ok(RecordReader::Disk {
+                reader: Box::new(BufReader::with_capacity(
+                    RECORD_BYTES,
+                    ScratchReader {
+                        file: file.clone(),
+                        offset: 0,
+                    },
+                )),
+                _run: None,
+                buffer: Vec::new(),
+            }),
         };
         RecordIter::new(reader, self.count)
     }
@@ -353,6 +384,67 @@ impl<T: DeserializeOwned> IntoIterator for DiskRecords<T> {
 enum WriterStorage {
     Memory(Vec<u8>),
     Disk(Box<DiskWriter>),
+    Scratch(BufWriter<File>),
+}
+
+#[derive(Clone)]
+enum RecordOutput {
+    Durable(RecordStageRoot),
+    Scratch(Arc<RecordMemoryBudget>),
+}
+impl RecordOutput {
+    fn memory(&self) -> &Arc<RecordMemoryBudget> {
+        match self {
+            Self::Durable(root) => &root.memory,
+            Self::Scratch(memory) => memory,
+        }
+    }
+
+    fn spill(&self, bytes: &[u8]) -> Result<WriterStorage> {
+        match self {
+            Self::Durable(root) => {
+                let mut writer = DiskWriter::create(root)?;
+                writer.write(bytes)?;
+                Ok(WriterStorage::Disk(Box::new(writer)))
+            }
+            Self::Scratch(_) => {
+                let file = tempfile::tempfile().map_err(scratch_io)?;
+                let mut writer = BufWriter::with_capacity(RECORD_BYTES, file);
+                writer.write_all(bytes).map_err(scratch_io)?;
+                Ok(WriterStorage::Scratch(writer))
+            }
+        }
+    }
+}
+
+fn scratch_io(error: std::io::Error) -> KioError {
+    crate::store_dir::ioerr(Path::new("record scratch"), error)
+}
+
+impl WriterStorage {
+    fn append(&mut self, bytes: &[u8]) -> Result<()> {
+        match self {
+            Self::Disk(writer) => writer.write(bytes),
+            Self::Scratch(writer) => writer.write_all(bytes).map_err(scratch_io),
+            Self::Memory(buffer) => {
+                buffer.extend_from_slice(bytes);
+                Ok(())
+            }
+        }
+    }
+
+    fn finish(self) -> Result<RecordStorage> {
+        match self {
+            Self::Disk(writer) => writer.finish(),
+            Self::Scratch(writer) => {
+                let file = writer
+                    .into_inner()
+                    .map_err(|error| scratch_io(error.into_error()))?;
+                Ok(RecordStorage::Scratch(Arc::new(Mutex::new(file))))
+            }
+            Self::Memory(_) => unreachable!("in-memory records must be accounted before sealing"),
+        }
+    }
 }
 
 struct DiskWriter {
@@ -407,7 +499,7 @@ impl DiskWriter {
 }
 
 pub struct RecordWriter<T> {
-    root: RecordStageRoot,
+    output: RecordOutput,
     storage: WriterStorage,
     count: usize,
     _value: PhantomData<T>,
@@ -418,12 +510,15 @@ impl<T: Serialize> RecordWriter<T> {
             root.preserve_scratch();
             return Err(error);
         }
-        Ok(Self {
-            root: root.clone(),
+        Ok(Self::buffered(RecordOutput::Durable(root.clone())))
+    }
+    fn buffered(output: RecordOutput) -> Self {
+        Self {
+            output,
             storage: WriterStorage::Memory(Vec::new()),
             count: 0,
             _value: PhantomData,
-        })
+        }
     }
     pub fn len(&self) -> usize {
         self.count
@@ -442,6 +537,7 @@ impl<T: Serialize> RecordWriter<T> {
             WriterStorage::Disk(writer) => {
                 Box::new(RecordIter::new(writer.sealed_run().reader(), self.count))
             }
+            WriterStorage::Scratch(_) => unreachable!("JSON decoding seals scratch before reading"),
         }
     }
     pub fn push(&mut self, value: &T) -> Result<()> {
@@ -478,35 +574,25 @@ impl<T: Serialize> RecordWriter<T> {
             .count
             .checked_add(1)
             .ok_or_else(|| record_limit(usize::MAX))?;
-        match &mut self.storage {
-            WriterStorage::Memory(buffer)
-                if count <= SORT_BUFFER_RECORDS
-                    && buffer.len() + bytes.len() <= MEMORY_RUN_BYTES =>
-            {
-                buffer.extend_from_slice(&bytes);
-            }
-            WriterStorage::Memory(buffer) => {
-                let mut disk = DiskWriter::create(&self.root)?;
-                disk.write(buffer)?;
-                disk.write(&bytes)?;
-                self.storage = WriterStorage::Disk(Box::new(disk));
-            }
-            WriterStorage::Disk(disk) => disk.write(&bytes)?,
+        if let WriterStorage::Memory(buffer) = &self.storage
+            && (count > SORT_BUFFER_RECORDS || buffer.len() + bytes.len() > MEMORY_RUN_BYTES)
+        {
+            let mut storage = self.output.spill(buffer)?;
+            storage.append(&bytes)?;
+            self.storage = storage;
+        } else {
+            self.storage.append(&bytes)?;
         }
         self.count = count;
         Ok(())
     }
     pub fn finish(self) -> Result<DiskRecords<T>> {
         let storage = match self.storage {
-            WriterStorage::Memory(bytes) => match self.root.memory.store(bytes) {
+            WriterStorage::Memory(bytes) => match self.output.memory().store(bytes) {
                 Ok(run) => RecordStorage::Memory(run),
-                Err(bytes) => {
-                    let mut disk = DiskWriter::create(&self.root)?;
-                    disk.write(&bytes)?;
-                    disk.finish()?
-                }
+                Err(bytes) => self.output.spill(&bytes)?.finish()?,
             },
-            WriterStorage::Disk(disk) => disk.finish()?,
+            spilled => spilled.finish()?,
         };
         Ok(DiskRecords {
             storage,
@@ -532,8 +618,8 @@ enum RecordReader {
         position: usize,
     },
     Disk {
-        reader: BufReader<File>,
-        _run: Arc<RunFile>,
+        reader: Box<dyn BufRead + Send>,
+        _run: Option<Arc<RunFile>>,
         buffer: Vec<u8>,
     },
 }
@@ -659,13 +745,22 @@ impl<'de, T: Serialize + DeserializeOwned> serde::Deserialize<'de> for DiskRecor
                 self,
                 mut seq: A,
             ) -> std::result::Result<Self::Value, A::Error> {
-                let root = DECODE_CONTEXT
-                    .with(|context| context.borrow().last().map(|context| context.root.clone()))
+                let output = DECODE_CONTEXT
+                    .with(|context| {
+                        context
+                            .borrow()
+                            .last()
+                            .map(|context| context.output.clone())
+                    })
                     .ok_or_else(|| {
                         serde::de::Error::custom("disk record decoding requires a stage root")
                     })?;
-                let mut writer =
-                    RecordWriter::new(&root).map_err(record_decode_error::<A::Error>)?;
+                let mut writer = match output {
+                    RecordOutput::Durable(root) => {
+                        RecordWriter::new(&root).map_err(record_decode_error::<A::Error>)?
+                    }
+                    output @ RecordOutput::Scratch(_) => RecordWriter::buffered(output),
+                };
                 while let Some(item) = seq.next_element::<T>()? {
                     writer
                         .push(&item)
@@ -777,7 +872,7 @@ impl<T: Serialize + DeserializeOwned> RecordSorter<T> {
 }
 
 struct DecodeContext {
-    root: RecordStageRoot,
+    output: RecordOutput,
     error: Option<KioError>,
 }
 
@@ -798,6 +893,10 @@ fn record_decode_error<E: serde::de::Error>(error: KioError) -> E {
 /// Pass the caller's retained stage authority through derived serde visitors.
 /// The scope is local to this thread and nests with other JSON decoding scopes.
 pub fn decode_json<T: DeserializeOwned>(root: &RecordStageRoot, reader: impl Read) -> Result<T> {
+    decode_json_to(RecordOutput::Durable(root.clone()), reader)
+}
+
+fn decode_json_to<T: DeserializeOwned>(output: RecordOutput, reader: impl Read) -> Result<T> {
     struct Scope;
     impl Drop for Scope {
         fn drop(&mut self) {
@@ -808,7 +907,7 @@ pub fn decode_json<T: DeserializeOwned>(root: &RecordStageRoot, reader: impl Rea
     }
     DECODE_CONTEXT.with(|context| {
         context.borrow_mut().push(DecodeContext {
-            root: root.clone(),
+            output,
             error: None,
         })
     });
@@ -831,6 +930,22 @@ pub fn decode_json<T: DeserializeOwned>(root: &RecordStageRoot, reader: impl Rea
 /// JSON whitespace and entry count are unbounded; only the live token is capped.
 pub fn decode_bounded_json<T: DeserializeOwned>(
     root: &RecordStageRoot,
+    reader: impl Read,
+) -> Result<T> {
+    decode_bounded_json_to(RecordOutput::Durable(root.clone()), reader)
+}
+
+/// Temporary work for an immutable read. Spill to an anonymous file only
+/// when needed, with the same record and live-run memory limits as writers.
+pub(crate) fn decode_bounded_scratch_json<T: DeserializeOwned>(
+    memory: Arc<RecordMemoryBudget>,
+    reader: impl Read,
+) -> Result<T> {
+    decode_bounded_json_to(RecordOutput::Scratch(memory), reader)
+}
+
+fn decode_bounded_json_to<T: DeserializeOwned>(
+    output: RecordOutput,
     reader: impl Read,
 ) -> Result<T> {
     struct TokenReader<R> {
@@ -879,7 +994,7 @@ pub fn decode_bounded_json<T: DeserializeOwned>(
         size: 0,
         error: None,
     };
-    let parsed = decode_json(root, &mut source);
+    let parsed = decode_json_to(output, &mut source);
     if let Some(error) = source.error {
         return Err(error);
     }
@@ -904,7 +1019,9 @@ mod tests {
     fn disk_run<T>(records: &DiskRecords<T>) -> &RunFile {
         match &records.storage {
             RecordStorage::Disk(run) => &run.run,
-            RecordStorage::Memory(_) => panic!("expected spilled records"),
+            RecordStorage::Memory(_) | RecordStorage::Scratch(_) => {
+                panic!("expected a durable record stage")
+            }
         }
     }
 

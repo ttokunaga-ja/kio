@@ -2018,7 +2018,6 @@ fn search_index_status_uses_preflight_month() {
                 &ledger_path,
                 month,
                 &kio_core::control::ControlHandle::default(),
-                &kio_core::scope::LockSession::default(),
             )
             .unwrap();
             assert_eq!(
@@ -2075,6 +2074,67 @@ fn search_budget_observation_retries_a_month_rollover_once() {
     .expect("rollover retry exhaustion must fail");
     assert_eq!(error.error_code(), "KIO-E-LEDGER-SNAPSHOT-ROLLOVER-001");
     assert_eq!(error.exit_code(), kio_core::ExitCode::PartialFailure);
+}
+
+#[test]
+fn search_index_status_leaves_an_interrupted_publication_pending() {
+    use crate::index::command::compute_index_status;
+    use crate::search::scope::SearchedScopeInfo;
+
+    let root = tempfile::tempdir().unwrap();
+    let repo = kio_core::scope::Repository::init(root.path()).unwrap();
+    std::fs::write(root.path().join("note.txt"), b"before").unwrap();
+    let before = repo.snapshot(None, None).unwrap().commit_hash.unwrap();
+    let old_manifest = std::fs::read(repo.kio_dir().join("manifest.json")).unwrap();
+    std::fs::write(root.path().join("note.txt"), b"after").unwrap();
+    let after = repo.snapshot(None, None).unwrap().commit_hash.unwrap();
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(repo.kio_dir().join("manifest.json")).unwrap())
+            .unwrap();
+    let journal_path = repo.kio_dir().join("publication-v1.json");
+    std::fs::write(
+        &journal_path,
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1, "expected_head": before, "new_head": after, "manifest": manifest
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(repo.kio_dir().join("HEAD"), format!("{before}\n")).unwrap();
+    std::fs::write(repo.kio_dir().join("manifest.json"), &old_manifest).unwrap();
+
+    let scope = SearchedScopeInfo {
+        scope_id: repo.scope_identity().unwrap().scope_id,
+        scope_path: repo.kio_dir().to_path_buf(),
+        repo_root: root.path().to_path_buf(),
+        snapshot_at: before.clone(),
+        max_rowid: 0,
+        max_association_rowid: 0,
+        chunking_config_hash: "sha256:config".to_owned(),
+        index_generation: "01TEST0000000000000000000".to_owned(),
+        shallow_skipped: 0,
+        journal_active_at_prepare: false,
+        runtime_binding_filter: None,
+    };
+    let status = compute_index_status(
+        &[scope],
+        None,
+        &root.path().join("cost-ledger.sqlite"),
+        "2026-09",
+        repo.control(),
+    )
+    .unwrap();
+    assert_eq!(repo.head_commit_hash().unwrap(), Some(before));
+    assert_eq!(
+        std::fs::read(repo.kio_dir().join("manifest.json")).unwrap(),
+        old_manifest
+    );
+    assert!(journal_path.is_file());
+    assert!(!status.unsupported_inputs_complete);
+    assert_eq!(
+        status.unsupported_input_errors[0].error_code,
+        "KIO-E-PUBLICATION-RECOVERY-REQUIRED-001"
+    );
 }
 
 #[test]
@@ -2146,7 +2206,6 @@ fn r23_aggregate_index_status_fails_closed_for_corrupt_scope_state() {
         std::path::Path::new("/private/test/cost-ledger.sqlite"),
         "2026-09",
         &kio_core::control::ControlHandle::default(),
-        &kio_core::scope::LockSession::default(),
     )
     .unwrap();
     assert!(!status.tasks_complete);

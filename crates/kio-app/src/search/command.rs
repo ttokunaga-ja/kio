@@ -547,7 +547,9 @@ fn run_search_inner(
         match &adapter_identity {
             Some((id, tool_profile_hash)) => embedding_opt_in_for_scopes(
                 adapter_settings,
-                &exec_scopes,
+                exec_scopes
+                    .iter()
+                    .map(|exec| &search_repositories[&exec.target.scope_id]),
                 id,
                 tool_profile_hash,
                 parsed.offline,
@@ -992,15 +994,20 @@ fn run_search_inner(
         }
     }
 
-    // Image authority requires a strict immutable-history walk. Calculate it
-    // only after the regular per-scope preflight has admitted a scope: a
+    // Image candidates require a strict immutable-history walk. Calculate
+    // their authority after the regular per-scope preflight: a
     // corrupt sibling must be recorded as an exclusion instead of aborting
     // healthy scopes before the replica can return their text results. This
     // runs before the all-failed aggregation and fresh cursor hash so their
     // scope sets include the same exclusions.
     let mut image_authorities = BTreeMap::new();
     let mut image_authority_exclusions = BTreeSet::new();
-    for scope in &searched {
+    for scope in searched.iter().filter(|_| {
+        matches!(
+            mode.resolved,
+            SearchMode::Hybrid | SearchMode::Vector | SearchMode::Image
+        )
+    }) {
         let repo = search_repositories
             .get(&scope.scope_id)
             .expect("eligible search scope retains its repository");
@@ -1842,7 +1849,6 @@ fn run_search_inner(
         &ledger_path,
         &budget_observation.month,
         ctx.control,
-        ctx.locks,
     )?;
     if let Some(reason) = budget_observation.reason {
         index_status.budget_status = "unknown".to_owned();
