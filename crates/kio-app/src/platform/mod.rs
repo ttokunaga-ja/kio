@@ -35,7 +35,6 @@ mod watch_lock;
 mod watch_lock;
 pub(crate) use watch_lock::open_watch_instance_lock;
 
-// Append these declarations/reexports in platform/mod.rs only.
 #[cfg(target_os = "macos")]
 #[path = "macos/watch_service.rs"]
 mod watch_service;
@@ -58,38 +57,35 @@ mod watch_runner;
 #[cfg(windows)]
 #[path = "windows/watch_runner.rs"]
 mod watch_runner;
-// Compile the portable automation transport and backend on Linux tests too;
-// only Windows actually invokes the native COM process.
-#[cfg(all(test, not(windows)))]
-#[allow(dead_code)]
-#[path = "windows/watch_service.rs"]
-mod watch_service_windows_test;
-#[cfg(any(windows, test))]
-#[cfg_attr(not(windows), allow(dead_code))]
-#[path = "windows/watch_task.rs"]
-mod watch_task;
 pub(crate) use watch_runner::run_watch_service_runner;
 
+#[cfg(windows)]
+#[path = "windows/watch_task.rs"]
+mod watch_task;
+
 #[cfg(any(windows, test))]
-#[path = "windows/watch_runner_model.rs"]
+#[path = "../watch_service/runner.rs"]
 mod watch_runner_model;
-#[cfg(all(test, unix, not(target_os = "macos")))]
-#[allow(dead_code)]
-#[path = "macos/watch_service.rs"]
-mod watch_service_macos_test;
 #[cfg(any(windows, test))]
 pub(crate) use watch_runner_model::{runner_argv, validate_runner_manifest_locator};
 
 #[cfg(any(windows, test))]
-#[path = "windows/watch_service_model.rs"]
-pub(crate) mod watch_service_model;
-#[cfg(any(target_os = "linux", test))]
-pub(crate) mod watch_unit_model;
+#[path = "../watch_service/task_definition.rs"]
+pub(crate) mod watch_task_definition;
 #[cfg(any(windows, test))]
-pub(crate) use watch_service_model::xml_escape;
+#[path = "../watch_service/task_registration.rs"]
+mod watch_task_registration;
 
-#[cfg(any(windows, target_os = "macos", test))]
-#[path = "windows/watch_service_argv.rs"]
+#[cfg(any(target_os = "linux", test))]
+#[path = "../watch_service/systemd_unit.rs"]
+pub(crate) mod watch_systemd_unit;
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+#[path = "../watch_service/launch_agent.rs"]
+mod watch_launch_agent;
+
+#[cfg(any(windows, target_os = "macos"))]
+#[path = "../watch_service/watch_argv.rs"]
 mod watch_service_argv;
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos"))]
 pub(crate) use watch_service_argv::watch_argv;

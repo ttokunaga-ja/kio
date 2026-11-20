@@ -1,6 +1,8 @@
 //! Language-independent Task Scheduler automation through the OS COM API.
 //! The script is embedded program code; request data is JSON, never script text.
-use crate::platform::watch_service_model::{task_definition_matches, task_lookup};
+use super::watch_task_registration::{
+    TaskQuery, TaskRecord, matches_enabled, matches_record, validate_query,
+};
 use crate::watch_service::{ServiceManifest, service_error};
 use base64::Engine;
 use kio_core::{
@@ -8,42 +10,8 @@ use kio_core::{
     control::ControlHandle,
     store_dir::{Publication, StoreDirectory},
 };
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{path::PathBuf, process::Command, time::Duration};
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct TaskQuery {
-    hresult: u32,
-    lookup_hresult: u32,
-    pub(crate) present: bool,
-    actual: Option<String>,
-    enabled_xml: Option<String>,
-    disabled_xml: Option<String>,
-    pub(crate) state: u32,
-    pub(crate) arguments: Option<String>,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TaskRecord {
-    template_hash: String,
-    enabled: bool,
-    pending_enabled: Option<bool>,
-}
-impl TaskRecord {
-    fn allowed(&self) -> Vec<&'static str> {
-        let mut states = vec![if self.enabled { "true" } else { "false" }];
-        if let Some(pending) = self.pending_enabled {
-            let state = if pending { "true" } else { "false" };
-            if !states.contains(&state) {
-                states.push(state);
-            }
-        }
-        states
-    }
-}
 
 pub(crate) fn query(id: &str, manifest: Option<&ServiceManifest>) -> Result<TaskQuery> {
     invoke("query", id, manifest, &[])
@@ -115,24 +83,6 @@ fn invoke(
     validate_query(result)
 }
 
-fn validate_query(result: TaskQuery) -> Result<TaskQuery> {
-    // A missing COM component or a failed connection is never task absence.
-    // Only the HRESULT returned by GetTask itself may establish absence.
-    if result.hresult != 0 {
-        return Err(service_error(format!(
-            "Task Scheduler API HRESULT 0x{:08x}",
-            result.hresult
-        )));
-    }
-    if task_lookup(result.lookup_hresult)? != result.present
-        || (result.present && result.actual.is_none())
-    {
-        return Err(service_error("inconsistent Task Scheduler response"));
-    }
-    Ok(result)
-}
-
-#[cfg(windows)]
 fn system_directory() -> Result<PathBuf> {
     use std::os::windows::ffi::OsStringExt;
     let mut buffer = vec![0_u16; 32768];
@@ -148,15 +98,6 @@ fn system_directory() -> Result<PathBuf> {
     Ok(PathBuf::from(std::ffi::OsString::from_wide(
         &buffer[..count],
     )))
-}
-
-#[cfg(not(windows))]
-fn system_directory() -> Result<PathBuf> {
-    // Native execution is Windows-only; portable tests exercise the protocol
-    // and ownership logic without resolving or starting a host OS tool.
-    Err(service_error(
-        "Windows system directory unavailable on this platform",
-    ))
 }
 
 fn record_location(m: &ServiceManifest) -> Result<(StoreDirectory, PathBuf)> {
@@ -213,24 +154,6 @@ fn save_record(m: &ServiceManifest, record: &TaskRecord, publication: Publicatio
     )?;
     store.ensure_owner_private(&leaf)
 }
-fn matches_enabled(query: &TaskQuery, enabled: bool) -> bool {
-    let Some(actual) = query.actual.as_deref() else {
-        return false;
-    };
-    let expected = if enabled {
-        query.enabled_xml.as_deref()
-    } else {
-        query.disabled_xml.as_deref()
-    };
-    expected.is_some_and(|xml| task_definition_matches(actual, xml))
-}
-fn matches_record(query: &TaskQuery, record: &TaskRecord) -> bool {
-    matches_enabled(query, record.enabled)
-        || record
-            .pending_enabled
-            .is_some_and(|enabled| matches_enabled(query, enabled))
-}
-
 pub(crate) fn matches(m: &ServiceManifest, allow_absent: bool) -> Result<bool> {
     let query = query(&m.id, Some(m))?;
     if !query.present {
@@ -303,59 +226,4 @@ pub(crate) fn uninstall(m: &ServiceManifest) -> Result<()> {
         store.quarantine_then_remove(&leaf, &bytes, 4096)?;
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn reply() -> TaskQuery {
-        TaskQuery { hresult: 0, lookup_hresult: 0, present: true,
-            actual: Some("<Task><Settings><Enabled>true</Enabled></Settings><Actions><Exec><Command>kio</Command></Exec></Actions></Task>".into()),
-            enabled_xml: Some("<Task><Settings><Enabled>true</Enabled></Settings><Actions><Exec><Command>kio</Command></Exec></Actions></Task>".into()),
-            disabled_xml: Some("<Task><Settings><Enabled>false</Enabled></Settings><Actions><Exec><Command>kio</Command></Exec></Actions></Task>".into()), state: 3, arguments: None }
-    }
-    #[test]
-    fn scheduler_connection_failure_cannot_masquerade_as_absence() {
-        let mut result = reply();
-        result.hresult = 0x80070002;
-        result.present = false;
-        assert!(validate_query(result).is_err());
-        let mut result = reply();
-        result.lookup_hresult = 0x80070002;
-        result.present = false;
-        result.actual = None;
-        assert!(!validate_query(result).unwrap().present);
-        let mut result = reply();
-        result.lookup_hresult = 0x80070005;
-        result.present = false;
-        assert!(validate_query(result).is_err());
-    }
-    #[test]
-    fn os_only_task_fields_and_unapproved_enable_changes_are_foreign() {
-        let record = TaskRecord {
-            template_hash: "fixture".into(),
-            enabled: true,
-            pending_enabled: None,
-        };
-        assert!(matches_record(&reply(), &record));
-        let mut foreign = reply();
-        foreign.actual = foreign.actual.map(|xml| {
-            xml.replace(
-                "</Exec>",
-                "<WorkingDirectory>foreign</WorkingDirectory></Exec>",
-            )
-        });
-        assert!(!matches_record(&foreign, &record));
-        let mut disabled = reply();
-        disabled.actual = disabled.disabled_xml.clone();
-        assert!(!matches_record(&disabled, &record));
-        let pending = TaskRecord {
-            pending_enabled: Some(false),
-            ..record
-        };
-        assert!(matches_record(&disabled, &pending));
-        assert!(!matches_enabled(&reply(), false));
-        assert!(matches_enabled(&disabled, false));
-    }
 }

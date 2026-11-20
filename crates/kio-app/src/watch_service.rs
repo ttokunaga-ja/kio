@@ -13,14 +13,12 @@ use crate::response::watch::{
 use std::env;
 use std::fs::{self, File};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
 use kio_core::control::ControlHandle;
 use kio_core::management::{ManagementAuthority, read_record};
 use kio_core::store_dir::{Publication, StoreDirectory};
 use kio_core::{ExitCode, KioError, Result};
-use kio_process::{BoundedProcessOptions, BoundedProcessOutput, run_bounded_command};
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use serde_json::Value;
@@ -1149,54 +1147,6 @@ impl Scheduler for NativeScheduler {
     }
 }
 
-pub(crate) fn run_native<I, P>(program: P, args: I) -> Result<BoundedProcessOutput>
-where
-    I: IntoIterator<Item = String>,
-    P: AsRef<std::ffi::OsStr>,
-{
-    let output = run_native_output(program, args)?;
-    if output.status.success() {
-        Ok(output)
-    } else {
-        Err(service_error(format!(
-            "native scheduler command failed: {}",
-            bounded_output(&output)
-        )))
-    }
-}
-pub(crate) fn run_native_output<I, P>(program: P, args: I) -> Result<BoundedProcessOutput>
-where
-    I: IntoIterator<Item = String>,
-    P: AsRef<std::ffi::OsStr>,
-{
-    let mut command = Command::new(program);
-    command.args(args).env_clear().env("LC_ALL", "C");
-    for name in [
-        "HOME",
-        "USERPROFILE",
-        "SystemRoot",
-        "XDG_RUNTIME_DIR",
-        "DBUS_SESSION_BUS_ADDRESS",
-    ] {
-        if let Some(value) = env::var_os(name) {
-            command.env(name, value);
-        }
-    }
-    run_bounded_command(
-        &mut command,
-        BoundedProcessOptions {
-            timeout: Duration::from_secs(10),
-            max_stdout_bytes: 64 * 1024,
-            max_stderr_bytes: 16 * 1024,
-        },
-        None,
-    )
-    .map_err(service_error)
-}
-fn bounded_output(output: &BoundedProcessOutput) -> String {
-    output.stderr.chars().take(512).collect()
-}
-
 pub(crate) fn invalid(message: impl Into<String>) -> KioError {
     KioError::new(
         "KIO-E-WATCH-SERVICE-INVALID-001",
@@ -1219,7 +1169,9 @@ mod tests {
     use std::cell::{Cell, RefCell};
 
     use super::*;
-    use crate::platform::{runner_argv, validate_runner_manifest_locator, xml_escape};
+    use crate::platform::{
+        runner_argv, validate_runner_manifest_locator, watch_task_definition::xml_escape,
+    };
 
     #[cfg(unix)]
     fn native_test_root() -> (tempfile::TempDir, PathBuf) {
