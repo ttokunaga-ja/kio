@@ -13,7 +13,7 @@ type Status = c_int;
 
 macro_rules! api {
     ($($name:ident: $signature:ty),+ $(,)?) => {
-        struct Api {
+        pub(super) struct Api {
             $($name: $signature,)+
             _library: Library,
         }
@@ -97,12 +97,11 @@ pub(super) struct Engine {
 
 impl Engine {
     pub(super) fn open(
-        library: VerifiedLibrary,
+        api: Api,
         model: &Path,
         cache: &Path,
         threads: i32,
     ) -> Result<Self, WorkerError> {
-        let api = Api::load(Library::open(library)?)?;
         let model = c_path(model)?;
         let cache = c_path(cache)?;
         // SAFETY: every handle comes from its matching constructor, strings
@@ -208,6 +207,10 @@ impl Engine {
 }
 
 impl Api {
+    pub(super) fn open(library: VerifiedLibrary) -> Result<Self, WorkerError> {
+        Self::load(Library::open(library)?)
+    }
+
     fn check(&self, status: Status) -> Result<(), WorkerError> {
         if status == 0 {
             return Ok(());

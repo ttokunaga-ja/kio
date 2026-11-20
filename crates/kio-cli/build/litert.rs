@@ -1,3 +1,4 @@
+#[allow(dead_code)] // The shared bundle also exposes release-verifier metadata.
 #[path = "../../kio-core/src/litert.rs"]
 mod pins;
 
@@ -25,25 +26,16 @@ pub(crate) fn stage(target: &str) -> Result<(), Box<dyn Error>> {
         .nth(4)
         .ok_or("unexpected Cargo output directory")?;
     let staged = root.join(bundle.directory());
-    let archive = match std::env::var_os("KIO_LITERT_C_API_ZIP") {
-        Some(path) => {
-            let path = PathBuf::from(path);
-            if !path.is_absolute() || !path.is_file() {
-                return Err("KIO_LITERT_C_API_ZIP must name an existing absolute ZIP path".into());
-            }
-            println!("cargo:rerun-if-changed={}", path.display());
-            path
+    let file = if let Some(path) = std::env::var_os("KIO_LITERT_C_API_ZIP") {
+        let path = PathBuf::from(path);
+        if !path.is_absolute() || !path.is_file() {
+            return Err("KIO_LITERT_C_API_ZIP must name an existing absolute ZIP path".into());
         }
-        None => download(&out)?,
+        println!("cargo:rerun-if-changed={}", path.display());
+        open_pinned_archive(&path)?
+    } else {
+        open_cached_archive(root, &out)?
     };
-    let mut file = File::open(&archive)?;
-    if file.metadata()?.len() != pins::ARCHIVE_BYTES {
-        return Err("LiteRT-LM ZIP size differs from the pin".into());
-    }
-    if pins::sha256(&mut (&mut file).take(pins::ARCHIVE_BYTES + 1))? != pins::ARCHIVE_SHA256 {
-        return Err("LiteRT-LM ZIP SHA-256 differs from the pin".into());
-    }
-    file.rewind()?;
     let mut zip = ZipArchive::new(file)?;
     fs::create_dir_all(&staged)?;
 
@@ -84,28 +76,52 @@ pub(crate) fn stage(target: &str) -> Result<(), Box<dyn Error>> {
     licenses.finish()?.flush()?;
     fs::rename(notice, staged.join(pins::THIRD_PARTY_LICENSES))?;
 
-    for name in bundle.names() {
-        println!("cargo:rerun-if-changed={}", staged.join(name).display());
-    }
     Ok(())
 }
 
-fn download(out: &Path) -> Result<PathBuf, Box<dyn Error>> {
+fn open_pinned_archive(path: &Path) -> Result<File, Box<dyn Error>> {
+    let mut file = File::open(path)?;
+    if file.metadata()?.len() != pins::ARCHIVE_BYTES {
+        return Err("LiteRT-LM ZIP size differs from the pin".into());
+    }
+    if pins::sha256(&mut (&mut file).take(pins::ARCHIVE_BYTES + 1))? != pins::ARCHIVE_SHA256 {
+        return Err("LiteRT-LM ZIP SHA-256 differs from the pin".into());
+    }
+    file.rewind()?;
+    Ok(file)
+}
+
+fn open_cached_archive(root: &Path, out: &Path) -> Result<File, Box<dyn Error>> {
     if std::env::var("CARGO_NET_OFFLINE").is_ok_and(|value| value == "true" || value == "1") {
         return Err(
             "offline build requires KIO_LITERT_C_API_ZIP to point to the pinned ZIP".into(),
         );
     }
-    // OUT_DIR belongs to this Cargo build unit. In particular, concurrent
-    // release builds have independent download and extraction work areas.
-    let path = out.join("litert_lm_c_api-1.0.0.zip");
+    // The cache and staged assets are outputs. Watching either would dirty
+    // the next Cargo invocation after staging. An explicit ZIP is an input.
+    let cache = root.join(".kio-litert-cache");
+    let archive = cache.join(format!("{}.zip", pins::ARCHIVE_SHA256));
+    if let Ok(verified) = open_pinned_archive(&archive) {
+        return Ok(verified);
+    }
+    fs::create_dir_all(cache)?;
+    let partial = out.join("litert-download.zip");
+    download(&partial)?;
+    // Cache only verified bytes, then open the published name using the same
+    // pin. Close the temporary input before renaming it on Windows.
+    drop(open_pinned_archive(&partial)?);
+    fs::rename(partial, &archive)?;
+    open_pinned_archive(&archive)
+}
+
+fn download(path: &Path) -> Result<(), Box<dyn Error>> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(300)))
+        .timeout_global(Some(Duration::from_secs(90)))
         .https_only(true)
         .build()
         .into();
     let response = agent.get(pins::ARCHIVE_URL).call()?;
-    let mut file = File::create(&path)?;
+    let mut file = File::create(path)?;
     io::copy(
         &mut response
             .into_body()
@@ -114,5 +130,5 @@ fn download(out: &Path) -> Result<PathBuf, Box<dyn Error>> {
         &mut file,
     )?;
     file.flush()?;
-    Ok(path)
+    Ok(())
 }

@@ -1,11 +1,13 @@
-use crate::eg2::{EngineSlot, MEMORY_BYTES, WorkerError};
+use crate::eg2::{EngineSlot, WorkerError};
 use std::fs::File;
 use std::io;
-use std::os::fd::FromRawFd;
-use std::os::unix::process::CommandExt;
-use std::process::{Child, Command, ExitStatus};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus};
+use std::thread::JoinHandle;
 
-pub(in crate::eg2) fn configure_command(command: &mut Command) {
+pub(in crate::eg2) fn configure_command(command: &mut Command, memory_bytes: u64) {
     command.process_group(0);
     for (name, _) in std::env::vars_os() {
         let name_bytes = name.as_encoded_bytes();
@@ -15,7 +17,7 @@ pub(in crate::eg2) fn configure_command(command: &mut Command) {
     }
     // SAFETY: only async-signal-safe system calls are used before exec.
     unsafe {
-        command.pre_exec(|| {
+        command.pre_exec(move || {
             let zero = libc::rlimit {
                 rlim_cur: 0,
                 rlim_max: 0,
@@ -23,21 +25,20 @@ pub(in crate::eg2) fn configure_command(command: &mut Command) {
             if libc::setrlimit(libc::RLIMIT_CORE, &zero) != 0 {
                 return Err(io::Error::last_os_error());
             }
-            #[cfg(target_os = "linux")]
-            {
-                let mut address_space = libc::rlimit {
-                    rlim_cur: 0,
-                    rlim_max: 0,
-                };
-                if libc::getrlimit(libc::RLIMIT_AS, &mut address_space) != 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                let cap = (2 * MEMORY_BYTES) as libc::rlim_t;
-                address_space.rlim_cur = address_space.rlim_cur.min(cap);
-                address_space.rlim_max = address_space.rlim_max.min(cap);
-                if libc::setrlimit(libc::RLIMIT_AS, &address_space) != 0 {
-                    return Err(io::Error::last_os_error());
-                }
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if libc::getrlimit(libc::RLIMIT_AS, &mut limit) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // The address-space ceiling is a kernel bound on the worker's
+            // mappings for its entire lifetime, including idle intervals.
+            let cap = memory_bytes as libc::rlim_t;
+            limit.rlim_cur = limit.rlim_cur.min(cap);
+            limit.rlim_max = limit.rlim_max.min(cap);
+            if libc::setrlimit(libc::RLIMIT_AS, &limit) != 0 {
+                return Err(io::Error::last_os_error());
             }
             Ok(())
         });
@@ -59,7 +60,6 @@ pub(in crate::eg2) fn configure_worker(slot: EngineSlot) -> Result<(), WorkerErr
 }
 
 pub(in crate::eg2) fn private_stdout() -> Result<File, WorkerError> {
-    use std::os::fd::AsRawFd;
     let null = File::options()
         .write(true)
         .open("/dev/null")
@@ -81,76 +81,123 @@ pub(in crate::eg2) fn private_stdout() -> Result<File, WorkerError> {
     }
 }
 
-pub(in crate::eg2) struct ProcessLimits {
-    pub(in crate::eg2) bytes: u64,
-}
+pub(in crate::eg2) struct ProcessLimits;
 
 impl ProcessLimits {
-    pub(in crate::eg2) fn attach(_: &Child) -> Result<Self, WorkerError> {
-        Ok(Self {
-            bytes: MEMORY_BYTES,
-        })
+    pub(in crate::eg2) fn attach(_: &Child, _: u64) -> Result<Self, WorkerError> {
+        Ok(Self)
     }
 
-    pub(in crate::eg2) fn check(&self, child: &Child) -> Result<(), WorkerError> {
-        match footprint(child.id()) {
-            Ok(bytes) if bytes > self.bytes => Err(WorkerError::MemoryLimit),
-            Ok(_) => Ok(()),
-            Err(error)
-                if matches!(error.kind(), io::ErrorKind::NotFound)
-                    || error.raw_os_error() == Some(libc::ESRCH) =>
-            {
-                Ok(())
-            }
-            Err(_) => Err(WorkerError::Startup),
-        }
+    pub(in crate::eg2) fn check(&self) -> Result<(), WorkerError> {
+        Ok(())
     }
 }
 
-pub(in crate::eg2) fn memory_exit(_: ExitStatus) -> bool {
-    // Unix signals alone do not identify the cause of termination. The
-    // footprint monitor and the C API status report observable memory limits.
-    false
-}
-
-#[cfg(target_os = "linux")]
-fn footprint(pid: u32) -> io::Result<u64> {
-    let status = std::fs::read_to_string(format!("/proc/{pid}/status"))?;
-    // VmHWM preserves a peak even if the worker frees a burst before polling.
-    Ok(status
-        .lines()
-        .find_map(|line| {
-            let kib = line
-                .strip_prefix("VmHWM:")?
-                .split_whitespace()
-                .next()?
-                .parse::<u64>()
-                .ok()?;
-            Some(kib.saturating_mul(1024))
-        })
-        .unwrap_or(0)) // An exited/zombie process no longer has memory counters.
-}
-
-#[cfg(target_os = "macos")]
-fn footprint(pid: u32) -> io::Result<u64> {
-    let mut usage = std::mem::MaybeUninit::<libc::rusage_info_v0>::zeroed();
-    // SAFETY: RUSAGE_INFO_V0 writes a rusage_info_v0.
+pub(in crate::eg2) fn peek_exit(child: &mut Child) -> io::Result<Option<ExitStatus>> {
+    // Keep the leader's PID reserved until stop() has signalled its group.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     if unsafe {
-        libc::proc_pid_rusage(
-            pid as libc::pid_t,
-            libc::RUSAGE_INFO_V0,
-            usage.as_mut_ptr().cast(),
+        libc::waitid(
+            libc::P_PID,
+            child.id(),
+            &mut info,
+            libc::WNOHANG | libc::WEXITED | libc::WNOWAIT,
         )
     } != 0
     {
         return Err(io::Error::last_os_error());
     }
-    Ok(unsafe { usage.assume_init() }.ri_phys_footprint)
+    if unsafe { info.si_pid() } == 0 {
+        return Ok(None);
+    }
+    let status = unsafe { info.si_status() };
+    let raw = if info.si_code == libc::CLD_EXITED {
+        status << 8
+    } else {
+        status
+    };
+    Ok(Some(ExitStatus::from_raw(raw)))
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn footprint(_: u32) -> io::Result<u64> {
-    Err(io::ErrorKind::Unsupported.into())
+pub(in crate::eg2) fn terminate_group(child: &Child) {
+    // SAFETY: the unreaped child's PID is the process group ID set at spawn.
+    unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
+}
+
+pub(in crate::eg2) fn configure_pipes(stdin: &ChildStdin, stdout: &ChildStdout) -> io::Result<()> {
+    for fd in [stdin.as_raw_fd(), stdout.as_raw_fd()] {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+pub(in crate::eg2) fn interrupt_io(_: &JoinHandle<()>) {}
+
+pub(in crate::eg2) fn memory_exit(_: ExitStatus) -> bool {
+    // Unix signals alone do not identify the cause of an abort. The C API
+    // reports resource exhaustion when a failed allocation is recoverable.
+    false
+}
+
+pub(in crate::eg2) struct SlotGate(File);
+
+impl SlotGate {
+    pub(in crate::eg2) fn open(slot: EngineSlot) -> Result<Self, WorkerError> {
+        // Fixed machine-wide sticky directory. These empty coordination files
+        // outlive individual workers and are never unlinked. Anyone may open
+        // them read-only and take a kernel lock, independent of HOME or XDG.
+        #[cfg(test)]
+        let root = std::env::temp_dir();
+        #[cfg(all(not(test), target_os = "macos"))]
+        let root = "/private/tmp";
+        #[cfg(all(not(test), not(target_os = "macos")))]
+        let root = "/tmp";
+        let path = std::path::Path::new(&root).join(format!("kio-eg2-engine-{}.lock", slot.name()));
+        let flags = libc::O_NOFOLLOW | libc::O_NONBLOCK;
+        let open = || File::options().read(true).custom_flags(flags).open(&path);
+        let file = match open() {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match File::options()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o644)
+                    .custom_flags(flags)
+                    .open(&path)
+                {
+                    Ok(created) => {
+                        if unsafe { libc::fchmod(created.as_raw_fd(), 0o644) } != 0 {
+                            return Err(WorkerError::Startup);
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(_) => return Err(WorkerError::Startup),
+                }
+                open()
+            }
+            result => result,
+        }
+        .map_err(|_| WorkerError::Startup)?;
+        let metadata = file.metadata().map_err(|_| WorkerError::Startup)?;
+        if !metadata.is_file()
+            || metadata.nlink() != 1
+            || metadata.len() != 0
+            || metadata.mode() & 0o022 != 0
+        {
+            return Err(WorkerError::Startup);
+        }
+        Ok(Self(file))
+    }
+
+    pub(in crate::eg2) fn try_acquire(&mut self) -> Result<bool, WorkerError> {
+        match self.0.try_lock() {
+            Ok(()) => Ok(true),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(false),
+            Err(_) => Err(WorkerError::Startup),
+        }
+    }
 }
 
 pub(in crate::eg2) fn exit_worker(code: i32) -> ! {

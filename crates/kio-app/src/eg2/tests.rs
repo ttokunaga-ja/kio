@@ -1,6 +1,8 @@
 use super::*;
 use std::io::{Read, Write};
+use std::path::Path;
 use std::process::Command;
+use std::time::Instant;
 
 #[test]
 fn fake_worker_entry() {
@@ -8,11 +10,32 @@ fn fake_worker_entry() {
         return;
     };
     let mut input = std::io::stdin().lock();
-    let mut output = std::io::stdout().lock();
+    let mut output: Box<dyn Write> = if mode == "diagnostics" {
+        Box::new(platform::private_stdout().unwrap())
+    } else {
+        Box::new(std::io::stdout().lock())
+    };
     let mut start = [0];
     input.read_exact(&mut start).unwrap();
     assert_eq!(start, [1]);
     platform::configure_worker(EngineSlot::Query).unwrap();
+    let _gate = if mode == "index-slot" || mode == "query-slot" {
+        let slot = if mode == "index-slot" {
+            EngineSlot::Index
+        } else {
+            EngineSlot::Query
+        };
+        match acquire_slot(slot, Duration::from_millis(80)) {
+            Ok(gate) => Some(gate),
+            Err(error) => {
+                output.write_all(&[error.wire()]).unwrap();
+                output.flush().unwrap();
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
     output.write_all(b"\x01\x02").unwrap(); // Ready
     output.flush().unwrap();
     if mode == "blocked-write" {
@@ -20,28 +43,48 @@ fn fake_worker_entry() {
         std::process::exit(0);
     }
     let mut count = 0;
-    while let Ok(Some(_)) = read_frame(&mut input, MAX_REQUEST_BYTES) {
+    while let Ok(Some(frame)) = read_frame(&mut input, REQUEST_ID_BYTES + MAX_REQUEST_BYTES) {
+        let (id, _) = split_message(&frame).unwrap();
+        let mut reply = |payload: &[u8]| {
+            let mut response = id.to_vec();
+            response.extend_from_slice(payload);
+            write_frame(&mut output, &response).unwrap();
+        };
         match mode.to_str().unwrap() {
             "abort" => std::process::abort(),
             "eof" => std::process::exit(0),
             "malformed" => output.write_all(&u32::MAX.to_le_bytes()).unwrap(),
-            "timeout" => std::thread::sleep(Duration::from_secs(60)),
-            #[cfg(target_os = "linux")]
-            "allocate" => {
-                let memory = vec![0xfe; 64 * 1024 * 1024];
-                std::hint::black_box(&memory);
-                std::thread::sleep(Duration::from_secs(60));
+            "descendant" => {
+                #[cfg(unix)]
+                let mut descendant = Command::new("/bin/sleep").arg("4").spawn().unwrap();
+                #[cfg(windows)]
+                let mut descendant = Command::new("powershell.exe")
+                    .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 4"])
+                    .spawn()
+                    .unwrap();
+                #[cfg(target_os = "linux")]
+                if let Some(path) = std::env::var_os("KIO_EG2_DESCENDANT_PID") {
+                    std::fs::write(path, descendant.id().to_string()).unwrap();
+                }
+                std::thread::sleep(Duration::from_secs(5));
+                descendant.wait().unwrap();
             }
-            "memory" => write_frame(&mut output, &[WorkerError::MemoryLimit.wire()]).unwrap(),
+            "timeout" => std::thread::sleep(Duration::from_secs(60)),
+            "hard-cap" => reply(&[memory_denial().wire()]),
+            "memory" => reply(&[WorkerError::MemoryLimit.wire()]),
             "nan" => {
                 let mut response = vec![0];
                 response.extend([f32::NAN.to_le_bytes(); DIMENSIONS].into_iter().flatten());
-                write_frame(&mut output, &response).unwrap();
+                reply(&response);
             }
-            "reuse" | "overflow" => {
+            "reuse" | "overflow" | "duplicate" | "diagnostics" => {
+                if mode == "diagnostics" {
+                    writeln!(std::io::stdout(), "native stdout diagnostic").unwrap();
+                    writeln!(std::io::stderr(), "native stderr diagnostic").unwrap();
+                }
                 count += 1;
                 if mode == "overflow" && count == 1 {
-                    write_frame(&mut output, &[WorkerError::InputOverflow.wire()]).unwrap();
+                    reply(&[WorkerError::InputOverflow.wire()]);
                     continue;
                 }
                 let mut response = vec![0];
@@ -50,7 +93,10 @@ fn fake_worker_entry() {
                         .into_iter()
                         .flatten(),
                 );
-                write_frame(&mut output, &response).unwrap();
+                reply(&response);
+                if mode == "duplicate" && count == 1 {
+                    reply(&response);
+                }
             }
             _ => unreachable!(),
         }
@@ -59,7 +105,7 @@ fn fake_worker_entry() {
     std::process::exit(0);
 }
 
-fn fake(mode: &str) -> Worker {
+fn fake_command(mode: &str) -> Command {
     let mut command = Command::new(std::env::current_exe().unwrap());
     command.args([
         "--exact",
@@ -68,8 +114,12 @@ fn fake(mode: &str) -> Worker {
         "--quiet",
     ]);
     command.env("KIO_EG2_FAKE_FIXTURE", mode);
+    command
+}
+
+fn fake(mode: &str) -> Worker {
     // The test harness emits its preamble before entering the fake worker.
-    Worker::spawn(command, Duration::from_secs(10), &|| false, true).unwrap()
+    Worker::spawn(fake_command(mode), Duration::from_secs(10), &|| false, true).unwrap()
 }
 
 #[test]
@@ -157,29 +207,6 @@ fn initialization_checks_the_pinned_location_only() {
 }
 
 const TEST_TIMEOUT: Duration = Duration::from_millis(350);
-
-#[test]
-fn indexing_and_query_have_independent_exclusive_slots() {
-    let temporary = crate::test_support::PrivateTempDir::new();
-    let directory = kio_core::store_dir::StoreDirectory::open(temporary.path()).unwrap();
-    let index = acquire_slot(&directory, EngineSlot::Index, Duration::ZERO).unwrap();
-    let query = acquire_slot(&directory, EngineSlot::Query, Duration::ZERO).unwrap();
-    let wait = Duration::from_millis(25);
-    let start = Instant::now();
-    assert_eq!(
-        acquire_slot(&directory, EngineSlot::Index, wait).unwrap_err(),
-        WorkerError::ResourceBusy
-    );
-    assert!(start.elapsed() >= wait);
-    assert_eq!(
-        acquire_slot(&directory, EngineSlot::Query, Duration::ZERO).unwrap_err(),
-        WorkerError::ResourceBusy
-    );
-    drop((index, query));
-    assert!(acquire_slot(&directory, EngineSlot::Index, Duration::ZERO).is_ok());
-    assert_eq!(EngineSlot::Index.threads(), 2);
-    assert!((1..=4).contains(&EngineSlot::Query.threads()));
-}
 
 #[test]
 fn overflow_requires_the_exact_2048_token_diagnostic() {
@@ -271,23 +298,172 @@ fn overflow_leaves_the_same_worker_available_for_another_request() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn resident_memory_limit_kills_and_reaps_a_live_worker() {
-    let mut worker = fake("allocate");
-    worker.limits.bytes = 48 * 1024 * 1024;
-    let pid = worker.child.as_ref().unwrap().id();
-    assert_eq!(
-        worker.embed(b"\x00allocate", Duration::from_secs(5), &|| false),
-        Err(WorkerError::MemoryLimit)
-    );
-    assert!(!Path::new(&format!("/proc/{pid}")).exists());
-}
-
-#[cfg(target_os = "linux")]
-#[test]
 fn dropping_a_reused_worker_reaps_it() {
     let mut worker = fake("reuse");
     let pid = worker.child.as_ref().unwrap().id();
     worker.embed(b"\x00hello", TEST_TIMEOUT, &|| false).unwrap();
     drop(worker);
     assert!(!Path::new(&format!("/proc/{pid}")).exists());
+}
+
+#[test]
+fn duplicate_response_cannot_be_reused_for_another_member() {
+    let mut worker = fake("duplicate");
+    assert_eq!(
+        worker.embed(b"\x00first", TEST_TIMEOUT, &|| false).unwrap()[0],
+        1.0
+    );
+    assert_eq!(
+        worker.embed(b"\x00second", TEST_TIMEOUT, &|| false),
+        Err(WorkerError::Protocol)
+    );
+    assert!(worker.child.is_none());
+}
+
+#[test]
+fn teardown_is_bounded_when_a_descendant_holds_the_pipe() {
+    let pid_file = tempfile::NamedTempFile::new().unwrap();
+    let mut command = fake_command("descendant");
+    command.env("KIO_EG2_DESCENDANT_PID", pid_file.path());
+    let mut worker = Worker::spawn(command, STARTUP_TIMEOUT, &|| false, true).unwrap();
+    let start = Instant::now();
+    assert_eq!(
+        worker.embed(b"\x00wait", TEST_TIMEOUT, &|| false),
+        Err(WorkerError::Timeout)
+    );
+    assert!(start.elapsed() < Duration::from_secs(2));
+    #[cfg(target_os = "linux")]
+    {
+        let pid = std::fs::read_to_string(pid_file.path()).unwrap();
+        assert!(
+            !pid.is_empty(),
+            "descendant must have spawned before timeout"
+        );
+        let status = Path::new("/proc").join(pid).join("stat");
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while let Ok(stat) = std::fs::read_to_string(&status) {
+            if stat
+                .rsplit_once(") ")
+                .is_some_and(|(_, tail)| tail.starts_with('Z'))
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "worker descendant is still running"
+            );
+            std::thread::sleep(POLL);
+        }
+    }
+}
+
+#[test]
+fn device_slots_are_shared_across_processes_with_different_data_roots() {
+    let data_a = crate::test_support::PrivateTempDir::new();
+    let data_b = crate::test_support::PrivateTempDir::new();
+    let launch = |mode, data: &Path| {
+        let mut command = fake_command(mode);
+        command.env("XDG_DATA_HOME", data);
+        Worker::spawn(command, Duration::from_secs(10), &|| false, true)
+    };
+    let index = launch("index-slot", data_a.path()).unwrap();
+    let start = Instant::now();
+    assert!(matches!(
+        launch("index-slot", data_b.path()),
+        Err(WorkerError::ResourceBusy)
+    ));
+    assert!(start.elapsed() >= Duration::from_millis(80));
+    let query = launch("query-slot", data_b.path()).unwrap();
+    assert!(matches!(
+        launch("query-slot", data_a.path()),
+        Err(WorkerError::ResourceBusy)
+    ));
+    drop((index, query));
+    assert!(launch("index-slot", data_b.path()).is_ok());
+}
+
+#[cfg(unix)]
+fn memory_denial() -> WorkerError {
+    // PROT_NONE checks the OS address-space limit without committing pages
+    // even if a regression permits the mapping.
+    let bytes = MEMORY_BYTES as usize + 4096;
+    let address = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            bytes,
+            libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+            -1,
+            0,
+        )
+    };
+    if address == libc::MAP_FAILED
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOMEM)
+    {
+        return WorkerError::MemoryLimit;
+    }
+    if address != libc::MAP_FAILED {
+        unsafe { libc::munmap(address, bytes) };
+    }
+    WorkerError::Inference
+}
+
+#[cfg(windows)]
+fn memory_denial() -> WorkerError {
+    use windows_sys::Win32::Foundation::{
+        ERROR_COMMITMENT_LIMIT, ERROR_NOT_ENOUGH_MEMORY, GetLastError,
+    };
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+    };
+    let address = unsafe {
+        VirtualAlloc(
+            std::ptr::null(),
+            192 * 1024 * 1024,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_READWRITE,
+        )
+    };
+    if address.is_null()
+        && matches!(
+            unsafe { GetLastError() },
+            ERROR_COMMITMENT_LIMIT | ERROR_NOT_ENOUGH_MEMORY
+        )
+    {
+        return WorkerError::MemoryLimit;
+    }
+    if !address.is_null() {
+        unsafe { VirtualFree(address, 0, MEM_RELEASE) };
+    }
+    WorkerError::Inference
+}
+
+#[test]
+fn worker_os_rejects_an_allocation_over_the_limit() {
+    #[cfg(unix)]
+    let bytes = MEMORY_BYTES;
+    #[cfg(windows)]
+    let bytes = 128 * 1024 * 1024;
+    let mut worker = Worker::spawn_limited(
+        fake_command("hard-cap"),
+        Duration::from_secs(10),
+        &|| false,
+        true,
+        bytes,
+    )
+    .unwrap();
+    assert_eq!(
+        worker.embed(b"\x00limit", TEST_TIMEOUT, &|| false),
+        Err(WorkerError::MemoryLimit)
+    );
+    assert!(worker.child.is_none());
+}
+
+#[test]
+fn worker_diagnostics_do_not_enter_the_response_pipe() {
+    let mut worker = fake("diagnostics");
+    assert_eq!(
+        worker.embed(b"\x00hello", TEST_TIMEOUT, &|| false).unwrap()[0],
+        1.0
+    );
 }

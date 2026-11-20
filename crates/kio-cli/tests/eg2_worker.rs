@@ -3,7 +3,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 #[test]
-fn same_binary_starts_worker_with_the_staged_runtime() {
+fn same_binary_loads_the_staged_runtime_and_resolves_its_exports() {
     let temp = tempfile::tempdir().unwrap();
     let executable = env!("CARGO_BIN_EXE_kio");
     let mut worker = Command::new(executable)
@@ -28,6 +28,7 @@ fn same_binary_starts_worker_with_the_staged_runtime() {
     }
     let output = worker.wait_with_output().unwrap();
     assert!(!output.status.success());
+    // Runtime loading and symbol resolution precede the model readiness check.
     assert_eq!(
         output.stdout,
         [kio_app::eg2::WorkerError::ModelMissing as u8]

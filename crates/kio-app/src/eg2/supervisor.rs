@@ -1,7 +1,12 @@
 use super::*;
 use std::process::{Child, Stdio};
 use std::sync::mpsc::{Receiver, SyncSender};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
 pub(super) struct Worker {
     pub(super) child: Option<Child>,
@@ -9,36 +14,50 @@ pub(super) struct Worker {
     requests: Option<SyncSender<Vec<u8>>>,
     responses: Receiver<Result<Vec<u8>, WorkerError>>,
     io: Option<JoinHandle<()>>,
-    pub(super) limits: platform::ProcessLimits,
+    limits: Option<platform::ProcessLimits>,
+    stopping: Arc<AtomicBool>,
+    last_id: u64,
 }
 
 impl Worker {
     pub(super) fn spawn(
-        mut command: Command,
+        command: Command,
         timeout: Duration,
         cancelled: &dyn Fn() -> bool,
         test_preamble: bool,
     ) -> Result<Self, WorkerError> {
+        Self::spawn_limited(command, timeout, cancelled, test_preamble, MEMORY_BYTES)
+    }
+
+    pub(super) fn spawn_limited(
+        mut command: Command,
+        timeout: Duration,
+        cancelled: &dyn Fn() -> bool,
+        test_preamble: bool,
+        memory_bytes: u64,
+    ) -> Result<Self, WorkerError> {
         if cancelled() {
             return Err(WorkerError::Cancelled);
         }
-        platform::configure_command(&mut command);
+        platform::configure_command(&mut command, memory_bytes);
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .map_err(|_| WorkerError::Startup)?;
-        let limits = match platform::ProcessLimits::attach(&child) {
+        let limits = match platform::ProcessLimits::attach(&child, memory_bytes) {
             Ok(limits) => limits,
             Err(error) => {
+                platform::terminate_group(&child);
                 let _ = child.kill();
-                let _ = child.wait();
+                reap(child, Instant::now() + STOP_TIMEOUT);
                 return Err(error);
             }
         };
-        let mut stdin = child.stdin.take().expect("piped worker stdin");
-        let mut stdout = child.stdout.take().expect("piped worker stdout");
+        let stdin = child.stdin.take().expect("piped worker stdin");
+        let stdout = child.stdout.take().expect("piped worker stdout");
+        let stopping = Arc::new(AtomicBool::new(false));
         let (send, receive) = mpsc::sync_channel::<Vec<u8>>(1);
         let (reply, responses) = mpsc::sync_channel(1);
         let mut worker = Self {
@@ -47,7 +66,18 @@ impl Worker {
             requests: Some(send),
             responses,
             io: None,
-            limits,
+            limits: Some(limits),
+            stopping: Arc::clone(&stopping),
+            last_id: 0,
+        };
+        platform::configure_pipes(&stdin, &stdout).map_err(|_| WorkerError::Startup)?;
+        let mut stdin = Interruptible {
+            pipe: stdin,
+            stopping: Arc::clone(&stopping),
+        };
+        let mut stdout = Interruptible {
+            pipe: stdout,
+            stopping,
         };
         worker.io = Some(
             thread::Builder::new()
@@ -85,7 +115,9 @@ impl Worker {
                     for frame in receive {
                         let response = write_frame(&mut stdin, &frame)
                             .map_err(|_| WorkerError::Eof)
-                            .and_then(|()| read_frame(&mut stdout, MAX_RESPONSE_BYTES))
+                            .and_then(|()| {
+                                read_frame(&mut stdout, REQUEST_ID_BYTES + MAX_RESPONSE_BYTES)
+                            })
                             .and_then(|frame| frame.ok_or(WorkerError::Eof));
                         let healthy = response.is_ok();
                         if reply.send(response).is_err() || !healthy {
@@ -130,13 +162,22 @@ impl Worker {
         timeout: Duration,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<Vec<f32>, WorkerError> {
+        self.last_id = self.last_id.checked_add(1).ok_or(WorkerError::Protocol)?;
+        let id = self.last_id.to_le_bytes();
+        let mut message = Vec::with_capacity(REQUEST_ID_BYTES + frame.len());
+        message.extend_from_slice(&id);
+        message.extend_from_slice(frame);
         self.requests
             .as_ref()
             .ok_or(WorkerError::Eof)?
-            .try_send(frame.to_vec())
+            .try_send(message)
             .map_err(|_| WorkerError::Eof)?;
         let response = self.wait_response(timeout, cancelled)?;
-        match response.as_slice() {
+        let (reply_id, payload) = split_message(&response)?;
+        if reply_id != &id {
+            return Err(WorkerError::Protocol);
+        }
+        match payload {
             [0, bytes @ ..] if bytes.len() == DIMENSIONS * 4 => {
                 let vector: Vec<_> = bytes
                     .as_chunks::<4>()
@@ -170,8 +211,8 @@ impl Worker {
             if remaining.is_zero() {
                 return Err(WorkerError::Timeout);
             }
-            if let Some(child) = self.child.as_ref() {
-                self.limits.check(child)?;
+            if let Some(limits) = &self.limits {
+                limits.check()?;
             }
             match self.responses.recv_timeout(POLL.min(remaining)) {
                 Ok(Err(WorkerError::Eof)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -184,8 +225,8 @@ impl Worker {
                     if Instant::now() >= deadline {
                         return Err(WorkerError::Timeout);
                     }
-                    if let Some(child) = self.child.as_ref() {
-                        self.limits.check(child)?;
+                    if let Some(limits) = &self.limits {
+                        limits.check()?;
                     }
                     return response;
                 }
@@ -201,7 +242,7 @@ impl Worker {
         // The pipe can close immediately before the exit status is visible.
         let deadline = deadline.min(Instant::now() + Duration::from_millis(50));
         loop {
-            match child.try_wait() {
+            match platform::peek_exit(child) {
                 Ok(Some(status)) if platform::memory_exit(status) => {
                     return WorkerError::MemoryLimit;
                 }
@@ -213,14 +254,74 @@ impl Worker {
     }
 
     fn stop(&mut self) {
+        self.stopping.store(true, Ordering::Release);
         self.requests.take();
+        // Close the Windows job before waiting on its members or their pipes.
+        self.limits.take();
+        let deadline = Instant::now() + STOP_TIMEOUT;
         if let Some(mut child) = self.child.take() {
+            platform::terminate_group(&child);
             let _ = child.kill();
-            let _ = child.wait();
+            reap(child, deadline);
         }
         if let Some(io) = self.io.take() {
-            let _ = io.join();
+            while !io.is_finished() && Instant::now() < deadline {
+                platform::interrupt_io(&io);
+                thread::sleep(IO_POLL);
+            }
+            if io.is_finished() {
+                let _ = io.join();
+            }
         }
+    }
+}
+
+const STOP_TIMEOUT: Duration = Duration::from_millis(500);
+const IO_POLL: Duration = Duration::from_millis(2);
+
+fn reap(mut child: Child, deadline: Instant) {
+    while let Ok(None) = child.try_wait() {
+        if Instant::now() >= deadline {
+            // Even a kernel-delayed exit must not extend the command deadline.
+            let _ = thread::Builder::new().spawn(move || child.wait());
+            return;
+        }
+        thread::sleep(IO_POLL);
+    }
+}
+
+struct Interruptible<T> {
+    pipe: T,
+    stopping: Arc<AtomicBool>,
+}
+
+impl<T> Interruptible<T> {
+    fn io<R>(&mut self, mut operation: impl FnMut(&mut T) -> io::Result<R>) -> io::Result<R> {
+        loop {
+            if self.stopping.load(Ordering::Acquire) {
+                return Err(io::ErrorKind::BrokenPipe.into());
+            }
+            match operation(&mut self.pipe) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => thread::sleep(IO_POLL),
+                result => return result,
+            }
+        }
+    }
+}
+
+impl<T: Read> Read for Interruptible<T> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.io(|pipe| pipe.read(buffer))
+    }
+}
+
+impl<T: Write> Write for Interruptible<T> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.io(|pipe| pipe.write(buffer))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.io(Write::flush)
     }
 }
 

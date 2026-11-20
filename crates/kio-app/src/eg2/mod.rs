@@ -10,10 +10,9 @@ mod tests;
 
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::path::Path;
 use std::process::Command;
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use kio_core::control::ControlHandle;
 
@@ -23,6 +22,7 @@ pub const WORKER_ARGUMENT: &str = "--internal-eg2-worker";
 pub const DIMENSIONS: usize = 768;
 const MAX_TEXT_BYTES: usize = 32 * 1024;
 const MAX_REQUEST_BYTES: usize = 1 + kio_adapter::types::MAX_EMBEDDING_ITEM_BYTES;
+const REQUEST_ID_BYTES: usize = size_of::<u64>();
 const MAX_RESPONSE_BYTES: usize = 1 + DIMENSIONS * 4;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const INFERENCE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -261,24 +261,18 @@ fn valid_vector(vector: &[f32]) -> bool {
         && vector.iter().any(|x| *x != 0.0)
 }
 
-fn acquire_slot(
-    directory: &kio_core::store_dir::StoreDirectory,
-    slot: EngineSlot,
-    wait: Duration,
-) -> Result<File, WorkerError> {
-    let gate = match slot {
-        EngineSlot::Index => Path::new("index.lock"),
-        EngineSlot::Query => Path::new("query.lock"),
-    };
-    let deadline = Instant::now() + wait;
+fn split_message(frame: &[u8]) -> Result<(&[u8; REQUEST_ID_BYTES], &[u8]), WorkerError> {
+    frame.split_first_chunk().ok_or(WorkerError::Protocol)
+}
+
+fn acquire_slot(slot: EngineSlot, wait: Duration) -> Result<platform::SlotGate, WorkerError> {
+    let deadline = std::time::Instant::now() + wait;
+    let mut gate = platform::SlotGate::open(slot)?;
     loop {
-        if let Some(file) = directory
-            .try_lock_private_gate(gate)
-            .map_err(|_| WorkerError::Startup)?
-        {
-            return Ok(file);
+        if gate.try_acquire()? {
+            return Ok(gate);
         }
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
             return Err(WorkerError::ResourceBusy);
         }
@@ -306,7 +300,7 @@ pub fn run_worker(slot: &str) -> Result<(), WorkerError> {
     std::thread::spawn(move || {
         let mut input = io::stdin().lock();
         loop {
-            match read_frame(&mut input, MAX_REQUEST_BYTES) {
+            match read_frame(&mut input, REQUEST_ID_BYTES + MAX_REQUEST_BYTES) {
                 Ok(Some(frame)) => {
                     if sender.send(frame).is_err() {
                         return;
@@ -334,8 +328,10 @@ pub fn run_worker(slot: &str) -> Result<(), WorkerError> {
         .map_err(|_| WorkerError::Eof)?;
     let (_gate, mut engine, _model) = result?;
     for frame in requests {
-        let result = parse_request(&frame).and_then(|input| engine.embed(input));
-        let mut response = Vec::with_capacity(MAX_RESPONSE_BYTES);
+        let (id, payload) = split_message(&frame)?;
+        let result = parse_request(payload).and_then(|input| engine.embed(input));
+        let mut response = Vec::with_capacity(REQUEST_ID_BYTES + MAX_RESPONSE_BYTES);
+        response.extend_from_slice(id);
         match result {
             Ok(vector) => {
                 response.push(0);
@@ -348,21 +344,20 @@ pub fn run_worker(slot: &str) -> Result<(), WorkerError> {
     Ok(())
 }
 
-fn initialize(slot: EngineSlot, threads: u8) -> Result<(File, native::Engine, File), WorkerError> {
+fn initialize(
+    slot: EngineSlot,
+    threads: u8,
+) -> Result<(platform::SlotGate, native::Engine, File), WorkerError> {
     platform::configure_worker(slot)?;
     let executable = std::env::current_exe().map_err(|_| WorkerError::Startup)?;
-    let runtime = runtime::verify(&executable)?;
+    let runtime = native::Api::open(runtime::verify(&executable)?)?;
     let control = ControlHandle::default();
     let model = crate::model::open_engine_model(&control)?;
-    let data = crate::settings::data_home(&control);
     let cache = crate::settings::cache_home(&control);
-    if !data.is_absolute() || !cache.is_absolute() {
+    if !cache.is_absolute() {
         return Err(WorkerError::Startup);
     }
-    let slots =
-        crate::private_state::ensure_private_directory(&data.join("kio/eg2"), &data, &control)
-            .map_err(|_| WorkerError::Startup)?;
-    let gate = acquire_slot(&slots, slot, SLOT_WAIT)?;
+    let gate = acquire_slot(slot, SLOT_WAIT)?;
     let cache_dir = cache.join("kio/eg2").join(slot.name());
     let _cache = crate::private_state::ensure_private_directory(&cache_dir, &cache, &control)
         .map_err(|_| WorkerError::Startup)?;

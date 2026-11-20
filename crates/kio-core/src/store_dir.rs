@@ -370,24 +370,6 @@ impl StoreDirectory {
         let gate = self.open_private_gate_raw(leaf)?;
         gate.lock()
             .map_err(|error| ioerr(&self.logical.join(leaf), error))?;
-        self.validate_private_gate(leaf, &gate)?;
-        Ok(gate)
-    }
-
-    /// Try to lock the same permanent gate without blocking other work.
-    pub fn try_lock_private_gate(&self, leaf: &Path) -> Result<Option<File>> {
-        let gate = self.open_private_gate_raw(leaf)?;
-        match gate.try_lock() {
-            Ok(()) => {
-                self.validate_private_gate(leaf, &gate)?;
-                Ok(Some(gate))
-            }
-            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-            Err(std::fs::TryLockError::Error(error)) => Err(ioerr(&self.logical.join(leaf), error)),
-        }
-    }
-
-    fn validate_private_gate(&self, leaf: &Path, gate: &File) -> Result<()> {
         if gate
             .metadata()
             .map_err(|error| ioerr(&self.logical.join(leaf), error))?
@@ -396,7 +378,8 @@ impl StoreDirectory {
         {
             return Err(err(&self.logical.join(leaf), "private gate is not empty"));
         }
-        self.ensure_owner_private(leaf)
+        self.ensure_owner_private(leaf)?;
+        Ok(gate)
     }
 
     /// Append through a verified, retained parent.  The caller owns the

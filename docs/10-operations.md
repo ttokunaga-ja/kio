@@ -499,7 +499,9 @@ runtime は LiteRT-LM v0.19.1 の C API 1.0.0 に固定する。Kio CLI の buil
 を検証してから、対象 target の library と license を配置する。offline build では
 `CARGO_NET_OFFLINE=true` と `KIO_LITERT_C_API_ZIP=<取得済み ZIP の絶対パス>` を渡す。配布物の `bin/kio` は
 同じ配布ルートの `lib` を参照する。Cargo の開発 build は profile ディレクトリと同じ階層に
-`lib` を配置する。
+`lib` を配置する。通常の開発 build は Cargo 出力先の検証済み ZIP を再利用する。CI は job ごとに
+ZIP を一度取得し、サイズと SHA-256 の照合後に各 build へ同じ入力を渡す。配布アーカイブの検証でも
+target ごとの library SHA-256 を照合する。
 
 モデルだけを明示取得または file import する。固定 artifact は次のとおり。
 
