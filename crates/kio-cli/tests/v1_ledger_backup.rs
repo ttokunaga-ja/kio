@@ -244,6 +244,8 @@ fn cli_backup_preserves_source_bytes_permissions_and_sidecar_presence() {
         let wal = path.with_file_name("cost-ledger.sqlite-wal");
         let shm = path.with_file_name("cost-ledger.sqlite-shm");
         if state != "clean" {
+            // Raw SQLite does not create sidecars with Kio's protected Windows DACL.
+            support::prepare_private_sqlite_sidecars(&path).unwrap();
             let conn = Connection::open(&path).unwrap();
             conn.set_db_config(
                 rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
@@ -261,16 +263,18 @@ fn cli_backup_preserves_source_bytes_permissions_and_sidecar_presence() {
         }
         let paths = [&path, &wal, &shm];
         let capture = || {
-            paths
-                .iter()
-                .map(|p| match fs::read(p) {
-                    Ok(bytes) => Some((bytes, fs::metadata(p).unwrap().permissions())),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                    Err(e) => panic!("{e}"),
-                })
-                .collect::<Vec<_>>()
+            paths.map(|p| match fs::read(p) {
+                Ok(bytes) => Some((bytes, fs::metadata(p).unwrap().permissions())),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => panic!("{e}"),
+            })
         };
         let before = capture();
+        assert_eq!(
+            before.each_ref().map(Option::is_some),
+            [true, state != "clean", state == "wal_and_shm"],
+            "{state}: unexpected source fixture layout"
+        );
         let destination = backup_dir(&fixture);
         fixture.ok(&["ledger", "backup", "--to", destination.to_str().unwrap()]);
         for ((p, expected), actual) in paths.iter().zip(before).zip(capture()) {
