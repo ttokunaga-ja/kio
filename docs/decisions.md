@@ -233,3 +233,17 @@
 - **内容**：次の 3 つを v1 の残作業に足す。(1) NC より前に索引したソースコードのデータが、索引し直したときに残らないようにする（NC2）。(2) index と status の working tree の走査で、使うメモリをファイル数によらず一定にする（S2b）。(3) `step3_p0_contract` の Windows での実行時間を、検証の内容を減らさずに短くする（WP）。
 - **理由**：統括は (1) を旧データの移行、(2) を仕様の有界の対象外として範囲外にしていたが、利用者が両方とも v1 で直すと決めた。(3) は残りの作業で CI を何度も回すため、利用者が v1 に入れると決めた。
 - **関係する資料**：`tasks/v1-plan.md` §3.1、§3.2b。D-20261113-10（v1 の範囲は利用者が決めたときだけ足す）。
+
+## 2026-11-20
+
+### D-20261120-01 EG2 の runtime library は build の時に固定 URL から取得する
+
+- **内容**：EG2 の runtime（LiteRT-LM の C API の共有 library。版は D-20261120-02。Linux x64・macOS arm64・Windows x64）は、repo に binary を commit しない。公式の release の固定 URL と target ごとの SHA-256 の一覧だけを repo に置き、CI と手元の build は取得して hash を照合してから使う。推測した path、PATH、`.kio`、current directory からは探索しない（`docs/10-operations.md` §5.1）。
+- **理由**：利用者が選んだ。repo を大きくせず、版と内容は hash で固定できる。代わりに build の時にネットワークが要る。
+- **関係する資料**：`docs/10-operations.md` §5.1、`tasks/v1-plan.md` §3.4 の G1。
+
+### D-20261120-02 EG2 の runtime の版を LiteRT-LM v0.19.1（C API 1.0.0）に変える
+
+- **内容**：EG2 の runtime の固定を、LiteRT-LM 0.18.0 から v0.19.1 の C API 1.0.0（公式 release の `litert_lm_c_api-1.0.0.zip`、SHA-256 `1d430d80eaf536f696a4922270ba55eb3d112189ac198c3066d487a45e3b4d4c`）に変える。同梱の置き場所は `lib/litert-lm/0.19.1/<target>/`。
+- **理由**：0.18.0 の release には、Linux・Windows 向けのビルド済みの C API の library がない（Apple 向けの xcframework だけ）。v0.19.1 の C API 1.0.0 の zip には Linux x64・macOS arm64・Windows x64 の共有 library と `embedding_engine.h` があり、release の記載の hash と一致した（2026-11-20、統括が確認）。自前で 3 OS 向けに build するより単純である。利用者が選んだ。C API 1.0.0 は 0.18.0 と互換のない変更を含むが、EG2 の実装はまだない。
+- **関係する資料**：`docs/10-operations.md` §5.1、`docs/03-data-model.md` の embedding の producer の例、D-20261120-01、`tasks/v1-plan.md` §3.4 の G1。

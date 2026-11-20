@@ -524,7 +524,7 @@ fn execute_pending_markdownize_tasks(
                 counts.resource_limit = Some(limit);
                 continue;
             }
-            OnlineMarkdownizePrecondition::Send(prepared_input) => prepared_input,
+            OnlineMarkdownizePrecondition::Send(prepared_input) => *prepared_input,
             OnlineMarkdownizePrecondition::PolicyUnavailable(error) => return Err(error),
             OnlineMarkdownizePrecondition::AwaitConversion => {
                 // A live Office document remains honest Pending work until its bounded

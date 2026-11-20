@@ -2700,7 +2700,7 @@ fn r23_markdown_charge_and_send_share_one_verified_input() {
     };
 
     let prepared = match classify_online_markdownize_precondition(&repo, &task) {
-        OnlineMarkdownizePrecondition::Send(prepared) => prepared,
+        OnlineMarkdownizePrecondition::Send(prepared) => *prepared,
         _ => panic!("valid text-bearing PDF must reach the prepared send state"),
     };
     let valid_unit_key = prepared.prepared_units[0].unit_key.clone();

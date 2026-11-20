@@ -15,6 +15,10 @@ use cap_primitives::fs::_WindowsByHandle;
 #[cfg(unix)]
 use cap_primitives::fs::MetadataExt;
 use cap_primitives::{ambient_authority, fs as cap_fs};
+use kio_adapter::{
+    catalog::builtin_prepare_profile, deterministic::DeterministicAdapter,
+    traits::MarkdownizeAdapter,
+};
 use kio_core::{
     cas::{canonical_json_bytes, hash_bytes, is_hash, lower_hex},
     disk_records::{DiskRecords, RecordStageRoot},
@@ -28,6 +32,7 @@ use std::{
     io::{Read, Write},
     path::{Component, Path, PathBuf},
     str,
+    sync::LazyLock,
 };
 use thiserror::Error;
 
@@ -45,12 +50,11 @@ const REFERENCE_ANCHOR_FEATURES: u32 = 64;
 const REFERENCE_ANCHOR_WEIGHT: f32 = 16.0;
 const DETERMINISTIC_EMBEDDING_PROFILE_HASH: &str =
     "sha256:2b5ed5b97d35496e611ccd22589c80fe6da7333bc2e7061b85eca910a1d5c497";
-const DETERMINISTIC_MARKDOWN_PROFILE_HASH: &str =
-    "sha256:c38c275574491ae2635459184f027b064cb6363cc2470dbacfa00dfe2727a68b";
-const DETERMINISTIC_PREPARE_PROFILE_HASH: &str =
-    "sha256:6f33f9331916e3bcbe7a5a2aeeb51a6e9fe159f9da1e78076c3db5c5315e4428";
-const DETERMINISTIC_TOOL_LOCK_HASH: &str =
-    "sha256:4e486424845a4c6c7c5ed6a1f2ad6a26a78e8b4ccebad29ad9985d927579dadc";
+// The extraction profiles are fixed by the built-ins linked into this evaluator.
+static DETERMINISTIC_MARKDOWN_PROFILE_HASH: LazyLock<String> =
+    LazyLock::new(|| MarkdownizeAdapter::profile(&DeterministicAdapter).tool_profile_hash);
+static DETERMINISTIC_PREPARE_PROFILE_HASH: LazyLock<String> =
+    LazyLock::new(|| builtin_prepare_profile().tool_profile_hash);
 
 const INDEX_SQL_FINGERPRINTS: &[(&str, &str)] = &[
     (
@@ -1037,10 +1041,10 @@ fn validate_working_tool_lock(raw: &[u8]) -> Result<(), AttestError> {
     let lock: WorkingToolLockWire = typed_json(raw, "working tool-lock")?;
     if lock.spec_version != 1
         || lock.prepare.tool_id != "prepare_default"
-        || lock.prepare.profile_hash != DETERMINISTIC_PREPARE_PROFILE_HASH
+        || lock.prepare.profile_hash != DETERMINISTIC_PREPARE_PROFILE_HASH.as_str()
         || lock.prepare.kind != "deterministic_library"
         || lock.markdown.tool_id != "deterministic_builtin"
-        || lock.markdown.profile_hash != DETERMINISTIC_MARKDOWN_PROFILE_HASH
+        || lock.markdown.profile_hash != DETERMINISTIC_MARKDOWN_PROFILE_HASH.as_str()
         || lock.markdown.kind != "deterministic_library"
         || lock.markdown.capabilities.len() != 2
         || lock.markdown.capabilities[0] != "baseline"
@@ -1193,11 +1197,11 @@ fn deterministic_tool_lock_bytes() -> Result<Vec<u8>, AttestError> {
             "tool_id": "kio_eval_deterministic_embedding"
         },
         "markdown": {
-            "profile_hash": DETERMINISTIC_MARKDOWN_PROFILE_HASH,
+            "profile_hash": DETERMINISTIC_MARKDOWN_PROFILE_HASH.as_str(),
             "tool_id": "deterministic_builtin"
         },
         "prepare": {
-            "profile_hash": DETERMINISTIC_PREPARE_PROFILE_HASH,
+            "profile_hash": DETERMINISTIC_PREPARE_PROFILE_HASH.as_str(),
             "tool_id": "prepare_default"
         },
         "spec_version": 1
@@ -1211,7 +1215,7 @@ fn attest_deterministic_tool_lock(
     bindings: &mut Vec<CasBinding>,
 ) -> Result<(), AttestError> {
     let expected = deterministic_tool_lock_bytes()?;
-    if hash != DETERMINISTIC_TOOL_LOCK_HASH || hash_bytes(&expected) != hash {
+    if hash_bytes(&expected) != hash {
         return Err(unsafe_state(
             "commit tool-lock identity differs from the frozen deterministic adapter set",
         ));
@@ -3551,11 +3555,46 @@ mod publication_tests {
     }
 
     #[test]
-    fn deterministic_tool_lock_preimage_matches_the_frozen_identity() {
+    fn deterministic_tool_lock_matches_the_builtin_profiles() {
+        let prepare = kio_adapter::catalog::builtin_prepare_profile();
+        let markdown = kio_adapter::catalog::builtin_offline_markdownize_adapter().profile();
+        let embedding = kio_adapter::catalog::declared_deterministic_embedding_profile();
+        let mut lock = serde_json::json!({
+            "spec_version": 1,
+            "prepare": {
+                "tool_id": prepare.adapter_id,
+                "profile_hash": prepare.tool_profile_hash,
+                "kind": prepare.execution_mode
+            },
+            "markdown": {
+                "tool_id": markdown.adapter_id,
+                "profile_hash": markdown.tool_profile_hash,
+                "kind": markdown.execution_mode,
+                "capabilities": markdown.capability_flags
+            },
+            "embedding": {
+                "tool_id": embedding.tool_id,
+                "profile_hash": embedding.profile_hash,
+                "dimensions": embedding.dimensions,
+                "distance": embedding.distance,
+                "modality": embedding.modality,
+                "kind": "deterministic_library",
+                "mode": "deterministic"
+            }
+        });
+        validate_working_tool_lock(&serde_json::to_vec(&lock).unwrap()).unwrap();
         assert_eq!(
             hash_bytes(&deterministic_tool_lock_bytes().unwrap()),
-            DETERMINISTIC_TOOL_LOCK_HASH
+            kio_adapter::tool_lock::tool_lock_hash(&lock).unwrap()
         );
+
+        for role in ["prepare", "markdown", "embedding"] {
+            let mut mismatched = lock.clone();
+            mismatched[role]["profile_hash"] = hash_bytes(role.as_bytes()).into();
+            assert!(validate_working_tool_lock(&serde_json::to_vec(&mismatched).unwrap()).is_err());
+        }
+        lock["markdown"]["capabilities"] = serde_json::json!(["baseline"]);
+        assert!(validate_working_tool_lock(&serde_json::to_vec(&lock).unwrap()).is_err());
     }
 
     #[test]
@@ -3565,12 +3604,12 @@ mod publication_tests {
                 "spec_version": 1,
                 "prepare": {
                     "tool_id": "prepare_default",
-                    "profile_hash": DETERMINISTIC_PREPARE_PROFILE_HASH,
+                    "profile_hash": DETERMINISTIC_PREPARE_PROFILE_HASH.as_str(),
                     "kind": "deterministic_library"
                 },
                 "markdown": {
                     "tool_id": "deterministic_builtin",
-                    "profile_hash": DETERMINISTIC_MARKDOWN_PROFILE_HASH,
+                    "profile_hash": DETERMINISTIC_MARKDOWN_PROFILE_HASH.as_str(),
                     "kind": "deterministic_library",
                     "capabilities": ["baseline", "text_passthrough"]
                 },
