@@ -160,8 +160,12 @@ pub(super) fn write_bound_content_at(
     }
     let (temp_name, mut temp) = bound_create_temp(parent)?;
     let result = (|| {
-        temp.write_all(bytes).kio_io(Path::new(&temp_name))?;
-        temp.sync_all().kio_io(Path::new(&temp_name))?;
+        temp.write_all(bytes).map_err(|error| {
+            crate::store_dir::stage::stage_io("cannot write staged CAS content", error)
+        })?;
+        temp.sync_all().map_err(|error| {
+            crate::store_dir::stage::stage_io("cannot sync staged CAS content", error)
+        })?;
         drop(temp);
         bound_publish_content(parent, &temp_name, leaf, kind, hash, bytes)
     })();

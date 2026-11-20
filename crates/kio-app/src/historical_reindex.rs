@@ -50,11 +50,9 @@ use kio_index::chunking::chunk_normalized_instance;
 use kio_index::fts::FtsSchemaConfig;
 use kio_index::fts::FtsTokenizer;
 use kio_index::fts::SqliteFtsIndex;
-use kio_pipeline::markdownize::NormalizedInstanceIdentity;
 use kio_pipeline::markdownize::NormalizedInstanceManifest;
 use kio_pipeline::markdownize::NormalizedUnitObject;
 use kio_pipeline::markdownize::UnitStatus;
-use kio_pipeline::markdownize::validate_normalized_instance;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -84,11 +82,11 @@ pub(super) struct ParsedReindex {
 /// than inferring completion from the subset of materialized `Done` units.
 /// Missing or corrupt pinned objects are errors; this never consults a mutable
 /// normalized-instance projection as a fallback.
-pub(super) fn pinned_manifest_and_units(
+pub(super) fn pinned_manifest(
     repo: &Repository,
     raw_hash: &str,
     normalize: &NormalizeRef,
-) -> Result<(NormalizedInstanceManifest, Vec<NormalizedUnitObject>)> {
+) -> Result<NormalizedInstanceManifest> {
     let manifest_hash = &normalize.manifest_hash;
     let store = repo.object_store();
     store
@@ -128,23 +126,7 @@ pub(super) fn pinned_manifest_and_units(
             "pinned manifest identity does not match its tree normalization reference",
         ));
     }
-    let selected_units =
-        kio_pipeline::markdownize::load_validated_normalized_units_from_manifest(&store, &manifest)
-            .map_err(pipeline_to_kio)?;
-    let identity = NormalizedInstanceIdentity {
-        raw_hash: raw_hash.to_owned(),
-        tool_profile_hash: normalize.tool_profile_hash.clone(),
-        r#gen: normalize.r#gen,
-    };
-    validate_normalized_instance(manifest_path, &identity, &manifest, &selected_units).map_err(
-        |error| {
-            crate::index::rebuild::store_corrupt_error(
-                manifest_path,
-                format!("pinned manifest/unit validation failed: {error}"),
-            )
-        },
-    )?;
-    Ok((manifest, selected_units))
+    Ok(manifest)
 }
 
 /// The immutable unit bodies this tree entry's PINNED manifest reports as
@@ -162,8 +144,28 @@ pub(super) fn pinned_done_units(
     raw_hash: &str,
     normalize: &NormalizeRef,
 ) -> Result<Vec<NormalizedUnitObject>> {
-    let (_, units) = pinned_manifest_and_units(repo, raw_hash, normalize)?;
-    Ok(units)
+    let manifest = pinned_manifest(repo, raw_hash, normalize)?;
+    kio_pipeline::markdownize::load_validated_normalized_units_from_manifest(
+        &repo.object_store(),
+        &manifest,
+    )
+    .map_err(pipeline_to_kio)
+}
+
+pub(super) fn visit_pinned_done_units(
+    repo: &Repository,
+    raw_hash: &str,
+    normalize: &NormalizeRef,
+    visit: impl FnMut(NormalizedUnitObject) -> kio_pipeline::Result<()>,
+) -> Result<()> {
+    let manifest = pinned_manifest(repo, raw_hash, normalize)?;
+    kio_pipeline::markdownize::visit_validated_normalized_units(
+        &repo.object_store(),
+        &manifest,
+        visit,
+    )
+    .map_err(pipeline_to_kio)?;
+    Ok(())
 }
 
 /// Whether the exact immutable pinned manifest is a completed normalization.
@@ -174,7 +176,13 @@ pub(super) fn pinned_manifest_is_complete(
     raw_hash: &str,
     normalize: &NormalizeRef,
 ) -> Result<bool> {
-    let (manifest, _) = pinned_manifest_and_units(repo, raw_hash, normalize)?;
+    let manifest = pinned_manifest(repo, raw_hash, normalize)?;
+    kio_pipeline::markdownize::visit_validated_normalized_units(
+        &repo.object_store(),
+        &manifest,
+        |_| Ok(()),
+    )
+    .map_err(pipeline_to_kio)?;
     Ok(!manifest.units.is_empty()
         && manifest
             .units
@@ -759,6 +767,7 @@ pub(super) fn run(
         rebuilt_chunks: appended.len() as u64,
         rebuilt_tree_entries: tree_entries.len() as u64,
         skipped_units,
+        enrichment_replay: None,
     };
     let response = HistoricalReindexResponse {
         status: "reindexed".to_owned(),
@@ -892,12 +901,13 @@ fn project_selected_snapshot(
             match selected_unit_authorities.entry(key) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
                     entry.insert(AuthenticatedNormalizedUnit {
-                        markdown: unit.markdown,
+                        text: crate::index::rebuild::UnitText::Inline(unit.markdown),
                         introductions: instance.introductions.iter().cloned().collect(),
                     });
                 }
                 std::collections::btree_map::Entry::Occupied(mut entry) => {
-                    if entry.get().markdown != unit.markdown {
+                    if !matches!(&entry.get().text, crate::index::rebuild::UnitText::Inline(markdown) if markdown == &unit.markdown)
+                    {
                         return Err(KioError::schema(
                             "selected pinned manifests disagree on normalized unit markdown",
                         ));

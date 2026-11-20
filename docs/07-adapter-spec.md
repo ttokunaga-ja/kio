@@ -875,6 +875,7 @@ MVP における Adapter の脅威モデルを次のとおり確定する。
      適用する (**AdapterRun = 1 回の Adapter 呼出 = 1 request / job** — §4・§5.5 の課金報告と同一
      単位。task 全体の総量上限ではない — 総量は budget cap 側が律する) — 超過は送信前に当該 task を
      terminal failed (invalid_input・非再試行) とし、送信しない (課金なし)
+     Office の変換前に原本を読み込む処理は、ローカルの standard メモリ予算内で行う。
    - Kio は allowed_scope 外のファイルを Adapter に渡さない (入力制御)
    - Kio は永続 gate が不成立の Adapter にオンライン送信前提の task を発行しない
    - AdapterRun (task_id / input_hashes / output_hashes / status) を監査ログとして残す

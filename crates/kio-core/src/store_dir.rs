@@ -266,6 +266,27 @@ impl StoreDirectory {
         platform::read_optional(&self.handle, relative, max_bytes, &self.logical)
     }
 
+    /// Decode a retained regular file and verify that the decoder consumed the
+    /// complete, unchanged file before accepting its result.
+    pub fn read_optional_with<T>(
+        &self,
+        relative: &Path,
+        max_bytes: u64,
+        read: impl FnOnce(&mut dyn std::io::Read) -> Result<T>,
+    ) -> Result<Option<T>> {
+        platform::read_optional_with(&self.handle, relative, max_bytes, &self.logical, read)
+    }
+
+    /// Publish streamed bytes through the same synchronized atomic workspace.
+    pub fn write_atomic_with(
+        &self,
+        relative: &Path,
+        publication: Publication,
+        write: impl FnOnce(&mut dyn std::io::Write) -> std::io::Result<()>,
+    ) -> Result<()> {
+        atomic::write_with(self, self, relative, publication, write)
+    }
+
     pub fn write_atomic(
         &self,
         relative: &Path,
@@ -379,6 +400,22 @@ impl StoreDirectory {
         destination_directory: &StoreDirectory,
         destination_leaf: &Path,
     ) -> Result<()> {
+        self.rename_directory_between_create_only_checked(
+            source_leaf,
+            destination_directory,
+            destination_leaf,
+            || Ok(()),
+        )
+    }
+
+    /// Run a check after the retained rename and before syncing either parent.
+    pub fn rename_directory_between_create_only_checked(
+        &self,
+        source_leaf: &Path,
+        destination_directory: &StoreDirectory,
+        destination_leaf: &Path,
+        before_sync: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
         platform::rename_directory_between_create_only(
             &self.handle,
             source_leaf,
@@ -386,6 +423,7 @@ impl StoreDirectory {
             destination_leaf,
             &self.logical,
             &destination_directory.logical,
+            before_sync,
         )
     }
 
@@ -512,6 +550,17 @@ impl StoreDirectory {
         )
     }
 
+    pub(crate) fn sync_stage_destination(&self) -> Result<()> {
+        use crate::durability::DurabilityPoint;
+        if self.path() == Path::new("manifests") {
+            self.control()
+                .checkpoint(DurabilityPoint::ExtractionManifestRenamed)?;
+        }
+        self.control()
+            .checkpoint(DurabilityPoint::ExtractionBeforeDestinationSync)?;
+        self.sync()
+    }
+
     pub fn sync(&self) -> Result<()> {
         platform::sync_directory(&self.handle, &self.logical)
     }
@@ -631,6 +680,24 @@ pub(crate) fn relative_components<'a>(
         return Err(err(label, "store path requires a leaf"));
     }
     Ok(out)
+}
+
+/// Match an identity-derived capture name or a retry slot for that identity.
+pub(crate) fn capture_matches(candidate: &Path, base: &Path) -> bool {
+    if candidate == base {
+        return true;
+    }
+    candidate
+        .to_str()
+        .zip(base.to_str())
+        .is_some_and(|(candidate, base)| {
+            candidate
+                .strip_prefix(base)
+                .and_then(|suffix| suffix.strip_prefix('.'))
+                .is_some_and(|slot| {
+                    slot.len() == 26 && slot.bytes().all(|byte| byte.is_ascii_alphanumeric())
+                })
+        })
 }
 
 #[cfg(test)]

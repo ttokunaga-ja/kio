@@ -6,13 +6,14 @@
 
 use super::*;
 use crate::historical_reindex::RetainedNormalizedInstance;
-use crate::historical_reindex::pinned_done_units;
 use crate::index::chunk_ledger::read_chunk_publication_events;
-use crate::index::chunk_ledger::read_stored_chunks;
-use crate::index::rebuild::AuthenticatedNormalizedUnit;
+use crate::index::chunk_ledger::visit_stored_chunks;
 use crate::index::rebuild::AuthenticatedNormalizedUnits;
 use crate::index::rebuild::NormalizedUnitKey;
+use crate::index::rebuild::PinnedUnitReader;
 use crate::index::rebuild::PublicationAuthenticationCache;
+use crate::index::rebuild::RebuildAuthorities;
+use crate::index::rebuild::append_pinned_unit_authorities;
 use crate::index::rebuild::authenticate_chunk_row;
 use crate::index::rebuild::authenticate_publication_event_cached;
 use crate::index::rebuild::durable_history_roots;
@@ -27,6 +28,7 @@ use kio_index::ChunkRow;
 #[cfg(test)]
 use kio_pipeline::markdownize::persist_normalized_instance;
 use kio_pipeline::policy::CurrentPolicyEvaluator;
+#[cfg(test)]
 use kio_pipeline::prepare::hash_bytes;
 use kio_pipeline::scan::classify_secret;
 use rusqlite::Connection;
@@ -222,23 +224,10 @@ fn exact_unit_authorities(
     repo: &Repository,
     raw: &str,
     normalize: &NormalizeRef,
+    reader: &Arc<PinnedUnitReader>,
 ) -> Result<AuthenticatedNormalizedUnits> {
     let mut authority = AuthenticatedNormalizedUnits::new();
-    for unit in pinned_done_units(repo, raw, normalize)? {
-        authority.insert(
-            (
-                raw.to_owned(),
-                normalize.tool_profile_hash.clone(),
-                normalize.r#gen,
-                unit.unit_key,
-                hash_bytes(unit.markdown.as_bytes()),
-            ),
-            AuthenticatedNormalizedUnit {
-                markdown: unit.markdown,
-                introductions: BTreeSet::new(),
-            },
-        );
-    }
+    append_pinned_unit_authorities(repo, raw, normalize, &[], reader, &mut authority)?;
     Ok(authority)
 }
 
@@ -305,10 +294,31 @@ pub(super) fn collect_retained_embedding_chunks(
     chunking_config_hash: Option<&str>,
     current_policy: Option<&CurrentPolicyEvaluator>,
 ) -> Result<Vec<RetainedEmbeddingChunk>> {
+    collect_retained_embedding_chunks_with_replay(
+        repo,
+        conn,
+        retained_instances,
+        chunking_config_hash,
+        current_policy,
+        None,
+    )
+}
+
+pub(super) fn collect_retained_embedding_chunks_with_replay(
+    repo: &Repository,
+    conn: &Connection,
+    retained_instances: &[RetainedNormalizedInstance],
+    chunking_config_hash: Option<&str>,
+    current_policy: Option<&CurrentPolicyEvaluator>,
+    replay: Option<&mut RebuildAuthorities>,
+) -> Result<Vec<RetainedEmbeddingChunk>> {
     let Some(head) = repo.head_commit_hash()? else {
         return Ok(Vec::new());
     };
-    let roots = durable_history_roots(repo)?;
+    let roots = match &replay {
+        Some(replay) => replay.roots.clone(),
+        None => durable_history_roots(repo)?,
+    };
     let (graph, _) = HistoryReader::new_with_store(repo.kio_dir(), repo.object_store())
         .walk_for_roots_allow_shallowed(&roots)?;
     let mut bindings = OwnerBindings::default();
@@ -320,6 +330,7 @@ pub(super) fn collect_retained_embedding_chunks(
     }
     let mut blocked = BTreeMap::new();
     let mut owners = BTreeMap::<InstanceKey, OwnerAuthority>::new();
+    let unit_reader = PinnedUnitReader::new(repo);
     for instance in retained_instances {
         let raw_blocked = match blocked.get(&instance.raw_hash) {
             Some(value) => *value,
@@ -344,21 +355,32 @@ pub(super) fn collect_retained_embedding_chunks(
         if let Some(owner) = owners.get_mut(&key) {
             owner.paths.extend(paths);
         } else {
-            let units = match exact_unit_authorities(repo, &instance.raw_hash, &instance.normalize)
-            {
-                Ok(units) => units,
-                Err(error) => {
-                    if crate::verify_objects::purge_explains_missing_retained_instance(
-                        repo,
-                        &instance.raw_hash,
-                        &instance.normalize,
-                    )? {
-                        // Only this exact old owner's removed closure is
-                        // explained. Raw-wide alias taint was already gathered
-                        // from every retained tree and must remain in force.
-                        continue;
+            let units = if let Some(replay) = &replay {
+                let Some(units) = replay.exact_units(instance) else {
+                    continue;
+                };
+                units
+            } else {
+                match exact_unit_authorities(
+                    repo,
+                    &instance.raw_hash,
+                    &instance.normalize,
+                    &unit_reader,
+                ) {
+                    Ok(units) => units,
+                    Err(error) => {
+                        if crate::verify_objects::purge_explains_missing_retained_instance(
+                            repo,
+                            &instance.raw_hash,
+                            &instance.normalize,
+                        )? {
+                            // Only this exact old owner's removed closure is
+                            // explained. Raw-wide alias taint was already gathered
+                            // from every retained tree and must remain in force.
+                            continue;
+                        }
+                        return Err(error);
                     }
-                    return Err(error);
                 }
             };
             owners.insert(
@@ -379,23 +401,22 @@ pub(super) fn collect_retained_embedding_chunks(
             owners_by_unit.entry(key.clone()).or_default().push(owner);
         }
     }
-    let creations = read_stored_chunks(repo.kio_dir())?;
-    let by_creation = creations
-        .iter()
-        .filter(|creation| {
-            chunking_config_hash.is_none_or(|config| creation.row.chunking_config_hash == config)
-        })
-        .map(|creation| {
-            (
+    let mut by_creation = BTreeMap::new();
+    visit_stored_chunks(repo.kio_dir(), |mut creation| {
+        if chunking_config_hash.is_none_or(|config| creation.row.chunking_config_hash == config) {
+            creation.row.text = String::new();
+            by_creation.insert(
                 (
-                    creation.row.chunk_id.as_str(),
-                    creation.row.chunking_config_hash.as_str(),
+                    creation.row.chunk_id.clone(),
+                    creation.row.chunking_config_hash.clone(),
                 ),
                 creation,
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    let mut publication_cache = PublicationAuthenticationCache::default();
+            );
+        }
+        Ok(())
+    })?;
+    let mut ordinary_cache = PublicationAuthenticationCache::default();
+    let publication_cache = replay.map_or(&mut ordinary_cache, |replay| &mut replay.publication);
     let mut publications = BTreeSet::new();
     for event in read_chunk_publication_events(repo.kio_dir())? {
         if chunking_config_hash.is_some_and(|config| event.chunking_config_hash != config)
@@ -404,7 +425,7 @@ pub(super) fn collect_retained_embedding_chunks(
             continue;
         }
         let creation = by_creation
-            .get(&(event.chunk_id.as_str(), event.chunking_config_hash.as_str()))
+            .get(&(event.chunk_id.clone(), event.chunking_config_hash.clone()))
             .ok_or_else(|| {
                 KioError::schema("embedding publication has no durable chunk/config association")
             })?;
@@ -413,7 +434,7 @@ pub(super) fn collect_retained_embedding_chunks(
             repo.kio_dir(),
             &event,
             creation,
-            &mut publication_cache,
+            publication_cache,
         )? {
             publications.insert((
                 event.chunk_id,
@@ -473,7 +494,7 @@ pub(super) fn collect_retained_embedding_chunks(
             ));
         }
         let creation = by_creation
-            .get(&(chunk_id.as_str(), config.as_str()))
+            .get(&(chunk_id.clone(), config.clone()))
             .ok_or_else(|| KioError::schema("embedding index chunk has no durable creation"))?;
         let expected = chunk_body(&creation.row);
         if !sql_identity_matches(&sql_body, &expected) {
@@ -484,7 +505,8 @@ pub(super) fn collect_retained_embedding_chunks(
         if !verified_chunks.insert(chunk_id.clone()) {
             continue;
         }
-        if store.read_chunk(&chunk_id)? != expected {
+        let chunk = store.read_chunk(&chunk_id)?;
+        if !sql_identity_matches(&chunk, &expected) {
             return Err(KioError::schema(
                 "embedding chunk CAS differs from its durable semantic identity",
             ));
@@ -496,8 +518,10 @@ pub(super) fn collect_retained_embedding_chunks(
             expected.unit_key.clone(),
             expected.unit_content_hash.clone(),
         );
+        let mut row = creation.row.clone();
+        row.text.clone_from(&chunk.text);
         for owner in owners_by_unit.get(&unit_key).into_iter().flatten() {
-            authenticate_chunk_row(&creation.row, &owner.units)?;
+            authenticate_chunk_row(&row, &owner.units)?;
             for path in &owner.paths {
                 if let Some(policy) = current_policy
                     && !policy.allows_path(path).map_err(pipeline_to_kio)?
@@ -507,7 +531,7 @@ pub(super) fn collect_retained_embedding_chunks(
                 let is_head_owner = owner.head_paths.contains(path);
                 candidates.admit(
                     &chunk_id,
-                    &expected,
+                    &chunk,
                     path,
                     bindings.secret_raws.contains(&expected.raw_hash),
                     is_head_owner,
@@ -752,8 +776,20 @@ mod tests {
             (&second.tool_profile_hash, second.r#gen)
         );
         assert_ne!(first.manifest_hash, second.manifest_hash);
-        let first_units = exact_unit_authorities(&repo, &first_row.raw_hash, &first).unwrap();
-        let second_units = exact_unit_authorities(&repo, &second_row.raw_hash, &second).unwrap();
+        let first_units = exact_unit_authorities(
+            &repo,
+            &first_row.raw_hash,
+            &first,
+            &PinnedUnitReader::new(&repo),
+        )
+        .unwrap();
+        let second_units = exact_unit_authorities(
+            &repo,
+            &second_row.raw_hash,
+            &second,
+            &PinnedUnitReader::new(&repo),
+        )
+        .unwrap();
         authenticate_chunk_row(&first_row, &first_units).unwrap();
         authenticate_chunk_row(&second_row, &second_units).unwrap();
         assert!(authenticate_chunk_row(&second_row, &first_units).is_err());
@@ -840,7 +876,13 @@ mod tests {
         let markdown = "escaped \\*markup\\* and cafe\u{301}\u{0}";
         let (normalize, row) = pinned_instance(&repo, "page:1", markdown);
         let canonical = repo.object_store().read_chunk(&row.chunk_id).unwrap();
-        let authority = exact_unit_authorities(&repo, &row.raw_hash, &normalize).unwrap();
+        let authority = exact_unit_authorities(
+            &repo,
+            &row.raw_hash,
+            &normalize,
+            &PinnedUnitReader::new(&repo),
+        )
+        .unwrap();
         authenticate_chunk_row(&row, &authority).unwrap();
         let mut projection = canonical.clone();
         projection.text = "poisoned SQLite search text".to_owned();

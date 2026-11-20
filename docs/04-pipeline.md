@@ -819,7 +819,7 @@ Evidence Pointer の解決に必要なデータは既存の履歴保持規則に
 }
 ```
 
-`output_ref` の Markdownize instance は `normalized:<raw64>.<tool64>.g<gen>` の portable taskref に固定する。`raw64` は `input_hash`、`tool64` は `tool_profile_hash` の lowercase digest-only hex、`gen` は leading zero なしの canonical decimal であり、全体が完全一致しなければ mutation 前に拒否する。absolute / relative pathref を task journal へ書く互換経路はない。`online:<adapter_id>`、`offline:<adapter_id>` は typed placeholder とする。
+`output_ref` の Markdownize instance は `normalized:<raw64>.<tool64>.g<gen>` の portable taskref に固定する。`raw64` は `input_hash`、`tool64` は `tool_profile_hash` の lowercase digest-only hex、`gen` は leading zero なしの canonical decimal であり、全体が完全一致しなければ mutation 前に拒否する。absolute / relative pathref を task journal へ書く互換経路はない。`online:<adapter_id>`、`offline:<adapter_id>` は typed placeholder とする。 ローカル抽出が資源不足のため出力未公開のときは `extraction:local` を使う。保留は原本 hash と scope 内の path に結び付ける。
 Embedding Task は chunk/image/query の typed target と profile/input identity を固定する。
 chunk の `output_ref` は `embedding:<chunk_hash>/<embedding_hash>`、image は元 image hash と
 receipt を固定する typed target、query は本文を可読 payload にせず hash/profile を使う。
@@ -1003,6 +1003,12 @@ context は `stage` と `resource`（memory|work|unit_text|raw_bytes|member_byte
 利用者が大きい tier を選ぶか、容量・memory 等の制約を解消した後、明示的な同一入力の
 index / reindex / repair / retry で再実行できる。同じ制約のまま通常 resume / watch が
 繰り返し再実行しない。保存済み結果と原本を保持し、未完成結果を完成扱いしない。
+ローカル抽出は unit 本体を R1 の一時領域へ順に書き、対応する stage identity と完了記録を耐久化する。
+抽出全体の完了記録を最後に書き、再開時は検証済みの完了 stage を使う。
+prepared・normalized unit・immutable manifest・view は、内容検証後に上書きなしの rename で公開する。
+検証済みの公開済みファイルを再利用する場合も、公開先を同期してから一時領域を回収する。
+normalized の公開は manifest で確定し、HEAD に結び付けた回収記録は回収成功まで保持する。
+prepared CAS・unit 合計・view に固定の保存容量上限を設けない。
 不正入力・record 破損・identity 不一致を `resource_limit` に変換せず、
 `contract_violation` の 1 回再投入・違反解除手順も適用しない。
 

@@ -77,6 +77,7 @@ fn replace_private_bytes(path: &Path, bytes: &[u8]) {
 
 fn index(online: bool) -> CommandRequest {
     CommandRequest::Index(IndexArgs {
+        resource_tier: kio_core::error::ResourceTier::Standard,
         max_file_bytes: None,
         max_total_bytes: None,
         preview: false,
@@ -781,6 +782,7 @@ fn configured_https_ca_failure_does_not_block_no_work_index_or_text() {
     // Ordinary index mode, with no new content or OCR work, rather than the
     // explicit --offline bypass. Declaring a HTTPS role is not a selected send.
     let request = CommandRequest::Index(IndexArgs {
+        resource_tier: kio_core::error::ResourceTier::Standard,
         max_file_bytes: None,
         max_total_bytes: None,
         preview: false,
@@ -1151,6 +1153,7 @@ fn configured_https_embedding_metadata_does_not_acquire_unused_ca() {
     fs::write(trust.join(snapshot), altered.as_bytes()).unwrap();
     let before = tree(&trust);
     let request = CommandRequest::Index(IndexArgs {
+        resource_tier: kio_core::error::ResourceTier::Standard,
         max_file_bytes: None,
         max_total_bytes: None,
         preview: false,
@@ -1184,6 +1187,7 @@ fn configured_https_embedding_metadata_does_not_acquire_unused_ca() {
         interaction: interaction.clone(),
     };
     let request = CommandRequest::Index(IndexArgs {
+        resource_tier: kio_core::error::ResourceTier::Standard,
         max_file_bytes: None,
         max_total_bytes: None,
         preview: false,
@@ -1239,6 +1243,7 @@ fn default_local_index_keeps_baseline_and_native_work_with_unavailable_markdown(
     let output = local_result(
         root.path(),
         CommandRequest::Index(IndexArgs {
+            resource_tier: kio_core::error::ResourceTier::Standard,
             max_file_bytes: None,
             max_total_bytes: None,
             preview: false,
@@ -1535,6 +1540,7 @@ fn st04_index_and_manual_snapshot_honor_invocation_budget_before_raw_publication
     fs::write(root.path().join("note.md"), b"five!").unwrap();
     for command in [
         CommandRequest::Index(IndexArgs {
+            resource_tier: kio_core::error::ResourceTier::Standard,
             max_file_bytes: Some(4),
             max_total_bytes: None,
             preview: false,

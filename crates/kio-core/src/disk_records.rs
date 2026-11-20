@@ -232,6 +232,151 @@ struct RunFile {
     frames: FrameAuthenticator,
     _location: RunDirectory,
 }
+fn new_run(root: &RecordStageRoot) -> Result<(Arc<RunFile>, StageWriter)> {
+    let mut key = [0; 32];
+    getrandom::fill(&mut key)
+        .map_err(|error| KioError::io(error.to_string(), "record stage key"))?;
+    let created = RunDirectory::create(root);
+    if created.is_err() {
+        root.preserve_scratch();
+    }
+    let (location, writer) = created?;
+    let run = Arc::new(RunFile {
+        directory: location.directory.clone(),
+        identity: writer.identity().clone(),
+        frames: FrameAuthenticator::new(&key),
+        _location: location,
+    });
+    Ok((run, writer))
+}
+
+/// A short reference to one serialized value in a private record stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PayloadRef {
+    offset: u64,
+    size: usize,
+    digest: [u8; 32],
+}
+
+/// Pack already size-validated bodies in an existing record stage. Sorters
+/// keep only their references, and the writer keeps one serialized body live.
+pub struct PayloadWriter<T> {
+    writer: StageWriter,
+    run: Arc<RunFile>,
+    size: u64,
+    _value: PhantomData<T>,
+}
+
+impl<T: Serialize> PayloadWriter<T> {
+    pub fn new(root: &RecordStageRoot) -> Result<Self> {
+        if let Err(error) = root.recover() {
+            root.preserve_scratch();
+            return Err(error);
+        }
+        let (run, writer) = new_run(root)?;
+        Ok(Self {
+            run,
+            writer,
+            size: 0,
+            _value: PhantomData,
+        })
+    }
+
+    pub fn push(&mut self, value: &T) -> Result<PayloadRef> {
+        let bytes =
+            serde_json::to_vec(value).map_err(|error| KioError::schema(error.to_string()))?;
+        let reference = PayloadRef {
+            offset: self.size,
+            size: bytes.len(),
+            digest: Sha256::digest(&bytes).into(),
+        };
+        let end = self
+            .size
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(changed_records)?;
+        for part in bytes.chunks(RECORD_BYTES) {
+            self.writer.write_chunk(part)?;
+        }
+        self.size = end;
+        Ok(reference)
+    }
+
+    pub fn finish(self) -> Result<RecordPayloads<T>> {
+        self.writer.sync()?;
+        drop(self.writer);
+        let file = self
+            .run
+            .directory
+            .open_regular_read(Path::new("records"), self.size)?;
+        self.run.identity.verify(&file)?;
+        Ok(RecordPayloads {
+            file: std::sync::Mutex::new(file),
+            run: self.run,
+            size: self.size,
+            _value: PhantomData,
+        })
+    }
+}
+
+/// A sealed payload stage. A referenced body is verified on each read so
+/// consumers can trust the decoded value even after seeking past other bodies.
+pub struct RecordPayloads<T> {
+    file: std::sync::Mutex<File>,
+    run: Arc<RunFile>,
+    size: u64,
+    _value: PhantomData<T>,
+}
+
+impl<T> std::fmt::Debug for RecordPayloads<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecordPayloads")
+            .field("size", &self.size)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T: DeserializeOwned> RecordPayloads<T> {
+    pub fn read(&self, reference: PayloadRef) -> Result<T> {
+        if reference
+            .offset
+            .checked_add(reference.size as u64)
+            .is_none_or(|end| end > self.size)
+        {
+            return Err(changed_records());
+        }
+        let mut file = self.file.lock().map_err(|_| changed_records())?;
+        self.run._location.identity.verify(&self.run.directory)?;
+        self.run.identity.verify(&file)?;
+        if file
+            .metadata()
+            .map_err(|error| crate::store_dir::ioerr(Path::new("records"), error))?
+            .len()
+            != self.size
+        {
+            return Err(changed_records());
+        }
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(reference.size).map_err(|_| {
+            ResourceLimit {
+                resource: Resource::Memory,
+                stage: "record_payload".to_owned(),
+                limit: None,
+                observed: Some(reference.size as u64),
+                resource_tier: None,
+            }
+            .into_error("cannot allocate a private record payload")
+        })?;
+        bytes.resize(reference.size, 0);
+        file.seek(SeekFrom::Start(reference.offset))
+            .and_then(|_| file.read_exact(&mut bytes))
+            .map_err(|error| crate::store_dir::ioerr(Path::new("records"), error))?;
+        if <[u8; 32]>::from(Sha256::digest(&bytes)) != reference.digest {
+            return Err(changed_records());
+        }
+        serde_json::from_slice(&bytes).map_err(|error| KioError::schema(error.to_string()))
+    }
+}
+
 // HMAC-SHA256 states for a per-run key that never goes to disk.
 struct FrameAuthenticator {
     inner: Sha256,
@@ -569,20 +714,7 @@ struct DiskWriter {
 }
 impl DiskWriter {
     fn create(root: &RecordStageRoot) -> Result<Self> {
-        let mut key = [0; 32];
-        getrandom::fill(&mut key)
-            .map_err(|error| KioError::io(error.to_string(), "record stage key"))?;
-        let created = RunDirectory::create(root);
-        if created.is_err() {
-            root.preserve_scratch();
-        }
-        let (location, writer) = created?;
-        let run = Arc::new(RunFile {
-            directory: location.directory.clone(),
-            identity: writer.identity().clone(),
-            frames: FrameAuthenticator::new(&key),
-            _location: location,
-        });
+        let (run, writer) = new_run(root)?;
         Ok(Self {
             writer,
             run,

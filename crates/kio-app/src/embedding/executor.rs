@@ -29,7 +29,6 @@ use crate::embedding::plan::hold_secret_embedding_tasks;
 use crate::embedding::plan::plan_embed_batch;
 use crate::embedding::plan::reconcile_committed_embedding_tasks;
 use crate::embedding::plan::retained_chunks_without_embedding;
-use crate::embedding::plan::retained_history_chunks;
 use crate::embedding::plan::selected_embedding_contexts;
 use crate::embedding::plan::validate_embedding_task_bindings;
 use crate::embedding::transport::{EmbeddingRunFailure, run_embedding_adapter};
@@ -38,6 +37,7 @@ use crate::historical_reindex::RetainedNormalizedInstance;
 use crate::historical_reindex::retained_history_instances;
 use crate::index::chunk_ledger::rotate_index_generation_unconditionally;
 use crate::index::chunk_ledger::sqlite_path;
+use crate::index::rebuild::RebuildAuthorities;
 use crate::index::rebuild::held_secret_embedding_chunk_ids;
 use crate::invocation::Invocation;
 use crate::ledger_access::RETIRED_NON_LIVE;
@@ -129,6 +129,7 @@ pub(crate) fn generate_scope_embeddings(
     ctx: &Invocation<'_>,
     repo: &Repository,
     args: &IndexArgs,
+    replay: Option<&mut RebuildAuthorities>,
 ) -> Result<ExecOutcome> {
     let adapter_settings = ctx.settings;
 
@@ -139,7 +140,7 @@ pub(crate) fn generate_scope_embeddings(
         embedding_online_allowed(adapter_settings, repo, args.offline, args.online, args.yes)?;
     // R11-2: return the enrichment outcome (was discarded) so `run_index` can disclose
     // it and raise the exit code on auth/budget-pause.
-    run_embedding_enrichment(ctx, repo, online, false, false)
+    run_embedding_enrichment(ctx, repo, online, false, false, replay)
 }
 
 /// Core enrichment pass shared by `kio index` (inline) and `kio batch
@@ -152,6 +153,7 @@ pub(crate) fn run_embedding_enrichment(
     online: bool,
     override_budget: bool,
     allow_auth_revive: bool,
+    replay: Option<&mut RebuildAuthorities>,
 ) -> Result<ExecOutcome> {
     let adapter_settings = ctx.settings;
 
@@ -167,7 +169,7 @@ pub(crate) fn run_embedding_enrichment(
         override_budget,
         allow_auth_revive,
         None,
-        None,
+        replay,
     )
 }
 
@@ -194,8 +196,8 @@ pub(crate) fn run_historical_embedding_enrichment(
         online,
         false,
         false,
-        Some(selected_instances),
-        Some(selected_tree_config_hash),
+        Some((selected_instances, selected_tree_config_hash)),
+        None,
     )
 }
 
@@ -205,9 +207,10 @@ fn run_embedding_enrichment_for_instances(
     online: bool,
     override_budget: bool,
     allow_auth_revive: bool,
-    selected_instances: Option<&[RetainedNormalizedInstance]>,
-    selected_tree_config_hash: Option<&str>,
+    selected: Option<(&[RetainedNormalizedInstance], &str)>,
+    mut replay: Option<&mut RebuildAuthorities>,
 ) -> Result<ExecOutcome> {
+    let (selected_instances, selected_tree_config_hash) = selected.unzip();
     let ctx = &invocation;
     let adapter_settings = invocation.settings;
 
@@ -255,7 +258,7 @@ fn run_embedding_enrichment_for_instances(
         Some(hash) => hash.to_owned(),
         None => snapshot_chunking_config_hash(repo, &head)?,
     };
-    let retained_instances_owned;
+    let mut retained_instances_owned;
     let retained_instances = if let Some(selected) = selected_instances {
         selected
     } else {
@@ -264,15 +267,19 @@ fn run_embedding_enrichment_for_instances(
         // cache relation here before its live-chunk JOIN.
         ensure_snapshot_tree_entries(repo, &conn, &head)?;
         retained_instances_owned = retained_history_instances(repo, &head)?;
+        if let Some(replay) = &replay {
+            retained_instances_owned.retain(|instance| !replay.excludes(instance));
+        }
         &retained_instances_owned
     };
     let current_policy = current_embedding_policy(repo)?;
-    let retained_chunks = retained_history_chunks(
-        &conn,
+    let retained_chunks = embedding_owners::collect_retained_embedding_chunks_with_replay(
         repo,
+        &conn,
         retained_instances,
-        &chunking_config_hash,
+        Some(&chunking_config_hash),
         Some(&current_policy),
+        replay.as_deref_mut(),
     )?;
     let projection_instances_owned;
     let projection_instances = if selected_instances.is_some() {
@@ -281,12 +288,13 @@ fn run_embedding_enrichment_for_instances(
     } else {
         retained_instances
     };
-    let projection_chunks = embedding_owners::collect_retained_embedding_chunks(
+    let projection_chunks = embedding_owners::collect_retained_embedding_chunks_with_replay(
         repo,
         &conn,
         projection_instances,
         None,
         Some(&current_policy),
+        replay,
     )?;
     let selected_contexts = selected_embedding_contexts(&projection_chunks, &current_policy)?;
     let projection_chunks = bind_embedding_work(projection_chunks, &profile)?;

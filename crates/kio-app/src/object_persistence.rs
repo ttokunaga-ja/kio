@@ -1,26 +1,20 @@
-use crate::index::rebuild::store_corrupt_error;
 use crate::ledger_access::ledger_snapshot_to_kio;
-use crate::open_view::cas_object_path;
-use kio_adapter::catalog::convert_office_to_pdf_with_control;
-use kio_adapter::office_convert::is_office_media;
 use kio_core::ExitCode;
 use kio_core::KioError;
 use kio_core::Result;
 use kio_core::cas::ContentObjectKind;
-use kio_core::cas::canonical_json_bytes;
-use kio_core::cas::is_hash;
-use kio_core::control::ControlHandle;
 use kio_core::scope::Repository;
 use kio_core::scope::new_ulid;
 use kio_pipeline::markdownize::NormalizedInstanceManifest;
-use kio_pipeline::markdownize::load_validated_normalized_instance_with_control;
-use kio_pipeline::markdownize::persist_normalized_instance_with_control;
-use kio_pipeline::prepare::PreparedUnit;
-use kio_pipeline::prepare::hash_bytes;
-use kio_pipeline::prepare::pdf_text_pages_bounded;
+use kio_pipeline::markdownize::{
+    NormalizedInstanceIdentity, persist_resumable_normalized_units,
+    read_normalized_instance_manifest, read_validated_normalized_unit,
+    visit_validated_normalized_units,
+};
 use kio_pipeline::task::normalized_task_output_ref;
 use serde_json::json;
-use std::fs;
+use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 /// Publish mutable Kio-owned metadata through its retained private directory.
@@ -49,52 +43,68 @@ pub(crate) fn atomic_overwrite_file(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 pub(crate) fn copy_normalized_instance_gen(
-    kio_dir: &Path,
+    repo: &Repository,
     raw_hash: &str,
-    tool_profile_hash: &str,
-    old_gen: u64,
+    normalize: &kio_core::dag::NormalizeRef,
     new_gen: u64,
-    control: &ControlHandle,
-) -> Result<()> {
+) -> Result<String> {
+    let source = crate::historical_reindex::pinned_manifest(repo, raw_hash, normalize)?;
+    let directory = bound_extraction_store(repo)?;
     let old_dir = kio_pipeline::markdownize::normalized_instance_dir(
-        kio_dir,
+        repo.kio_dir(),
         raw_hash,
-        tool_profile_hash,
-        old_gen,
+        &normalize.tool_profile_hash,
+        normalize.r#gen,
     );
-    if let Ok(entries) = fs::read_dir(&old_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            if name.to_str().is_some_and(is_orphan_temp_name)
-                && entry
-                    .file_type()
-                    .map(|file_type| file_type.is_file())
-                    .unwrap_or(false)
-            {
-                let _ = fs::remove_file(entry.path());
+    if let Ok(relative) = old_dir.strip_prefix(repo.kio_dir())
+        && let Ok(handle) = directory.open_directory(relative)
+    {
+        let old = kio_core::store_dir::StoreDirectory::from_retained_with_control(
+            handle,
+            old_dir,
+            repo.control().clone(),
+        )?;
+        if let Ok(entries) = old.entries(Path::new("")) {
+            for entry in entries {
+                if entry.is_regular_file && entry.name.to_str().is_some_and(is_orphan_temp_name) {
+                    old.remove_file(Path::new(&entry.name))?;
+                }
             }
         }
     }
-    let mut instance = load_validated_normalized_instance_with_control(
-        kio_dir,
-        raw_hash,
-        tool_profile_hash,
-        old_gen,
-        control,
+    let entries = source
+        .units
+        .iter()
+        .map(|entry| (entry.unit_key.as_str(), entry))
+        .collect::<BTreeMap<_, _>>();
+    let identity = NormalizedInstanceIdentity {
+        raw_hash: source.raw_hash.clone(),
+        tool_profile_hash: source.tool_profile_hash.clone(),
+        r#gen: normalize.r#gen,
+    };
+    let mut target = source.clone();
+    target.parent_gen = Some(normalize.r#gen);
+    target.r#gen = new_gen;
+    target.run_id = format!("run_{}", new_ulid(repo.kio_dir()));
+    target.generated_at = repo.control().now_utc_seconds();
+    let store = repo.object_store();
+    let stamped = persist_resumable_normalized_units(
+        &directory,
+        &target,
+        &normalize.manifest_hash,
+        |draft, entry| {
+            let mut unit = read_validated_normalized_unit(
+                &store,
+                &identity,
+                entries[entry.unit_key.as_str()],
+            )?;
+            unit.r#gen = new_gen;
+            unit.generated_at.clone_from(&draft.generated_at);
+            Ok(Cow::Owned(unit))
+        },
     )
     .map_err(pipeline_to_kio)?;
-    let generated_at = control.now_utc_seconds();
-    instance.manifest.parent_gen = Some(old_gen);
-    instance.manifest.r#gen = new_gen;
-    instance.manifest.run_id = format!("run_{}", new_ulid(kio_dir));
-    instance.manifest.generated_at = generated_at.clone();
-    for unit in &mut instance.units {
-        unit.r#gen = new_gen;
-        unit.generated_at.clone_from(&generated_at);
-    }
-    persist_normalized_instance_with_control(kio_dir, &instance.manifest, &instance.units, control)
-        .map(|_| ())
-        .map_err(pipeline_to_kio)
+    published_manifest_hash(repo, &stamped)
 }
 
 /// Whether `name` matches the normalized-unit file naming convention written by
@@ -136,112 +146,19 @@ pub(crate) fn search_to_kio(error: kio_search::SearchError) -> KioError {
     }
 }
 
-/// Publish derived bytes through the shared private CAS boundary, retaining
-/// the declared content identity before any storage mutation.
-pub(crate) fn write_canonical_cas_object_or_reuse(
-    kio_dir: &Path,
-    kind: ContentObjectKind,
-    hash: &str,
-    bytes: &[u8],
-) -> Result<()> {
-    let path = kio_core::cas::fanout_path(kio_dir.join("objects").join(kind.directory()), hash)?;
-    if hash_bytes(bytes) != hash {
-        return Err(store_corrupt_error(
-            &path,
-            "content-addressed object bytes do not match the declared hash",
-        ));
-    }
-    kio_core::cas::ObjectStore::new(kio_dir).write_content_object(kind, bytes)?;
-    Ok(())
-}
-
-pub(crate) fn write_prepared_objects(
+pub(crate) fn bound_extraction_store(
     repo: &Repository,
-    prepared_units: &[PreparedUnit],
-    prepared_hashes: &[String],
-    bytes: &[u8],
-    media_type: &str,
-) -> Result<()> {
-    if prepared_units.len() != prepared_hashes.len() {
-        return Err(KioError::schema(
-            "prepared unit and object hash cardinalities differ",
-        ));
-    }
-    // 07 §5.1: a DOCX/PPTX unit is a page/slide of the CONVERTED PDF, not the
-    // original file -- its declared `prepared_hash` (kio-pipeline's
-    // `prepare_units_from_bytes`, which converts+extracts the same way) is the
-    // per-page TEXT of that converted PDF, exactly like the `application/pdf`
-    // branch below but sourced from a freshly reconverted PDF (deterministic
-    // renderer output, 07 §5.1) instead of `bytes` itself. The `!is_empty()`
-    // guard skips conversion entirely when Prepare already reported no units
-    // (no converter resolved, or a non-Office/media caller) -- nothing to write
-    // and no need to invoke (and possibly fail on) a converter for a no-op.
-    // The `!prepared_units.is_empty()` guard (both arms) skips the page
-    // recompute when Prepare already reported no units: there is nothing to
-    // write, and re-running the extractor here can DISAGREE with Prepare's
-    // verdict — a scanned/raster PDF whose compressed bytes contain a chance
-    // "BT" passes the text-layer gate and lossy-scans to one garbage page,
-    // which Prepare's R20-4 garbage gate then rejects (0 units). Comparing
-    // that recomputed 1 against 0 declared hashes failed the whole `kio
-    // index` with KIO-E-CONFIG-SCHEMA-001 (found on real img2pdf rasters,
-    // 2026-07-23 fixture registration). The office arm always had this
-    // guard; the PDF arm was the asymmetry.
-    //
-    // 07 §5.1 (2026-07-25): XLSX joins the same shape with a third source. Its
-    // unit is a worksheet and its declared `prepared_hash` is that sheet's
-    // extracted Markdown, so the bytes to store are re-derived by re-running
-    // the extractor — deterministic and local, no converter involved.
-    let unit_texts = if media_type == "application/pdf" && !prepared_units.is_empty() {
-        Some(pdf_text_pages_bounded(bytes).map_err(pipeline_to_kio)?)
-    } else if is_office_media(media_type) && !prepared_units.is_empty() {
-        let converted = convert_office_to_pdf_with_control(bytes, media_type, repo.control())
-            .map_err(adapter_to_kio)?;
-        Some(pdf_text_pages_bounded(&converted).map_err(pipeline_to_kio)?)
-    } else if kio_adapter::xlsx_extract::is_xlsx_media(media_type) && !prepared_units.is_empty() {
-        Some(
-            kio_adapter::xlsx_extract::extract_xlsx(bytes)
-                .map_err(adapter_to_kio)?
-                .sheets
-                .into_iter()
-                .map(|sheet| sheet.markdown)
-                .collect(),
-        )
-    } else {
-        None
-    };
-    if unit_texts
-        .as_ref()
-        .is_some_and(|texts| texts.len() != prepared_hashes.len())
-    {
-        return Err(KioError::schema(
-            "prepared unit text and object hash cardinalities differ",
-        ));
-    }
-    for (index, prepared_hash) in prepared_hashes.iter().enumerate() {
-        if !is_hash(prepared_hash) {
-            return Err(KioError::schema("prepared object hash is invalid"));
-        }
-        let path = cas_object_path(repo.kio_dir(), "prepared", prepared_hash)?;
-        let object_bytes = unit_texts
-            .as_ref()
-            .and_then(|texts| texts.get(index))
-            .map_or(bytes, |text| text.as_bytes());
-        if hash_bytes(object_bytes) != *prepared_hash
-            || prepared_units[index].prepared_hash != *prepared_hash
-        {
-            return Err(store_corrupt_error(
-                &path,
-                "prepared object bytes do not match the declared hash",
-            ));
-        }
-        write_canonical_cas_object_or_reuse(
-            repo.kio_dir(),
-            ContentObjectKind::Prepared,
-            prepared_hash,
-            object_bytes,
-        )?;
-    }
-    Ok(())
+) -> Result<kio_core::store_dir::StoreDirectory> {
+    let handle = repo.bound_kio_handle().ok_or_else(|| {
+        KioError::schema("managed extraction is missing its retained store handle")
+    })?;
+    kio_core::store_dir::StoreDirectory::from_retained_with_control(
+        handle.try_clone().map_err(|error| {
+            KioError::io(error.to_string(), repo.kio_dir().display().to_string())
+        })?,
+        repo.kio_dir().to_owned(),
+        repo.control().clone(),
+    )
 }
 
 pub(crate) fn normalized_output_ref(
@@ -253,51 +170,45 @@ pub(crate) fn normalized_output_ref(
     normalized_task_output_ref(raw_hash, tool_profile_hash, r#gen)
 }
 
-/// PB04 (step4b-contract-tests-p2b.md §B; 10 §7.5.1 L493-497; 03 §8.1):
-/// compute this normalized instance's *current* manifest.json canonical JCS
-/// content hash and durably CAS-write it as a `ContentObjectKind::Manifest`
-/// object (`objects/manifests/` — 03 §2.1), for `NormalizeRef::manifest_hash`
-/// (tree schema v2). Reuses the same provenance-rebinding loader
-/// `verify_objects`/purge's orphan scan already use rather than reading
-/// `manifest.json` bytes ad hoc, so the hashed content is bound to the
-/// requested `(raw_hash, tool_profile_hash, gen)` identity. `write_content_object`
-/// is idempotent (verifies existing bytes rather than re-writing), matching
-/// same-gen finalize's repeated manifest updates (03 §8, "unit の failed →
-/// done 遷移で変わるため" — each transition yields a new manifest_hash).
-///
-/// This is a strict provenance boundary: callers must propagate any failure.
-/// Every current-format `NormalizeRef` carries the returned manifest hash;
-/// there is no missing-hash compatibility shape.
+/// Resolve the current manifest through authenticated normalized storage.
 pub(crate) fn compute_manifest_hash(
     repo: &Repository,
     raw_hash: &str,
     tool_profile_hash: &str,
     r#gen: u64,
 ) -> Result<String> {
-    let instance = load_validated_normalized_instance_with_control(
-        repo.kio_dir(),
-        raw_hash,
-        tool_profile_hash,
-        r#gen,
-        repo.control(),
-    )
-    .map_err(pipeline_to_kio)?;
-    hash_and_write_manifest_object(repo, &instance.manifest)
+    let (manifest, _) =
+        read_normalized_instance_manifest(repo.kio_dir(), raw_hash, tool_profile_hash, r#gen)
+            .map_err(pipeline_to_kio)?;
+    visit_validated_normalized_units(&repo.object_store(), &manifest, |_| Ok(()))
+        .map_err(pipeline_to_kio)?;
+    published_manifest_hash(repo, &manifest)
 }
 
-/// Low-level half of [`compute_manifest_hash`]: canonicalize an
-/// already-in-memory `NormalizedInstanceManifest` and CAS-write it. Callers
-/// that just finished `persist_normalized_instance` (the manifest is already
-/// in hand, no need to re-read+re-validate it from disk) use this directly.
-pub(crate) fn hash_and_write_manifest_object(
+/// Verify and sync the immutable manifest already published by normalization.
+pub(crate) fn published_manifest_hash(
     repo: &Repository,
     manifest: &NormalizedInstanceManifest,
 ) -> Result<String> {
-    let value =
-        serde_json::to_value(manifest).map_err(|error| KioError::schema(error.to_string()))?;
-    let bytes = canonical_json_bytes(&value)?;
-    repo.object_store()
-        .write_content_object(ContentObjectKind::Manifest, &bytes)
+    let directory = bound_extraction_store(repo)?;
+    kio_pipeline::markdownize::adopt_normalized_instance(
+        &directory,
+        &manifest.raw_hash,
+        &manifest.tool_profile_hash,
+        manifest.r#gen,
+    )
+    .map_err(pipeline_to_kio)?;
+    let hash =
+        kio_pipeline::markdownize::normalized_manifest_hash(manifest).map_err(pipeline_to_kio)?;
+    if !repo.object_store().publish_content_stage(
+        ContentObjectKind::Manifest,
+        &hash,
+        &directory,
+        None,
+    )? {
+        return Err(KioError::not_found(&hash));
+    }
+    Ok(hash)
 }
 
 pub(crate) fn adapter_to_kio(error: kio_adapter::AdapterError) -> KioError {

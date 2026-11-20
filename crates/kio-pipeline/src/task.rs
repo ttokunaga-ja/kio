@@ -309,8 +309,12 @@ impl EmbeddingWorkKey {
     }
 }
 
+/// A local extraction waiting for resources has no published output yet.
+pub const EXTRACTION_HOLD_OUTPUT_REF: &str = "extraction:local";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskOutputRef {
+    ExtractionHold,
     Online {
         adapter_id: String,
     },
@@ -403,6 +407,16 @@ pub struct TaskStore {
     control: kio_core::control::ControlHandle,
 }
 
+pub struct SortedTasks {
+    bodies: kio_core::disk_records::RecordPayloads<TaskDescriptor>,
+    ordered: kio_core::disk_records::DiskRecords<kio_core::disk_records::PayloadRef>,
+}
+impl SortedTasks {
+    pub fn iter(&self) -> impl Iterator<Item = kio_core::Result<TaskDescriptor>> + '_ {
+        self.ordered.iter().map(|record| self.bodies.read(record?))
+    }
+}
+
 impl TaskStore {
     #[must_use]
     pub fn new(kio_dir: impl AsRef<Path>) -> Self {
@@ -491,13 +505,82 @@ impl TaskStore {
         &self,
         retained: &kio_core::store_dir::StoreDirectory,
     ) -> Result<Vec<TaskDescriptor>> {
+        let mut by_id = BTreeMap::new();
+        self.visit_bound(retained, |descriptor| {
+            by_id.insert(descriptor.task_id.clone(), descriptor);
+            Ok(())
+        })?;
+        Ok(by_id.into_values().collect())
+    }
+
+    /// Materialize the last frame for each task in ID order using store-local runs.
+    pub fn sorted_bound(
+        &self,
+        retained: &kio_core::store_dir::StoreDirectory,
+        stages: &kio_core::disk_records::RecordStageRoot,
+    ) -> Result<SortedTasks> {
+        use kio_core::disk_records::{PayloadRef, PayloadWriter, RecordSorter, RecordWriter};
+        let error = |error| crate::journal::error(&self.path, error);
+        let mut bodies = PayloadWriter::new(stages).map_err(error)?;
+        let mut sorter = RecordSorter::<(String, u64, PayloadRef)>::new(stages, |a, b| {
+            a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1))
+        });
+        let mut sequence = 0u64;
+        self.visit_bound(retained, |descriptor| {
+            let body = bodies.push(&descriptor).map_err(error)?;
+            sorter
+                .push((descriptor.task_id, sequence, body))
+                .map_err(error)?;
+            sequence += 1;
+            Ok(())
+        })?;
+        let mut output = RecordWriter::new(stages).map_err(error)?;
+        let mut current = None;
+        for row in sorter.finish().map_err(error)?.iter() {
+            let row = row.map_err(error)?;
+            if let Some((id, _, body)) = current.replace(row)
+                && current.as_ref().is_some_and(|next| next.0 != id)
+            {
+                output.push(&body).map_err(error)?;
+            }
+        }
+        if let Some((_, _, body)) = current {
+            output.push(&body).map_err(error)?;
+        }
+        Ok(SortedTasks {
+            bodies: bodies.finish().map_err(error)?,
+            ordered: output.finish().map_err(error)?,
+        })
+    }
+
+    pub fn replace_sorted_bound(
+        &self,
+        retained: &kio_core::store_dir::StoreDirectory,
+        descriptors: impl Iterator<Item = kio_core::Result<TaskDescriptor>>,
+    ) -> Result<()> {
+        crate::journal::replace(
+            retained,
+            Path::new("tasks.jsonl"),
+            descriptors.map(|descriptor| {
+                let descriptor =
+                    descriptor.map_err(|error| crate::journal::error(&self.path, error))?;
+                self.framed_record(&descriptor)
+            }),
+        )
+    }
+
+    fn visit_bound(
+        &self,
+        retained: &kio_core::store_dir::StoreDirectory,
+        mut visit: impl FnMut(TaskDescriptor) -> Result<()>,
+    ) -> Result<()> {
         kio_core::private_fs::verify_private_directory_handle(retained)
             .map_err(|error| self.private_error(error))?;
         let leaf = Path::new("tasks.jsonl");
         if !retained.contains_entry(leaf).map_err(|error| {
             PipelineError::corrupt(self.path.display().to_string(), error.to_string())
         })? {
-            return Ok(Vec::new());
+            return Ok(());
         }
         let file = retained
             .open_regular_read(leaf, u64::MAX)
@@ -506,17 +589,6 @@ impl TaskStore {
             })?;
         kio_core::private_fs::verify_private_regular_file_handle(&file)
             .map_err(|error| self.private_error(error))?;
-        self.read_descriptors(file, |descriptor| {
-            validate_task_descriptor(self.kio_dir(), descriptor)
-        })
-    }
-
-    fn read_descriptors(
-        &self,
-        file: fs::File,
-        mut validate: impl FnMut(&TaskDescriptor) -> Result<()>,
-    ) -> Result<Vec<TaskDescriptor>> {
-        let mut by_id = BTreeMap::new();
         let mut reader = std::io::BufReader::new(file);
         let mut line = Vec::new();
         loop {
@@ -549,10 +621,10 @@ impl TaskStore {
             let descriptor: TaskDescriptor = serde_json::from_slice(&line).map_err(|err| {
                 PipelineError::corrupt(self.path.display().to_string(), err.to_string())
             })?;
-            validate(&descriptor)?;
-            by_id.insert(descriptor.task_id.clone(), descriptor);
+            validate_task_descriptor(self.kio_dir(), &descriptor)?;
+            visit(descriptor)?;
         }
-        Ok(by_id.into_values().collect())
+        Ok(())
     }
 
     pub fn replace_all(&self, descriptors: &[TaskDescriptor]) -> Result<()> {
@@ -675,6 +747,19 @@ pub fn validate_task_output_ref(
 ) -> Result<TaskOutputRef> {
     if !kio_core::cas::is_hash(&descriptor.input_hash) {
         return Err(invalid_output_ref(kio_dir.as_ref(), &descriptor.output_ref));
+    }
+    if descriptor.output_ref == EXTRACTION_HOLD_OUTPUT_REF {
+        if descriptor.task_type != TaskType::Markdownize
+            || !matches!(
+                descriptor.status,
+                TaskStatus::Paused | TaskStatus::Failed | TaskStatus::Skipped
+            )
+            || descriptor.bbox_annotation_enabled.is_some()
+            || descriptor.reservation_id.is_some()
+        {
+            return Err(invalid_output_ref(kio_dir.as_ref(), &descriptor.output_ref));
+        }
+        return Ok(TaskOutputRef::ExtractionHold);
     }
     if let Some(adapter_id) = descriptor.output_ref.strip_prefix("online:") {
         if descriptor.task_type != TaskType::Markdownize || !is_safe_logical_id(adapter_id) {
@@ -1983,6 +2068,18 @@ mod tests {
         let append_dir = crate::test_support::PrivateTempDir::new();
         let append_store = TaskStore::new(append_dir.path());
         append_store.append(&task).unwrap();
+        assert_eq!(append_store.all().unwrap(), vec![task.clone()]);
+        let root = append_store.private_root().unwrap();
+        let stages = kio_core::disk_records::RecordStageRoot::temporary().unwrap();
+        let sorted = append_store.sorted_bound(&root, &stages).unwrap();
+        assert_eq!(
+            sorted.iter().collect::<kio_core::Result<Vec<_>>>().unwrap(),
+            vec![task.clone()]
+        );
+
+        append_store
+            .replace_sorted_bound(&root, sorted.iter())
+            .unwrap();
         assert_eq!(append_store.all().unwrap(), vec![task.clone()]);
 
         let replace_dir = crate::test_support::PrivateTempDir::new();

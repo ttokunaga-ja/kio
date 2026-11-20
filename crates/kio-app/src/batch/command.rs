@@ -340,6 +340,30 @@ pub(crate) fn run_batch(ctx: &Invocation<'_>, args: BatchArgs) -> Result<Command
             // execute_pending_markdownize_tasks selects it. On full success it
             // becomes Done, ending the silent data gap index_status showed as
             // fully enriched.
+            let (local_resumed, local_published) = crate::index::pipeline::retry_local_extractions(
+                ctx,
+                &repo,
+                &store,
+                kio_core::error::ResourceTier::Standard,
+            )?;
+            if local_published || !crate::index::rebuild::source_index_matches_head(&repo)? {
+                ctx.control.checkpoint(
+                    kio_core::durability::DurabilityPoint::ExtractionBeforeIndexRebuild,
+                )?;
+                crate::index::rebuild::rebuild_step3_index(ctx, &repo)?;
+                crate::index::chunk_ledger::recover_index_generation(
+                    repo.kio_dir(),
+                    repo.control(),
+                )?;
+                crate::scope_access::register_scope(ctx, &repo, true);
+            } else if repo.head_commit_hash()?.is_some()
+                && crate::search::projection::capture_ready_replica_snapshot(&repo).is_none()
+            {
+                // SQLite can survive the swap even if the writer stopped
+                // before publishing its replica projection.
+                crate::search::projection::write_through_projection_or_log_for_repo(ctx, &repo);
+                crate::scope_access::register_scope(ctx, &repo, true);
+            }
             let resources_reenqueued =
                 reenqueue_resource_limited_tasks(&repo, &store, recheck_resource_limit)?;
             let incomplete_reenqueued = if markdown_ready {
@@ -407,7 +431,10 @@ pub(crate) fn run_batch(ctx: &Invocation<'_>, args: BatchArgs) -> Result<Command
                 body: ResponseBody::Batch(BatchResponse::Retry(BatchRetryResponse {
                     status: "retry scheduled".to_owned(),
                     counts: BatchCounts {
-                        tasks_updated: changed + incomplete_reenqueued + resources_reenqueued,
+                        tasks_updated: changed
+                            + incomplete_reenqueued
+                            + resources_reenqueued
+                            + local_resumed,
                         tasks_executed: outcome.executed,
                         tasks_attempted: outcome.attempted(),
                         tasks_failed: outcome.failed,
@@ -1659,6 +1686,9 @@ pub(crate) fn reenqueue_resource_limited_tasks(
         }
         // Validate identity before interpreting any failure as a resource hold.
         let identity = validate_task_output_ref(store.kio_dir(), &task).map_err(pipeline_to_kio)?;
+        if matches!(identity, TaskOutputRef::ExtractionHold) {
+            continue;
+        }
         if !resource_task_input_matches(repo, &task)? {
             continue;
         }
@@ -1776,8 +1806,7 @@ pub(crate) fn reenqueue_resource_limited_tasks(
 /// embedding owns authenticated retained chunk text and its contextual target.
 fn resource_task_input_matches(repo: &Repository, task: &TaskDescriptor) -> Result<bool> {
     if task.task_type == TaskType::Markdownize {
-        let max = crate::settings::effective_max_input_bytes(repo)?;
-        let input = crate::index::command::read_repository_scan_input(repo, &task.input_path, max)
+        let input = crate::index::command::hash_repository_scan_input(repo, &task.input_path)
             .map_err(pipeline_to_kio)?;
         return Ok(input.raw_hash == task.input_hash);
     }

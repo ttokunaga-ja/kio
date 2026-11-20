@@ -4,7 +4,7 @@
 //! typed normalized instances and verifies their immutable unit identities before
 //! binding them into HEAD. Complete tasks and resource-held partial tasks publish
 //! only verified done units.
-use crate::index::command::read_repository_scan_input;
+use crate::index::command::hash_repository_scan_input;
 use crate::index::command::repository_scan_policy_allows_file;
 use crate::index::rebuild::rebuild_step3_index;
 use crate::object_persistence::adapter_to_kio;
@@ -13,7 +13,6 @@ use crate::scope_access::ensure_raw_ingest_allowed;
 use crate::scope_access::is_store_not_found;
 use crate::search::projection::mark_replica_rebuilding_or_log;
 use crate::settings::bbox_annotation_enabled;
-use crate::settings::effective_max_input_bytes;
 use kio_adapter::catalog::active_local_ocr_execution_with_control;
 use kio_adapter::catalog::resolve_standard_online_markdownize_profile_with_bbox_with_control;
 use kio_adapter::catalog::standard_online_markdownize_profile;
@@ -394,7 +393,6 @@ fn plan_online_markdownize_promotion(
     let mut tasks = tasks;
     tasks.retain(is_online_promotion);
     tasks.sort_unstable_by(|a, b| a.input_path.cmp(&b.input_path));
-    let max_input_bytes = effective_max_input_bytes(repo)?;
     let mut policies_to_resolve = BTreeSet::new();
     let mut found = false;
     // Establish live HEAD and working identities before opening task output.
@@ -408,8 +406,7 @@ fn plan_online_markdownize_promotion(
         {
             continue;
         }
-        let Ok(verified) = read_repository_scan_input(repo, &task.input_path, max_input_bytes)
-        else {
+        let Ok(verified) = hash_repository_scan_input(repo, &task.input_path) else {
             continue;
         };
         if verified.raw_hash != task.input_hash {
@@ -539,7 +536,6 @@ fn plan_local_markdownize_promotion(
     };
     let head = repo.read_commit(&head_hash)?;
     let tree = repo.read_tree(&head.tree)?;
-    let max_input_bytes = effective_max_input_bytes(repo)?;
     let mut tasks = TaskStore::new_with_control(repo.kio_dir(), repo.control().clone())
         .all()
         .map_err(pipeline_to_kio)?;
@@ -573,8 +569,7 @@ fn plan_local_markdownize_promotion(
         {
             continue;
         }
-        let Ok(verified) = read_repository_scan_input(repo, &task.input_path, max_input_bytes)
-        else {
+        let Ok(verified) = hash_repository_scan_input(repo, &task.input_path) else {
             continue;
         };
         if verified.raw_hash != task.input_hash {
@@ -747,21 +742,16 @@ fn has_accepted_local_pipeline_ref(
     refs: impl IntoIterator<Item = kio_core::Result<(String, PendingNormalizeRef)>>,
     profile: &AdapterProfile,
 ) -> kio_core::Result<bool> {
-    let mut max_input_bytes = None;
     let mut accepted = false;
     for row in refs {
         let (path, pending) = row?;
         if pending.normalize.tool_profile_hash != profile.tool_profile_hash {
             continue;
         }
-        let max_input_bytes = match max_input_bytes {
-            Some(limit) => limit,
-            None => *max_input_bytes.insert(effective_max_input_bytes(repo)?),
-        };
         if !repository_scan_policy_allows_file(repo, &path).map_err(pipeline_to_kio)? {
             continue;
         }
-        let Ok(current) = read_repository_scan_input(repo, &path, max_input_bytes) else {
+        let Ok(current) = hash_repository_scan_input(repo, &path) else {
             continue;
         };
         if current.raw_hash != pending.expected_raw_hash {

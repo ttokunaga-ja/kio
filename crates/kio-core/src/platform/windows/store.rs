@@ -494,6 +494,22 @@ pub(crate) fn read_optional(
     max: u64,
     label: &Path,
 ) -> Result<Option<Vec<u8>>> {
+    read_optional_with(root, relative, max, label, |reader| {
+        let mut bytes = Vec::new();
+        reader
+            .read_to_end(&mut bytes)
+            .map_err(|error| ioerr(&full(label, relative), error))?;
+        Ok(bytes)
+    })
+}
+
+pub(crate) fn read_optional_with<T>(
+    root: &File,
+    relative: &Path,
+    max: u64,
+    label: &Path,
+    read: impl FnOnce(&mut dyn Read) -> Result<T>,
+) -> Result<Option<T>> {
     let Some((p, n)) = parent_optional(root, relative, label)? else {
         return Ok(None);
     };
@@ -508,24 +524,23 @@ pub(crate) fn read_optional(
     if before.len() > max {
         return Err(err(&path, "store file exceeds byte limit"));
     }
-    let mut bytes = Vec::new();
-    Read::by_ref(&mut f)
-        .take(max.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|e| ioerr(&path, e))?;
+    let limit = max.saturating_add(1);
+    let mut reader = Read::by_ref(&mut f).take(limit);
+    let value = read(&mut reader)?;
+    let read_bytes = limit - reader.limit();
     let after = regular(&f, &path)?;
     let after_identity = crate::platform::regular_file_handle_identity(&f)
         .ok_or_else(|| err(&path, "store leaf changed type while being read"))?;
     let after_change = change_time(&f, &path)?;
-    if bytes.len() as u64 > max
+    if read_bytes > max
         || before_identity != after_identity
         || before.len() != after.len()
         || before_change != after_change
-        || after.len() != bytes.len() as u64
+        || after.len() != read_bytes
     {
         return Err(err(&path, "store file changed while it was read"));
     }
-    Ok(Some(bytes))
+    Ok(Some(value))
 }
 pub(crate) fn create_private_file_raw(root: &File, leaf: &Path, label: &Path) -> Result<File> {
     let leaf = direct_leaf(leaf, label)?;
@@ -892,6 +907,7 @@ pub(crate) fn rename_directory_between_create_only(
     destination_leaf: &Path,
     source_label: &Path,
     destination_label: &Path,
+    before_sync: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
     let source = direct_leaf(source_leaf, source_label)?;
     let destination = direct_leaf(destination_leaf, destination_label)?;
@@ -914,6 +930,7 @@ pub(crate) fn rename_directory_between_create_only(
             "published directory identity changed",
         ));
     }
+    before_sync()?;
     sync_directory(source_parent, source_label)?;
     sync_directory(destination_parent, destination_label)
 }

@@ -1070,6 +1070,55 @@ impl ObjectStore {
         result.map(|()| hash)
     }
 
+    /// Move a synced extraction stage into the CAS without a two-link window.
+    /// After a crash following rename, the verified destination is sufficient.
+    pub fn publish_content_stage(
+        &self,
+        kind: ContentObjectKind,
+        hash: &str,
+        workspace: &crate::store_dir::StoreDirectory,
+        source: Option<(&Path, &crate::store_dir::StageIdentity)>,
+    ) -> Result<bool> {
+        if !matches!(
+            kind,
+            ContentObjectKind::Prepared
+                | ContentObjectKind::NormalizedUnit
+                | ContentObjectKind::Manifest
+        ) {
+            return Err(KioError::invalid_usage(
+                "unsupported extraction object kind",
+            ));
+        }
+        let bound = self.bound.as_ref().ok_or_else(|| {
+            KioError::invalid_usage("extraction stage publication requires a bound CAS")
+        })?;
+        let (parent, name) = bound.content_fanout(kind, hash, true)?;
+        let target = crate::store_dir::StoreDirectory::from_retained_with_control(
+            parent,
+            PathBuf::from(kind.directory()),
+            self.control.clone(),
+        )?;
+        let published =
+            workspace.publish_or_adopt_stage(&target, Path::new(&name), source, |file| {
+                let found =
+                    bound_hash_open_regular(&CasReadAccess::Unmetered, file, kind.max_bytes())?;
+                if found != hash {
+                    return Err(corrupt_object_error(
+                        target.path(),
+                        "extraction object hash mismatch",
+                        hash,
+                        Some(&found),
+                    ));
+                }
+                Ok(())
+            })?;
+        if published && source.is_some() {
+            self.control
+                .checkpoint(crate::durability::DurabilityPoint::ExtractionCasPublished)?;
+        }
+        Ok(published)
+    }
+
     /// PB01/PB02: bounded read of a content object's raw bytes for semantic
     /// (JSON) parsing — [`Self::inspect_content_accounted`] verifies the
     /// byte-hash but deliberately never retains the body (it streams

@@ -31,6 +31,8 @@ pub struct IndexPreviewResponse {
     pub budget_cap: Option<f64>,
     pub estimated_completion: String,
     pub candidates: DiskRecords<ScanCandidate>,
+    #[serde(skip_serializing_if = "DiskRecords::is_empty")]
+    pub extraction_issues: DiskRecords<ExtractionIssue>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub child_scopes: Option<Vec<ChildPreviewRow>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -41,6 +43,14 @@ pub struct IndexPreviewResponse {
     pub estimated_aggregate_cost_usd: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub child_scope_discovery: Option<PreviewChildDiscovery>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ExtractionIssue {
+    pub path: PathBuf,
+    pub error_code: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_limit: Option<kio_core::error::ResourceLimit>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -113,7 +123,6 @@ pub struct IndexPublishedResponse {
     pub failed_files: usize,
     pub normalized_files: usize,
     pub pending_files: usize,
-    pub skipped_oversized_files: usize,
     pub skipped_unrecognized_binary_files: usize,
     pub embedding_tasks_executed: usize,
     pub embedding_tasks_failed: usize,

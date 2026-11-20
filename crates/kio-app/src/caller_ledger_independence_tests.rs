@@ -37,6 +37,7 @@ fn request(caller: Caller) -> CommandRequest {
         }),
         Caller::Rebuild => CommandRequest::Repair(RepairArgs {
             operation: RepairOperation::RebuildDb(RepairRebuildDbArgs {
+                resource_tier: kio_core::error::ResourceTier::Standard,
                 online: false,
                 offline: false,
                 realtime: false,
@@ -65,6 +66,7 @@ fn fixture() -> PrivateTempDir {
     crate::execute(
         &context(root.path()),
         CommandRequest::Index(IndexArgs {
+            resource_tier: kio_core::error::ResourceTier::Standard,
             max_file_bytes: None,
             max_total_bytes: None,
             preview: false,

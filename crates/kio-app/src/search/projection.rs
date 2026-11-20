@@ -1,6 +1,6 @@
 use crate::embedding::input::authorized_local_image_object_hash;
-use crate::historical_reindex::pinned_done_units;
 use crate::historical_reindex::retained_history_instances;
+use crate::historical_reindex::visit_pinned_done_units;
 use crate::image_authority;
 use crate::index::chunk_ledger::rotate_index_generation_unconditionally;
 use crate::index::chunk_ledger::sqlite_path;
@@ -750,15 +750,16 @@ fn projection_bindings_for_plan(
             r#gen: key.r#gen,
             manifest_hash: key.manifest_hash.clone(),
         };
-        match pinned_done_units(repo, &binding.raw_hash, &normalize) {
-            Ok(done) => {
-                let done = done
-                    .into_iter()
-                    .map(|unit| {
-                        let content_hash = kio_core::cas::hash_bytes(unit.markdown.as_bytes());
-                        Ok((unit.unit_key, content_hash))
-                    })
-                    .collect::<Result<BTreeSet<_>>>()?;
+        let mut done = BTreeSet::new();
+        let verified = visit_pinned_done_units(repo, &binding.raw_hash, &normalize, |unit| {
+            done.insert((
+                unit.unit_key,
+                kio_core::cas::hash_bytes(unit.markdown.as_bytes()),
+            ));
+            Ok(())
+        });
+        match verified {
+            Ok(()) => {
                 done_units.insert(key.clone(), done);
             }
             Err(error) => {

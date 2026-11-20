@@ -543,11 +543,23 @@ pub(super) fn write(
     bytes: &[u8],
     publication: Publication,
 ) -> Result<()> {
+    write_with(owner, target, relative, publication, |file| {
+        file.write_all(bytes)
+    })
+}
+
+pub(super) fn write_with(
+    owner: &StoreDirectory,
+    target: &StoreDirectory,
+    relative: &Path,
+    publication: Publication,
+    write: impl FnOnce(&mut dyn Write) -> std::io::Result<()>,
+) -> Result<()> {
     write_with_readonly(
         owner,
         target,
         relative,
-        |file| write_artifact(file, bytes),
+        |file| write(file).map_err(|e| io_failure("cannot write atomic publication artifact", e)),
         publication,
         false,
         |_, _| Ok(()),
@@ -636,6 +648,9 @@ fn write_with_readonly(
         return Err(error);
     }
     workspace.sync()?;
+    owner
+        .control()
+        .checkpoint(crate::durability::DurabilityPoint::AtomicWriteBeforeDirectorySync)?;
     parent.sync()?;
     owner
         .control()

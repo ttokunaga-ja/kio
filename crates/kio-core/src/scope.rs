@@ -165,6 +165,15 @@ pub struct PendingNormalizeRef {
     pub normalize: NormalizeRef,
 }
 
+/// A completed explicit retry, sorted by direct-child path before publication.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetriedExtraction {
+    pub path: String,
+    pub raw_hash: String,
+    pub normalize: Option<NormalizeRef>,
+    pub raw_only: bool,
+}
+
 #[derive(Debug)]
 struct WorkingFileCandidate {
     path: PathBuf,
@@ -4277,6 +4286,7 @@ mod tests {
                 &[],
                 true,
                 Some(&expected),
+                None,
                 None,
                 None,
                 None,

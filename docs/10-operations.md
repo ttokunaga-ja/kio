@@ -469,7 +469,7 @@ truth:
 
 materialized view (cache):
   .kio/objects/normalized_units/ab/cd/<raw64>.<tool64>.g<gen>/  # retained current .kio で解決する runtime view
-  .kio/objects/normalized/ab/cd/<raw64>.<tool64>.g<gen>.md
+  .kio/objects/normalized/ab/cd/<raw64>.<tool64>.g<gen>.<manifest64>.md
 
 virtual view:
   report.pdf.md

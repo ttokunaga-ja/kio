@@ -57,6 +57,7 @@ fn empty_preview() -> IndexPreviewResponse {
             "baseline completes in this run; online enhancement depends on budget and opt-in"
                 .to_owned(),
         candidates: records([]),
+        extraction_issues: records([]),
         child_scopes: None,
         estimated_aggregate_file_count: None,
         estimated_aggregate_size_bytes: None,
@@ -181,7 +182,6 @@ fn published() -> IndexPublishedResponse {
         failed_files: 0,
         normalized_files: 0,
         pending_files: 0,
-        skipped_oversized_files: 0,
         skipped_unrecognized_binary_files: 0,
         embedding_tasks_executed: 0,
         embedding_tasks_failed: 0,
@@ -207,7 +207,7 @@ fn published_legacy() -> Value {
     json!({
         "status": "noop", "approval_method": "existing", "network_allowed": false, "network_opt_in": false,
         "pending_online_tasks": 0_usize, "paused_tasks": 0_usize, "failed_files": 0_usize, "normalized_files": 0_usize, "pending_files": 0_usize,
-        "skipped_oversized_files": 0_usize, "skipped_unrecognized_binary_files": 0_usize, "embedding_tasks_executed": 0_usize, "embedding_tasks_failed": 0_usize,
+        "skipped_unrecognized_binary_files": 0_usize, "embedding_tasks_executed": 0_usize, "embedding_tasks_failed": 0_usize,
         "tree_hash": "a".repeat(64), "commit_hash": null, "commit": null, "budget_status": "known", "budget_reason": null, "budget_warning": null, "skipped_units": [],
     })
 }

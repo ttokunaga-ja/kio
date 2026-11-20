@@ -47,7 +47,6 @@ use crate::management::binding_for_repo;
 use crate::management::open_existing_managed_root;
 use crate::management::reconcile_planned_child;
 use crate::markdownize::batch::poll_batch_markdownize_jobs;
-use crate::object_persistence::compute_manifest_hash;
 use crate::object_persistence::copy_normalized_instance_gen;
 use crate::object_persistence::pipeline_to_kio;
 use crate::promotion::apply_online_promotion_to_index;
@@ -104,7 +103,6 @@ use kio_pipeline::scan::build_managed_scan_preview;
 use kio_pipeline::scan::build_planned_child_scan_preview;
 use kio_pipeline::scan::discover_managed_child_scopes_page;
 use kio_pipeline::scan::managed_scan_policy_allows_file;
-use kio_pipeline::scan::read_bound_verified_scan_input;
 use kio_pipeline::task::TaskStore;
 use kio_pipeline::task::TaskType;
 use kio_pipeline::task::{TaskDescriptor, TaskStatus};
@@ -184,7 +182,6 @@ struct IndexPublishedWork {
     normalized_files: usize,
     deferred_inputs: DiskRecords<DeferredInput>,
     pending_files: usize,
-    skipped_oversized_files: usize,
     skipped_unrecognized_binary_files: usize,
     embedding_tasks_executed: usize,
     embedding_tasks_failed: usize,
@@ -212,7 +209,6 @@ impl IndexPublishedWork {
             normalized_files: self.normalized_files,
             deferred_inputs: self.deferred_inputs,
             pending_files: self.pending_files,
-            skipped_oversized_files: self.skipped_oversized_files,
             skipped_unrecognized_binary_files: self.skipped_unrecognized_binary_files,
             embedding_tasks_executed: self.embedding_tasks_executed,
             embedding_tasks_failed: self.embedding_tasks_failed,
@@ -516,14 +512,21 @@ fn run_index_for_repo_inner(
     // well as paid sends. Check an owned read-only registry snapshot before
     // GC recovery, grants or any index mutation can begin.
     if !args.preview {
-        let scope_id = repo.scope_identity()?.scope_id;
-        resolve_evidence_scope_target(
-            ctx.cwd(),
-            &EvidenceRegistry::default(),
-            &scope_id,
-            Some(&repo.canonical_root().display().to_string()),
-            ctx.control,
-        )?;
+        if super::extraction_retirement::has_journal(repo)? {
+            crate::scope_access::validate_extraction_recovery_registration(ctx.cwd(), repo)?;
+            let _lock = repo.lock_store_in_session(repo.lock_session())?;
+            admission_policy.revalidate().map_err(pipeline_to_kio)?;
+            super::extraction_retirement::recover_for_index(repo)?;
+        } else {
+            let scope_id = repo.scope_identity()?.scope_id;
+            resolve_evidence_scope_target(
+                ctx.cwd(),
+                &EvidenceRegistry::default(),
+                &scope_id,
+                Some(&repo.canonical_root().display().to_string()),
+                ctx.control,
+            )?;
+        }
     }
     let lane_override = LaneOverride::new(args.realtime, args.batch);
     let mut child_discovery = if discover_children && args.preview {
@@ -539,6 +542,9 @@ fn run_index_for_repo_inner(
         Some(&repo.kio_dir().join("config.toml")),
         ctx.control,
     )?;
+    // Validate the adapter input policy before planning. Its size limit is
+    // applied when the adapter input is prepared for a send.
+    crate::settings::effective_max_input_bytes(repo)?;
     // Preview and network-revoke are not successful index publications, so
     // they never activate automatic GC.  A real index first resumes any
     // after_index marker; if the bounded slice expires, return before taking
@@ -564,6 +570,7 @@ fn run_index_for_repo_inner(
         // writer is acquired.  This stays descriptor-bound for internal child
         // scopes through `build_repository_scan_preview`.
         validate_repo_tool_lock(repo)?;
+        let preview_stages = RecordStageRoot::temporary()?;
         let preview = build_repository_scan_preview(
             adapter_settings,
             repo,
@@ -572,9 +579,22 @@ fn run_index_for_repo_inner(
                 include_raw_hashes: false,
                 require_network_approval: !args.offline,
             },
-            RecordStageRoot::temporary()?,
+            preview_stages.clone(),
         )?;
         let mut output = index_preview_response(repo.canonical_root(), &preview)?;
+        let root = repo
+            .bound_root_handle()
+            .ok_or_else(|| KioError::schema("preview lost retained scope root"))?;
+        let mut extraction_issues = RecordWriter::new(&preview_stages)?;
+        preview_extraction_issues(
+            &mut extraction_issues,
+            root,
+            repo.canonical_root(),
+            Path::new(""),
+            &preview,
+            args.resource_tier,
+            repo.control(),
+        )?;
         if let Some(discovery) = child_discovery.as_ref() {
             let plan = &discovery.slice.plan;
             let mut children = Vec::new();
@@ -615,6 +635,15 @@ fn run_index_for_repo_inner(
                         parent_case,
                     )
                     .map_err(pipeline_to_kio)?;
+                    preview_extraction_issues(
+                        &mut extraction_issues,
+                        &bound.root,
+                        &bound.canonical_root,
+                        Path::new(&child.path),
+                        &child_preview,
+                        args.resource_tier,
+                        repo.control(),
+                    )?;
                     let (count, bytes) = child_preview.included_totals()?;
                     let cost = child_preview
                         .estimated_cost
@@ -640,6 +669,7 @@ fn run_index_for_repo_inner(
                 preview: true,
             });
         }
+        output.extraction_issues = extraction_issues.finish()?;
         admission_policy.revalidate().map_err(pipeline_to_kio)?;
         return Ok(IndexExecution {
             response: IndexWorkResponse::Preview(output),
@@ -663,6 +693,7 @@ fn run_index_for_repo_inner(
     // reentrant, so the internal auto-snapshot re-acquisition does not deadlock.
     let lock = repo.lock_store_for_publication()?;
     admission_policy.revalidate().map_err(pipeline_to_kio)?;
+    super::extraction_retirement::recover(repo)?;
     management::reconcile_child_lifecycle(repo)?;
     // Lifecycle reconciliation may legitimately change management records.
     // Bind scanning and publication to the resulting live policy snapshot.
@@ -778,9 +809,16 @@ fn run_index_for_repo_inner(
             crate::batch::command::recheck_resource_limit,
         )?;
     }
-    let (index_result, observations) =
-        run_index_pipeline(adapter_settings, repo, &preview, &args, ledger.as_ref())?;
+    let (index_result, observations) = run_index_pipeline(
+        adapter_settings,
+        repo,
+        &preview,
+        &args,
+        ledger.as_ref(),
+        invocation_state.recheck_resources,
+    )?;
     invocation_state.defer(repo, index_result.deferred_budget.finish()?)?;
+    let retired_extractions = index_result.retired_extractions.finish()?;
     // A prior batch may already have produced a complete accepted online
     // instance. Overlay it before the one normal index snapshot so an ordinary
     // index neither demotes the file to the deterministic baseline nor creates a
@@ -831,7 +869,22 @@ fn run_index_for_repo_inner(
         deferred,
         &selected,
         &|_| publication_policy.revalidate().map_err(pipeline_to_kio),
+        &|head, tree, deferred| {
+            if !retired_extractions.is_empty() || index_result.resource_limit.is_some() {
+                super::extraction_retirement::record(
+                    repo,
+                    head,
+                    tree,
+                    &retired_extractions,
+                    deferred,
+                )?;
+            }
+            ctx.control
+                .checkpoint(kio_core::durability::DurabilityPoint::ExtractionBeforeHead)
+        },
     )?;
+    ctx.control
+        .checkpoint(kio_core::durability::DurabilityPoint::ExtractionAfterHead)?;
     #[cfg(debug_assertions)]
     ctx.interaction.working_scan_published();
     if let Some(commit_hash) = &outcome.commit_hash {
@@ -853,7 +906,8 @@ fn run_index_for_repo_inner(
             }),
         )?;
     }
-    let rebuild_report = rebuild_step3_index(ctx, repo)?;
+    super::extraction_retirement::recover(repo)?;
+    let mut rebuild_report = rebuild_step3_index(ctx, repo)?;
     // LC42-LC44: after the rebuild's temp-build-then-rename lands the final
     // `sqlite.db`, reconcile `index_metadata` (item 2).
     recover_index_generation(repo.kio_dir(), repo.control())?;
@@ -861,7 +915,8 @@ fn run_index_for_repo_inner(
     // guardrails (K4). No-op unless an embedding adapter is configured. R11-2: keep
     // the ExecOutcome (was discarded) so the embedding enrichment result is disclosed
     // and can raise the exit code (auth/budget) instead of a silent exit 0.
-    let enrichment = generate_scope_embeddings(ctx, repo, &args)?;
+    let enrichment =
+        generate_scope_embeddings(ctx, repo, &args, rebuild_report.enrichment_replay.as_mut())?;
     // The scope now has a search index; register it as indexed so it participates
     // in default multi-scope search (05 §1.8, K3). Cache write, never fatal.
     register_scope(ctx, repo, true);
@@ -876,7 +931,9 @@ fn run_index_for_repo_inner(
         .or(enrichment.resource_limit.clone())
         .or(persisted_limit)
     {
-        return Err(limit.into_error("index preserved completed units and is held for resources"));
+        return Err(limit
+            .into_error("index preserved completed units and is held for resources")
+            .with_context_field("published_with_resource_hold", json!(true)));
     }
     let mut output = IndexPublishedWork {
         status: if outcome.noop { "noop" } else { "indexed" }.to_owned(),
@@ -890,7 +947,6 @@ fn run_index_for_repo_inner(
         normalized_files: index_result.normalized_files,
         deferred_inputs,
         pending_files: index_result.pending_files,
-        skipped_oversized_files: index_result.skipped_oversized_files,
         skipped_unrecognized_binary_files: index_result.skipped_unrecognized_binary_files,
         embedding_tasks_executed: enrichment.executed,
         embedding_tasks_failed: enrichment.failed,
@@ -1246,7 +1302,84 @@ fn build_repository_scan_preview(
     .map_err(pipeline_to_kio)
 }
 
-pub(crate) fn read_repository_scan_input(
+fn preview_extraction_issues(
+    issues: &mut RecordWriter<crate::response::index::ExtractionIssue>,
+    root: &std::fs::File,
+    display_root: &Path,
+    prefix: &Path,
+    preview: &ScanPreview,
+    tier: kio_core::error::ResourceTier,
+    control: &kio_core::control::ControlHandle,
+) -> Result<()> {
+    use kio_pipeline::prepare::{
+        ExtractionBudget, PrepareStageBytesRequest, visit_prepared_units_with_budget,
+    };
+
+    let profile = kio_adapter::catalog::builtin_prepare_profile();
+    let budget = ExtractionBudget::new(tier);
+    for candidate in &preview.candidates {
+        let candidate = candidate?;
+        if candidate.ignored
+            || candidate.media_type == "inode/directory"
+            || kio_pipeline::unsupported::unsupported_reason_for_path(Path::new(
+                &candidate.input_path,
+            ))
+            .is_some()
+        {
+            continue;
+        }
+        let result =
+            kio_pipeline::scan::read_bound_extraction_input(root, &candidate.input_path, tier)
+                .and_then(|verified| {
+                    let path = display_root.join(&candidate.input_path);
+                    visit_prepared_units_with_budget(
+                        PrepareStageBytesRequest {
+                            raw_hash: &verified.raw_hash,
+                            media_type: &candidate.media_type,
+                            input_path: &path.to_string_lossy(),
+                            tool_profile_hash: &profile.tool_profile_hash,
+                            bytes: &verified.bytes,
+                        },
+                        control,
+                        budget,
+                        |prepared, bytes| {
+                            super::pipeline::check_preview_normalized_unit(
+                                &path,
+                                &verified.raw_hash,
+                                &candidate.media_type,
+                                prepared,
+                                bytes,
+                            )
+                        },
+                    )
+                });
+        if let Err(error) = result {
+            let error = pipeline_to_kio(error);
+            issues.push(&crate::response::index::ExtractionIssue {
+                path: prefix.join(&candidate.input_path),
+                error_code: error.error_code().to_owned(),
+                resource_limit: error.resource_limit().cloned(),
+            })?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn read_repository_extraction_input(
+    repo: &Repository,
+    input_path: &str,
+    tier: kio_core::error::ResourceTier,
+) -> kio_pipeline::Result<kio_pipeline::scan::VerifiedScanInput> {
+    let root = repo.bound_root_handle().ok_or_else(|| {
+        kio_pipeline::PipelineError::contract(
+            "KIO-E-SCOPE-BOUND-STATE-001",
+            "managed index is missing its retained scope handle",
+        )
+    })?;
+    kio_pipeline::scan::read_bound_extraction_input(root, input_path, tier)
+}
+
+pub(crate) fn read_verified_adapter_source(
     repo: &Repository,
     input_path: &str,
     max_bytes: u64,
@@ -1257,7 +1390,33 @@ pub(crate) fn read_repository_scan_input(
             "managed index is missing its retained scope handle",
         )
     })?;
-    read_bound_verified_scan_input(root, input_path, max_bytes)
+    kio_pipeline::scan::read_bound_extraction_input_at_most(
+        root,
+        input_path,
+        kio_core::error::ResourceTier::Standard,
+        max_bytes,
+    )
+    .map_err(|error| match error {
+        kio_pipeline::PipelineError::ResourceLimit(mut limit) => {
+            limit.stage = "read_adapter_source".to_owned();
+            limit.resource_tier = None;
+            kio_pipeline::PipelineError::ResourceLimit(limit)
+        }
+        error => error,
+    })
+}
+
+pub(crate) fn hash_repository_scan_input(
+    repo: &Repository,
+    input_path: &str,
+) -> kio_pipeline::Result<kio_pipeline::scan::VerifiedScanIdentity> {
+    let root = repo.bound_root_handle().ok_or_else(|| {
+        kio_pipeline::PipelineError::contract(
+            "KIO-E-SCOPE-BOUND-STATE-001",
+            "managed index is missing its retained scope handle",
+        )
+    })?;
+    kio_pipeline::scan::hash_bound_verified_scan_input(root, input_path, u64::MAX)
 }
 
 pub(crate) fn repository_scan_policy_allows_file(
@@ -1798,7 +1957,10 @@ fn current_dispositions(
 /// Unsupported paths must be raw-only in the selected tree.
 type HeadDispositions = (Option<TreeObject>, DiskRecords<UnsupportedInputDisposition>);
 
-fn dispositions_at_head(repo: &Repository, head: Option<&str>) -> Result<HeadDispositions> {
+pub(super) fn dispositions_at_head(
+    repo: &Repository,
+    head: Option<&str>,
+) -> Result<HeadDispositions> {
     let store = UnsupportedInputStore::new(repo.kio_dir())
         .with_record_stages(repo.object_store().scratch_record_stages());
     let Some(head) = head else {
@@ -1954,9 +2116,14 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
     // M1(a): serialize both HEAD reindex and historical enrichment against
     // concurrent index/repair/reindex. Historical enrichment is derived-state
     // only, but still appends to the chunk ledger and SQLite projection.
-    let _lock = repo.lock_store_for_publication()?;
+    let _lock = repo.lock_store_in_session(repo.lock_session())?;
     publication_policy.revalidate().map_err(pipeline_to_kio)?;
     validate_repo_tool_lock(&repo)?;
+    if parsed.force && parsed.yes && super::extraction_retirement::has_journal(&repo)? {
+        crate::scope_access::validate_extraction_recovery_registration(ctx.cwd(), &repo)?;
+        super::extraction_retirement::recover_for_index(&repo)?;
+    }
+    let _publication_lock = repo.lock_store_for_publication()?;
     // CL45/item 5: reconcile any stale `request_kind='sync'` cost-ledger.sqlite
     // rows left by a crashed prior run — applies uniformly to both the
     // historical (`--at`) and HEAD (`--force`) reindex modes below.
@@ -2018,6 +2185,7 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
             ExitCode::ConfirmationRejected,
         ));
     }
+    crate::index::pipeline::retry_local_extractions(ctx, &repo, &store, args.resource_tier)?;
     let head = repo
         .head_commit_hash()?
         .ok_or_else(|| KioError::not_found("HEAD"))?;
@@ -2052,7 +2220,8 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
     )?;
     let stages = repo.object_store().record_stages()?;
     let inputs = scanned_inputs(&stages, &closing_preview)?;
-    let classified = record_reindex_unsupported_inputs(&repo, &closing_preview, &tree)?;
+    let classified =
+        record_reindex_unsupported_inputs(&repo, &closing_preview, &tree, args.resource_tier)?;
     let mut unsupported_paths =
         SortedRecordCursor::new(classified.unsupported.iter(), |row| &row.path);
     let mut normalizes = RecordWriter::new(&stages)?;
@@ -2066,6 +2235,7 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
     // still points at its last-good normalized instance and search keeps serving that
     // gen's cached chunks) and is recorded; healthy documents still re-normalize.
     let mut reindex_skipped = RecordWriter::new(&stages)?;
+    let mut retire = RecordWriter::new(&stages)?;
     for entry in &tree.entries {
         let entry = entry?;
         if unsupported_paths.at(&entry.path)?.is_some() {
@@ -2075,25 +2245,14 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
             continue;
         };
         let new_gen = normalize.r#gen + 1;
-        match copy_normalized_instance_gen(
-            repo.kio_dir(),
-            &entry.raw_hash,
-            &normalize.tool_profile_hash,
-            normalize.r#gen,
-            new_gen,
-            ctx.control,
-        ) {
-            Ok(()) => {
-                // PB04: the copied instance's manifest.json now declares
-                // `gen: new_gen` (different bytes than the source gen's
-                // manifest), so its manifest_hash must be recomputed, not
-                // carried forward.
-                let manifest_hash = compute_manifest_hash(
-                    &repo,
-                    &entry.raw_hash,
-                    &normalize.tool_profile_hash,
-                    new_gen,
-                )?;
+        match copy_normalized_instance_gen(&repo, &entry.raw_hash, normalize, new_gen) {
+            Ok(manifest_hash) => {
+                retire.push(&super::extraction_retirement::Retirement {
+                    raw: entry.raw_hash.clone(),
+                    path: entry.path.clone(),
+                    hold: None,
+                    normalize: None,
+                })?;
                 normalizes.push(&(
                     entry.path.clone(),
                     PendingNormalizeRef {
@@ -2136,6 +2295,7 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
             Err(error) => return Err(error),
         }
     }
+    let retire = retire.finish()?;
     let reindex_skipped = reindex_skipped.finish()?;
     let regenerated_paths = regenerated_paths.finish()?;
     repo.control()
@@ -2153,6 +2313,12 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
         deferred,
         &normalizes.finish()?,
         &|_| publication_policy.revalidate().map_err(pipeline_to_kio),
+        &|head, tree, deferred| {
+            if !retire.is_empty() {
+                super::extraction_retirement::record(&repo, head, tree, &retire, deferred)?;
+            }
+            Ok(())
+        },
     )?;
     let mut regenerated = SortedRecordCursor::new(regenerated_paths.iter(), String::as_str);
     for row in &deferred_inputs {
@@ -2170,6 +2336,7 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
         mark_replica_rebuilding_or_log(ctx, repo.kio_dir(), commit_hash);
         maybe_inject_replica_after_head_fault("reindex", ctx.control)?;
     }
+    super::extraction_retirement::recover(&repo)?;
     let mut report = rebuild_step3_index(ctx, &repo)?;
     // LC42-LC44 (item 2), same ordering rationale as `run_index`'s call.
     recover_index_generation(repo.kio_dir(), repo.control())?;
@@ -2197,7 +2364,14 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
     )?;
     // R11-2: keep the enrichment ExecOutcome (was discarded) so a new-generation
     // embedding auth/budget-pause is disclosed and raises the exit (result on stdout).
-    let enrichment = run_embedding_enrichment(ctx, &repo, embedding_online, false, false)?;
+    let enrichment = run_embedding_enrichment(
+        ctx,
+        &repo,
+        embedding_online,
+        false,
+        false,
+        report.enrichment_replay.as_mut(),
+    )?;
     let response = HeadReindexResponse {
         status: "reindexed".to_owned(),
         reindexed_files: reindexed,

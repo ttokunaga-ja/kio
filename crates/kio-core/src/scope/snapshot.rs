@@ -7,6 +7,13 @@ type ScannedSnapshotInputs<'a> = (
     &'a DiskRecords<(String, PendingNormalizeRef)>,
 );
 
+type ExtractionRetirementHook<'a> =
+    dyn Fn(&str, &TreeObject, &DiskRecords<DeferredInput>) -> Result<()> + 'a;
+
+pub(super) struct ExtractionPublication<'a> {
+    selected: Option<&'a crate::disk_records::DiskRecords<RetriedExtraction>>,
+    hook: &'a ExtractionRetirementHook<'a>,
+}
 type SnapshotPublicationGuard<'a> = &'a dyn Fn(&TreeObject) -> Result<()>;
 
 #[derive(Serialize, Deserialize)]
@@ -53,6 +60,7 @@ impl Repository {
             false,
             &[],
             true,
+            None,
             None,
             None,
             None,
@@ -115,6 +123,38 @@ impl Repository {
             None,
             publication_guard,
             None,
+            None,
+        )
+    }
+
+    /// Archive just the explicitly retried sources and retain unrelated HEAD entries.
+    pub fn snapshot_retried_extractions(
+        &self,
+        selected: &crate::disk_records::DiskRecords<RetriedExtraction>,
+        before_head: &ExtractionRetirementHook<'_>,
+        publication_guard: SnapshotPublicationGuard<'_>,
+    ) -> Result<SnapshotOutcome> {
+        self.snapshot_with_type(
+            Some("kio resume local extraction"),
+            None,
+            CommitType::Auto,
+            &|_| true,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            false,
+            &[],
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(publication_guard),
+            None,
+            Some(ExtractionPublication {
+                selected: Some(selected),
+                hook: before_head,
+            }),
         )
     }
 
@@ -128,6 +168,7 @@ impl Repository {
         mut deferred: DiskRecords<DeferredInput>,
         normalizes: &DiskRecords<(String, PendingNormalizeRef)>,
         publication_guard: SnapshotPublicationGuard<'_>,
+        before_head: &ExtractionRetirementHook<'_>,
     ) -> Result<(SnapshotOutcome, DiskRecords<DeferredInput>)> {
         let _lock = self.lock_store_in_session(&self.lock_session)?;
         let outcome = self.snapshot_with_type(
@@ -147,6 +188,10 @@ impl Repository {
             None,
             Some(publication_guard),
             Some((inputs, &mut deferred, normalizes)),
+            Some(ExtractionPublication {
+                selected: None,
+                hook: before_head,
+            }),
         )?;
         self.write_index_deferrals(&deferred)?;
         Ok((outcome, deferred))
@@ -431,6 +476,7 @@ impl Repository {
             Some(before_ref_publication),
             None,
             None,
+            None,
         )
     }
 
@@ -648,6 +694,7 @@ impl Repository {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -708,6 +755,7 @@ impl Repository {
         before_ref_publication: Option<&mut dyn FnMut() -> Result<SnapshotAutoStateBinding>>,
         publication_guard: Option<SnapshotPublicationGuard<'_>>,
         mut scanned: Option<ScannedSnapshotInputs<'_>>,
+        extraction: Option<ExtractionPublication<'_>>,
     ) -> Result<SnapshotOutcome> {
         // A retained repository is also used by the existing child-index
         // subprocess.  Bound descriptors plus `commit_type=auto` therefore do
@@ -790,7 +838,10 @@ impl Repository {
         } else {
             BTreeSet::new()
         };
-        let working = {
+        let selected = extraction
+            .as_ref()
+            .and_then(|extraction| extraction.selected);
+        let mut working = {
             let _archive_lock = self.lock_store_in_session(&self.lock_session)?;
             if let Some((inputs, deferred, normalizes)) = scanned.as_mut() {
                 self.archive_scanned_working_tree(
@@ -801,12 +852,15 @@ impl Repository {
                     &chunking_config_hash,
                 )?
             } else {
-                let candidates = self.working_file_candidates(
-                    include_path,
-                    explicitly_allowed_tier_a_paths,
-                    true,
-                    self.archive_limits,
-                )?;
+                let candidates = match selected {
+                    Some(selected) => self.retried_working_file_candidates(selected)?,
+                    None => self.working_file_candidates(
+                        include_path,
+                        explicitly_allowed_tier_a_paths,
+                        true,
+                        self.archive_limits,
+                    )?,
+                };
                 self.archive_staged_working_tree(
                     candidates,
                     &mut |path| Ok(normalize_by_path.get(path).cloned()),
@@ -820,6 +874,50 @@ impl Repository {
             }
         }
         .tree;
+
+        if let (Some(selected), Some(prior)) = (selected, &prior_tree) {
+            let mut builder = crate::dag::TreeBuilder::new(
+                &self.store.record_stages()?,
+                prior.chunking_config_hash.clone(),
+            );
+            let mut retries = working
+                .entries
+                .iter()
+                .zip(selected.iter())
+                .map(|(entry, retry)| Ok::<_, KioError>((entry?, retry?.raw_only)));
+            let mut next = retries.next().transpose()?;
+            for old in &prior.entries {
+                let old = old?;
+                while next
+                    .as_ref()
+                    .is_some_and(|(entry, _)| entry.path < old.path)
+                {
+                    builder.push(next.take().expect("retry entry was compared").0)?;
+                    next = retries.next().transpose()?;
+                }
+                if let Some((mut entry, raw_only)) =
+                    next.take_if(|(entry, _)| entry.path == old.path)
+                {
+                    if entry.normalize.is_none() && entry.raw_hash == old.raw_hash && !raw_only {
+                        entry.normalize = old.normalize;
+                    }
+                    builder.push(entry)?;
+                    next = retries.next().transpose()?;
+                } else {
+                    builder.push(old)?;
+                }
+            }
+            if let Some((entry, _)) = next {
+                builder.push(entry)?;
+            }
+            for entry in retries {
+                builder.push(entry?.0)?;
+            }
+            working = builder.finish()?;
+        }
+
+        let no_deferrals = DiskRecords::empty();
+        let deferrals = scanned.as_ref().map_or(&no_deferrals, |(_, rows, _)| rows);
 
         // U19/LC22-LC26: a raw_hash that is both (a) present in the tree we are
         // about to commit and (b) currently the target of an *active*
@@ -841,13 +939,16 @@ impl Repository {
             let purge = self.purge_state()?;
             let mut sorter = RecordSorter::new(&self.store.record_stages()?, String::cmp);
             let mut found = false;
-            let mut deferred = SortedRecordCursor::new(
-                scanned.iter().flat_map(|(_, rows, _)| rows.iter()),
-                |entry| &entry.path,
-            );
+            let mut deferred = SortedRecordCursor::new(deferrals.iter(), |entry| &entry.path);
+            let mut retried =
+                SortedRecordCursor::new(selected.iter().flat_map(|rows| rows.iter()), |entry| {
+                    &entry.path
+                });
             for entry in &working.entries {
                 let entry = entry?;
-                if deferred.at(&entry.path)?.is_some() {
+                if deferred.at(&entry.path)?.is_some()
+                    || (selected.is_some() && retried.at(&entry.path)?.is_none())
+                {
                     continue;
                 }
                 let tombstoned = purge
@@ -936,6 +1037,13 @@ impl Repository {
             }
             if let Some(guard) = publication_guard {
                 guard(&working)?;
+            }
+            if let Some(extraction) = &extraction {
+                (extraction.hook)(
+                    head_hash.as_deref().expect("existing no-op HEAD"),
+                    &working,
+                    deferrals,
+                )?;
             }
             return Ok(SnapshotOutcome {
                 noop: true,
@@ -1073,6 +1181,9 @@ impl Repository {
         } else {
             if let Some(guard) = publication_guard {
                 guard(&working)?;
+            }
+            if let Some(extraction) = &extraction {
+                (extraction.hook)(&commit_hash, &working, deferrals)?;
             }
             self.publish_with_journal(parent.as_deref(), &commit_hash, &commit, manifest.clone())?;
             None

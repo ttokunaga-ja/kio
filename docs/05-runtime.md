@@ -524,7 +524,7 @@ result 行は**検証可能な span** を指し (`kio evidence verify` が成立
 
 **リストはパスを返し、選択したらそのリンク先を表示する。**本文を返す API は作らない。
 
-リンク先は **全文 view** `objects/normalized/ab/cd/<raw64>.<tool64>.g<gen>.md`
+リンク先は **全文 view** `objects/normalized/ab/cd/<raw64>.<tool64>.g<gen>.<manifest64>.md`
 ([03-data-model.md §2.1](03-data-model.md))。既に実体があり
 (`kio_pipeline::markdownize::normalized_view_path`)、再生成可能な cache である。
 

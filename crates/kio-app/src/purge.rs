@@ -1282,6 +1282,14 @@ fn delete_derived_surfaces(
         .saturating_add(remove_target_normalized_instances(repo, &targets)?);
     report.deleted.normalized_views = remove_target_normalized_views(repo.kio_dir(), &targets)?;
 
+    let extraction_store = crate::object_persistence::bound_extraction_store(repo)?;
+    for raw_hash in &targets {
+        kio_pipeline::prepare::discard_prepared_stages(&extraction_store, raw_hash)
+            .map_err(crate::object_persistence::pipeline_to_kio)?;
+        kio_pipeline::markdownize::discard_normalized_stages(&extraction_store, raw_hash)
+            .map_err(crate::object_persistence::pipeline_to_kio)?;
+    }
+
     delete_target_tasks(repo, &targets, &chunk_ids, report)?;
     report.deleted.manifest_rows = scrub_manifest(repo.kio_dir(), &targets)?;
     let published_tree = repo
@@ -1820,7 +1828,7 @@ fn remove_target_normalized_views(kio_dir: &Path, targets: &BTreeSet<&str>) -> R
                 .and_then(|value| value.to_str())
                 .ok_or_else(|| store_corrupt(&path, "normalized view leaf is not valid UTF-8"))?;
             if name.starts_with(&format!("{digest}.")) && name.ends_with(".md") {
-                validate_existing_regular(&path, Some(256 * 1024 * 1024))?;
+                validate_existing_regular(&path, None)?;
                 candidates.push(path);
             }
         }

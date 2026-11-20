@@ -4,6 +4,7 @@ use crate::disk_records::{DiskRecords, RecordSorter, RecordWriter, SortedRecordC
 
 pub(super) struct WorkingCandidates {
     names: DiskRecords<String>,
+    selected: Option<DiskRecords<RetriedExtraction>>,
     root: PathBuf,
     bound_root: Option<Arc<File>>,
 }
@@ -25,6 +26,7 @@ struct ArchivedFile {
     name: String,
     size: u64,
     source: crate::platform::ScheduledSourceIdentity,
+    retried_normalize: Option<NormalizeRef>,
     stage: crate::cas::SavedRawStage,
 }
 type StagedInput = (
@@ -285,6 +287,7 @@ impl Repository {
                         name,
                         size: stage.size_bytes(),
                         source,
+                        retried_normalize: None,
                         stage: stage.saved(),
                     })?;
                     stage.detach();
@@ -400,6 +403,7 @@ impl Repository {
             records: RecordWriter::new(&record_stages)?,
             store: &self.store,
         };
+        let mut selected = candidates.selected.as_ref().map(DiskRecords::iter);
         let mut consumed = 0u64;
         for candidate in candidates.iter() {
             let candidate = candidate?;
@@ -441,10 +445,24 @@ impl Repository {
                     "scheduled snapshot inputs changed before publication",
                 ));
             }
+            let retried_normalize = match &mut selected {
+                Some(selected) => {
+                    let retry = selected
+                        .next()
+                        .transpose()?
+                        .ok_or_else(retried_input_changed)?;
+                    if retry.path != candidate.file_name || retry.raw_hash != stage.raw_hash() {
+                        return Err(retried_input_changed());
+                    }
+                    retry.normalize
+                }
+                None => None,
+            };
             batch.records.push(&ArchivedFile {
                 name: candidate.file_name,
                 size: stage.size_bytes(),
                 source: identity,
+                retried_normalize,
                 stage: stage.saved(),
             })?;
             stage.detach();
@@ -552,10 +570,43 @@ impl Repository {
                     .with_context_field("saved", json!(false))
             })?;
             let mut entry = TreeEntry::raw_file(record.name.clone(), hash)?;
-            attach_pending_normalize(&mut entry, &record.name, normalize_for_path(&record.name)?);
+            entry.normalize = record.retried_normalize;
+            if entry.normalize.is_none() {
+                attach_pending_normalize(
+                    &mut entry,
+                    &record.name,
+                    normalize_for_path(&record.name)?,
+                );
+            }
             entries.push(entry)?;
         }
         Ok(())
+    }
+
+    pub(super) fn retried_working_file_candidates(
+        &self,
+        selected: &DiskRecords<RetriedExtraction>,
+    ) -> Result<WorkingCandidates> {
+        let mut names = RecordWriter::new(&self.store.record_stages()?)?;
+        let mut previous: Option<String> = None;
+        for retry in selected {
+            let retry = retry?;
+            if !is_materializable_direct_child(&retry.path)
+                || retry.path == ".kio"
+                || previous.as_ref().is_some_and(|path| path >= &retry.path)
+                || (retry.raw_only && retry.normalize.is_some())
+            {
+                return Err(retried_input_changed());
+            }
+            names.push(&retry.path)?;
+            previous = Some(retry.path);
+        }
+        Ok(WorkingCandidates {
+            names: names.finish()?,
+            selected: Some(selected.clone()),
+            root: self.canonical_root.clone(),
+            bound_root: self.bound_root.clone(),
+        })
     }
 
     pub(super) fn working_file_candidates(
@@ -638,6 +689,7 @@ impl Repository {
             }
             return Ok(WorkingCandidates {
                 names: candidates.finish()?,
+                selected: None,
                 root: self.canonical_root.clone(),
                 bound_root: self.bound_root.clone(),
             });
@@ -700,6 +752,7 @@ impl Repository {
         }
         Ok(WorkingCandidates {
             names: candidates.finish()?,
+            selected: None,
             root: self.root.clone(),
             bound_root: None,
         })
@@ -788,6 +841,15 @@ impl Repository {
             head_shallow,
         })
     }
+}
+
+fn retried_input_changed() -> KioError {
+    KioError::new(
+        "KIO-E-SNAPSHOT-AUTHORITY-CHANGED-001",
+        "retried extraction inputs changed before publication",
+        json!({}),
+        ExitCode::PartialFailure,
+    )
 }
 
 fn warn_large_working_tree() {
