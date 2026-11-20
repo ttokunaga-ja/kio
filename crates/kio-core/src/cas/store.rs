@@ -218,22 +218,35 @@ impl ObjectStore {
         self.scratch_record_reads = true;
     }
 
+    /// Share the store's live-run budget for disposable, anonymous read records.
+    pub fn scratch_record_stages(&self) -> crate::disk_records::RecordStageRoot {
+        crate::disk_records::RecordStageRoot::anonymous(self.record_memory.clone())
+    }
+
+    pub(crate) fn record_read_stages(&self) -> Result<crate::disk_records::RecordStageRoot> {
+        if self.scratch_record_reads {
+            Ok(self.scratch_record_stages())
+        } else {
+            self.record_stages()
+        }
+    }
+
     pub(crate) fn decode_record_json<T: serde::de::DeserializeOwned>(
         &self,
         reader: impl Read,
     ) -> Result<T> {
-        if self.scratch_record_reads {
-            crate::disk_records::decode_bounded_scratch_json(self.record_memory.clone(), reader)
-        } else {
-            crate::disk_records::decode_bounded_json(&self.record_stages()?, reader)
-        }
+        crate::disk_records::decode_bounded_json(&self.record_read_stages()?, reader)
     }
 
-    pub fn inspect_raw_stages(&self) -> Result<Vec<RawStageResidue>> {
+    pub fn inspect_raw_stages(&self) -> Result<crate::disk_records::DiskRecords<RawStageResidue>> {
         if let Some(bound) = &self.bound {
-            let mut residues = bound.inspect_raw_stages(false)?;
-            residues.extend(self.record_stages()?.inspect()?);
-            return Ok(residues);
+            let scratch = crate::disk_records::RecordStageRoot::temporary()?;
+            let mut residues = crate::disk_records::RecordWriter::new(&scratch)?;
+            bound.visit_raw_stages(&scratch, false, |row| residues.push(&row))?;
+            for row in self.record_stages()?.inspect()? {
+                residues.push(&row)?;
+            }
+            return residues.finish();
         }
         let directory = crate::store_dir::StoreDirectory::open_with_control(
             self.ambient_kio_dir()?,
@@ -249,7 +262,7 @@ impl ObjectStore {
             .ok_or_else(|| {
                 KioError::invalid_usage("bound raw cleanup requires a retained ObjectStore")
             })?
-            .cleanup_raw_ingest_orphans()
+            .visit_raw_stages(&self.record_stages()?, true, |_| Ok(()))
     }
 
     pub fn validate_bound_layout(&self) -> Result<()> {

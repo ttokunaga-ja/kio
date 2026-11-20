@@ -15161,11 +15161,16 @@ fn nc2_defers_when_classified_bytes_change_before_snapshot() {
     let path = dir.path().join("document.cfg");
     let original = b"racedneedle searchable text\n";
     let binary = vec![0xff; original.len()];
+    // Put the raced path after more than one run of classified inputs.
+    for n in 0..=kio_core::disk_records::SORT_BUFFER_RECORDS {
+        fs::write(dir.path().join(format!("{n:05}.rs")), "source fixture").unwrap();
+    }
     fs::write(&path, original).unwrap();
     kio(&dir, &["init"]).assert().success();
     json_success(&dir, &["index", "--yes", "--offline"]);
     let kio_dir = dir.path().join(".kio");
     let head = head_commit(&kio_dir);
+    let published = json_success(&dir, &["status"])["unsupported_inputs"].clone();
     let replacements = canonical_tempdir();
 
     for command in [NC2_REINDEX, &["index", "--yes", "--offline"][..]] {
@@ -15186,7 +15191,7 @@ fn nc2_defers_when_classified_bytes_change_before_snapshot() {
             assert_eq!(head_commit(&kio_dir), head);
             assert_eq!(
                 json_success(&dir, &["status"])["unsupported_inputs"],
-                serde_json::json!([])
+                published
             );
         }
     }
@@ -15196,7 +15201,12 @@ fn nc2_defers_when_classified_bytes_change_before_snapshot() {
     let status = json_success(&dir, &["status"]);
     assert!(status.get("deferred_inputs").is_none());
     assert_eq!(
-        status["unsupported_inputs"][0]["raw_hash"],
+        status["unsupported_inputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["path"] == "document.cfg")
+            .unwrap()["raw_hash"],
         kio_core::cas::hash_bytes(&binary)
     );
     let search = json_success(&dir, &["search", "racedneedle", "--mode", "text"]);
@@ -15446,9 +15456,16 @@ fn assert_nc2_deferred(
 #[cfg(debug_assertions)]
 #[test]
 fn nc2_defers_files_added_after_scanning() {
-    for command in [NC2_REINDEX, &["index", "--yes", "--offline"][..]] {
+    let index = &["index", "--yes", "--offline"][..];
+    for (command, additional_inputs) in [
+        (NC2_REINDEX, 0),
+        (index, kio_core::disk_records::SORT_BUFFER_RECORDS + 1),
+    ] {
         let dir = canonical_tempdir();
         fs::write(dir.path().join("a.md"), "# Original\n\noriginal text\n").unwrap();
+        for n in 0..additional_inputs {
+            fs::write(dir.path().join(format!("z{n:05}.rs")), "source fixture").unwrap();
+        }
         json_success(&dir, &["init"]);
         json_success(&dir, &["index", "--yes", "--offline"]);
         let added_raw = kio_core::cas::hash_bytes(b"\xff");

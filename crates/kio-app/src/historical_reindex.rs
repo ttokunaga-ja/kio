@@ -187,18 +187,20 @@ pub(super) fn pinned_manifest_is_complete(
 /// cache must never make an older pinned snapshot appear to contain new text.
 pub(super) fn merge_reindex_skips(
     report: &mut Step3RebuildReport,
-    reindex_skipped: Vec<SkippedUnit>,
-) {
+    reindex_skipped: kio_core::disk_records::DiskRecords<SkippedUnit>,
+) -> Result<()> {
     let seen: BTreeSet<String> = report
         .skipped_units
         .iter()
         .map(|entry| entry.raw_hash.clone())
         .collect();
     for skip in reindex_skipped {
+        let skip = skip?;
         if !seen.contains(&skip.raw_hash) {
             report.skipped_units.push(skip);
         }
     }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]

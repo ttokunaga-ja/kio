@@ -620,7 +620,7 @@ struct BoundObjectDirs {
     stage_directories: Arc<Mutex<Option<bound::RawStageDirectories>>>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawStageResidue {
     pub path: String,
     pub reason: String,

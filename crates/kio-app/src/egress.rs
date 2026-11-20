@@ -458,6 +458,7 @@ pub(crate) fn record_quarantine_candidates(
     kio_core::private_fs::verify_private_directory_handle(&directory)?;
     directory.append_private(Path::new("quarantine.jsonl"), &[])?;
     for candidate in &preview.candidates {
+        let candidate = candidate?;
         let secrets_approved = match adapter_settings.role_configuration_ready("markdown") {
             Ok(()) => {
                 let profile =
@@ -602,6 +603,7 @@ pub(crate) fn write_approval_record(
         .as_ref()
         .map(|cost| (cost.estimated_markdownize_usd, cost.estimated_embedding_usd))
         .unwrap_or((0.0, 0.0));
+    let (estimated_file_count, estimated_total_bytes) = preview.included_totals()?;
     repo.record_scan_approval(json!({
         "scope_id": preview.scope_id,
         "root_path": repo.canonical_root().display().to_string(),
@@ -610,8 +612,8 @@ pub(crate) fn write_approval_record(
         "approval_method": approval_method,
         "kio_version": env!("CARGO_PKG_VERSION"),
         "effective_ignore_hash": effective_ignore_hash(),
-        "estimated_file_count": preview.candidates.iter().filter(|candidate| !candidate.ignored).count(),
-        "estimated_total_bytes": preview.candidates.iter().filter(|candidate| !candidate.ignored).map(|candidate| candidate.size_bytes).sum::<u64>(),
+        "estimated_file_count": estimated_file_count,
+        "estimated_total_bytes": estimated_total_bytes,
         "estimated_markdownize_usd": estimated_markdownize_usd,
         "estimated_embedding_usd": estimated_embedding_usd,
     }))?;

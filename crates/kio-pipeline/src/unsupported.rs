@@ -1,6 +1,10 @@
 //! Durable dispositions for archived inputs that cannot be enriched.
 
-use std::collections::{BTreeMap, BTreeSet};
+use kio_core::dag::{TreeEntry, TreeObject};
+use kio_core::disk_records::{
+    DiskRecords, RecordSorter, RecordStageRoot, RecordWriter, SortedRecordCursor,
+    merge_sorted_records,
+};
 #[cfg(test)]
 use std::fs;
 #[cfg(test)]
@@ -69,7 +73,8 @@ impl UnsupportedInputDisposition {
 pub struct UnsupportedInputStore {
     pub(crate) kio_dir: PathBuf,
     path: PathBuf,
-    published_inputs: BTreeMap<String, (String, bool)>,
+    published_tree: Option<TreeObject>,
+    stages: Option<RecordStageRoot>,
 }
 
 impl UnsupportedInputStore {
@@ -79,32 +84,22 @@ impl UnsupportedInputStore {
         Self {
             path: kio_dir.join(UNSUPPORTED_INPUTS_FILE),
             kio_dir,
-            published_inputs: BTreeMap::new(),
+            published_tree: None,
+            stages: None,
         }
     }
 
-    /// Retain HEAD identities only for paths that already have journal rows.
-    /// A newer observation may hide a row for the published raw at the same path.
-    pub fn with_published_tree(mut self, tree: Option<&kio_core::dag::TreeObject>) -> Result<Self> {
-        self.published_inputs.clear();
-        let Some(tree) = tree else {
-            return Ok(self);
-        };
-        let paths: BTreeSet<_> = self
-            .latest_by_path()?
-            .into_iter()
-            .map(|row| row.path)
-            .collect();
-        if !paths.is_empty() {
-            for entry in &tree.entries {
-                let entry = entry.map_err(|error| crate::journal::error(&self.path, error))?;
-                if paths.contains(&entry.path) {
-                    self.published_inputs
-                        .insert(entry.path, (entry.raw_hash, entry.normalize.is_some()));
-                }
-            }
-        }
-        Ok(self)
+    /// Select the tree whose published reasons must survive a newer observation.
+    #[must_use]
+    pub fn with_published_tree(mut self, tree: Option<&TreeObject>) -> Self {
+        self.published_tree = tree.cloned();
+        self
+    }
+
+    #[must_use]
+    pub fn with_record_stages(mut self, stages: RecordStageRoot) -> Self {
+        self.stages = Some(stages);
+        self
     }
 
     #[must_use]
@@ -148,9 +143,12 @@ impl UnsupportedInputStore {
         };
         let projected_len = current_len.saturating_add(line.len() as u64);
         if projected_len > UNSUPPORTED_COMPACTION_BYTES {
-            let mut projection = self.read_bound(&directory)?;
-            self.add_record(&mut projection, disposition.clone());
-            return self.replace_bound(&directory, &projection.retained_rows());
+            let projected = self.project(
+                &directory,
+                ProjectionKind::Retained,
+                [Ok(disposition.clone())],
+            )?;
+            return self.replace_records(&directory, projected.rows);
         }
 
         directory
@@ -158,84 +156,187 @@ impl UnsupportedInputStore {
             .map_err(|e| crate::journal::error(&self.path, e))
     }
 
-    /// Durably stage a scan's new reasons while retaining those visible at HEAD.
+    /// Durably stage a scan's new reasons in path order while retaining those visible at HEAD.
     pub fn record_observations(
         &self,
-        observations: impl IntoIterator<Item = UnsupportedInputDisposition>,
+        observations: impl IntoIterator<Item = kio_core::Result<UnsupportedInputDisposition>>,
     ) -> Result<()> {
+        let directory = self.private_root()?;
         let mut observations = observations.into_iter().peekable();
         if observations.peek().is_none() {
+            self.read_bound(&directory, |_| Ok(()))?;
             return Ok(());
         }
-        let directory = self.private_root()?;
-        let mut projection = self.read_bound(&directory)?;
-        let mut changed = false;
-        for observation in observations {
-            if projection.latest.get(&observation.path) != Some(&observation) {
-                self.add_record(&mut projection, observation);
-                changed = true;
-            }
-        }
-        if changed {
-            self.replace_bound(&directory, &projection.retained_rows())?;
+        let projected = self.project(&directory, ProjectionKind::Retained, observations)?;
+        if projected.changed {
+            self.replace_records(&directory, projected.rows)?;
         }
         Ok(())
     }
 
     /// Read the latest observation for each path, for writer deduplication.
-    pub fn latest_by_path(&self) -> Result<Vec<UnsupportedInputDisposition>> {
+    pub fn latest_by_path(&self) -> Result<DiskRecords<UnsupportedInputDisposition>> {
         Ok(self
-            .read_bound(&self.private_root()?)?
-            .latest
-            .into_values()
-            .collect())
+            .project(&self.private_root()?, ProjectionKind::Latest, [])?
+            .rows)
     }
 
     /// Read the latest HEAD dispositions and show unsupported reasons only for raw-only entries.
-    pub fn published_by_path(&self) -> Result<Vec<UnsupportedInputDisposition>> {
+    pub fn published_by_path(&self) -> Result<DiskRecords<UnsupportedInputDisposition>> {
         Ok(self
-            .read_bound(&self.private_root()?)?
-            .published
-            .into_values()
-            .filter(|row| !row.is_unsupported() || !self.published_inputs[&row.path].1)
-            .collect())
+            .project(&self.private_root()?, ProjectionKind::Published, [])?
+            .rows)
     }
 
     /// Include both current HEAD reasons and newer observations when rewriting.
-    pub fn retained_rows(&self) -> Result<Vec<UnsupportedInputDisposition>> {
-        Ok(self.read_bound(&self.private_root()?)?.retained_rows())
+    pub fn retained_rows(&self) -> Result<DiskRecords<UnsupportedInputDisposition>> {
+        Ok(self
+            .project(&self.private_root()?, ProjectionKind::Retained, [])?
+            .rows)
     }
 
-    fn add_record(
+    fn stage_error(&self, error: kio_core::KioError) -> PipelineError {
+        crate::journal::error(&self.path, error)
+    }
+
+    fn project(
         &self,
-        projection: &mut DispositionProjection,
-        disposition: UnsupportedInputDisposition,
-    ) {
-        if self
-            .published_inputs
-            .get(&disposition.path)
-            .is_some_and(|(raw_hash, _)| raw_hash == &disposition.raw_hash)
-        {
-            projection
-                .published
-                .insert(disposition.path.clone(), disposition.clone());
+        directory: &kio_core::store_dir::StoreDirectory,
+        kind: ProjectionKind,
+        observations: impl IntoIterator<Item = kio_core::Result<UnsupportedInputDisposition>>,
+    ) -> Result<DispositionProjection> {
+        let stages = match &self.stages {
+            Some(stages) => stages.clone(),
+            None => RecordStageRoot::temporary().map_err(|e| self.stage_error(e))?,
+        };
+        let mut previous = String::new();
+        let mut ordered = true;
+        let mut sequence = 0;
+        let mut spool = RecordWriter::new(&stages).map_err(|e| self.stage_error(e))?;
+        let old_count = self.read_bound(directory, |row| {
+            ordered &= previous <= row.path;
+            previous.clone_from(&row.path);
+            spool
+                .push(&(sequence, row))
+                .map_err(|e| self.stage_error(e))?;
+            sequence += 1;
+            Ok(())
+        })?;
+        let mut journal = spool.finish().map_err(|e| self.stage_error(e))?;
+        // A compacted journal is already ordered unless it has older HEAD
+        // reasons at the front. Use the ordered frames directly in that case.
+        if !ordered {
+            let mut sorter = RecordSorter::new(&stages, compare_observations);
+            for row in journal {
+                sorter
+                    .push(row.map_err(|e| self.stage_error(e))?)
+                    .map_err(|e| self.stage_error(e))?;
+            }
+            journal = sorter.finish().map_err(|e| self.stage_error(e))?;
         }
-        projection
-            .latest
-            .insert(disposition.path.clone(), disposition);
+        let mut additions = RecordWriter::new(&stages).map_err(|e| self.stage_error(e))?;
+        let mut previous = String::new();
+        for row in observations {
+            let row = row.map_err(|e| self.stage_error(e))?;
+            if row.path < previous {
+                return Err(PipelineError::Schema(
+                    "unsupported observations are not ordered by path".to_owned(),
+                ));
+            }
+            previous.clone_from(&row.path);
+            additions
+                .push(&(sequence, row))
+                .map_err(|e| self.stage_error(e))?;
+            sequence += 1;
+        }
+        let additions = additions.finish().map_err(|e| self.stage_error(e))?;
+        let mut input =
+            merge_sorted_records(journal.iter(), additions.iter(), compare_observations).peekable();
+        let mut head = SortedRecordCursor::new(
+            self.published_tree
+                .iter()
+                .flat_map(|tree| tree.entries.iter()),
+            |entry: &TreeEntry| &entry.path,
+        );
+        let mut rows = RecordWriter::new(&stages).map_err(|e| self.stage_error(e))?;
+        let mut retained_latest = match kind {
+            ProjectionKind::Retained => {
+                Some(RecordWriter::new(&stages).map_err(|e| self.stage_error(e))?)
+            }
+            _ => None,
+        };
+        let mut changed = false;
+        while let Some(row) = input.next() {
+            let (position, mut latest) = row.map_err(|e| self.stage_error(e))?;
+            let entry = if matches!(kind, ProjectionKind::Latest) {
+                None
+            } else {
+                head.at(&latest.path).map_err(|e| self.stage_error(e))?
+            };
+            let mut published = entry
+                .filter(|entry| entry.raw_hash == latest.raw_hash)
+                .map(|_| latest.clone());
+            changed |= position >= old_count;
+            while input
+                .peek()
+                .is_some_and(|row| row.as_ref().is_ok_and(|(_, row)| row.path == latest.path))
+            {
+                let (position, row) = input
+                    .next()
+                    .expect("peeked row")
+                    .map_err(|e| self.stage_error(e))?;
+                changed |= position >= old_count && row != latest;
+                if entry.is_some_and(|entry| entry.raw_hash == row.raw_hash) {
+                    published = Some(row.clone());
+                }
+                latest = row;
+            }
+            match kind {
+                ProjectionKind::Latest => rows.push(&latest),
+                ProjectionKind::Published => {
+                    if let Some(row) = published
+                        && (!row.is_unsupported()
+                            || entry.is_some_and(|entry| entry.normalize.is_none()))
+                    {
+                        rows.push(&row)
+                    } else {
+                        Ok(())
+                    }
+                }
+                ProjectionKind::Retained => {
+                    if let Some(row) = published.filter(|row| row.raw_hash != latest.raw_hash) {
+                        rows.push(&row).map_err(|e| self.stage_error(e))?;
+                    }
+                    retained_latest
+                        .as_mut()
+                        .expect("retained projection")
+                        .push(&latest)
+                }
+            }
+            .map_err(|e| self.stage_error(e))?;
+        }
+        if let Some(latest) = retained_latest {
+            for row in latest.finish().map_err(|e| self.stage_error(e))? {
+                rows.push(&row.map_err(|e| self.stage_error(e))?)
+                    .map_err(|e| self.stage_error(e))?;
+            }
+        }
+        let rows = rows.finish().map_err(|e| self.stage_error(e))?;
+        Ok(DispositionProjection { rows, changed })
     }
 
     fn read_bound(
         &self,
         directory: &kio_core::store_dir::StoreDirectory,
-    ) -> Result<DispositionProjection> {
-        let mut projection = DispositionProjection::default();
+        mut push: impl FnMut(UnsupportedInputDisposition) -> Result<()>,
+    ) -> Result<usize> {
+        let mut count = 0;
         let leaf = Path::new(UNSUPPORTED_INPUTS_FILE);
         if !directory
             .contains_entry(leaf)
             .map_err(|e| crate::journal::error(&self.path, e))?
         {
-            return Ok(projection);
+            return Ok(0);
         }
         let file = directory
             .open_regular_read(leaf, u64::MAX)
@@ -269,39 +370,52 @@ impl UnsupportedInputStore {
             let disposition: UnsupportedInputDisposition =
                 serde_json::from_slice(&line).map_err(|error| self.corrupt(error.to_string()))?;
             validate_disposition(&disposition).map_err(|message| self.corrupt(message))?;
-            self.add_record(&mut projection, disposition);
+            push(disposition)?;
+            count += 1;
         }
 
-        Ok(projection)
+        Ok(count)
     }
 
     /// Replace a validated current projection (also used by purge).
     pub fn replace_all(&self, dispositions: &[UnsupportedInputDisposition]) -> Result<()> {
-        self.replace_bound(&self.private_root()?, dispositions)
+        let directory = self.private_root()?;
+        self.replace_frames(
+            &directory,
+            dispositions.iter().map(|row| self.encode_record(row)),
+        )
     }
 
-    fn replace_bound(
+    fn replace_records(
         &self,
         directory: &kio_core::store_dir::StoreDirectory,
-        dispositions: &[UnsupportedInputDisposition],
+        records: DiskRecords<UnsupportedInputDisposition>,
     ) -> Result<()> {
-        for disposition in dispositions {
-            validate_disposition(disposition)
-                .map_err(|message| PipelineError::contract(INVALID_DISPOSITION_CODE, message))?;
-        }
-        crate::journal::replace(
+        self.replace_frames(
             directory,
-            Path::new(UNSUPPORTED_INPUTS_FILE),
-            dispositions.iter().map(|row| {
-                let mut line =
-                    serde_json::to_vec(row).map_err(|e| PipelineError::Schema(e.to_string()))?;
-                line.push(b'\n');
-                if line.len() as u64 > MAX_UNSUPPORTED_INPUT_RECORD_BYTES {
-                    return Err(self.corrupt("unsupported-input record exceeds byte limit"));
-                }
-                Ok(line)
-            }),
+            records
+                .iter()
+                .map(|row| self.encode_record(&row.map_err(|e| self.stage_error(e))?)),
         )
+    }
+
+    fn replace_frames(
+        &self,
+        directory: &kio_core::store_dir::StoreDirectory,
+        records: impl IntoIterator<Item = Result<Vec<u8>>>,
+    ) -> Result<()> {
+        crate::journal::replace_streamed(directory, Path::new(UNSUPPORTED_INPUTS_FILE), records)
+    }
+
+    fn encode_record(&self, row: &UnsupportedInputDisposition) -> Result<Vec<u8>> {
+        validate_disposition(row)
+            .map_err(|message| PipelineError::contract(INVALID_DISPOSITION_CODE, message))?;
+        let mut line = serde_json::to_vec(row).map_err(|e| PipelineError::Schema(e.to_string()))?;
+        line.push(b'\n');
+        if line.len() as u64 > MAX_UNSUPPORTED_INPUT_RECORD_BYTES {
+            return Err(self.corrupt("unsupported-input record exceeds byte limit"));
+        }
+        Ok(line)
     }
 
     fn private_root(&self) -> Result<kio_core::store_dir::StoreDirectory> {
@@ -317,21 +431,22 @@ impl UnsupportedInputStore {
     }
 }
 
-#[derive(Default)]
-struct DispositionProjection {
-    latest: BTreeMap<String, UnsupportedInputDisposition>,
-    published: BTreeMap<String, UnsupportedInputDisposition>,
+fn compare_observations(
+    left: &(usize, UnsupportedInputDisposition),
+    right: &(usize, UnsupportedInputDisposition),
+) -> std::cmp::Ordering {
+    left.1.path.cmp(&right.1.path).then(left.0.cmp(&right.0))
 }
 
-impl DispositionProjection {
-    fn retained_rows(mut self) -> Vec<UnsupportedInputDisposition> {
-        self.published
-            .retain(|path, row| self.latest[path].raw_hash != row.raw_hash);
-        self.published
-            .into_values()
-            .chain(self.latest.into_values())
-            .collect()
-    }
+enum ProjectionKind {
+    Latest,
+    Published,
+    Retained,
+}
+
+struct DispositionProjection {
+    rows: DiskRecords<UnsupportedInputDisposition>,
+    changed: bool,
 }
 
 fn validate_disposition(
@@ -385,7 +500,7 @@ mod tests {
         let directory = crate::test_support::PrivateTempDir::new();
         let store = UnsupportedInputStore::new(directory.path());
 
-        assert!(store.latest_by_path().unwrap().is_empty());
+        assert!(store.latest_by_path().unwrap().to_vec().unwrap().is_empty());
     }
 
     #[test]
@@ -400,7 +515,7 @@ mod tests {
         latest_photo.reason = "unsupported_image_codec".to_owned();
         store.record(&latest_photo).unwrap();
 
-        let latest = store.latest_by_path().unwrap();
+        let latest = store.latest_by_path().unwrap().to_vec().unwrap();
 
         assert_eq!(latest.len(), 2);
         assert_eq!(latest[0].path, "archive.zip");
@@ -417,7 +532,10 @@ mod tests {
         let expected = disposition("manual.pdf", 'd');
         store.record(&expected).unwrap();
 
-        assert_eq!(store.latest_by_path().unwrap(), vec![expected]);
+        assert_eq!(
+            store.latest_by_path().unwrap().to_vec().unwrap(),
+            vec![expected]
+        );
     }
 
     #[cfg(unix)]
@@ -531,11 +649,11 @@ mod tests {
             .collect();
         store.replace_all(&rows).unwrap();
         assert!(fs::metadata(store.path()).unwrap().len() > 16 * 1024 * 1024);
-        assert_eq!(store.latest_by_path().unwrap(), rows);
+        assert_eq!(store.latest_by_path().unwrap().to_vec().unwrap(), rows);
         let mut current = rows[0].clone();
         current.reason = UNSUPPORTED_REASON_RESOLVED.into();
         store.record(&current).unwrap();
-        let updated = store.latest_by_path().unwrap();
+        let updated = store.latest_by_path().unwrap().to_vec().unwrap();
         assert_eq!(updated.len(), rows.len());
         assert_eq!(updated[0], current);
         assert_eq!(&updated[1..], &rows[1..]);
@@ -569,11 +687,14 @@ mod tests {
         }
         drop(writer);
         assert!(fs::metadata(store.path()).unwrap().len() > 16 * 1024 * 1024);
-        assert_eq!(store.latest_by_path().unwrap(), vec![old]);
+        assert_eq!(store.latest_by_path().unwrap().to_vec().unwrap(), vec![old]);
         let mut current = disposition("photo.bmp", 'b');
         current.reason = UNSUPPORTED_REASON_RESOLVED.into();
         store.record(&current).unwrap();
-        assert_eq!(store.latest_by_path().unwrap(), vec![current]);
+        assert_eq!(
+            store.latest_by_path().unwrap().to_vec().unwrap(),
+            vec![current]
+        );
         assert!(fs::metadata(store.path()).unwrap().len() < 16 * 1024 * 1024);
     }
 

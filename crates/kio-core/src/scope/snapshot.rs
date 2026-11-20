@@ -1,11 +1,18 @@
 use super::*;
+use crate::disk_records::{DiskRecords, RecordSorter, SortedRecordCursor};
+
+type ScannedSnapshotInputs<'a> = (
+    &'a DiskRecords<ScannedInput>,
+    &'a mut DiskRecords<DeferredInput>,
+    &'a DiskRecords<(String, PendingNormalizeRef)>,
+);
 
 type SnapshotPublicationGuard<'a> = &'a dyn Fn(&TreeObject) -> Result<()>;
 
 #[derive(Serialize, Deserialize)]
 struct IndexDeferrals {
     head: Option<String>,
-    inputs: Vec<DeferredInput>,
+    inputs: DiskRecords<DeferredInput>,
 }
 
 impl Repository {
@@ -113,21 +120,22 @@ impl Repository {
 
     /// Capture only verified scan inputs and keep the prior entries for paths
     /// that changed during this pass. Normalization still binds to the raw hash.
+    /// Each input stream is ordered by path, with at most one record per path.
     pub fn auto_snapshot_scanned(
         &self,
         message: &str,
-        inputs: &ScannedInputs,
-        deferred: &mut DeferredInputs,
-        normalize_by_path: &BTreeMap<String, PendingNormalizeRef>,
+        inputs: &DiskRecords<ScannedInput>,
+        mut deferred: DiskRecords<DeferredInput>,
+        normalizes: &DiskRecords<(String, PendingNormalizeRef)>,
         publication_guard: SnapshotPublicationGuard<'_>,
-    ) -> Result<(SnapshotOutcome, Vec<DeferredInput>)> {
+    ) -> Result<(SnapshotOutcome, DiskRecords<DeferredInput>)> {
         let _lock = self.lock_store_in_session(&self.lock_session)?;
         let outcome = self.snapshot_with_type(
             Some(message),
             None,
             CommitType::Auto,
             &|_| true,
-            normalize_by_path,
+            &BTreeMap::new(),
             &BTreeSet::new(),
             false,
             &[],
@@ -138,43 +146,57 @@ impl Repository {
             None,
             None,
             Some(publication_guard),
-            Some((inputs, deferred)),
+            Some((inputs, &mut deferred, normalizes)),
         )?;
-        let inputs: Vec<_> = std::mem::take(deferred)
-            .into_iter()
-            .map(|(path, reason)| DeferredInput { path, reason })
-            .collect();
-        self.write_index_deferrals(&inputs)?;
-        Ok((outcome, inputs))
+        self.write_index_deferrals(&deferred)?;
+        Ok((outcome, deferred))
     }
 
-    fn write_index_deferrals(&self, inputs: &[DeferredInput]) -> Result<()> {
+    fn write_index_deferrals(&self, inputs: &DiskRecords<DeferredInput>) -> Result<()> {
         let directory = self.store_directory()?;
         let leaf = Path::new("index-deferrals.json");
-        if inputs.is_empty() && directory.read_optional(leaf, u64::MAX)?.is_none() {
+        if inputs.is_empty() && !directory.contains_entry(leaf)? {
             return Ok(());
         }
-        let bytes = serde_json::to_vec(&IndexDeferrals {
+        let report = IndexDeferrals {
             head: self.head_commit_hash()?,
-            inputs: inputs.to_vec(),
+            inputs: inputs.clone(),
+        };
+        directory.write_atomic_stream(leaf, crate::store_dir::Publication::Upsert, |file| {
+            let mut writer = std::io::BufWriter::new(file);
+            serde_json::to_writer(&mut writer, &report).map_err(|error| {
+                if let Some(kind) = error.io_error_kind() {
+                    crate::store_dir::atomic::io_failure(
+                        "cannot write index deferrals",
+                        std::io::Error::new(kind, error),
+                    )
+                } else {
+                    KioError::schema(error.to_string())
+                }
+            })?;
+            std::io::Write::flush(&mut writer).map_err(|error| {
+                crate::store_dir::atomic::io_failure("cannot flush index deferrals", error)
+            })
         })
-        .map_err(|error| KioError::schema(error.to_string()))?;
-        directory.write_atomic(leaf, &bytes, crate::store_dir::Publication::Upsert)
     }
 
-    pub fn index_deferrals_at_head(&self, head: Option<&str>) -> Result<Vec<DeferredInput>> {
-        let Some(bytes) = self
-            .store_directory()?
-            .read_optional(Path::new("index-deferrals.json"), u64::MAX)?
-        else {
-            return Ok(Vec::new());
-        };
-        let report: IndexDeferrals = serde_json::from_slice(&bytes)
-            .map_err(|error| KioError::schema(format!("invalid index deferrals: {error}")))?;
+    pub fn index_deferrals_at_head(
+        &self,
+        head: Option<&str>,
+    ) -> Result<DiskRecords<DeferredInput>> {
+        let directory = self.store_directory()?;
+        let leaf = Path::new("index-deferrals.json");
+        if !directory.contains_entry(leaf)? {
+            return Ok(DiskRecords::empty());
+        }
+        let file = directory.open_regular_read(leaf, u64::MAX)?;
+        let scratch = crate::disk_records::RecordStageRoot::temporary()?;
+        let report: IndexDeferrals =
+            crate::disk_records::decode_bounded_json(&scratch, std::io::BufReader::new(file))?;
         Ok(if report.head.as_deref() == head {
             report.inputs
         } else {
-            Vec::new()
+            DiskRecords::empty()
         })
     }
 
@@ -427,7 +449,11 @@ impl Repository {
         message: Option<&str>,
         normalize_by_path: &BTreeMap<String, PendingNormalizeRef>,
     ) -> Result<SnapshotOutcome> {
-        self.promote_normalize_refs_with_tool_lock_hash(message, normalize_by_path, None)
+        self.promote_normalize_refs_with_tool_lock_hash(
+            message,
+            &mut |path| Ok(normalize_by_path.get(path).cloned()),
+            None,
+        )
     }
 
     /// Promotion variant used by a caller that has durably staged the next
@@ -436,7 +462,7 @@ impl Repository {
     pub fn promote_normalize_refs_with_staged_tool_lock(
         &self,
         message: Option<&str>,
-        normalize_by_path: &BTreeMap<String, PendingNormalizeRef>,
+        normalizes: &DiskRecords<(String, PendingNormalizeRef)>,
         tool_lock_hash: &str,
     ) -> Result<SnapshotOutcome> {
         if !is_hash(tool_lock_hash) {
@@ -451,9 +477,10 @@ impl Repository {
                     "staged promotion tool_lock_hash must name a published immutable tool-lock",
                 )
             })?;
+        let mut normalizes = SortedRecordCursor::new(normalizes.iter(), |row| &row.0);
         self.promote_normalize_refs_with_tool_lock_hash(
             message,
-            normalize_by_path,
+            &mut |path| Ok(normalizes.at(path)?.map(|row| row.1.clone())),
             Some(tool_lock_hash),
         )
     }
@@ -461,7 +488,7 @@ impl Repository {
     fn promote_normalize_refs_with_tool_lock_hash(
         &self,
         message: Option<&str>,
-        normalize_by_path: &BTreeMap<String, PendingNormalizeRef>,
+        normalize_for_path: &mut dyn FnMut(&str) -> Result<Option<PendingNormalizeRef>>,
         staged_tool_lock_hash: Option<&str>,
     ) -> Result<SnapshotOutcome> {
         self.validate()?;
@@ -492,20 +519,20 @@ impl Repository {
             Err(error) => return Err(error),
         };
         let current = self.build_working_tree(false)?.tree;
-        let current_raw = tree_map(&current)?;
+        let mut current_raw = SortedRecordCursor::new(current.entries.iter(), |entry| &entry.path);
         let purge = self.purge_state()?;
         let mut promoted_tree = prior_tree.clone();
         let mut changed = false;
         let mut updated = crate::disk_records::RecordWriter::new(&self.store.record_stages()?)?;
         for entry in &promoted_tree.entries {
             let mut entry = entry?;
-            let Some(pending) = normalize_by_path.get(&entry.path) else {
+            let Some(pending) = normalize_for_path(&entry.path)? else {
                 updated.push(&entry)?;
                 continue;
             };
             let exact_current = current_raw
-                .get(&entry.path)
-                .is_some_and(|raw_hash| raw_hash == &pending.expected_raw_hash);
+                .at(&entry.path)?
+                .is_some_and(|file| file.raw_hash == pending.expected_raw_hash);
             if !exact_current || entry.raw_hash != pending.expected_raw_hash {
                 updated.push(&entry)?;
                 continue;
@@ -680,7 +707,7 @@ impl Repository {
         expected_scheduled_authority: Option<&ScheduledSnapshotAuthority>,
         before_ref_publication: Option<&mut dyn FnMut() -> Result<SnapshotAutoStateBinding>>,
         publication_guard: Option<SnapshotPublicationGuard<'_>>,
-        mut scanned: Option<(&ScannedInputs, &mut DeferredInputs)>,
+        mut scanned: Option<ScannedSnapshotInputs<'_>>,
     ) -> Result<SnapshotOutcome> {
         // A retained repository is also used by the existing child-index
         // subprocess.  Bound descriptors plus `commit_type=auto` therefore do
@@ -765,12 +792,12 @@ impl Repository {
         };
         let working = {
             let _archive_lock = self.lock_store_in_session(&self.lock_session)?;
-            if let Some((inputs, deferred)) = scanned.as_mut() {
+            if let Some((inputs, deferred, normalizes)) = scanned.as_mut() {
                 self.archive_scanned_working_tree(
                     inputs,
                     deferred,
                     prior_tree.as_ref(),
-                    normalize_by_path,
+                    normalizes,
                     &chunking_config_hash,
                 )?
             } else {
@@ -782,7 +809,7 @@ impl Repository {
                 )?;
                 self.archive_staged_working_tree(
                     candidates,
-                    normalize_by_path,
+                    &mut |path| Ok(normalize_by_path.get(path).cloned()),
                     self.archive_limits,
                     &purge_self_targets,
                     expected_raw_by_path,
@@ -809,17 +836,18 @@ impl Repository {
         // stays defensive (keeps a mid-purge re-run of this method, e.g.
         // re-purge, from ever retiring the marker it is itself about to
         // create).
-        let resurrection_candidates = if scheduled_bound || commit_type == CommitType::Purged {
-            BTreeSet::new()
-        } else {
+        let mut resurrection_candidates = None;
+        if !scheduled_bound && commit_type != CommitType::Purged {
             let purge = self.purge_state()?;
-            let mut candidates = BTreeSet::new();
+            let mut sorter = RecordSorter::new(&self.store.record_stages()?, String::cmp);
+            let mut found = false;
+            let mut deferred = SortedRecordCursor::new(
+                scanned.iter().flat_map(|(_, rows, _)| rows.iter()),
+                |entry| &entry.path,
+            );
             for entry in &working.entries {
                 let entry = entry?;
-                if scanned
-                    .as_ref()
-                    .is_some_and(|(_, deferred)| deferred.contains_key(&entry.path))
-                {
+                if deferred.at(&entry.path)?.is_some() {
                     continue;
                 }
                 let tombstoned = purge
@@ -829,11 +857,14 @@ impl Repository {
                     .read_erase_receipt(&entry.raw_hash)?
                     .is_some_and(|receipt| receipt.is_active());
                 if tombstoned || erased {
-                    candidates.insert(entry.raw_hash.clone());
+                    sorter.push(entry.raw_hash)?;
+                    found = true;
                 }
             }
-            candidates
-        };
+            if found {
+                resurrection_candidates = Some(sorter.finish()?);
+            }
+        }
 
         let tree_hash = self.store.write_tree(&working)?;
         let stats = commit_stats(prior_tree.as_ref(), &working)?;
@@ -846,7 +877,7 @@ impl Repository {
         // object being alive again.
         let (current_tool_lock_hash, current_tool_lock_bytes) = self.tool_lock_identity()?;
         if !force_commit
-            && resurrection_candidates.is_empty()
+            && resurrection_candidates.is_none()
             && head_tree_hash.as_deref() == Some(tree_hash.as_str())
             && head_commit
                 .as_ref()
@@ -1078,11 +1109,11 @@ impl Repository {
         // active (LC24, safe side); the next locked mutation touching this
         // raw_hash (this same code path, naturally re-run) or an explicit
         // `kio repair verify-objects` backfill (LC27) completes it later.
-        if !resurrection_candidates.is_empty() {
+        if let Some(resurrection_candidates) = resurrection_candidates {
             let purge = self.purge_state()?;
             let actor = std::env::var("USER").unwrap_or_else(|_| "local-user".to_owned());
             purge.retire_resurrected(
-                &resurrection_candidates,
+                resurrection_candidates.iter(),
                 &commit_hash,
                 &commit.created_at,
                 &actor,

@@ -16,8 +16,8 @@ pub(crate) struct ReindexExecution {
 
 #[derive(Debug, Serialize)]
 pub struct HeadReindexResponse {
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub deferred_inputs: Vec<kio_core::scope::DeferredInput>,
+    #[serde(skip_serializing_if = "kio_core::disk_records::DiskRecords::is_empty")]
+    pub deferred_inputs: kio_core::disk_records::DiskRecords<kio_core::scope::DeferredInput>,
     pub status: String,
     pub reindexed_files: u64,
     pub commit_hash: Option<String>,

@@ -126,6 +126,16 @@ pub(crate) fn replace(
         .map_err(|e| error(&directory.path().join(leaf), e))
 }
 
+/// Replace an already streamed projection without accumulating a prefix of
+/// the journal in memory.
+pub(crate) fn replace_streamed(
+    directory: &StoreDirectory,
+    leaf: &Path,
+    records: impl IntoIterator<Item = Result<Vec<u8>>>,
+) -> Result<()> {
+    replace_with(directory, leaf, records, |_| Ok(()))
+}
+
 fn replace_with(
     directory: &StoreDirectory,
     leaf: &Path,

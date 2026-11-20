@@ -1,6 +1,6 @@
 use super::*;
 use crate::dag::TreeBuilder;
-use crate::disk_records::{DiskRecords, RecordSorter, RecordWriter};
+use crate::disk_records::{DiskRecords, RecordSorter, RecordWriter, SortedRecordCursor};
 
 pub(super) struct WorkingCandidates {
     names: DiskRecords<String>,
@@ -134,7 +134,7 @@ impl Repository {
             // applies unconditionally here, as it always has.
             return self.archive_staged_working_tree(
                 candidates,
-                normalize_by_path,
+                &mut |path| Ok(normalize_by_path.get(path).cloned()),
                 limits,
                 &BTreeSet::new(),
                 None,
@@ -143,11 +143,36 @@ impl Repository {
                 &chunking_config_hash,
             );
         }
-        let mut entries =
-            TreeBuilder::new(&self.store.record_stages()?, chunking_config_hash.clone());
+        self.read_working_tree(
+            candidates,
+            normalize_by_path,
+            &DiskRecords::empty(),
+            chunking_config_hash,
+            limits,
+        )
+    }
+
+    fn read_working_tree(
+        &self,
+        candidates: WorkingCandidates,
+        normalize_by_path: &BTreeMap<String, PendingNormalizeRef>,
+        deferred: &DiskRecords<DeferredInput>,
+        chunking_config_hash: String,
+        limits: ArchiveLimits,
+    ) -> Result<WorkingTree> {
+        let mut deferred = SortedRecordCursor::new(deferred.iter(), |row| &row.path);
+        let mut entries = TreeBuilder::new(&self.store.record_stages()?, chunking_config_hash);
         let mut consumed_scope_bytes = 0_u64;
+        let mut count = 0;
         for candidate in candidates.iter() {
             let candidate = candidate?;
+            if deferred.at(&candidate.file_name)?.is_some() {
+                continue;
+            }
+            if count == TREE_ENTRY_WARNING_THRESHOLD {
+                warn_large_working_tree();
+            }
+            count += 1;
             let mut file = open_working_file_candidate(&candidate, self.control())?;
             let metadata = file.metadata().kio_io(&candidate.path)?;
             let remaining = limits
@@ -194,10 +219,15 @@ impl Repository {
         })
     }
 
-    pub fn validate_scanned_archive_budget(&self, inputs: &ScannedInputs) -> Result<()> {
+    pub fn validate_scanned_archive_budget(
+        &self,
+        inputs: &DiskRecords<ScannedInput>,
+    ) -> Result<()> {
         let limits = self.archive_limits;
         let mut consumed = 0u64;
-        for (name, input) in inputs {
+        for input in inputs {
+            let input = input?;
+            let name = &input.path;
             if input.raw_hash.is_none() {
                 continue;
             }
@@ -216,10 +246,10 @@ impl Repository {
 
     pub(super) fn archive_scanned_working_tree(
         &self,
-        inputs: &ScannedInputs,
-        deferred: &mut DeferredInputs,
+        inputs: &DiskRecords<ScannedInput>,
+        deferred: &mut DiskRecords<DeferredInput>,
         prior_tree: Option<&TreeObject>,
-        normalize_by_path: &BTreeMap<String, PendingNormalizeRef>,
+        normalizes: &DiskRecords<(String, PendingNormalizeRef)>,
         chunking_config_hash: &str,
     ) -> Result<WorkingTree> {
         let root = self.bound_root.as_deref().ok_or_else(|| {
@@ -227,9 +257,7 @@ impl Repository {
         })?;
         self.validate_scanned_archive_budget(inputs)?;
         if inputs.len() > TREE_ENTRY_WARNING_THRESHOLD {
-            eprintln!(
-                "warning: scope has more than 10,000 direct files; split into subfolders or use ignore; processing all files"
-            );
+            warn_large_working_tree();
         }
         self.store.cleanup_bound_raw_stages()?;
         let record_stages = self.store.record_stages()?;
@@ -237,29 +265,46 @@ impl Repository {
             records: RecordWriter::new(&record_stages)?,
             store: &self.store,
         };
-        for (name, input) in inputs {
-            if deferred.contains_key(name) {
+        let mut new_deferrals = RecordWriter::new(&record_stages)?;
+        let mut prior_deferrals = SortedRecordCursor::new(deferred.iter(), |row| &row.path);
+        for input in inputs {
+            let input = input?;
+            let name = input.path;
+            if prior_deferrals.at(&name)?.is_some() {
                 continue;
             }
-            let Some(raw_hash) = input.raw_hash.as_deref() else {
-                deferred.insert(name.clone(), DeferredInputReason::UnstableDuringScan);
-                continue;
+            let staged = match input.raw_hash.as_deref() {
+                Some(raw_hash) => {
+                    self.stage_scanned_input(root, &name, raw_hash, input.size_bytes)?
+                }
+                None => Err(DeferredInputReason::UnstableDuringScan),
             };
-            match self.stage_scanned_input(root, name, raw_hash, input.size_bytes)? {
-                Ok((stage, source)) => {
+            match staged {
+                Ok((mut stage, source)) => {
                     batch.records.push(&ArchivedFile {
-                        name: name.clone(),
+                        name,
                         size: stage.size_bytes(),
                         source,
                         stage: stage.saved(),
                     })?;
-                    let mut stage = stage;
                     stage.detach();
                 }
-                Err(reason) => {
-                    deferred.insert(name.clone(), reason);
-                }
+                Err(reason) => new_deferrals.push(&DeferredInput { path: name, reason })?,
             }
+        }
+        let new_deferrals = new_deferrals.finish()?;
+        if deferred.is_empty() {
+            *deferred = new_deferrals;
+        } else if !new_deferrals.is_empty() {
+            let mut combined = RecordWriter::new(&record_stages)?;
+            for row in crate::disk_records::merge_sorted_records(
+                deferred.iter(),
+                new_deferrals.iter(),
+                |a, b| a.path.cmp(&b.path),
+            ) {
+                combined.push(&row?)?;
+            }
+            *deferred = combined.finish()?;
         }
 
         let purge = self.purge_state()?;
@@ -267,18 +312,20 @@ impl Repository {
         if !deferred.is_empty()
             && let Some(prior) = prior_tree
         {
+            let mut deferred_paths = SortedRecordCursor::new(deferred.iter(), |row| &row.path);
             for entry in &prior.entries {
                 let entry = entry?;
-                if deferred.contains_key(&entry.path) {
+                if deferred_paths.at(&entry.path)?.is_some() {
                     ensure_raw_publication_allowed(&purge, &entry.raw_hash)?;
                     entries.push(entry)?;
                 }
             }
         }
+        let mut normalizes = SortedRecordCursor::new(normalizes.iter(), |row| &row.0);
         self.publish_archive_batch(
             &batch,
             &mut entries,
-            normalize_by_path,
+            &mut |path| Ok(normalizes.at(path)?.map(|(_, pending)| pending.clone())),
             &BTreeSet::new(),
             Some(&purge),
         )?;
@@ -338,7 +385,7 @@ impl Repository {
     pub(super) fn archive_staged_working_tree(
         &self,
         candidates: WorkingCandidates,
-        normalize_by_path: &BTreeMap<String, PendingNormalizeRef>,
+        normalize_for_path: &mut dyn FnMut(&str) -> Result<Option<PendingNormalizeRef>>,
         limits: ArchiveLimits,
         purge_self_targets: &BTreeSet<String>,
         expected_raw_by_path: Option<&BTreeMap<String, String>>,
@@ -461,7 +508,7 @@ impl Repository {
         self.publish_archive_batch(
             &batch,
             &mut entries,
-            normalize_by_path,
+            normalize_for_path,
             purge_self_targets,
             purge.as_ref(),
         )?;
@@ -474,7 +521,7 @@ impl Repository {
         &self,
         batch: &ArchiveBatch<'_>,
         entries: &mut TreeBuilder,
-        normalize_by_path: &BTreeMap<String, PendingNormalizeRef>,
+        normalize_for_path: &mut dyn FnMut(&str) -> Result<Option<PendingNormalizeRef>>,
         purge_self_targets: &BTreeSet<String>,
         purge: Option<&PurgeState>,
     ) -> Result<()> {
@@ -505,7 +552,7 @@ impl Repository {
                     .with_context_field("saved", json!(false))
             })?;
             let mut entry = TreeEntry::raw_file(record.name.clone(), hash)?;
-            attach_pending_normalize(&mut entry, &record.name, normalize_by_path);
+            attach_pending_normalize(&mut entry, &record.name, normalize_for_path(&record.name)?);
             entries.push(entry)?;
         }
         Ok(())
@@ -515,7 +562,7 @@ impl Repository {
         &self,
         include_path: &dyn Fn(&str) -> bool,
         explicitly_allowed_tier_a_paths: &BTreeSet<String>,
-        enforce_tier_a: bool,
+        for_archive: bool,
         limits: ArchiveLimits,
     ) -> Result<WorkingCandidates> {
         let mut candidates = RecordSorter::<String>::new(&self.store.record_stages()?, |a, b| {
@@ -558,32 +605,33 @@ impl Repository {
                     eprintln!("warning: skipping non-regular file: {}", path.display());
                     continue;
                 }
-                if enforce_tier_a
+                if for_archive
                     && is_tier_a_secret_name(&file_name)
                     && !explicitly_allowed_tier_a_paths.contains(&file_name)
                 {
                     eprintln!("warning: skipping Tier-A secret file: {file_name}");
                     continue;
                 }
-                if count == TREE_ENTRY_WARNING_THRESHOLD {
-                    eprintln!(
-                        "warning: scope has more than 10,000 direct files; split into subfolders or use ignore; processing all files"
-                    );
-                }
-                let file = open_bound_scope_file_nofollow(root, &file_name, &path, self.control())?;
-                let metadata = file.metadata().kio_io(&path)?;
-                if metadata.len() > limits.max_file_bytes {
-                    return Err(scope_input_oversized(&file_name, limits, metadata.len()));
-                }
-                declared_scope_bytes = declared_scope_bytes
-                    .checked_add(metadata.len())
-                    .ok_or_else(|| scope_total_oversized(&file_name, limits, u64::MAX))?;
-                if declared_scope_bytes > limits.max_scope_bytes {
-                    return Err(scope_total_oversized(
-                        &file_name,
-                        limits,
-                        declared_scope_bytes,
-                    ));
+                if for_archive {
+                    if count == TREE_ENTRY_WARNING_THRESHOLD {
+                        warn_large_working_tree();
+                    }
+                    let file =
+                        open_bound_scope_file_nofollow(root, &file_name, &path, self.control())?;
+                    let metadata = file.metadata().kio_io(&path)?;
+                    if metadata.len() > limits.max_file_bytes {
+                        return Err(scope_input_oversized(&file_name, limits, metadata.len()));
+                    }
+                    declared_scope_bytes = declared_scope_bytes
+                        .checked_add(metadata.len())
+                        .ok_or_else(|| scope_total_oversized(&file_name, limits, u64::MAX))?;
+                    if declared_scope_bytes > limits.max_scope_bytes {
+                        return Err(scope_total_oversized(
+                            &file_name,
+                            limits,
+                            declared_scope_bytes,
+                        ));
+                    }
                 }
                 candidates.push(file_name)?;
                 count += 1;
@@ -620,32 +668,32 @@ impl Repository {
                     continue;
                 }
             };
-            if enforce_tier_a
+            if for_archive
                 && is_tier_a_secret_name(&file_name)
                 && !explicitly_allowed_tier_a_paths.contains(&file_name)
             {
                 eprintln!("warning: skipping Tier-A secret file: {file_name}");
                 continue;
             }
-            if count == TREE_ENTRY_WARNING_THRESHOLD {
-                eprintln!(
-                    "warning: scope has more than 10,000 direct files; split into subfolders or use ignore; processing all files"
-                );
-            }
-            let file = open_scope_file_nofollow(&path)?;
-            let metadata = file.metadata().kio_io(&path)?;
-            if metadata.len() > limits.max_file_bytes {
-                return Err(scope_input_oversized(&file_name, limits, metadata.len()));
-            }
-            declared_scope_bytes = declared_scope_bytes
-                .checked_add(metadata.len())
-                .ok_or_else(|| scope_total_oversized(&file_name, limits, u64::MAX))?;
-            if declared_scope_bytes > limits.max_scope_bytes {
-                return Err(scope_total_oversized(
-                    &file_name,
-                    limits,
-                    declared_scope_bytes,
-                ));
+            if for_archive {
+                if count == TREE_ENTRY_WARNING_THRESHOLD {
+                    warn_large_working_tree();
+                }
+                let file = open_scope_file_nofollow(&path)?;
+                let metadata = file.metadata().kio_io(&path)?;
+                if metadata.len() > limits.max_file_bytes {
+                    return Err(scope_input_oversized(&file_name, limits, metadata.len()));
+                }
+                declared_scope_bytes = declared_scope_bytes
+                    .checked_add(metadata.len())
+                    .ok_or_else(|| scope_total_oversized(&file_name, limits, u64::MAX))?;
+                if declared_scope_bytes > limits.max_scope_bytes {
+                    return Err(scope_total_oversized(
+                        &file_name,
+                        limits,
+                        declared_scope_bytes,
+                    ));
+                }
             }
             candidates.push(file_name)?;
             count += 1;
@@ -658,70 +706,94 @@ impl Repository {
     }
 
     pub fn status(&self) -> Result<StatusReport> {
-        self.status_with_deferred(&[])
+        self.status_with_deferred(&DiskRecords::empty())
     }
 
-    pub fn status_with_deferred(&self, deferred: &[DeferredInput]) -> Result<StatusReport> {
-        let deferred_paths: BTreeSet<_> = deferred.iter().map(|entry| entry.path.clone()).collect();
+    /// Exclude the sorted deferrals before opening files for status.
+    pub fn status_with_deferred(
+        &self,
+        deferred: &DiskRecords<DeferredInput>,
+    ) -> Result<StatusReport> {
         let _inspection = crate::disk_records::StageInspection::begin();
         self.validate()?;
+        let limits = ArchiveLimits::default();
+        let candidates =
+            self.working_file_candidates(&|_| true, &BTreeSet::new(), false, limits)?;
         let current = self
-            .build_working_tree_filtered(false, &deferred_paths)?
+            .read_working_tree(
+                candidates,
+                &BTreeMap::new(),
+                deferred,
+                self.effective_chunking_config_hash()?,
+                limits,
+            )?
             .tree;
-        let current_map = tree_map(&current)?;
-        // R15-4: a shallow HEAD (tree object discarded) must NOT brick a pure read.
-        // Degrade to listing the current files without a classification instead of
-        // propagating the raw KIO-E-STORE-NOT-FOUND-001 from `read_tree`.
-        let (head_map, head_shallow) = match self.head_tree_state()? {
-            HeadTreeState::Unborn => (BTreeMap::new(), false),
-            HeadTreeState::Present(tree) => (tree_map(&tree)?, false),
-            HeadTreeState::Shallow => (BTreeMap::new(), true),
+        let mut deferred = SortedRecordCursor::new(deferred.iter(), |row| &row.path);
+        let (head, head_shallow) = match self.head_tree_state()? {
+            HeadTreeState::Unborn => (None, false),
+            HeadTreeState::Present(tree) => (Some(tree), false),
+            HeadTreeState::Shallow => (None, true),
         };
 
-        let mut paths = BTreeSet::new();
-        paths.extend(current_map.keys().cloned());
-        paths.extend(head_map.keys().cloned());
-
-        let mut statuses = Vec::new();
-        for path in paths {
-            if deferred_paths.contains(&path) {
+        let mut current = current.entries.iter();
+        let mut head = head.iter().flat_map(|tree| tree.entries.iter());
+        let mut new = current.next().transpose()?;
+        let mut old = head.next().transpose()?;
+        let mut statuses = RecordWriter::new(&self.store.record_stages()?)?;
+        while new.is_some() || old.is_some() {
+            let order = match (&old, &new) {
+                (Some(old), Some(new)) => old.path.cmp(&new.path),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                _ => std::cmp::Ordering::Greater,
+            };
+            let (entry, status) = match order {
+                std::cmp::Ordering::Less => (
+                    std::mem::replace(&mut old, head.next().transpose()?),
+                    "deleted",
+                ),
+                std::cmp::Ordering::Greater => (
+                    std::mem::replace(&mut new, current.next().transpose()?),
+                    "new",
+                ),
+                std::cmp::Ordering::Equal => {
+                    let previous = std::mem::replace(&mut old, head.next().transpose()?)
+                        .expect("matched HEAD entry");
+                    let entry = std::mem::replace(&mut new, current.next().transpose()?);
+                    let status = if entry
+                        .as_ref()
+                        .is_some_and(|row| row.raw_hash == previous.raw_hash)
+                    {
+                        "unchanged"
+                    } else {
+                        "modified"
+                    };
+                    (entry, status)
+                }
+            };
+            let entry = entry.expect("status merge has an entry");
+            if deferred.at(&entry.path)?.is_some() {
                 continue;
             }
-            // Omit the tree-derived classification when HEAD is shallow — the prior
-            // tree needed to compute it is gone.
-            let status = if head_shallow {
-                if !current_map.contains_key(&path) {
-                    continue;
-                }
-                None
-            } else {
-                Some(
-                    match (head_map.get(&path), current_map.get(&path)) {
-                        (None, Some(_)) => "new",
-                        (Some(old), Some(new)) if old == new => "unchanged",
-                        (Some(_), Some(_)) => "modified",
-                        (Some(_), None) => "deleted",
-                        (None, None) => continue,
-                    }
-                    .to_owned(),
-                )
-            };
-            statuses.push(FileStatus {
-                path: is_materializable_direct_child(&path).then(|| self.root.join(&path)),
-                relative_path: path.clone(),
-                status,
-                raw_hash: current_map
-                    .get(&path)
-                    .or_else(|| head_map.get(&path))
-                    .cloned(),
-            });
+            statuses.push(&FileStatus {
+                path: is_materializable_direct_child(&entry.path)
+                    .then(|| self.root.join(&entry.path)),
+                relative_path: entry.path,
+                status: (!head_shallow).then(|| status.to_owned()),
+                raw_hash: Some(entry.raw_hash),
+            })?;
         }
         Ok(StatusReport {
             stage_residues: self.store.inspect_raw_stages()?,
-            files: statuses,
+            files: statuses.finish()?,
             head_shallow,
         })
     }
+}
+
+fn warn_large_working_tree() {
+    eprintln!(
+        "warning: scope has more than 10,000 direct files; split into subfolders or use ignore; processing all files"
+    );
 }
 
 fn scanned_open_failure(root: &File, name: &str, error: KioError) -> Result<DeferredInputReason> {

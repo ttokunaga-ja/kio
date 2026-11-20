@@ -222,6 +222,11 @@ pub struct DebugTestControl {
     pub cli: CliTestControl,
 }
 
+/// Enable allocation measurements in the debug CLI process.
+pub fn scan_heap_requested() -> bool {
+    std::env::var_os("KIO_TEST_SCAN_HEAP").as_deref() == Some(OsStr::new("1"))
+}
+
 /// Process-wide lock for tests that temporarily mutate environment variables.
 ///
 /// Every crate in one test process reaches this same lock through `kio-core`,

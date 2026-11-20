@@ -1,5 +1,7 @@
 mod args;
 mod release_binding;
+#[cfg(debug_assertions)]
+mod scan_heap;
 
 use std::io::{BufRead, IsTerminal, Read, Write};
 use std::process;
@@ -9,11 +11,13 @@ use clap::Parser;
 
 use crate::args::Cli;
 use kio_app::context::{AppContext, Interaction};
-use kio_app::response::Completion;
+use kio_app::response::{Completion, ResponseBody, index::IndexResponse, reindex::ReindexResponse};
 use kio_core::{ExitCode, KioError, Result};
 use serde_json::{Value, json};
 
 fn main() {
+    #[cfg(debug_assertions)]
+    scan_heap::start();
     release_binding::retain();
     kio_index::vec::ensure_registered();
     let cli = match Cli::try_parse() {
@@ -30,14 +34,77 @@ fn main() {
         interaction: Arc::new(TerminalInteraction { json_mode }),
     };
     let exit_code = match kio_app::execute(&context, cli.command.into()).and_then(|response| {
+        #[cfg(debug_assertions)]
+        scan_heap::output_started();
         let code = completion_exit_code(response.completion);
         let output = match response.body {
-            kio_app::response::ResponseBody::Inspect(
-                kio_app::response::history::InspectResponse::Tree(tree),
-            ) => {
+            ResponseBody::Inspect(kio_app::response::history::InspectResponse::Tree(tree)) => {
                 let stdout = std::io::stdout();
                 let mut writer = std::io::BufWriter::with_capacity(64 * 1024, stdout.lock());
                 write_inspected_tree(&tree, &mut writer, json_mode)?;
+                None
+            }
+            ResponseBody::Index(IndexResponse::Preview(preview)) => {
+                if json_mode {
+                    write_output_json(|writer| serde_json::to_writer(writer, &preview))?;
+                } else {
+                    println!("{}", terminal_safe_text(&preview.status, false));
+                }
+                None
+            }
+            ResponseBody::Index(IndexResponse::Published(report)) => {
+                if code != ExitCode::Success {
+                    append_completion_error(&json!({"error_code": report.error_code}), code);
+                }
+                if json_mode {
+                    write_output_json(|writer| serde_json::to_writer(writer, &report))?;
+                } else {
+                    println!("{}", terminal_safe_text(&report.status, false));
+                    write_deferred_inputs(&report.deferred_inputs, None)?;
+                    for child in report.child_scopes.iter().flatten() {
+                        write_deferred_inputs(&child.deferred_inputs, Some(&child.discovery.path))?;
+                    }
+                    if let Some(gc) = report.gc {
+                        let gc = serde_json::to_value(gc)
+                            .map_err(|error| KioError::schema(error.to_string()))?;
+                        print_gc_summary(&gc);
+                    }
+                }
+                None
+            }
+            ResponseBody::Reindex(ReindexResponse::Head(report)) => {
+                if code != ExitCode::Success {
+                    append_completion_error(&Value::Null, code);
+                }
+                if json_mode {
+                    write_output_json(|writer| serde_json::to_writer(writer, &report))?;
+                } else {
+                    println!("{}", terminal_safe_text(&report.status, false));
+                    write_deferred_inputs(&report.deferred_inputs, None)?;
+                }
+                None
+            }
+            ResponseBody::Status(status) => {
+                if json_mode {
+                    write_output_json(|writer| serde_json::to_writer(writer, &status))?;
+                } else {
+                    for file in &status.files {
+                        let file = file?;
+                        println!(
+                            "{} {}",
+                            terminal_safe_text(file.status.as_deref().unwrap_or_default(), false),
+                            terminal_safe_text(&file.relative_path, false)
+                        );
+                    }
+                    write_deferred_inputs(&status.deferred_inputs, None)?;
+                    if let Some(readiness) = status.office_readiness.as_ref() {
+                        print_office_readiness(
+                            readiness.state,
+                            &readiness.reason,
+                            readiness.alternatives,
+                        );
+                    }
+                }
                 None
             }
             body => Some(
@@ -61,7 +128,25 @@ fn main() {
             error.exit_code()
         }
     };
+    #[cfg(debug_assertions)]
+    scan_heap::report();
     process::exit(exit_code.code());
+}
+
+fn write_output_json(write: impl FnOnce(&mut dyn Write) -> serde_json::Result<()>) -> Result<()> {
+    let stdout = std::io::stdout();
+    let mut writer = std::io::BufWriter::with_capacity(64 * 1024, stdout.lock());
+    write(&mut writer).map_err(|error| {
+        if error.is_io() {
+            KioError::io(error.to_string(), "stdout")
+        } else {
+            KioError::schema(error.to_string())
+        }
+    })?;
+    writer
+        .write_all(b"\n")
+        .and_then(|()| writer.flush())
+        .map_err(|error| KioError::io(error.to_string(), "stdout"))
 }
 
 /// Inspect explicitly emits the complete tree, but neither JSON values nor
@@ -157,6 +242,16 @@ struct TerminalInteraction {
 }
 
 impl Interaction for TerminalInteraction {
+    #[cfg(debug_assertions)]
+    fn working_scan_started(&self) {
+        scan_heap::scan_started();
+    }
+
+    #[cfg(debug_assertions)]
+    fn working_scan_published(&self) {
+        scan_heap::scan_published();
+    }
+
     fn confirm(&self, summary: &str) -> Result<bool> {
         if !self.is_interactive() {
             return Ok(false);
@@ -289,6 +384,11 @@ fn clap_error_reason(err: &clap::Error) -> String {
         .to_string()
 }
 
+fn print_office_readiness(state: &str, reason: &str, alternatives: &str) {
+    let rendered = format!("Office: {state} — {reason}. {alternatives}");
+    println!("{}", terminal_safe_text(&rendered, false));
+}
+
 fn print_output(value: Value, json_mode: bool) {
     if json_mode {
         println!(
@@ -408,22 +508,20 @@ fn print_output(value: Value, json_mode: bool) {
             serde_json::to_string_pretty(&value).expect("serializing command output cannot fail");
         println!("{}", terminal_safe_text(&rendered, true));
     }
-    print_deferred_inputs(&value, None);
-    if let Some(children) = value.get("child_scopes").and_then(Value::as_array) {
-        for child in children {
-            print_deferred_inputs(child, child["path"].as_str());
-        }
-    }
     if let Some(readiness) = value.get("office_readiness") {
-        let rendered = format!(
-            "Office: {} — {}. {}",
+        print_office_readiness(
             readiness["state"].as_str().unwrap_or("unavailable"),
             readiness["reason"].as_str().unwrap_or(""),
-            readiness["alternatives"].as_str().unwrap_or("")
+            readiness["alternatives"].as_str().unwrap_or(""),
         );
-        println!("{}", terminal_safe_text(&rendered, false));
     }
-    if let Some(gc) = value.get("gc").and_then(Value::as_object) {
+    if let Some(gc) = value.get("gc") {
+        print_gc_summary(gc);
+    }
+}
+
+fn print_gc_summary(gc: &Value) {
+    if let Some(gc) = gc.as_object() {
         let status = gc
             .get("status")
             .and_then(Value::as_str)
@@ -437,18 +535,23 @@ fn print_output(value: Value, json_mode: bool) {
     }
 }
 
-fn print_deferred_inputs(report: &Value, scope: Option<&str>) {
-    if let Some(inputs) = report.get("deferred_inputs").and_then(Value::as_array) {
-        for input in inputs {
-            let path = input["path"].as_str().unwrap_or_default();
-            let path = scope.map_or_else(|| path.to_owned(), |scope| format!("{scope}/{path}"));
-            println!(
-                "deferred {} ({})",
-                terminal_safe_text(&path, false),
-                terminal_safe_text(input["reason"].as_str().unwrap_or_default(), false),
-            );
-        }
+fn write_deferred_inputs(
+    rows: &kio_core::disk_records::DiskRecords<kio_core::scope::DeferredInput>,
+    scope: Option<&str>,
+) -> Result<()> {
+    for row in rows {
+        let row = row?;
+        let path = match scope {
+            Some(scope) => format!("{scope}/{}", row.path),
+            None => row.path,
+        };
+        println!(
+            "deferred {} ({})",
+            terminal_safe_text(&path, false),
+            row.reason.as_str()
+        );
     }
+    Ok(())
 }
 
 fn print_error(error: &KioError, json_mode: bool) {

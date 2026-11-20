@@ -520,6 +520,22 @@ pub(super) fn recover(owner: &StoreDirectory, allowed_targets: &[&StoreDirectory
     recover_locked(owner, &workspace, allowed_targets, false)
 }
 
+fn write_artifact(file: &mut File, bytes: &[u8]) -> Result<()> {
+    file.write_all(bytes)
+        .map_err(|error| io_failure("cannot write atomic publication artifact", error))
+}
+
+pub(super) fn write_stream(
+    owner: &StoreDirectory,
+    relative: &Path,
+    publication: Publication,
+    write: impl FnOnce(&mut File) -> Result<()>,
+) -> Result<()> {
+    write_with_readonly(owner, owner, relative, write, publication, false, |_, _| {
+        Ok(())
+    })
+}
+
 pub(super) fn write(
     owner: &StoreDirectory,
     target: &StoreDirectory,
@@ -531,7 +547,7 @@ pub(super) fn write(
         owner,
         target,
         relative,
-        bytes,
+        |file| write_artifact(file, bytes),
         publication,
         false,
         |_, _| Ok(()),
@@ -549,7 +565,7 @@ pub(super) fn write_checked(
         owner,
         owner,
         relative,
-        bytes,
+        |file| write_artifact(file, bytes),
         publication,
         false,
         before_publish,
@@ -561,7 +577,7 @@ pub(super) fn write_readonly(owner: &StoreDirectory, relative: &Path, bytes: &[u
         owner,
         owner,
         relative,
-        bytes,
+        |file| write_artifact(file, bytes),
         Publication::CreateOnly,
         true,
         |_, _| Ok(()),
@@ -572,7 +588,7 @@ fn write_with_readonly(
     owner: &StoreDirectory,
     target: &StoreDirectory,
     relative: &Path,
-    bytes: &[u8],
+    write: impl FnOnce(&mut File) -> Result<()>,
     publication: Publication,
     readonly: bool,
     before_publish: impl FnOnce(&StoreDirectory, &Path) -> Result<()>,
@@ -587,9 +603,7 @@ fn write_with_readonly(
     let (parent, leaf, _) = parent_chain(target, relative)?;
     same_volume(&workspace, &parent)?;
     let mut staged = workspace.create_private_file(Path::new(WRITE))?;
-    staged
-        .write_all(bytes)
-        .map_err(|e| io_failure("cannot write atomic publication artifact", e))?;
+    write(&mut staged)?;
     if readonly {
         let mut permissions = staged
             .metadata()

@@ -107,6 +107,7 @@ pub(crate) fn run_init(ctx: &Invocation<'_>, args: commands::InitArgs) -> Result
 }
 
 pub(crate) fn run_status(ctx: &Invocation<'_>) -> Result<CommandResponse> {
+    let _inspection = kio_core::disk_records::StageInspection::begin();
     let repo = ctx.open_recovery_repository()?;
     validate_repo_tool_lock(&repo)?;
     let task_store = TaskStore::new_with_control(repo.kio_dir(), repo.control().clone());
@@ -121,7 +122,7 @@ pub(crate) fn run_status(ctx: &Invocation<'_>) -> Result<CommandResponse> {
                 UnsupportedInputStore::new(repo.kio_dir())
                     .latest_by_path()
                     .map_err(pipeline_to_kio)?;
-                (Vec::new(), false)
+                (kio_core::disk_records::DiskRecords::empty(), false)
             } else {
                 (unsupported_inputs_at_head(&repo, head)?, true)
             };

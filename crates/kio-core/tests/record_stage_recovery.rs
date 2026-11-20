@@ -108,7 +108,7 @@ fn killed_record_writer_is_reported_and_reclaimed_on_retry() {
     let repo = Repository::open(fixture.path()).unwrap();
     let residues = repo.object_store().inspect_raw_stages().unwrap();
     assert!(
-        residues.iter().any(|entry| entry.path.contains("record")),
+        residues.any(|entry| entry.path.contains("record")).unwrap(),
         "killed writer's record stage was lost: {residues:?}"
     );
     let search = Repository::open_for_search(fixture.path()).unwrap();
@@ -145,8 +145,8 @@ fn killed_record_writer_is_reported_and_reclaimed_on_retry() {
     assert!(
         status
             .stage_residues
-            .iter()
-            .any(|entry| entry.path.contains("record")),
+            .any(|entry| entry.path.contains("record"))
+            .unwrap(),
         "status must report record residues before a retry"
     );
     let other_fixture = tempfile::tempdir().unwrap();

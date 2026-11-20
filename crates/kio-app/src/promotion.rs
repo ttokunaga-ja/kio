@@ -6,7 +6,6 @@
 //! only verified done units.
 use crate::index::command::read_repository_scan_input;
 use crate::index::command::repository_scan_policy_allows_file;
-use crate::index::pipeline::IndexPipelineResult;
 use crate::index::rebuild::rebuild_step3_index;
 use crate::object_persistence::adapter_to_kio;
 use crate::object_persistence::pipeline_to_kio;
@@ -23,6 +22,7 @@ use kio_adapter::types::AdapterProfile;
 use kio_core::control::ControlHandle;
 use kio_core::dag::CommitType;
 use kio_core::dag::NormalizeRef;
+use kio_core::disk_records::{DiskRecords, RecordSorter, RecordWriter, SortedRecordCursor};
 use kio_core::scope::PendingNormalizeRef;
 use kio_pipeline::task::TaskStore;
 use kio_pipeline::task::TaskType;
@@ -46,7 +46,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::object_persistence::atomic_overwrite_file;
-use crate::*;
 
 const PROMOTION_STATE_FILE: &str = "promotion-state.json";
 const PROMOTION_STATE_MAX_BYTES: u64 = 1024 * 1024;
@@ -249,7 +248,7 @@ pub(crate) fn promotion_recovery_error(phase: &str, message: impl Into<String>) 
 }
 
 /// One complete online result that is safe to consider for promotion.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ValidatedOnlinePromotion {
     pub task_id: String,
     pub input_path: String,
@@ -267,92 +266,104 @@ pub(crate) struct ValidatedOnlinePromotion {
 /// candidates.  A task that claims `online_adapter_done` but points at malformed or
 /// incomplete persisted output is store corruption, not something to silently bind
 /// into a commit.
+#[cfg(test)]
 pub(crate) fn validated_online_promotions(
     kio_dir: &Path,
     tasks: &[TaskDescriptor],
     control: &ControlHandle,
 ) -> PipelineResult<Vec<ValidatedOnlinePromotion>> {
     let mut promotions = Vec::new();
-    for task in tasks {
-        if task.task_type != kio_pipeline::task::TaskType::Markdownize
-            || !(task.status == TaskStatus::Done
-                && task.fallback_reason.as_deref() == Some("online_adapter_done")
-                || task.status == TaskStatus::Partial
-                    && task.bbox_annotation_enabled.is_some()
-                    && task.hold_reason == Some(kio_pipeline::task::HoldReason::ResourceLimit))
-        {
-            continue;
-        }
-
-        let output = validate_task_output_ref(kio_dir, task)?;
-        let TaskOutputRef::NormalizedInstance {
-            raw_hash,
-            tool_profile_hash,
-            r#gen,
-            ..
-        } = output
-        else {
-            return Err(PipelineError::corrupt(
-                kio_dir.join("tasks.jsonl").display().to_string(),
-                "completed online Markdownize task has no normalized-instance output",
-            ));
-        };
-        let instance = load_validated_normalized_instance_with_control(
-            kio_dir,
-            &raw_hash,
-            &tool_profile_hash,
-            r#gen,
-            control,
-        )?;
-        let complete = task.status == TaskStatus::Done
-            && !instance.manifest.units.is_empty()
-            && instance
-                .manifest
-                .units
-                .iter()
-                .all(|unit| unit.status == UnitStatus::Done)
-            && instance.units.len() == instance.manifest.units.len();
-        let resource_partial = resource_partial_can_publish(task, &instance);
-        if !complete && !resource_partial {
-            return Err(PipelineError::corrupt(
-                task.output_ref.clone(),
-                "Done online Markdownize task points at an incomplete normalized instance",
-            ));
-        }
-        let bbox_annotation_enabled = task.bbox_annotation_enabled.ok_or_else(|| {
-            PipelineError::corrupt(
-                kio_dir.join("tasks.jsonl").display().to_string(),
-                "completed online Markdownize task is missing bbox_annotation_enabled policy stamp",
-            )
-        })?;
-        promotions.push(ValidatedOnlinePromotion {
-            task_id: task.task_id.clone(),
-            input_path: task.input_path.clone(),
-            raw_hash,
-            tool_profile_hash,
-            r#gen,
-            created_at: task.created_at.clone(),
-            bbox_annotation_enabled,
-        });
+    for task in tasks.iter().filter(|task| is_online_promotion(task)) {
+        promotions.push(validate_online_promotion(kio_dir, task, control)?);
     }
-    promotions.sort_by(|left, right| {
-        left.input_path
-            .as_bytes()
-            .cmp(right.input_path.as_bytes())
-            .then_with(|| left.created_at.cmp(&right.created_at))
-            .then_with(|| left.task_id.cmp(&right.task_id))
-    });
+    promotions.sort_by(compare_online_promotions);
     Ok(promotions)
+}
+
+fn is_online_promotion(task: &TaskDescriptor) -> bool {
+    task.task_type == TaskType::Markdownize
+        && (task.status == TaskStatus::Done
+            && task.fallback_reason.as_deref() == Some("online_adapter_done")
+            || task.status == TaskStatus::Partial
+                && task.bbox_annotation_enabled.is_some()
+                && task.hold_reason == Some(kio_pipeline::task::HoldReason::ResourceLimit))
+}
+
+fn compare_online_promotions(
+    left: &ValidatedOnlinePromotion,
+    right: &ValidatedOnlinePromotion,
+) -> std::cmp::Ordering {
+    left.input_path
+        .cmp(&right.input_path)
+        .then_with(|| left.created_at.cmp(&right.created_at))
+        .then_with(|| left.task_id.cmp(&right.task_id))
+}
+
+fn validate_online_promotion(
+    kio_dir: &Path,
+    task: &TaskDescriptor,
+    control: &ControlHandle,
+) -> PipelineResult<ValidatedOnlinePromotion> {
+    let output = validate_task_output_ref(kio_dir, task)?;
+    let TaskOutputRef::NormalizedInstance {
+        raw_hash,
+        tool_profile_hash,
+        r#gen,
+        ..
+    } = output
+    else {
+        return Err(PipelineError::corrupt(
+            kio_dir.join("tasks.jsonl").display().to_string(),
+            "completed online Markdownize task has no normalized-instance output",
+        ));
+    };
+    let instance = load_validated_normalized_instance_with_control(
+        kio_dir,
+        &raw_hash,
+        &tool_profile_hash,
+        r#gen,
+        control,
+    )?;
+    let complete = task.status == TaskStatus::Done
+        && !instance.manifest.units.is_empty()
+        && instance
+            .manifest
+            .units
+            .iter()
+            .all(|unit| unit.status == UnitStatus::Done)
+        && instance.units.len() == instance.manifest.units.len();
+    let resource_partial = resource_partial_can_publish(task, &instance);
+    if !complete && !resource_partial {
+        return Err(PipelineError::corrupt(
+            task.output_ref.clone(),
+            "Done online Markdownize task points at an incomplete normalized instance",
+        ));
+    }
+    let bbox_annotation_enabled = task.bbox_annotation_enabled.ok_or_else(|| {
+        PipelineError::corrupt(
+            kio_dir.join("tasks.jsonl").display().to_string(),
+            "completed online Markdownize task is missing bbox_annotation_enabled policy stamp",
+        )
+    })?;
+    Ok(ValidatedOnlinePromotion {
+        task_id: task.task_id.clone(),
+        input_path: task.input_path.clone(),
+        raw_hash,
+        tool_profile_hash,
+        r#gen,
+        created_at: task.created_at.clone(),
+        bbox_annotation_enabled,
+    })
 }
 
 #[derive(Debug)]
 struct MarkdownizePromotionPlan {
-    normalize_by_path: BTreeMap<String, PendingNormalizeRef>,
+    normalize_by_path: DiskRecords<(String, PendingNormalizeRef)>,
     markdown_profile: AdapterProfile,
 }
 
 /// Re-derive the promotable online result set from persisted task/instance truth.
-/// Mutable task status alone is never enough: `validated_online_promotions`
+/// Mutable task status alone is never enough: `validate_online_promotion`
 /// verifies the typed output and complete manifest/unit set, while this boundary
 /// rechecks current scope policy, working bytes, HEAD membership, and the adapter's
 /// currently resolved immutable profile.
@@ -375,34 +386,20 @@ fn plan_online_markdownize_promotion(
         Err(error) if is_store_not_found(&error) => return Ok(None),
         Err(error) => return Err(error),
     };
-    let task_paths = tasks
-        .iter()
-        .map(|task| task.input_path.as_str())
-        .collect::<BTreeSet<_>>();
-    let mut head_entries = BTreeMap::new();
-    for entry in &head_tree.entries {
-        let entry = entry?;
-        if task_paths.contains(entry.path.as_str()) {
-            head_entries.insert(entry.path.clone(), entry);
-        }
-    }
+    let stages = repo.object_store().record_stages()?;
+    let mut head_entries = SortedRecordCursor::new(head_tree.entries.iter(), |entry| &entry.path);
+    let mut current = RecordSorter::new(&stages, |a: &(ValidatedOnlinePromotion, bool), b| {
+        compare_online_promotions(&a.0, &b.0)
+    });
+    let mut tasks = tasks;
+    tasks.retain(is_online_promotion);
+    tasks.sort_unstable_by(|a, b| a.input_path.cmp(&b.input_path));
     let max_input_bytes = effective_max_input_bytes(repo)?;
-    // Establish that the task still describes the live HEAD/working identity
-    // before opening its normalized output. A corrupt output for the current
-    // identity is fatal, but a stale previous generation must not break a later
-    // full re-index after the file changed.
-    let mut current_tasks = Vec::new();
+    let mut policies_to_resolve = BTreeSet::new();
+    let mut found = false;
+    // Establish live HEAD and working identities before opening task output.
     for task in tasks {
-        if task.task_type != TaskType::Markdownize
-            || !(task.status == TaskStatus::Done
-                && task.fallback_reason.as_deref() == Some("online_adapter_done")
-                || task.status == TaskStatus::Partial
-                    && task.bbox_annotation_enabled.is_some()
-                    && task.hold_reason == Some(kio_pipeline::task::HoldReason::ResourceLimit))
-        {
-            continue;
-        }
-        let Some(head_entry) = head_entries.get(task.input_path.as_str()) else {
+        let Some(head_entry) = head_entries.at(&task.input_path)? else {
             continue;
         };
         if head_entry.raw_hash != task.input_hash
@@ -419,31 +416,24 @@ fn plan_online_markdownize_promotion(
             continue;
         }
         ensure_raw_ingest_allowed(repo, &task.input_hash)?;
-        current_tasks.push(task);
+        let candidate = validate_online_promotion(repo.kio_dir(), &task, repo.control())
+            .map_err(pipeline_to_kio)?;
+        let already_bound = head_entry.normalize.as_ref().is_some_and(|normalize| {
+            normalize.tool_profile_hash == candidate.tool_profile_hash
+                && normalize.r#gen == candidate.r#gen
+        });
+        if !already_bound {
+            policies_to_resolve.insert(candidate.bbox_annotation_enabled);
+        }
+        current.push((candidate, already_bound))?;
+        found = true;
     }
-    let current = validated_online_promotions(repo.kio_dir(), &current_tasks, repo.control())
-        .map_err(pipeline_to_kio)?;
-    if current.is_empty() {
+    if !found {
         return Ok(None);
     }
 
-    // A result already bound by HEAD stays authoritative without another model
-    // resolution. A not-yet-bound result is promotable only if its immutable hash
-    // matches the profile resolved now; this prevents a Done result from an older
-    // mutable model alias being promoted after the alias advances.
-    let policies_to_resolve = current
-        .iter()
-        .filter(|candidate| {
-            head_entries
-                .get(candidate.input_path.as_str())
-                .and_then(|entry| entry.normalize.as_ref())
-                .is_none_or(|normalize| {
-                    normalize.tool_profile_hash != candidate.tool_profile_hash
-                        || normalize.r#gen != candidate.r#gen
-                })
-        })
-        .map(|candidate| candidate.bbox_annotation_enabled)
-        .collect::<BTreeSet<_>>();
+    // A HEAD-bound result stays authoritative. Unbound results need a
+    // profile resolved for this invocation and their persisted bbox policy.
     let adapter_scope_id = repo.scope_identity()?.scope_id;
     let resolved_profiles = policies_to_resolve
         .into_iter()
@@ -459,84 +449,72 @@ fn plan_online_markdownize_promotion(
         })
         .collect::<BTreeMap<_, _>>();
 
-    let mut by_path = BTreeMap::<String, Vec<_>>::new();
-    for candidate in current {
-        by_path
-            .entry(candidate.input_path.clone())
-            .or_default()
-            .push(candidate);
-    }
-    let mut selected = Vec::new();
-    for (path, candidates) in by_path {
-        let resolved = candidates.iter().rev().find(|candidate| {
-            resolved_profiles
+    let mut normalizes = RecordWriter::new(&stages)?;
+    let mut current = current.finish()?.into_iter().peekable();
+    let mut last_hash = None;
+    let mut latest_for_policy = [None, None];
+    let mut resolved_for_policy = [None, None];
+    while let Some(first) = current.next() {
+        let first = first?;
+        let path = first.0.input_path.clone();
+        let mut resolved = None;
+        let mut bound = None;
+        let mut consider = |(candidate, already_bound): (ValidatedOnlinePromotion, bool)| {
+            if resolved_profiles
                 .get(&candidate.bbox_annotation_enabled)
-                .is_some_and(|profile| candidate.tool_profile_hash == profile.tool_profile_hash)
-        });
-        let already_bound = candidates.iter().rev().find(|candidate| {
-            head_entries
-                .get(path.as_str())
-                .and_then(|entry| entry.normalize.as_ref())
-                .is_some_and(|normalize| {
-                    normalize.tool_profile_hash == candidate.tool_profile_hash
-                        && normalize.r#gen == candidate.r#gen
-                })
-        });
-        if let Some(candidate) = resolved.or(already_bound) {
-            selected.push(candidate.clone());
+                .is_some_and(|profile| profile.tool_profile_hash == candidate.tool_profile_hash)
+            {
+                resolved = Some(candidate);
+            } else if already_bound {
+                bound = Some(candidate);
+            }
+        };
+        consider(first);
+        while current
+            .peek()
+            .is_some_and(|row| row.as_ref().is_ok_and(|row| row.0.input_path == path))
+        {
+            consider(current.next().expect("peeked candidate")?);
         }
-    }
-    if selected.is_empty() {
-        return Ok(None);
-    }
-    selected.sort_by(|left, right| left.input_path.as_bytes().cmp(right.input_path.as_bytes()));
-    let effective_bbox_policy = bbox_annotation_enabled(repo)?;
-    let active_profile_hash = selected
-        .iter()
-        .rev()
-        .filter(|candidate| candidate.bbox_annotation_enabled == effective_bbox_policy)
-        .find_map(|candidate| {
-            resolved_profiles
-                .get(&candidate.bbox_annotation_enabled)
-                .filter(|profile| profile.tool_profile_hash == candidate.tool_profile_hash)
-                .map(|profile| profile.tool_profile_hash.clone())
-        })
-        .unwrap_or_else(|| {
-            selected
-                .iter()
-                .rev()
-                .find(|candidate| candidate.bbox_annotation_enabled == effective_bbox_policy)
-                .or_else(|| selected.last())
-                .expect("selected promotion is non-empty")
-                .tool_profile_hash
-                .clone()
-        });
-    let normalize_by_path = selected
-        .into_iter()
-        .map(|candidate| {
-            // PB04: this online candidate's normalized instance was just
-            // materialized (`validated_online_promotions` above already
-            // opened and validated its manifest/units), so its manifest.json
-            // is hashable here.
-            let manifest_hash = crate::object_persistence::compute_manifest_hash(
-                repo,
-                &candidate.raw_hash,
-                &candidate.tool_profile_hash,
-                candidate.r#gen,
-            )?;
-            Ok((
-                candidate.input_path,
-                PendingNormalizeRef {
-                    expected_raw_hash: candidate.raw_hash,
-                    normalize: NormalizeRef {
-                        tool_profile_hash: candidate.tool_profile_hash,
-                        r#gen: candidate.r#gen,
-                        manifest_hash,
-                    },
+        let from_resolved_profile = resolved.is_some();
+        let Some(candidate) = resolved.or(bound) else {
+            continue;
+        };
+        let policy = usize::from(candidate.bbox_annotation_enabled);
+        let profile_hash = candidate.tool_profile_hash;
+        if from_resolved_profile {
+            resolved_for_policy[policy] = Some(profile_hash.clone());
+        }
+        latest_for_policy[policy] = Some(profile_hash.clone());
+        last_hash = Some(profile_hash.clone());
+
+        let manifest_hash = crate::object_persistence::compute_manifest_hash(
+            repo,
+            &candidate.raw_hash,
+            &profile_hash,
+            candidate.r#gen,
+        )?;
+        normalizes.push(&(
+            candidate.input_path,
+            PendingNormalizeRef {
+                expected_raw_hash: candidate.raw_hash,
+                normalize: NormalizeRef {
+                    tool_profile_hash: profile_hash,
+                    r#gen: candidate.r#gen,
+                    manifest_hash,
                 },
-            ))
-        })
-        .collect::<Result<_>>()?;
+            },
+        ))?;
+    }
+    let Some(last_hash) = last_hash else {
+        return Ok(None);
+    };
+    let effective_policy = usize::from(bbox_annotation_enabled(repo)?);
+    let active_profile_hash = resolved_for_policy[effective_policy]
+        .take()
+        .or_else(|| latest_for_policy[effective_policy].take())
+        .unwrap_or(last_hash);
+    let normalize_by_path = normalizes.finish()?;
     let mut markdown_profile = standard_online_markdownize_profile();
     markdown_profile.tool_profile_hash = active_profile_hash;
     Ok(Some(MarkdownizePromotionPlan {
@@ -572,18 +550,10 @@ fn plan_local_markdownize_promotion(
             .then_with(|| left.created_at.cmp(&right.created_at))
             .then_with(|| left.task_id.cmp(&right.task_id))
     });
-    let task_paths = tasks
-        .iter()
-        .map(|task| task.input_path.as_str())
-        .collect::<BTreeSet<_>>();
-    let mut entries = BTreeMap::new();
-    for entry in &tree.entries {
-        let entry = entry?;
-        if task_paths.contains(entry.path.as_str()) {
-            entries.insert(entry.path.clone(), entry);
-        }
-    }
-    let mut normalize_by_path = BTreeMap::new();
+    let mut entries = SortedRecordCursor::new(tree.entries.iter(), |entry| &entry.path);
+    let stages = repo.object_store().record_stages()?;
+    let mut normalizes = RecordWriter::new(&stages)?;
+    let mut previous: Option<(String, PendingNormalizeRef)> = None;
     for task in tasks {
         if task.task_type != TaskType::Markdownize
             || !(task.status == TaskStatus::Done
@@ -594,7 +564,7 @@ fn plan_local_markdownize_promotion(
         {
             continue;
         }
-        let Some(entry) = entries.get(task.input_path.as_str()) else {
+        let Some(entry) = entries.at(&task.input_path)? else {
             continue;
         };
         if entry.raw_hash != task.input_hash
@@ -612,9 +582,18 @@ fn plan_local_markdownize_promotion(
         }
         ensure_raw_ingest_allowed(repo, &task.input_hash)?;
         if let Some(normalize) = validated_local_normalize_ref(repo, &task, &profile)? {
-            normalize_by_path.insert(task.input_path, normalize);
+            if let Some(row) = previous.take()
+                && row.0 != task.input_path
+            {
+                normalizes.push(&row)?;
+            }
+            previous = Some((task.input_path, normalize));
         }
     }
+    if let Some(row) = previous {
+        normalizes.push(&row)?;
+    }
+    let normalize_by_path = normalizes.finish()?;
     if normalize_by_path.is_empty() {
         return Ok(None);
     }
@@ -765,23 +744,24 @@ fn materialize_promoted_markdown_tool_lock(
 /// or requiring the complete-only batch promotion planner to find an old HEAD.
 fn has_accepted_local_pipeline_ref(
     repo: &Repository,
-    refs: &BTreeMap<String, PendingNormalizeRef>,
+    refs: impl IntoIterator<Item = kio_core::Result<(String, PendingNormalizeRef)>>,
     profile: &AdapterProfile,
 ) -> kio_core::Result<bool> {
-    let matching = refs
-        .iter()
-        .filter(|(_, pending)| pending.normalize.tool_profile_hash == profile.tool_profile_hash)
-        .collect::<Vec<_>>();
-    if matching.is_empty() {
-        return Ok(false);
-    }
-    let max_input_bytes = effective_max_input_bytes(repo)?;
+    let mut max_input_bytes = None;
     let mut accepted = false;
-    for (path, pending) in matching {
-        if !repository_scan_policy_allows_file(repo, path).map_err(pipeline_to_kio)? {
+    for row in refs {
+        let (path, pending) = row?;
+        if pending.normalize.tool_profile_hash != profile.tool_profile_hash {
             continue;
         }
-        let Ok(current) = read_repository_scan_input(repo, path, max_input_bytes) else {
+        let max_input_bytes = match max_input_bytes {
+            Some(limit) => limit,
+            None => *max_input_bytes.insert(effective_max_input_bytes(repo)?),
+        };
+        if !repository_scan_policy_allows_file(repo, &path).map_err(pipeline_to_kio)? {
+            continue;
+        }
+        let Ok(current) = read_repository_scan_input(repo, &path, max_input_bytes) else {
             continue;
         };
         if current.raw_hash != pending.expected_raw_hash {
@@ -825,15 +805,14 @@ fn has_accepted_local_pipeline_ref(
 pub(super) fn apply_online_promotion_to_index(
     adapter_settings: &Arc<AdapterRuntimeSettings>,
     repo: &Repository,
-    result: &mut IndexPipelineResult,
-) -> kio_core::Result<()> {
+    normalizes: &DiskRecords<(String, PendingNormalizeRef)>,
+) -> kio_core::Result<Option<DiskRecords<(String, PendingNormalizeRef)>>> {
     let plan = plan_selected_markdownize_promotion(adapter_settings, repo)?;
     let produced_local_profile = if let Some(execution) =
         active_local_ocr_execution_with_control(adapter_settings, repo.control())
     {
         let profile = kio_adapter::local_ocr_markdownize::profile_for(execution);
-        has_accepted_local_pipeline_ref(repo, &result.normalize_by_path, &profile)?
-            .then_some(profile)
+        has_accepted_local_pipeline_ref(repo, normalizes.iter(), &profile)?.then_some(profile)
     } else {
         None
     };
@@ -844,10 +823,7 @@ pub(super) fn apply_online_promotion_to_index(
     {
         materialize_promoted_markdown_tool_lock(repo, profile)?;
     }
-    if let Some(plan) = plan {
-        result.normalize_by_path.extend(plan.normalize_by_path);
-    }
-    Ok(())
+    Ok(plan.map(|plan| plan.normalize_by_path))
 }
 
 /// Publish one deterministic promotion commit for all accepted outputs completed
@@ -1259,9 +1235,7 @@ mod tests {
         );
         let path = repo.kio_dir().join("tool-lock.json");
         let before = std::fs::read(&path).unwrap();
-        assert!(
-            !super::has_accepted_local_pipeline_ref(&repo, &BTreeMap::new(), &profile).unwrap()
-        );
+        assert!(!super::has_accepted_local_pipeline_ref(&repo, [], &profile).unwrap());
         let baseline = BTreeMap::from([(
             "report.pdf".to_owned(),
             kio_core::scope::PendingNormalizeRef {
@@ -1273,7 +1247,10 @@ mod tests {
                 },
             },
         )]);
-        assert!(!super::has_accepted_local_pipeline_ref(&repo, &baseline, &profile).unwrap());
+        assert!(
+            !super::has_accepted_local_pipeline_ref(&repo, baseline.into_iter().map(Ok), &profile)
+                .unwrap()
+        );
         assert_eq!(std::fs::read(path).unwrap(), before);
         assert!(
             repo.head_commit_hash().unwrap().is_none(),

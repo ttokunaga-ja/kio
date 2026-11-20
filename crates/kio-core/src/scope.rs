@@ -159,7 +159,7 @@ pub struct ScopeIdentity {
     pub canonical_root: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingNormalizeRef {
     pub expected_raw_hash: String,
     pub normalize: NormalizeRef,
@@ -219,7 +219,9 @@ impl Repository {
 
 /// Input admitted by the managed index scan. No hash means the scan
 /// observed this path but could not read a stable version.
+#[derive(Serialize, Deserialize)]
 pub struct ScannedInput {
+    pub path: String,
     pub raw_hash: Option<String>,
     pub size_bytes: u64,
 }
@@ -233,21 +235,29 @@ pub enum DeferredInputReason {
     UnstableDuringScan,
 }
 
+impl DeferredInputReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AddedAfterScan => "added_after_scan",
+            Self::MissingAfterScan => "missing_after_scan",
+            Self::ChangedAfterScan => "changed_after_scan",
+            Self::UnstableDuringScan => "unstable_during_scan",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeferredInput {
     pub path: String,
     pub reason: DeferredInputReason,
 }
 
-type ScannedInputs = BTreeMap<String, ScannedInput>;
-type DeferredInputs = BTreeMap<String, DeferredInputReason>;
-
 #[derive(Debug, Clone)]
 pub struct WorkingTree {
     pub tree: TreeObject,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
@@ -269,8 +279,8 @@ pub struct FileStatus {
 /// scope stays inspectable instead of bricking on a raw `KIO-E-STORE-NOT-FOUND-001`.
 #[derive(Debug, Clone, Serialize)]
 pub struct StatusReport {
-    pub stage_residues: Vec<crate::cas::RawStageResidue>,
-    pub files: Vec<FileStatus>,
+    pub stage_residues: crate::disk_records::DiskRecords<crate::cas::RawStageResidue>,
+    pub files: crate::disk_records::DiskRecords<FileStatus>,
     pub head_shallow: bool,
 }
 
@@ -1356,11 +1366,11 @@ fn wait_at_bound_snapshot_auto_barrier(_: Option<&Path>) {}
 fn attach_pending_normalize(
     tree_entry: &mut TreeEntry,
     file_name: &str,
-    normalize_by_path: &BTreeMap<String, PendingNormalizeRef>,
+    pending: Option<PendingNormalizeRef>,
 ) {
-    if let Some(pending) = normalize_by_path.get(file_name) {
+    if let Some(pending) = pending {
         if pending.expected_raw_hash == tree_entry.raw_hash {
-            tree_entry.normalize = Some(pending.normalize.clone());
+            tree_entry.normalize = Some(pending.normalize);
         } else {
             eprintln!(
                 "warning: normalization metadata not attached because {file_name} changed after normalization"
@@ -4107,8 +4117,8 @@ mod tests {
         assert!(
             status
                 .stage_residues
-                .iter()
                 .any(|entry| entry.path.ends_with(".ingest-unknown"))
+                .unwrap()
         );
     }
 
