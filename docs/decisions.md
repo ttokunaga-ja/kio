@@ -233,3 +233,11 @@
 - **内容**：次の 3 つを v1 の残作業に足す。(1) NC より前に索引したソースコードのデータが、索引し直したときに残らないようにする（NC2）。(2) index と status の working tree の走査で、使うメモリをファイル数によらず一定にする（S2b）。(3) `step3_p0_contract` の Windows での実行時間を、検証の内容を減らさずに短くする（WP）。
 - **理由**：統括は (1) を旧データの移行、(2) を仕様の有界の対象外として範囲外にしていたが、利用者が両方とも v1 で直すと決めた。(3) は残りの作業で CI を何度も回すため、利用者が v1 に入れると決めた。
 - **関係する資料**：`tasks/v1-plan.md` §3.1、§3.2b。D-20261113-10（v1 の範囲は利用者が決めたときだけ足す）。
+
+## 2026-11-20
+
+### D-20261120-01 EG2 の runtime library は build の時に固定 URL から取得する
+
+- **内容**：EG2 の runtime（LiteRT-LM 0.18.0 の C API の共有 library。Linux x64・macOS arm64・Windows x64）は、repo に binary を commit しない。公式の release の固定 URL と target ごとの SHA-256 の一覧だけを repo に置き、CI と手元の build は取得して hash を照合してから使う。推測した path、PATH、`.kio`、current directory からは探索しない（`docs/10-operations.md` §5.1）。
+- **理由**：利用者が選んだ。repo を大きくせず、版と内容は hash で固定できる。代わりに build の時にネットワークが要る。
+- **関係する資料**：`docs/10-operations.md` §5.1、`tasks/v1-plan.md` §3.4 の G1。
