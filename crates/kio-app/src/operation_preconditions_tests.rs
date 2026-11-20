@@ -699,7 +699,7 @@ fn online_embedding_ignores_unused_markdown_and_trust() {
             replace_private_bytes(&tools, SELECTED.as_bytes());
             Some(install_unused(Unused::Trust))
         } else {
-            replace_private_bytes(&tools, format!("{SELECTED}[markdown.paddleocr_vl_local]\nkind = 'offline_api'\nurl = 'https://127.0.0.1:8443'\n").as_bytes());
+            replace_private_bytes(&tools, format!("{SELECTED}[markdown.paddleocr_vl_local]\nkind = 'offline_api'\nurl = 'https://127.0.0.1:8443'\nmodel = 'test-embedding'\nwire_format = 'messages'\nmodel_version_pin = 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\nchat_template_hash = 'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'\ninstruction = ''\n").as_bytes());
             Some(install_unused(Unused::RetiredAdapterConfig))
         };
         if unused == "markdown_transport" {
@@ -1118,7 +1118,7 @@ fn configured_https_embedding_metadata_does_not_acquire_unused_ca() {
     if !config.exists() {
         create_private_test_directory(&config);
     }
-    private_bytes(&config.join("tools.toml"), b"[embedding.qwen3_vl_embedding_local]\nkind = 'offline_api'\nurl = 'https://127.0.0.1:8443'\n");
+    private_bytes(&config.join("tools.toml"), b"[embedding.local_embedding]\nkind = 'offline_api'\nurl = 'https://127.0.0.1:8443'\nmodel = 'test-embedding'\nwire_format = 'messages'\nmodel_version_pin = 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\nchat_template_hash = 'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'\ninstruction = ''\n");
     let control = ControlHandle::default();
     let ca = root.path().join("source.pem");
     private_bytes(&ca, PEM.as_bytes());
@@ -1129,7 +1129,7 @@ fn configured_https_embedding_metadata_does_not_acquire_unused_ca() {
         CommandRequest::Adapter(crate::commands::AdapterArgs {
             command: Some(crate::commands::AdapterCommand::Approve(
                 crate::commands::ApproveArgs {
-                    target: crate::commands::AdapterTarget::Tool("qwen3_vl_embedding_local".into()),
+                    target: crate::commands::AdapterTarget::Tool("local_embedding".into()),
                     preview: false,
                     yes: true,
                     resume: None,

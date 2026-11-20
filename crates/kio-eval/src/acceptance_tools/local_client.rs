@@ -151,8 +151,6 @@ enum Verb {
     Identity,
     StartOcr,
     StopOcr,
-    StartEmbedding,
-    StopEmbedding,
     Finish,
 }
 
@@ -163,8 +161,6 @@ impl Verb {
             Self::Identity => "identity",
             Self::StartOcr => "start-ocr",
             Self::StopOcr => "stop-ocr",
-            Self::StartEmbedding => "start-embedding",
-            Self::StopEmbedding => "stop-embedding",
             Self::Finish => "finish",
         }
     }
@@ -173,9 +169,7 @@ impl Verb {
         match self {
             Self::Identity => IDENTITY_TIMEOUT,
             Self::Init | Self::Finish => INIT_TIMEOUT,
-            Self::StartOcr | Self::StopOcr | Self::StartEmbedding | Self::StopEmbedding => {
-                PHASE_TIMEOUT
-            }
+            Self::StartOcr | Self::StopOcr => PHASE_TIMEOUT,
         }
     }
 }
@@ -366,15 +360,11 @@ impl Client {
         self.observe(&identity_value, "ocr")?;
         let mut tunnel = self.start_tunnel()?;
         let result = (|| {
-            self.health(&identity_value, &mut tunnel, "ocr")?;
+            self.health(&identity_value, &mut tunnel)?;
             self.evaluate("ocr", inputs, &identity_value)?;
             self.invoke(Verb::StopOcr)?;
-            self.invoke(Verb::StartEmbedding)?;
-            self.observe(&identity_value, "embedding")?;
-            self.health(&identity_value, &mut tunnel, "embedding")?;
-            self.evaluate("embedding", inputs, &identity_value)?;
-            self.invoke(Verb::StopEmbedding)?;
             self.invoke(Verb::Finish)?;
+            self.evaluate("embedding", inputs, &identity_value)?;
             Ok(())
         })();
         let _ = tunnel.terminate_and_wait();
@@ -390,19 +380,13 @@ impl Client {
             "-L",
             "127.0.0.1:18443:127.0.0.1:18443",
             "-L",
-            "127.0.0.1:18444:127.0.0.1:18444",
             "kio-lab-wsl",
         ]);
         SupervisedChild::spawn(&mut command, Duration::from_secs(1_300))
             .map_err(|error| format!("cannot start owned SSH tunnel: {error}"))
     }
 
-    fn health(
-        &self,
-        identity: &Value,
-        tunnel: &mut SupervisedChild,
-        phase: &str,
-    ) -> Result<(), String> {
+    fn health(&self, identity: &Value, tunnel: &mut SupervisedChild) -> Result<(), String> {
         let pem = public_ca(identity)?;
         let certificate = ureq::tls::Certificate::from_pem(pem.as_bytes())
             .map_err(|error| format!("public CA PEM is invalid: {error}"))?;
@@ -418,12 +402,7 @@ impl Client {
             )
             .build()
             .into();
-        let port = match phase {
-            "ocr" => 18_443,
-            "embedding" => 18_444,
-            _ => return Err("invalid local GPU phase".into()),
-        };
-        let endpoint = format!("https://127.0.0.1:{port}/health");
+        let endpoint = "https://127.0.0.1:18443/health";
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
             if tunnel
@@ -433,7 +412,7 @@ impl Client {
             {
                 return Err("owned SSH tunnel failed to start".into());
             }
-            if agent.get(&endpoint).call().is_ok() {
+            if agent.get(endpoint).call().is_ok() {
                 return Ok(());
             }
             if std::time::Instant::now() >= deadline {
@@ -496,7 +475,6 @@ impl Client {
                 .arg("--receipt")
                 .arg(&inputs.receipt)
                 .args(["--ocr-endpoint", "https://127.0.0.1:18443"])
-                .args(["--embedding-endpoint", "https://127.0.0.1:18444"])
                 .arg("--ca-pem")
                 .arg(&ca_path)
                 .arg("--service-identity")
@@ -524,7 +502,7 @@ impl Client {
     }
 
     fn cleanup(&mut self) {
-        for verb in [Verb::StopOcr, Verb::StopEmbedding, Verb::Finish] {
+        for verb in [Verb::StopOcr, Verb::Finish] {
             let _ = self.invoke(verb);
         }
     }
@@ -708,7 +686,7 @@ fn validate_observation(original: &Value, live: &Value, phase: &str) -> Result<(
         .get("running_image_ids")
         .and_then(Value::as_array)
         .ok_or_else(|| "active service observation lacks measured image identities".to_owned())?;
-    let expected_images = if phase == "ocr" { 2 } else { 1 };
+    let expected_images = 2;
     if entry.get("schema") != Some(&Value::String("kio.v1.local_gpu.phase_observed.v1".into()))
         || entry.get("identity_sha256")
             != Some(&Value::String(sha256(&compact_json(
@@ -969,8 +947,7 @@ mod tests {
 
     #[test]
     fn observation_requires_exact_identity_phase_and_image_ids() {
-        let identity =
-            serde_json::json!({"schema":"kio.local-gpu.identity/v1","run_nonce":"a".repeat(64)});
+        let identity = serde_json::json!({"schema":"kio.local-gpu.ocr-identity/v1","run_nonce":"a".repeat(64)});
         let original =
             serde_json::json!({"identity":identity,"observed":[],"public_ca_pem":"CA\n"});
         let digest = sha256(&compact_json(&original["identity"]).unwrap());

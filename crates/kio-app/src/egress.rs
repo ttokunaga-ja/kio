@@ -124,8 +124,8 @@ pub(crate) fn admit_embedding_transport(
     current_policy: &CurrentPolicyEvaluator,
     needs_secret: bool,
 ) -> Result<()> {
-    if embedding_is_deterministic(execution) {
-        return Ok(());
+    if !execution.uses_endpoint() {
+        return current_policy.revalidate().map_err(pipeline_to_kio);
     }
     adapter_settings
         .role_credentials_ready("embedding")
@@ -187,7 +187,7 @@ pub(crate) fn embedding_opt_in_for_scopes<'a>(
     if !embedding_transport_allowed(execution, offline) {
         return Ok(false);
     }
-    if embedding_is_deterministic(execution) {
+    if !execution.uses_endpoint() {
         return Ok(true);
     }
     for repo in repositories {
@@ -214,7 +214,7 @@ pub(crate) fn embedding_online_allowed(
     let Some(execution) = embedding_execution(adapter_settings, repo.control()) else {
         return Ok(false);
     };
-    if embedding_is_deterministic(execution) {
+    if !execution.uses_endpoint() {
         return Ok(true);
     }
     if !embedding_transport_allowed(execution, offline) {

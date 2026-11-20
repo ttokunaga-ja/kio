@@ -543,14 +543,19 @@ pub(crate) fn embedding_profile_summary(
     }
 }
 
-/// The optional provenance label is not itself authority: only the exact
-/// built-in, in-process identity can avoid a recipient secret-send grant.
-pub(crate) fn persisted_embedding_is_deterministic(
+/// Both the execution mode and exact built-in profile must match before
+/// reprojection can proceed without a secret-send grant.
+pub(crate) fn persisted_embedding_is_local_library(
     entry: &kio_adapter::tool_lock::EmbeddingToolLockEntry,
 ) -> bool {
-    let builtin = declared_deterministic_embedding_profile();
-    entry.kind == Some(ExecutionMode::DeterministicLibrary)
-        && entry.tool_id == builtin.tool_id
+    let builtin = match entry.kind {
+        Some(ExecutionMode::DeterministicLibrary) => declared_deterministic_embedding_profile(),
+        Some(ExecutionMode::NativeLibrary) => {
+            kio_adapter::catalog::declared_native_embedding_profile()
+        }
+        _ => return false,
+    };
+    entry.tool_id == builtin.tool_id
         && entry.profile_hash == builtin.profile_hash
         && u64::from(entry.dimensions) == builtin.dimensions
         && entry.distance == builtin.distance

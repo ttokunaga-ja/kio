@@ -2,7 +2,6 @@ use crate::commands::SearchArgs;
 use crate::egress::active_embedding_adapter_identity;
 use crate::egress::embedding_opt_in_for_scopes;
 use crate::embedding::admission::embedding_execution;
-use crate::embedding::admission::embedding_is_deterministic;
 use crate::embedding::admission::embedding_transport_allowed;
 use crate::embedding::transport::QueryEmbeddingOutcome;
 use crate::embedding::transport::compute_query_embedding_page1;
@@ -524,8 +523,8 @@ fn run_search_inner(
     // The evaluator has no transport. A selected loopback endpoint remains
     // eligible offline, subject to its current device approval.
     let active_embedding = embedding_execution(adapter_settings, ctx.control);
-    let embedding_is_deterministic = active_embedding.is_some_and(embedding_is_deterministic);
-    if parsed.online && (active_embedding.is_none() || embedding_is_deterministic) {
+    let uses_endpoint = active_embedding.is_some_and(|execution| execution.uses_endpoint());
+    if parsed.online && !uses_endpoint {
         if requested_mode == SearchMode::Vector
             && decoded_cursor.is_none()
             && query_embeddable
@@ -541,7 +540,7 @@ fn run_search_inner(
             "search --online requires an active network embedding adapter",
         ));
     }
-    let embedding_opt_in = if embedding_is_deterministic {
+    let embedding_opt_in = if !uses_endpoint && active_embedding.is_some() {
         true
     } else {
         match &adapter_identity {
@@ -558,7 +557,7 @@ fn run_search_inner(
             None => false,
         }
     };
-    let vector_precheck = resolve_vector_availability(
+    let mut vector_precheck = resolve_vector_availability(
         requested_mode,
         &replica_embedding_states,
         // Offline blocks only the selected external transport. Endpoint and
@@ -570,6 +569,20 @@ fn run_search_inner(
         embedding_opt_in,
         query_embeddable,
     );
+    if requested_mode != SearchMode::Text
+        && decoded_cursor.is_none()
+        && active_embedding == Some(kio_adapter::catalog::EmbeddingExecution::Native)
+        && matches!(
+            vector_precheck,
+            VectorAvailability::Unavailable {
+                reason: "embedding_index_missing"
+            }
+        )
+        && crate::model::engine_model_absent(ctx.control)
+    {
+        vector_precheck =
+            VectorAvailability::NativeUnavailable(crate::eg2::WorkerError::ModelMissing);
+    }
     if parsed.online
         && requested_mode == SearchMode::Vector
         && decoded_cursor.is_none()
@@ -616,7 +629,9 @@ fn run_search_inner(
     // 04 §5.4 §H (CL48-55): only a FRESH page 1 (no cursor) writes the device
     // query-embedding row. R23-01 (05 §1.5 L234): a cursor replay (page 2+)
     // no longer computes a query embedding at all — see the `else` arm below.
-    let mut vector_unavailable_reason = "query_embedding_unavailable";
+    let mut vector_failure = VectorAvailability::Unavailable {
+        reason: "query_embedding_unavailable",
+    };
     let mut final_consent_unauthorized = false;
     let query_embedding = if uses_vectors {
         if decoded_cursor.is_none() {
@@ -638,14 +653,18 @@ fn run_search_inner(
                 // holds this exact query — text fallback, distinct reason from
                 // a plain adapter failure.
                 Some(QueryEmbeddingOutcome::InFlight) => {
-                    vector_unavailable_reason = "embedding_in_flight";
+                    vector_failure = VectorAvailability::Unavailable {
+                        reason: "embedding_in_flight",
+                    };
                     None
                 }
                 // PC7: the adapter's response failed its 07 §5.3 acceptance
                 // check — a distinct technical failure from a generic
                 // "unavailable" (both are fail_behavior-governed, PC2).
                 Some(QueryEmbeddingOutcome::ContractViolation) => {
-                    vector_unavailable_reason = "embedding_contract_violation";
+                    vector_failure = VectorAvailability::Unavailable {
+                        reason: "embedding_contract_violation",
+                    };
                     None
                 }
                 // PC6: the final pre-attempt re-read found the send no longer
@@ -654,6 +673,10 @@ fn run_search_inner(
                 // the precheck's own Unauthorized, not a technical failure.
                 Some(QueryEmbeddingOutcome::NotAuthorized) => {
                     final_consent_unauthorized = true;
+                    None
+                }
+                Some(QueryEmbeddingOutcome::Unavailable(error)) => {
+                    vector_failure = VectorAvailability::NativeUnavailable(error);
                     None
                 }
                 None => None,
@@ -685,9 +708,7 @@ fn run_search_inner(
         if final_consent_unauthorized {
             VectorAvailability::Unauthorized
         } else {
-            VectorAvailability::Unavailable {
-                reason: vector_unavailable_reason,
-            }
+            vector_failure
         }
     } else {
         vector_precheck

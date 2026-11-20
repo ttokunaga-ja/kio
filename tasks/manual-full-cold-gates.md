@@ -108,7 +108,7 @@ remains a contract smoke and cannot satisfy this gate. The report's D1 TTFV/cost
 fields remain typed `not-measured` for this scale-only run: P4 owns actual D1
 data, and dogfood is a separate manual gate. See [the evaluator contract](../eval/README.md).
 
-## 3. U7 GPU/model gate
+## 3. Local endpoint and native embedding gates
 
 This lane requires an explicitly started serving runtime, a reviewed local
 reference-model directory, a Python environment containing the reference ML
@@ -118,7 +118,7 @@ reporting; Python owns only local reference inference.
 ```sh
 target/release/kio-eval u7 \
   --base-url http://127.0.0.1:8000 \
-  --model Qwen/Qwen3-VL-Embedding-2B \
+  --model "my-embedding-model" \
   --reference-python /absolute/path/to/reference-venv/bin/python3 \
   --reference-adapter /absolute/path/to/kio/eval/u7/reference_adapter.py \
   --reference-model /absolute/path/to/pinned-local-model \
@@ -132,6 +132,16 @@ jq -e '.verdict.adoptable == true and .verdict.reason == "both-agree"' \
 `image-diverged`, `harness-suspect`, `image-not-measured`, malformed vectors,
 or a nonzero command rejects/blocks adoption. This command must not download a
 model implicitly. Full operating details remain in [the U7 manual](../eval/u7/README.md).
+
+The native EG2 smoke runs through the packaged command using the official
+model and pinned LiteRT-LM bundle.
+
+```sh
+KIO_LITERT_C_API_ZIP=/absolute/path/to/c_api.zip \
+KIO_EG2_TEST_MODEL=/absolute/path/to/embeddinggemma-2-text-vision-440m.litertlm \
+cargo +1.98.0 test -p kio-cli --locked --test v1_free_local_embedding \
+  default_eg2_publishes_native_text_and_images_and_searches_offline -- --ignored
+```
 
 ## 4. OCR fixture and paid provider gates
 

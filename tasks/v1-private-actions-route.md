@@ -31,7 +31,7 @@ Windows には新規の非管理者 local user `kio-ci` を作る。`sshd_config
 - `MaxSessions 0` で shell・PTY・subsystem の session を拒否し、`AllowAgentForwarding no` を適用する。Windows で未対応の設定項目を拒否の根拠にしない。
 - Administrators group、Docker group、Docker daemon 操作権限を付与しない。
 
-Windows の `kio-ci` key は WSL の既存 `kio-test` へ接続するためだけに使う。WSL 側にも同じ新規 CI 専用鍵の public key を `authorized_keys` の forced-command entry として登録し、port forwarding と `127.0.0.1:18443` / `127.0.0.1:18444` だけを許可する。shell、PTY、SFTP、任意 path、任意 Docker 引数を許可しない。`kio-test` は Docker 操作権限を持つ信頼済み試験ユーザーであり、低権限の実行 sandbox とは扱わない。WSL の dispatcher は fixed deployment record と Rust 定義の `FIXED_SOURCES` を照合し、lease と phase state を管理する実装である。forced command は owner-private に設置した reviewed `kio-acceptance-tools` binary の `kio-acceptance-tools dispatch` で終端し、mutable repository script を直接実行しない。2026-09-26 に Daybreak Blue の account entitlement と専用設定を付けた CLI 応答を確認し、独立 review を開始した。専用設定で要求したモデルは Daybreak Blue だが、返却 metadata から actual model は確認できていない。route review 報告は回収済みであり、このモデル provenance 制約を残す。疎通確認や報告回収は route acceptance を意味しない。先行する Rust 実装の GPT-6 Sol 独立 review と Astra crosscheck も、route の実効構成や acceptance を意味しない。
+Windows の `kio-ci` key は WSL の既存 `kio-test` へ接続するためだけに使う。WSL 側にも同じ新規 CI 専用鍵の public key を `authorized_keys` の forced-command entry として登録し、port forwarding と `127.0.0.1:18443` だけを許可する。shell、PTY、SFTP、任意 path、任意 Docker 引数を許可しない。`kio-test` は Docker 操作権限を持つ信頼済み試験ユーザーであり、低権限の実行 sandbox とは扱わない。WSL の dispatcher は fixed deployment record と Rust 定義の `FIXED_SOURCES` を照合し、lease と phase state を管理する実装である。forced command は owner-private に設置した reviewed `kio-acceptance-tools` binary の `kio-acceptance-tools dispatch` で終端し、mutable repository script を直接実行しない。2026-09-26 に Daybreak Blue の account entitlement と専用設定を付けた CLI 応答を確認し、独立 review を開始した。専用設定で要求したモデルは Daybreak Blue だが、返却 metadata から actual model は確認できていない。route review 報告は回収済みであり、このモデル provenance 制約を残す。疎通確認や報告回収は route acceptance を意味しない。先行する Rust 実装の GPT-6 Sol 独立 review と Astra crosscheck も、route の実効構成や acceptance を意味しない。
 
 client は remote `init` より前に durable owner-private 256-bit capability を create-only で保存し、全 verb でこれを stdin に渡す。`init` reply は status だけで capability を返さないため、reply 消失時も client は同じ capability を保持し authenticated `finish` を実行できる。`finish` は unknown/interrupted phase でも許可されるが、controller cleanup が成功し、exited container を含め exact Docker project label の両方を照会できた後だけ lease を削除する。cleanup または照会失敗時は unknown lease を残す。`init` 中の compose 欠落は対応する exact project の不在を証明できる場合だけ安全である。pre-lease failure は diagnostic root を残すが global lease/controller は作らず、同一 attempt は create-only のまま、新しい GitHub attempt だけが retry できる。
 
@@ -266,7 +266,7 @@ route key は新規生成し、既存 Mac key を複製・再利用しない。`
 
 ## 事前検証と導入後の検証
 
-外部変更を申請する前に、Windows で現行 `sshd_config` と effective configuration、port 22 listener、enabled firewall rules、`rm2c` の existing authorization path を記録する。Windows `kio-ci` 不在と、WSL の既存 `kio-test` に新規CI鍵が未登録であることを確認する。導入後の `kio-ci` は Administrators/Docker group 非所属とする。18443/18444 の loopback binding、両 host alias の現在の host key も確認する。Tailscale は適用直前に live policy を再読し、上記 full replacement の削除・追加範囲と owner の変更権限を確認する。
+外部変更を申請する前に、Windows で現行 `sshd_config` と effective configuration、port 22 listener、enabled firewall rules、`rm2c` の existing authorization path を記録する。Windows `kio-ci` 不在と、WSL の既存 `kio-test` に新規CI鍵が未登録であることを確認する。導入後の `kio-ci` は Administrators/Docker group 非所属とする。18443 の loopback binding、両 host alias の現在の host key も確認する。Tailscale は適用直前に live policy を再読し、上記 full replacement の削除・追加範囲と owner の変更権限を確認する。
 
 承認後は dedicated key の fingerprint を記録してから、Windows Match、Windows user key、WSL forced-command key と stream-local 制限、承認済み full tailnet policy、Tailscale OIDC binding、Environment values を導入する。現案は既存 host firewall rules を変更しない。各段階で `kio-ci` の local forward 以外の port、interactive shell、PTY、SFTP、agent/X11 forwarding、Docker access が拒否されることを確認する。続けて three hosted OS から pinned aliases による forward、fixed dispatcher verb、service identity の read-only observation、lease cleanup を確認する。candidate execution、paid provider call、workflow dispatch はこの導入前検証に含めない。
 
@@ -367,7 +367,7 @@ only its two local API destinations. Substitute the actual reviewed public key;
 do not put a private key, candidate, or capability into this file:
 
 ```
-command="/home/kio-test/work/kio/v1-actions-source/scripts/v1-local-gpu/kio-acceptance-tools dispatch",no-agent-forwarding,no-pty,no-user-rc,no-X11-forwarding,permitopen="127.0.0.1:18443",permitopen="127.0.0.1:18444" ssh-ed25519 <dedicated-ci-public-key> kio-v1-local-acceptance
+command="/home/kio-test/work/kio/v1-actions-source/scripts/v1-local-gpu/kio-acceptance-tools dispatch",no-agent-forwarding,no-pty,no-user-rc,no-X11-forwarding,permitopen="127.0.0.1:18443" ssh-ed25519 <dedicated-ci-public-key> kio-v1-local-acceptance
 ```
 
 `no-port-forwarding` is intentionally absent because the two `permitopen`
@@ -421,7 +421,7 @@ ACL/firewall rules, Environment values, and the WSL forced-command entry.
 Post-approval installation and verification checklist: install the exact
 owner-private `deployment.json` generated by the approved clean preflight; then
 perform denial tests for shell, PTY, SFTP, agent/X11, remote forwarding,
-non-2222 Windows forwarding, and non-18443/18444 WSL forwarding. Record the
+non-2222 Windows forwarding, and non-18443 WSL forwarding. Record the
 new key fingerprint and re-read the affected effective configurations, policy,
 and listener/firewall state before any candidate workflow dispatch.
 

@@ -85,6 +85,7 @@ fn reindex_head_projection_preserves_nullable_commit_counts_and_empty_skips() {
             });
             assert_projection(
                 HeadReindexResponse {
+                    embedding_unavailable_reason: None,
                     deferred_inputs: kio_core::disk_records::DiskRecords::empty(),
                     status: "reindexed".to_owned(),
                     reindexed_files: u64::MAX,

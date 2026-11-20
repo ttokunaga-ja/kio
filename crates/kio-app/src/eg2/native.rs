@@ -13,9 +13,7 @@ type Handle = *mut c_void;
 type Delete = unsafe extern "C" fn(Handle);
 type Status = c_int;
 
-pub(super) const C_API_VERSION: &str = "1.0.0";
-pub(super) const NORMALIZE: bool = true;
-pub(super) const INSERT_SPECIAL_TOKENS: bool = true;
+use kio_core::eg2::{INSERT_SPECIAL_TOKENS, NORMALIZE};
 
 macro_rules! api {
     ($($name:ident: $signature:ty),+ $(,)?) => {

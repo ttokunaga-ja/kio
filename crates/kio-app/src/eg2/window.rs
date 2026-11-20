@@ -1,6 +1,6 @@
 use super::{DIMENSIONS, WorkerError, valid_vector};
 
-pub(super) const MAX_DEPTH: u8 = 32;
+use kio_core::eg2::MAX_DEPTH;
 
 /// Visit the left subtree first so floating-point additions occur in source order.
 pub(super) fn embed_text<'a>(

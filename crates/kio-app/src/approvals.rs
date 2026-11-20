@@ -46,9 +46,7 @@ pub(crate) fn store_path(control: &ControlHandle) -> PathBuf {
 
 fn tool_role(tool: &str) -> Option<AdapterRole> {
     match tool {
-        "gemini_embedding_2" | "qwen3_vl_embedding_local" | GENERIC_LOCAL_EMBEDDING_TOOL_ID => {
-            Some(AdapterRole::Embedding)
-        }
+        "gemini_embedding_2" | GENERIC_LOCAL_EMBEDDING_TOOL_ID => Some(AdapterRole::Embedding),
         "mistral_ocr_markdownize" | "paddleocr_vl_local" => Some(AdapterRole::Markdown),
         _ => None,
     }
@@ -236,7 +234,7 @@ fn configured_profile(
                 return Ok(None);
             };
             // A library has no external recipient to approve.
-            if crate::embedding::admission::embedding_is_deterministic(execution) {
+            if !execution.uses_endpoint() {
                 return Ok(None);
             }
             let profile = crate::embedding::admission::declared_embedding_profile(

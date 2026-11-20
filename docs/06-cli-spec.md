@@ -214,6 +214,10 @@ model/adapter status の typed fields は `selected_profile`、`profile_hash`、
 `runtime_version`、`readiness`（ready / missing / license-required / hash-mismatch）、
 `reembedding_count`、`producers`（OS/arch、library SHA、runtime version、件数）、`mixed_producers`。
 Task の Skipped は理由別件数、資源待ちは `resource_busy` として表示する。
+`index` と HEAD の `reindex` は、モデルまたは runtime の準備不足で EG2 を実行できないとき、
+`embedding_unavailable_reason` に理由を記録する。例は `model_missing` と `runtime_hash_mismatch`。
+背景 engine の競合は `status` の `paused_by_hold_reason.resource_busy` に含める。
+
 local HTTP peer には `peer_authenticated=false` を表示し、承認確認にも未認証と明示する。
 HTTPS の trust 状態は既存の managed CA status に従う。producer の認定状態は設けない。
 汎用 endpoint の設定は [07-adapter-spec.md §5.3](07-adapter-spec.md) に従う。

@@ -841,7 +841,7 @@ mod tests {
             trust_binding: kio_adapter::local_peer::HTTP_UNAUTHENTICATED_TRUST_BINDING.into(),
         };
         let disclosure = EndpointDisclosure {
-            tool_id: "qwen3_vl_embedding_local".into(),
+            tool_id: "local_embedding".into(),
             tool_profile_hash: "profile".into(),
             purpose: "embedding".into(),
             content_types: vec!["query text".into(), "document text".into(), "images".into()],
@@ -905,7 +905,7 @@ mod tests {
             trust_binding: kio_adapter::local_peer::HTTP_UNAUTHENTICATED_TRUST_BINDING.into(),
         };
         let disclosure = EndpointDisclosure {
-            tool_id: "qwen3_vl_embedding_local".into(),
+            tool_id: "local_embedding".into(),
             tool_profile_hash: "profile".into(),
             purpose: "embedding".into(),
             content_types: vec!["query text".into(), "document text".into(), "images".into()],

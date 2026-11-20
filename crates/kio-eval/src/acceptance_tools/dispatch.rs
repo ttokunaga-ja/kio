@@ -79,13 +79,7 @@ mod unix {
             && p[0] == "v1"
             && matches!(
                 p[1],
-                "init"
-                    | "identity"
-                    | "start-ocr"
-                    | "stop-ocr"
-                    | "start-embedding"
-                    | "stop-embedding"
-                    | "finish"
+                "init" | "identity" | "start-ocr" | "stop-ocr" | "finish"
             )
             && valid_sha(p[2], 40)
             && positive_decimal(p[3], 19)
@@ -504,10 +498,7 @@ mod unix {
         let root = retained_private_dir(base, &root_relative)?;
         let phase = current_state(&root, request)?;
         if request.verb == "identity" {
-            if !matches!(
-                phase.as_str(),
-                "ready" | "ocr-running" | "ocr-stopped" | "embedding-running" | "embedding-stopped"
-            ) {
+            if !matches!(phase.as_str(), "ready" | "ocr-running" | "ocr-stopped") {
                 return Err("identity is forbidden in this phase".into());
             };
             let state = retained_private_child(&root, "state")?;
@@ -520,10 +511,12 @@ mod unix {
                 .map_err(|_| "public CA unavailable".to_string())?;
             let ca = String::from_utf8(ca).map_err(|_| "public CA unavailable".to_string())?;
             let mut observed = Vec::new();
-            for name in ["ocr-observed.json", "embedding-observed.json"] {
-                if state.contains_entry(Path::new(name)).unwrap_or(false) {
-                    observed.push(private_json::<serde_json::Value>(&state, name)?.0);
-                }
+            let observed_file = "ocr-observed.json";
+            if state
+                .contains_entry(Path::new(observed_file))
+                .unwrap_or(false)
+            {
+                observed.push(private_json::<serde_json::Value>(&state, observed_file)?.0);
             }
             let response = serde_jcs::to_string(
                 &serde_json::json!({"identity":identity,"observed":observed,"public_ca_pem":ca}),
@@ -544,10 +537,6 @@ mod unix {
                     | "ocr-running"
                     | "ocr-stopping"
                     | "ocr-stopped"
-                    | "embedding-starting"
-                    | "embedding-running"
-                    | "embedding-stopping"
-                    | "embedding-stopped"
                     | "finishing"
                     | "finished"
             ) {
@@ -574,12 +563,6 @@ mod unix {
         let (before, action, after) = match (request.verb.as_str(), phase.as_str()) {
             ("start-ocr", "ready") => ("ocr-starting", "start-ocr", "ocr-running"),
             ("stop-ocr", "ocr-running") => ("ocr-stopping", "stop-ocr", "ocr-stopped"),
-            ("start-embedding", "ocr-stopped") => {
-                ("embedding-starting", "start-embedding", "embedding-running")
-            }
-            ("stop-embedding", "embedding-running") => {
-                ("embedding-stopping", "stop-embedding", "embedding-stopped")
-            }
             _ => return Err("controller phase is invalid".into()),
         };
         replace_state(&root, request, before)?;
@@ -782,22 +765,7 @@ mod unix {
                 ))
                 .is_err()
             );
-            assert!(
-                handle(
-                    &base,
-                    &req("start-embedding"),
-                    Some(&cap),
-                    &mut |_, _| panic!("wrong phase")
-                )
-                .is_err()
-            );
-            for verb in [
-                "start-ocr",
-                "stop-ocr",
-                "start-embedding",
-                "stop-embedding",
-                "finish",
-            ] {
+            for verb in ["start-ocr", "stop-ocr", "finish"] {
                 assert_eq!(
                     handle(&base, &req(verb), Some(&cap), &mut |_, action| {
                         calls.push(action.to_owned());
@@ -808,17 +776,7 @@ mod unix {
                 );
             }
             assert!(!base.contains_entry(Path::new("lease.json")).unwrap());
-            assert_eq!(
-                calls,
-                [
-                    "init",
-                    "start-ocr",
-                    "stop-ocr",
-                    "start-embedding",
-                    "stop-embedding",
-                    "cleanup"
-                ]
-            );
+            assert_eq!(calls, ["init", "start-ocr", "stop-ocr", "cleanup"]);
         }
         #[test]
         fn failed_controller_cannot_reexecute_and_cleanup_must_succeed() {

@@ -1,5 +1,5 @@
 //! Baseline-bound memory admission and recovery for the fixed local GPU route.
-use clap::{Args as ClapArgs, Subcommand, ValueEnum};
+use clap::{Args as ClapArgs, Subcommand};
 use kio_core::{
     private_fs::{read_private_file_at, verify_private_directory},
     store_dir::{Publication, StoreDirectory},
@@ -33,13 +33,6 @@ pub struct State {
 pub struct Start {
     #[command(flatten)]
     pub state: State,
-    #[arg(long, value_enum)]
-    pub phase: Phase,
-}
-#[derive(Clone, Copy, Debug, ValueEnum)]
-pub enum Phase {
-    Ocr,
-    Embedding,
 }
 #[derive(ClapArgs, Debug)]
 pub struct Recovered {
@@ -70,7 +63,7 @@ pub fn run(args: Args) -> Result<(), String> {
         Command::Capture(args) => capture(&args.state_dir, sample_stdin()?),
         Command::CheckStart(args) => {
             let baseline = load(&args.state.state_dir, false)?.ok_or("missing baseline")?;
-            check_start(&baseline.sample, &sample_stdin()?, args.phase)
+            check_start(&baseline.sample, &sample_stdin()?)
         }
         Command::CheckRecovered(args) => {
             // Drain and validate the bounded sample even when an interrupted init
@@ -185,14 +178,11 @@ fn same_gpu(baseline: &Sample, current: &Sample) -> Result<(), String> {
     }
     Ok(())
 }
-fn check_start(baseline: &Sample, current: &Sample, phase: Phase) -> Result<(), String> {
+fn check_start(baseline: &Sample, current: &Sample) -> Result<(), String> {
     same_gpu(baseline, current)?;
-    let required = match phase {
-        Phase::Ocr => 6141,
-        Phase::Embedding => 6638.max(((u128::from(current.total_mib) * 4).div_ceil(5)) as u64),
-    }
-    .checked_add(RESERVE)
-    .ok_or("GPU admission threshold overflow")?;
+    let required = 6141_u64
+        .checked_add(RESERVE)
+        .ok_or("GPU admission threshold overflow")?;
     if current.free_mib < required {
         return Err(format!(
             "insufficient GPU free memory: {} MiB; need {required} MiB",
@@ -260,16 +250,14 @@ mod tests {
     #[test]
     fn idle_1222_and_measured_admission() {
         let baseline = sample(1222);
-        check_start(&baseline, &baseline, Phase::Ocr).unwrap();
-        check_start(&baseline, &baseline, Phase::Embedding).unwrap();
+        check_start(&baseline, &baseline).unwrap();
         check_recovered(&baseline, &sample(1350)).unwrap();
         assert!(check_recovered(&baseline, &sample(1351)).is_err());
-        assert!(check_start(&baseline, &sample(2000), Phase::Ocr).is_err());
-        assert!(check_start(&baseline, &sample(1500), Phase::Embedding).is_err());
+        assert!(check_start(&baseline, &sample(2000)).is_err());
         let mut changed = sample(1222);
         changed.uuid = UUID.replace("01234567", "11234567");
         assert!(check_recovered(&baseline, &changed).is_err());
-        assert!(check_start(&baseline, &changed, Phase::Ocr).is_err());
+        assert!(check_start(&baseline, &changed).is_err());
         changed = sample(1222);
         changed.total_mib += 1;
         assert!(check_recovered(&baseline, &changed).is_err());

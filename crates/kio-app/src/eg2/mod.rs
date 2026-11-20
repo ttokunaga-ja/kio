@@ -4,7 +4,6 @@
 mod input;
 mod native;
 mod platform;
-mod profile;
 mod runtime;
 mod supervisor;
 #[cfg(test)]
@@ -21,13 +20,12 @@ use kio_core::control::ControlHandle;
 
 pub use input::EmbeddingInput;
 use input::PreparedInput;
-pub use profile::{profile_hash, profile_value};
+use kio_core::eg2::TOKEN_CAP;
+pub use kio_core::eg2::{DIMENSIONS, profile_hash, profile_value};
 use supervisor::Worker;
 
 pub const WORKER_ARGUMENT: &str = "--internal-eg2-worker";
 const TEST_NATIVE_DIAGNOSTICS: &str = "KIO_EG2_TEST_NATIVE_DIAGNOSTICS";
-pub const DIMENSIONS: usize = 768;
-const TOKEN_CAP: u32 = 2048;
 const MAX_TEXT_BYTES: usize = 32 * 1024;
 const MAX_REQUEST_BYTES: usize = 1 + kio_adapter::types::MAX_EMBEDDING_ITEM_BYTES;
 const REQUEST_ID_BYTES: usize = size_of::<u64>();
@@ -68,50 +66,110 @@ enum WireInput<'a> {
     Image(&'a [u8]),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum WorkerError {
-    #[error("runtime_missing")]
     RuntimeMissing = 2,
-    #[error("runtime_hash_mismatch")]
     RuntimeHashMismatch,
-    #[error("runtime_unsupported_target")]
     RuntimeUnsupported,
-    #[error("runtime_unavailable")]
     RuntimeUnavailable,
-    #[error("model_missing")]
     ModelMissing,
-    #[error("model_hash_mismatch")]
     ModelHashMismatch,
-    #[error("model_unavailable")]
     ModelUnavailable,
-    #[error("resource_busy")]
     ResourceBusy,
-    #[error("worker_startup")]
     Startup,
-    #[error("worker_crash")]
     Crash,
-    #[error("worker_eof")]
     Eof,
-    #[error("worker_protocol")]
     Protocol,
-    #[error("worker_timeout")]
     Timeout,
-    #[error("cancelled")]
     Cancelled,
-    #[error("worker_memory_limit")]
     MemoryLimit,
-    #[error("input_limit")]
     InputLimit,
-    #[error("input_overflow")]
     InputOverflow,
-    #[error("native_inference")]
     Inference,
-    #[error("invalid_input")]
     InvalidInput,
 }
 
+impl std::fmt::Display for WorkerError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.reason())
+    }
+}
+
+impl std::error::Error for WorkerError {}
+
 impl WorkerError {
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Self::RuntimeMissing => "runtime_missing",
+            Self::RuntimeHashMismatch => "runtime_hash_mismatch",
+            Self::RuntimeUnsupported => "runtime_unsupported_target",
+            Self::RuntimeUnavailable => "runtime_unavailable",
+            Self::ModelMissing => "model_missing",
+            Self::ModelHashMismatch => "model_hash_mismatch",
+            Self::ModelUnavailable => "model_unavailable",
+            Self::ResourceBusy => "resource_busy",
+            Self::Startup => "worker_startup",
+            Self::Crash => "worker_crash",
+            Self::Eof => "worker_eof",
+            Self::Protocol => "worker_protocol",
+            Self::Timeout => "worker_timeout",
+            Self::Cancelled => "cancelled",
+            Self::MemoryLimit => "worker_memory_limit",
+            Self::InputLimit => "input_limit",
+            Self::InputOverflow => "input_overflow",
+            Self::Inference => "native_inference",
+            Self::InvalidInput => "invalid_input",
+        }
+    }
+
+    pub(crate) fn public_error(self) -> (&'static str, kio_core::ExitCode) {
+        use kio_core::ExitCode;
+        match self {
+            Self::ModelMissing | Self::ModelUnavailable => {
+                ("KIO-E-MODEL-NOT-READY-001", ExitCode::PermanentFailure)
+            }
+            Self::ModelHashMismatch | Self::RuntimeHashMismatch => {
+                ("KIO-E-MODEL-HASH-001", ExitCode::PermanentFailure)
+            }
+            Self::ResourceBusy | Self::MemoryLimit => {
+                ("KIO-E-EMBED-RESOURCE-001", ExitCode::PartialFailure)
+            }
+            Self::Cancelled => ("KIO-E-INTERRUPTED-001", ExitCode::Interrupted),
+            _ => ("KIO-E-EMBED-RUNTIME-001", ExitCode::PermanentFailure),
+        }
+    }
+
+    pub(crate) fn is_resource_busy(self) -> bool {
+        matches!(self, Self::MemoryLimit | Self::ResourceBusy)
+    }
+
+    pub(crate) fn is_unsent(self) -> bool {
+        matches!(
+            self,
+            Self::RuntimeMissing
+                | Self::RuntimeHashMismatch
+                | Self::RuntimeUnsupported
+                | Self::RuntimeUnavailable
+                | Self::ModelMissing
+                | Self::ModelHashMismatch
+                | Self::ModelUnavailable
+                | Self::ResourceBusy
+        )
+    }
+
+    pub(crate) fn retryable(self) -> bool {
+        matches!(
+            self,
+            Self::Startup
+                | Self::Crash
+                | Self::Eof
+                | Self::Protocol
+                | Self::Timeout
+                | Self::Cancelled
+        )
+    }
+
     fn wire(self) -> u8 {
         self as u8
     }
@@ -167,11 +225,16 @@ pub(crate) fn verify_runtime() -> Result<(), WorkerError> {
 pub struct EmbeddingSession {
     slot: EngineSlot,
     worker: Option<Worker>,
+    unavailable: Option<WorkerError>,
 }
 
 impl EmbeddingSession {
     pub fn new(slot: EngineSlot) -> Self {
-        Self { slot, worker: None }
+        Self {
+            slot,
+            worker: None,
+            unavailable: None,
+        }
     }
 
     pub fn embed(
@@ -183,6 +246,13 @@ impl EmbeddingSession {
             self.worker.take();
             return Err(WorkerError::Cancelled);
         }
+        if let Some(error) = self.unavailable {
+            return Err(error);
+        }
+        if self.worker.is_none() && crate::model::engine_model_absent(&ControlHandle::default()) {
+            self.unavailable = Some(WorkerError::ModelMissing);
+            return Err(WorkerError::ModelMissing);
+        }
         let input = input.prepare()?;
         let pin = kio_core::litert::Bundle::for_target(runtime::TARGET)
             .ok_or(WorkerError::RuntimeUnsupported)?;
@@ -191,14 +261,23 @@ impl EmbeddingSession {
             let mut command = Command::new(executable);
             command.args([WORKER_ARGUMENT, self.slot.name()]);
             command.env_remove(TEST_NATIVE_DIAGNOSTICS);
-            self.worker = Some(Worker::spawn(command, STARTUP_TIMEOUT, cancelled, false)?);
+            match Worker::spawn(command, STARTUP_TIMEOUT, cancelled, false) {
+                Ok(worker) => self.worker = Some(worker),
+                Err(error) => {
+                    self.unavailable = error.is_unsent().then_some(error);
+                    return Err(error);
+                }
+            }
         }
         let worker = self.worker.as_mut().expect("worker started");
         let threads = worker.threads;
         let result =
             embed_with_worker(worker, input, Instant::now() + INFERENCE_TIMEOUT, cancelled);
         if worker.child.is_none()
-            || matches!(result, Err(WorkerError::Timeout | WorkerError::Cancelled))
+            || matches!(
+                result,
+                Err(WorkerError::Timeout | WorkerError::Cancelled | WorkerError::MemoryLimit)
+            )
         {
             self.worker.take();
         }

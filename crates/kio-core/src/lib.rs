@@ -4,6 +4,7 @@ pub mod cas;
 pub mod control;
 pub mod dag;
 pub mod durability;
+pub mod eg2;
 pub mod error;
 pub mod exit_code;
 pub mod gc;

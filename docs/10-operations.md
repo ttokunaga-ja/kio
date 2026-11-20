@@ -486,6 +486,10 @@ task journal の normalized output はこの physical path ではなく `normali
 
 ## 5.1 EG2 のモデル・runtime 配置と取得
 
+Embedding の接続設定がない端末では、モデルの準備後に通常の `kio index` と `kio search` が EG2 を使う。
+`--offline` でも同じモデルを利用できる。準備状況は `kio model status` で確認する。
+
+
 runtime library は LiteRT-LM v0.19.1 の C API 1.0.0 の共有 library（`liblitert-lm.so`・`liblitert-lm.dylib`・`litert-lm.dll`）を使い、
 Kio release 所有の `lib/litert-lm/0.19.1/<target>/` に同梱し、配布 manifest の target ごとの SHA-256 と照合する。
 取得元は公式 release の `litert_lm_c_api-1.0.0.zip`（SHA-256 `1d430d80eaf536f696a4922270ba55eb3d112189ac198c3066d487a45e3b4d4c`）で、

@@ -195,6 +195,7 @@ fn index_preview_projection_preserves_domain_candidates_costs_and_parent_child_s
 
 fn published() -> IndexPublishedResponse {
     IndexPublishedResponse {
+        embedding_unavailable_reason: None,
         deferred_inputs: kio_core::disk_records::DiskRecords::empty(),
         status: "noop".to_owned(),
         approval_method: "existing".to_owned(),

@@ -187,6 +187,7 @@ struct IndexPublishedWork {
     skipped_unrecognized_binary_files: usize,
     embedding_tasks_executed: usize,
     embedding_tasks_failed: usize,
+    embedding_unavailable_reason: Option<&'static str>,
     tree_hash: String,
     commit_hash: Option<String>,
     commit: Option<CommitObject>,
@@ -214,6 +215,7 @@ impl IndexPublishedWork {
             skipped_unrecognized_binary_files: self.skipped_unrecognized_binary_files,
             embedding_tasks_executed: self.embedding_tasks_executed,
             embedding_tasks_failed: self.embedding_tasks_failed,
+            embedding_unavailable_reason: self.embedding_unavailable_reason,
             tree_hash: self.tree_hash,
             commit_hash: self.commit_hash,
             commit: self.commit,
@@ -952,11 +954,23 @@ fn run_index_for_repo_inner(
         skipped_unrecognized_binary_files: index_result.skipped_unrecognized_binary_files,
         embedding_tasks_executed: enrichment.executed,
         embedding_tasks_failed: enrichment.failed,
+        embedding_unavailable_reason: enrichment.embedding_unavailable_reason,
         tree_hash: outcome.tree_hash,
         commit_hash: outcome.commit_hash,
         commit: outcome.commit,
         skipped: skipped_disclosure(&rebuild_report, repo.kio_dir()),
-        error_code: (index_result.failed_files > 0).then(|| "KIO-E-INDEX-PARTIAL-001".to_owned()),
+        error_code: if enrichment.resource_busy > 0 {
+            Some(
+                crate::eg2::WorkerError::ResourceBusy
+                    .public_error()
+                    .0
+                    .to_owned(),
+            )
+        } else if let Some(failure) = enrichment.native_failure {
+            Some(failure.public_error().0.to_owned())
+        } else {
+            (index_result.failed_files > 0).then(|| "KIO-E-INDEX-PARTIAL-001".to_owned())
+        },
         gc: None,
         publication_status: None,
         child_scopes: None,
@@ -2408,6 +2422,7 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
         rebuilt_chunks: report.rebuilt_chunks,
         embedding_tasks_executed: enrichment.executed,
         embedding_tasks_failed: enrichment.failed,
+        embedding_unavailable_reason: enrichment.embedding_unavailable_reason,
         paused_tasks: enrichment.paused,
         skipped: skipped_disclosure(&report, repo.kio_dir()),
     };

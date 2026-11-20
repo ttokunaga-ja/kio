@@ -31,7 +31,7 @@ use crate::search::projection::mark_replica_unavailable_or_log;
 use crate::search::projection::write_through_repository_projection;
 use crate::search::scope::current_embedding_policy;
 use crate::settings::embedding_profile_summary;
-use crate::settings::persisted_embedding_is_deterministic;
+use crate::settings::persisted_embedding_is_local_library;
 use crate::settings::{
     rebuild_embedding_entry_from_tool_lock, rebuild_embedding_profile_from_tool_lock,
 };
@@ -2261,7 +2261,7 @@ fn build_sqlite_index_at(
     let locked_embedding = rebuild_embedding_entry_from_tool_lock(kio_dir)?;
     let expected_embedding_profile = locked_embedding.as_ref().map(embedding_profile_summary);
     let secrets_allowed = match locked_embedding.as_ref() {
-        Some(entry) if persisted_embedding_is_deterministic(entry) => true,
+        Some(entry) if persisted_embedding_is_local_library(entry) => true,
         Some(entry) => approvals::allowed(
             adapter_settings,
             repository,

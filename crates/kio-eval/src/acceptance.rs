@@ -282,21 +282,16 @@ pub struct ServiceIdentity {
     pub schema: String,
     pub run_nonce: String,
     pub ocr_endpoint: String,
-    pub embedding_endpoint: String,
     pub ca_sha256: String,
     pub leaf_cert_sha256: String,
     pub controller_sha256: String,
     pub proxy_sha256: String,
     pub entrypoint_sha256: String,
     pub ocr_compose_sha256: String,
-    pub embedding_compose_sha256: String,
     pub backend_config_sha256: String,
     pub ocr_image: String,
     pub ocr_revision: String,
     pub ocr_weight_sha256: String,
-    pub embedding_image: String,
-    pub embedding_revision: String,
-    pub embedding_weight_sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -338,7 +333,7 @@ pub(crate) fn read_service_identity(
 }
 
 pub(crate) fn validate_service_identity(identity: &ServiceIdentity) -> Result<(), AcceptanceError> {
-    if identity.schema != "kio.local-gpu.identity/v1"
+    if identity.schema != "kio.local-gpu.ocr-identity/v1"
         || identity.run_nonce.is_empty()
         || identity.run_nonce.len() > 256
         || !identity.run_nonce.is_ascii()
@@ -347,9 +342,7 @@ pub(crate) fn validate_service_identity(identity: &ServiceIdentity) -> Result<()
             "service identity schema or nonce is invalid".into(),
         ));
     }
-    for endpoint in [&identity.ocr_endpoint, &identity.embedding_endpoint] {
-        validate_loopback_https(endpoint)?;
-    }
+    validate_loopback_https(&identity.ocr_endpoint)?;
     for hash in [
         &identity.ca_sha256,
         &identity.leaf_cert_sha256,
@@ -357,10 +350,8 @@ pub(crate) fn validate_service_identity(identity: &ServiceIdentity) -> Result<()
         &identity.proxy_sha256,
         &identity.entrypoint_sha256,
         &identity.ocr_compose_sha256,
-        &identity.embedding_compose_sha256,
         &identity.backend_config_sha256,
         &identity.ocr_weight_sha256,
-        &identity.embedding_weight_sha256,
     ] {
         if !hash.starts_with("sha256:") || !is_lower_hex(&hash[7..], 64) {
             return Err(AcceptanceError::Invalid(
@@ -368,12 +359,7 @@ pub(crate) fn validate_service_identity(identity: &ServiceIdentity) -> Result<()
             ));
         }
     }
-    for text in [
-        &identity.ocr_image,
-        &identity.ocr_revision,
-        &identity.embedding_image,
-        &identity.embedding_revision,
-    ] {
+    for text in [&identity.ocr_image, &identity.ocr_revision] {
         if text.is_empty() || text.len() > 512 || !text.is_ascii() {
             return Err(AcceptanceError::Invalid(
                 "service identity text is malformed".into(),
@@ -385,11 +371,6 @@ pub(crate) fn validate_service_identity(identity: &ServiceIdentity) -> Result<()
         || identity.ocr_revision != "PaddleOCR-VL-1.6"
         || identity.ocr_weight_sha256
             != "sha256:85a479d506a11e724e7285d395c551be69f41dbc16b6342d3cacfb189aed71db"
-        || identity.embedding_image
-            != "vllm/vllm-openai@sha256:770fe65b2c73ee74a5c42165cf3433de4048cc2cd9c57a937ca4e35aba5aa87b"
-        || identity.embedding_revision != "9f2f7e710d6d81056aa5c0a4f04764fec6bb7bda"
-        || identity.embedding_weight_sha256
-            != "sha256:c73fa9caeddeb3ff831d46c085a7a5708343248ca777e90f2d486964464509c1"
     {
         return Err(AcceptanceError::Invalid(
             "service identity does not match measured GPU pins".into(),
@@ -3734,10 +3715,12 @@ fn validate_receipt(receipt: &AcceptanceReceipt) -> Result<(), AcceptanceError> 
         .map_err(|error| AcceptanceError::Receipt(error.to_string()))?;
     if receipt.requirement.subcase == AcceptanceSubcase::AuthenticatedLocal
         && receipt.runtime.tools.iter().any(|tool| {
-            !matches!(
-                tool.tool_id.as_str(),
-                "prepare_default" | "paddleocr_vl_local" | "qwen3_vl_embedding_local"
-            )
+            (tool.tool_id == kio_core::eg2::TOOL_ID
+                && tool.tool_profile_hash != kio_core::eg2::profile_hash())
+                || !matches!(
+                    tool.tool_id.as_str(),
+                    "prepare_default" | "paddleocr_vl_local" | kio_core::eg2::TOOL_ID
+                )
         })
     {
         return Err(AcceptanceError::Receipt(
@@ -3752,7 +3735,7 @@ fn validate_receipt(receipt: &AcceptanceReceipt) -> Result<(), AcceptanceError> 
         (AcceptanceCase::A08, AcceptanceSubcase::Mistral) => Some("mistral_ocr_markdownize"),
         (AcceptanceCase::A08, AcceptanceSubcase::Gemini) => Some("gemini_embedding_2"),
         (AcceptanceCase::A08, AcceptanceSubcase::AuthenticatedLocal) => {
-            Some("qwen3_vl_embedding_local")
+            Some(kio_core::eg2::TOOL_ID)
         }
         _ => None,
     };
@@ -4225,11 +4208,11 @@ esac
             }),
             (AcceptanceCase::A08, AcceptanceSubcase::AuthenticatedLocal) => {
                 tools.push(ObservedToolIdentity {
-                    tool_id: "paddleocr_vl_local".into(),
-                    tool_profile_hash: hash.clone(),
+                    tool_id: kio_core::eg2::TOOL_ID.into(),
+                    tool_profile_hash: kio_core::eg2::profile_hash().to_owned(),
                 });
                 tools.push(ObservedToolIdentity {
-                    tool_id: "qwen3_vl_embedding_local".into(),
+                    tool_id: "paddleocr_vl_local".into(),
                     tool_profile_hash: hash.clone(),
                 });
             }

@@ -24,6 +24,8 @@ pub struct HeadReindexResponse {
     pub rebuilt_chunks: u64,
     pub embedding_tasks_executed: usize,
     pub embedding_tasks_failed: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedding_unavailable_reason: Option<&'static str>,
     pub paused_tasks: usize,
     #[serde(flatten)]
     pub skipped: SkippedDisclosure,

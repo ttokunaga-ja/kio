@@ -14,10 +14,8 @@ use crate::context::AppContext;
 use crate::response::model::{ModelReadiness, ModelResponse};
 use crate::response::{CommandResponse, Completion, ResponseBody};
 
-pub(crate) const MODEL: &str = "embeddinggemma-2";
-pub(crate) const REVISION: &str = "e301f74d5551b0c2641bd5cb4652a76239d5c5f8";
-pub(crate) const MODEL_SHA256: &str =
-    "92dcbea108899e5d6e30d919b0744f90d9967e80c67a4ab5503ac16d54f62eb0";
+use kio_core::eg2::{MODEL, MODEL_SHA256, REVISION};
+
 const ARTIFACT: &str = "embeddinggemma-2-text-vision-440m.litertlm";
 const SOURCE: &str =
     "https://huggingface.co/litert-community/embeddinggemma-2-text-vision-440m-litert-lm";
@@ -193,6 +191,18 @@ pub(crate) fn run(
         "model size and SHA-256 verified",
         None,
     ))
+}
+
+/// Report an absent artifact without loading weights or opening a worker.
+pub(crate) fn engine_model_absent(control: &ControlHandle) -> bool {
+    let base = crate::settings::data_home(control);
+    matches!(
+        Pin::current(control)
+            .directory(&base)
+            .join(ARTIFACT)
+            .try_exists(),
+        Ok(false)
+    )
 }
 
 pub(crate) fn open_engine_model(

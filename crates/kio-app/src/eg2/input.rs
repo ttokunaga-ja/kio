@@ -1,11 +1,7 @@
 use super::{MAX_REQUEST_BYTES, MAX_TEXT_BYTES, WireInput, WorkerError, request, window};
 use crate::embedding::input::verified_image_mime;
-use kio_core::dag::DEFAULT_CHUNKING_MAX_CHARS;
+use kio_core::eg2::{DOCUMENT_PROMPT, MAX_BODY_CHARS, QUERY_PROMPT};
 use kio_index::embedding_store::contextualized_embedding_input;
-
-pub(super) const QUERY_PROMPT: &str = "task: search result | query: ";
-pub(super) const DOCUMENT_PROMPT: &str = "title: none | text: ";
-pub(super) const MAX_BODY_CHARS: usize = DEFAULT_CHUNKING_MAX_CHARS as usize;
 
 #[derive(Clone, Copy)]
 pub enum EmbeddingInput<'a> {

@@ -709,13 +709,12 @@ fn embedding_grants_require_the_explicit_current_role_and_profile() {
                 .all(|row| row["permitted"] == true)
         );
 
-        // Persisted embedding grants cannot borrow Markdown runtime authority
-        // when rebuild has no active embedding adapter.
+        // Persisted Gemini grants cannot borrow authority from default EG2.
         {
             let adapter_settings = &std::sync::Arc::new(AdapterRuntimeSettings::default());
-            assert!(
-                crate::embedding::admission::embedding_execution(adapter_settings, control)
-                    .is_none()
+            assert_eq!(
+                crate::embedding::admission::embedding_execution(adapter_settings, control),
+                Some(kio_adapter::catalog::EmbeddingExecution::Native)
             );
             for operation in [GrantOperation::Network, GrantOperation::SendSecrets] {
                 assert!(
@@ -1241,7 +1240,7 @@ fn nested_execute_preserves_outer_control_after_inner_panic() {
 const LOOPBACK_TEST_CA: &str = "-----BEGIN CERTIFICATE-----\nMIIBWTCB/6ADAgECAhR5P0J0YMFaZPlrOFyN8/jwpGzhqjAKBggqhkjOPQQDAjAh\nMR8wHQYDVQQDDBZyY2dlbiBzZWxmIHNpZ25lZCBjZXJ0MCAXDTc1MDEwMTAwMDAw\nMFoYDzQwOTYwMTAxMDAwMDAwWjAhMR8wHQYDVQQDDBZyY2dlbiBzZWxmIHNpZ25l\nZCBjZXJ0MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEGhIwEPQnvWSlH+iUQ5Ui\nq0khmBj4hlxmW+mTL5xjjyxwwopOnkxLs2AofasS2lYPdILzMaIeRE78g2S7Hz1n\nX6MTMBEwDwYDVR0RBAgwBocEfwAAATAKBggqhkjOPQQDAgNJADBGAiEA0GBG4uEL\nSJJea18R17+yhRTyn3rsD6PzDhdg7F/v2sQCIQCccgcgjDh+ABNajeb1deKZoqbx\nnP4qBrGe09azOI4jbg==\n-----END CERTIFICATE-----\n";
 
 fn loopback_settings(fixture: &Fixture) -> Arc<AdapterRuntimeSettings> {
-    use kio_adapter::tool_lock::DeclaredAdapter;
+    use kio_adapter::tool_lock::{declared_adapter_for_role, parse_tools_toml_for_roles};
     use std::io::Write;
     let ca = fixture.repo.kio_dir().join("loopback-test-ca.pem");
     let mut file = crate::test_support::create_private_test_file(&ca);
@@ -1256,14 +1255,22 @@ fn loopback_settings(fixture: &Fixture) -> Arc<AdapterRuntimeSettings> {
         "local-ca:v1:g1:01ARZ3NDEKTSV4RRFFQ69G5FAV:{}",
         settings.local_peer_trust_digest.as_ref().unwrap()
     ));
+    let declaration = parse_tools_toml_for_roles(
+        br#"[embedding.local_embedding]
+kind = 'offline_api'
+url = 'https://127.0.0.1:9443/v1/embeddings'
+model = 'test-embedding'
+wire_format = 'messages'
+model_version_pin = 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+chat_template_hash = 'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+instruction = ''
+"#,
+        &["embedding"],
+    )
+    .unwrap();
     settings.declarations.insert(
         "embedding".into(),
-        DeclaredAdapter {
-            tool_id: Some("qwen3_vl_embedding_local".into()),
-            kind: Some("offline_api".into()),
-            url: Some("https://127.0.0.1:9443/v1/embeddings".into()),
-            ..Default::default()
-        },
+        declared_adapter_for_role(&declaration, "embedding").unwrap(),
     );
     Arc::new(settings)
 }
@@ -1417,7 +1424,7 @@ fn endpoint_secret_confirmation_is_scoped_resumable_and_requires_live_parent() {
     use crate::grants::{GrantOperation, GrantState};
     let fixture = Fixture::new();
     let settings = loopback_settings(&fixture);
-    let tool = "qwen3_vl_embedding_local";
+    let tool = "local_embedding";
     let profile = crate::embedding::admission::declared_embedding_profile(
         &settings,
         crate::embedding::admission::embedding_execution(&settings, fixture.repo.control())
@@ -1540,7 +1547,7 @@ fn combined_endpoint_secret_pending_cannot_resume_after_parent_revoke() {
     use crate::grants::{GrantOperation, GrantState};
     let fixture = Fixture::new();
     let settings = loopback_settings(&fixture);
-    let tool = "qwen3_vl_embedding_local";
+    let tool = "local_embedding";
     assert!(
         fixture
             .approve_with_control(
@@ -1691,7 +1698,8 @@ fn assert_dispatch_grant_directory_binding(active_original: bool) {
                     }
                     let mut vector = vec![0.0_f32; 768];
                     vector[0] = 1.0;
-                    let response = serde_json::json!({"data":[{"embedding":vector}]}).to_string();
+                    let response =
+                        serde_json::json!({"data":[{"index":0,"embedding":vector}]}).to_string();
                     write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
                     stream.flush().unwrap();
                     break;
@@ -1905,7 +1913,8 @@ fn assert_retired_child_secret_is_revalidated_under_dispatch_lease() {
                     }
                     let mut vector = vec![0.0_f32; 768];
                     vector[0] = 1.0;
-                    let response = serde_json::json!({"data":[{"embedding":vector}]}).to_string();
+                    let response =
+                        serde_json::json!({"data":[{"index":0,"embedding":vector}]}).to_string();
                     write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
                     stream.flush().unwrap();
                     break;

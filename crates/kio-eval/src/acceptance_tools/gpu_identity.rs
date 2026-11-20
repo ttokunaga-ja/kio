@@ -11,7 +11,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const IDENTITY_SCHEMA: &str = "kio.local-gpu.identity/v1";
+const IDENTITY_SCHEMA: &str = "kio.local-gpu.ocr-identity/v1";
 const OBSERVED_SCHEMA: &str = "kio.v1.local_gpu.phase_observed.v1";
 const MAX_IDENTITY: u64 = 64 * 1024;
 const MAX_SOURCE: u64 = 16 * 1024 * 1024;
@@ -44,8 +44,6 @@ pub struct Binding {
     #[arg(long)]
     pub ocr_compose: PathBuf,
     #[arg(long)]
-    pub embedding_compose: PathBuf,
-    #[arg(long)]
     pub backend_config: PathBuf,
     #[arg(long)]
     pub ca_cert: PathBuf,
@@ -57,12 +55,6 @@ pub struct Binding {
     pub ocr_revision: String,
     #[arg(long)]
     pub ocr_weight_sha256: String,
-    #[arg(long)]
-    pub embedding_image: String,
-    #[arg(long)]
-    pub embedding_revision: String,
-    #[arg(long)]
-    pub embedding_weight_sha256: String,
 }
 
 #[derive(ClapArgs, Debug)]
@@ -104,18 +96,13 @@ struct Identity {
     proxy_sha256: String,
     entrypoint_sha256: String,
     ocr_compose_sha256: String,
-    embedding_compose_sha256: String,
     backend_config_sha256: String,
     ca_sha256: String,
     leaf_cert_sha256: String,
     ocr_endpoint: String,
-    embedding_endpoint: String,
     ocr_image: String,
     ocr_revision: String,
     ocr_weight_sha256: String,
-    embedding_image: String,
-    embedding_revision: String,
-    embedding_weight_sha256: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -173,7 +160,7 @@ fn check(args: Check) -> Result<(), String> {
 }
 
 fn observe(args: Observe) -> Result<(), String> {
-    if !matches!(args.phase.as_str(), "ocr" | "embedding")
+    if args.phase != "ocr"
         || !image_id(&args.first_image_id)
         || args
             .second_image_id
@@ -181,9 +168,6 @@ fn observe(args: Observe) -> Result<(), String> {
             .is_some_and(|v| !image_id(v))
     {
         return Err("invalid observed phase or image id".into());
-    }
-    if args.phase == "embedding" && args.second_image_id.is_some() {
-        return Err("embedding has one running image".into());
     }
     let state = state(&args.state_dir)?;
     let identity = read_private_file_at(&state, "identity.json", MAX_IDENTITY)
@@ -225,9 +209,6 @@ fn identity(b: &Binding, run_nonce: String) -> Result<Identity, String> {
         || !image_digest(&b.ocr_image)
         || b.ocr_revision != "PaddleOCR-VL-1.6"
         || !sha256_id_value(&b.ocr_weight_sha256)
-        || !image_digest(&b.embedding_image)
-        || !hex(&b.embedding_revision, 40)
-        || !sha256_id_value(&b.embedding_weight_sha256)
     {
         return Err("identity properties are invalid".into());
     }
@@ -238,18 +219,13 @@ fn identity(b: &Binding, run_nonce: String) -> Result<Identity, String> {
         proxy_sha256: digest_file(&b.proxy, MAX_PROXY_BINARY)?,
         entrypoint_sha256: digest_file(&b.entrypoint, MAX_SOURCE)?,
         ocr_compose_sha256: digest_file(&b.ocr_compose, MAX_SOURCE)?,
-        embedding_compose_sha256: digest_file(&b.embedding_compose, MAX_SOURCE)?,
         backend_config_sha256: digest_file(&b.backend_config, MAX_SOURCE)?,
         ca_sha256: digest_file(&b.ca_cert, MAX_SOURCE)?,
         leaf_cert_sha256: digest_file(&b.leaf_cert, MAX_SOURCE)?,
         ocr_endpoint: "https://127.0.0.1:18443".into(),
-        embedding_endpoint: "https://127.0.0.1:18444".into(),
         ocr_image: b.ocr_image.clone(),
         ocr_revision: b.ocr_revision.clone(),
         ocr_weight_sha256: b.ocr_weight_sha256.clone(),
-        embedding_image: b.embedding_image.clone(),
-        embedding_revision: b.embedding_revision.clone(),
-        embedding_weight_sha256: b.embedding_weight_sha256.clone(),
     })
 }
 
@@ -265,22 +241,17 @@ fn valid_identity(v: &Identity) -> bool {
     v.schema == IDENTITY_SCHEMA
         && nonce(&v.run_nonce)
         && v.ocr_endpoint == "https://127.0.0.1:18443"
-        && v.embedding_endpoint == "https://127.0.0.1:18444"
         && v.ocr_revision == "PaddleOCR-VL-1.6"
         && image_digest(&v.ocr_image)
-        && image_digest(&v.embedding_image)
-        && hex(&v.embedding_revision, 40)
         && [
             &v.controller_sha256,
             &v.proxy_sha256,
             &v.entrypoint_sha256,
             &v.ocr_compose_sha256,
-            &v.embedding_compose_sha256,
             &v.backend_config_sha256,
             &v.ca_sha256,
             &v.leaf_cert_sha256,
             &v.ocr_weight_sha256,
-            &v.embedding_weight_sha256,
         ]
         .into_iter()
         .all(|v| sha256_id_value(v))
@@ -378,16 +349,12 @@ mod tests {
             proxy: source.clone(),
             entrypoint: source.clone(),
             ocr_compose: source.clone(),
-            embedding_compose: source.clone(),
             backend_config: source.clone(),
             ca_cert: source.clone(),
             leaf_cert: source.clone(),
             ocr_image: format!("ocr@sha256:{}", "a".repeat(64)),
             ocr_revision: "PaddleOCR-VL-1.6".into(),
             ocr_weight_sha256: format!("sha256:{}", "0".repeat(64)),
-            embedding_image: format!("embedding@sha256:{}", "b".repeat(64)),
-            embedding_revision: "0".repeat(40),
-            embedding_weight_sha256: format!("sha256:{}", "0".repeat(64)),
         };
         (binding, source.clone(), source)
     }
@@ -404,8 +371,6 @@ mod tests {
                 "sha256:0000000000000000000000000000000000000000000000000000000000000000".into(),
             ocr_compose_sha256:
                 "sha256:0000000000000000000000000000000000000000000000000000000000000000".into(),
-            embedding_compose_sha256:
-                "sha256:0000000000000000000000000000000000000000000000000000000000000000".into(),
             backend_config_sha256:
                 "sha256:0000000000000000000000000000000000000000000000000000000000000000".into(),
             ca_sha256: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
@@ -413,14 +378,9 @@ mod tests {
             leaf_cert_sha256:
                 "sha256:0000000000000000000000000000000000000000000000000000000000000000".into(),
             ocr_endpoint: "https://127.0.0.1:18443".into(),
-            embedding_endpoint: "https://127.0.0.1:18444".into(),
             ocr_image: format!("ocr@sha256:{}", "a".repeat(64)),
             ocr_revision: "PaddleOCR-VL-1.6".into(),
             ocr_weight_sha256:
-                "sha256:0000000000000000000000000000000000000000000000000000000000000000".into(),
-            embedding_image: format!("embedding@sha256:{}", "b".repeat(64)),
-            embedding_revision: "0000000000000000000000000000000000000000".into(),
-            embedding_weight_sha256:
                 "sha256:0000000000000000000000000000000000000000000000000000000000000000".into(),
         };
         let bytes = canonical(&value).unwrap();

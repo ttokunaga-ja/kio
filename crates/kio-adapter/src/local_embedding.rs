@@ -1,4 +1,4 @@
-//! Loopback embedding transport for configured endpoints and the measured Qwen target.
+//! Loopback embedding transport for configured endpoints.
 
 use serde_json::{Value, json};
 
@@ -20,58 +20,7 @@ use crate::{AdapterError, Result};
 /// Tool ID of the configurable loopback embedding target.
 pub const GENERIC_LOCAL_EMBEDDING_TOOL_ID: &str = "local_embedding";
 
-pub const LOCAL_EMBEDDING_ADAPTER_ID: &str = "qwen3_vl_embedding_local";
-pub const LOCAL_EMBEDDING_MODEL_FAMILY: &str = "qwen3-vl-embedding";
-
-/// 04 §4.3: `chunk_vec` is `float[768]`, so a local model is MRL-truncated to
-/// the same width. A different width would produce vectors vector search
-/// cannot read.
-///
-/// V4 measured the server returning **2048** natively, so this is a genuine
-/// truncation and not a no-op. Whether that costs retrieval quality was V3's
-/// question, and **V3 answered it on 2026-08-01: it does not.** Over the 24
-/// golden queries against the OCR'd fixture, recall@10 was 0.5417 at native
-/// 2048 and 0.5833 at 768 — the truncation did not show up as a loss, so this
-/// value is **settled**, not provisional, and with it the `tool_profile_hash`
-/// it feeds. Read the +1 query as noise at n=24 rather than as 768 being
-/// better; the claim is only that no cost was measurable, which is enough,
-/// because widening to 2048 buys a lower measured recall at the price of a
-/// `chunk_vec` DDL revision and re-embedding everything (03 §7).
-/// `eval/v3/results/README.md` has the numbers and the reasoning.
-///
-/// No equality check against 2048 lives in the code: a later model in the same
-/// family may be wider, and truncating a wider vector is still MRL. What must
-/// never happen is truncating *up*, which [`truncate_and_renormalize`] rejects.
 pub const LOCAL_EMBEDDING_DIMENSIONS: u32 = 768;
-
-/// The model id sent on the wire when `tools.toml` names none. Matches
-/// `tool_lock::EMBEDDING_RUNTIME_TARGETS`' entry for this adapter.
-pub const LOCAL_EMBEDDING_DEFAULT_MODEL: &str = "Qwen/Qwen3-VL-Embedding-2B";
-
-/// 03 §5.1: a weight-bearing local adapter pins the sha256 of the weights, not
-/// a tag — quantization variants share tag names. Measured in V4 over the sole
-/// `model.safetensors` of `Qwen/Qwen3-VL-Embedding-2B` rev `9f2f7e71`; the
-/// value matches the published blob hash, so it doubles as a download check.
-pub const LOCAL_EMBEDDING_MODEL_VERSION_PIN: &str =
-    "sha256:c73fa9caeddeb3ff831d46c085a7a5708343248ca777e90f2d486964464509c1";
-
-/// 07 §5.3 (1): `sha256(JCS({"chat_template": P(T), "instruction": P(I)}))`
-/// over the model's shipped `chat_template.jinja` with `instruction = ""`.
-/// The accepted inputs and digest are frozen in `eval/v4/results/v4-profile.json`
-/// and checked by the Rust profile identity vectors below.  The former Python
-/// producer was a completed non-authorizing experiment and has been removed.
-pub const LOCAL_EMBEDDING_PROMPT_TEMPLATE_HASH: &str =
-    "sha256:7b7f47224b2e5c3fee914cb56bf6c701202dfe2693e4b1160291a81a44389e8b";
-
-/// Byte identity of the archived accepted V4 profile.  The executable
-/// experiment is retired; this frozen Rust witness is the reproduction
-/// boundary for the adopted profile.
-#[cfg(all(test, debug_assertions))]
-const LOCAL_EMBEDDING_V4_RESULT_DIGEST: &str =
-    "sha256:b5ff0d6fa325c48a4e6143d4e975b96380dd602d5b63e1700e2a14821cb4bb8a";
-
-/// Kio's own name for that template, per 03 §5.1's `prompt_template_id`.
-pub const LOCAL_EMBEDDING_PROMPT_TEMPLATE_ID: &str = "kio-local-embedding-v1";
 
 /// Declared by an embedding adapter that genuinely embeds supplied image
 /// OBJECT bytes rather than only text.
@@ -82,17 +31,6 @@ pub const LOCAL_EMBEDDING_PROMPT_TEMPLATE_ID: &str = "kio-local-embedding-v1";
 /// and reads only `text`, so it must not be given image items until that
 /// changes — at which point adding this flag is the whole of turning it on.
 pub const IMAGE_OBJECT_CAPABILITY: &str = "image_object";
-
-/// Selects which local implementation runs.
-///
-/// A unit enum on purpose: it stays `Copy` and travels inside
-/// [`crate::catalog::EmbeddingExecution`], while the declared url and model —
-/// which only `Real` needs — are read where the adapter is built, exactly as
-/// the online `Real` arm reads its configured model there.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LocalEmbeddingExecution {
-    Real,
-}
 
 #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -235,7 +173,6 @@ pub struct EnvLocalEmbeddingClient {
     endpoint: LocalEndpoint,
     model: String,
     http_policy: HttpPolicy,
-    require_response_index: bool,
 }
 
 impl EnvLocalEmbeddingClient {
@@ -252,12 +189,10 @@ impl EnvLocalEmbeddingClient {
         endpoint: LocalEndpoint,
         model: impl Into<String>,
         timeout_seconds: Option<u64>,
-        require_response_index: bool,
     ) -> Self {
         Self {
             endpoint,
             model: model.into(),
-            require_response_index,
             http_policy: timeout_seconds
                 .map_or_else(HttpPolicy::default, HttpPolicy::with_timeout_seconds),
         }
@@ -279,7 +214,7 @@ impl LocalEmbeddingClient for EnvLocalEmbeddingClient {
             EMBEDDING_RESPONSE_MAX_BYTES,
             "local embedding response",
         )?;
-        parse_single_embedding(&body, self.require_response_index)
+        parse_single_embedding(&body)
     }
 }
 
@@ -320,7 +255,7 @@ fn local_http_status_error(response: &HttpResponse) -> AdapterError {
 /// wire rule forces. More than one vector back means the server batched
 /// something we did not send, so it is a contract violation rather than a
 /// value to pick from.
-fn parse_single_embedding(body: &Value, require_index: bool) -> Result<Vec<f32>> {
+fn parse_single_embedding(body: &Value) -> Result<Vec<f32>> {
     let data = body
         .get("data")
         .and_then(Value::as_array)
@@ -331,7 +266,7 @@ fn parse_single_embedding(body: &Value, require_index: bool) -> Result<Vec<f32>>
             data.len()
         )));
     };
-    if require_index && entry.get("index").and_then(Value::as_u64) != Some(0) {
+    if entry.get("index").and_then(Value::as_u64) != Some(0) {
         return Err(violation(
             "local embedding response must identify the single input with index 0",
         ));
@@ -354,12 +289,7 @@ fn parse_single_embedding(body: &Value, require_index: bool) -> Result<Vec<f32>>
 
 /// MRL: keep the leading `dimensions` components and restore unit length.
 ///
-/// The renormalization is not cosmetic. V4 measured the server returning
-/// L2 ≈ 1.0 at native width, so a prefix of it is **shorter** than unit — by
-/// however much energy the dropped tail carried, which varies per vector.
-/// Storing those unnormalized would make cosine similarity depend on how much
-/// of each vector's mass happened to live past 768, which is not a property of
-/// the text at all.
+/// The retained prefix can have a different norm from the full vector.
 fn truncate_and_renormalize(raw: &[f32], dimensions: usize) -> Result<Vec<f32>> {
     if raw.len() < dimensions {
         return Err(violation(format!(
@@ -411,7 +341,7 @@ fn violation(message: impl Into<String>) -> AdapterError {
 /// The `offline_api` embedding adapter.
 pub struct LocalEmbeddingAdapter<C = EnvLocalEmbeddingClient> {
     client: C,
-    spec: Option<LocalEmbeddingSpec>,
+    spec: LocalEmbeddingSpec,
     profile: AdapterProfile,
 }
 
@@ -431,78 +361,13 @@ pub(crate) fn descriptor_from_profile(
 }
 
 impl<C: LocalEmbeddingClient> LocalEmbeddingAdapter<C> {
-    /// The measured Qwen backend, over whichever transport the client provides.
-    #[must_use]
-    pub fn with_client(client: C) -> Self {
-        Self {
-            client,
-            spec: None,
-            profile: profile_for(LocalEmbeddingExecution::Real),
-        }
-    }
-
     pub(crate) fn with_spec(client: C, spec: LocalEmbeddingSpec) -> Self {
         Self {
             profile: spec.profile(),
             client,
-            spec: Some(spec),
+            spec,
         }
     }
-}
-
-/// The profile JSON `tool_profile_hash` is taken over (03 §5.1).
-///
-/// `runtime_kind` is `"local"` and carries no serving backend: 07 §5.3 (3)
-/// forbids naming one here, so that the same weights served two ways stay one
-/// profile and a backend swap costs no re-embed.
-///
-/// Free-standing because callers that only need the identity — 03 §7's
-/// compatibility gate, the tool-lock entry — must not have to conjure a
-/// transport to ask for it.
-#[must_use]
-pub fn profile_value_for(execution: LocalEmbeddingExecution) -> Value {
-    let mut profile = json!({
-        "adapter_kind": "embedding",
-        "adapter_role": "multimodal",
-        "dimensions": LOCAL_EMBEDDING_DIMENSIONS,
-        "distance": "cosine",
-        // Same chunk-input construction as the online adapter: the humanized
-        // filename is prepended before embedding, which is part of what a
-        // vector MEANS and therefore of this identity.
-        "input_construction": "chunk_filename_context_v1",
-        "modality": "multimodal",
-        "model_or_tool_family": LOCAL_EMBEDDING_MODEL_FAMILY,
-        "runtime_kind": "local",
-        "spec_version": 1
-    });
-    let fields = profile
-        .as_object_mut()
-        .expect("profile literal is an object");
-    let _ = execution;
-    fields.insert(
-        "model_version_pin".to_owned(),
-        json!(LOCAL_EMBEDDING_MODEL_VERSION_PIN),
-    );
-    fields.insert(
-        "prompt_template_hash".to_owned(),
-        json!(LOCAL_EMBEDDING_PROMPT_TEMPLATE_HASH),
-    );
-    fields.insert(
-        "prompt_template_id".to_owned(),
-        json!(LOCAL_EMBEDDING_PROMPT_TEMPLATE_ID),
-    );
-    profile
-}
-
-/// The full declared profile for a backend. Same reason as
-/// [`profile_value_for`] for being free-standing.
-#[must_use]
-pub fn profile_for(execution: LocalEmbeddingExecution) -> AdapterProfile {
-    local_profile(
-        LOCAL_EMBEDDING_ADAPTER_ID,
-        &profile_value_for(execution),
-        WireFormat::Messages,
-    )
 }
 
 fn local_profile(tool_id: &str, identity: &Value, wire_format: WireFormat) -> AdapterProfile {
@@ -538,10 +403,7 @@ impl<C: LocalEmbeddingClient> EmbeddingAdapter for LocalEmbeddingAdapter<C> {
 
     fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingOutcome> {
         validate_embedding_request_bytes(&request)?;
-        if self
-            .spec
-            .as_ref()
-            .is_some_and(|spec| spec.wire_format == WireFormat::Input)
+        if self.spec.wire_format == WireFormat::Input
             && request
                 .items
                 .iter()
@@ -553,17 +415,9 @@ impl<C: LocalEmbeddingClient> EmbeddingAdapter for LocalEmbeddingAdapter<C> {
             .items
             .iter()
             .map(|item| {
-                let vector = match &self.spec {
-                    Some(spec) => {
-                        spec.accept_vector(self.client.embed_payload(spec.payload(item)?)?)?
-                    }
-                    None => {
-                        let native = self
-                            .client
-                            .embed_payload(json!({ "messages": user_messages(item, "") }))?;
-                        truncate_and_renormalize(&native, LOCAL_EMBEDDING_DIMENSIONS as usize)?
-                    }
-                };
+                let vector = self
+                    .spec
+                    .accept_vector(self.client.embed_payload(self.spec.payload(item)?)?)?;
                 Ok(EmbeddingVector {
                     id: item.id.clone(),
                     vector,
@@ -590,15 +444,16 @@ mod tests {
         EmbeddingContent, EmbeddingInputType, EmbeddingItem, MAX_EMBEDDING_ITEM_BYTES,
         MAX_EMBEDDING_REQUEST_BYTES,
     };
-    use sha2::{Digest, Sha256};
 
-    fn sha256(bytes: &[u8]) -> String {
-        let digest = Sha256::digest(bytes);
-        let hex = digest
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        format!("sha256:{hex}")
+    fn messages_spec() -> LocalEmbeddingSpec {
+        LocalEmbeddingSpec {
+            wire_format: WireFormat::Messages,
+            model: "test-embedding".to_owned(),
+            model_version_pin: kio_core::cas::hash_bytes(b"weights"),
+            chat_template_hash: kio_core::cas::hash_bytes(b"template"),
+            instruction: String::new(),
+            truncate_dimensions: true,
+        }
     }
 
     fn request(texts: &[&str]) -> EmbeddingRequest {
@@ -615,9 +470,10 @@ mod tests {
 
     #[test]
     fn profile_declares_the_offline_posture() {
-        let profile = LocalEmbeddingAdapter::with_client(RecordingClient::new()).profile();
+        let profile =
+            LocalEmbeddingAdapter::with_spec(RecordingClient::new(), messages_spec()).profile();
         assert_eq!(profile.execution_mode, ExecutionMode::OfflineApi);
-        assert_eq!(profile.adapter_id, LOCAL_EMBEDDING_ADAPTER_ID);
+        assert_eq!(profile.adapter_id, GENERIC_LOCAL_EMBEDDING_TOOL_ID);
         // The three properties the offline forks key off (07 §3 / 07 §5.5).
         assert!(!profile.allow_network, "offline_api must not claim network");
         assert!(
@@ -630,7 +486,8 @@ mod tests {
     /// Both local and online adapters now declare actual PNG/JPEG image support.
     #[test]
     fn declares_image_object_capability_for_local_and_online_png_jpeg() {
-        let local = LocalEmbeddingAdapter::with_client(RecordingClient::new()).profile();
+        let local =
+            LocalEmbeddingAdapter::with_spec(RecordingClient::new(), messages_spec()).profile();
         assert!(
             local
                 .capability_flags
@@ -662,28 +519,13 @@ mod tests {
         );
     }
 
-    /// 07 §5.3: the serving backend must not appear anywhere in the hashed
-    /// profile, so that the same weights served two ways stay one vector space
-    /// and a backend swap does not force a re-embed.
-    #[test]
-    fn profile_identity_names_no_serving_backend() {
-        let value = profile_value_for(LocalEmbeddingExecution::Real);
-        let rendered = value.to_string().to_ascii_lowercase();
-        for backend in ["vllm", "sglang", "llama.cpp", "llamacpp", "ollama", "mlx"] {
-            assert!(
-                !rendered.contains(backend),
-                "profile identity must not name `{backend}`: {rendered}"
-            );
-        }
-        assert_eq!(value["runtime_kind"], "local");
-    }
-
     /// 03 §7 / 07 §5.3: the local profile is a DIFFERENT vector space from the
     /// online one. The compatibility gate must be able to tell them apart, and
     /// it only has the profile hash to do it with.
     #[test]
     fn local_profile_hash_differs_from_the_online_one() {
-        let local = LocalEmbeddingAdapter::with_client(RecordingClient::new()).profile();
+        let local =
+            LocalEmbeddingAdapter::with_spec(RecordingClient::new(), messages_spec()).profile();
         let online = crate::catalog::adopted_embedding_profile();
         assert_ne!(local.tool_profile_hash, online.tool_profile_hash);
         // Same width and metric, though — `chunk_vec` is one table (04 §4.3),
@@ -693,7 +535,7 @@ mod tests {
 
     #[test]
     fn embed_returns_one_usable_vector_per_input_in_order() {
-        let adapter = LocalEmbeddingAdapter::with_client(RecordingClient::new());
+        let adapter = LocalEmbeddingAdapter::with_spec(RecordingClient::new(), messages_spec());
         let response = adapter
             .embed(request(&["alpha", "beta", "gamma"]))
             .unwrap()
@@ -718,7 +560,7 @@ mod tests {
 
     #[test]
     fn embed_reports_no_usage_because_there_is_no_invoice() {
-        let response = LocalEmbeddingAdapter::with_client(RecordingClient::new())
+        let response = LocalEmbeddingAdapter::with_spec(RecordingClient::new(), messages_spec())
             .embed(request(&["alpha"]))
             .unwrap()
             .into_completed()
@@ -732,12 +574,12 @@ mod tests {
     fn prefers_the_sync_lane() {
         use crate::traits::PreferredRequestKind;
         assert_eq!(
-            LocalEmbeddingAdapter::with_client(RecordingClient::new()).preferred_request_kind(),
+            LocalEmbeddingAdapter::with_spec(RecordingClient::new(), messages_spec())
+                .preferred_request_kind(),
             PreferredRequestKind::Sync
         );
     }
 
-    // -- the measured backend -------------------------------------------------
     //
     // CI has no GPU, so the real server is stood in for by a client that
     // records what it was sent. What these tests pin is everything between the
@@ -778,7 +620,6 @@ mod tests {
         }
     }
 
-    /// What V4 measured the server returning before MRL truncation.
     const NATIVE_DIMENSIONS: usize = 2048;
 
     fn norm(vector: &[f32]) -> f64 {
@@ -791,32 +632,6 @@ mod tests {
 
     /// 07 §5.3 (2) and the module's ruling on the system message, read off the
     /// bytes that would go out rather than off the code that builds them.
-    #[test]
-    fn the_real_backend_sends_one_user_turn_per_item_and_no_system_message() {
-        let client = RecordingClient::new();
-        let adapter = LocalEmbeddingAdapter::with_client(client.clone());
-        adapter.embed(request(&["alpha", "beta"])).unwrap();
-
-        let sent = client.sent();
-        assert_eq!(sent.len(), 2, "one request per item — never a batch");
-        for (index, messages) in sent.iter().enumerate() {
-            let turns = messages["messages"]
-                .as_array()
-                .expect("messages is an array");
-            assert_eq!(
-                turns.len(),
-                1,
-                "a system turn would change the token stream"
-            );
-            assert_eq!(turns[0]["role"], "user");
-            assert_eq!(turns[0]["content"][0]["type"], "text");
-            assert_eq!(
-                turns[0]["content"][0]["text"],
-                ["alpha", "beta"][index],
-                "items must go out in order"
-            );
-        }
-    }
 
     #[test]
     fn generic_local_embedding_wire_and_dimension_policy_apply_to_all_text_items() {
@@ -1007,7 +822,7 @@ mod tests {
         let bytes: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
 
         let client = RecordingClient::new();
-        LocalEmbeddingAdapter::with_client(client.clone())
+        LocalEmbeddingAdapter::with_spec(client.clone(), messages_spec())
             .embed(EmbeddingRequest {
                 input_type: crate::types::EmbeddingInputType::ImageObject,
                 items: vec![EmbeddingItem {
@@ -1053,7 +868,7 @@ mod tests {
     #[test]
     fn oversized_image_is_rejected_before_the_client_or_base64_wire() {
         let client = RecordingClient::new();
-        let error = LocalEmbeddingAdapter::with_client(client)
+        let error = LocalEmbeddingAdapter::with_spec(client, messages_spec())
             .embed(EmbeddingRequest {
                 input_type: crate::types::EmbeddingInputType::ImageObject,
                 items: vec![EmbeddingItem {
@@ -1076,7 +891,7 @@ mod tests {
     fn aggregate_payload_cap_is_enforced_before_any_client_call() {
         let client = RecordingClient::new();
         let half = MAX_EMBEDDING_REQUEST_BYTES / 2 + 1;
-        let error = LocalEmbeddingAdapter::with_client(client.clone())
+        let error = LocalEmbeddingAdapter::with_spec(client.clone(), messages_spec())
             .embed(EmbeddingRequest {
                 input_type: crate::types::EmbeddingInputType::ImageObject,
                 items: vec![
@@ -1108,25 +923,27 @@ mod tests {
     fn a_response_carrying_more_than_one_vector_is_a_contract_violation() {
         let body = json!({"data": [{"embedding": [1.0, 2.0]}, {"embedding": [3.0, 4.0]}]});
         assert!(matches!(
-            parse_single_embedding(&body, false).unwrap_err(),
+            parse_single_embedding(&body).unwrap_err(),
             AdapterError::ContractViolation(_)
         ));
     }
 
     #[test]
     fn a_response_with_a_non_numeric_component_is_a_contract_violation() {
-        let body = json!({"data": [{"embedding": [1.0, "nope"]}]});
-        assert!(parse_single_embedding(&body, false).is_err());
+        let body = json!({"data": [{"index": 0, "embedding": [1.0, "nope"]}]});
+        assert!(parse_single_embedding(&body).is_err());
         assert!(
-            parse_single_embedding(&json!({"data": [{"embedding": [1.0, null]}]}), false).is_err()
+            parse_single_embedding(&json!({"data": [{"index": 0, "embedding": [1.0, null]}]}))
+                .is_err()
         );
         // JSON has no literal for infinity, so the `is_finite` filter is
         // defence against a PARSER that maps an overflowing exponent to one.
         // Guarded because rejecting it outright is equally correct.
-        if let Ok(overflowed) = serde_json::from_str::<Value>(r#"{"data":[{"embedding":[1e400]}]}"#)
+        if let Ok(overflowed) =
+            serde_json::from_str::<Value>(r#"{"data":[{"index":0,"embedding":[1e400]}]}"#)
         {
             assert!(
-                parse_single_embedding(&overflowed, false).is_err(),
+                parse_single_embedding(&overflowed).is_err(),
                 "a non-finite component must not reach the stored vector"
             );
         }
@@ -1134,49 +951,11 @@ mod tests {
 
     #[test]
     fn a_well_formed_response_parses_in_order() {
-        let body = json!({"data": [{"embedding": [0.25, -0.5, 0.75]}], "usage": {}});
+        let body = json!({"data": [{"index": 0, "embedding": [0.25, -0.5, 0.75]}], "usage": {}});
         assert_eq!(
-            parse_single_embedding(&body, false).unwrap(),
+            parse_single_embedding(&body).unwrap(),
             vec![0.25, -0.5, 0.75]
         );
-    }
-
-    /// V4's measurement, frozen. If a profile field moves, this fails and the
-    /// person moving it has to decide consciously whether every vector already
-    /// stored under the old identity is being orphaned (03 §7).
-    #[test]
-    fn the_real_profile_matches_the_identity_v4_settled() {
-        assert_eq!(
-            sha256(include_bytes!("../../../eval/v4/results/v4-profile.json")),
-            LOCAL_EMBEDDING_V4_RESULT_DIGEST
-        );
-        let profile = profile_value_for(LocalEmbeddingExecution::Real);
-        assert_eq!(
-            profile["model_version_pin"],
-            LOCAL_EMBEDDING_MODEL_VERSION_PIN
-        );
-        assert_eq!(
-            profile["prompt_template_hash"],
-            LOCAL_EMBEDDING_PROMPT_TEMPLATE_HASH
-        );
-        assert_eq!(
-            profile["prompt_template_id"],
-            LOCAL_EMBEDDING_PROMPT_TEMPLATE_ID
-        );
-        assert_eq!(
-            profile_for(LocalEmbeddingExecution::Real).tool_profile_hash,
-            "sha256:f9f610bbe0dde5799630031e312a078ec94c1b71f7bd8ae56f2c5f08d365439a",
-            "this is eval/v4/results/v4-profile.json's tool_profile_hash; if it \
-             no longer matches, the Rust profile and the measured one have \
-             diverged and one of them is describing vectors that do not exist"
-        );
-    }
-
-    #[test]
-    fn local_embedding_identity_always_names_the_measured_template() {
-        let profile = profile_value_for(LocalEmbeddingExecution::Real);
-        assert!(profile.get("prompt_template_hash").is_some());
-        assert!(profile.get("prompt_template_id").is_some());
     }
 
     /// Plain loopback HTTP used to be accepted here.  It is now rejected before
@@ -1201,7 +980,7 @@ mod tests {
             let body = json!({"data": [{"index": index, "embedding": [1.0]}]});
             assert!(
                 matches!(
-                    parse_single_embedding(&body, true),
+                    parse_single_embedding(&body),
                     Err(AdapterError::ContractViolation(_))
                 ),
                 "{body}"
@@ -1209,12 +988,11 @@ mod tests {
         }
         let missing = json!({"data": [{"embedding": [1.0]}]});
         assert!(matches!(
-            parse_single_embedding(&missing, true),
+            parse_single_embedding(&missing),
             Err(AdapterError::ContractViolation(_))
         ));
         assert_eq!(
-            parse_single_embedding(&json!({"data": [{"index": 0, "embedding": [1.0]}]}), true)
-                .unwrap(),
+            parse_single_embedding(&json!({"data": [{"index": 0, "embedding": [1.0]}]})).unwrap(),
             [1.0]
         );
     }

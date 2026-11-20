@@ -670,15 +670,11 @@ fn ct3_hybrid_002_auto_vector_configured_but_absent_falls_back_visibly() {
     let dir = indexed_scope(); // indexed without an embedding adapter → no vectors
     initialize_paid_ledger(&dir);
     approve_embed(&dir, "mock");
-    // (a) endpoint truly unconfigured → the 05 §1.7 example string.
-    // "off" is an unrecognized seam value → no adapter, regardless of any
-    // ambient GEMINI_API_KEY.
+    // (a) No HTTP declaration selects the default native model. The isolated
+    // device does not have an imported model.
     let unconfigured = json_success_embed(&dir, "off", &["search", "トークン TTL 3600"]);
     assert_eq!(unconfigured["resolved_mode"], "text");
-    assert_eq!(
-        unconfigured["fallback_reason"],
-        "embedding_endpoint_not_configured"
-    );
+    assert_eq!(unconfigured["fallback_reason"], "model_missing");
     // (b) endpoint configured (mock) but this scope carries no embeddings →
     // the precise cause, not the generic endpoint string.
     let search = json_success_embed(&dir, "mock", &["search", "トークン TTL 3600"]);

@@ -2,7 +2,7 @@
 use kio_core::Result;
 use kio_core::cas::ImageInputReceipt;
 
-pub(crate) const PNG_TRANSCODE_RECIPE: &str = "kio_image_png_v1";
+use kio_core::eg2::PNG_TRANSCODE_RECIPE;
 
 pub(crate) struct PreparedEmbeddingImage {
     pub(crate) bytes: Vec<u8>,

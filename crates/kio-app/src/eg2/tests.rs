@@ -307,6 +307,7 @@ fn native_worker_embeds_on_cpu() {
     );
 
     let mut session = EmbeddingSession {
+        unavailable: None,
         slot: EngineSlot::Query,
         worker: Some(worker),
     };
@@ -561,6 +562,7 @@ fn session_splits_overflow_and_returns_one_normalized_vector() {
         ),
     ] {
         let mut session = EmbeddingSession {
+            unavailable: None,
             slot: EngineSlot::Query,
             worker: Some(fake(mode)),
         };
@@ -577,6 +579,7 @@ fn session_splits_overflow_and_returns_one_normalized_vector() {
 #[test]
 fn session_normalizes_even_one_successful_text_window() {
     let mut session = EmbeddingSession {
+        unavailable: None,
         slot: EngineSlot::Query,
         worker: Some(fake("reuse")),
     };

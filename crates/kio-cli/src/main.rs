@@ -76,6 +76,9 @@ fn main() {
                     write_output_json(|writer| serde_json::to_writer(writer, &report))?;
                 } else {
                     println!("{}", terminal_safe_text(&report.status, false));
+                    if let Some(reason) = report.embedding_unavailable_reason {
+                        eprintln!("embedding: {reason}");
+                    }
                     write_deferred_inputs(&report.deferred_inputs, None)?;
                     for child in report.child_scopes.iter().flatten() {
                         write_deferred_inputs(&child.deferred_inputs, Some(&child.discovery.path))?;
@@ -96,6 +99,9 @@ fn main() {
                     write_output_json(|writer| serde_json::to_writer(writer, &report))?;
                 } else {
                     println!("{}", terminal_safe_text(&report.status, false));
+                    if let Some(reason) = report.embedding_unavailable_reason {
+                        eprintln!("embedding: {reason}");
+                    }
                     write_deferred_inputs(&report.deferred_inputs, None)?;
                 }
                 None

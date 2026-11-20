@@ -1,16 +1,15 @@
-# Sequential local GPU controller
+# Authenticated OCR GPU controller
 
-`gpu-phase.sh` is a host-side controller for the measured `kio-lab` GPU. Run
-it only as `kio-test`. It creates its private, create-only runtime root at
-`/home/kio-test/work/kio/v1-local-gpu`, stages the fixed inputs, and starts at
-most one measured service phase at a time. It is not an Actions route installer
-and it does not establish an acceptance result.
+`gpu-phase.sh` is the host-side PaddleOCR controller for the measured
+`kio-lab` GPU. Run it as `kio-test`. The private route binds the pinned
+OCR service and public TLS identity to the exact release candidate.
+A08 stops OCR and releases its GPU lease before the Actions client explicitly
+installs and verifies EG2 in its isolated device state. The packaged native
+runtime on the client runs indexing and queries with `--offline`.
 
-The controller is driven by the reviewed `kio-acceptance-tools` binary, built
-from `crates/kio-eval/src/acceptance_tools` and `acceptance_tools_main.rs`.
-`init` copies that binary into the staged OCR directory, while the script uses
-it for model validation and runtime identity. The binary must be a reviewed
-regular executable; a missing or changed binary causes refusal.
+The controller uses the reviewed `kio-acceptance-tools` binary from
+`crates/kio-eval/src/acceptance_tools` and `acceptance_tools_main.rs`.
+`init` stages the fixed OCR inputs and copies this binary into the OCR directory.
 
 ## Native WSL Rust environment
 
@@ -28,66 +27,27 @@ remain covered by the separate host-application approval.
 
 `init` creates the private runtime directories, one seven-day CA and localhost
 leaf certificate (SANs `127.0.0.1`, `::1`, and `localhost`), stages the fixed
-OCR inputs and offline embedding manifest, then writes a create-only identity.
-It never starts a service, replaces keys or state, mounts the CA signing key,
-or puts private-key material into the public identity receipt.
+OCR inputs, then writes the create-only `kio.local-gpu.ocr-identity/v1` record.
+The record binds the compose and runtime inputs, public TLS identities and
+measured OCR image. The phase observation binds the same identity to two
+digest-verified running image IDs.
 
-Use `init`, `status`, and exactly one phase (`start-ocr` or
-`start-embedding`). Stop the active phase before the other begins. `stop`
-stops both owned projects. The controller never prunes Docker, installs a
-driver or daemon, or adds a runner.
+Use `init`, `status`, `start-ocr`, `stop-ocr` and `cleanup`.
+OCR exposes `127.0.0.1:18443:8443`. The API container runs the fixed PaddleX
+command behind the bounded TLS proxy.
 
-The private Actions client creates and publishes its durable owner-private
-256-bit capability before its first remote `init`; every dispatcher verb sends
-that capability on standard input. `init` returns only a status, never the
-capability. Therefore a lost `init` response leaves the client holding the
-same authenticated cleanup authority. Client capability publication is
-create-only.
+The Actions client publishes its owner-private 256-bit capability before
+remote `init` and sends it to the dispatcher on standard input. A lost reply
+leaves the client with the capability needed for authenticated `finish`.
+`finish` removes the lease after cleanup proves the exact OCR project absent,
+including exited containers. A failed cleanup preserves the lease as unknown.
 
-Authenticated `finish` is permitted from an unknown or interrupted phase. It
-removes the lease only after controller cleanup succeeds and cleanup has
-successfully queried both exact Docker project labels, including exited
-containers. A failed query or cleanup leaves the lease and its phase `unknown`.
-During `init`, a missing compose file is safe only when the corresponding exact
-project is proved absent. A pre-lease failure preserves its diagnostic runtime
-root but creates neither a global lease nor a controller run; the same attempt
-remains create-only and a new GitHub attempt can retry.
-
-OCR exposes only `127.0.0.1:18443:8443`; its fixed PaddleX command and bounded
-TLS proxy run in the API container. Embedding exposes only
-`127.0.0.1:18444:8000`, uses native TLS, mounts the measured model bundle
-read-only at `/model`, and uses offline Hugging Face and Transformers flags
-with a separate transient cache. Hugging Face cache symlinks are not mounted
-into the service.
-
-Starts wait for HTTPS readiness and validate the measured model/image digests.
-Before any service starts, `init` proves both exact owned projects absent and
-captures one private, create-only `state/gpu-memory.json` baseline. It binds the
-absolute run state directory, schema `kio.local-gpu.memory/v1`, GPU UUID, total,
-used and free MiB in canonical JSON. No retry or cleanup replaces that baseline.
-The helper accepts only one bounded NVIDIA CSV row; reserved VRAM may make
-used plus free less than total.
-
-Each start again proves both owned projects absent, checks the same GPU UUID
-and total memory, and requires free memory of at least 6,141 + 128 MiB for OCR,
-or max(6,638 MiB, ceil(total MiB × 0.8)) + 128 MiB for embedding. These thresholds
-use the fixed services' recorded incremental peaks and embedding's 80% budget,
-with 128 MiB headroom. They are admission guards, not acceptance evidence.
-
-Stops require both owned projects absent and wait at most 60 seconds for the
-same GPU to return to captured used memory plus 128 MiB. The historical 575 MiB
-idle reading is not a host-wide constant. A failed recovery exits nonzero so
-dispatch preserves the unknown lease. Interrupted-init cleanup may succeed with
-an absent baseline only after both projects are proved absent and a valid GPU
-sample is available; malformed or unsafe baseline files always fail. GPU sample
-reads at init/start are bounded to five seconds. Starts always require a valid baseline. An unrelated running GPU container makes the
-controller refuse to proceed.
-
-The identity uses `kio.local-gpu.identity/v1`, compact sorted JSON without a
-trailing newline and below 64 KiB. It separately binds OCR and embedding
-composition digests, controller inputs, TLS public material, and measured
-images. Phase observations bind that identity to observed digest-verified
-running image IDs. No private key is copied into or hashed by either record.
+Before starting, the controller proves the OCR project absent and captures an
+immutable private GPU baseline. It checks the GPU UUID and total memory,
+requires 6,141 MiB plus 128 MiB of free memory, and refuses unrelated running
+GPU containers. Cleanup waits for the same GPU to return to within 128 MiB of
+its recorded used memory. After interrupted init, cleanup without a baseline
+requires a valid GPU sample and proof that the exact OCR project is absent.
 
 ## Candidate-bound deployment proposal
 

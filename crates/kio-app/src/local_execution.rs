@@ -27,6 +27,7 @@ const MAX_EMBEDDING_RESULT: usize = 32 * 1024 * 1024;
 #[serde(rename_all = "snake_case")]
 pub(crate) enum LocalExecutionKind {
     InProcess,
+    NativeWorker,
     Loopback,
 }
 
@@ -351,7 +352,7 @@ impl LocalExecution {
     ) -> Result<Claim> {
         let key = identity.key()?;
         let max_attempts = match identity.execution {
-            LocalExecutionKind::InProcess => max_attempts.min(3),
+            LocalExecutionKind::InProcess | LocalExecutionKind::NativeWorker => max_attempts.min(3),
             LocalExecutionKind::Loopback => max_attempts,
         };
         if max_attempts == 0 {
@@ -511,7 +512,7 @@ impl LocalExecution {
         }
         if matches!(record.phase, Phase::Intent) && record.attempts >= max_attempts {
             let kind = match identity.execution {
-                LocalExecutionKind::InProcess => None,
+                LocalExecutionKind::InProcess | LocalExecutionKind::NativeWorker => None,
                 LocalExecutionKind::Loopback => Some(RetryErrorKind::NetworkError),
             };
             record.phase = Phase::Exhausted { kind };
@@ -714,7 +715,7 @@ impl LocalGuard {
 
     pub(crate) fn interrupt(&mut self) -> Result<()> {
         self.check_current()?;
-        if self.record.identity.execution != LocalExecutionKind::InProcess
+        if self.record.identity.execution == LocalExecutionKind::Loopback
             || !matches!(self.record.phase, Phase::Intent)
         {
             return Err(invalid("only an active in-process attempt may interrupt"));
@@ -1125,9 +1126,12 @@ mod tests {
         let Claim::Claimed(mut first) = store.claim(&original, 0, None, 5, 0).unwrap() else {
             panic!("initial claim")
         };
-        first
-            .stage_result(&serde_json::to_vec(&completed).unwrap())
-            .unwrap();
+        crate::embedding::transport::LocalEmbeddingResult {
+            completed: completed.clone(),
+            native_producer: None,
+        }
+        .stage(&mut first)
+        .unwrap();
         drop(first);
 
         let Claim::Claimed(mut recovered) = store.claim(&expanded, 1, None, 5, 0).unwrap() else {
@@ -1146,7 +1150,8 @@ mod tests {
                 &profile,
                 recovered.embedding_member_ids().unwrap()
             )
-            .unwrap(),
+            .unwrap()
+            .completed,
             completed
         );
         let LocalContract::Embedding { members, .. } = &expanded.contract else {
