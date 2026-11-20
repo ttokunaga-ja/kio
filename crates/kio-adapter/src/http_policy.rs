@@ -150,16 +150,7 @@ fn effective_overall_timeout(policy: HttpPolicy) -> Duration {
         .min(policy.write_timeout)
 }
 
-/// Read a response body under `max_bytes` with the shared identity-encoding
-/// posture (reject any transparent decompression, precheck `Content-Length`,
-/// hard-stop the wire read at the ceiling). Returns the raw bytes for
-/// non-JSON payloads (e.g. the Batch output-file JSONL, 07 §5.5);
-/// [`read_json_bounded`] layers JSON parsing on top for everything else.
-pub(crate) fn read_bytes_bounded(
-    mut response: HttpResponse,
-    max_bytes: usize,
-    context: &str,
-) -> Result<Vec<u8>> {
+pub(crate) fn require_identity_encoding(response: &HttpResponse, context: &str) -> Result<()> {
     if response
         .headers()
         .get("Content-Encoding")
@@ -170,6 +161,20 @@ pub(crate) fn read_bytes_bounded(
             "{context} uses unsupported content encoding"
         )));
     }
+    Ok(())
+}
+
+/// Read a response body under `max_bytes` with the shared identity-encoding
+/// posture (reject any transparent decompression, precheck `Content-Length`,
+/// hard-stop the wire read at the ceiling). Returns the raw bytes for
+/// non-JSON payloads (e.g. the Batch output-file JSONL, 07 §5.5);
+/// [`read_json_bounded`] layers JSON parsing on top for everything else.
+pub(crate) fn read_bytes_bounded(
+    mut response: HttpResponse,
+    max_bytes: usize,
+    context: &str,
+) -> Result<Vec<u8>> {
+    require_identity_encoding(&response, context)?;
     if let Some(content_length) = response
         .headers()
         .get("Content-Length")

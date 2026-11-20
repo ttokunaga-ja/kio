@@ -21,7 +21,7 @@ pub use stage::{
     DirectoryStageIdentity, StageEntryState, StageIdentity, StageInspectionEntry, StageWriter,
 };
 pub(crate) mod planned_removal;
-pub use atomic::{ATOMIC_WORKSPACE_DIR, AtomicWorkspaceState};
+pub use atomic::{ATOMIC_WORKSPACE_DIR, AtomicWorkspaceState, hash_file as hash_regular_file};
 pub(crate) use planned_removal::require_same_filesystem;
 pub use planned_removal::{
     CAS_REMOVAL_QUARANTINE_PREFIX, PRUNE_DIRECTORY_QUARANTINE_PREFIX, PlannedDirectoryRemoval,
@@ -296,13 +296,28 @@ impl StoreDirectory {
         atomic::write(self, self, relative, bytes, publication)
     }
 
-    pub(crate) fn write_atomic_stream(
+    /// The callback writes and validates a retained private staging file before publication.
+    pub fn write_atomic_stream(
         &self,
         relative: &Path,
         publication: Publication,
         write: impl FnOnce(&mut File) -> Result<()>,
     ) -> Result<()> {
         atomic::write_stream(self, relative, publication, write)
+    }
+
+    /// Stage an import in a write-only store while preserving the retained source.
+    /// Returns false when the source already occupies the destination and the
+    /// caller must validate it in place. An alias of a recovery artifact is
+    /// rejected before recovery can remove it.
+    pub fn write_atomic_stream_preserving_source(
+        &self,
+        relative: &Path,
+        publication: Publication,
+        source: &File,
+        write: impl FnOnce(&mut File) -> Result<()>,
+    ) -> Result<bool> {
+        atomic::write_stream_preserving(self, relative, publication, source, write)
     }
 
     /// Publish private bytes only after a caller's final target check succeeds.

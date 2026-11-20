@@ -1035,6 +1035,7 @@ dependencies = [
  "toml",
  "unicode-normalization",
  "ureq",
+ "url",
  "windows-sys 0.61.2",
  "zip",
 ]
@@ -1112,6 +1113,7 @@ dependencies = [
  "getrandom 0.4.3",
  "jsonschema",
  "libc",
+ "same-file",
  "serde",
  "serde_jcs",
  "serde_json",

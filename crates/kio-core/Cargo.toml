@@ -12,6 +12,7 @@ path = "src/lib.rs"
 [dependencies]
 getrandom.workspace = true
 jsonschema.workspace = true
+same-file = "1"
 serde.workspace = true
 serde_jcs.workspace = true
 serde_json.workspace = true

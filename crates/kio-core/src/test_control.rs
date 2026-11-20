@@ -158,6 +158,7 @@ fn u64_selector(name: &str) -> Selector<u64> {
 /// Adapter seams. Fixture values that name files retain OS-path semantics.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct AdapterTestControl {
+    pub model_source: Selector<String>,
     pub mistral_ocr: Selector<MistralOcrMode>,
     pub gemini_embed: Selector<GeminiEmbedMode>,
     pub local_ocr: Selector<LocalOcrMode>,
@@ -193,6 +194,7 @@ pub struct CoreTestControl {
 /// CLI-only seams and process coordination controls.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CliTestControl {
+    pub model_write_enospc: bool,
     pub snapshot_pre_gc_preflight_ready: Option<PathBuf>,
     pub snapshot_prelock_ready: Option<PathBuf>,
     pub snapshot_locked_ready: Option<PathBuf>,
@@ -290,6 +292,7 @@ impl DebugTestControl {
         Self {
             fixed_now: text("KIO_FIXED_NOW"),
             adapters: AdapterTestControl {
+                model_source: text("KIO_TEST_MODEL_SOURCE"),
                 mistral_ocr: selector("KIO_TEST_MISTRAL_OCR", MistralOcrMode::parse),
                 gemini_embed: selector("KIO_TEST_GEMINI_EMBED", GeminiEmbedMode::parse),
                 local_ocr: selector("KIO_TEST_LOCAL_OCR", LocalOcrMode::parse),
@@ -329,6 +332,8 @@ impl DebugTestControl {
                     .is_some(),
             },
             cli: CliTestControl {
+                model_write_enospc: std::env::var_os("KIO_TEST_MODEL_WRITE_ENOSPC")
+                    .is_some_and(|value| value == "1"),
                 snapshot_pre_gc_preflight_ready: path(
                     "KIO_TEST_SNAPSHOT_AUTO_PRE_GC_PREFLIGHT_READY",
                 ),

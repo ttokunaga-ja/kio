@@ -18,6 +18,7 @@ pub mod local_ocr_markdownize;
 pub mod local_peer;
 pub mod local_rerank;
 mod mistral_ocr;
+pub mod model_download;
 pub mod office_convert;
 #[cfg(any(target_os = "macos", test))]
 mod office_macos_seal;

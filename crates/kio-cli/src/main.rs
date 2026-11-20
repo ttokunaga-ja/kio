@@ -25,6 +25,12 @@ fn main() {
         Err(error) => exit_from_clap_error(error),
     };
     let json_mode = cli.json;
+    let read_only_model_status = matches!(
+        &cli.command,
+        args::Command::Model {
+            command: args::ModelCommand::Status
+        }
+    );
     let working_directory = match std::env::current_dir() {
         Ok(path) => path,
         Err(error) => exit_with_error(KioError::io(error.to_string(), "."), json_mode),
@@ -123,7 +129,9 @@ fn main() {
             code
         }
         Err(error) => {
-            let _ = kio_core::scope::append_error_log(&error);
+            if !read_only_model_status {
+                let _ = kio_core::scope::append_error_log(&error);
+            }
             print_error(&error, json_mode);
             error.exit_code()
         }
