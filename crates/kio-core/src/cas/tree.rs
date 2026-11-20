@@ -122,10 +122,10 @@ impl ObjectStore {
             consumed: 0,
             error: None,
         };
-        let decoded = crate::disk_records::decode_bounded_json::<TreeObject>(
-            &self.record_stages()?,
-            std::io::BufReader::with_capacity(CAS_STREAM_BUFFER_BYTES, &mut source),
-        );
+        let decoded = self.decode_record_json::<TreeObject>(std::io::BufReader::with_capacity(
+            CAS_STREAM_BUFFER_BYTES,
+            &mut source,
+        ));
         if decoded
             .as_ref()
             .err()
@@ -184,7 +184,7 @@ impl ObjectStore {
             ));
         }
         let tree = decoded?;
-        tree.validate()?;
+        // The canonical writer validates the tree before hashing it.
         if crate::dag::tree_hash(&tree)? != hash {
             return Err(bound_stage_corrupt("tree JSON is not canonical"));
         }
@@ -196,6 +196,33 @@ impl ObjectStore {
 mod tests {
     use super::*;
     use crate::dag::{NormalizeRef, TreeEntry, TreeJsonReader, build_tree, tree_hash};
+
+    #[test]
+    fn a_tree_larger_than_a_memory_run_does_not_create_writer_stages_when_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = crate::scope::Repository::init(temp.path()).unwrap();
+        let build_stages = crate::disk_records::RecordStageRoot::temporary().unwrap();
+        let stem = "a".repeat(180);
+        let entries = (0..=crate::disk_records::SORT_BUFFER_RECORDS).map(|index| {
+            TreeEntry::raw_file(format!("{index:05}-{stem}.txt"), hash_bytes(b"raw")).unwrap()
+        });
+        let tree = build_tree(&build_stages, entries).unwrap();
+        let store = repo.object_store();
+        let hash = store.write_tree(&tree).unwrap();
+        let stages = repo.kio_dir().join("internal/record-stages");
+        assert!(!stages.exists());
+        let search = crate::scope::Repository::open_for_search(temp.path()).unwrap();
+        let reread = search.read_tree(&hash).unwrap();
+        assert_eq!(reread, tree);
+        let mut left = reread.entries.iter();
+        let mut right = reread.entries.iter();
+        for entry in tree.entries.iter() {
+            let entry = entry.unwrap();
+            assert_eq!(left.next().unwrap().unwrap(), entry);
+            assert_eq!(right.next().unwrap().unwrap(), entry);
+        }
+        assert!(!stages.exists(), "CAS reads must use disposable scratch");
+    }
 
     #[test]
     fn st05_tree_larger_than_sixteen_mib_roundtrips() {

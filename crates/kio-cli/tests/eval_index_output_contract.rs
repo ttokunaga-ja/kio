@@ -336,3 +336,72 @@ fn mf3_deferrals_are_bounded_through_publication_and_status_output() {
         );
     }
 }
+
+#[cfg(all(debug_assertions, unix))]
+#[test]
+fn mf4_search_spills_unsupported_observations_without_record_stages() {
+    let fixture = support::canonical_tempdir();
+    let root = fixture.path().join("scope");
+    let device = fixture.path().join("device");
+    fs::create_dir(&root).unwrap();
+    for name in ["home", "config", "data", "cache", "state", "runtime", "tmp"] {
+        fs::create_dir_all(device.join(name)).unwrap();
+    }
+    fs::write(root.join("note.md"), "needle searchable text").unwrap();
+    fs::write(root.join("unsupported.rs"), "source fixture").unwrap();
+    run(&root, &device, &["--json", "init", "."]);
+    run(&root, &device, &["--json", "index", "--offline"]);
+
+    // Initialize the device's cursor key before observing staged writes.
+    run(
+        &root,
+        &device,
+        &["--json", "search", "needle", "--mode", "text"],
+    );
+
+    // Force the search's disposition projection to sort across spilled runs
+    // without indexing hundreds of originals. The temp directory alias can
+    // hold anonymous files but cannot be opened as a retained stage directory.
+    let journal = root.join(".kio/unsupported-inputs.jsonl");
+    let mut pair = fs::read(&journal).unwrap();
+    let mut stale: serde_json::Value = serde_json::from_slice(&pair).unwrap();
+    stale["path"] = "deleted.rs".into();
+    serde_json::to_writer(&mut pair, &stale).unwrap();
+    pair.push(b'\n');
+    fs::write(
+        &journal,
+        pair.repeat(kio_core::disk_records::SORT_BUFFER_RECORDS / 2 + 1),
+    )
+    .unwrap();
+    let temp_alias = fixture.path().join("temp-alias");
+    std::os::unix::fs::symlink(device.join("tmp"), &temp_alias).unwrap();
+    let ready = fixture.path().join("write-staged");
+    fs::write(ready.with_extension("release"), b"release").unwrap();
+    let output = command(
+        &root,
+        &device,
+        &["--json", "search", "needle", "--mode", "text"],
+        false,
+    )
+    .env("TMPDIR", &temp_alias)
+    .env("KIO_TEST_DURABILITY_POINT", "atomic_write_staged")
+    .env("KIO_TEST_DURABILITY_READY", &ready)
+    .output()
+    .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["results"][0]["evidence_pointer"]["path_at_commit"],
+        "note.md"
+    );
+    assert_eq!(
+        report["index_status"]["unsupported_input_errors"],
+        serde_json::json!([]),
+        "{report}"
+    );
+    assert_eq!(
+        report["index_status"]["unsupported_inputs"][0]["reason"],
+        "source_code_is_not_supported"
+    );
+    assert!(!ready.exists(), "search created a recoverable record stage");
+}

@@ -508,11 +508,7 @@ fn print_output(value: Value, json_mode: bool) {
             serde_json::to_string_pretty(&value).expect("serializing command output cannot fail");
         println!("{}", terminal_safe_text(&rendered, true));
     }
-    if let Some(readiness) = value.get("office_readiness").or_else(|| {
-        value
-            .get("index_status")
-            .and_then(|status| status.get("office_readiness"))
-    }) {
+    if let Some(readiness) = value.get("office_readiness") {
         print_office_readiness(
             readiness["state"].as_str().unwrap_or("unavailable"),
             readiness["reason"].as_str().unwrap_or(""),

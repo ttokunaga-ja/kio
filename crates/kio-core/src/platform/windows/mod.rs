@@ -10,7 +10,7 @@ pub(crate) mod cas_io;
 pub(crate) mod cas_semantics;
 #[cfg(windows)]
 #[cfg(test)]
-pub(crate) mod durability;
+pub(crate) mod durability_tests;
 #[cfg(windows)]
 pub(crate) mod gc_exchange;
 #[cfg(windows)]
