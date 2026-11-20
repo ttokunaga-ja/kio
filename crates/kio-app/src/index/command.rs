@@ -1314,7 +1314,8 @@ fn preview_extraction_issues(
     control: &kio_core::control::ControlHandle,
 ) -> Result<()> {
     use kio_pipeline::prepare::{
-        ExtractionBudget, PrepareStageBytesRequest, visit_prepared_units_with_budget,
+        ExtractionBudget, PrepareStageBytesRequest, XlsxExtractionProgress,
+        visit_prepared_units_with_budget,
     };
 
     let profile = kio_adapter::catalog::builtin_prepare_profile();
@@ -1330,11 +1331,13 @@ fn preview_extraction_issues(
         {
             continue;
         }
+        let is_xlsx = kio_adapter::xlsx_extract::is_xlsx_media(&candidate.media_type);
+        let mut progress = XlsxExtractionProgress::default();
         let result =
             kio_pipeline::scan::read_bound_extraction_input(root, &candidate.input_path, tier)
                 .and_then(|verified| {
                     let path = display_root.join(&candidate.input_path);
-                    visit_prepared_units_with_budget(
+                    let output = visit_prepared_units_with_budget(
                         PrepareStageBytesRequest {
                             raw_hash: &verified.raw_hash,
                             media_type: &candidate.media_type,
@@ -1344,6 +1347,7 @@ fn preview_extraction_issues(
                         },
                         control,
                         budget,
+                        &mut progress,
                         |prepared, bytes| {
                             super::pipeline::check_preview_normalized_unit(
                                 &path,
@@ -1353,14 +1357,34 @@ fn preview_extraction_issues(
                                 bytes,
                             )
                         },
-                    )
+                    )?;
+                    if is_xlsx {
+                        super::pipeline::check_preview_xlsx_manifest(
+                            &path,
+                            &verified.raw_hash,
+                            &output.prepared_units,
+                        )?;
+                    }
+                    Ok(())
                 });
         if let Err(error) = result {
             let error = pipeline_to_kio(error);
+            let resource_limit = error.resource_limit().cloned();
+            let retry = resource_limit.as_ref().filter(|_| is_xlsx).map(|limit| {
+                use kio_core::error::{Resource, ResourceTier};
+                let hint = match (limit.resource, limit.resource_tier) {
+                    (Resource::Storage, _) => "Free space for extraction and rerun kio index",
+                    (_, Some(ResourceTier::Standard)) => "kio index --resource-tier large",
+                    _ => "Reduce the workbook and run kio index --resource-tier large",
+                };
+                hint.to_owned()
+            });
             issues.push(&crate::response::index::ExtractionIssue {
                 path: prefix.join(&candidate.input_path),
                 error_code: error.error_code().to_owned(),
-                resource_limit: error.resource_limit().cloned(),
+                resource_limit,
+                xlsx_progress: is_xlsx.then_some(progress),
+                retry,
             })?;
         }
     }

@@ -4,9 +4,9 @@ use super::gc::{
     GcRuntimeDeferredReport, PrepublicationDeferredResponse,
 };
 use super::index::{
-    AdapterExecutionMode, ChildPreviewRow, ChildPublishedRow, IndexPreviewResponse,
-    IndexPublishedResponse, LargeFile, NetworkTransmissionPolicy, PreviewChildDiscovery,
-    PublishedChildDiscovery, SensitiveCandidate,
+    AdapterExecutionMode, ChildPreviewRow, ChildPublishedRow, ExtractionIssue,
+    IndexPreviewResponse, IndexPublishedResponse, LargeFile, NetworkTransmissionPolicy,
+    PreviewChildDiscovery, PublishedChildDiscovery, SensitiveCandidate,
 };
 use super::skipped_units::SkippedDisclosure;
 use kio_core::dag::{CommitObject, CommitStats, CommitType};
@@ -81,6 +81,29 @@ fn empty_preview_legacy() -> Value {
 #[test]
 fn index_preview_projection_preserves_empty_arrays_null_cost_and_absent_parent_fields() {
     assert_projection(empty_preview(), empty_preview_legacy());
+}
+
+#[test]
+fn index_preview_records_preserve_xlsx_progress_and_retry() {
+    let mut preview = empty_preview();
+    preview.extraction_issues = records([ExtractionIssue {
+        path: PathBuf::from("ranges.xlsx"),
+        error_code: "KIO-E-RESOURCE-LIMIT-001".to_owned(),
+        resource_limit: None,
+        xlsx_progress: Some(kio_pipeline::prepare::XlsxExtractionProgress {
+            completed_sheets: 1,
+            first_unprocessed_sheet: 2,
+            first_unprocessed_row: Some(1027),
+            ..Default::default()
+        }),
+        retry: Some("kio index --resource-tier large".into()),
+    }]);
+
+    let actual = serde_json::to_value(preview).unwrap();
+    let issue = &actual["extraction_issues"][0];
+    assert_eq!(issue["xlsx_progress"]["first_unprocessed_sheet"], 2);
+    assert_eq!(issue["xlsx_progress"]["first_unprocessed_row"], 1027);
+    assert_eq!(issue["retry"], "kio index --resource-tier large");
 }
 
 #[test]

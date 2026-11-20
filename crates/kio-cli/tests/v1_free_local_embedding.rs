@@ -1545,6 +1545,7 @@ fn resource_limit_image_result_retry_authenticates_input_and_publishes_without_r
             limit: None,
             observed: Some(1024),
             resource_tier: None,
+            page_progress: None,
         });
         image.next_retry_at = None;
         image.heartbeat_at = None;

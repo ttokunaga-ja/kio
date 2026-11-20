@@ -847,7 +847,7 @@ fn normalize_converted_pdf(pdf: &[u8]) -> Vec<u8> {
 /// escapes and balanced nested parens (a PDF literal string may itself
 /// contain unescaped, balanced parens) via [`find_literal_string_end`], the
 /// same conservative-but-correct spirit as `skip_pdf_literal_string` in
-/// `deterministic.rs`. An unterminated literal (malformed input) stops the
+/// `pdf_decode.rs`. An unterminated literal (malformed input) stops the
 /// scan rather than risk corrupting the buffer.
 fn overwrite_paren_value(bytes: &mut [u8], key: &[u8]) {
     let mut search_from = 0usize;
@@ -967,7 +967,7 @@ fn find_hex_string(bytes: &[u8], from: usize) -> Option<(usize, usize)> {
 /// LibreOffice's `/DocChecksum /F9B8AED3…`) to a fixed all-zero value of the
 /// SAME byte length. A PDF name token ends at the next delimiter
 /// (whitespace or one of `()<>[]{}/%`), mirroring `is_pdf_delimiter` in
-/// `deterministic.rs`.
+/// `pdf_decode.rs`.
 fn overwrite_name_value(bytes: &mut [u8], key: &[u8]) {
     let mut search_from = 0usize;
     while let Some(offset) = find_subslice(&bytes[search_from..], key) {
@@ -2515,12 +2515,17 @@ mod tests {
         // The graph decoder must recover the body text offline — this is
         // the acceptance property the round exists for, and it was NOT
         // covered before (only byte determinism was asserted).
-        let pages = crate::deterministic::extract_pdf_text_pages_bounded(
-            &first,
-            crate::deterministic::MAX_DETERMINISTIC_PDF_PAGES,
-        )
-        .expect("extract converted-PDF text layer");
-        let joined = pages.join("\n");
+        let mut pages =
+            crate::pdf_decode::PdfPages::open(&first, kio_core::error::ResourceTier::Standard)
+                .expect("index converted PDF");
+        let joined = (0..pages.len())
+            .map(|page| {
+                pages
+                    .read_page(page)
+                    .expect("extract converted-PDF text layer")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
             joined.contains("office") && joined.contains("convert"),
             "converted-PDF compressed text layer must decode offline; got {joined:?}"

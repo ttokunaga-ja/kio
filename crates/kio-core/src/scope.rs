@@ -1428,6 +1428,7 @@ fn archive_budget_error(
         limit: Some(limit),
         observed: Some(actual),
         resource_tier: None,
+        page_progress: None,
     }
     .into_error(format!(
         "not saved: {file_name}: archive byte budget exceeded"

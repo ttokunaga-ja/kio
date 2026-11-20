@@ -1781,6 +1781,7 @@ pub(crate) fn task_failure_from_adapter(error: kio_adapter::AdapterError) -> Tas
         _ => None,
     };
     let retry_kind = match error {
+        kio_adapter::AdapterError::RecordStage(_) => persist_failure_retry_kind(),
         kio_adapter::AdapterError::ResourceLimit(_) => RetryErrorKind::ResourceLimit,
         kio_adapter::AdapterError::Auth(_) => RetryErrorKind::AuthError,
         kio_adapter::AdapterError::LocalPeerAuth(_) => RetryErrorKind::LocalPeerAuth,
@@ -2593,6 +2594,7 @@ mod resource_failure_tests {
                 limit: None,
                 observed: Some(1024),
                 resource_tier: None,
+                page_progress: None,
             };
             let failure =
                 task_failure_from_adapter(kio_adapter::AdapterError::ResourceLimit(limit.clone()));

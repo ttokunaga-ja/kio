@@ -10,24 +10,53 @@ pub(crate) fn fail_next_tree_write() {
     FAIL_TREE_WRITE.with(|fault| fault.set(true));
 }
 
-struct TreeRead<'a> {
+#[derive(Clone, Copy)]
+enum StreamKind {
+    Tree,
+    Content(ContentObjectKind),
+}
+
+impl StreamKind {
+    fn size_error(self, limit: u64, observed: u64) -> KioError {
+        match self {
+            Self::Tree => object_size_error(ObjectKind::Tree, limit, observed),
+            Self::Content(kind) => content_object_size_error(kind, limit, observed),
+        }
+    }
+    fn label(self) -> &'static Path {
+        Path::new(match self {
+            Self::Tree => "tree",
+            Self::Content(kind) => kind.object_type(),
+        })
+    }
+}
+
+struct VerifiedRead<'a> {
     accounted: &'a mut u64,
     max_bytes: u64,
+    kind: StreamKind,
     file: File,
     reads: &'a CasReadAccess,
     hasher: Sha256,
     consumed: u64,
     error: Option<KioError>,
 }
-impl Read for TreeRead<'_> {
+impl Read for VerifiedRead<'_> {
     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
-        let count = match self.file.read(bytes) {
+        let remaining = self
+            .max_bytes
+            .saturating_sub(self.consumed)
+            .saturating_add(1);
+        let cap = bytes
+            .len()
+            .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+        let count = match self.file.read(&mut bytes[..cap]) {
             Ok(count) => count,
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => return Err(error),
             Err(error) => {
                 let kind = error.kind();
-                self.error = Some(stream_error(error, Path::new("tree")));
-                return Err(std::io::Error::new(kind, "cannot read tree"));
+                self.error = Some(stream_error(error, self.kind.label()));
+                return Err(std::io::Error::new(kind, "cannot read CAS object"));
             }
         };
         if count != 0 {
@@ -35,18 +64,14 @@ impl Read for TreeRead<'_> {
             *self.accounted = self.consumed;
             let result = self.reads.charge(count as u64).and_then(|()| {
                 if self.consumed > self.max_bytes {
-                    Err(object_size_error(
-                        ObjectKind::Tree,
-                        self.max_bytes,
-                        self.consumed,
-                    ))
+                    Err(self.kind.size_error(self.max_bytes, self.consumed))
                 } else {
                     Ok(())
                 }
             });
             if let Err(error) = result {
                 self.error = Some(error);
-                return Err(std::io::Error::other("tree read budget exceeded"));
+                return Err(std::io::Error::other("CAS read budget exceeded"));
             }
             self.hasher.update(&bytes[..count]);
         }
@@ -104,25 +129,98 @@ impl ObjectStore {
                 .ok_or_else(|| KioError::not_found(hash))?;
             open_private_cas_file(&path)?
         };
-        let opened = cap_primitives::fs::Metadata::from_file(&file).kio_io(Path::new("tree"))?;
-        let before = observe_regular_file_stability(
-            &file.metadata().kio_io(Path::new("tree"))?,
-            Path::new("tree"),
+        let (tree, consumed) = self.decode_verified_stream(
+            StreamKind::Tree,
+            slot.as_ref(),
+            file,
+            hash,
+            max_bytes,
+            accounted,
+            |input| self.decode_record_json::<TreeObject>(input),
         )?;
-        let size = file.metadata().kio_io(Path::new("tree"))?.len();
-        if size > max_bytes {
-            return Err(object_size_error(ObjectKind::Tree, max_bytes, size));
+        // The canonical writer validates the tree before hashing it.
+        if crate::dag::tree_hash(&tree)? != hash {
+            return Err(bound_stage_corrupt("tree JSON is not canonical"));
         }
-        let mut source = TreeRead {
+        Ok((tree, consumed))
+    }
+
+    /// Decode an immutable content object from the same bounded, accounted
+    /// stream that verifies its digest and retained file identity.
+    pub fn decode_content_accounted<T>(
+        &self,
+        kind: ContentObjectKind,
+        hash: &str,
+        max_bytes: u64,
+        decode: impl FnOnce(&mut dyn std::io::BufRead) -> Result<T>,
+    ) -> std::result::Result<(T, u64), AccountedReadError> {
+        let mut consumed_bytes = 0;
+        let result = (|| {
+            self.reads.charge(0)?;
+            if !is_hash(hash) {
+                return Err(KioError::invalid_usage("invalid content object hash"));
+            }
+            let slot = self
+                .bound
+                .as_ref()
+                .map(|bound| bound.content_fanout(kind, hash, false))
+                .transpose()?;
+            let file = if let Some((parent, leaf)) = &slot {
+                bound_open_regular_handle(parent, leaf)?
+            } else {
+                if !self.validate_content_parent(kind, hash)? {
+                    return Err(KioError::not_found(hash));
+                }
+                let path = self
+                    .existing_content_path(kind, hash)?
+                    .ok_or_else(|| KioError::not_found(hash))?;
+                open_private_cas_file(&path)?
+            };
+            self.decode_verified_stream(
+                StreamKind::Content(kind),
+                slot.as_ref(),
+                file,
+                hash,
+                max_bytes.min(kind.max_bytes()),
+                &mut consumed_bytes,
+                decode,
+            )
+        })();
+        result.map_err(|error| AccountedReadError {
+            error,
+            consumed_bytes,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_verified_stream<T>(
+        &self,
+        kind: StreamKind,
+        slot: Option<&(File, String)>,
+        file: File,
+        hash: &str,
+        max_bytes: u64,
+        accounted: &mut u64,
+        decode: impl FnOnce(&mut dyn std::io::BufRead) -> Result<T>,
+    ) -> Result<(T, u64)> {
+        let label = kind.label();
+        let opened = cap_primitives::fs::Metadata::from_file(&file).kio_io(label)?;
+        let before = observe_regular_file_stability(&file.metadata().kio_io(label)?, label)?;
+        let size = file.metadata().kio_io(label)?.len();
+        if size > max_bytes {
+            return Err(kind.size_error(max_bytes, size));
+        }
+        let mut source = VerifiedRead {
             file,
             accounted,
             max_bytes,
+            kind,
             reads: &self.reads,
             hasher: Sha256::new(),
             consumed: 0,
             error: None,
         };
-        let decoded = self.decode_record_json::<TreeObject>(std::io::BufReader::with_capacity(
+        let decoded = decode(&mut std::io::BufReader::with_capacity(
             CAS_STREAM_BUFFER_BYTES,
             &mut source,
         ));
@@ -144,17 +242,15 @@ impl ObjectStore {
         if let Some(error) = source.error.take() {
             return Err(error);
         }
-        drained.kio_io(Path::new("tree"))?;
+        drained.kio_io(label)?;
         crate::private_fs::verify_private_regular_file_handle(&source.file)?;
         if source.consumed != size
-            || observe_regular_file_stability(
-                &source.file.metadata().kio_io(Path::new("tree"))?,
-                Path::new("tree"),
-            )? != before
+            || observe_regular_file_stability(&source.file.metadata().kio_io(label)?, label)?
+                != before
         {
-            return Err(bound_stage_corrupt("tree changed while reading"));
+            return Err(bound_stage_corrupt("CAS object changed while reading"));
         }
-        if let Some((parent, leaf)) = &slot {
+        if let Some((parent, leaf)) = slot {
             let named = cap_primitives::fs::stat(
                 parent,
                 Path::new(leaf),
@@ -171,24 +267,19 @@ impl ObjectStore {
                     &named,
                 )?
             {
-                return Err(bound_stage_corrupt("tree namespace changed while reading"));
+                return Err(bound_stage_corrupt("CAS namespace changed while reading"));
             }
         }
         let actual = format!("sha256:{}", lower_hex(&source.hasher.finalize()));
         if actual != hash {
             return Err(corrupt_object_error(
-                Path::new("tree"),
-                "tree hash mismatch",
+                label,
+                "CAS object hash mismatch",
                 hash,
                 Some(&actual),
             ));
         }
-        let tree = decoded?;
-        // The canonical writer validates the tree before hashing it.
-        if crate::dag::tree_hash(&tree)? != hash {
-            return Err(bound_stage_corrupt("tree JSON is not canonical"));
-        }
-        Ok((tree, source.consumed))
+        Ok((decoded?, source.consumed))
     }
 }
 

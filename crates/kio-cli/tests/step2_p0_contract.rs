@@ -4260,6 +4260,7 @@ fn resource_limit_embedding_retry_uses_chunk_identity() {
         limit: None,
         observed: Some(1024),
         resource_tier: None,
+        page_progress: None,
     });
     let held = task.clone();
     store.replace_all(&tasks).unwrap();
@@ -4354,6 +4355,7 @@ fn exercise_resource_mixed_retry(resource_sibling: bool, initial_attempts: u32) 
             limit: Some(10),
             observed: Some(11),
             resource_tier: None,
+            page_progress: None,
         };
         let unit: NormalizedUnitObject = serde_json::from_value(json!({"unit_key":"page:1","unit_type":"page","raw_hash":raw_hash,"prepared_hash":preparation,"preparation_profile_hash":preparation_profile,"tool_profile_hash":profile_hash,"gen":0,"mode":"full","markdown":"verified first page\n","owned_image_hashes":[],"metadata":{},"reused_from":null,"generated_at":"2026-07-03T00:00:00Z"})).unwrap();
         let manifest = NormalizedInstanceManifest {
@@ -4401,6 +4403,7 @@ fn exercise_resource_mixed_retry(resource_sibling: bool, initial_attempts: u32) 
                             limit: None,
                             observed: Some(1024),
                             resource_tier: None,
+                            page_progress: None,
                         })
                     } else {
                         None

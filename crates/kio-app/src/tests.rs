@@ -4497,6 +4497,7 @@ fn ledger_snapshot_error_mapping_preserves_typed_exit_and_closed_reason() {
         limit: None,
         observed: None,
         resource_tier: None,
+        page_progress: None,
     };
     let resource_error =
         crate::object_persistence::pipeline_to_kio(kio_pipeline::PipelineError::ledger_snapshot(
@@ -5201,6 +5202,7 @@ fn test_resource_limit() -> kio_core::error::ResourceLimit {
         limit: None,
         observed: Some(1024),
         resource_tier: None,
+        page_progress: None,
     }
 }
 

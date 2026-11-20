@@ -54,6 +54,9 @@ pub enum AdapterError {
     /// App-owned managed trust failure, retaining its original typed error.
     #[error("{0}")]
     RuntimeTrust(kio_core::KioError),
+    /// Private extraction spill storage failed.
+    #[error("{0}")]
+    RecordStage(#[source] kio_core::KioError),
     /// An unavailable selected role is distinct from an absent declaration.
     #[error("adapter role {role} is unavailable: {error}")]
     RuntimeConfiguration {
@@ -130,6 +133,7 @@ impl AdapterError {
             Self::LocalPeerConfig { .. } | Self::RuntimeTrust(_) => "KIO-E-LOCAL-PEER-CONFIG-001",
             Self::RateLimit { .. } => "KIO-E-BATCH-RATE-001",
             Self::QuotaExceeded(_) => "KIO-E-BATCH-QUOTA-001",
+            Self::RecordStage(_) => "KIO-E-STORE-IO-001",
             Self::Network(_) | Self::Io { .. } => "KIO-E-BATCH-NET-001",
             Self::ContractViolation(_) | Self::ConfigSchema(_) | Self::ConfigSchemaCoded { .. } => {
                 "KIO-E-ADAPTER-CONTRACT-001"
@@ -158,7 +162,8 @@ impl AdapterError {
             }
             // Retryable in 04 §5.3's table (network_error/quota_exceeded/
             // contract_violation all have max_attempts >= 1).
-            Self::QuotaExceeded(_)
+            Self::RecordStage(_)
+            | Self::QuotaExceeded(_)
             | Self::Network(_)
             | Self::Io { .. }
             | Self::ContractViolation(_)
@@ -217,6 +222,7 @@ mod adapter_error_tests {
             limit: Some(10),
             observed: Some(11),
             resource_tier: Some(kio_core::error::ResourceTier::Standard),
+            page_progress: None,
         };
         let error = AdapterError::ResourceLimit(limit.clone());
         assert_eq!(error.error_code(), "KIO-E-RESOURCE-LIMIT-001");

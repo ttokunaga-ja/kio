@@ -258,6 +258,17 @@ pub struct PayloadRef {
     digest: [u8; 32],
 }
 
+impl PayloadRef {
+    pub fn serialized_size(self) -> usize {
+        self.size
+    }
+}
+
+pub enum PayloadWriteError<E> {
+    Admission(E),
+    Storage(KioError),
+}
+
 /// Pack already size-validated bodies in a bounded buffer, spilling to a
 /// private record stage when the buffer or shared memory budget is exhausted.
 pub struct PayloadWriter<T> {
@@ -289,10 +300,58 @@ impl<T: Serialize> PayloadWriter<T> {
     pub fn push(&mut self, value: &T) -> Result<PayloadRef> {
         let bytes =
             serde_json::to_vec(value).map_err(|error| KioError::schema(error.to_string()))?;
+        self.push_bytes(&bytes)
+    }
+
+    /// Admit the serialization before allocating its buffer.
+    pub fn push_accounted<E>(
+        &mut self,
+        value: &T,
+        admit: impl FnOnce(usize) -> std::result::Result<(), E>,
+    ) -> std::result::Result<PayloadRef, PayloadWriteError<E>> {
+        #[derive(Default)]
+        struct Counter(usize);
+        impl std::io::Write for Counter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 = self
+                    .0
+                    .checked_add(bytes.len())
+                    .ok_or_else(|| std::io::Error::other("private payload size overflows"))?;
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut length = Counter::default();
+        let schema = |error: serde_json::Error| {
+            PayloadWriteError::Storage(KioError::schema(error.to_string()))
+        };
+        serde_json::to_writer(&mut length, value).map_err(schema)?;
+        admit(length.0).map_err(PayloadWriteError::Admission)?;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(length.0).map_err(|_| {
+            PayloadWriteError::Storage(
+                ResourceLimit {
+                    resource: Resource::Memory,
+                    stage: "record_payload".to_owned(),
+                    limit: None,
+                    observed: Some(length.0 as u64),
+                    resource_tier: None,
+                    page_progress: None,
+                }
+                .into_error("cannot allocate a private record payload"),
+            )
+        })?;
+        serde_json::to_writer(&mut bytes, value).map_err(schema)?;
+        self.push_bytes(&bytes).map_err(PayloadWriteError::Storage)
+    }
+
+    fn push_bytes(&mut self, bytes: &[u8]) -> Result<PayloadRef> {
         let reference = PayloadRef {
             offset: self.size,
             size: bytes.len(),
-            digest: Sha256::digest(&bytes).into(),
+            digest: Sha256::digest(bytes).into(),
         };
         let end = self
             .size
@@ -300,7 +359,7 @@ impl<T: Serialize> PayloadWriter<T> {
             .ok_or_else(changed_records)?;
         if let PayloadBuffer::Memory(buffer) = &mut self.buffer {
             if end <= RECORD_BYTES as u64 {
-                buffer.extend_from_slice(&bytes);
+                buffer.extend_from_slice(bytes);
                 self.size = end;
                 return Ok(reference);
             }
@@ -409,6 +468,7 @@ impl<T: DeserializeOwned> RecordPayloads<T> {
                         limit: None,
                         observed: Some(reference.size as u64),
                         resource_tier: None,
+                        page_progress: None,
                     }
                     .into_error("cannot allocate a private record payload")
                 })?;
@@ -918,6 +978,7 @@ fn record_limit(observed: usize) -> KioError {
         limit: Some(RECORD_BYTES as u64),
         observed: Some(observed as u64),
         resource_tier: None,
+        page_progress: None,
     }
     .into_error("tree metadata record exceeds the streaming buffer")
 }

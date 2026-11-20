@@ -98,6 +98,8 @@ Kio は `deterministic_library` の Prepare / Markdownize Adapter を同梱す�
 > 変更は deterministic profile の `model_version_pin` 1.0.0 → 1.1.0 として**新
 > `tool_profile_hash`** に載せた (§9 / [03-data-model.md §5.1](03-data-model.md) — 既存
 > instance 内の prepared_hash drift ではなく新 identity としての基線再構築)。
+> PDF の資源 tier 対応では、ページごとのフォント解決と unsupported filter の空抽出を
+> 有効な xref に従うページ順と合わせて Prepare 1.4.0 / Markdownize 1.5.0 の identity に載せる。
 
 - online Adapter が未設定または network 未承認のとき、Markdownize タスクは同梱 deterministic Adapter で実行する (タスクを止めない)。Embedding はモデル準備済みなら既定の EG2 を使い、未準備なら理由を表示して text fallback する ([05-runtime.md §1](05-runtime.md))
 - この状態を **ベースライン index** と呼ぶ。`init → index --yes → search → open <pointer>` の最低体験ライン ([01-positioning.md §3](01-positioning.md)) はベースライン index のみで成立しなければならない
@@ -381,7 +383,9 @@ workbook main part と worksheet relationship は XLSX の MIME / namespace / �
 不正 ZIP/XML と上記の不受理 variant は `KIO-E-PREPARE-XLSX-EXTRACT-001`、
 容量・work 予算超過は [04 §5.3](04-pipeline.md#53-エラー種別と-retry-budget) の
 `resource_limit` と区別し、部分抽出を完成済み workbook として公開しない。
-preview は完了 sheet/row、未処理範囲とその理由を表示する。再開時も元 sheet/row identity を保持する。
+preview は完了 sheet/row、未処理範囲とその理由を表示する。worksheet 内では解析済みの行と
+出力済みの行を区別し、判明している未処理開始行を元の行番号で示す。再開時も元 sheet/row identity
+を保持し、完了シートの work と出力サイズも、その実行で選んだ tier の検査に含める。
 
 - **unit = worksheet 1 枚**。`unit_key` は 04 §2 / QB27 の `sheet:` 規則 —
   NFC 正規化 → 元名の `#` を `##` へ escape → **その後で**同名 2 枚目以降に `#2` / `#3` を付す
@@ -397,7 +401,7 @@ preview は完了 sheet/row、未処理範囲とその理由を表示する。�
 - **sheet に埋め込まれた chart / 画像は本追記の対象外。** これは真に視覚的で直接抽出では読めないが、
   「file X の sheet M の中の image N」という evidence 上の同一性が未定義であり、
   `image_object_hashes` は 3 つの構造体に**宣言があるだけで書き手も読み手も無い**。
-  半端に配線せず、抽出器が**件数を報告して穴を可視に保つ** (`XlsxDocument::media_paths`)。
+  半端に配線せず、抽出器が**件数を報告して穴を可視に保つ** (`XlsxWorkbook::media_paths`)。
 
 ### PDF / XLSX の抽出資源 tier
 
@@ -413,14 +417,27 @@ invocation 限定の資源選択で、省略時は standard。永続的な安全
 | XLSX 1 member の展開 bytes | 64 MiB | 256 MiB |
 | XLSX 全 member の declared / 実読取り展開 bytes 合計 / file | 256 MiB | 4 GiB |
 
+PDF の parser work には、object / reference の訪問、入力の走査、実際に展開した bytes を数える。
+展開 bytes はファイル全体で累積し、累計を 1 KiB 単位へ切り上げるため、展開の chunk 分割によって
+消費量は変わらない。可変長バッファは保持する容量を会計する。content stream、CMap、出力 text は
+ページごとに解放する。圧縮 object の索引は member の位置を持ち、展開の作業領域には最大 1 コンテナを保持する。
+
 XLSX の容量値は選択 tier に対応し、declared size と実読取りの両方に適用する。
 member / aggregate の容量枠は streaming で消費する総量であり、同時保持 memory 枠の拡張ではない。
 共有文字列・escape・出力を含む保持 bytes、parser work、unit text、ZIP 容量の全枠を同時に満たす。
 全て有限の checked counter とし、割当・展開前に予算を検査する。メモリ予算は allocator の
-全 RSS の保証ではなく parser が保持する bytes の上限である。page / sheet 出力は順に private stage へ
-流し、文書全体の展開 bytes を同時保持しない。旧固定限界を超える正常 fixture が処理できることと、
-不正構造・展開爆弾・循環が有限 work で止まることの両方を受入条件とする。
+全 RSS の保証ではなく parser が保持する bytes の上限である。page / sheet 出力は順に処理し、
+合計が 64 KiB を超えた時点で、それまでの出力と以降の出力を private stage に保存する
+（[04 §5.3](04-pipeline.md#53-エラー種別と-retry-budget)）。文書全体の展開 bytes は同時保持しない。
+旧固定限界を超える正常 fixture が処理できることと、不正構造・展開爆弾・循環が有限 work で
+止まることの両方を受入条件とする。
 未完了の場合は処理済み範囲・未処理範囲・予算と再実行方法を表示し、cell / page を黙って捨てない。
+PDF のページ総数が確定している場合は、予算情報の `page_progress` に総数、抽出済みの末尾ページ、
+次の抽出ページ、再実行方法を含める。stage が作成された実行では、耐久化済みの末尾ページも
+含める。末尾が 0 の範囲は空である。通常の `index` の保留出力にもこの情報を表示する。
+ストレージ不足では空き容量の確保、standard の抽出予算超過では large への変更を案内する。
+large の unit text 超過では該当ページのテキスト量を減らし、その他の抽出予算超過では PDF の
+サイズや複雑さを抑えてから再実行する。
 preview も同じ予算と受入検査に従い、有料 fallback や外部送信の承認を追加しない。
 
 ## 5.2 Markdownize

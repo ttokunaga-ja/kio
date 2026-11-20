@@ -161,6 +161,7 @@ pub(crate) fn stage_io(message: &str, error: std::io::Error) -> crate::KioError 
             limit: None,
             observed: None,
             resource_tier: None,
+            page_progress: None,
         }
         .into_error(format!("{message}: {error}"))
     } else {

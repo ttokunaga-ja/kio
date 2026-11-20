@@ -1,6 +1,7 @@
 use super::{
-    ExtractionBudget, PrepareStageBytesRequest, PrepareStageOutput, PreparedUnit, hash_bytes,
-    office_preparation_profile_hash, prepare_units_emitting, resolve_prepare_converter,
+    ExtractionBudget, PrepareStageBytesRequest, PrepareStageOutput, PreparedUnit,
+    XlsxExtractionProgress, hash_bytes, office_preparation_profile_hash, prepare_units_emitting,
+    resolve_prepare_converter, xlsx_preparation_profile_hash,
 };
 #[cfg(test)]
 use crate::IoResultExt;
@@ -9,9 +10,11 @@ use crate::extraction_stage::{
     stage_error, write_record,
 };
 use crate::{PipelineError, Result};
+use kio_adapter::xlsx_extract::SheetUsage;
 #[cfg(test)]
 use kio_core::cas::MAX_CONTENT_OBJECT_BYTES;
 use kio_core::cas::{ContentObjectKind, ObjectStore, is_hash};
+use kio_core::disk_records::RecordStageRoot;
 use kio_core::store_dir::{Publication, StoreDirectory};
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
@@ -30,6 +33,8 @@ struct UnitRecord {
     unit: PreparedUnit,
     stage: SavedStage,
     complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sheet_usage: Option<SheetUsage>,
 }
 
 /// A completed extraction whose payloads remain private until persisted.
@@ -42,8 +47,15 @@ pub struct StagedPreparation {
 
 #[derive(Debug)]
 enum PreparedPayloads {
-    Small(Vec<(PreparedUnit, Vec<u8>)>),
+    Small(Vec<BufferedUnit>),
     Staged(StoreDirectory),
+}
+
+#[derive(Debug)]
+struct BufferedUnit {
+    unit: PreparedUnit,
+    bytes: Vec<u8>,
+    sheet_usage: Option<SheetUsage>,
 }
 
 pub fn prepare_staged(
@@ -53,7 +65,13 @@ pub fn prepare_staged(
 ) -> Result<StagedPreparation> {
     let converter = resolve_prepare_converter(request.media_type, root.control());
     let profile = converter.as_ref().map_or_else(
-        || request.tool_profile_hash.to_owned(),
+        || {
+            if kio_adapter::xlsx_extract::is_xlsx_media(request.media_type) {
+                xlsx_preparation_profile_hash(request.tool_profile_hash)
+            } else {
+                request.tool_profile_hash.to_owned()
+            }
+        },
         |converter| {
             office_preparation_profile_hash(
                 request.tool_profile_hash,
@@ -62,7 +80,32 @@ pub fn prepare_staged(
         },
     );
     prepare_staged_with(root, request, &profile, |completed, emit| {
-        prepare_units_emitting(request, converter.as_ref(), budget, completed, emit)
+        let record_stages = kio_adapter::xlsx_extract::is_xlsx_media(request.media_type)
+            .then(|| {
+                ObjectStore::from_bound_kio_with_control(
+                    root.root_handle().as_ref(),
+                    root.control().clone(),
+                )?
+                .record_stages()
+            })
+            .transpose()
+            .map_err(|error| match error.resource_limit() {
+                Some(limit) => PipelineError::ResourceLimit(limit.clone()),
+                None => PipelineError::RecordStage(error),
+            })?;
+        prepare_units_emitting(
+            request,
+            converter.as_ref(),
+            budget,
+            completed,
+            &mut XlsxExtractionProgress::default(),
+            &mut PreparedUnitSink {
+                declare: emit.declare,
+                write: emit.write,
+                read_sheet_usage: emit.read_sheet_usage,
+                record_stages: record_stages.as_ref(),
+            },
+        )
     })
 }
 
@@ -86,12 +129,13 @@ pub fn prepare_staged_with(
     let path = Path::new("extraction-stages/prepared")
         .join(request.raw_hash.trim_start_matches("sha256:"))
         .join(key.trim_start_matches("sha256:"));
+    let check_sheet_usage = kio_adapter::xlsx_extract::is_xlsx_media(request.media_type);
     let (output, payloads) = match existing_workspace(root, &path)? {
         Some(directory) => {
-            let output = stage_units(&directory, extract)?;
+            let output = stage_units_checked(&directory, check_sheet_usage, extract)?;
             (output, PreparedPayloads::Staged(directory))
         }
-        None => prepare_fresh(root, &path, extract)?,
+        None => prepare_fresh(root, &path, check_sheet_usage, extract)?,
     };
     if output.prepared_units.iter().any(|unit| {
         unit.preparation_profile_hash != profile || unit.mime.as_deref() != Some(request.media_type)
@@ -108,15 +152,17 @@ pub fn prepare_staged_with(
 fn prepare_fresh(
     root: &StoreDirectory,
     path: &Path,
+    check_sheet_usage: bool,
     extract: impl FnOnce(&[PreparedUnit], &mut PreparedUnitSink<'_>) -> Result<PrepareStageOutput>,
 ) -> Result<(PrepareStageOutput, PreparedPayloads)> {
     let count = Cell::new(None);
-    let mut buffered = Vec::<(PreparedUnit, Vec<u8>)>::new();
+    let mut buffered = Vec::<BufferedUnit>::new();
     let mut size = 0usize;
     let mut workspace = None;
     let mut written = 0;
+    let mut ready_through = 0;
     let mut keys = BTreeSet::new();
-    let output = extract(
+    let result = extract(
         &[],
         &mut PreparedUnitSink {
             declare: &mut |units| {
@@ -128,7 +174,8 @@ fn prepare_fresh(
                 }
                 Ok(())
             },
-            write: &mut |unit, bytes| {
+            write: &mut |unit, bytes, sheet_usage| {
+                validate_sheet_usage(root, check_sheet_usage, bytes, sheet_usage)?;
                 if unit.order != written as u64
                     || count.get().is_none_or(|units| units <= written)
                     || !keys.insert(unit.unit_key.clone())
@@ -142,7 +189,11 @@ fn prepare_fresh(
                 written += 1;
                 size = size.saturating_add(bytes.len());
                 if workspace.is_none() && size <= SMALL_EXTRACTION_BYTES {
-                    buffered.push((unit.clone(), bytes.to_vec()));
+                    buffered.push(BufferedUnit {
+                        unit: unit.clone(),
+                        bytes: bytes.to_vec(),
+                        sheet_usage,
+                    });
                     return Ok(());
                 }
                 if workspace.is_none() {
@@ -153,15 +204,37 @@ fn prepare_fresh(
                         &count.get().expect("declared layout"),
                         Publication::CreateOnly,
                     )?;
-                    for (unit, bytes) in buffered.drain(..) {
-                        write_prepared_unit(&directory, &unit, &bytes)?;
-                    }
                     workspace = Some(directory);
+                    let directory = workspace.as_ref().expect("opened workspace");
+                    for buffered in buffered.drain(..) {
+                        write_prepared_unit(
+                            directory,
+                            &buffered.unit,
+                            &buffered.bytes,
+                            buffered.sheet_usage,
+                            &mut ready_through,
+                        )?;
+                    }
                 }
-                write_prepared_unit(workspace.as_ref().expect("opened workspace"), unit, bytes)
+                write_prepared_unit(
+                    workspace.as_ref().expect("opened workspace"),
+                    unit,
+                    bytes,
+                    sheet_usage,
+                    &mut ready_through,
+                )
+            },
+            record_stages: None,
+            read_sheet_usage: &|_| {
+                Err(stage_corrupt(
+                    root,
+                    "fresh extraction has no completed worksheets",
+                ))
             },
         },
-    )?;
+    );
+    let output = result
+        .map_err(|error| with_staged_progress(error, workspace.as_ref().map(|_| ready_through)))?;
     if written != output.prepared_units.len() || count.get().is_some_and(|units| units != written) {
         return Err(stage_corrupt(
             root,
@@ -169,12 +242,12 @@ fn prepare_fresh(
         ));
     }
     let payloads = if let Some(directory) = workspace {
-        complete_prepared_workspace(&directory, &output)?;
+        complete_prepared_workspace(&directory, &output, false)?;
         PreparedPayloads::Staged(directory)
     } else {
         if !buffered
             .iter()
-            .map(|(unit, _)| unit)
+            .map(|buffered| &buffered.unit)
             .eq(&output.prepared_units)
         {
             return Err(stage_corrupt(
@@ -238,13 +311,15 @@ pub fn publish_prepared_source(root: &StoreDirectory, hash: &str, bytes: &[u8]) 
     )
 }
 
-type UnitWriter<'a> = dyn FnMut(&PreparedUnit, &[u8]) -> Result<()> + 'a;
+type UnitWriter<'a> = dyn FnMut(&PreparedUnit, &[u8], Option<SheetUsage>) -> Result<()> + 'a;
 
 /// A producer declares its expected unit count before writing any bodies.
 /// It can then skip the durable prefix and supply the remaining units in order.
 pub struct PreparedUnitSink<'a> {
     pub(super) declare: &'a mut dyn FnMut(usize) -> Result<()>,
     pub(super) write: &'a mut UnitWriter<'a>,
+    pub(super) record_stages: Option<&'a RecordStageRoot>,
+    pub(super) read_sheet_usage: &'a dyn Fn(u64) -> Result<SheetUsage>,
 }
 
 impl PreparedUnitSink<'_> {
@@ -253,15 +328,36 @@ impl PreparedUnitSink<'_> {
     }
 
     pub fn write(&mut self, unit: &PreparedUnit, bytes: &[u8]) -> Result<()> {
-        (self.write)(unit, bytes)
+        (self.write)(unit, bytes, None)
+    }
+
+    pub(super) fn write_sheet(
+        &mut self,
+        unit: &PreparedUnit,
+        bytes: &[u8],
+        usage: SheetUsage,
+    ) -> Result<()> {
+        (self.write)(unit, bytes, Some(usage))
     }
 }
 
+#[cfg(test)]
 fn stage_units(
     directory: &StoreDirectory,
     extract: impl FnOnce(&[PreparedUnit], &mut PreparedUnitSink<'_>) -> Result<PrepareStageOutput>,
 ) -> Result<PrepareStageOutput> {
-    if let Some(count) = read_record::<usize>(directory, Path::new(COMPLETE), 64)? {
+    stage_units_checked(directory, false, extract)
+}
+
+fn stage_units_checked(
+    directory: &StoreDirectory,
+    check_sheet_usage: bool,
+    extract: impl FnOnce(&[PreparedUnit], &mut PreparedUnitSink<'_>) -> Result<PrepareStageOutput>,
+) -> Result<PrepareStageOutput> {
+    let already_complete = read_record::<usize>(directory, Path::new(COMPLETE), 64)?;
+    if let Some(count) = already_complete
+        && !check_sheet_usage
+    {
         return Ok(prepared_output(completed_units(directory, count)?));
     }
 
@@ -283,7 +379,13 @@ fn stage_units(
     }
     let layout = Path::new(LAYOUT);
     let declared = read_record::<usize>(directory, layout, 64)?;
-    if declared == Some(completed.len()) {
+    if already_complete.is_some_and(|count| count != completed.len() || declared != Some(count)) {
+        return Err(stage_corrupt(
+            directory,
+            "prepared completion does not match its layout",
+        ));
+    }
+    if declared == Some(completed.len()) && !check_sheet_usage {
         let units = completed_units(directory, completed.len())?;
         write_record(
             directory,
@@ -306,14 +408,27 @@ fn stage_units(
             write_record(directory, layout, &count, Publication::CreateOnly)
         }
     };
-    let mut write = |unit: &PreparedUnit, bytes: &[u8]| write_prepared_unit(directory, unit, bytes);
-    let output = extract(
+    let mut ready_through = completed.len() as u64;
+    let mut write = |unit: &PreparedUnit, bytes: &[u8], sheet_usage| {
+        validate_sheet_usage(directory, check_sheet_usage, bytes, sheet_usage)?;
+        write_prepared_unit(directory, unit, bytes, sheet_usage, &mut ready_through)
+    };
+    let result = extract(
         &completed,
         &mut PreparedUnitSink {
             declare: &mut declare,
             write: &mut write,
+            record_stages: None,
+            read_sheet_usage: &|order| {
+                completed_unit(directory, order)?
+                    .sheet_usage
+                    .ok_or_else(|| {
+                        stage_corrupt(directory, "missing worksheet resource accounting")
+                    })
+            },
         },
-    )?;
+    );
+    let output = result.map_err(|error| with_staged_progress(error, Some(ready_through)))?;
     if let Some(count) = read_record::<usize>(directory, layout, 64)?
         && count != output.prepared_units.len()
     {
@@ -328,13 +443,14 @@ fn stage_units(
             "extractor returned a different unit layout",
         ));
     }
-    complete_prepared_workspace(directory, &output)?;
+    complete_prepared_workspace(directory, &output, already_complete.is_some())?;
     Ok(output)
 }
 
 fn complete_prepared_workspace(
     directory: &StoreDirectory,
     output: &PrepareStageOutput,
+    already_complete: bool,
 ) -> Result<()> {
     if completed_units(directory, output.prepared_units.len())? != output.prepared_units {
         return Err(stage_corrupt(
@@ -342,25 +458,57 @@ fn complete_prepared_workspace(
             "extractor returned a different unit layout",
         ));
     }
-    write_record(
-        directory,
-        Path::new(COMPLETE),
-        &output.prepared_units.len(),
-        Publication::CreateOnly,
-    )
+    if !already_complete {
+        write_record(
+            directory,
+            Path::new(COMPLETE),
+            &output.prepared_units.len(),
+            Publication::CreateOnly,
+        )?;
+    }
+    Ok(())
+}
+
+fn with_staged_progress(mut error: PipelineError, staged_through: Option<u64>) -> PipelineError {
+    if let PipelineError::ResourceLimit(limit) = &mut error
+        && let Some(progress) = &mut limit.page_progress
+    {
+        progress.staged_through = staged_through;
+    }
+    error
+}
+
+fn validate_sheet_usage(
+    directory: &StoreDirectory,
+    check_sheet_usage: bool,
+    bytes: &[u8],
+    sheet_usage: Option<SheetUsage>,
+) -> Result<()> {
+    if check_sheet_usage != sheet_usage.is_some()
+        || sheet_usage.is_some_and(|usage| usage.output_bytes != bytes.len() as u64)
+    {
+        return Err(stage_corrupt(
+            directory,
+            "invalid worksheet resource accounting",
+        ));
+    }
+    Ok(())
 }
 
 fn write_prepared_unit(
     directory: &StoreDirectory,
     unit: &PreparedUnit,
     bytes: &[u8],
+    sheet_usage: Option<SheetUsage>,
+    ready_through: &mut u64,
 ) -> Result<()> {
     let leaf = unit_record_name(unit.order);
     if let Some(record) = read_record::<UnitRecord>(directory, &leaf, RECORD_BYTES)? {
-        if record.unit != *unit {
+        if record.unit != *unit || record.sheet_usage != sheet_usage {
             return Err(stage_corrupt(directory, "staged unit identity changed"));
         }
         if record.complete {
+            *ready_through = (*ready_through).max(unit.order + 1);
             return Ok(());
         }
         record.stage.discard(directory)?;
@@ -370,6 +518,7 @@ fn write_prepared_unit(
         unit: unit.clone(),
         stage,
         complete: false,
+        sheet_usage,
     };
     write_record(directory, &leaf, &record, Publication::Upsert)?;
     directory
@@ -384,8 +533,10 @@ fn write_prepared_unit(
     writer
         .sync()
         .map_err(|error| stage_error(directory, error))?;
+    drop(writer);
     record.complete = true;
     write_record(directory, &leaf, &record, Publication::Upsert)?;
+    *ready_through = unit.order + 1;
     directory
         .control()
         .checkpoint(kio_core::durability::DurabilityPoint::ExtractionUnitReady)
@@ -420,7 +571,7 @@ impl StagedPreparation {
     pub fn persist_objects(&self, store: &ObjectStore) -> Result<()> {
         match &self.payloads {
             PreparedPayloads::Small(payloads) => {
-                for (unit, bytes) in payloads {
+                for BufferedUnit { unit, bytes, .. } in payloads {
                     if hash_bytes(bytes) != unit.prepared_hash {
                         return Err(PipelineError::contract(
                             "KIO-E-PREPARE-IDENTITY-001",
@@ -488,6 +639,7 @@ fn read_staged_unit(directory: &StoreDirectory, record: &UnitRecord) -> Result<V
             limit: None,
             observed: Some(size),
             resource_tier: None,
+            page_progress: None,
         })
     })?;
     file.take(MAX_CONTENT_OBJECT_BYTES + 1)
@@ -572,6 +724,118 @@ mod tests {
         }
     }
 
+    #[test]
+    fn pdf_prepare_stages_only_above_the_combined_output_boundary() {
+        use std::io::Write as _;
+
+        for extra in [0, 1] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = StoreDirectory::open(temp.path()).unwrap();
+            let mut pdf = b"%PDF-1.4\n".to_vec();
+            let lengths = [
+                SMALL_EXTRACTION_BYTES / 2,
+                SMALL_EXTRACTION_BYTES / 2 + extra,
+            ];
+            for (i, length) in lengths.into_iter().enumerate() {
+                let page = i * 2 + 1;
+                let contents = page + 1;
+                write!(
+                    pdf,
+                    "{page} 0 obj << /Type /Page /Contents {contents} 0 R >> endobj\n\
+                     {contents} 0 obj << /Length {} >> stream\nBT (",
+                    length + 8,
+                )
+                .unwrap();
+                pdf.resize(pdf.len() + length, b'x');
+                pdf.extend_from_slice(b") Tj\nendstream\nendobj\n");
+            }
+            let result = prepare_staged(
+                &root,
+                PrepareStageBytesRequest {
+                    raw_hash: &hash_bytes(&pdf),
+                    media_type: "application/pdf",
+                    input_path: "two-pages.pdf",
+                    tool_profile_hash: &hash_bytes(b"profile"),
+                    bytes: &pdf,
+                },
+                ExtractionBudget::new(kio_core::error::ResourceTier::Standard),
+            )
+            .unwrap();
+            assert_eq!(result.output.prepared_units.len(), 2);
+            for (index, (unit, length)) in
+                result.output.prepared_units.iter().zip(lengths).enumerate()
+            {
+                assert_eq!(unit.page_number, Some(index as u64 + 1));
+                assert_eq!(unit.prepared_hash, hash_bytes(&vec![b'x'; length]));
+            }
+            assert_eq!(result.has_staged_payloads(), extra == 1);
+            assert_eq!(root.path().join("extraction-stages").exists(), extra == 1);
+        }
+    }
+
+    #[test]
+    fn xlsx_prepare_small_workbook_needs_no_identified_workspace() {
+        let raw =
+            include_bytes!("../../../kio-eval/acceptance-fixtures/v1/office-public/table.xlsx");
+        let temp = tempfile::tempdir().unwrap();
+        let repo = kio_core::scope::Repository::init(temp.path()).unwrap();
+        let root = StoreDirectory::open(repo.kio_dir()).unwrap();
+        let prepared = prepare_staged(
+            &root,
+            PrepareStageBytesRequest {
+                raw_hash: &hash_bytes(raw),
+                media_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                input_path: "table.xlsx",
+                tool_profile_hash: &hash_bytes(b"profile"),
+                bytes: raw,
+            },
+            ExtractionBudget::new(kio_core::error::ResourceTier::Standard),
+        )
+        .unwrap();
+        assert_eq!(prepared.output.prepared_units.len(), 1);
+        assert!(!prepared.has_staged_payloads());
+        assert!(!root.path().join("extraction-stages").exists());
+        prepared.persist_objects(&repo.object_store()).unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn review_completed_sheet_stage_still_runs_budget_admission() {
+        use kio_adapter::xlsx_extract::{SheetProgress, XlsxWorkbook};
+        use kio_core::error::ResourceTier;
+
+        let raw =
+            include_bytes!("../../../kio-eval/acceptance-fixtures/v1/office-public/table.xlsx");
+        let mut book = XlsxWorkbook::open(raw, ResourceTier::Standard).unwrap();
+        let (markdown, usage) = book.read_sheet(0, &mut SheetProgress::default()).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let directory = StoreDirectory::open(tmp.path()).unwrap();
+
+        stage_units_checked(&directory, true, |_, sink| {
+            sink.declare(1)?;
+            let mut prepared = unit(0, markdown.as_bytes());
+            prepared.unit_type = UnitType::Sheet;
+            sink.write_sheet(&prepared, markdown.as_bytes(), usage)?;
+            Ok(prepared_output(vec![prepared]))
+        })
+        .unwrap();
+
+        let limit = ResourceLimit {
+            resource: Resource::Work,
+            stage: "xlsx_extract".to_owned(),
+            limit: Some(5),
+            observed: Some(6),
+            resource_tier: Some(ResourceTier::Standard),
+            page_progress: None,
+        };
+        let outcome = stage_units_checked(&directory, true, |completed, sink| {
+            assert_eq!(completed.len(), 1);
+            assert_eq!((sink.read_sheet_usage)(0)?, usage);
+            Err(PipelineError::ResourceLimit(limit.clone()))
+        });
+        assert!(matches!(outcome, Err(PipelineError::ResourceLimit(actual)) if actual == limit));
+    }
+
     #[cfg(any(unix, windows))]
     #[test]
     fn p0_producer_cannot_mark_unwritten_units_complete() {
@@ -615,7 +879,7 @@ mod tests {
             let path = Path::new("extraction-stages/prepared-test");
             let first = vec![b'x'; SMALL_EXTRACTION_BYTES / 2];
             let second = vec![b'y'; SMALL_EXTRACTION_BYTES / 2 + extra];
-            let (output, payloads) = prepare_fresh(&root, path, |_, emit| {
+            let (output, payloads) = prepare_fresh(&root, path, false, |_, emit| {
                 let units = vec![unit(0, &first), unit(1, &second)];
                 emit.declare(2)?;
                 for (entry, bytes) in units.iter().zip([&first, &second]) {
@@ -692,6 +956,7 @@ mod tests {
             limit: None,
             observed: None,
             resource_tier: None,
+            page_progress: None,
         };
         let failed = stage_units(&directory, |completed, emit| {
             assert!(completed.is_empty());
@@ -707,6 +972,7 @@ mod tests {
                     unit: second.clone(),
                     stage,
                     complete: false,
+                    sheet_usage: None,
                 },
                 Publication::CreateOnly,
             )?;

@@ -95,7 +95,8 @@ pub const MAX_EMBEDDING_OBJECT_BYTES: u64 = 1024 * 1024;
 /// prepared object. Keeping the limit at the CAS boundary prevents inventory
 /// and fsck from hashing a pathologically large object before the semantic
 /// manifest reader can apply its own bound.
-pub const MAX_MANIFEST_OBJECT_BYTES: u64 = 8 * 1024 * 1024;
+// A normalized instance may contain every worksheet in a ZIP32 workbook.
+pub const MAX_MANIFEST_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
 
 mod read_budget;
 
@@ -2220,6 +2221,7 @@ fn object_size_error(kind: ObjectKind, limit: u64, actual: u64) -> KioError {
             limit: Some(limit),
             observed: Some(actual),
             resource_tier: None,
+            page_progress: None,
         }
         .into_error("raw archive byte budget exceeded");
     }

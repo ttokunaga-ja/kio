@@ -567,7 +567,50 @@ fn print_error(error: &KioError, json_mode: bool) {
             terminal_safe_text(error.error_code(), false),
             terminal_safe_text(error.message(), false)
         );
+        if let Some(progress) = error
+            .resource_limit()
+            .and_then(|limit| limit.page_progress.as_deref())
+        {
+            eprintln!("{}", page_hold_details(progress));
+        }
     }
+}
+
+fn page_hold_details(progress: &kio_core::error::PageExtractionProgress) -> String {
+    use kio_core::error::PageExtractionRetry;
+
+    let prefix = |end| match end {
+        0 => "none".to_owned(),
+        1 => "1".to_owned(),
+        end => format!("1–{end}"),
+    };
+    let mut details = format!(
+        "Extracted pages {} of {}",
+        prefix(progress.extracted_through),
+        progress.total_pages
+    );
+    if let Some(end) = progress.staged_through {
+        details.push_str(&format!(", staged pages {}", prefix(end)));
+    }
+    if let Some(page) = progress.next_page {
+        details.push_str(&format!(", next page {page}"));
+    }
+    let retry = match progress.retry {
+        PageExtractionRetry::TryLarge => "Run kio index --resource-tier large.",
+        PageExtractionRetry::FreeStorage => "Free storage, then run kio index.",
+        PageExtractionRetry::FreeStorageThenIndexLarge => {
+            "Free storage, then run kio index --resource-tier large."
+        }
+        PageExtractionRetry::ReducePageText => {
+            "Reduce the page text to fit the large tier before indexing again."
+        }
+        PageExtractionRetry::ReducePdfComplexity => {
+            "Reduce the PDF size or complexity before indexing again."
+        }
+    };
+    details.push_str(". ");
+    details.push_str(retry);
+    details
 }
 
 /// Make lower-trust repository/provider text inert before writing it to a terminal.

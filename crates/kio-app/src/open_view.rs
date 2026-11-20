@@ -514,8 +514,6 @@ fn resolve_short_hash_command(
 // 3-4/6/6a/6b.
 // ===========================================================================
 
-pub(crate) const MAX_MANIFEST_OBJECT_READ_BYTES: u64 = 8 * 1024 * 1024;
-
 /// The 08 §3.1 6a/6b verdict for one resolved `(tree entry, chunk)` pair at
 /// `pointer_commit`.
 pub(crate) enum PointInTimeAttribution {

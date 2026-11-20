@@ -369,7 +369,7 @@ pub(crate) fn ingest_standalone_image(
     )?;
     let stamped = persist_resumable_normalized_units(
         &directory,
-        &manifest,
+        manifest,
         input_path,
         staged.has_staged_payloads(),
         |draft, _| {

@@ -319,7 +319,7 @@ fn flate_03_chance_bt_raster_pdf_routes_to_ocr_without_schema_error() {
     ));
     pdf.extend(stream_obj(
         3,
-        "<< /Length 28 >>",
+        "<< /Length 30 >>",
         b"q 100 0 0 100 0 0 cm /Im0 Do Q",
     ));
     pdf.extend(stream_obj(
@@ -336,12 +336,25 @@ fn flate_03_chance_bt_raster_pdf_routes_to_ocr_without_schema_error() {
     ));
     pdf.extend_from_slice(b"%%EOF\n");
     fs::write(dir.path().join("scan-like.pdf"), pdf).unwrap();
+    let mut filtered = b"%PDF-1.4\n".to_vec();
+    filtered.extend(obj(1, b"<< /Type /Page /Contents 2 0 R >>"));
+    let payload = b"BT (foreign bytes) Tj ET";
+    filtered.extend(stream_obj(
+        2,
+        &format!("<< /Length {} /Filter /DCTDecode >>", payload.len()),
+        payload,
+    ));
+    fs::write(dir.path().join("unsupported-filter.pdf"), filtered).unwrap();
     init(&dir);
 
+    let trace = dir.path().join(".kio/ocr-egress.txt");
     kio(&dir, &["index", "--yes"])
+        .env("KIO_TEST_MISTRAL_OCR", "mock")
+        .env("KIO_TEST_CAPTURE_SENT_MEDIA", &trace)
         .arg("--json")
         .assert()
         .success();
+    assert!(!trace.exists(), "unapproved OCR reached the provider");
     kio(&dir, &["adapter", "approve", "--all", "--yes"])
         .assert()
         .success();
@@ -351,13 +364,15 @@ fn flate_03_chance_bt_raster_pdf_routes_to_ocr_without_schema_error() {
     let units_root = dir.path().join(".kio/objects/normalized_units");
     assert!(gen_dirs_under(&units_root).is_empty());
     let status = json_success(&dir, &["status"]);
-    let online_task = online_markdownize_task_for(&status, "scan-like.pdf")
-        .unwrap_or_else(|| panic!("OCR placeholder missing: {status}"));
-    assert_eq!(online_task["status"], "paused", "{status}");
-    assert_eq!(
-        online_task["hold_reason"], "ledger_initialization_required",
-        "{status}"
-    );
+    for file in ["scan-like.pdf", "unsupported-filter.pdf"] {
+        let online_task = online_markdownize_task_for(&status, file)
+            .unwrap_or_else(|| panic!("OCR placeholder missing for {file}: {status}"));
+        assert_eq!(online_task["status"], "paused", "{status}");
+        assert_eq!(
+            online_task["hold_reason"], "ledger_initialization_required",
+            "{status}"
+        );
+    }
     assert!(
         !dir.path()
             .join(".test-data/kio/cost-ledger.sqlite")
@@ -398,4 +413,84 @@ fn flate_02_objstm_two_byte_codes_index_offline() {
 
     assert_search_hit(&dir, "twobyte", "paper.pdf");
     assert_search_hit(&dir, "harvest", "paper.pdf");
+}
+
+#[test]
+fn p1_review_cli_reports_pdf_page_ranges_and_resumes() {
+    let dir = canonical_tempdir();
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    pdf.extend(obj(1, b"<< /Type /Page >>"));
+    pdf.extend(obj(2, b"<< /Type /Page /Contents 4 0 R >>"));
+    pdf.extend(obj(3, b"<< /Type /Page /Contents 5 0 R >>"));
+    // Cross the prepared boundary before the next page hits its budget so
+    // this run has a durable prefix to resume.
+    let padding = " ".repeat(kio_core::cas::CAS_STREAM_BUFFER_BYTES);
+    let first = format!("BT (first{padding}\nx) Tj");
+    let first = zlib(first.as_bytes());
+    pdf.extend(stream_obj(
+        4,
+        &format!("<< /Length {} /Filter /FlateDecode >>", first.len()),
+        &first,
+    ));
+    // Whitespace inside the literal counts toward extraction. Normalization
+    // strips trailing spaces from its first line, keeping indexing light.
+    let mut large = b"BT (large".to_vec();
+    large.resize(4 + 16 * 1024 * 1024 - 1, b' ');
+    large.extend_from_slice(b"\nx) Tj");
+    let compressed = zlib(&large);
+    pdf.extend(stream_obj(
+        5,
+        &format!("<< /Length {} /Filter /FlateDecode >>", compressed.len()),
+        &compressed,
+    ));
+    fs::write(dir.path().join("tier.pdf"), pdf).unwrap();
+    init(&dir);
+
+    let preview = json_success(&dir, &["index", "--preview"]);
+    let preview_limit = &preview["extraction_issues"][0]["resource_limit"];
+    assert_eq!(preview_limit["resource"], "unit_text", "{preview}");
+    let expected = serde_json::json!({
+        "total_pages": 3, "extracted_through": 2, "next_page": 3,
+        "retry": "index --resource-tier large"
+    });
+    assert_eq!(preview_limit["page_progress"], expected, "{preview}");
+
+    let held = kio(&dir, &["index", "--yes", "--offline"]).assert().code(3);
+    let stderr = String::from_utf8_lossy(&held.get_output().stderr);
+    assert!(stderr.contains("Extracted pages 1–2 of 3"), "{stderr}");
+    assert!(stderr.contains("staged pages 1–2"), "{stderr}");
+    assert!(stderr.contains("next page 3"), "{stderr}");
+    assert!(
+        stderr.contains("kio index --resource-tier large"),
+        "{stderr}"
+    );
+    let status = json_success(&dir, &["status"]);
+    let hold = status["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["output_ref"] == "extraction:local")
+        .unwrap();
+    let mut expected_durable = expected;
+    expected_durable["staged_through"] = 2.into();
+    assert_eq!(
+        hold["resource_limit"]["page_progress"], expected_durable,
+        "{status}"
+    );
+    assert!(gen_dirs_under(&dir.path().join(".kio/objects/normalized_units")).is_empty());
+
+    kio(
+        &dir,
+        &["index", "--yes", "--offline", "--resource-tier", "large"],
+    )
+    .assert()
+    .success();
+    let status = json_success(&dir, &["status"]);
+    assert_eq!(
+        status["paused_by_hold_reason"]["resource_limit"], 0,
+        "{status}"
+    );
+    let manifests = gen_dirs_under(&dir.path().join(".kio/objects/normalized_units"));
+    let manifest = manifest_json(&manifests[0]);
+    assert_eq!(manifest["units"].as_array().unwrap().len(), 3);
 }

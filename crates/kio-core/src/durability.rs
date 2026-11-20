@@ -266,6 +266,7 @@ fn checkpoint_debug(owner: &crate::control::ControlHandle, point: DurabilityPoin
             limit: None,
             observed: None,
             resource_tier: None,
+            page_progress: None,
         }
         .into_error(format!("injected storage failure at {}", point.name())));
     }
