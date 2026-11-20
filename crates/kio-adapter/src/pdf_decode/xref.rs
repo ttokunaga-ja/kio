@@ -36,6 +36,12 @@ fn capacity_bytes<T>(entries: &Vec<T>) -> usize {
     entries.capacity() * std::mem::size_of::<T>()
 }
 
+fn release_index<T>(entries: Vec<T>, budget: &mut PdfDecodeBudget) {
+    let bytes = capacity_bytes(&entries);
+    drop(entries);
+    budget.release(bytes);
+}
+
 /// Keep the old allocation charged until its replacement has been admitted.
 fn reserve_index<T>(
     entries: &mut Vec<T>,
@@ -379,9 +385,19 @@ fn paeth(left: u8, up: u8, upper_left: u8) -> u8 {
 struct PhysicalObject {
     offset: usize,
     reference: PdfRef,
-    revision: usize,
     active: bool,
+    at_boundary: Cell<bool>,
     length: Cell<Option<usize>>,
+}
+
+impl PhysicalObject {
+    fn key(&self) -> (usize, u32, u16) {
+        (
+            self.offset,
+            self.reference.number,
+            self.reference.generation,
+        )
+    }
 }
 
 #[derive(Default)]
@@ -398,10 +414,11 @@ impl ObjectLocations<'_> {
         self.rows.get(index).filter(|row| row.number == number)
     }
 
-    fn physical(&self, offset: usize) -> Option<&PhysicalObject> {
+    fn physical(&self, offset: usize, reference: PdfRef) -> Option<&PhysicalObject> {
+        let key = (offset, reference.number, reference.generation);
         let index = self
             .physical
-            .binary_search_by_key(&offset, |object| object.offset)
+            .binary_search_by_key(&key, PhysicalObject::key)
             .ok()?;
         self.physical.get(index)
     }
@@ -415,45 +432,32 @@ fn load_objects<'a>(
     budget: &mut PdfDecodeBudget,
 ) -> Result<Objects<'a>> {
     let mut physical = Vec::new();
-    let mut packed = Vec::new();
     for group in rows.chunk_by(|left, right| left.number == right.number) {
         for (index, row) in group.iter().enumerate() {
             budget.visit(1)?;
-            match row.entry {
-                Entry::Direct { offset, generation } => {
-                    reserve_index(&mut physical, 1, budget)?;
-                    physical.push(PhysicalObject {
-                        offset,
-                        reference: PdfRef {
-                            number: row.number,
-                            generation,
-                        },
-                        revision: row.revision,
-                        active: index == 0,
-                        length: Cell::new(None),
-                    });
-                }
-                Entry::Packed { stream, member } if index == 0 => {
-                    reserve_index(&mut packed, 1, budget)?;
-                    packed.push((stream, row.number, member));
-                }
-                _ => {}
+            if let Entry::Direct { offset, generation } = row.entry {
+                reserve_index(&mut physical, 1, budget)?;
+                physical.push(PhysicalObject {
+                    offset,
+                    reference: PdfRef {
+                        number: row.number,
+                        generation,
+                    },
+                    active: index == 0,
+                    at_boundary: Cell::new(false),
+                    length: Cell::new(None),
+                });
             }
         }
     }
-    physical.sort_unstable_by_key(|object| (object.offset, object.revision));
-    let mut collision = false;
+    physical.sort_unstable_by_key(PhysicalObject::key);
     physical.dedup_by(|later, earlier| {
-        if later.offset != earlier.offset {
+        if later.key() != earlier.key() {
             return false;
         }
-        collision |= later.reference != earlier.reference;
         earlier.active |= later.active;
         true
     });
-    if collision {
-        return Err(invalid());
-    }
     let locations = ObjectLocations {
         rows,
         physical: &physical,
@@ -461,7 +465,7 @@ fn load_objects<'a>(
     let mut objects = Objects::default();
     let mut cursor = 0;
     let mut sections = sections.iter().copied().peekable();
-    for expected in &physical {
+    for expected in physical.iter().filter(|object| object.active) {
         while let Some(position) = sections.next_if(|position| *position < expected.offset) {
             cursor = scan_to_boundary(pdf, cursor, position, &locations, revisions, budget)?;
         }
@@ -475,35 +479,41 @@ fn load_objects<'a>(
             start,
             actual.generation,
             &locations,
-            expected.revision,
+            usize::MAX,
             budget,
         )?;
         cursor = end;
         sections.next_if_eq(&expected.offset);
-        if expected.active {
-            // A later revision may replace an indirect Length. The active
-            // value must still describe the same physical stream range.
-            if let Some(range) = &object.stream
-                && let Some(dict) = object.dictionary()
-                && expected.revision != revisions.last().copied().unwrap_or(expected.revision)
-                && probe_dict_ref(dict, b"Length").is_some()
-                && stream_length(dict, pdf, &locations, usize::MAX, budget)? != range.len()
-            {
-                return Err(invalid());
-            }
-            reserve_index(&mut objects.direct.sorted, 1, budget)?;
-            objects.direct.sorted.push((actual.number, object));
-        }
+        expected.at_boundary.set(true);
+        reserve_index(&mut objects.direct.sorted, 1, budget)?;
+        objects.direct.sorted.push((actual.number, object));
     }
     for position in sections {
         cursor = scan_to_boundary(pdf, cursor, position, &locations, revisions, budget)?;
     }
-    budget.release(capacity_bytes(&physical));
+    // Lexical scans may use a historical /Length to skip an inactive stream.
+    // Any length used to establish boundaries must itself occur at a boundary.
+    if physical
+        .iter()
+        .any(|object| object.length.get().is_some() && !object.at_boundary.get())
+    {
+        return Err(invalid());
+    }
+    release_index(physical, budget);
     objects
         .direct
         .sorted
         .sort_unstable_by_key(|(number, _)| *number);
 
+    let mut packed = Vec::new();
+    for group in rows.chunk_by(|left, right| left.number == right.number) {
+        budget.check_deadline()?;
+        let row = &group[0];
+        if let Entry::Packed { stream, member } = row.entry {
+            reserve_index(&mut packed, 1, budget)?;
+            packed.push((stream, row.number, member));
+        }
+    }
     packed.sort_unstable();
     let mut probe_members = Vec::new();
     for members in packed.chunk_by(|left, right| left.0 == right.0) {
@@ -546,7 +556,7 @@ fn load_objects<'a>(
         }
         budget.release(data.capacity() + offsets.capacity() * std::mem::size_of::<(u32, usize)>());
     }
-    budget.release(capacity_bytes(&packed));
+    release_index(packed, budget);
     objects
         .packed
         .sorted
@@ -596,6 +606,9 @@ fn scan_to_boundary(
                 revision,
                 budget,
             )?;
+            if let Some(object) = locations.physical(cursor, reference) {
+                object.at_boundary.set(true);
+            }
             cursor = end;
         } else {
             cursor = match pdf[cursor] {
@@ -691,10 +704,10 @@ fn stream_length(
     else {
         return Err(invalid());
     };
-    let physical = locations.physical(offset).ok_or_else(invalid)?;
-    if physical.reference != reference || generation != reference.generation {
+    if generation != reference.generation {
         return Err(invalid());
     }
+    let physical = locations.physical(offset, reference).ok_or_else(invalid)?;
     if let Some(length) = physical.length.get() {
         return Ok(length);
     }
@@ -961,6 +974,114 @@ mod tests {
     }
 
     #[test]
+    fn pdf_xref_discards_superseded_offsets_but_checks_active_offsets() {
+        use std::io::Write;
+
+        for bad_offset in [0, b"%PDF-1.6\n".len(), 4096] {
+            let mut pdf = b"%PDF-1.6\n".to_vec();
+            let root = pdf.len();
+            pdf.extend_from_slice(b"1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n");
+            let pages = pdf.len();
+            pdf.extend_from_slice(b"2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n");
+            let page = pdf.len();
+            pdf.extend_from_slice(
+                b"3 0 obj << /Type /Page /Parent 2 0 R /Contents 5 0 R >> endobj\n",
+            );
+            let content = pdf.len();
+            pdf.extend_from_slice(
+                b"5 0 obj << /Length 4 0 R >> stream\nBT (one) Tj\nendstream\nendobj\n",
+            );
+            let length = pdf.len();
+            pdf.extend_from_slice(b"4 0 obj 11 endobj\n");
+            let previous = pdf.len();
+            write_classic_xref(&mut pdf, &[root, pages, bad_offset, bad_offset, content]);
+
+            for latest in [page, bad_offset] {
+                let mut updated = pdf.clone();
+                let xref = updated.len();
+                write!(
+                    updated,
+                    "xref\n3 2\n{latest:010} 00000 n \n{length:010} 00000 n \ntrailer\n<< /Size 6 /Prev {previous} >>\nstartxref\n{xref}\n%%EOF\n"
+                )
+                .unwrap();
+                let result =
+                    super::super::PdfPages::open(&updated, kio_core::error::ResourceTier::Standard);
+                if latest == page {
+                    assert!(
+                        result.is_ok(),
+                        "superseded offset {bad_offset}: {:?}",
+                        result.err()
+                    );
+                } else {
+                    assert!(matches!(result, Err(AdapterError::ContractViolation(_))));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pdf_xref_temporary_indexes_fit_in_separate_memory_phases() {
+        use std::io::Write;
+
+        let mut pdf = b"%PDF-1.6\n".to_vec();
+        let mut rows = Vec::new();
+        for number in 1..=3 {
+            rows.push(XrefRow {
+                number,
+                entry: Entry::Direct {
+                    offset: pdf.len(),
+                    generation: 0,
+                },
+                revision: 0,
+                supplemental: false,
+            });
+            if number == 1 {
+                pdf.extend_from_slice(
+                    b"1 0 obj << /Type /ObjStm /N 1 /First 4 /Length 8 >> stream\n5 0 null\nendstream\nendobj\n",
+                );
+            } else {
+                writeln!(pdf, "{number} 0 obj null endobj").unwrap();
+            }
+        }
+        rows.push(XrefRow {
+            number: 5,
+            entry: Entry::Packed {
+                stream: 1,
+                member: 0,
+            },
+            revision: 0,
+            supplemental: false,
+        });
+
+        let physical = 4 * std::mem::size_of::<PhysicalObject>();
+        let direct_width = std::mem::size_of::<(u32, PdfObject<'_>)>();
+        // At the direct-index peak its old two slots and three new slots are charged.
+        let peak = physical + 5 * direct_width;
+        let mut budget = PdfDecodeBudget {
+            memory_limit: peak - 1,
+            ..PdfDecodeBudget::default()
+        };
+        assert!(matches!(
+            load_objects(&pdf, &rows, &[], &[], &mut budget),
+            Err(AdapterError::ResourceLimit(ref limit)) if limit.resource == kio_core::error::Resource::Memory
+        ));
+
+        let mut budget = PdfDecodeBudget {
+            memory_limit: peak,
+            ..PdfDecodeBudget::default()
+        };
+        let objects = load_objects(&pdf, &rows, &[], &[], &mut budget).unwrap();
+        assert!(matches!(
+            objects.packed.get(&5),
+            Some(PackedObject::Member { .. })
+        ));
+        assert_eq!(
+            budget.retained,
+            capacity_bytes(&objects.direct.sorted) + capacity_bytes(&objects.packed.sorted)
+        );
+    }
+
+    #[test]
     fn p1_review2_shared_length_charges_once_and_counts_each_reference() {
         let mut pdf = b"%PDF-1.6\n".to_vec();
         let offset = pdf.len();
@@ -982,8 +1103,8 @@ mod tests {
                 number: 3,
                 generation: 0,
             },
-            revision: 10,
             active: true,
+            at_boundary: Cell::new(false),
             length: Cell::new(None),
         }];
         let locations = ObjectLocations {
