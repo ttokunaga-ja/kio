@@ -20,16 +20,16 @@ Kio core:                 Adapter:
 
 Adapter の実行設定 (cmd / args / url / 認証情報) は **`.kio/` の共有対象に含めない**。各デバイスの `~/.config/kio/tools.toml` に保存する。`.kio/` は生成済み artifact の provenance と互換性判定に必要な `profile_hash` だけを保持する。
 
-R23 の同梱 runtime が実行できる online target は `mistral_ocr_markdownize` と
+同梱 runtime が実行できる online target は `mistral_ocr_markdownize` と
 `gemini_embedding_2` の built-in 実装に限定する。これらの role では `cmd` / `args` /
 `url` による実行先の差し替えを受理せず、宣言された model と built-in target の一致を
 その role を利用するコマンドの設定読取り時と実行直前に検証する。未使用 role は起動条件にしない
-([操作別前提条件](14-v1-runtime-contracts.md#operation-specific-prerequisites))。
+([操作別前提条件](10-operations.md#113-設定ファイル-schema-validation))。
 利用者管理のローカル endpoint の送信境界は §3.1、embedding endpoint の設定は §5.3 に従う。
 
 認証情報の保存規約:
 
-private credential file の保護は [14 の正本](14-v1-runtime-contracts.md#protection-of-kio-created-objects) に従う。
+private credential file の保護は [Kio 作成物の保護](10-operations.md#43-kio-created-object-boundary) に従う。
 利用者が用意した tools.toml に平文 credential を置く場合も file 自体の owner-only 保護を必要とする。
 Kio が作っていない親ディレクトリにはその要件を課さず、権限を変更しない。
 
@@ -84,22 +84,13 @@ Kio core
 
 Kio は `deterministic_library` の Prepare / Markdownize Adapter を同梱する。対象: plain text / Markdown、PDF text layer 抽出。OCR・レイアウト解析・画像理解は行わない。**出力は単純な passthrough ではなく、Normalized Markdown v1 (§5.2.1) への決定的正規化**である — 少なくとも Setext 見出し → ATX 変換・生 HTML block の fenced text 化・改行 / 空白 / fence の正規化を行う (§5.2.1 準拠が受け入れ検査 V5 の通過条件のため、passthrough では通常の Markdown (Setext 等) がオフライン基線 index で全滅する)。
 
-> **PDF text layer 抽出の範囲 (実装フィードバック 2026-07-23)**: 実世界の text-layer PDF
-> (TeX / LibreOffice 出力) は FlateDecode 圧縮 content stream + subset font の glyph index +
-> font ごとの ToUnicode CMap (TeX Live はさらに `/Type /ObjStm` 内へ辞書を格納) で構成される。
-> deterministic Adapter の text layer 抽出はここまでを対象とする: **FlateDecode の有界展開**、`/Type /ObjStm` の展開、Page → Resources → Font → ToUnicode の解決、
-> CMap (`bfchar`/`bfrange`) による glyph index 復号。PDF は page ごとに streaming し、
-> 256 pages / 8,192 objects を文書全体の固定拒否条件にしない。資源 tier は下記の共通規則に従う。
-> malformed object stream、循環参照、不正 offset/length は `contract_violation` とし、
-> 資源予算超過と区別する。いずれも弱い parser や有料 OCR へ無断 fallback しない。
-> **確信を持って復号できないファイルは空抽出へ縮退し (fail-empty)、従来どおり
-> online OCR ルーティングに乗る** — FlateDecode 以外の filter (DCTDecode 等)・ToUnicode を
-> 持たない font の glyph 列・スキャン/画像系は引き続き OCR の領分である。この抽出意味論の
-> 変更は deterministic profile の `model_version_pin` 1.0.0 → 1.1.0 として**新
-> `tool_profile_hash`** に載せた (§9 / [03-data-model.md §5.1](03-data-model.md) — 既存
-> instance 内の prepared_hash drift ではなく新 identity としての基線再構築)。
-> PDF の資源 tier 対応では、ページごとのフォント解決と unsupported filter の空抽出を
-> 有効な xref に従うページ順と合わせて Prepare 1.4.0 / Markdownize 1.5.0 の identity に載せる。
+PDF text layer は FlateDecode を有界に展開し、object stream 内の辞書、ページごとの font resource、
+subset glyph の ToUnicode 対応を扱う。有効な xref に従ったページ順で抽出する。未対応 filter や
+必要な Unicode mapping がない範囲は空抽出とし、OCR の対象にできる。適用する Prepare / Markdownize の
+profile はそれぞれ 1.4.0 / 1.5.0 とし、抽出意味論の変更を profile identity で区別する。
+PDF はページ単位で有界に扱い、256 pages / 8,192 objects を文書全体の固定拒否条件にしない。
+malformed object stream、循環参照、不正 offset/length は `contract_violation` とし、資源予算超過と区別する。
+これらの失敗で弱い parser や有料 OCR への無断切替を行わない。資源 tier は §5.1 に従う。
 
 - online Adapter が未設定または network 未承認のとき、Markdownize タスクは同梱 deterministic Adapter で実行する (タスクを止めない)。Embedding はモデル準備済みなら既定の EG2 を使い、未準備なら理由を表示して text fallback する ([05-runtime.md §1](05-runtime.md))
 - この状態を **ベースライン index** と呼ぶ。`init → index --yes → search → open <pointer>` の最低体験ライン ([01-positioning.md §3](01-positioning.md)) はベースライン index のみで成立しなければならない
@@ -138,8 +129,7 @@ default: no network transmission (opt-in 未成立の scope からはオンラ�
 送信境界: admission と dispatch の双方で current paired identity を検査する。
   active record の欠落、不一致、revocation、または必要な online_api policy の拒否は
   fail closed である。`adapter status` は scope/device/pending と effective match を
-  read-only で表示する。詳細な CLI 構文は [06-cli-spec.md §1](06-cli-spec.md) と
-  [14-v1-runtime-contracts.md](14-v1-runtime-contracts.md) に従う。
+  read-only で表示する。詳細な CLI 構文は [06-cli-spec.md §1](06-cli-spec.md) に従う。
 ```
 
 `--online` は temporary opt-in でも grant 作成手段でもない。`index --online` は、
@@ -184,9 +174,15 @@ revoke 完了後は後続 admission / dispatch が拒否され、送信済み by
 
 secret hold と必要な scope/device の secret-send paired grant は別に維持し、端末の通常送信承認で
 秘密を解放しない。HTTPS は device-local の登録済み managed CA snapshot だけを信頼し、
-送信前に証明書の有効性と名前を検証する。HTTP に CA を要求しない。CA の登録・回転・失効・status と
-snapshot の寿命は [14](14-v1-runtime-contracts.md#local-adapter-and-renderer-boundaries) に従う。
-`ca_pem_path` による直接指定は拒否する。
+送信前に証明書の有効性と名前を検証する。認証エラーは permanent、接続拒否は transport error とする。
+HTTP に CA を要求しない。CA の登録・回転・失効・status は scope に依存しない。登録は CA の
+device-private な snapshot を作成する。中断した登録の再開も同じ契約に従う。
+登録済み CA は明示的な rotation でだけ置き換えられ、その際に generation を進める。
+承認は active snapshot の実体と generation・digest に結び付く。選択された HTTPS 送信は trust-store lock の下で
+active な CA の実体を固定・検証し、dispatch までその lock を保持する。この区間で rotation・revoke は完了できない。
+回転・失効の後に古い承認で送信できず、登録済み CA を失効するとその状態は再起動後も
+保持される。managed snapshot は [Kio 作成物の保護](10-operations.md#43-kio-created-object-boundary)
+に従い、承認情報に CA の元パスや証明書本文を保存しない。`ca_pem_path` による直接指定は拒否する。
 
 ローカル窓の接続先は device の tools 設定に置き、`cmd` / `args` は受理しない。
 Markdownize OCR は `POST {url}/layout-parsing` を使う。Embedding の wire は §5.3 に従う。
@@ -227,9 +223,9 @@ AdapterRun:
   status                "pending" | "running" | "done" | "partial" | "failed"
                         (partial = unit 単位の部分失敗, 04-pipeline.md §5.2。`full_required`
                          (= fallback_to_full) は request の制御結果であり、AdapterRun は "done" でも
-                         normalized task の完了を意味しない。送信前なら Kio が Full を選べるが、有料
-                         incremental の送信後に自動 Full 再送はしない。後者は result_unknown として
-                         明示 `--resend-unknown` 承認を待つ。request outcome の区別は cost_ledger 側
+                         normalized task の完了を意味しない。同期の有料 incremental を送信した後は
+                         自動 Full 再送を行わず result_unknown として明示承認を待つ。有効な Batch 制御応答
+                         からの Full 開始は 04 §5.8 に従う。request outcome の区別は cost_ledger 側
                          ([04-pipeline.md §3.2](04-pipeline.md)))
   error_code            機械判定用 (06-cli-spec.md §8)
   error_category        transient | permanent | rate_limit — 04 §5.3 の retry 分類の入力
@@ -280,22 +276,18 @@ metadata:
 
 PDF page image、Office intermediate、抽出済み image など、後続 Markdownize / Embedding が扱いやすい単位を作る。
 
-**Office intermediate の変換機構 (DOCX / PPTX — 実装フィードバック 2026-07-23)**: DOCX / PPTX の
-unit 化 ([04-pipeline.md §2](04-pipeline.md) の表) は外部 renderer (LibreOffice headless
-`soffice --convert-to pdf`。解決順 = `KIO_OFFICE_CONVERTER` env → PATH 上の `soffice`) による
-**変換 PDF 経由**とする。DOCX は変換 PDF の page を `page:N`、PPTX は 1 page = 1 slide の対応で
-`slide:N` として列挙する。**変換出力は決定論化する** — PDF の `/CreationDate` `/ModDate` `/ID` 等の
-揮発メタデータを同長固定値へ正規化してから hash する (xref offset を壊さない)。これにより同一
-renderer 版内で prepared_hash が安定し、renderer 更新による出力変化は
-[03-data-model.md §2.1](03-data-model.md) の「prepare profile / renderer 変更による prepared_hash
-変化が駆動する再 Markdownize」(gen+1 の第二の合法経路) が
-そのまま吸収する。renderer の名称・版は provenance として記録し、hash 入力にはしない (同一 bytes =
-同一 identity)。**renderer が環境に存在しない場合、当該 Office ファイルの online タスクは enqueue
-しない** (doomed task を作らない) — `index_status` ([05-runtime.md §1.7](05-runtime.md)) に理由付きで
-可視化する。実行時の変換失敗は contract_violation ([04-pipeline.md §5.3](04-pipeline.md) — 同一入力の
-再試行 1 回) に合流する。音声の変換機構は現在の契約に含めない。
+**Office の準備 (DOCX / PPTX)** は、隔離された LibreOffice の PDF 変換を使用する。
+変換 PDF の `/CreationDate`・`/ModDate`・`/ID` 等の揮発 metadata は、xref offset を保つ同長の固定値に
+正規化してから hash する。DOCX は PDF のページを `page:N`、PPTX は一スライド一ページの対応で
+`slide:N` として列挙する。選択した renderer と変換条件は
+[準備 profile](03-data-model.md#21-normalized-instance-と全文-view) に結び付ける。同じ出力 bytes でも、
+準備 profile が変われば以前の unit をそのまま再利用しない。renderer が利用できないファイルは、
+理由を `index_status` に表示し、online タスクを積まない。実変換の失敗は `contract_violation` とし、
+同一入力の再試行は一回までとする。[04 の retry 契約](04-pipeline.md#53-エラー種別と-retry-budget) に従う。
+音声の変換は対象外である。
 
-renderer の検出は配布元名、固定 install prefix、最低 version の文字列だけで可否を決めない。
+renderer は `KIO_OFFICE_CONVERTER` で指定できる。未指定時は PATH の `soffice` を調べる。
+配布元名、固定 install prefix、最低 version の文字列だけで可否を決めない。
 実 executable identity と必要 runtime resource を特定・検証し、隔離内の bounded な実変換 probe で
 headless PDF 出力 capability を確認する。名称・version・配布物 digest は provenance と診断に残す。
 実変換 probe は Office 入力の索引・処理と、明示的な診断コマンド `kio status` で行う。
@@ -329,7 +321,25 @@ portable では、信頼できる配布物のファイル一覧を展開先直�
 相対パスは最大 1,024 バイト・32 要素、暗黙の親を含めて最大 32,768 エントリとする。
 一覧は信頼できる配布物から作成し、現在の展開ツリーを自動的に承認するためには使わない。
 
-renderer scratch は [14 の storage 契約](14-v1-runtime-contracts.md#protection-of-kio-created-objects) に従う。
+renderer scratch は [Kio 作成物の保護](10-operations.md#43-kio-created-object-boundary) に従う。
+
+変換は利用者の LibreOffice profile や導入済みの配布物を変更せず、隔離した実行環境、明示的に指定した環境変数だけの環境、
+private scratch を使う。関連のない private file とネットワークへのアクセスを禁止する。隔離できなければ変換を拒否する。
+Office 入力は 100 MiB、PDF 出力は 250 MiB とする。変換の wall-clock と CPU 時間の上限は各 300 秒、
+対応環境のアドレス空間・Job メモリの上限は 2 GiB とする。scratch 増加の監視はカーネルの disk quota を
+提供しない。終了時はプロセスツリーを後始末する。
+
+Windows では Job に 2 GiB のメモリ上限を適用する。Job の全プロセスが終了した後の最終 scratch 検証を
+通った場合だけ出力を確定する。Job の監視・pipe drain・最終検査はすべて元の実行期限に含む。
+失敗時は Job 全体の終了を要求し、後始末の確認は残り時間内に限る。timeout 時点で終了完了は保証しない。
+Job の close 時にも全プロセスを終了させる。
+
+macOS では fork を禁止し、物理メモリの使用量を 50 ms ごとに観測して 2 GiB の閾値を適用する。
+超過または観測不能は timeout と同じ終了・回収条件に従う。この観測値は瞬間的なカーネル上限を表さない。
+UNO service catalog は有界な private copy を使う。構造上有効な独立した MacSpellChecker の定義が
+一件だけあればその定義だけを除去し、他の bytes を保持する。該当定義が存在しない構成では、隔離内での
+実変換 probe が成功すれば未変更の private copy を使える。構造不正や曖昧な一致は拒否する。
+呼出しごとに catalog の元の実体を再検証する。
 
 **Office package preflight (DOCX / PPTX)**: LibreOffice に渡す前に raw ZIP を最大 100 MiB、central-directory を最大 4,096 entry、各 member を最大 32 MiB、全 member の declared aggregate を最大 256 MiB として検証する。必要な `[Content_Types].xml`、`_rels/.rels`、main XML の読取り合計は 6 MiB に制限し、CRC を検証して読む。encrypted / split ZIP、ZIP64、重複・非 UTF-8・unsafe part name、非 Stored/Deflated member は拒否する。XML は UTF-8、nesting 256、attribute 1,024 を上限とし、DTD/entity declaration を受けない。DOCX / PPTX ごとに genuine な MIME override、内部 root relationship、main part と namespace を検証する。preflight failure は renderer を起動せず contract violation とする。
 
@@ -361,15 +371,7 @@ host cgroup / procfs、制御 descriptor を渡さず、既存の filesystem / n
 この契約の実装・試験状況は [v1 実装記録](../tasks/v1-plan.md) に記録し、
 前提検査の成功だけで実変換や native Actions の合格とは扱わない。
 
-**XLSX の unit 化 (実装フィードバック 2026-07-25 — 上の「対象外」を解除)**: XLSX は
-**変換 PDF を経由しない**。DOCX / PPTX が変換 PDF に載るのは page と slide が**それ自体で視覚的な
-unit** だからであり、sheet にはそれが無い。実測: 10 列 1 シートを `soffice` で PDF 化すると
-**2 ページに縦割り**され、ヘッダ `作業区分` が 1 ページ目・その値が 2 ページ目へ分かれ、
-**同一行の左右半分を再結合する手がかりが残らない**。行の同一性が壊れた unit は evidence pointer の
-指し先として誤りであり、OCR を通せばさらに劣化する。加えて cell は**既に構造化テキスト**であり、
-画素へ落として読み戻すのは失われていない構造を壊す往復である。
-
-したがって XLSX は**ローカルで決定論的に直接抽出する** (`kio_adapter::xlsx_extract`)。
+**XLSX の unit 化**は PDF 変換を経ず、sheet / row の構造を保持する決定論的なローカル抽出で行う。
 row / sheet 単位で有界 streaming し、256 sheets / 50,000 rows / 1,024 columns /
 1,000,000 padded cells を workbook 全体の固定拒否条件にしない。疎な列の padding を常駐展開せず、
 共有文字列の参照・Markdown escape も資源予算へ数える。資源 tier は下記に従う。
@@ -478,26 +480,14 @@ incremental の詳細プロンプト規約は §8 (生成 LLM 系のみ。§8 �
 - 表は Markdown 本文に inline で保持する (`table_format=null` 相当)。独立 table object は作らない。
 - 文書内 embedded image は抽出して image object ([03-data-model.md §2](03-data-model.md)) として保存し、Markdown 内の参照は `kio://<scope_id>/object/image/<image_hash>` に置換する ([08-evidence-pointer-spec.md §2.3](08-evidence-pointer-spec.md))。実装は Step 2 ([09-mvp-scope.md §3.1](09-mvp-scope.md))。
 - bbox / page / confidence score は unit metadata に記録する。**Evidence Pointer schema には含めない**。
-- **図中テキストの検索可能性 — bbox_annotation を採用 (2026-07-04 実 API 境界調査で確定)**: 実測
-  (`experiments/ocr-verification`、段階 fixture C0-C5 + 曖昧画像 15 枚) により、表は複雑・ラスタ化でも
-  100% textize される一方、**チャート/グラフ内テキスト (軸ラベル・凡例・値) は 100% images[] へ消失**
-  し (C3 が境界)、ホワイトボード写真風は ~55%、フロー図入りスライドは ~41% を失うことを確認。
-  対策として Mistral の **bbox_annotation (+25% コスト) を既定 ON** とし、images[] として返る領域の
-  説明+書き起こしを取得して unit metadata に記録し、chunk 化時に image 参照近傍へ検索可能テキスト
-  として取り込む (`.kio/config.toml` の `[markdownize] bbox_annotation = true` (既定) で制御 — folder-config schema の正式 key ([10-operations.md §11.3](10-operations.md))。**値は出力に影響するため tool_profile_hash に畳み込む** = 切替は世代判定に乗る)。Markdownize は文書 1 版につき 1 回のコストであり
-  incremental 再利用でさらに希釈されるため +25% は budget 内。生成 LLM (Gemini Vision) による二次
-  追加の生成 LLM fallback は現在の契約に含めない。
+- 図中テキストは `[markdownize] bbox_annotation` が有効な場合（既定）、説明・書き起こしを
+  unit metadata に記録し、参照画像の近くに検索可能テキストとして反映する。設定は `tool_profile_hash` に含める。
+  Mistral の bbox annotation の追加費用は OCR 単価に反映する。生成 LLM による二次 fallback は対象外とする。
   - wire は次の exact `bbox_annotation_format` JSON Schema 1 個を使い、説明/書き起こし指示は schema
     field description に固定する (bbox 専用 prompt parameter は使わない)。各 `pages[].images[]` の
     `image_annotation` は `short_description` / `transcribed_text` の厳密 JSON とする。JCS byte 列の
     sha256 `sha256:79443071238e373b41e34818e91d52ea69d2bba70a30169cda2cf98bfd8bea76`
-    を enabled profile の `prompt_template_hash` とする
-    (2026-07-27 訂正: 従前ここに書かれていた `sha256:9404f8ff…` は下記 JSON のどの版
-    — 外側込み / `json_schema` のみ / `schema` のみ — の JCS とも一致せず、由来を再現できない。
-    正しい値は `bbox_annotation.rs` の `BBOX_ANNOTATION_FORMAT_HASH` および
-    同ファイルの凍結 JCS byte 列と一致し、下記 JSON から再現できる。
-    §5.3 の D3 が「§5.2 と同型」と述べる参照実装がここなので、誤った定数は
-    ローカル embedding profile の算出まで波及する)
+    を enabled profile の `prompt_template_hash` とする。
 
     ```json
     {
@@ -538,9 +528,7 @@ incremental の詳細プロンプト規約は §8 (生成 LLM 系のみ。§8 �
     policy/profile は task identity に含め、既存 annotation 無し Done task を default-on の完了扱いにしない
 - 生成 LLM (Gemini / Claude / GPT 等) は Markdownize の主処理ではなく、OCR 後の品質検証・図表解釈に使う。
 
-> **実地検証済み (2026-07-03、Adapter 選定 — [09-mvp-scope.md §5](09-mvp-scope.md))**: 合成 fixture (複雑表・日本語・数式・埋め込み画像、4 ページ) を sync / Batch 両モードで検証: 表セル一致率 1.0 (17/17)、日本語 CER 0.0、画像抽出 1/1 (placeholder 形式も §5.2 想定どおり)、数式は LaTeX でテキスト化。単価は公称一致 (API $4 / Batch $2 per 1,000 pages)、Batch のジョブ往復は 4 ページで約 24 秒。ハーネスと実測ログは `experiments/ocr-verification`。
-
-## 5.2.1 Normalized Markdown 形式 (最小凍結 — 2026-07-18)
+## 5.2.1 Normalized Markdown 形式
 
 全 Markdownize Adapter の出力 (normalized unit の Markdown) は次の最小形式に従う。chunk span と
 Evidence Pointer のバイト位置は保存された bytes に対して定義されるため、**この形式は実装後に
@@ -601,8 +589,11 @@ frame 0 を full logical canvas に合成した透明 RGBA8 straight alpha と�
 resize/crop なし、WebP EXIF orientation 適用、ICC/gamma 色変換なしの PNG とする。
 出力に可変 metadata/timestamp を含めず、固定 codec pin の同一入力は 3 OS で同じ SHA-256 を持つ。
 元 CAS、image target、Evidence Pointer は差し替えない。receipt と入力 identity は
-[03-data-model.md §8.1](03-data-model.md)、保護上限は
-[14-v1-runtime-contracts.md](14-v1-runtime-contracts.md) の画像契約に従う。
+[03-data-model.md §8.1](03-data-model.md) に従う。画像 payload は 16 MiB、各辺 8,192 pixel、
+総画素数 1,600 万、decode の割当 64 MiB を上限とする。OCR 後に保持する GIF は最大 32 frame、
+全 frame で 1,600 万 pixel / RGBA 64 MiB までとする。
+HTTP の画像 embedding は一送信につき一画像とし、有界メモリで処理する。
+無料のローカル HTTP でも、各送信に現在の policy と宛先承認、必要な別の secret-send 承認を要求する。
 MIME magic と宣言 MIME、bounded decode、元 hash、typed ownership を予約・dispatch 前に検証する。
 GIF の変換は animation 全体の取り込み検証を迂回しない。独立 GIF の新規 ingest は追加しない。
 
@@ -758,9 +749,6 @@ provider_scope_id()            下記の versioned credential-bound recovery sco
    を**恒久保持の cost_ledger 全履歴**に対して突合するため — 期限付きの一意性では期限超の再利用が
    過去行と誤合致して確定記帳を落とす)
 
-`mistral_ocr_markdownize` の Batch モードは 2026-07-03 の実地検証 (§5.2 末尾) の範囲でこの条件下で
-採用済み。
-
 Markdownize の Batch は 1 job = 1 task、custom_id = task の input_hash、job metadata は
 `intent_token / scope_id / adapter_kind / input_hash / tool_profile_hash`、upload filename は
 `kio-<intent_token>.jsonl` とする。レーンは設定・CLI で選択し、価格解決は §4 に従う。
@@ -800,7 +788,7 @@ Markdownize の Batch は 1 job = 1 task、custom_id = task の input_hash、job
 
 `tool_lock_hash` は **[03-data-model.md §5.2](03-data-model.md) の canonical 入力** (spec_version + 各 role の tool_id / profile_hash — embedding のみ + dimensions / distance / modality) を JCS 畳み込みした identity — **tool-lock.json 全体ではない**。`kind` / `capabilities` / `mode` は作業コピーの表示・検証用 field であり identity に含めない (toollock object へ保存されるのも §5.2 の canonical bytes)。
 
-config (`~/.config/kio/tools.toml`) では `mistral-ocr-latest` のような可変 alias を指定してよい。ただし **OCR API は応答内で alias を実バージョンに解決しない** (2026-07-03 実測: 応答の `model` フィールドは `mistral-ocr-latest` のまま返る。`experiments/ocr-verification`)。したがって Adapter は **API 呼び出し自体を版付きモデル名で行う**: alias が設定されている場合は、Adapter が実行開始時に提供元のモデル一覧 API から現行の版付き名を解決してから呼び出し、その版を `tool_profile_hash` の `model_version_pin` に記録する ([03-data-model.md §5.1](03-data-model.md) — 可変 alias の pin は禁止)。モデル更新は `tool_changed` として扱われ、再 Markdownize は first-instance-wins / gen の既存機構 (§9) に乗る。
+config (`~/.config/kio/tools.toml`) では `mistral-ocr-latest` のような可変 alias を指定してよい。ただし **OCR API は応答内で alias を実バージョンに解決しない**。したがって Adapter は **API 呼び出し自体を版付きモデル名で行う**: alias が設定されている場合は、Adapter が実行開始時に提供元のモデル一覧 API から現行の版付き名を解決してから呼び出し、その版を `tool_profile_hash` の `model_version_pin` に記録する ([03-data-model.md §5.1](03-data-model.md) — 可変 alias の pin は禁止)。モデル更新は `tool_changed` として扱われ、再 Markdownize は first-instance-wins / gen の既存機構 (§9) に乗る。
 
 ---
 
@@ -818,36 +806,16 @@ store_response_body = false
 require_command_confirmation = true
 ```
 
-> **execution_mode 別の上書き (2026-07-26 確定)**: `[adapter.policy]` は全 Adapter 共通の
-> 既定だが、CPU 推論のローカル VLM は 1 ページの OCR で `timeout_seconds = 300` を超え得る。
-> **`[adapter.policy.<execution_mode>]` の sub-table による上書きを認める** (`online_api` /
-> `offline_api` / `deterministic_library`)。未指定のキーは親の値を継承する。
->
-> ```toml
-> [adapter.policy]
-> timeout_seconds = 300
->
-> [adapter.policy.offline_api]
-> timeout_seconds = 1800          # 親を上書き。他のキーは親から継承
-> ```
->
-> **enforcement の単位は変えない** — §7.1 のとおり AdapterRun 1 回 (= 1 request / job) に
-> 適用する。上書きが変えるのは値だけであり、適用対象・適用時点は共通である。
-> `offline_api` の既定値は Stage 3 のローカル OCR 実測をもって確定する。
-> なお `max_input_bytes` など他のキーも同じ機構で上書きできるが、**現時点で
-> execution_mode 差を必要とするのは `timeout_seconds` のみ**である。
->
-> **実装状況 (2026-08-02)**: 配線されているのは **`offline_api` の
-> `timeout_seconds` だけ**である。`online_api` / `deterministic_library` の
-> sub-table は `KIO-E-CONFIG-NOT-IMPLEMENTED-001` で**拒否する** — 何も honour
-> しない値を受理すると、現在の大声の拒否が黙った no-op に退化し、運用者は効いて
-> いない上限が効いていると信じることになる。親の `timeout_seconds` も従来どおり
-> 既定の 300 以外を拒否する (広げると課金の走る online adapter の挙動まで変わる
-> ため、D7 の範囲外)。sub-table が無い場合は親を継承 = 既定のままで、**D7 以前と
-> 挙動は 1 ミリも変わらない**。`offline_api` の既定値は上記のとおり Stage 3 待ちで、
-> こちらで発明していない。
+設計上は `[adapter.policy.<execution_mode>]` で `online_api`、`offline_api`、`deterministic_library`
+ごとの値（`timeout_seconds`、`max_input_bytes` など）を上書きでき、未指定のキーは共通設定を継承する。
+適用対象とタイミングは変わらず、上限は AdapterRun 一回（request または job）ごとに適用する。
+`offline_api` 専用の既定値はローカル OCR の実測で決める。
 
-R23 の Markdownize / Embedding runtime は同梱 target だけを実行し、任意コマンドの実行経路を持たない。
+現行実装で有効な上書きは `[adapter.policy.offline_api]` の `timeout_seconds` だけである。
+省略時は共通の 300 秒を継承する。共通 `timeout_seconds` の 300 以外の値、
+`online_api` と `deterministic_library` の sub-table は `KIO-E-CONFIG-NOT-IMPLEMENTED-001` で拒否する。
+
+Markdownize / Embedding runtime は同梱 target だけを実行し、任意コマンドの実行経路を持たない。
 
 ログに残してよいもの:
 
@@ -884,7 +852,7 @@ usage_validation (missing | invalid), billing_source (estimated)
 MVP における Adapter の脅威モデルを次のとおり確定する。
 
 ```text
-1. R23 で実行される Adapter は Kio 同梱の built-in target のみを trusted code として扱う。
+1. Kio が実行する Adapter は Kio 同梱の built-in target のみを trusted code として扱う。
 
 2. [adapter.policy] は「Kio 側の入力制御 + 事後監査」の規約であり、
    sandbox による強制保証ではない。
@@ -1012,7 +980,7 @@ Adapter の完全な再実行決定性は要求しない。Kio が保証する�
 raw_hash 不変                既存 artifact を尊重 (first-instance-wins)
 raw_hash 変化                 新 artifact 候補を作る
 explicit re-normalize         同 (raw_hash, tool_profile_hash) に対して gen+1 の新 normalized
-                              instance を作る (kio reindex --regenerate、または prepared_hash 変化起因の
+                              instance を作る (kio reindex --regenerate、または準備の出力・profile の変化による
                               自動 gen+1 — 03-data-model.md §2.1 の例外)。旧 instance は
                               保全され、既存 commit / Evidence Pointer は旧 gen を参照し続ける
                               (03-data-model.md §2.1)

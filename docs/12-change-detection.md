@@ -1,14 +1,8 @@
-# 12 Change Detection — design direction and current status
+# 12 Change Detection
 
-本書の設計方針は 2026-09-07 に承認済みである。以下には当初の設計理由と検証項目も残しており、
-各段落を一律に実装済みの契約と読まない。現行 CLI と watch の詳細契約は
-[06-cli-spec.md](06-cli-spec.md) を正本とする。`watch run/status/stop` とログインユーザーの
-service lifecycle、起動・定期・通知欠落時の再照合は実装されている。`watch status` には
-backlog、監視能力の低下、最終成功時刻、最終失敗がある。ただし、個々のファイルの版ごとに
-原本保存・抽出・全文検索・embedding の準備状態を示す機能は今後の改善である。
-実装と 3 OS の最終受入は別の判定とし、現行候補の最終受入完了は主張しない。
-[v1 進捗記録](../tasks/v1-plan.md)、[今後の実装計画](../tasks/knowledge-ux-implementation-plan-2026-10-03.md)、
-[製品要求](11-product-requirements.md) を参照する。
+登録ルートの変更検知と欠落からの回復を定める。watch と user service の操作は
+[CLI 契約](06-cli-spec.md#v1-foreground-watch)、製品としての受入は
+[製品要求](11-product-requirements.md#3-受入) に従う。
 
 ## 1. 方針
 
@@ -55,13 +49,10 @@ Windows の通知欠落時には subtree の列挙が必要になる。USN は N
 [Change Journal Records](https://learn.microsoft.com/en-us/windows/win32/fileio/change-journal-records)、
 [Journal lifecycle](https://learn.microsoft.com/en-us/windows/win32/fileio/creating-modifying-and-deleting-a-change-journal)
 
-Windows backend はrootごとに独立した2つのhandleで、名前・サイズ・更新日時の通知と、属性・securityの
-通知を購読する。前者のModified通知だけは、観測できた通常directory自身の更新を抑止する。
-これはKioのlock作成・削除による親directoryの自己通知を収束させるためであり、control path、
-file、reparse point、観測失敗、作成・削除・rename、属性・security通知は抑止しない。
-どちらかの購読が失敗した場合はbackend低下とroot再照合を記録する。停止時は未完了I/Oの
-cancel完了を確認してworkerをjoinしてからhandleとbufferを解放する。通知の解釈はauthorityの
-検証を代替せず、通常のbinding再確認と定期照合を維持する。
+Windows は通常 directory 自体の名前・サイズ・更新日時系の `Modified` 通知に限り、観測に成功した場合の自己通知を
+抑止できる。制御ファイル、file、reparse point、観測失敗、作成・削除・rename、属性・security の通知を
+抑止しない。どちらかの通知系統が失敗した場合は能力低下を表示し、root を再照合する。
+停止時は未完了 I/O の取消しと監視 worker の終了を確認してから監視資源を解放する。
 
 永続 cursor は volume identity、journal identity、root identity と組にする。Linux の inotify watch ID は
 永続 cursor として保存しない。OS 共通 API はイベントだけでなく、`rescan_required`、監視範囲、
@@ -82,10 +73,6 @@ polling に切り替え、低下した検知能力と最終照合時刻を利用
 ファイルサイズと時刻のフィールドは OS のメタデータであり、内容 hash と別の意味を持つ。
 [POSIX stat fields](https://www.man7.org/linux/man-pages/man0/sys_stat.h.0p.html)
 
-2026-09-07 に macOS の使い捨て一時フォルダで、既存ファイルを同サイズに書き換え mtime を維持したところ、
-root/child directory の size・mtime と file の size・mtime は一致したまま、SHA-256 だけが変化した。
-これはメタデータ比較の限界を示す局所実験であり、Kio や 3 OS の受入試験ではない。
-
 通常はイベント候補に絞って hash を再計算する。通知継続性を失った場合は安全に再走査する。
 metadata が完全一致していても内容が変わるケースまで回復を保証するには、必要な範囲の再 hash が必要である。
 周期的な整合性確認は負荷を分散できるが、metadata-only 走査で完全性を保証したとは表示しない。
@@ -93,21 +80,37 @@ metadata が完全一致していても内容が変わるケースまで回復�
 OS の更新履歴は「何かが変わった」情報であり、Kio の immutable commit 履歴の代わりにはならない。
 短時間に作成後削除され、一度も安定状態として取り込めなかったファイルまで保存する保証は別要件である。
 
-## 4. 取りこぼさない処理順序
+## 4. 再照合と中断からの復旧
 
-1. root identity と管理許可を確認し、watch を開始して通知をキューに入れる。
-2. 初回または復旧走査で inventory を作り、watch 開始後に蓄積した通知を再照合する。
-   Linux では各ディレクトリの watch 登録後にも内容を確認し、登録前後の race を吸収する。
-3. 通知の path はヒントとして扱う。保持した directory handle と現在の filesystem identity で対象を開き直し、
-   root 外移動、symlink/reparse point、mount 境界、ignore を検証する。
-4. 変更候補を scope 単位で統合する。rename の対が不足した場合も、旧親・新親の現在状態から復旧する。
-   debounce に加えて最大待機時間を設け、書き込みが続くファイルは不安定として再試行する。
-5. `.kio` 正本の更新と派生処理の再実行を冪等にする。処理済み cursor は再処理に必要な intent を永続化してから進め、
-   crash 時に未処理イベントを失わない。異なる DB/ファイルの更新を一つの transaction と称さない。
-6. 起動、監視再接続、sleep 復帰後の継続性不明、overflow、権限変更、root 移動、定期照合で欠落を回復する。
+| 設定 | 既定値 |
+|---|---:|
+| 通知の debounce | 250 ms |
+| 通知連続時の最大待ち時間 | 2 s |
+| 完全再照合の間隔 | 300 s |
+| root ごとの保留 path ヒント上限 | 4,096 |
 
-通知キュー・cursor・inventory は device 側の再構築可能な運用状態とする。消失時は `.kio` と実ファイルから
-再照合できなければならない。承認などの正本をこの cache だけに置かない。
+起動、監視再接続、sleep 復帰後の継続性不明、通知欠落、backend error、queue overflow、権限変更、root 移動、
+定期照合で完全再照合する。root の実体と管理許可を確認して監視を開始し、初回・復旧走査の間に届いた通知も
+保留して走査後に再照合する。Linux ではディレクトリごとの監視登録直後にも内容を確認して登録前後の変更を
+回収する。rename の対の一方が欠ければ旧親・新親の現在状態から判断し、更新が続く不安定なファイルは再試行する。
+
+照合中に届いた通知を先行処理の成功で消さず、未完了の変更は可視のままキューに残す。正本更新と派生処理は
+冪等とし、再処理に必要な意図を耐久化した後で cursor を進める。壁時計の変更で定期照合を省略しない。
+queue・state は監視 root 外の owner-private device storage に置く。queue・cursor・inventory は
+消失時に `.kio` と実ファイルから再照合できる運用状態とし、承認の正本を置かない。
+
+毎回、現在の端末設定、保持済みの root 実体、管理権限、Ignore を再検証する。HEAD・manifest・lock・task を
+含む `.kio` 生成物の変更を自己通知として除外する。管理・policy・設定・承認の変更は完全再照合を起こす。
+通知 path を候補として、保持済み directory handle と現在の実体で検証し、root 外への移動、symlink、
+reparse point、mount 境界、Ignore を確認する。
+内容は関連する bytes の hash で確定する。watch は offline で、外部 job の poll・download・cleanup
+を行わない。loopback は [Adapter の送信境界](07-adapter-spec.md#31-ローカル窓の送信境界) に従う。
+
+同じ root の watcher は OS file lock で一つに限る。status は読み取り専用で、観測時刻を表示し、保存値だけで
+現在の稼働を判定しない。stop は PID ではなく現在の instance を指定し、稼働中の照合が終了してから止まる。
+scheduler への登録と実行では、他の利用者が書き換えられず、祖先ディレクトリ経由でも
+置き換えられない実行ファイルを要求する。条件を満たさない場合は権限を修復せず拒否する。
+service manifest、lock、queue、state は [Kio 作成物の保護](10-operations.md#43-kio-created-object-boundary) に従う。
 
 ## 5. スコープと送信承認
 

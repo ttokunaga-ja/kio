@@ -150,14 +150,12 @@ retention GCのshallow候補から除外する ([06-cli-spec.md §6.1](06-cli-sp
 最新状態のmanual snapshotや復元commitのprovenanceは、元pointerのcommitを保護する代わりにならない。
 既にshallow化されたcommitへのtag作成は拒否され、tagは明示purge/eraseを防ぐ保証でもない。
 
-2026-10-03の開発版でtagの削除・同名再作成をCLIへ接続した。解除後は、そのcommitを保護する
+tag 解除後は、そのcommitを保護する
 別のrefがなければ通常のretention規則が再び適用される。名前の監査行と既存CASは削除時に保持する。
 tag名は内容固定の引用識別子として使わず、既発行pointerをtagや最新版へ黙って付け替えない。
 既存exportは原本ファイルの書き出しであり、別環境でpointerを検証・解決する自立bundleとは異なる。
 
-2026-10-03承認の追加方針では、既存tagを利用した引用保持と削除影響の表示を先に改善する。
-引用群の登録・自立bundle・文書lineageは詳細契約を別途固定する。
-実装順序と受入条件は [実装計画](../tasks/knowledge-ux-implementation-plan-2026-10-03.md) を参照する。
+引用の保持・削除影響表示の要件は [11 の製品要件](11-product-requirements.md#5-保存復元引用保持の追加方針) を参照する。
 
 ---
 
@@ -549,10 +547,6 @@ Kio は Evidence Pointer を **JSON object として AI Agent に返す**。Agen
 [10-operations.md §11.1](10-operations.md) の関係と同型)。
 `results[]` の各行は `evidence_pointer` に §2 の schema を**そのまま**埋め込み、
 その正規テキスト形を `evidence_uri` として併記する。
-
-> 2026-07-26 の整理: 本節はかつて `preview` field を持つ独自の例を掲げていたが、
-> 05 §1.7 が実契約の正本になった際に追随しておらず、実在しない field を示していた。
-> 例の二重管理をやめ、正本への参照に置き換えた。
 
 Evidence Pointer との関係で本書が定める点は 1 つある。**`result_type: "image"` の行でも
 `evidence_pointer` は画像そのものではなく参照元 chunk を指す** (05 §1.7)。

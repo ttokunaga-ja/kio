@@ -19,7 +19,7 @@ use rusqlite::Connection;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
-// Synthetic Kio-owned records must meet docs/14's owned-object protection contract.
+// Synthetic Kio-owned records must meet docs/10 §4.3.
 fn write_private_fixture(path: &Path, bytes: impl AsRef<[u8]>) -> kio_core::Result<()> {
     let directory = kio_core::store_dir::StoreDirectory::open(path.parent().unwrap())?;
     kio_core::private_fs::verify_private_directory_handle(&directory)?;

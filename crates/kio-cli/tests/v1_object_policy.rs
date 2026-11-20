@@ -280,7 +280,7 @@ fn ancestor_ignore_denies_a_childs_direct_evidence_uri() {
     assert!(!denied.status.success());
 }
 
-/// docs/14: ordinary local commands create private scope and device storage,
+/// docs/10 §4.3: ordinary local commands create private scope and device storage,
 /// including CAS, task, source index, registry and search replica surfaces.
 #[test]
 fn local_commands_create_only_private_scope_and_device_storage() {

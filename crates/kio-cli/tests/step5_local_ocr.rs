@@ -915,7 +915,7 @@ fn app01_local_ocr_respects_pending_task_retry_deadline_without_a_ledger() {
     );
 }
 
-/// APP-04 / docs/14 Operation-specific prerequisites: an unavailable unused
+/// APP-04 / docs/10 §11.3: an unavailable unused
 /// adapter does not erase accepted local knowledge or select another endpoint.
 #[test]
 fn app04_unavailable_local_ocr_preserves_accepted_head_normalization() {

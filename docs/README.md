@@ -63,8 +63,8 @@ cache = aggregator                       全 scope の chunk (live + 過去) の
 # 1. ドキュメント構成 と Reading Path
 
 `docs/` 直下に実装スペック、製品要件、明示した設計提案を置く。`README.md` (本書) を最初に読み、
-続いて `01-` から `14-` の順に読む。`11-` は製品要件、`12-` と `13-` は承認済み方針、
-現行実装との対応、未実装の追加改善を区別して記録する。`14-` は v1 の実装契約である。
+続いて `01-` から `13-` の順に読む。`11-` は製品要件、`12-` と `13-` は承認済み方針、
+変更検知と線形履歴・復元の契約を定める。
 実装済みを3 OS受入・配布済みと同一視しない。
 
 | 順 | ファイル | 役割 |
@@ -79,20 +79,14 @@ cache = aggregator                       全 scope の chunk (live + 過去) の
 | **07** | [07-adapter-spec.md](07-adapter-spec.md) | Adapter trait (Prepare / Markdownize / Embedding / etc.) / 実行形態 / **incremental Markdownize プロンプト規約** |
 | **08** | [08-evidence-pointer-spec.md](08-evidence-pointer-spec.md) | Evidence Pointer schema / 解決手順 / **Dead Pointer (purge) のセマンティクス** / exact-only retarget / 外部 Agent 相互運用 |
 | **09** | [09-mvp-scope.md](09-mvp-scope.md) | MVP scope / RC platform support matrix / non-authorizing roadmap / Step 1-4 / **コード規模と構造の上限 (OS 共通ロジックと OS 固有層の分離)** / 北極星シナリオ / 決定済みの設計論点 |
-| **10** | [10-operations.md](10-operations.md) | 横断規約 (semver / 観測ログ / 命名リネーム表 / 初回スキャン承認 / Adapter セキュリティ) |
+| **10** | [10-operations.md](10-operations.md) | 管理とストレージ保護 / 台帳とバックアップ / 設定 / 観測ログ / 導入 |
 | **11** | [11-product-requirements.md](11-product-requirements.md) | **製品要件の正本**: v1 の到達要求、RCとの区別、v2/v3 の境界、検証要求 |
 | **12** | [12-change-detection.md](12-change-detection.md) | **承認済み方針・実装対応**: OSイベント、差分走査、欠落復旧、子scope自動管理、後続の版別状態表示 |
 | **13** | [13-linear-history.md](13-linear-history.md) | **承認済み方針・実装対応**: 線形履歴、管理対象復元、公開・回復、tag保持、後続の操作表示 |
-| **14** | [14-v1-runtime-contracts.md](14-v1-runtime-contracts.md) | **v1 実装契約**: 正本と運用状態の所在、課金台帳、送信承認、local Adapter の trust、watch・restore の実装判断 (英語。文書削減工程で各契約書へ統合する) |
 
-01〜10 と 14 は実装・運用契約、11 は製品要件である。契約が RC の現状や提案を記録する場合、v1 の到達要求と実装済みを混同しない。旧統合要件ドラフトは current consumer がなく、旧 CLI/schema を残すだけだったため削除済みである。
+01〜10、12〜13 は設計・実装・運用契約、11 は製品要件である。契約が RC の現状や提案を記録する場合、v1 の到達要求と実装済みを混同しない。旧統合要件ドラフトは current consumer がなく、旧 CLI/schema を残すだけだったため削除済みである。
 
-## 1.1 設計検討メモ (撤去済み)
-
-旧 `docs/research/` (LLM 出力由来の設計検討メモ + folder-history 独立設計書) は 2026-07-18 に docs から
-撤去した — 実装・運用契約は `01-` 〜 `10-`、製品要件は `11-` を参照する。経緯を参照する場合は git 履歴 (撤去直前のコミット) を辿る。
-
-## 1.2 非規範の戦略文書
+## 1.1 非規範の戦略文書
 
 [`strategy/`](../strategy/) は市場・事業・将来製品の意思決定材料を置く領域であり、`01-`〜`13-` のReading Pathや実装specには含めない。現在の将来Cloud仮説は [cloud-competitive-advantage.md](../strategy/cloud-competitive-advantage.md) を参照する。同文書の機能・roadmap・設計判断は、明示的にspecへ採用されるまで未承認である。
 
@@ -103,7 +97,7 @@ cache = aggregator                       全 scope の chunk (live + 過去) の
 詳細は [09-mvp-scope.md](09-mvp-scope.md)。
 
 現在の計画・進捗・残作業は [v1 plan](../tasks/v1-plan.md)、利用者の決定は
-[decisions](decisions.md)、技術契約は上記の docs/01〜14、役割と運用は
+[decisions](decisions.md)、技術契約は上記の docs/01〜13、役割と運用は
 [AGENTS.md](../AGENTS.md) を参照する。
 
 `tasks/` には、計画のほかに、任意の高コスト検証の手順、v1 後の設計、正式な受入の経路の資料、
@@ -146,9 +140,8 @@ Phase 1 着手前に確定した論点の結論と正本は [09-mvp-scope.md §5
 
 ADR (Architecture Decision Records) フォルダは廃止しました。本プロジェクトでは:
 
-- **実装・運用契約の正本は01〜10と14、製品要件は11**。12・13は承認済み方針、実装対応、後続改善を区別する。
+- **設計・実装・運用契約は01〜10と12〜13、製品要件は11**。
 - 「なぜそう決めたか」は spec の各セクション冒頭に短く埋め込む (例: `01-positioning.md §1.1`「なぜ local-first であって offline-first ではないか」)
-- 設計検討メモ (旧 `docs/research/`) は 2026-07-18 に撤去済み — 経緯は git history で辿れる
 
 将来、本当に「逆方向の判断もありえた」「外部から問われたら答える義務がある」決定が出てきた時点で、改めて `adr/` を作る方針です。
 
