@@ -1182,7 +1182,6 @@ mod tests {
         (temp, root)
     }
 
-    #[cfg(unix)]
     #[test]
     fn review4_changed_data_home_discovers_the_os_registered_manifest() {
         let temp = tempfile::tempdir().unwrap();
@@ -1200,6 +1199,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn native_location_creates_private_suffix_below_trusted_shared_read_parent() {
         use std::os::unix::fs::PermissionsExt;
@@ -1452,37 +1452,48 @@ mod tests {
         }
     }
 
+    const TEST_HOME: &str = if cfg!(windows) { "C:/tmp" } else { "/tmp" };
+
     pub(super) fn manifest() -> ServiceManifest {
+        let home = Path::new(TEST_HOME);
+        let id = "io.kio.watch.0123456789abcdef0123456789abcdef";
+        let environment = ServiceEnvironment {
+            home: home.to_path_buf(),
+            userprofile: home.to_path_buf(),
+            xdg_config_home: home.join("config"),
+            xdg_data_home: home.join("data"),
+            xdg_cache_home: home.join("cache"),
+        };
+        let native_path = if cfg!(windows) {
+            native_definition_path(id, &environment).unwrap()
+        } else {
+            home.join("watch.plist")
+        };
         ServiceManifest {
             version: VERSION,
-            id: "io.kio.watch.0123456789abcdef0123456789abcdef".into(),
+            id: id.into(),
             scope_id: "scope".into(),
-            root: PathBuf::from("/tmp/root"),
-            binary: PathBuf::from("/tmp/kio"),
+            root: home.join("root"),
+            binary: home.join("kio"),
             reconcile_interval_seconds: 300,
-            native_path: PathBuf::from("/tmp/watch.plist"),
+            native_path,
             definition: "definition".into(),
-            environment: ServiceEnvironment {
-                home: PathBuf::from("/tmp"),
-                userprofile: PathBuf::from("/tmp"),
-                xdg_config_home: PathBuf::from("/tmp/config"),
-                xdg_data_home: PathBuf::from("/tmp/data"),
-                xdg_cache_home: PathBuf::from("/tmp/cache"),
-            },
+            environment,
             phase: ServicePhase::Installing,
         }
     }
     #[test]
     fn renders_escaped_native_definition_without_shell_syntax() {
-        let root = Path::new("/tmp/watch & root");
+        let manifest = manifest();
+        let root = manifest.environment.home.join("watch & root");
         let binary = root.join("kio");
         let rendered = render_definition(
-            "io.kio.watch.abc",
+            &manifest.id,
             &binary,
-            root,
+            &root,
             300,
-            &manifest().environment,
-            Path::new("/tmp/data/kio/watch-services/io.kio.watch.abc.json"),
+            &manifest.environment,
+            &registered_manifest_locator(&manifest).unwrap(),
         )
         .unwrap();
         assert!(rendered.contains("watch &amp; root") || rendered.contains("watch & root"));
@@ -1511,29 +1522,30 @@ mod tests {
 
     #[test]
     fn runner_argv_carries_only_the_explicit_manifest_locator() {
-        let locator = Path::new("/tmp/data/kio/watch-services/io.kio.watch.abc.json");
+        let locator = registered_manifest_locator(&manifest()).unwrap();
         assert_eq!(
-            runner_argv(locator).unwrap(),
+            runner_argv(&locator).unwrap(),
             vec![
                 "watch",
                 "service",
                 "runner",
                 "--manifest",
-                "/tmp/data/kio/watch-services/io.kio.watch.abc.json",
+                locator.to_str().unwrap(),
             ]
         );
     }
 
     #[test]
     fn service_child_environment_is_complete_and_does_not_need_global_mutation() {
+        let home = Path::new(TEST_HOME);
         assert_eq!(
             service_environment_pairs(&manifest().environment).unwrap(),
             vec![
-                ("HOME", "/tmp".to_owned()),
-                ("USERPROFILE", "/tmp".to_owned()),
-                ("XDG_CONFIG_HOME", "/tmp/config".to_owned()),
-                ("XDG_DATA_HOME", "/tmp/data".to_owned()),
-                ("XDG_CACHE_HOME", "/tmp/cache".to_owned()),
+                ("HOME", TEST_HOME.to_owned()),
+                ("USERPROFILE", TEST_HOME.to_owned()),
+                ("XDG_CONFIG_HOME", home.join("config").display().to_string()),
+                ("XDG_DATA_HOME", home.join("data").display().to_string()),
+                ("XDG_CACHE_HOME", home.join("cache").display().to_string()),
             ]
         );
     }
@@ -1541,8 +1553,10 @@ mod tests {
     #[test]
     fn runner_rejects_foreign_manifest_locator() {
         let manifest = manifest();
-        let foreign = Path::new("/tmp/other/watch-services/io.kio.watch.foreign.json");
-        assert!(validate_runner_manifest_locator(foreign, &manifest).is_err());
+        let locator = registered_manifest_locator(&manifest).unwrap();
+        validate_runner_manifest_locator(&locator, &manifest).unwrap();
+        let foreign = locator.with_file_name("io.kio.watch.foreign.json");
+        assert!(validate_runner_manifest_locator(&foreign, &manifest).is_err());
     }
 
     #[test]

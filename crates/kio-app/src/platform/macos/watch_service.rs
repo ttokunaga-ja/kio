@@ -10,7 +10,7 @@ use crate::watch_service::{
     ServiceEnvironment, ServiceManifest, service_environment_pairs, service_error,
 };
 use kio_core::Result;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 pub(crate) fn native_registration_absent(manifest: &ServiceManifest) -> Result<bool> {
     let output = run_native_output(
