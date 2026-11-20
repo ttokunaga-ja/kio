@@ -1172,6 +1172,7 @@ fn embedding_cas_failure_cannot_publish_source_or_replica_vectors() {
             execution: kio_adapter::catalog::EmbeddingExecution::DeterministicEvaluator,
             policy: &policy,
             selected_contexts: &contexts,
+            rebuild: None,
             invalidated: std::cell::Cell::new(false),
         };
         let result = persist_group_vector(

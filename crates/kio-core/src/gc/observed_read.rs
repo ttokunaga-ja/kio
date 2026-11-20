@@ -343,16 +343,21 @@ mod tests {
             &crate::disk_records::RecordStageRoot::temporary().unwrap(),
             config,
         );
-        let suffix = "a".repeat(30_000);
+        // Exceed 16 MiB with valid direct-child names on every supported OS.
+        let entry_count = 50_000;
+        let suffix = "a".repeat(250);
         let raw = format!("sha256:{}", "a".repeat(64));
-        for index in 0..600 {
+        for index in 0..entry_count {
+            let name = format!("{index:05}{suffix}");
+            assert_eq!(crate::portable::portable_leaf_error(&name), None);
             builder
-                .push(TreeEntry::raw_file(format!("{index:04}{suffix}"), raw.clone()).unwrap())
+                .push(TreeEntry::raw_file(name, raw.clone()).unwrap())
                 .unwrap();
         }
         let tree = builder.finish().unwrap();
         let mut file = directory.create_private_file(Path::new("tree")).unwrap();
         let size = std::io::copy(&mut TreeJsonReader::new(&tree).unwrap(), &mut file).unwrap();
+        drop(file);
         assert!(size > 16 * 1024 * 1024);
         let expected = crate::dag::tree_hash(&tree).unwrap();
         let (decoded, observed) = read_cas_tree_observed(
@@ -363,7 +368,7 @@ mod tests {
             size,
         )
         .unwrap();
-        assert_eq!(decoded.entries.len(), 600);
+        assert_eq!(decoded.entries.len(), entry_count);
         assert_eq!(observed.digest, expected);
         assert_eq!(observed.state.len, size);
         assert!(

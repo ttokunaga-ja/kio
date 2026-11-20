@@ -239,7 +239,6 @@ pub fn visit_prepared_units_with_budget(
         &[],
         progress,
         &mut PreparedUnitSink {
-            durable: false,
             declare: &mut |_| Ok(()),
             write: &mut |unit, bytes, _| visit(unit, bytes),
             read_sheet_usage: &|_| unreachable!("preview has no staged worksheet"),
@@ -433,34 +432,27 @@ fn prepare_units_emitting(
         let mut pages =
             kio_adapter::pdf_decode::PdfPages::open(pdf, budget.tier).map_err(pdf_error)?;
         let count = pages.len();
-        let durable = emit.durable;
-        let annotate = |error, extracted_through, units| {
-            page_extraction_error(
-                error,
-                count,
-                extracted_through,
-                durable.then_some(units),
-                budget.tier,
-            )
+        let annotate = |error, extracted_through| {
+            page_extraction_error(error, count, extracted_through, budget.tier)
         };
         let mut prepared_units = completed.to_vec();
         let mut declared = !completed.is_empty();
         if declared {
             emit.declare(count)
-                .map_err(|err| annotate(err, completed.len(), completed.len()))?;
+                .map_err(|err| annotate(err, completed.len()))?;
         }
         for index in completed.len()..count {
             let page = pages
                 .read_page(index)
                 .map_err(pdf_error)
-                .map_err(|err| annotate(err, index, prepared_units.len()))?;
+                .map_err(|err| annotate(err, index))?;
             let real = is_probably_real_text(&page);
             if !declared {
                 if !real {
                     continue;
                 }
                 emit.declare(count)
-                    .map_err(|err| annotate(err, index + 1, prepared_units.len()))?;
+                    .map_err(|err| annotate(err, index + 1))?;
                 declared = true;
             }
             // Once there is a text layer, preserve blank pages and slides as
@@ -484,7 +476,7 @@ fn prepare_units_emitting(
                     page_number: (unit_type == UnitType::Page).then_some(page_number),
                 };
                 emit.write(&unit, body)
-                    .map_err(|err| annotate(err, index + 1, prepared_units.len()))?;
+                    .map_err(|err| annotate(err, index + 1))?;
                 prepared_units.push(unit);
             }
         }
@@ -529,7 +521,6 @@ fn page_extraction_error(
     error: crate::PipelineError,
     total_pages: usize,
     extracted_through: usize,
-    staged_through: Option<usize>,
     tier: kio_core::error::ResourceTier,
 ) -> crate::PipelineError {
     use kio_core::error::{PageExtractionProgress, PageExtractionRetry, Resource, ResourceTier};
@@ -547,7 +538,7 @@ fn page_extraction_error(
     limit.page_progress = Some(Box::new(PageExtractionProgress {
         total_pages: total_pages as u64,
         extracted_through: extracted_through as u64,
-        staged_through: staged_through.map(|count| count as u64),
+        staged_through: None,
         next_page: (extracted_through < total_pages).then(|| extracted_through as u64 + 1),
         retry,
     }));
@@ -1123,7 +1114,7 @@ mod tests {
             page_progress: None,
         });
         let crate::PipelineError::ResourceLimit(limit) =
-            page_extraction_error(error, 4, 2, Some(1), ResourceTier::Large)
+            page_extraction_error(error, 4, 2, ResourceTier::Large)
         else {
             panic!("missing extraction hold");
         };

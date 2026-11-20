@@ -422,7 +422,16 @@ fn p1_review_cli_reports_pdf_page_ranges_and_resumes() {
     pdf.extend(obj(1, b"<< /Type /Page >>"));
     pdf.extend(obj(2, b"<< /Type /Page /Contents 4 0 R >>"));
     pdf.extend(obj(3, b"<< /Type /Page /Contents 5 0 R >>"));
-    pdf.extend(stream_obj(4, "<< /Length 13 >>", b"BT (first) Tj"));
+    // Cross the prepared boundary before the next page hits its budget so
+    // this run has a durable prefix to resume.
+    let padding = " ".repeat(kio_core::cas::CAS_STREAM_BUFFER_BYTES);
+    let first = format!("BT (first{padding}\nx) Tj");
+    let first = zlib(first.as_bytes());
+    pdf.extend(stream_obj(
+        4,
+        &format!("<< /Length {} /Filter /FlateDecode >>", first.len()),
+        &first,
+    ));
     // Whitespace inside the literal counts toward extraction. Normalization
     // strips trailing spaces from its first line, keeping indexing light.
     let mut large = b"BT (large".to_vec();

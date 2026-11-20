@@ -1,7 +1,7 @@
 //! Markdownize and normalized-unit contracts.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -21,7 +21,8 @@ use serde_json::Value;
 use unicode_normalization::UnicodeNormalization;
 
 use crate::extraction_stage::{
-    SavedStage, child_directory, read_record, stage_error, write_record,
+    SMALL_EXTRACTION_BYTES, SavedStage, child_directory, existing_workspace, read_record,
+    stage_error, write_record,
 };
 use crate::prepare::{
     PreparedUnit, UnitFingerprint, UnitType, hash_bytes, unit_ref as prepared_unit_ref,
@@ -1453,7 +1454,7 @@ pub fn persist_normalized_instance_from_units_bound<'a>(
     manifest: &NormalizedInstanceManifest,
     mut unit_for: impl FnMut(&NormalizedUnitManifestEntry) -> Result<Cow<'a, NormalizedUnitObject>>,
 ) -> Result<NormalizedInstanceManifest> {
-    persist_normalized_units(directory, manifest.clone(), None, |_, entry| {
+    persist_normalized_units(directory, manifest.clone(), None, false, |_, entry| {
         unit_for(entry)
     })
 }
@@ -1464,12 +1465,13 @@ pub fn persist_resumable_normalized_units<'a>(
     directory: &StoreDirectory,
     manifest: NormalizedInstanceManifest,
     source: &str,
+    large_source: bool,
     unit_for: impl FnMut(
         &NormalizedInstanceManifest,
         &NormalizedUnitManifestEntry,
     ) -> Result<Cow<'a, NormalizedUnitObject>>,
 ) -> Result<NormalizedInstanceManifest> {
-    persist_normalized_units(directory, manifest, Some(source), unit_for)
+    persist_normalized_units(directory, manifest, Some(source), large_source, unit_for)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1484,6 +1486,7 @@ fn persist_normalized_units<'a>(
     directory: &StoreDirectory,
     mut stamped: NormalizedInstanceManifest,
     resumable_source: Option<&str>,
+    large_source: bool,
     mut unit_for: impl FnMut(
         &NormalizedInstanceManifest,
         &NormalizedUnitManifestEntry,
@@ -1541,12 +1544,42 @@ fn persist_normalized_units<'a>(
         stamped.run_id = run_id;
         stamped.generated_at = generated_at;
     }
-    let stage_workspace = child_directory(
-        directory,
-        &Path::new("extraction-stages/views")
-            .join(normalized_path_digest(&stamped.raw_hash))
-            .join(normalized_path_digest(&draft_key)),
-    )?;
+    let workspace_path = Path::new("extraction-stages/views")
+        .join(normalized_path_digest(&stamped.raw_hash))
+        .join(normalized_path_digest(&draft_key));
+    let mut buffered = VecDeque::new();
+    let stage_workspace = match existing_workspace(directory, &workspace_path)? {
+        Some(workspace) => workspace,
+        None => {
+            if !large_source && let Some(mut size) = small_manifest_size(&stamped)? {
+                for entry in stamped
+                    .units
+                    .iter()
+                    .filter(|entry| entry.status == UnitStatus::Done)
+                {
+                    let unit = unit_for(&stamped, entry)?;
+                    validate_normalized_unit(directory.path(), &identity, entry, &unit)?;
+                    // Check the body first so choosing a stage needs no second
+                    // large serialization buffer.
+                    size = if unit.markdown.len() > SMALL_EXTRACTION_BYTES - size {
+                        SMALL_EXTRACTION_BYTES + 1
+                    } else {
+                        size.saturating_add(canonical_normalized_unit_object_bytes(&unit)?.len())
+                    };
+                    buffered.push_back(unit);
+                    if size > SMALL_EXTRACTION_BYTES {
+                        break;
+                    }
+                }
+                if size <= SMALL_EXTRACTION_BYTES {
+                    return publish_small_normalization(
+                        directory, &store, &instance, stamped, buffered,
+                    );
+                }
+            }
+            child_directory(directory, &workspace_path)?
+        }
+    };
     let stamp_record = Path::new("stamp.json");
     let mut recovering = false;
     if resumable_source.is_some() {
@@ -1598,7 +1631,10 @@ fn persist_normalized_units<'a>(
                 if let Some(incomplete) = incomplete {
                     incomplete.stage.discard(&stage_workspace)?;
                 }
-                let unit = unit_for(&stamped, entry)?;
+                let unit = match buffered.pop_front() {
+                    Some(unit) => unit,
+                    None => unit_for(&stamped, entry)?,
+                };
                 validate_normalized_unit(directory.path(), &identity, entry, &unit)?;
                 checked_unit_size(
                     directory.path(),
@@ -1731,6 +1767,92 @@ fn persist_normalized_units<'a>(
         }
     }
     Ok(stamped)
+}
+
+fn small_manifest_size(manifest: &NormalizedInstanceManifest) -> Result<Option<usize>> {
+    let mut writer = ManifestWriter::new(std::io::sink(), SMALL_EXTRACTION_BYTES as u64, false);
+    let result = manifest_stream::encode(&mut writer, manifest, ManifestEncoding::Canonical);
+    if writer.limit_failure().is_some() {
+        return Ok(None);
+    }
+    writer.check(result)?;
+    Ok(Some(writer.bytes_written() as usize))
+}
+
+/// Small generations use the ordinary CAS and mutable cache writers. The
+/// working manifest is the last write, including when updating the same gen.
+fn publish_small_normalization(
+    directory: &StoreDirectory,
+    store: &ObjectStore,
+    instance: &Path,
+    mut manifest: NormalizedInstanceManifest,
+    units: VecDeque<Cow<'_, NormalizedUnitObject>>,
+) -> Result<NormalizedInstanceManifest> {
+    let mut cache = Vec::with_capacity(units.len());
+    for (entry, unit) in manifest
+        .units
+        .iter_mut()
+        .filter(|entry| entry.status == UnitStatus::Done)
+        .zip(units)
+    {
+        let name = format!("{}.json", entry.unit_ref);
+        let bytes = serde_json::to_vec_pretty(&unit)
+            .map_err(|error| PipelineError::Schema(error.to_string()))?;
+        checked_unit_size(instance, 0, bytes.len() as u64, NORMALIZED_SIZE_LIMITS)?;
+        let canonical = canonical_normalized_unit_object_bytes(&unit)?;
+        let hash = store
+            .write_content_object(ContentObjectKind::NormalizedUnit, &canonical)
+            .map_err(|error| stage_error(directory, error))?;
+        entry.unit_object_hash = Some(hash);
+        cache.push((name, bytes));
+    }
+    let mut manifest_bytes = Vec::new();
+    let mut writer = ManifestWriter::new(&mut manifest_bytes, MAX_NORMALIZED_MANIFEST_BYTES, false);
+    let result = manifest_stream::encode(&mut writer, &manifest, ManifestEncoding::Pretty);
+    writer.check(result)?;
+    let mut canonical = Vec::new();
+    manifest_stream::encode(&mut canonical, &manifest, ManifestEncoding::Canonical)
+        .map_err(|error| PipelineError::Schema(error.to_string()))?;
+    let manifest_hash = store
+        .write_content_object(ContentObjectKind::Manifest, &canonical)
+        .map_err(|error| stage_error(directory, error))?;
+    let view = normalized_view_relative_path(
+        &manifest.raw_hash,
+        &manifest.tool_profile_hash,
+        manifest.r#gen,
+        &manifest_hash,
+    );
+    let view_dir = child_directory(directory, view.parent().expect("normalized view parent"))?;
+    let mut view_bytes = Vec::new();
+    visit_normalized_view(store, &manifest, |_, bytes| {
+        view_bytes.extend_from_slice(bytes);
+        Ok(())
+    })?;
+    view_dir
+        .write_atomic(
+            Path::new(view.file_name().expect("normalized view leaf")),
+            &view_bytes,
+            Publication::Upsert,
+        )
+        .map_err(|error| stage_error(&view_dir, error))?;
+    directory
+        .control()
+        .checkpoint(kio_core::durability::DurabilityPoint::ExtractionBeforeManifest)
+        .map_err(|error| stage_error(directory, error))?;
+    let instance_dir = child_directory(directory, instance)?;
+    for (name, bytes) in cache {
+        instance_dir
+            .write_atomic(Path::new(&name), &bytes, Publication::Upsert)
+            .map_err(|error| stage_error(&instance_dir, error))?;
+    }
+    instance_dir
+        .write_atomic(
+            Path::new("manifest.json"),
+            &manifest_bytes,
+            Publication::Upsert,
+        )
+        .map_err(|error| stage_error(&instance_dir, error))?;
+    Ok(manifest)
 }
 
 fn normalized_unit_journal(entry: &NormalizedUnitManifestEntry) -> PathBuf {
@@ -4269,7 +4391,8 @@ mod tests {
     fn p0_recheck_view_cache_can_be_regenerated_via_create_only_publication() {
         let dir = canonical_tempdir();
         initialize_persist_store(dir.path());
-        let (identity, manifest, units) = normalized_fixture();
+        let (identity, manifest, mut units) = normalized_fixture();
+        units[0].markdown = "x".repeat(SMALL_EXTRACTION_BYTES + 1);
         let original = persist_normalized_instance(dir.path(), &manifest, &units).unwrap();
         let view = normalized_view_path(
             dir.path(),
@@ -4288,11 +4411,48 @@ mod tests {
     }
 
     #[test]
+    fn p0_normalized_spills_only_above_combined_canonical_boundary() {
+        for extra in [0, 1] {
+            let dir = canonical_tempdir();
+            initialize_persist_store(dir.path());
+            let (_, mut manifest, mut units) = normalized_fixture();
+            // The final manifest contains a hash rather than the draft's null pin.
+            let manifest_size = canonical_normalized_manifest_bytes(&manifest)
+                .unwrap()
+                .len();
+            manifest.units[0].unit_object_hash = None;
+            let unit = &mut units[0];
+            unit.markdown.clear();
+            let unit_overhead = canonical_normalized_unit_object_bytes(unit).unwrap().len();
+            unit.markdown =
+                "x".repeat(SMALL_EXTRACTION_BYTES - manifest_size - unit_overhead + extra);
+            let stamped = persist_normalized_instance(dir.path(), &manifest, &units).unwrap();
+            let canonical = canonical_normalized_manifest_bytes(&stamped).unwrap();
+            assert_eq!(
+                canonical.len()
+                    + canonical_normalized_unit_object_bytes(&units[0])
+                        .unwrap()
+                        .len(),
+                SMALL_EXTRACTION_BYTES + extra
+            );
+            assert_eq!(
+                dir.path().join("extraction-stages/views").exists(),
+                extra == 1
+            );
+            assert_eq!(
+                normalized_manifest_hash(&stamped).unwrap(),
+                cas_hash_bytes(&canonical)
+            );
+        }
+    }
+
+    #[test]
     fn p0_normalization_resume_skips_a_durable_unit() {
         let dir = canonical_tempdir();
         initialize_persist_store(dir.path());
         let (_, mut manifest, mut units) = normalized_fixture();
-        let first = units.pop().unwrap();
+        let mut first = units.pop().unwrap();
+        first.markdown = "x".repeat(SMALL_EXTRACTION_BYTES + 1);
         let mut second = first.clone();
         second.unit_key = "page:2".to_owned();
         let mut entry = manifest.units[0].clone();

@@ -29,7 +29,7 @@ use crate::object_persistence::adapter_to_kio;
 use crate::object_persistence::index_to_kio;
 use crate::object_persistence::pipeline_to_kio;
 use crate::search::projection::mark_replica_unavailable_or_log;
-use crate::search::projection::write_through_projection_or_log;
+use crate::search::projection::write_through_repository_projection;
 use crate::settings::user_config_toml_path;
 use crate::task_execution::ExecOutcome;
 use crate::task_execution::retry_reason;
@@ -331,7 +331,7 @@ pub(crate) fn run_image_embedding_enrichment(
             embedding.repo.kio_dir(),
             embedding.repo.control(),
         )?;
-        write_through_projection_or_log(ctx, embedding.repo.kio_dir());
+        write_through_repository_projection(ctx, embedding.repo, embedding.projection.rebuild);
     }
     restoration?;
     let now = invocation.control.now_utc_seconds();
@@ -1232,7 +1232,7 @@ pub(crate) fn run_image_embedding_enrichment(
             embedding.repo.kio_dir(),
             embedding.repo.control(),
         )?;
-        write_through_projection_or_log(ctx, embedding.repo.kio_dir());
+        write_through_repository_projection(ctx, embedding.repo, embedding.projection.rebuild);
     }
     result?;
     for mut claim in local_publications {

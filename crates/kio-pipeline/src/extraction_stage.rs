@@ -8,6 +8,23 @@ use std::path::{Path, PathBuf};
 
 use crate::{PipelineError, Result};
 
+// The same small-write boundary as one CAS streaming buffer.
+pub(crate) const SMALL_EXTRACTION_BYTES: usize = kio_core::cas::CAS_STREAM_BUFFER_BYTES;
+
+pub(crate) fn existing_workspace(
+    root: &StoreDirectory,
+    path: &Path,
+) -> Result<Option<StoreDirectory>> {
+    if root
+        .entries_optional(path)
+        .map_err(|error| stage_error(root, error))?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    child_directory(root, path).map(Some)
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SavedStage {
@@ -233,13 +250,17 @@ pub(crate) fn write_record(
 }
 
 pub(crate) fn stage_error(directory: &StoreDirectory, error: kio_core::KioError) -> PipelineError {
+    stage_error_path(directory.path(), error)
+}
+
+pub(crate) fn stage_error_path(path: &Path, error: kio_core::KioError) -> PipelineError {
     if let Some(limit) = error.resource_limit() {
         return PipelineError::ResourceLimit(limit.clone());
     }
     if error.error_code() == "KIO-E-STAGE-NONCE-001" {
         return PipelineError::contract("KIO-E-STAGE-NONCE-001", error.to_string());
     }
-    PipelineError::corrupt(directory.path().display().to_string(), error.to_string())
+    PipelineError::corrupt(path.display().to_string(), error.to_string())
 }
 
 /// Visit only a raw object's extraction workspaces through the retained store.

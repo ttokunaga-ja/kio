@@ -92,6 +92,7 @@ pub(crate) fn copy_normalized_instance_gen(
         &directory,
         target,
         &normalize.manifest_hash,
+        false,
         |draft, entry| {
             let mut source_entry = entry.clone();
             source_entry.unit_object_hash = entries.get(&entry.order).cloned();

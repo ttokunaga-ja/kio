@@ -426,9 +426,11 @@ XLSX の容量値は選択 tier に対応し、declared size と実読取りの�
 member / aggregate の容量枠は streaming で消費する総量であり、同時保持 memory 枠の拡張ではない。
 共有文字列・escape・出力を含む保持 bytes、parser work、unit text、ZIP 容量の全枠を同時に満たす。
 全て有限の checked counter とし、割当・展開前に予算を検査する。メモリ予算は allocator の
-全 RSS の保証ではなく parser が保持する bytes の上限である。page / sheet 出力は順に private stage へ
-流し、文書全体の展開 bytes を同時保持しない。旧固定限界を超える正常 fixture が処理できることと、
-不正構造・展開爆弾・循環が有限 work で止まることの両方を受入条件とする。
+全 RSS の保証ではなく parser が保持する bytes の上限である。page / sheet 出力は順に処理し、
+合計が 64 KiB を超えた時点で、それまでの出力と以降の出力を private stage に保存する
+（[04 §5.3](04-pipeline.md#53-エラー種別と-retry-budget)）。文書全体の展開 bytes は同時保持しない。
+旧固定限界を超える正常 fixture が処理できることと、不正構造・展開爆弾・循環が有限 work で
+止まることの両方を受入条件とする。
 未完了の場合は処理済み範囲・未処理範囲・予算と再実行方法を表示し、cell / page を黙って捨てない。
 PDF のページ総数が確定している場合は、予算情報の `page_progress` に総数、抽出済みの末尾ページ、
 次の抽出ページ、再実行方法を含める。stage が作成された実行では、耐久化済みの末尾ページも

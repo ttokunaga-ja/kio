@@ -408,6 +408,7 @@ fn persist_local_normalization(
         &bound_extraction_store(repo)?,
         manifest,
         &path,
+        false,
         |draft, entry| {
             let bytes = store
                 .read_content_object_bytes(

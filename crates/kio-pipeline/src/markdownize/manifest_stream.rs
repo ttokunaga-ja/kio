@@ -174,6 +174,10 @@ impl<W: Write> Bounded<W> {
         }
     }
 
+    pub fn bytes_written(&self) -> u64 {
+        self.count
+    }
+
     pub fn limit_failure(&self) -> Option<PipelineError> {
         self.exceeded.then(|| {
             PipelineError::ResourceLimit(ResourceLimit {

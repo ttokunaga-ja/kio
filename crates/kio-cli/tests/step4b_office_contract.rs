@@ -1440,9 +1440,7 @@ fn p2_preparation_emits_a_prefix_and_keeps_source_coordinates_across_tiers() {
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 #[test]
-fn p2_preview_and_staged_resume_report_the_same_sheet_and_row() {
-    use kio_pipeline::prepare::hash_bytes;
-
+fn p2_preview_reports_sheet_and_row_and_small_prefix_restarts() {
     let dir = canonical_tempdir();
     init(&dir);
     let input = p2_xlsx_workbook();
@@ -1456,7 +1454,6 @@ fn p2_preview_and_staged_resume_report_the_same_sheet_and_row() {
     assert_eq!(issue["retry"], "kio index --resource-tier large");
     assert!(!dir.path().join(".kio/extraction-stages").exists());
 
-    let hash = hash_bytes(&input);
     let stopped = kio(&dir, &["index", "--offline"])
         .arg("--json")
         .assert()
@@ -1470,22 +1467,7 @@ fn p2_preview_and_staged_resume_report_the_same_sheet_and_row() {
         json_success(&dir, &["status"])["paused_by_hold_reason"]["resource_limit"],
         1
     );
-    let stages = dir
-        .path()
-        .join(".kio/extraction-stages/prepared")
-        .join(hash.trim_start_matches("sha256:"));
-    let workspace = fs::read_dir(stages)
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
-    let first: Value =
-        serde_json::from_slice(&fs::read(workspace.join("unit-0.json")).unwrap()).unwrap();
-    assert_eq!(first["unit"]["unit_key"], "sheet:A##2");
-    assert!(first["sheet_usage"]["output_bytes"].as_u64().is_some());
-    assert!(!workspace.join("complete.json").exists());
-    assert!(!workspace.join("unit-1.json").exists());
+    assert!(!dir.path().join(".kio/extraction-stages/prepared").exists());
     kio(&dir, &["index", "--offline", "--resource-tier", "large"])
         .assert()
         .success();
@@ -1515,7 +1497,9 @@ fn p2_completed_large_stage_is_rechecked_under_standard_tier() {
         media_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         tool_profile_hash: &profile.tool_profile_hash,
     };
-    prepare_staged(&root, request, ExtractionBudget::new(ResourceTier::Large)).unwrap();
+    let prepared =
+        prepare_staged(&root, request, ExtractionBudget::new(ResourceTier::Large)).unwrap();
+    assert!(prepared.has_staged_payloads());
     assert!(
         matches!(prepare_staged(&root, request, ExtractionBudget::new(ResourceTier::Standard)),
         Err(PipelineError::ResourceLimit(limit)) if limit.resource == Resource::UnitText)
@@ -1594,6 +1578,24 @@ fn p2_reclaims_the_workbook_spill_after_process_exit() {
     }
     child.kill().unwrap();
     assert!(!child.wait().unwrap().success());
+    let raw = fs::read(dir.path().join("spill.xlsx")).unwrap();
+    let hash = kio_pipeline::prepare::hash_bytes(&raw);
+    let stages = dir
+        .path()
+        .join(".kio/extraction-stages/prepared")
+        .join(hash.trim_start_matches("sha256:"));
+    let workspace = fs::read_dir(stages)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let first: Value =
+        serde_json::from_slice(&fs::read(workspace.join("unit-0.json")).unwrap()).unwrap();
+    assert_eq!(first["unit"]["unit_key"], "sheet:A##2");
+    assert_eq!(first["sheet_usage"]["output_bytes"], "first marker".len());
+    assert!(!workspace.join("complete.json").exists());
+    assert!(!workspace.join("unit-1.json").exists());
     let registry = dir.path().join(".kio/internal/record-stages/stages");
     let spill = fs::read_dir(registry)
         .unwrap()
