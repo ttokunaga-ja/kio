@@ -549,6 +549,27 @@ mod windows {
         path
     }
     #[test]
+    fn os_scheduler_tool_keeps_acl_checks_and_accepts_system_component_links() {
+        let root = std::env::var_os("SystemRoot").expect("Windows system root");
+        // Test the filesystem admission contract on an always-present OS
+        // component, without requiring the optional service backend to run.
+        let tool = Path::new(&root).join("System32/kernel32.dll");
+        assert!(kio_core::private_fs::verify_trusted_system_tool(&tool).is_ok());
+        let directory = private_dir();
+        let user_tool = private_file(directory.path(), "tool.exe", b"fixture");
+        let admitted_before = kio_core::private_fs::verify_trusted_executable(&user_tool).is_ok();
+        let alias = directory.path().join("alias.exe");
+        fs::hard_link(&user_tool, &alias).unwrap();
+        assert!(kio_core::private_fs::verify_trusted_system_tool(&user_tool).is_err());
+        assert!(kio_core::private_fs::verify_trusted_executable(&user_tool).is_err());
+        fs::remove_file(alias).unwrap();
+        assert_eq!(
+            kio_core::private_fs::verify_trusted_executable(&user_tool).is_ok(),
+            admitted_before
+        );
+    }
+
+    #[test]
     fn reads_owner_private_regular_file() {
         let dir = private_dir();
         let file = private_file(dir.path(), "device-ca.pem", b"certificate");

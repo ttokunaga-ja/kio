@@ -40,6 +40,10 @@ impl WindowsFileInformation {
         self.file_attributes & (Self::DIRECTORY_ATTRIBUTE | Self::REPARSE_POINT_ATTRIBUTE) == 0
     }
 
+    pub(crate) fn is_system_tool_file(self) -> bool {
+        self.is_regular_file() && self.number_of_links > 0
+    }
+
     fn is_real_directory(self) -> bool {
         self.file_attributes & Self::DIRECTORY_ATTRIBUTE != 0
             && self.file_attributes & Self::REPARSE_POINT_ATTRIBUTE == 0
@@ -125,6 +129,16 @@ pub(crate) fn same_windows_repair_quarantine_file_components(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protected_system_tool_kind_accepts_component_store_hardlinks_only_as_regular_files() {
+        let component = WindowsFileInformation::new(7, 11, 2, 0);
+        assert!(component.is_system_tool_file());
+        assert!(!component.is_single_link());
+        assert!(!WindowsFileInformation::new(7, 11, 2, 0x400).is_system_tool_file());
+        assert!(!WindowsFileInformation::new(7, 11, 2, 0x10).is_system_tool_file());
+        assert!(!WindowsFileInformation::new(7, 11, 0, 0).is_system_tool_file());
+    }
 
     #[test]
     fn windows_identity_components_require_complete_exact_match() {

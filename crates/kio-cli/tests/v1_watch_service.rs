@@ -38,4 +38,6 @@ fn watch_service_install_help_exposes_bounded_interval() {
     assert!(output.status.success());
     let help = String::from_utf8(output.stdout).unwrap();
     assert!(help.contains("--reconcile-interval-seconds"));
+    assert!(help.contains("--replace"));
+    assert!(help.contains("--yes"));
 }

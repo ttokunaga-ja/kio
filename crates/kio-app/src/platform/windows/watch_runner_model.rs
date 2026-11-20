@@ -1,4 +1,4 @@
-use crate::watch_service::{ServiceManifest, invalid, manifest_locator, service_error};
+use crate::watch_service::{ServiceManifest, invalid, registered_manifest_locator, service_error};
 use kio_core::Result;
 use std::path::Path;
 
@@ -6,7 +6,7 @@ pub(crate) fn validate_runner_manifest_locator(
     manifest_path: &Path,
     manifest: &ServiceManifest,
 ) -> Result<()> {
-    if manifest_path != manifest_locator(&manifest.id, &manifest.environment)? {
+    if manifest_path != registered_manifest_locator(manifest)? {
         return Err(service_error(
             "watch service runner manifest locator does not bind its environment and identifier",
         ));

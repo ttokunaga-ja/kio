@@ -80,6 +80,8 @@ pub enum WatchCommand {
 pub enum WatchServiceCommand {
     Install {
         reconcile_interval_seconds: u64,
+        replace: bool,
+        yes: bool,
     },
     Start,
     Stop,

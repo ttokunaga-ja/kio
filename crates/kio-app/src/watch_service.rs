@@ -31,9 +31,14 @@ use crate::commands::WatchServiceCommand;
 use crate::management::{binding_for_repo, open_existing_managed_root};
 use crate::platform::{
     native_after_remove, native_definition_path, native_enable, native_loaded_definition_matches,
-    native_start, native_state, native_stop, native_uninstall, render_definition,
-    run_watch_service_runner,
+    native_manifest_anchor, native_manifest_locator, native_prepare_replacement,
+    native_registration_absent, native_start, native_state, native_stop, native_uninstall,
+    render_definition, run_watch_service_runner,
 };
+
+mod locator;
+mod replacement;
+use locator::{ensure_installation_locator, installation_locator, load_installation, read_locator};
 
 const MANIFEST_DIRECTORY: &str = "watch-services";
 const MUTATION_LOCK_DIRECTORY: &str = "watch-services/locks";
@@ -84,7 +89,16 @@ pub(crate) fn run(
     match command {
         WatchServiceCommand::Install {
             reconcile_interval_seconds,
-        } => install(ctx, root_argument, reconcile_interval_seconds, control),
+            replace,
+            yes,
+        } => install(
+            ctx,
+            root_argument,
+            reconcile_interval_seconds,
+            replace,
+            yes,
+            control,
+        ),
         WatchServiceCommand::Start => {
             mutate_existing(ctx, root_argument, Lifecycle::Start, control)
         }
@@ -103,6 +117,8 @@ fn install(
     ctx: &AppContext,
     root_argument: Option<PathBuf>,
     interval: u64,
+    replace: bool,
+    yes: bool,
     control: &ControlHandle,
 ) -> Result<WatchResponse> {
     if !(1..=86_400).contains(&interval) {
@@ -128,8 +144,25 @@ fn install(
     validate_argument_path(&binary)?;
     let id = stable_id(&record.scope_id, &root);
     let environment = capture_environment()?;
-    let manifest_path = manifest_locator(&id, &environment)?;
-    let native_path = native_definition_path(&id, &environment)?;
+    let located = installation_locator(&id, &environment, native_manifest_locator)?
+        .map(|path| load_installation(&path, control))
+        .transpose()?;
+    if let Some((_, _, existing)) = &located
+        && (existing.id != id || existing.root != root || existing.scope_id != record.scope_id)
+    {
+        return Err(service_error(
+            "registered manifest belongs to another service identity",
+        ));
+    }
+    let manifest_path = if let Some((store, leaf, _)) = &located {
+        store.path().join(leaf)
+    } else {
+        manifest_locator(&id, &environment)?
+    };
+    let native_path = located
+        .as_ref()
+        .map(|(_, _, m)| m.native_path.clone())
+        .unwrap_or(native_definition_path(&id, &environment)?);
     let definition =
         render_definition(&id, &binary, &root, interval, &environment, &manifest_path)?;
     let manifest = ServiceManifest {
@@ -144,11 +177,21 @@ fn install(
         environment,
         phase: ServicePhase::Installing,
     };
+    validate_manifest(&manifest)?;
     let _native_location = NativeDefinitionLocation::admit(&manifest.native_path, control)?;
-    let store = manifest_store(true, control)?
-        .ok_or_else(|| service_error("device manifest store unavailable"))?;
-    let leaf = manifest_leaf(&manifest.id)?;
+    let (store, leaf) = if let Some((store, leaf, _)) = located {
+        (store, leaf)
+    } else {
+        (
+            manifest_store(true, control)?
+                .ok_or_else(|| service_error("device manifest store unavailable"))?,
+            manifest_leaf(&manifest.id)?,
+        )
+    };
     let _mutation_lock = acquire_mutation_lock(&store, &manifest.id)?;
+    // Finish only identity-checked atomic metadata operations from an earlier
+    // attempt before deciding which durable installation phase is present.
+    store.recover_atomic(&[&store])?;
     if let Some(bytes) = store.read_optional(&leaf, MAX_MANIFEST_BYTES)? {
         let existing: ServiceManifest = serde_json::from_slice(&bytes).map_err(service_error)?;
         validate_manifest(&existing)?;
@@ -157,12 +200,24 @@ fn install(
                 "watch service identity is already bound to another root",
             ));
         }
-        if !same_installation(&existing, &manifest) {
-            return Err(service_error(
-                "watch service is already recorded with a different executable or environment; inspect or uninstall it first",
-            ));
-        }
-        return recover_install(&store, &leaf, existing, &NativeScheduler(control.clone()));
+        return replacement::replace_existing(
+            &store,
+            &leaf,
+            existing,
+            &manifest,
+            replace,
+            |summary| {
+                ctx.interaction.write_diagnostic(summary)?;
+                ctx.interaction.write_diagnostic("\n")?;
+                ctx.interaction.flush_diagnostics()?;
+                if yes {
+                    Ok(true)
+                } else {
+                    ctx.interaction.confirm("Replace this watch service? [y/N]")
+                }
+            },
+            &NativeScheduler(control.clone()),
+        );
     }
     let scheduler = NativeScheduler(control.clone());
     match scheduler.inspect(&manifest)? {
@@ -205,29 +260,52 @@ fn recover_install<S: Scheduler>(
     mut manifest: ServiceManifest,
     scheduler: &S,
 ) -> Result<WatchResponse> {
-    if manifest.phase != ServicePhase::Installing {
-        return Err(service_error("watch service is already installed"));
+    if manifest.phase == ServicePhase::Installed {
+        return match scheduler.inspect(&manifest)? {
+            NativeRegistration::Owned => {
+                scheduler.state(&manifest, NativeRegistration::Owned)?;
+                Ok(installed_response(manifest, "installed", "unchanged"))
+            }
+            _ => Err(service_error(
+                "installed watch service is absent or foreign",
+            )),
+        };
     }
+    scheduler.recover_install_definition(&manifest)?;
     match scheduler.inspect(&manifest)? {
-        NativeRegistration::Absent => scheduler.install(&manifest)?,
-        NativeRegistration::Owned => {}
+        NativeRegistration::Absent | NativeRegistration::Owned => scheduler.install(&manifest)?,
         NativeRegistration::Foreign => {
             return Err(service_error(
                 "refusing to replace a foreign native service registration",
             ));
         }
     }
+    if scheduler.inspect(&manifest)? != NativeRegistration::Owned {
+        return Err(service_error(
+            "watch service installation failed verification",
+        ));
+    }
     manifest.phase = ServicePhase::Installed;
     write_manifest(store, leaf, &manifest, Publication::Replace)?;
     store.ensure_owner_private(leaf)?;
-    Ok(WatchResponse::ServiceInstalled(
-        WatchServiceInstalledResponse {
-            status: "installed".to_owned(),
-            service_id: manifest.id,
-            root: manifest.root,
-            native_registration: "enabled_not_started".to_owned(),
-        },
+    Ok(installed_response(
+        manifest,
+        "installed",
+        "enabled_not_started",
     ))
+}
+
+fn installed_response(
+    manifest: ServiceManifest,
+    status: &str,
+    registration: &str,
+) -> WatchResponse {
+    WatchResponse::ServiceInstalled(WatchServiceInstalledResponse {
+        status: status.to_owned(),
+        service_id: manifest.id,
+        root: manifest.root,
+        native_registration: registration.to_owned(),
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -255,6 +333,17 @@ fn mutate_existing(
         })?;
     let manifest: ServiceManifest = serde_json::from_slice(&bytes).map_err(service_error)?;
     validate_manifest(&manifest)?;
+    if store
+        .read_optional(
+            &replacement::intent_leaf(&leaf),
+            replacement::MAX_INTENT_BYTES,
+        )?
+        .is_some()
+    {
+        return Err(service_error(
+            "finish watch service install --replace before lifecycle changes",
+        ));
+    }
     let scheduler = NativeScheduler(control.clone());
     let registration = scheduler.inspect(&manifest)?;
     if registration == NativeRegistration::Foreign {
@@ -394,10 +483,21 @@ fn find_manifest(
             continue;
         }
         let name = entry.name.to_string_lossy();
-        if !name.ends_with(".json") || name.len() > 80 {
+        if !name.ends_with(".json") || name.ends_with(".replace.json") || name.len() > 80 {
             continue;
         }
         let leaf = Path::new(MANIFEST_DIRECTORY).join(name.as_ref());
+        if name.ends_with(".locator.json") {
+            if let Some(path) = read_locator(&store.path().join(&leaf))?
+                && path.exists()
+            {
+                let located = load_installation(&path, control)?;
+                if located.2.root == requested {
+                    found.push(located);
+                }
+            }
+            continue;
+        }
         let Some(bytes) = store.read_optional(&leaf, MAX_MANIFEST_BYTES)? else {
             continue;
         };
@@ -409,14 +509,11 @@ fn find_manifest(
             ));
         }
         if manifest.root == requested {
-            found.push((leaf, manifest));
+            found.push((store.rebind_with_control(control.clone()), leaf, manifest));
         }
     }
     match found.len() {
-        1 => {
-            let (leaf, manifest) = found.pop().expect("checked length");
-            Ok((store, leaf, manifest))
-        }
+        1 => Ok(found.pop().expect("checked length")),
         0 => Err(service_error("no watch service is installed for this root")),
         _ => Err(service_error("ambiguous watch service manifests for root")),
     }
@@ -488,7 +585,7 @@ fn manifest_store(create: bool, control: &ControlHandle) -> Result<Option<StoreD
     Ok(Some(store))
 }
 
-fn manifest_leaf(id: &str) -> Result<PathBuf> {
+pub(crate) fn manifest_leaf(id: &str) -> Result<PathBuf> {
     if !id.starts_with("io.kio.watch.")
         || id.len() > 80
         || !id
@@ -510,6 +607,13 @@ pub(crate) fn manifest_locator(id: &str, environment: &ServiceEnvironment) -> Re
     Ok(path)
 }
 
+pub(crate) fn registered_manifest_locator(manifest: &ServiceManifest) -> Result<PathBuf> {
+    if let Some(anchor) = native_manifest_anchor(manifest)? {
+        return Ok(anchor);
+    }
+    manifest_locator(&manifest.id, &manifest.environment)
+}
+
 fn stable_id(scope_id: &str, root: &Path) -> String {
     let mut hash = Sha256::new();
     hash.update(scope_id.as_bytes());
@@ -529,14 +633,19 @@ pub(crate) fn validate_manifest(manifest: &ServiceManifest) -> Result<()> {
         return Err(service_error("watch service manifest is invalid"));
     }
     manifest_leaf(&manifest.id)?;
+    if serde_json::to_vec(manifest).map_err(service_error)?.len() as u64 > MAX_MANIFEST_BYTES {
+        return Err(invalid("watch service manifest exceeds its metadata limit"));
+    }
     validate_argument_path(&manifest.root)?;
     validate_argument_path(&manifest.binary)?;
+    validate_argument_path(&manifest.native_path)?;
     validate_environment(&manifest.environment)?;
     if manifest.definition.len() > 16_384 || manifest.definition.contains('\0') {
         return Err(service_error("watch service definition is invalid"));
     }
     if manifest.id != stable_id(&manifest.scope_id, &manifest.root)
-        || manifest.native_path != native_definition_path(&manifest.id, &manifest.environment)?
+        || manifest.native_path.file_name()
+            != native_definition_path(&manifest.id, &manifest.environment)?.file_name()
         || manifest.definition
             != render_definition(
                 &manifest.id,
@@ -544,7 +653,7 @@ pub(crate) fn validate_manifest(manifest: &ServiceManifest) -> Result<()> {
                 &manifest.root,
                 manifest.reconcile_interval_seconds,
                 &manifest.environment,
-                &manifest_locator(&manifest.id, &manifest.environment)?,
+                &registered_manifest_locator(manifest)?,
             )?
     {
         return Err(service_error(
@@ -655,6 +764,9 @@ fn write_manifest(
     publication: Publication,
 ) -> Result<()> {
     let bytes = serde_json::to_vec(manifest).map_err(service_error)?;
+    if bytes.len() as u64 > MAX_MANIFEST_BYTES {
+        return Err(invalid("watch service manifest exceeds its metadata limit"));
+    }
     store.write_atomic(leaf, &bytes, publication)
 }
 
@@ -699,6 +811,22 @@ pub(crate) trait Scheduler {
     fn start(&self, manifest: &ServiceManifest) -> Result<()>;
     fn stop(&self, manifest: &ServiceManifest) -> Result<()>;
     fn uninstall(&self, manifest: &ServiceManifest) -> Result<()>;
+    fn recover_install_definition(&self, _manifest: &ServiceManifest) -> Result<()> {
+        Ok(())
+    }
+    fn recover_replacement_definition(
+        &self,
+        _old: &ServiceManifest,
+        _new: &ServiceManifest,
+    ) -> Result<()> {
+        Ok(())
+    }
+    fn replace_definition(&self, old: &ServiceManifest, _new: &ServiceManifest) -> Result<()> {
+        self.uninstall(old)
+    }
+    fn running(&self, manifest: &ServiceManifest) -> Result<bool> {
+        Ok(self.state(manifest, NativeRegistration::Owned)?.active)
+    }
     fn state(
         &self,
         manifest: &ServiceManifest,
@@ -857,11 +985,14 @@ impl Scheduler for NativeScheduler {
     fn inspect(&self, manifest: &ServiceManifest) -> Result<NativeRegistration> {
         let location = NativeDefinitionLocation::admit(&manifest.native_path, &self.0)?;
         let registration = location.inspect(manifest.definition.as_bytes())?;
-        if registration != NativeRegistration::Owned {
+        if registration == NativeRegistration::Foreign {
+            return Ok(registration);
+        }
+        if native_registration_absent(manifest)? {
             return Ok(registration);
         }
         let matches = native_loaded_definition_matches(manifest)?;
-        location.require_owned(manifest)?;
+        location.revalidate()?;
         Ok(if matches {
             NativeRegistration::Owned
         } else {
@@ -869,35 +1000,131 @@ impl Scheduler for NativeScheduler {
         })
     }
     fn install(&self, manifest: &ServiceManifest) -> Result<()> {
+        if self.inspect(manifest)? == NativeRegistration::Foreign {
+            return Err(service_error(
+                "refusing to install over a foreign native service",
+            ));
+        }
         let mut location = NativeDefinitionLocation::admit(&manifest.native_path, &self.0)?;
-        location.publish(manifest.definition.as_bytes())?;
+        if location.missing.is_empty() {
+            location.directory.recover_atomic(&[&location.directory])?;
+        }
+        match location.inspect(manifest.definition.as_bytes())? {
+            NativeRegistration::Absent => location.publish(manifest.definition.as_bytes())?,
+            NativeRegistration::Owned => {}
+            NativeRegistration::Foreign => {
+                return Err(service_error("foreign native definition during install"));
+            }
+        }
         location.require_owned(manifest)?;
         native_enable(manifest)?;
         location.require_owned(manifest)
     }
+
     fn start(&self, manifest: &ServiceManifest) -> Result<()> {
+        if self.inspect(manifest)? != NativeRegistration::Owned {
+            return Err(service_error("foreign native definition before start"));
+        }
         let location = NativeDefinitionLocation::admit(&manifest.native_path, &self.0)?;
         location.require_owned(manifest)?;
         native_start(manifest)?;
         location.require_owned(manifest)
     }
+    fn running(&self, manifest: &ServiceManifest) -> Result<bool> {
+        Ok(
+            crate::watch_command::inspect_liveness(&manifest.root, &self.0)?.status == "running"
+                || self.state(manifest, NativeRegistration::Owned)?.active,
+        )
+    }
     fn stop(&self, manifest: &ServiceManifest) -> Result<()> {
-        let location = NativeDefinitionLocation::admit(&manifest.native_path, &self.0)?;
-        location.require_owned(manifest)?;
+        if self.inspect(manifest)? == NativeRegistration::Foreign {
+            return Err(service_error("foreign native registration before stop"));
+        }
         native_stop(manifest)?;
-        location.require_owned(manifest)
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while crate::watch_command::inspect_liveness(&manifest.root, &self.0)?.status == "running" {
+            if std::time::Instant::now() >= deadline {
+                return Err(service_error(
+                    "watcher has not stopped; replacement remains pending",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if self.inspect(manifest)? == NativeRegistration::Foreign {
+            return Err(service_error("foreign native registration after stop"));
+        }
+        Ok(())
+    }
+    fn recover_install_definition(&self, manifest: &ServiceManifest) -> Result<()> {
+        let location = NativeDefinitionLocation::admit(&manifest.native_path, &self.0)?;
+        if location.inspect(manifest.definition.as_bytes())? == NativeRegistration::Owned {
+            native_prepare_replacement(manifest)?;
+        }
+        Ok(())
+    }
+    fn recover_replacement_definition(
+        &self,
+        old: &ServiceManifest,
+        new: &ServiceManifest,
+    ) -> Result<()> {
+        let location = NativeDefinitionLocation::admit(&new.native_path, &self.0)?;
+        if old.definition != new.definition
+            && location.inspect(new.definition.as_bytes())? == NativeRegistration::Owned
+        {
+            native_prepare_replacement(new)?;
+        }
+        Ok(())
+    }
+    fn replace_definition(&self, old: &ServiceManifest, new: &ServiceManifest) -> Result<()> {
+        if old.native_path != new.native_path || self.inspect(old)? != NativeRegistration::Owned {
+            return Err(service_error(
+                "native definition changed before replacement",
+            ));
+        }
+        let location = NativeDefinitionLocation::admit(&old.native_path, &self.0)?;
+        native_uninstall(old)?;
+        location.require_owned(old)?;
+        location.directory.write_atomic_checked(
+            &location.leaf,
+            new.definition.as_bytes(),
+            Publication::Replace,
+            |_, _| {
+                location.require_owned(old)?;
+                if self.inspect(old)? != NativeRegistration::Owned {
+                    return Err(service_error(
+                        "native definition changed during publication",
+                    ));
+                }
+                Ok(())
+            },
+        )?;
+        native_prepare_replacement(new)?;
+        Ok(())
     }
     fn uninstall(&self, manifest: &ServiceManifest) -> Result<()> {
+        if self.inspect(manifest)? == NativeRegistration::Foreign {
+            return Err(service_error(
+                "foreign native registration before uninstall",
+            ));
+        }
         let location = NativeDefinitionLocation::admit(&manifest.native_path, &self.0)?;
-        location.require_owned(manifest)?;
         native_uninstall(manifest)?;
-        // Recheck the retained XML/plist/unit cache without querying a Windows
-        // registration that native_uninstall has intentionally just removed.
-        location.require_owned(manifest)?;
-        location.directory.remove_file(&location.leaf)?;
+        if self.inspect(manifest)? == NativeRegistration::Foreign {
+            return Err(service_error("native definition changed during uninstall"));
+        }
+        // Recheck only the retained file after the scheduler has removed its
+        // registration. A crash may leave either half absent on the next retry.
+        match location.inspect(manifest.definition.as_bytes())? {
+            NativeRegistration::Owned => location.directory.remove_file(&location.leaf)?,
+            NativeRegistration::Absent => {}
+            NativeRegistration::Foreign => {
+                return Err(service_error("foreign native definition after uninstall"));
+            }
+        }
         native_after_remove()?;
         location.revalidate()
     }
+
     fn state(
         &self,
         manifest: &ServiceManifest,
@@ -959,7 +1186,7 @@ where
         &mut command,
         BoundedProcessOptions {
             timeout: Duration::from_secs(10),
-            max_stdout_bytes: 16 * 1024,
+            max_stdout_bytes: 64 * 1024,
             max_stderr_bytes: 16 * 1024,
         },
         None,
@@ -1004,6 +1231,23 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn review4_changed_data_home_discovers_the_os_registered_manifest() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut environment = manifest().environment;
+        environment.xdg_data_home = temp.path().canonicalize().unwrap().join("new-data");
+        let old = temp
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("old-data/kio/watch-services/io.kio.watch.test.json");
+        assert_eq!(
+            installation_locator("io.kio.watch.test", &environment, |_| Ok(Some(old.clone())))
+                .unwrap(),
+            Some(old)
+        );
+    }
+
     #[test]
     fn native_location_creates_private_suffix_below_trusted_shared_read_parent() {
         use std::os::unix::fs::PermissionsExt;
@@ -1256,7 +1500,7 @@ mod tests {
         }
     }
 
-    fn manifest() -> ServiceManifest {
+    pub(super) fn manifest() -> ServiceManifest {
         ServiceManifest {
             version: VERSION,
             id: "io.kio.watch.0123456789abcdef0123456789abcdef".into(),
@@ -1448,7 +1692,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_duplicate_install_is_rejected_without_scheduler_or_manifest_mutation() {
+    fn completed_duplicate_install_is_idempotent_without_scheduler_or_manifest_mutation() {
         let temp = tempfile::tempdir().unwrap();
         let store = StoreDirectory::open(&temp.path().canonicalize().unwrap()).unwrap();
         let leaf = Path::new("service.json");
@@ -1462,8 +1706,12 @@ mod tests {
         for registration in [NativeRegistration::Owned, NativeRegistration::Absent] {
             let fake = FakeScheduler::owned();
             *fake.registration.borrow_mut() = registration;
-            let error = recover_install(&store, leaf, manifest.clone(), &fake).unwrap_err();
-            assert!(error.to_string().contains("already installed"));
+            let result = recover_install(&store, leaf, manifest.clone(), &fake);
+            if registration == NativeRegistration::Owned {
+                assert!(result.is_ok(), "{result:?}");
+            } else {
+                assert!(result.is_err());
+            }
             assert_eq!(fake.installs.get(), 0);
             assert_eq!(fake.starts.get(), 0);
             assert_eq!(fake.stops.get(), 0);
@@ -1509,10 +1757,7 @@ mod tests {
                         "installed"
                     );
                     assert_eq!(stored.phase, ServicePhase::Installed);
-                    assert_eq!(
-                        fake.installs.get(),
-                        u8::from(registration == NativeRegistration::Absent)
-                    );
+                    assert_eq!(fake.installs.get(), 1);
                     assert_eq!(fake.inspect(&stored).unwrap(), NativeRegistration::Owned);
                 }
                 NativeRegistration::Foreign => {

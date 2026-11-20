@@ -136,6 +136,12 @@ pub(crate) enum WatchServiceCommand {
     Install {
         #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..=86400))]
         reconcile_interval_seconds: u64,
+        /// Review and replace this user's existing service definition.
+        #[arg(long)]
+        replace: bool,
+        /// Confirm the displayed replacement without an interactive prompt.
+        #[arg(long)]
+        yes: bool,
     },
     Start,
     Stop,
@@ -644,8 +650,12 @@ impl From<WatchArgs> for app::WatchArgs {
                     app::WatchCommand::Service(match service.command {
                         WatchServiceCommand::Install {
                             reconcile_interval_seconds,
+                            replace,
+                            yes,
                         } => app::WatchServiceCommand::Install {
                             reconcile_interval_seconds,
+                            replace,
+                            yes,
                         },
                         WatchServiceCommand::Start => app::WatchServiceCommand::Start,
                         WatchServiceCommand::Stop => app::WatchServiceCommand::Stop,
@@ -947,7 +957,7 @@ mod tests {
 
     use super::{
         AdapterCommand, Cli, Command, GcArgs, RepairOperation, SnapshotAction, SnapshotArgs,
-        TrustCommand, WatchCommand,
+        TrustCommand, WatchCommand, app,
     };
 
     #[test]
@@ -1160,6 +1170,32 @@ mod tests {
         let cli = Cli::try_parse_from(["kio", "status", "--json"]).unwrap();
         assert!(cli.json);
         assert!(matches!(cli.command, Command::Status));
+    }
+
+    #[test]
+    fn watch_service_replacement_flags_reach_the_application() {
+        for (flags, replace, yes) in [
+            (vec![], false, false),
+            (vec!["--yes"], false, true),
+            (vec!["--replace"], true, false),
+            (vec!["--replace", "--yes"], true, true),
+        ] {
+            let command = Cli::try_parse_from(
+                ["kio", "watch", "service", "install"]
+                    .into_iter()
+                    .chain(flags),
+            )
+            .unwrap()
+            .command;
+            let app::CommandRequest::Watch(args) = command.into() else {
+                panic!("expected watch");
+            };
+            assert!(
+                matches!(args.command, app::WatchCommand::Service(app::WatchServiceCommand::Install {
+                replace: actual_replace, yes: actual_yes, reconcile_interval_seconds: 300
+            }) if actual_replace == replace && actual_yes == yes)
+            );
+        }
     }
 
     #[test]
