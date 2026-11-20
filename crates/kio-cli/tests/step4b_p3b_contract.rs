@@ -1483,7 +1483,6 @@ fn qb39_chunk_history() -> (TempDir, String, String, String) {
     assert_ne!(original, changed, "fixture must have a publication event");
     fs::write(&ledger, changed).unwrap();
     let sqlite = kio_dir(&dir).join("index/sqlite.db");
-    support::prepare_private_sqlite_sidecars(&sqlite).unwrap();
     rusqlite::Connection::open(sqlite)
         .unwrap()
         .execute(
@@ -1578,7 +1577,6 @@ fn qb39_diff_rejects_a_lost_chunk_event_without_the_projection() {
         .collect();
     assert!(damaged.contains("\"event\":\"publication\""));
     fs::write(&ledger, damaged).unwrap();
-    support::prepare_private_sqlite_sidecars(&sqlite).unwrap();
     rusqlite::Connection::open(sqlite)
         .unwrap()
         .execute("DELETE FROM chunk_publications", [])
