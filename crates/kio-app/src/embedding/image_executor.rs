@@ -1,5 +1,9 @@
 //! Image embedding scheduling, durable ownership and source publication.
 
+use crate::eg2::EmbeddingInput;
+use crate::embedding::executor::{finish_native_embedding_failure, pause_for_missing_model};
+use crate::embedding::transport::{LocalEmbeddingRunFailure, run_native_embedding};
+
 use crate::egress::admit_embedding_transport;
 use crate::egress::embedding_secrets_allowed;
 use crate::embedding::admission::EMBEDDING_ADAPTER_KIND;
@@ -133,6 +137,7 @@ pub(crate) struct ImageEnrichmentRequest<'a> {
     pub(crate) ledger: Option<&'a LedgerDb>,
     pub(crate) secrets_approved: bool,
     pub(crate) execution_allowed: bool,
+    pub(crate) model_missing: bool,
     pub(crate) override_budget: bool,
 }
 
@@ -149,8 +154,17 @@ pub(crate) fn run_image_embedding_enrichment(
         ledger,
         secrets_approved,
         execution_allowed,
+        model_missing,
         override_budget,
     } = request;
+    // A text-only rebuild already authenticated its staged units. There is
+    // no image authority to resolve until a chunk actually cites an image.
+    if !eligible_chunks
+        .iter()
+        .any(|chunk| !kio_search::extract_related_images(&chunk.text).is_empty())
+    {
+        return Ok(ExecOutcome::default());
+    }
     let ctx = &invocation;
     let adapter_settings = invocation.settings;
 
@@ -489,6 +503,15 @@ pub(crate) fn run_image_embedding_enrichment(
     if pending.is_empty() {
         return Ok(ExecOutcome::default());
     }
+    if model_missing {
+        let refs = pending
+            .iter()
+            .map(|hash| plans[hash].target.output_ref())
+            .collect();
+        let mut outcome = ExecOutcome::default();
+        pause_for_missing_model(task_store, &refs, &mut outcome)?;
+        return Ok(outcome);
+    }
     let budget_caps = read_budget_policy(
         user_config_toml_path(invocation.control),
         embedding.repo.kio_dir().join("config.toml"),
@@ -524,7 +547,12 @@ pub(crate) fn run_image_embedding_enrichment(
             else {
                 return Err(KioError::schema("image send has no typed task"));
             };
-            if !(free_execution && task.status == TaskStatus::Running)
+            if !(free_execution
+                && (task.status == TaskStatus::Running
+                    || matches!(
+                        task.hold_reason,
+                        Some(HoldReason::ResourceBusy | HoldReason::ModelNotReady)
+                    )))
                 && !(task.status == TaskStatus::Pending && task_retry_due(task, invocation.control))
                 && !(task.status == TaskStatus::Failed
                     && task_retry_allowed(task)
@@ -704,6 +732,18 @@ pub(crate) fn run_image_embedding_enrichment(
                     )
                     .map_err(crate::embedding::transport::LocalEmbeddingRunFailure::Admission)
                     .and_then(|_| {
+                        if embedding.execution == kio_adapter::catalog::EmbeddingExecution::Native {
+                            let EmbeddingContent::Image { bytes, .. } = &items[0].content else {
+                                unreachable!("image item")
+                            };
+                            return run_native_embedding(
+                                invocation.context.interaction.as_ref(),
+                                &mut embedding.native_session.borrow_mut(),
+                                EmbeddingInput::Image(bytes),
+                                image_hash.clone(),
+                                embedding.profile,
+                            );
+                        }
                         crate::embedding::transport::run_local_embedding_adapter(
                             adapter_settings,
                             Some(crate::embedding::transport::LocalSendAuthority {
@@ -718,11 +758,19 @@ pub(crate) fn run_image_embedding_enrichment(
                         )
                     });
                     match result {
-                        Ok(completed) => {
-                            claim.stage_result(&serde_json::to_vec(&completed).map_err(
-                                |_| KioError::schema("cannot serialize local image completion"),
-                            )?)?;
-                            completed
+                        Ok(result) => {
+                            result.stage(&mut claim)?;
+                            result
+                        }
+                        Err(LocalEmbeddingRunFailure::Native(error)) => {
+                            finish_native_embedding_failure(
+                                task_store,
+                                &refs,
+                                &mut claim,
+                                error,
+                                &mut outcome,
+                            )?;
+                            continue;
                         }
                         Err(crate::embedding::transport::LocalEmbeddingRunFailure::Classified(
                             failure,
@@ -777,7 +825,9 @@ pub(crate) fn run_image_embedding_enrichment(
                         }
                     }
                 };
-                let EmbeddingMemberResult::Vector { vector } = &completed.members[0].result else {
+                let EmbeddingMemberResult::Vector { vector } =
+                    &completed.completed.members[0].result
+                else {
                     return Err(KioError::schema("local image result is not a vector"));
                 };
                 embedding
@@ -805,7 +855,7 @@ pub(crate) fn run_image_embedding_enrichment(
                     embedding.repo,
                     &embedding_hash,
                     image_hash,
-                    vector,
+                    (vector, completed.native_producer),
                     embedding.profile,
                     embedding.execution,
                     plan,
@@ -1189,7 +1239,7 @@ pub(crate) fn run_image_embedding_enrichment(
                 embedding.repo,
                 &embedding_hash,
                 image_hash,
-                vector,
+                (vector, None),
                 embedding.profile,
                 embedding.execution,
                 plan,

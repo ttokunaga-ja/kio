@@ -64,9 +64,7 @@ fn disclosure(
     let content_types = match role {
         AdapterRole::Embedding => {
             let mut types = vec!["query text", "document text"];
-            if tool != GENERIC_LOCAL_EMBEDDING_TOOL_ID
-                || generic_embedding_declares_images(settings)?
-            {
+            if generic_embedding_declares_images(settings)? {
                 types.push("images");
             }
             types
@@ -125,10 +123,11 @@ pub(super) fn current_endpoints(
         if declared.kind.as_deref() != Some("offline_api") {
             continue;
         }
-        let tool = declared.tool_id.as_deref().unwrap_or(match role {
-            AdapterRole::Markdown => "paddleocr_vl_local",
-            AdapterRole::Embedding => "qwen3_vl_embedding_local",
-        });
+        let tool = match (declared.tool_id.as_deref(), role) {
+            (Some(tool), _) => tool,
+            (None, AdapterRole::Markdown) => "paddleocr_vl_local",
+            (None, AdapterRole::Embedding) => continue,
+        };
         if selected.is_some_and(|selected| selected != tool) {
             continue;
         }

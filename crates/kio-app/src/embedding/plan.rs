@@ -336,6 +336,7 @@ pub(crate) fn reconcile_committed_embedding_tasks(
             && retry_kind_from_reason(task.fallback_reason.as_deref()) == RetryErrorKind::AuthError;
         if !budget_paused
             && !auth_paused
+            && task.hold_reason != Some(HoldReason::ResourceBusy)
             && !matches!(
                 task.status,
                 TaskStatus::Pending | TaskStatus::Running | TaskStatus::Failed

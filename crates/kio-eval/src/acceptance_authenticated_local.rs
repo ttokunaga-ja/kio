@@ -1,10 +1,5 @@
-//! A08 authenticated-local acceptance, split across the two GPU-host phases.
-//!
-//! The evaluator never starts a model server.  The caller starts exactly one
-//! already-authenticated loopback service, calls [`run_ocr`], stops it, then
-//! starts the embedding service and calls [`run_embedding`] with the same work
-//! directory.  The create-only checkpoint is deliberately evidence of the OCR
-//! phase, not an acceptance receipt.
+//! A08 acceptance uses the authenticated OCR peer, then runs EG2 on the client.
+//! The create-only OCR checkpoint binds the source and device state across phases.
 
 use std::{
     collections::BTreeMap,
@@ -31,12 +26,15 @@ use crate::{
 };
 
 const OCR_TOOL: &str = "paddleocr_vl_local";
-const EMBEDDING_TOOL: &str = "qwen3_vl_embedding_local";
+const EMBEDDING_TOOL: &str = kio_core::eg2::TOOL_ID;
 /// Mirrors kio-adapter's documented local OCR model alias.
 const OCR_MODEL: &str = "PaddleOCR-VL-0.9B";
 const OCR_PDF: &str = "ocr.pdf";
 const IMAGE_PNG: &str = "image.png";
+#[cfg(not(windows))]
 const CANDIDATE_COPY: &str = "device/candidate/kio";
+#[cfg(windows)]
+const CANDIDATE_COPY: &str = "device/candidate/kio.exe";
 const CA_COPY: &str = "device/trust/ca.pem";
 const SERVICE_IDENTITY_COPY: &str = "device/service-identity.json";
 const CHECKPOINT: &str = "checkpoints/ocr.json";
@@ -57,7 +55,6 @@ pub struct AuthenticatedLocalOptions {
     pub work_dir: PathBuf,
     pub receipt: PathBuf,
     pub ocr_endpoint: String,
-    pub embedding_endpoint: String,
     /// One pre-existing public CA used by both phase endpoints.
     pub ca_pem: PathBuf,
     pub service_identity: PathBuf,
@@ -73,7 +70,6 @@ pub struct OcrCheckpoint {
     fixture_sha256: String,
     ca_sha256: String,
     ocr_endpoint_sha256: String,
-    embedding_endpoint_sha256: String,
     tools_toml_sha256: String,
     tool_lock_sha256: String,
     service_identity_sha256: String,
@@ -96,15 +92,15 @@ struct CapturedFixture {
 /// grants, or any other private transport configuration.
 #[derive(Clone, Copy)]
 enum ImageQueryStage {
-    BeforeRepairOnline,
-    AfterRepairOnline,
+    BeforeRepair,
+    AfterRepair,
 }
 
 impl ImageQueryStage {
     fn diagnostic_name(self) -> &'static str {
         match self {
-            Self::BeforeRepairOnline => "image-query-before-repair-online.json",
-            Self::AfterRepairOnline => "image-query-after-repair-online.json",
+            Self::BeforeRepair => "image-query-before-repair.json",
+            Self::AfterRepair => "image-query-after-repair.json",
         }
     }
 }
@@ -133,12 +129,7 @@ pub fn run_ocr(options: &AuthenticatedLocalOptions) -> Result<OcrCheckpoint, Acc
     {
         return Err(invalid("service identity differs from expected binding"));
     }
-    validate_captured_service_binding(
-        &service_identity,
-        &ca,
-        &options.ocr_endpoint,
-        &options.embedding_endpoint,
-    )?;
+    validate_captured_service_binding(&service_identity, &ca, &options.ocr_endpoint)?;
     if ca.is_empty() {
         return Err(invalid("authenticated-local CA is empty"));
     }
@@ -154,6 +145,7 @@ pub fn run_ocr(options: &AuthenticatedLocalOptions) -> Result<OcrCheckpoint, Acc
     let root = fs::canonicalize(&options.work_dir).map_err(io)?;
     let private = prepare_private_root(&root)?;
     write_private_candidate(&root, &candidate)?;
+    stage_native_library(options, &root)?;
     let staged_ca = write_private_ca(&root, &ca)?;
     let identity_copy = root.join(SERVICE_IDENTITY_COPY);
     fs::write(&identity_copy, canonical(&service_identity)?).map_err(io)?;
@@ -171,7 +163,7 @@ pub fn run_ocr(options: &AuthenticatedLocalOptions) -> Result<OcrCheckpoint, Acc
             "private candidate, fixture, or CA copy changed before execution",
         ));
     }
-    write_tools(&private, &options.ocr_endpoint, None)?;
+    write_tools(&private, &options.ocr_endpoint)?;
     let binary = root.join(CANDIDATE_COPY);
 
     json(&binary, &private, &scope, &["init"])?;
@@ -214,13 +206,12 @@ pub fn run_ocr(options: &AuthenticatedLocalOptions) -> Result<OcrCheckpoint, Acc
     let tool_lock = scope.join(".kio/tool-lock.json");
     let tool_lock_sha256 = sha256_regular_file(&tool_lock, MAX_FIXTURE_BYTES)?;
     let checkpoint = OcrCheckpoint {
-        schema: "kio.acceptance.authenticated-local-ocr/v1".into(),
+        schema: "kio.acceptance.authenticated-local-ocr/v2".into(),
         expected: options.expected.clone(),
         binary_sha256: sha256_regular_file(&binary, MAX_BINARY_BYTES)?,
         fixture_sha256: fixture.sha256,
         ca_sha256: sha256_regular_file(&staged_ca, MAX_FIXTURE_BYTES)?,
         ocr_endpoint_sha256: sha256_bytes(options.ocr_endpoint.as_bytes()),
-        embedding_endpoint_sha256: sha256_bytes(options.embedding_endpoint.as_bytes()),
         tools_toml_sha256: sha256_regular_file(
             &private.join("xdg-config/kio/tools.toml"),
             MAX_FIXTURE_BYTES,
@@ -260,23 +251,26 @@ pub fn run_embedding(
         read_service_identity(&root.join(SERVICE_IDENTITY_COPY))?;
     if identity_sha256 != checkpoint.service_identity_sha256
         || service_identity.ocr_endpoint != options.ocr_endpoint
-        || service_identity.embedding_endpoint != options.embedding_endpoint
     {
         return Err(invalid("private service identity checkpoint mismatch"));
     }
     let binary = root.join(CANDIDATE_COPY);
 
-    // Preserve the OCR declaration byte-for-byte and append the sole embedding
-    // declaration after its checkpoint has bound the former state.
-    append_embedding_tools(&private, &options.embedding_endpoint)?;
     json(
         &binary,
         &private,
         &scope,
-        &["adapter", "approve", EMBEDDING_TOOL, "--yes"],
+        &["model", "install", "embeddinggemma-2", "--yes"],
     )?;
-    let indexed = json(&binary, &private, &scope, &["index", "--online"])?;
-    if indexed.pointer("/status").and_then(Value::as_str) != Some("indexed") {
+    let readiness = json(&binary, &private, &scope, &["model", "status"])?;
+    if readiness.get("readiness").and_then(Value::as_str) != Some("ready") {
+        return Err(invalid("EG2 model and runtime are not ready"));
+    }
+    let indexed = json(&binary, &private, &scope, &["index", "--offline"])?;
+    if !matches!(
+        indexed.get("status").and_then(Value::as_str),
+        Some("indexed" | "noop")
+    ) {
         return Err(invalid(
             "embedding phase did not complete an index operation",
         ));
@@ -293,7 +287,7 @@ pub fn run_embedding(
             "Kio provider OCR fixture",
             "--mode",
             "vector",
-            "--online",
+            "--offline",
         ],
     )?;
     require_results(&text, "text vector query")?;
@@ -306,7 +300,7 @@ pub fn run_embedding(
             "Kio provider OCR fixture",
             "--mode",
             "hybrid",
-            "--online",
+            "--offline",
         ],
     )?;
     require_results(&hybrid, "hybrid text query")?;
@@ -314,13 +308,13 @@ pub fn run_embedding(
         &binary,
         &private,
         &scope,
-        ImageQueryStage::BeforeRepairOnline,
+        ImageQueryStage::BeforeRepair,
         &[
             "search",
             "standalone acceptance image",
             "--mode",
-            "hybrid",
-            "--online",
+            "image",
+            "--offline",
         ],
     )?;
     let image_uri = require_image_result(&image)?;
@@ -343,24 +337,7 @@ pub fn run_embedding(
     )?;
     require_results(&stored_text, "stored text query")?;
     let stored_text_rows = stable_result_rows(&stored_text)?;
-    let offline_hybrid = json(
-        &binary,
-        &private,
-        &scope,
-        &[
-            "search",
-            "Kio provider OCR fixture",
-            "--mode",
-            "hybrid",
-            "--offline",
-        ],
-    )?;
-    require_results(&offline_hybrid, "offline hybrid fallback query")?;
-    require_offline_hybrid_fallback(&offline_hybrid)?;
-
-    // Rebuild from persisted objects only.  The offline flag forbids every
-    // adapter transport, so these checks exercise the rebuilt source and
-    // replica projections without another model request.
+    // Rebuild the exact persisted vectors from the scope's CAS.
     json(
         &binary,
         &private,
@@ -390,13 +367,13 @@ pub fn run_embedding(
         &binary,
         &private,
         &scope,
-        ImageQueryStage::AfterRepairOnline,
+        ImageQueryStage::AfterRepair,
         &[
             "search",
             "standalone acceptance image",
             "--mode",
-            "hybrid",
-            "--online",
+            "image",
+            "--offline",
         ],
     )?;
     require_results(&rebuilt_text, "rebuilt text query")?;
@@ -410,16 +387,11 @@ pub fn run_embedding(
         ));
     }
 
-    let revoked = json(
-        &binary,
-        &private,
-        &scope,
-        &["adapter", "revoke", EMBEDDING_TOOL],
-    )?;
+    let revoked = json(&binary, &private, &scope, &["adapter", "revoke", OCR_TOOL])?;
     if revoked.get("status").and_then(Value::as_str) != Some("revoked") {
-        return Err(invalid("embedding grant revocation did not take effect"));
+        return Err(invalid("OCR grant revocation did not take effect"));
     }
-    json_failure_code(
+    let after_revoke = json(
         &binary,
         &private,
         &scope,
@@ -428,11 +400,10 @@ pub fn run_embedding(
             "Kio provider OCR fixture",
             "--mode",
             "vector",
-            "--online",
+            "--offline",
         ],
-        "KIO-E-SEARCH-VEC-UNAUTHORIZED-001",
-        "revoked embedding grant",
     )?;
+    require_results(&after_revoke, "EG2 vector query after OCR grant revocation")?;
     ensure_ledger_zero(&private)?;
 
     if sha256_regular_file(&binary, MAX_BINARY_BYTES)? != options.expected.candidate.binary_sha256
@@ -500,10 +471,8 @@ fn validate_captured_service_binding(
     identity: &crate::acceptance::ServiceIdentity,
     ca: &[u8],
     ocr_endpoint: &str,
-    embedding_endpoint: &str,
 ) -> Result<(), AcceptanceError> {
     if identity.ocr_endpoint != ocr_endpoint
-        || identity.embedding_endpoint != embedding_endpoint
         || identity.ca_sha256 != format!("sha256:{}", sha256_bytes(ca))
     {
         return Err(invalid(
@@ -533,6 +502,33 @@ fn prepare_private_root(root: &Path) -> Result<PathBuf, AcceptanceError> {
     Ok(private)
 }
 
+fn stage_native_library(
+    options: &AuthenticatedLocalOptions,
+    root: &Path,
+) -> Result<(), AcceptanceError> {
+    let bundle = kio_core::litert::Bundle::for_target(&options.expected.candidate.target)
+        .ok_or_else(|| invalid("unsupported EG2 runtime target"))?;
+    let package = options
+        .binary
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| invalid("candidate binary has no distribution root"))?;
+    let directory = PathBuf::from(bundle.directory());
+    let library = bundle.library.name();
+    let bytes =
+        bounded_file_with_limit(&package.join(&directory).join(library), 256 * 1024 * 1024)?;
+    if sha256_bytes(&bytes) != bundle.library.sha256 {
+        return Err(invalid(
+            "candidate native runtime differs from the pinned artifact",
+        ));
+    }
+    let destination = root.join("device").join(directory);
+    fs::create_dir_all(&destination).map_err(io)?;
+    let path = destination.join(library);
+    fs::write(&path, bytes).map_err(io)?;
+    private_file(&path)
+}
+
 fn write_private_candidate(root: &Path, bytes: &[u8]) -> Result<(), AcceptanceError> {
     let directory = root.join("device/candidate");
     fs::create_dir(&directory).map_err(io)?;
@@ -552,15 +548,12 @@ fn write_private_ca(root: &Path, bytes: &[u8]) -> Result<PathBuf, AcceptanceErro
     Ok(path)
 }
 
-fn write_tools(private: &Path, ocr: &str, embedding: Option<&str>) -> Result<(), AcceptanceError> {
-    let mut body = format!(
+fn write_tools(private: &Path, ocr: &str) -> Result<(), AcceptanceError> {
+    let body = format!(
         "[markdown.{OCR_TOOL}]\nkind = \"offline_api\"\nurl = {}\nmodel = {}\n",
         toml_string(ocr)?,
         toml_string(OCR_MODEL)?
     );
-    if let Some(endpoint) = embedding {
-        body.push_str(&embedding_config(endpoint));
-    }
     let config = private.join("xdg-config/kio");
     fs::create_dir(&config).map_err(io)?;
     private_dir(&config)?;
@@ -568,25 +561,6 @@ fn write_tools(private: &Path, ocr: &str, embedding: Option<&str>) -> Result<(),
     fs::write(&tools, body).map_err(io)?;
     private_file(&tools)
 }
-fn append_embedding_tools(private: &Path, endpoint: &str) -> Result<(), AcceptanceError> {
-    let path = private.join("xdg-config/kio/tools.toml");
-    let mut current = fs::read_to_string(&path).map_err(io)?;
-    if current.contains("[embedding.") {
-        return Err(invalid(
-            "OCR tools configuration already declares embedding",
-        ));
-    }
-    current.push_str(&embedding_config(endpoint));
-    fs::write(&path, current).map_err(io)?;
-    private_file(&path)
-}
-fn embedding_config(endpoint: &str) -> String {
-    format!(
-        "\n[embedding.{EMBEDDING_TOOL}]\nkind = \"offline_api\"\nurl = {}\nmodel = \"Qwen/Qwen3-VL-Embedding-2B\"\n",
-        toml_string(endpoint).expect("validated endpoint serializes")
-    )
-}
-
 fn copy_fixture(fixture: &CapturedFixture, scope: &Path) -> Result<(), AcceptanceError> {
     fs::write(scope.join(OCR_PDF), &fixture.pdf).map_err(io)?;
     fs::write(scope.join(IMAGE_PNG), &fixture.image).map_err(io)?;
@@ -732,47 +706,6 @@ fn write_image_query_diagnostic(
     private_file(&path)
 }
 
-fn json_failure_code(
-    binary: &Path,
-    private: &Path,
-    scope: &Path,
-    args: &[&str],
-    expected_code: &str,
-    context: &str,
-) -> Result<(), AcceptanceError> {
-    let mut command = Command::new(binary);
-    IsolatedChildEnvironment::new(
-        private,
-        private.join("xdg-config"),
-        private.join("xdg-data"),
-        private.join("xdg-cache"),
-        private.join("tmp"),
-    )
-    .apply(&mut command)?;
-    command.current_dir(scope).arg("--json").args(args);
-    let output = run_bounded_command(
-        &mut command,
-        BoundedProcessOptions {
-            timeout: COMMAND_TIMEOUT,
-            max_stdout_bytes: MAX_OUTPUT,
-            max_stderr_bytes: MAX_OUTPUT / 4,
-        },
-        None,
-    )
-    .map_err(|error| AcceptanceError::Command(format!("{context} did not complete: {error}")))?;
-    if output.status.success() {
-        return Err(invalid(format!("{context} unexpectedly succeeded")));
-    }
-    let error: Value = serde_json::from_str(&output.stderr)
-        .map_err(|_| invalid(format!("{context} did not emit a JSON error")))?;
-    if error.get("error_code").and_then(Value::as_str) != Some(expected_code) {
-        return Err(invalid(format!(
-            "{context} did not refuse the revoked grant"
-        )));
-    }
-    Ok(())
-}
-
 fn require_results(value: &Value, label: &str) -> Result<(), AcceptanceError> {
     if value
         .pointer("/results")
@@ -797,18 +730,6 @@ fn require_image_result(value: &Value) -> Result<String, AcceptanceError> {
         .filter(|uri| uri.starts_with("kio://") && uri.contains("/object/image/sha256:"))
         .map(ToOwned::to_owned)
         .ok_or_else(|| invalid("image vector query returned no image object URI"))
-}
-fn require_offline_hybrid_fallback(value: &Value) -> Result<(), AcceptanceError> {
-    if value.get("requested_mode").and_then(Value::as_str) != Some("hybrid")
-        || value.get("resolved_mode").and_then(Value::as_str) != Some("text")
-        || value.get("fallback").and_then(Value::as_bool) != Some(true)
-        || value.get("fallback_reason").and_then(Value::as_str) != Some("offline")
-    {
-        return Err(invalid(
-            "offline hybrid search did not report the required text fallback",
-        ));
-    }
-    Ok(())
 }
 fn assert_opened_image(value: &Value, expected: &Path) -> Result<(), AcceptanceError> {
     let path = value
@@ -859,6 +780,31 @@ fn assert_vectors(scope: &Path) -> Result<(), AcceptanceError> {
         "embedding",
         EMBEDDING_TOOL,
     )?;
+    if profile != kio_core::eg2::profile_hash() {
+        return Err(invalid(
+            "scope does not use the pinned EG2 semantic profile",
+        ));
+    }
+    let store = kio_core::cas::ObjectStore::new(scope.join(".kio"));
+    let mut targets = std::collections::BTreeSet::new();
+    for hash in store
+        .embedding_hashes()
+        .map_err(|error| invalid(error.to_string()))?
+    {
+        let object = store
+            .read_embedding(&hash)
+            .map_err(|error| invalid(error.to_string()))?;
+        if object.profile_hash != profile
+            || object.metadata.producer.execution_mode
+                != kio_core::cas::ProducerExecutionMode::NativeLibrary
+        {
+            return Err(invalid("CAS lacks EG2 native producer provenance"));
+        }
+        targets.insert(object.target_type);
+    }
+    if !targets.contains("chunk") || !targets.contains("image") {
+        return Err(invalid("CAS lacks native text or image embeddings"));
+    }
     for (table, id, target) in [
         ("chunk_vec", "chunk_id", "chunk"),
         ("image_vec", "image_id", "image"),
@@ -1102,15 +1048,13 @@ fn verify_checkpoint(
     root: &Path,
     checkpoint: &OcrCheckpoint,
 ) -> Result<(), AcceptanceError> {
-    if checkpoint.schema != "kio.acceptance.authenticated-local-ocr/v1"
+    if checkpoint.schema != "kio.acceptance.authenticated-local-ocr/v2"
         || checkpoint.expected != options.expected
         || checkpoint.binary_sha256
             != sha256_regular_file(&root.join(CANDIDATE_COPY), MAX_BINARY_BYTES)?
         || checkpoint.fixture_sha256 != fixture_digest_from_scope(&root.join("scope"))?
         || checkpoint.ca_sha256 != sha256_regular_file(&root.join(CA_COPY), MAX_FIXTURE_BYTES)?
         || checkpoint.ocr_endpoint_sha256 != sha256_bytes(options.ocr_endpoint.as_bytes())
-        || checkpoint.embedding_endpoint_sha256
-            != sha256_bytes(options.embedding_endpoint.as_bytes())
         || checkpoint.tools_toml_sha256
             != sha256_regular_file(
                 &root.join("device/xdg-config/kio/tools.toml"),
@@ -1296,7 +1240,7 @@ mod tests {
         let private = prepare_private_root(temporary.path()).unwrap();
         let endpoint = "https://127.0.0.1:9443/ocr?name=\\\"quoted\\\"";
 
-        write_tools(&private, endpoint, None).unwrap();
+        write_tools(&private, endpoint).unwrap();
 
         let tools = fs::read_to_string(private.join("xdg-config/kio/tools.toml")).unwrap();
         let parsed: toml::Value = toml::from_str(&tools).unwrap();
@@ -1311,73 +1255,32 @@ mod tests {
     }
 
     #[test]
-    fn embedding_configuration_appends_without_rewriting_ocr_declaration() {
-        let temporary = tempfile::tempdir().unwrap();
-        let private = prepare_private_root(temporary.path()).unwrap();
-        write_tools(&private, "https://127.0.0.1:9443", None).unwrap();
-        let before = fs::read_to_string(private.join("xdg-config/kio/tools.toml")).unwrap();
-
-        append_embedding_tools(&private, "https://127.0.0.1:9444").unwrap();
-
-        let after = fs::read_to_string(private.join("xdg-config/kio/tools.toml")).unwrap();
-        assert!(after.starts_with(&before));
-        let parsed: toml::Value = toml::from_str(&after).unwrap();
-        assert_eq!(
-            parsed["embedding"][EMBEDDING_TOOL]["url"].as_str(),
-            Some("https://127.0.0.1:9444")
-        );
-        assert!(append_embedding_tools(&private, "https://127.0.0.1:9445").is_err());
-    }
-
-    #[test]
     fn captured_service_binding_rejects_ca_or_endpoint_mismatch_before_cli() {
         let ca = b"captured-ca";
         let identity = crate::acceptance::ServiceIdentity {
-            schema: "kio.local-gpu.identity/v1".into(),
+            schema: "kio.local-gpu.ocr-identity/v1".into(),
             run_nonce: "run".into(),
             ocr_endpoint: "https://127.0.0.1:18080".into(),
-            embedding_endpoint: "https://127.0.0.1:18081".into(),
             ca_sha256: format!("sha256:{}", sha256_bytes(ca)),
             leaf_cert_sha256: String::new(),
             controller_sha256: String::new(),
             proxy_sha256: String::new(),
             entrypoint_sha256: String::new(),
             ocr_compose_sha256: String::new(),
-            embedding_compose_sha256: String::new(),
             backend_config_sha256: String::new(),
             ocr_image: String::new(),
             ocr_revision: String::new(),
             ocr_weight_sha256: String::new(),
-            embedding_image: String::new(),
-            embedding_revision: String::new(),
-            embedding_weight_sha256: String::new(),
         };
         assert!(
-            validate_captured_service_binding(
-                &identity,
-                ca,
-                "https://127.0.0.1:18080",
-                "https://127.0.0.1:18081"
-            )
-            .is_ok()
+            validate_captured_service_binding(&identity, ca, "https://127.0.0.1:18080",).is_ok()
         );
         assert!(
-            validate_captured_service_binding(
-                &identity,
-                b"other-ca",
-                "https://127.0.0.1:18080",
-                "https://127.0.0.1:18081"
-            )
-            .is_err()
+            validate_captured_service_binding(&identity, b"other-ca", "https://127.0.0.1:18080",)
+                .is_err()
         );
         assert!(
-            validate_captured_service_binding(
-                &identity,
-                ca,
-                "https://127.0.0.1:28080",
-                "https://127.0.0.1:18081"
-            )
-            .is_err()
+            validate_captured_service_binding(&identity, ca, "https://127.0.0.1:28080",).is_err()
         );
     }
 
@@ -1417,7 +1320,7 @@ mod tests {
                 .iter()
                 .map(|tool| tool.tool_id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["paddleocr_vl_local", "prepare_default", EMBEDDING_TOOL]
+            vec![EMBEDDING_TOOL, "paddleocr_vl_local", "prepare_default"]
         );
         assert_eq!(
             runtime
@@ -1448,21 +1351,19 @@ mod tests {
             {"result_type":"chunk","chunk_hash":"sha256:other"}
         ]}"#;
 
-        write_image_query_diagnostic(&private, ImageQueryStage::BeforeRepairOnline, response)
-            .unwrap();
+        write_image_query_diagnostic(&private, ImageQueryStage::BeforeRepair, response).unwrap();
 
         let path = private
             .join(IMAGE_QUERY_DIAGNOSTICS)
-            .join(ImageQueryStage::BeforeRepairOnline.diagnostic_name());
+            .join(ImageQueryStage::BeforeRepair.diagnostic_name());
         assert_eq!(fs::read(&path).unwrap(), response);
         let captured: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert!(require_image_result(&captured).is_err());
         assert!(
-            write_image_query_diagnostic(&private, ImageQueryStage::BeforeRepairOnline, response)
+            write_image_query_diagnostic(&private, ImageQueryStage::BeforeRepair, response)
                 .is_err()
         );
 
-        write_image_query_diagnostic(&private, ImageQueryStage::AfterRepairOnline, response)
-            .unwrap();
+        write_image_query_diagnostic(&private, ImageQueryStage::AfterRepair, response).unwrap();
     }
 }

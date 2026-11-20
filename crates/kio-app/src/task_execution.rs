@@ -154,6 +154,10 @@ pub(crate) fn known_markdownize_completion(
 #[derive(Debug, Default, Clone)]
 pub(crate) struct ExecOutcome {
     pub(crate) resource_limit: Option<kio_core::error::ResourceLimit>,
+    pub(crate) resource_busy: usize,
+    pub(crate) model_not_ready: usize,
+    pub(crate) native_failure: Option<crate::eg2::WorkerError>,
+    pub(crate) embedding_unavailable_reason: Option<&'static str>,
     pub(crate) executed: usize,
     pub(crate) failed: usize,
     /// R11-2: tasks whose online send this pass was halted by the budget cap
@@ -189,6 +193,27 @@ pub(crate) struct ExecOutcome {
 }
 
 impl ExecOutcome {
+    fn native_rejection(&self) -> Option<(crate::response::Completion, &'static str)> {
+        use crate::{eg2::WorkerError, response::Completion};
+        if let Some(error) = self.native_failure.filter(|error| error.is_hash_mismatch()) {
+            Some((Completion::Permanent, error.public_error().0))
+        } else if self.resource_busy > 0 {
+            Some((
+                Completion::Partial,
+                WorkerError::ResourceBusy.public_error().0,
+            ))
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn native_error_code(&self) -> Option<String> {
+        self.native_rejection()
+            .map(|(_, code)| code)
+            .or_else(|| self.native_failure.map(|error| error.public_error().0))
+            .map(str::to_owned)
+    }
+
     pub(crate) fn attempted(&self) -> usize {
         self.executed + self.failed
     }
@@ -197,6 +222,18 @@ impl ExecOutcome {
         if self.resource_limit.is_none() {
             self.resource_limit = other.resource_limit;
         }
+        self.resource_busy += other.resource_busy;
+        self.model_not_ready += other.model_not_ready;
+        if self.native_failure.is_none()
+            || other
+                .native_failure
+                .is_some_and(crate::eg2::WorkerError::is_hash_mismatch)
+        {
+            self.native_failure = other.native_failure;
+        }
+        self.embedding_unavailable_reason = self
+            .embedding_unavailable_reason
+            .or(other.embedding_unavailable_reason);
         self.executed += other.executed;
         self.failed += other.failed;
         self.paused += other.paused;
@@ -211,9 +248,11 @@ pub(crate) fn batch_completion(outcome: &ExecOutcome) -> crate::response::Comple
     use crate::response::Completion;
     if outcome.resource_limit.is_some() {
         Completion::Partial
+    } else if let Some((completion, _)) = outcome.native_rejection() {
+        completion
     } else if outcome.auth_failed > 0 {
         Completion::AuthRequired
-    } else if outcome.paused > 0 {
+    } else if outcome.paused > outcome.resource_busy + outcome.model_not_ready {
         Completion::BudgetBlocked
     } else if outcome.failed_retryable > 0 || outcome.inflight > 0 {
         Completion::Partial
@@ -235,10 +274,18 @@ pub(crate) fn enrichment_completion(outcome: &ExecOutcome) -> crate::response::C
     use crate::response::Completion;
     if outcome.resource_limit.is_some() {
         Completion::Partial
+    } else if let Some((completion, _)) = outcome.native_rejection() {
+        completion
     } else if outcome.auth_failed > 0 {
         Completion::AuthRequired
-    } else if outcome.paused > 0 {
+    } else if outcome.paused > outcome.resource_busy + outcome.model_not_ready {
         Completion::BudgetBlocked
+    } else if outcome.native_failure.is_some() {
+        if outcome.failed_retryable > 0 {
+            Completion::Partial
+        } else {
+            Completion::Permanent
+        }
     } else {
         Completion::Complete
     }
@@ -1175,6 +1222,7 @@ pub(crate) fn retry_reason(kind: RetryErrorKind) -> &'static str {
     match kind {
         RetryErrorKind::ResourceLimit => "resource_limit",
         RetryErrorKind::NetworkError => "network_error",
+        RetryErrorKind::NativeRuntime => "embedding_runtime",
         RetryErrorKind::RateLimit => "rate_limit",
         RetryErrorKind::AuthError => "auth_error",
         RetryErrorKind::LocalPeerAuth => "local_peer_auth",
@@ -1191,6 +1239,7 @@ pub(crate) fn retry_kind_from_reason(reason: Option<&str>) -> RetryErrorKind {
     match reason {
         Some("resource_limit") => RetryErrorKind::ResourceLimit,
         Some("network_error") => RetryErrorKind::NetworkError,
+        Some("embedding_runtime") => RetryErrorKind::NativeRuntime,
         Some("rate_limit") => RetryErrorKind::RateLimit,
         Some("auth_error") => RetryErrorKind::AuthError,
         Some("local_peer_auth") => RetryErrorKind::LocalPeerAuth,
@@ -1383,6 +1432,8 @@ pub(crate) fn media_type_for_cli_path(path: &Path) -> &'static str {
 /// compatibility/unknown bucket.
 pub(crate) fn paused_tasks_by_hold_reason(tasks: &[TaskDescriptor]) -> PausedTasksByHoldReason {
     let mut resource_limit = 0u64;
+    let mut resource_busy = 0u64;
+    let mut model_not_ready = 0u64;
     let mut budget = 0u64;
     let mut auth = 0u64;
     let mut tier_b_approval = 0u64;
@@ -1393,6 +1444,8 @@ pub(crate) fn paused_tasks_by_hold_reason(tasks: &[TaskDescriptor]) -> PausedTas
         }
         match task.hold_reason {
             Some(HoldReason::ResourceLimit) => resource_limit += 1,
+            Some(HoldReason::ResourceBusy) => resource_busy += 1,
+            Some(HoldReason::ModelNotReady) => model_not_ready += 1,
             Some(HoldReason::Budget) => budget += 1,
             Some(HoldReason::Auth) => auth += 1,
             Some(HoldReason::TierBApproval) => tier_b_approval += 1,
@@ -1402,6 +1455,8 @@ pub(crate) fn paused_tasks_by_hold_reason(tasks: &[TaskDescriptor]) -> PausedTas
     }
     PausedTasksByHoldReason {
         resource_limit,
+        resource_busy,
+        model_not_ready,
         budget,
         auth,
         tier_b_approval,

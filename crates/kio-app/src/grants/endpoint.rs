@@ -56,9 +56,6 @@ pub(super) fn validate_disclosure(
         .map(String::as_str)
         .collect::<Vec<_>>();
     let valid_content = match (disclosure.purpose.as_str(), disclosure.tool_id.as_str()) {
-        ("embedding", "qwen3_vl_embedding_local") => {
-            types == ["query text", "document text", "images"]
-        }
         ("embedding", GENERIC_LOCAL_EMBEDDING_TOOL_ID) => matches!(
             types.as_slice(),
             ["query text", "document text"] | ["query text", "document text", "images"]

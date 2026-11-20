@@ -634,7 +634,7 @@ Batch の停止条件・明示解除と bounded attempt の正本は [04-pipelin
 | engine | Kio と同一 binary の管理 worker 内で native library を使う。外部 server、Python、証明書は不要。ネットワーク送信・listen なし |
 | 入力・出力 | text/image/query、cap 2048、特殊 token と正規化有効、overflow ERROR、768 次元 / cosine / multimodal |
 | prompt | query prefix は `task: search result | query: `。document は `title: none | text: ` に上記 filename context 付き本文を続ける固定 template とし、exact prompt bytes を profile に pin。空 prompt や別文面へ置換しない |
-| 窓 | 全文を試し、code=3 かつ `Input sequence length (N) exceeds maximum supported signature length (2048).` の N>2048 だけを InputOverflow として二分。他の native error は分割理由にしない |
+| 窓 | 全文を試す。固定 LiteRT-LM v0.19.1 C API の embedding 計算が code=3 を返し、診断が `INVALID_ARGUMENT: ERROR: [third_party/odml/litert_lm/runtime/core/embedding_engine_impl.cc:<行番号>]`、LF、`└ ` に続く `Input sequence length (N) exceeds maximum supported signature length (2048).`（N>2048）に完全一致する場合だけ InputOverflow として二分する。他の native error は分割理由にしない |
 | 境界 | 本文 Unicode scalar 中央半分で段落空行 → 文末 `.。!！?？` → 文字境界。同距離は先の境界。全連続 byte 区間を重複・欠落なく覆い、各窓に同じ prompt/context。長い query も同じ規則、truncation なし |
 | 集約 | 窓を L2 正規化 → 本文文字数で加重平均（prefix を除外）→ 再 L2 正規化。固定順 f64 集約、最終 f32。全窓成功後に一つの vector を返し、窓別 Task/保存を作らない |
 | 有界性 | 共通 max_chars=6000 を維持。depth 32、本文 scalar 数由来の二分木 call 上限と時間上限。空/零 norm/不正値/分割不能は明示失敗。小窓の overflow も本文を切り捨てない |

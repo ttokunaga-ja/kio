@@ -101,7 +101,9 @@ fn embedding_identity(
     request: RuntimeExecutionIdentityRequest<'_>,
     declared: Option<&DeclaredAdapter>,
 ) -> Result<RuntimeExecutionIdentity> {
-    let tool_id = effective_tool_id(declared, "gemini_embedding_2", "qwen3_vl_embedding_local");
+    let tool_id = declared
+        .and_then(|declared| declared.tool_id.as_deref())
+        .unwrap_or("gemini_embedding_2");
     require_requested_tool_id(request.tool_id, tool_id)?;
     match tool_id {
         "gemini_embedding_2" => {
@@ -113,9 +115,7 @@ fn embedding_identity(
             );
             online_identity(request, tool_id, declared, &destination)
         }
-        "qwen3_vl_embedding_local" | GENERIC_LOCAL_EMBEDDING_TOOL_ID => {
-            local_identity(settings, request, tool_id, declared)
-        }
+        GENERIC_LOCAL_EMBEDDING_TOOL_ID => local_identity(settings, request, tool_id, declared),
         _ => Err(schema("declared embedding target is unsupported")),
     }
 }
@@ -478,10 +478,11 @@ mod tests {
         let trust_digest = crate::local_peer::capture_private_local_trust(&ca_path).unwrap();
 
         let declaration = DeclaredAdapter {
-            tool_id: Some("qwen3_vl_embedding_local".to_owned()),
+            tool_id: Some(GENERIC_LOCAL_EMBEDDING_TOOL_ID.to_owned()),
             kind: Some("offline_api".to_owned()),
             url: Some("https://127.0.0.1:8443/".to_owned()),
-            model: Some("Qwen/Qwen3-VL-Embedding-2B".to_owned()),
+            model: Some("test-embedding".to_owned()),
+            local_embedding: Some(crate::tool_lock::test_local_embedding_options()),
             ..DeclaredAdapter::default()
         };
         let mut declarations = HashMap::new();
@@ -498,7 +499,7 @@ mod tests {
                 settings,
                 RuntimeExecutionIdentityRequest {
                     role: "embedding",
-                    tool_id: "qwen3_vl_embedding_local",
+                    tool_id: GENERIC_LOCAL_EMBEDDING_TOOL_ID,
                     tool_profile_hash: "sha256:local-profile",
                 },
             )
@@ -512,10 +513,11 @@ mod tests {
     #[test]
     fn local_http_identity_is_exact_and_requires_no_ca_or_auth() {
         let declaration = DeclaredAdapter {
-            tool_id: Some("qwen3_vl_embedding_local".to_owned()),
+            tool_id: Some(GENERIC_LOCAL_EMBEDDING_TOOL_ID.to_owned()),
             kind: Some("offline_api".to_owned()),
             url: Some("http://127.0.0.1:8443/model/".to_owned()),
-            model: Some("Qwen/Qwen3-VL-Embedding-2B".to_owned()),
+            model: Some("test-embedding".to_owned()),
+            local_embedding: Some(crate::tool_lock::test_local_embedding_options()),
             ..DeclaredAdapter::default()
         };
         with_declaration("embedding", declaration, |settings| {
@@ -523,7 +525,7 @@ mod tests {
                 settings,
                 RuntimeExecutionIdentityRequest {
                     role: "embedding",
-                    tool_id: "qwen3_vl_embedding_local",
+                    tool_id: GENERIC_LOCAL_EMBEDDING_TOOL_ID,
                     tool_profile_hash: "sha256:local-http-profile",
                 },
             )

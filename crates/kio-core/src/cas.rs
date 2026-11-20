@@ -431,6 +431,16 @@ impl EmbeddingObject {
                 None,
             ));
         }
+        if self.profile_hash == crate::eg2::profile_hash()
+            && (self.dimensions != crate::eg2::DIMENSIONS as u64
+                || self.distance != "cosine"
+                || self.modality != "multimodal")
+        {
+            return Err(embedding_corrupt_error(
+                "EG2 embedding metadata differs from the profile",
+                None,
+            ));
+        }
         self.metadata.validate(
             &self.profile_hash,
             &self.target_type,

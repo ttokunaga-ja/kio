@@ -315,7 +315,9 @@ pub(crate) fn run_batch(ctx: &Invocation<'_>, args: BatchArgs) -> Result<Command
                         tasks_inflight: outcome.inflight,
                         tasks_inflight_unreadable: outcome.held_unreadable,
                     },
-                    error_code: batch_error_code(completion),
+                    error_code: outcome
+                        .native_error_code()
+                        .or_else(|| batch_error_code(completion)),
                 })),
                 completion,
             })
@@ -442,7 +444,9 @@ pub(crate) fn run_batch(ctx: &Invocation<'_>, args: BatchArgs) -> Result<Command
                         tasks_inflight: outcome.inflight,
                         tasks_inflight_unreadable: outcome.held_unreadable,
                     },
-                    error_code: batch_error_code(completion),
+                    error_code: outcome
+                        .native_error_code()
+                        .or_else(|| batch_error_code(completion)),
                 })),
                 completion,
             })

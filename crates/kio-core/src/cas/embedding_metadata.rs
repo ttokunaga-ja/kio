@@ -56,7 +56,7 @@ impl ProducerProvenance {
         Ok(producer)
     }
 
-    fn validate(&self, profile_hash: &str) -> Result<()> {
+    pub fn validate(&self, profile_hash: &str) -> Result<()> {
         if !is_hash(&self.profile_hash) || self.profile_hash != profile_hash {
             return Err(embedding_corrupt_error(
                 "producer profile hash is invalid or unbound",
@@ -69,14 +69,44 @@ impl ProducerProvenance {
                 None,
             ));
         }
-        // A native record needs authenticated profile/artifact-set context,
-        // which the current non-native CAS boundary does not have. Syntactic
-        // provenance alone must never authenticate a runtime library.
-        if self.execution_mode == ProducerExecutionMode::NativeLibrary {
+        let native = self.execution_mode == ProducerExecutionMode::NativeLibrary;
+        if native != (profile_hash == crate::eg2::profile_hash()) {
             return Err(embedding_corrupt_error(
-                "native producer requires authenticated artifact-set validation",
+                "producer execution mode does not match EG2 profile",
                 None,
             ));
+        }
+        if native {
+            let target = match (self.os.as_str(), self.arch.as_str()) {
+                ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
+                ("macos", "aarch64") => "aarch64-apple-darwin",
+                ("windows", "x86_64") => "x86_64-pc-windows-msvc",
+                _ => {
+                    return Err(embedding_corrupt_error(
+                        "unrecognized native producer target",
+                        None,
+                    ));
+                }
+            };
+            let pin = crate::litert::Bundle::for_target(target).expect("supported EG2 target");
+            if self.runtime_version.as_deref() != Some(crate::litert::VERSION)
+                || self
+                    .runtime_library_sha256
+                    .as_deref()
+                    .and_then(|digest| digest.strip_prefix("sha256:"))
+                    != Some(pin.library.sha256)
+                || self
+                    .cpu_backend
+                    .as_deref()
+                    .is_none_or(|backend| backend.trim().is_empty())
+                || self.threads.is_none_or(|threads| threads == 0)
+            {
+                return Err(embedding_corrupt_error(
+                    "native producer does not match the pinned runtime",
+                    None,
+                ));
+            }
+            return Ok(());
         }
         if self.runtime_version.is_some()
             || self.runtime_library_sha256.is_some()

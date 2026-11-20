@@ -187,6 +187,7 @@ struct IndexPublishedWork {
     skipped_unrecognized_binary_files: usize,
     embedding_tasks_executed: usize,
     embedding_tasks_failed: usize,
+    embedding_unavailable_reason: Option<&'static str>,
     tree_hash: String,
     commit_hash: Option<String>,
     commit: Option<CommitObject>,
@@ -214,6 +215,7 @@ impl IndexPublishedWork {
             skipped_unrecognized_binary_files: self.skipped_unrecognized_binary_files,
             embedding_tasks_executed: self.embedding_tasks_executed,
             embedding_tasks_failed: self.embedding_tasks_failed,
+            embedding_unavailable_reason: self.embedding_unavailable_reason,
             tree_hash: self.tree_hash,
             commit_hash: self.commit_hash,
             commit: self.commit,
@@ -952,11 +954,14 @@ fn run_index_for_repo_inner(
         skipped_unrecognized_binary_files: index_result.skipped_unrecognized_binary_files,
         embedding_tasks_executed: enrichment.executed,
         embedding_tasks_failed: enrichment.failed,
+        embedding_unavailable_reason: enrichment.embedding_unavailable_reason,
         tree_hash: outcome.tree_hash,
         commit_hash: outcome.commit_hash,
         commit: outcome.commit,
         skipped: skipped_disclosure(&rebuild_report, repo.kio_dir()),
-        error_code: (index_result.failed_files > 0).then(|| "KIO-E-INDEX-PARTIAL-001".to_owned()),
+        error_code: enrichment.native_error_code().or_else(|| {
+            (index_result.failed_files > 0).then(|| "KIO-E-INDEX-PARTIAL-001".to_owned())
+        }),
         gc: None,
         publication_status: None,
         child_scopes: None,
@@ -989,6 +994,8 @@ fn run_index_for_repo_inner(
         let mut child_gc_reports = BTreeMap::<String, GcReport>::new();
         let mut child_deferrals = BTreeMap::new();
         let parent_completion = completion;
+        let model_hash_error = crate::eg2::WorkerError::ModelHashMismatch.public_error().0;
+        let mut model_hash_rejected = output.error_code.as_deref() == Some(model_hash_error);
         let mut child_completions = Vec::new();
         let mut incomplete_child_discovery = false;
         let mut restart_count = u8::from(page.restarted_from_root);
@@ -1102,6 +1109,8 @@ fn run_index_for_repo_inner(
                             }
                         }
                         let child_completion = child_output.completion;
+                        model_hash_rejected |=
+                            child_output.response.error_code() == Some(model_hash_error);
                         if child_completion == Completion::Complete {
                             child.status = "indexed".to_owned();
                         } else {
@@ -1138,6 +1147,7 @@ fn run_index_for_repo_inner(
                                 });
                         }
                     }
+                    Err(error) if error.exit_code() == ExitCode::Interrupted => return Err(error),
                     Err(error) => {
                         #[cfg(test)]
                         eprintln!(
@@ -1238,6 +1248,10 @@ fn run_index_for_repo_inner(
             child_completions,
             incomplete_child_discovery,
         );
+        if model_hash_rejected {
+            completion = Completion::Permanent;
+            output.error_code = Some(model_hash_error.to_owned());
+        }
         if completion != Completion::Complete && output.error_code.is_none() {
             output.error_code = Some(
                 match completion {
@@ -2408,6 +2422,8 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
         rebuilt_chunks: report.rebuilt_chunks,
         embedding_tasks_executed: enrichment.executed,
         embedding_tasks_failed: enrichment.failed,
+        embedding_unavailable_reason: enrichment.embedding_unavailable_reason,
+        error_code: enrichment.native_error_code(),
         paused_tasks: enrichment.paused,
         skipped: skipped_disclosure(&report, repo.kio_dir()),
     };

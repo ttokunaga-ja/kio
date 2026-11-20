@@ -1,5 +1,6 @@
 //! The pinned device model is installed only through the explicit model command.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{self, Read, Seek};
 use std::path::{Path, PathBuf};
@@ -11,11 +12,11 @@ use kio_core::{ExitCode, KioError, Result};
 
 use crate::commands::ModelCommand;
 use crate::context::AppContext;
-use crate::response::model::{ModelReadiness, ModelResponse};
+use crate::response::model::{ModelProducer, ModelReadiness, ModelResponse};
 use crate::response::{CommandResponse, Completion, ResponseBody};
 
-const MODEL: &str = "embeddinggemma-2";
-const REVISION: &str = "e301f74d5551b0c2641bd5cb4652a76239d5c5f8";
+use kio_core::eg2::{MODEL, MODEL_SHA256, REVISION};
+
 const ARTIFACT: &str = "embeddinggemma-2-text-vision-440m.litertlm";
 const SOURCE: &str =
     "https://huggingface.co/litert-community/embeddinggemma-2-text-vision-440m-litert-lm";
@@ -37,7 +38,7 @@ impl Pin {
         let _ = control;
         Self {
             bytes: 387_710_976,
-            sha256: "92dcbea108899e5d6e30d919b0744f90d9967e80c67a4ab5503ac16d54f62eb0",
+            sha256: MODEL_SHA256,
         }
     }
 
@@ -53,6 +54,7 @@ impl Pin {
         path: &Path,
         readiness: ModelReadiness,
         reason: &'static str,
+        runtime_version: Option<String>,
     ) -> CommandResponse {
         CommandResponse {
             body: ResponseBody::Model(ModelResponse {
@@ -61,7 +63,7 @@ impl Pin {
                 profile_hash: None,
                 model_revision: REVISION,
                 model_hash: self.sha256,
-                runtime_version: None,
+                runtime_version,
                 readiness,
                 reason,
                 path: path.display().to_string(),
@@ -71,6 +73,24 @@ impl Pin {
             }),
             completion: Completion::Complete,
         }
+    }
+
+    fn open_installed(
+        &self,
+        base: &Path,
+        control: &ControlHandle,
+    ) -> Result<Option<(File, Option<ModelMismatch>)>> {
+        let directory = self.directory(base);
+        let Some(installed) = crate::private_state::open_readonly(&directory, base, control)?
+        else {
+            return Ok(None);
+        };
+        if !installed.contains_entry(Path::new(ARTIFACT))? {
+            return Ok(None);
+        }
+        let mut file = verified_model_file(&installed)?;
+        let mismatch = self.mismatch(&mut file, &directory.join(ARTIFACT))?;
+        Ok(Some((file, mismatch)))
     }
 
     /// Returns a mismatch reason for a regular file whose bytes fail the pin.
@@ -99,18 +119,11 @@ pub(crate) fn run(
     let path = directory.join(ARTIFACT);
     match command {
         ModelCommand::Status => {
-            let installed = crate::private_state::open_readonly(&directory, &base, control)?;
-            let Some(installed) = installed else {
-                return Ok(missing(&pin, &path));
-            };
-            let leaf = Path::new(ARTIFACT);
-            if !installed.contains_entry(leaf)? {
-                return Ok(missing(&pin, &path));
+            let mut response = model_status(&pin, &base, &path, control)?;
+            if let ResponseBody::Model(model) = &mut response.body {
+                describe_selected_profile(ctx.cwd(), control, model)?;
             }
-            let mut file = verified_model_file(&installed)?;
-            if let Some(mismatch) = pin.mismatch(&mut file, &path)? {
-                return Ok(pin.response(&path, ModelReadiness::HashMismatch, mismatch.message()));
-            }
+            return Ok(response);
         }
         ModelCommand::Install { from, yes, offline } => {
             if offline && from.is_none() {
@@ -152,7 +165,142 @@ pub(crate) fn run(
         &path,
         ModelReadiness::Ready,
         "model size and SHA-256 verified",
+        None,
     ))
+}
+
+fn model_status(
+    pin: &Pin,
+    base: &Path,
+    path: &Path,
+    control: &ControlHandle,
+) -> Result<CommandResponse> {
+    use crate::eg2::WorkerError;
+    let Some((_, mismatch)) = pin.open_installed(base, control)? else {
+        return Ok(pin.response(
+            path,
+            ModelReadiness::Missing,
+            "model is not installed; run kio model install embeddinggemma-2",
+            None,
+        ));
+    };
+    if let Some(mismatch) = mismatch {
+        return Ok(pin.response(path, ModelReadiness::HashMismatch, mismatch.message(), None));
+    }
+    let (readiness, reason, version) = match crate::eg2::verify_runtime() {
+        Ok(()) => (
+            ModelReadiness::Ready,
+            "model and runtime SHA-256 verified",
+            Some(kio_core::litert::VERSION.to_owned()),
+        ),
+        Err(WorkerError::RuntimeHashMismatch) => {
+            (ModelReadiness::HashMismatch, "runtime_hash_mismatch", None)
+        }
+        Err(error) => (ModelReadiness::Missing, error.reason(), None),
+    };
+    Ok(pin.response(path, readiness, reason, version))
+}
+
+fn describe_selected_profile(
+    cwd: &Path,
+    control: &ControlHandle,
+    model: &mut ModelResponse,
+) -> Result<()> {
+    use kio_core::cas::EmbeddingContext;
+    use kio_core::scope::Repository;
+
+    let settings = crate::settings::adapter_runtime_settings_for_roles(control, &["embedding"])?;
+    let Some(execution) =
+        kio_adapter::catalog::active_embedding_execution_with_control(&settings, control)
+    else {
+        return Ok(());
+    };
+    let profile = crate::embedding::admission::declared_embedding_profile(&settings, execution)?;
+    let cwd = cwd
+        .canonicalize()
+        .map_err(|error| KioError::io(error.to_string(), cwd.display().to_string()))?;
+    for root in cwd.ancestors() {
+        match std::fs::symlink_metadata(root.join(".kio")) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(KioError::io(error.to_string(), root.display().to_string())),
+            Ok(_) => {}
+        }
+        let repo = Repository::open_read_only_with_control(root, control.clone())?;
+        let store = repo.object_store();
+        let mut current = BTreeSet::new();
+        let mut previous = BTreeSet::new();
+        let mut producers = BTreeMap::new();
+        for hash in store.embedding_hashes()? {
+            let object = store.read_embedding(&hash)?;
+            let filename = match object.context {
+                Some(EmbeddingContext::Text(filename)) => Some(filename),
+                _ => None,
+            };
+            let input = (object.target_type, object.target_hash, filename);
+            if object.profile_hash != profile.profile_hash {
+                previous.insert(input);
+                continue;
+            }
+            current.insert(input);
+            let producer = object.metadata.producer;
+            if let (Some(library), Some(version)) =
+                (producer.runtime_library_sha256, producer.runtime_version)
+            {
+                *producers
+                    .entry((producer.os, producer.arch, library, version))
+                    .or_insert(0) += 1;
+            }
+        }
+        model.reembedding_count = Some(previous.difference(&current).count() as u64);
+        model.producers = producers
+            .into_iter()
+            .map(
+                |((os, arch, library_sha256, runtime_version), count)| ModelProducer {
+                    os,
+                    arch,
+                    library_sha256,
+                    runtime_version,
+                    count,
+                },
+            )
+            .collect();
+        model.mixed_producers = model.producers.len() > 1;
+        break;
+    }
+    model.selected_profile = Some(profile.tool_id);
+    model.profile_hash = Some(profile.profile_hash);
+    Ok(())
+}
+
+/// Report an absent artifact without loading weights or opening a worker.
+pub(crate) fn engine_model_absent(control: &ControlHandle) -> bool {
+    let base = crate::settings::data_home(control);
+    matches!(
+        Pin::current(control)
+            .directory(&base)
+            .join(ARTIFACT)
+            .try_exists(),
+        Ok(false)
+    )
+}
+
+pub(crate) fn open_engine_model(
+    control: &ControlHandle,
+) -> std::result::Result<(PathBuf, File), crate::eg2::WorkerError> {
+    use crate::eg2::WorkerError;
+    let base = crate::settings::data_home(control);
+    if !base.is_absolute() {
+        return Err(WorkerError::ModelUnavailable);
+    }
+    let pin = Pin::current(control);
+    let (file, mismatch) = pin
+        .open_installed(&base, control)
+        .map_err(|_| WorkerError::ModelUnavailable)?
+        .ok_or(WorkerError::ModelMissing)?;
+    if mismatch.is_some() {
+        return Err(WorkerError::ModelHashMismatch);
+    }
+    Ok((pin.directory(&base).join(ARTIFACT), file))
 }
 
 fn confirm(
@@ -188,14 +336,6 @@ fn confirm(
     } else {
         Err(consent_error("model installation declined"))
     }
-}
-
-fn missing(pin: &Pin, path: &Path) -> CommandResponse {
-    pin.response(
-        path,
-        ModelReadiness::Missing,
-        "model is not installed; run kio model install embeddinggemma-2",
-    )
 }
 
 fn verified_model_file(directory: &StoreDirectory) -> Result<File> {

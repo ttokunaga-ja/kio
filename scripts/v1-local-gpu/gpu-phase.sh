@@ -8,16 +8,9 @@ TOOLS="$SCRIPT_DIR/kio-acceptance-tools"
 REPO=${KIO_REPO:-$(cd "$SCRIPT_DIR/../.." && pwd -P)}
 ROOT=${KIO_GPU_ROOT:-/home/kio-test/work/kio/v1-local-gpu}
 OCR_PROJECT=kio-v1-local-gpu-ocr
-EMBED_PROJECT=kio-v1-local-gpu-embedding
 OCR_WEIGHT=85a479d506a11e724e7285d395c551be69f41dbc16b6342d3cacfb189aed71db
-EMBED_WEIGHT=c73fa9caeddeb3ff831d46c085a7a5708343248ca777e90f2d486964464509c1
-EMBED_REVISION=9f2f7e710d6d81056aa5c0a4f04764fec6bb7bda
-EMBED_BUNDLE=/home/kio-test/work/kio/v1-models/qwen3-vl-embedding-2b-9f2f7e710d6d81056aa5c0a4f04764fec6bb7bda
-EMBED_MANIFEST_SHA=c09c5c9a87f5d014ecd5201e4f5cc3a18df258a6aab0ba686f9299625bfe2145
-EMBED_MODEL_NAME=Qwen/Qwen3-VL-Embedding-2B
 OCR_API_IMAGE=ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-vl@sha256:6c735bdf9e758ffdd58ccc067db0c2d84e37e5e6a2cbd47156069d4d7ea5d709
 OCR_VLM_IMAGE=ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-genai-vllm-server@sha256:d0d32c04a2119613d25a0a4c292e165ccc107954b74580613cf59e378037f8f5
-EMBED_IMAGE=vllm/vllm-openai@sha256:770fe65b2c73ee74a5c42165cf3433de4048cc2cd9c57a937ca4e35aba5aa87b
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 note() { printf '%s\n' "$*"; }
@@ -93,9 +86,8 @@ gpu_memory() {
   printf '%s\n' "$sample" | "$TOOLS" gpu-memory "$@" --state-dir "$ROOT/state"
 }
 
-both_projects_gone() {
+ocr_project_gone() {
   project_gone "$OCR_PROJECT" || die "owned OCR project is not absent"
-  project_gone "$EMBED_PROJECT" || die "owned embedding project is not absent"
 }
 
 gpu_guard() {
@@ -109,7 +101,7 @@ gpu_guard() {
       null|'[]') continue ;;
     esac
     case "$project" in
-      "$OCR_PROJECT"|"$EMBED_PROJECT") ;;
+      "$OCR_PROJECT") ;;
       *) die "unrelated GPU container is running: $id" ;;
     esac
   done <<< "$ids"
@@ -126,7 +118,7 @@ wait_gone() {
 
 wait_vram() {
   local deadline=$((SECONDS + 60)) remaining
-  both_projects_gone
+  ocr_project_gone
   while [ "$SECONDS" -lt "$deadline" ]; do
     remaining=$((deadline - SECONDS))
     # Bound the sample producer as well as the helper's stdin reader.
@@ -135,7 +127,7 @@ wait_vram() {
       sample=$("$1" --query-gpu=uuid,memory.total,memory.used,memory.free --format=csv,noheader,nounits)
       printf "%s\n" "$sample" | "$2" gpu-memory check-recovered --state-dir "$3" "${@:4}"
     ' bash "$(gpu_command)" "$TOOLS" "$ROOT/state" "$@"; then
-      both_projects_gone
+      ocr_project_gone
       return 0
     fi
     sleep 1
@@ -185,70 +177,6 @@ verify_ocr_weight() {
   [ "$actual" = "$OCR_WEIGHT" ] || die "OCR model hash differs from measured value"
 }
 
-verify_embedding_bundle() {
-  local staged_manifest="$ROOT/embedding/model-files.json"
-  [ -f "$TOOLS" ] && [ -x "$TOOLS" ] && [ ! -L "$TOOLS" ] || die "reviewed acceptance tools binary is missing"
-  [ -f "$SCRIPT_DIR/model-files.json" ] && [ ! -L "$SCRIPT_DIR/model-files.json" ] || die "controller model manifest is missing"
-  [ "$(sha "$SCRIPT_DIR/model-files.json")" = "$EMBED_MANIFEST_SHA" ] || die "controller model manifest differs from hardcoded pin"
-  private_file "$staged_manifest"
-  [ "$(sha "$staged_manifest")" = "$EMBED_MANIFEST_SHA" ] || die "staged model manifest differs from controller pin"
-  cmp -s -- "$SCRIPT_DIR/model-files.json" "$staged_manifest" || die "staged model manifest differs from controller source"
-  "$TOOLS" prepare-embedding \
-    --manifest "$staged_manifest" --expected-manifest-sha "$EMBED_MANIFEST_SHA" \
-    verify --bundle "$EMBED_BUNDLE" || die "coherent embedding bundle validation failed"
-}
-
-stage_embedding_compose() {
-  local target="$ROOT/embedding/compose.yaml" model_path=/model
-  if [ -e "$target" ]; then
-    [ ! -L "$target" ] || die "embedding compose may not be a symlink"
-    grep -Fq '127.0.0.1:18444:8000' "$target" || die "embedding mapping differs"
-    grep -Fq "$EMBED_BUNDLE:/model:ro" "$target" || die "embedding bundle mount differs"
-    grep -Fq "$ROOT/tls-server:/tls:ro" "$target" || die "embedding TLS mapping differs"
-    grep -Fq "$ROOT/embedding/hf-transient:/tmp/huggingface" "$target" || die "embedding transient cache mapping differs"
-    grep -Fq -- '      - /model' "$target" || die "embedding model path differs"
-    ! grep -Fq -- '--trust-remote-code' "$target" || die "embedding compose enables unneeded remote code"
-    return 0
-  fi
-  awk -v bundle="$EMBED_BUNDLE" -v tls="$ROOT/tls-server" -v transient="$ROOT/embedding/hf-transient" '
-    $0 == "      - ./models:/models" {
-      print "      - " bundle ":/model:ro"
-      next
-    }
-    $0 == "      - ./tls-server:/tls:ro" {
-      print "      - " tls ":/tls:ro"
-      print "      - " transient ":/tmp/huggingface"
-      next
-    }
-    $0 == "      - Qwen/Qwen3-VL-Embedding-2B" {
-      print "      - /model"
-      print "      - --served-model-name"
-      print "      - Qwen/Qwen3-VL-Embedding-2B"
-      next
-    }
-    $0 == "      - --revision" {
-      getline
-      next
-    }
-    $0 == "      - --trust-remote-code" {
-      next
-    }
-    /HF_HUB_DISABLE_TELEMETRY:/ {
-      print
-      print "      HF_HUB_OFFLINE: \"1\""
-      print "      TRANSFORMERS_OFFLINE: \"1\""
-      next
-    }
-    {
-      gsub("127.0.0.1:18081:8000", "127.0.0.1:18444:8000")
-      if ($0 == "      HF_HOME: /models") $0 = "      HF_HOME: /tmp/huggingface"
-      if ($0 == "      - /models") $0 = "      - /tmp/huggingface"
-      print
-    }
-  ' "$REPO/tasks/artifacts/v1-gpu-4060/embedding/compose.yaml" > "$target"
-  chmod 600 "$target"
-}
-
 stage_ocr_compose() {
   local target="$ROOT/ocr/compose.yaml"
   if [ -e "$target" ]; then
@@ -284,11 +212,10 @@ identity_binding() {
   "$TOOLS" gpu-identity "$@" \
     --state-dir "$ROOT/state" --controller "$SCRIPT_DIR/gpu-phase.sh" \
     --proxy "$TOOLS" --entrypoint "$SCRIPT_DIR/ocr_api_entrypoint.sh" \
-    --ocr-compose "$ROOT/ocr/compose.yaml" --embedding-compose "$ROOT/embedding/compose.yaml" \
+    --ocr-compose "$ROOT/ocr/compose.yaml" \
     --backend-config "$ROOT/ocr/backend-config.yaml" \
     --ca-cert "$ROOT/tls-server/ca-cert.pem" --leaf-cert "$ROOT/tls-server/server-cert.pem" \
-    --ocr-image "$OCR_API_IMAGE" --ocr-revision PaddleOCR-VL-1.6 --ocr-weight-sha256 "sha256:$OCR_WEIGHT" \
-    --embedding-image "$EMBED_IMAGE" --embedding-revision "$EMBED_REVISION" --embedding-weight-sha256 "sha256:$EMBED_WEIGHT"
+    --ocr-image "$OCR_API_IMAGE" --ocr-revision PaddleOCR-VL-1.6 --ocr-weight-sha256 "sha256:$OCR_WEIGHT"
 }
 
 write_identity() {
@@ -328,9 +255,9 @@ init() {
   [ -x "$TOOLS" ] && [ ! -L "$TOOLS" ] || die "reviewed acceptance tools binary is missing"
   gpu_command >/dev/null || die "missing nvidia-smi"
   ensure_root
-  both_projects_gone
-  for name in state tls-authority tls-server ocr embedding embedding/hf-transient; do private_dir "$ROOT/$name"; done
-  both_projects_gone
+  ocr_project_gone
+  for name in state tls-authority tls-server ocr; do private_dir "$ROOT/$name"; done
+  ocr_project_gone
   gpu_memory capture
 
   if [ ! -e "$ROOT/tls-authority/ca-key.pem" ]; then
@@ -355,8 +282,6 @@ init() {
   copy_once "$TOOLS" "$ROOT/ocr/kio-acceptance-tools" 700
   copy_once "$SCRIPT_DIR/ocr_api_entrypoint.sh" "$ROOT/ocr/ocr_api_entrypoint.sh"
   stage_ocr_compose
-  copy_once "$SCRIPT_DIR/model-files.json" "$ROOT/embedding/model-files.json"
-  stage_embedding_compose
   write_identity
   note "initialized $ROOT; no service started"
 }
@@ -365,7 +290,6 @@ status() {
   gpu_guard
   note "GPU UUID, total, used, free MiB: $(gpu_sample || die 'cannot read GPU memory')"
   compose "$OCR_PROJECT" "$ROOT/ocr/compose.yaml" ps || true
-  compose "$EMBED_PROJECT" "$ROOT/embedding/compose.yaml" ps || true
 }
 
 start_ocr() {
@@ -375,8 +299,8 @@ start_ocr() {
   gpu_guard
   [ -f "$ROOT/ocr/compose.yaml" ] || die "run init first"
   verify_identity
-  both_projects_gone
-  gpu_memory check-start --phase ocr
+  ocr_project_gone
+  gpu_memory check-start
   compose "$OCR_PROJECT" "$ROOT/ocr/compose.yaml" up -d
   wait_https 18443 "$OCR_PROJECT" "$ROOT/ocr/compose.yaml" || { compose "$OCR_PROJECT" "$ROOT/ocr/compose.yaml" down; die "OCR HTTPS endpoint was not ready"; }
   api_id=$(assert_container_image "$(compose "$OCR_PROJECT" "$ROOT/ocr/compose.yaml" ps -q paddleocr-vl-api)" "$OCR_API_IMAGE")
@@ -390,30 +314,6 @@ stop_ocr() {
   lock
   compose "$OCR_PROJECT" "$ROOT/ocr/compose.yaml" down
   wait_gone "$OCR_PROJECT" "$ROOT/ocr/compose.yaml"
-  wait_vram
-}
-
-start_embedding() {
-  local image_id
-  lock
-  [ ! -e "$ROOT/state/embedding-observed.json" ] && [ ! -L "$ROOT/state/embedding-observed.json" ] || die "embedding already observed; use a fresh controller root"
-  gpu_guard
-  [ -f "$ROOT/embedding/compose.yaml" ] || die "run init first"
-  verify_identity
-  verify_embedding_bundle
-  both_projects_gone
-  gpu_memory check-start --phase embedding
-  compose "$EMBED_PROJECT" "$ROOT/embedding/compose.yaml" up -d
-  wait_https 18444 "$EMBED_PROJECT" "$ROOT/embedding/compose.yaml" || { compose "$EMBED_PROJECT" "$ROOT/embedding/compose.yaml" down; die "embedding HTTPS endpoint was not ready"; }
-  image_id=$(assert_container_image "$(compose "$EMBED_PROJECT" "$ROOT/embedding/compose.yaml" ps -q qwen3-vl-embedding)" "$EMBED_IMAGE")
-  write_phase_evidence embedding "$image_id"
-  note "embedding ready at https://127.0.0.1:18444"
-}
-
-stop_embedding() {
-  lock
-  compose "$EMBED_PROJECT" "$ROOT/embedding/compose.yaml" down
-  wait_gone "$EMBED_PROJECT" "$ROOT/embedding/compose.yaml"
   wait_vram
 }
 
@@ -433,7 +333,6 @@ cleanup_project() {
 cleanup() {
   lock
   cleanup_project "$OCR_PROJECT" "$ROOT/ocr/compose.yaml"
-  cleanup_project "$EMBED_PROJECT" "$ROOT/embedding/compose.yaml"
   private_dir "$ROOT/state"
   wait_vram --allow-missing
   note "owned services stopped"
@@ -444,9 +343,6 @@ case ${1:-} in
   status) lock; status ;;
   start-ocr) start_ocr ;;
   stop-ocr) stop_ocr ;;
-  start-embedding) start_embedding ;;
-  stop-embedding) stop_embedding ;;
-  stop) stop_ocr; stop_embedding ;;
   cleanup) cleanup ;;
-  *) die "usage: init|status|start-ocr|stop-ocr|start-embedding|stop-embedding|stop|cleanup" ;;
+  *) die "usage: init|status|start-ocr|stop-ocr|cleanup" ;;
 esac

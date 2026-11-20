@@ -939,7 +939,7 @@ mod tests {
 
         vec![
             ("embedding", |endpoint| {
-                EnvLocalEmbeddingClient::new(endpoint, "model", None, false)
+                EnvLocalEmbeddingClient::new(endpoint, "model", None)
                     .embed_payload(json!({"messages": []}))
                     .map(|_| ())
             }),
@@ -1187,7 +1187,7 @@ mod tests {
     fn every_local_client_posts_only_after_the_shared_peer_is_authenticated() {
         let cases = local_client_cases();
         let responses = [
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 30\r\nConnection: close\r\n\r\n{\"data\":[{\"embedding\":[1.0]}]}",
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 40\r\nConnection: close\r\n\r\n{\"data\":[{\"index\":0,\"embedding\":[1.0]}]}",
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 14\r\nConnection: close\r\n\r\n{\"results\":[]}",
         ];

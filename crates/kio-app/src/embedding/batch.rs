@@ -1108,7 +1108,7 @@ pub(crate) fn poll_batch_embedding_jobs(
                         &conn,
                         &profile,
                         &group,
-                        vector,
+                        (vector, None),
                         &held,
                         &projection,
                         &mut replica,

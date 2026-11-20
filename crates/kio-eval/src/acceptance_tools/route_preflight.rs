@@ -24,17 +24,14 @@ pub(crate) const FIXED_SOURCES: &[&str] = &[
     "crates/kio-eval/src/acceptance_tools/route_preflight.rs",
     "crates/kio-eval/src/acceptance_tools/provider_ledger.rs",
     "crates/kio-eval/src/acceptance_tools/local_client.rs",
-    "crates/kio-eval/src/acceptance_tools/prepare_embedding.rs",
     "crates/kio-eval/src/acceptance_tools/ocr_proxy.rs",
     "crates/kio-eval/src/acceptance_tools/gpu_identity.rs",
     "crates/kio-eval/src/acceptance_tools/gpu_memory.rs",
     "crates/kio-eval/src/acceptance_tools/package_extract.rs",
     "scripts/v1-local-gpu/gpu-phase.sh",
     "scripts/v1-local-gpu/ocr_api_entrypoint.sh",
-    "scripts/v1-local-gpu/model-files.json",
     "tasks/artifacts/v1-gpu-4060/ocr/backend-config.yaml",
     "tasks/artifacts/v1-gpu-4060/ocr/compose.yaml",
-    "tasks/artifacts/v1-gpu-4060/embedding/compose.yaml",
 ];
 #[derive(Debug, ClapArgs)]
 pub struct Args {

@@ -76,6 +76,8 @@ pub enum HoldReason {
     TierBApproval,
     LedgerInitializationRequired,
     ResourceLimit,
+    ResourceBusy,
+    ModelNotReady,
 }
 
 impl HoldReason {
@@ -83,6 +85,8 @@ impl HoldReason {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ResourceLimit => "resource_limit",
+            Self::ResourceBusy => "resource_busy",
+            Self::ModelNotReady => "model_not_ready",
             Self::Budget => "budget",
             Self::Auth => "auth",
             Self::TierBApproval => "tier_b_approval",
@@ -99,6 +103,8 @@ impl HoldReason {
 pub fn hold_reason_for_reason(reason: &str) -> Option<HoldReason> {
     match reason {
         "resource_limit" => Some(HoldReason::ResourceLimit),
+        "resource_busy" => Some(HoldReason::ResourceBusy),
+        "model_not_ready" => Some(HoldReason::ModelNotReady),
         BUDGET_EXCEEDED_REASON => Some(HoldReason::Budget),
         SECRETS_TIER_B_HOLD_REASON => Some(HoldReason::TierBApproval),
         "auth_error" => Some(HoldReason::Auth),
@@ -378,6 +384,7 @@ pub struct TaskReservationClaim<'a> {
 #[serde(rename_all = "snake_case")]
 pub enum RetryErrorKind {
     NetworkError,
+    NativeRuntime,
     RateLimit,
     AuthError,
     LocalPeerAuth,
@@ -882,12 +889,23 @@ pub fn task_retry_kind(task: &TaskDescriptor) -> RetryErrorKind {
     match task.fallback_reason.as_deref() {
         Some("resource_limit") => RetryErrorKind::ResourceLimit,
         Some("network_error") => RetryErrorKind::NetworkError,
+        Some(
+            "embedding_runtime" | "worker_startup" | "worker_crash" | "worker_eof"
+            | "worker_protocol" | "worker_timeout" | "cancelled",
+        ) => RetryErrorKind::NativeRuntime,
         Some("rate_limit") => RetryErrorKind::RateLimit,
         Some("auth_error") => RetryErrorKind::AuthError,
         Some("local_peer_auth") => RetryErrorKind::LocalPeerAuth,
         Some("local_peer_config") => RetryErrorKind::LocalPeerConfig,
         Some("quota_exceeded") => RetryErrorKind::QuotaExceeded,
-        Some("invalid_input") | Some(RETIRED_NON_LIVE_REASON) => RetryErrorKind::InvalidInput,
+        Some(
+            "invalid_input"
+            | "input_limit"
+            | "input_overflow"
+            | "native_inference"
+            | "worker_memory_limit",
+        )
+        | Some(RETIRED_NON_LIVE_REASON) => RetryErrorKind::InvalidInput,
         Some(RESULT_UNKNOWN_REASON) => RetryErrorKind::ResultUnknown,
         Some(BUDGET_EXCEEDED_REASON) => RetryErrorKind::BudgetExceeded,
         _ => RetryErrorKind::ContractViolation,
@@ -939,7 +957,7 @@ pub fn task_can_complete_from_materialized_output(task: &TaskDescriptor) -> bool
         TaskStatus::Pending | TaskStatus::Running | TaskStatus::Failed => true,
         TaskStatus::Paused => matches!(
             task.fallback_reason.as_deref(),
-            Some(BUDGET_EXCEEDED_REASON) | Some("auth_error")
+            Some(BUDGET_EXCEEDED_REASON | "auth_error" | "resource_busy")
         ),
         TaskStatus::Done | TaskStatus::Partial | TaskStatus::Skipped => false,
     }
@@ -1294,6 +1312,14 @@ pub fn retry_policy(error_kind: RetryErrorKind) -> RetryPolicy {
             max_attempts: Some(5),
             backoff: "exp(base=2s,cap=60s,jitter=none)".to_owned(),
             error_code: "KIO-E-BATCH-NET-001".to_owned(),
+            paused: false,
+        },
+        RetryErrorKind::NativeRuntime => RetryPolicy {
+            error_kind,
+            retryable: true,
+            max_attempts: Some(3),
+            backoff: "immediate".to_owned(),
+            error_code: "KIO-E-EMBED-RUNTIME-001".to_owned(),
             paused: false,
         },
         RetryErrorKind::RateLimit => RetryPolicy {
@@ -2571,4 +2597,20 @@ mod tests {
 
         assert_eq!(store.all().unwrap(), vec![paused, ledger_paused]);
     }
+}
+
+#[test]
+fn eg2_slot_contention_has_a_task_hold() {
+    assert_eq!(
+        hold_reason_for_reason("resource_busy").map(HoldReason::as_str),
+        Some("resource_busy")
+    );
+}
+
+#[test]
+fn eg2_uninstalled_model_has_a_task_hold() {
+    assert_eq!(
+        hold_reason_for_reason("model_not_ready").map(HoldReason::as_str),
+        Some("model_not_ready")
+    );
 }

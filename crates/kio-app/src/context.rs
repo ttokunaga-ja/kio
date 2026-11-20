@@ -9,6 +9,10 @@ pub trait Interaction: Send + Sync {
     fn working_scan_started(&self) {}
     #[cfg(debug_assertions)]
     fn working_scan_published(&self) {}
+    fn embedding_cancellation(&self) -> Result<Box<dyn Fn() -> bool>> {
+        Ok(Box::new(|| false))
+    }
+
     fn confirm(&self, summary: &str) -> Result<bool>;
     fn read_input(&self, max_bytes: usize) -> Result<Vec<u8>>;
     fn is_interactive(&self) -> bool;

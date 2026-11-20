@@ -18,10 +18,7 @@ use crate::deterministic_embedding::{
 use crate::gemini_embedding::GeminiEmbeddingClient;
 pub use crate::gemini_embedding::validate_gemini_sync_inputs;
 use crate::gemini_embedding::{ADOPTED_DIMENSIONS, ADOPTED_MODEL_PIN, GeminiEmbeddingAdapter};
-use crate::local_embedding::{
-    EnvLocalEmbeddingClient, LOCAL_EMBEDDING_DEFAULT_MODEL, LocalEmbeddingAdapter,
-    LocalEmbeddingExecution, LocalEmbeddingSpec,
-};
+use crate::local_embedding::{EnvLocalEmbeddingClient, LocalEmbeddingAdapter, LocalEmbeddingSpec};
 use crate::mistral_ocr::{EnvMistralOcrClient, MistralOcrClient, MistralOcrMarkdownizeAdapter};
 #[cfg(debug_assertions)]
 use crate::mistral_ocr::{OcrImage, OcrPage, OcrResponse};
@@ -1033,7 +1030,8 @@ pub enum EmbeddingExecution {
     /// The adopted online adapter, under one of its seams (or `Real`).
     Online(AdoptedEmbeddingExecution),
     /// The `offline_api` adapter, reached over loopback (07 §3).
-    Offline(LocalEmbeddingExecution),
+    Offline,
+    Native,
     /// The Rust-only evaluator adapter, selected only by the exact evaluator
     /// environment contract.
     DeterministicEvaluator,
@@ -1044,9 +1042,16 @@ impl EmbeddingExecution {
     pub fn execution_mode(self) -> ExecutionMode {
         match self {
             Self::Online(_) => ExecutionMode::OnlineApi,
-            Self::Offline(_) => ExecutionMode::OfflineApi,
+            Self::Offline => ExecutionMode::OfflineApi,
+            Self::Native => ExecutionMode::NativeLibrary,
             Self::DeterministicEvaluator => ExecutionMode::DeterministicLibrary,
         }
+    }
+
+    /// Whether inference uses a configured HTTP endpoint with send approval.
+    #[must_use]
+    pub fn uses_endpoint(self) -> bool {
+        matches!(self, Self::Online(_) | Self::Offline)
     }
 
     /// Whether this send leaves the machine — the question 07 §3's consent
@@ -1063,17 +1068,13 @@ impl EmbeddingExecution {
     pub fn online_seam(self) -> Option<AdoptedEmbeddingExecution> {
         match self {
             Self::Online(seam) => Some(seam),
-            Self::Offline(_) | Self::DeterministicEvaluator => None,
+            Self::Offline | Self::Native | Self::DeterministicEvaluator => None,
         }
     }
 }
 
-/// Resolves the active embedding implementation, or `None` when none is
-/// configured — in which case the existing degradations apply unchanged
-/// (search falls back to text, no embedding tasks are generated).
-///
-/// Shaped after [`crate::gemini_batch_client::resolve_gemini_batch_client`]:
-/// resolve to `Option`, let `None` mean "this lane is unavailable, degrade".
+/// Select the configured embedding implementation, defaulting to native EG2
+/// when no embedding is declared. This does not read or install model files.
 #[must_use]
 pub fn active_embedding_execution(settings: &AdapterRuntimeSettings) -> Option<EmbeddingExecution> {
     active_embedding_execution_with_control(settings, &ControlHandle::default())
@@ -1097,17 +1098,17 @@ pub fn active_embedding_execution_with_control(
     if settings.role_configuration_ready("embedding").is_err() {
         return None;
     }
-    if let Some(local) = active_local_embedding_execution(settings) {
-        return Some(EmbeddingExecution::Offline(local));
+    if declared_offline_embedding(settings) {
+        return Some(EmbeddingExecution::Offline);
     }
     active_adopted_embedding_execution_with_control(settings, control)
         .map(EmbeddingExecution::Online)
-}
-
-fn active_local_embedding_execution(
-    settings: &AdapterRuntimeSettings,
-) -> Option<LocalEmbeddingExecution> {
-    declared_offline_embedding(settings).then_some(LocalEmbeddingExecution::Real)
+        .or_else(|| {
+            settings
+                .declared_adapter("embedding")
+                .is_none()
+                .then_some(EmbeddingExecution::Native)
+        })
 }
 
 /// Whether `tools.toml` declares the embedding role as `offline_api`.
@@ -1162,24 +1163,17 @@ pub fn embedding_adapter_for_with_control(
     }
     match execution {
         EmbeddingExecution::DeterministicEvaluator => Ok(Box::new(DeterministicEmbeddingAdapter)),
-        EmbeddingExecution::Offline(LocalEmbeddingExecution::Real) => {
+        EmbeddingExecution::Native => Err(AdapterError::ConfigSchema(
+            "native embedding requires the managed EG2 worker".to_owned(),
+        )),
+        EmbeddingExecution::Offline => {
             let declared = offline_embedding_declaration(&settings)?;
             let endpoint = settings
                 .local_endpoint("embedding", declared.url.as_deref().expect("validated url"))?;
             let timeout = settings.execution_timeout("offline_api");
-            if declared.tool_id.as_deref() == Some(GENERIC_LOCAL_EMBEDDING_TOOL_ID) {
-                let spec = LocalEmbeddingSpec::from_declaration(&declared)?;
-                let client =
-                    EnvLocalEmbeddingClient::new(endpoint, spec.model.clone(), timeout, true);
-                Ok(Box::new(LocalEmbeddingAdapter::with_spec(client, spec)))
-            } else {
-                let model = declared
-                    .model
-                    .unwrap_or_else(|| LOCAL_EMBEDDING_DEFAULT_MODEL.to_owned());
-                Ok(Box::new(LocalEmbeddingAdapter::with_client(
-                    EnvLocalEmbeddingClient::new(endpoint, model, timeout, false),
-                )))
-            }
+            let spec = LocalEmbeddingSpec::from_declaration(&declared)?;
+            let client = EnvLocalEmbeddingClient::new(endpoint, spec.model.clone(), timeout);
+            Ok(Box::new(LocalEmbeddingAdapter::with_spec(client, spec)))
         }
         EmbeddingExecution::Online(AdoptedEmbeddingExecution::Real) => {
             let declared = settings.declared_adapter("embedding");
@@ -1297,8 +1291,9 @@ pub fn declared_embedding_profile_for(
 ) -> Result<DeclaredEmbeddingProfile> {
     Ok(match execution {
         EmbeddingExecution::Online(seam) => declared_adopted_embedding_profile(seam),
-        EmbeddingExecution::Offline(local) => {
-            let profile = offline_embedding_profile(settings, local)?;
+        EmbeddingExecution::Native => declared_native_embedding_profile(),
+        EmbeddingExecution::Offline => {
+            let profile = offline_embedding_profile(settings)?;
             DeclaredEmbeddingProfile {
                 tool_id: profile.adapter_id,
                 dimensions: u64::from(crate::local_embedding::LOCAL_EMBEDDING_DIMENSIONS),
@@ -1309,6 +1304,17 @@ pub fn declared_embedding_profile_for(
         }
         EmbeddingExecution::DeterministicEvaluator => declared_deterministic_embedding_profile(),
     })
+}
+
+#[must_use]
+pub fn declared_native_embedding_profile() -> DeclaredEmbeddingProfile {
+    DeclaredEmbeddingProfile {
+        tool_id: kio_core::eg2::TOOL_ID.to_owned(),
+        dimensions: kio_core::eg2::DIMENSIONS as u64,
+        distance: "cosine".to_owned(),
+        modality: "multimodal".to_owned(),
+        profile_hash: kio_core::eg2::profile_hash().to_owned(),
+    }
 }
 
 #[must_use]
@@ -1460,7 +1466,9 @@ pub fn embedding_descriptor_with_control(
     let profile = embedding_adapter_profile_with_control(settings, execution, control)?;
     let mut descriptor = match execution {
         EmbeddingExecution::DeterministicEvaluator => DeterministicEmbeddingAdapter.descriptor(),
-        EmbeddingExecution::Offline(_) => crate::local_embedding::descriptor_from_profile(&profile),
+        EmbeddingExecution::Offline | EmbeddingExecution::Native => {
+            crate::local_embedding::descriptor_from_profile(&profile)
+        }
         EmbeddingExecution::Online(_) => crate::gemini_embedding::descriptor_from_profile(&profile),
     };
     let declared = settings.declared_pricing("embedding");
@@ -1492,22 +1500,14 @@ pub fn embedding_preferred_request_kind_with_control(
     embedding_adapter_profile_with_control(settings, execution, control)?;
     Ok(match execution {
         EmbeddingExecution::Online(_) => crate::traits::PreferredRequestKind::Batch,
-        EmbeddingExecution::Offline(_) | EmbeddingExecution::DeterministicEvaluator => {
-            crate::traits::PreferredRequestKind::Sync
-        }
+        EmbeddingExecution::Offline
+        | EmbeddingExecution::Native
+        | EmbeddingExecution::DeterministicEvaluator => crate::traits::PreferredRequestKind::Sync,
     })
 }
 
-fn offline_embedding_profile(
-    settings: &AdapterRuntimeSettings,
-    execution: LocalEmbeddingExecution,
-) -> Result<AdapterProfile> {
-    let declared = offline_embedding_declaration(settings)?;
-    if declared.tool_id.as_deref() == Some(GENERIC_LOCAL_EMBEDDING_TOOL_ID) {
-        Ok(LocalEmbeddingSpec::from_declaration(&declared)?.profile())
-    } else {
-        Ok(crate::local_embedding::profile_for(execution))
-    }
+fn offline_embedding_profile(settings: &AdapterRuntimeSettings) -> Result<AdapterProfile> {
+    Ok(LocalEmbeddingSpec::from_declaration(&offline_embedding_declaration(settings)?)?.profile())
 }
 
 /// The active implementation's `AdapterProfile` — the source for
@@ -1531,7 +1531,21 @@ pub fn embedding_adapter_profile_with_control(
     }
     match execution {
         EmbeddingExecution::DeterministicEvaluator => Ok(DeterministicEmbeddingAdapter.profile()),
-        EmbeddingExecution::Offline(local) => offline_embedding_profile(settings, local),
+        EmbeddingExecution::Offline => offline_embedding_profile(settings),
+        EmbeddingExecution::Native => Ok(AdapterProfile {
+            adapter_kind: crate::types::AdapterKind::Embedding,
+            adapter_id: kio_core::eg2::TOOL_ID.to_owned(),
+            execution_mode: ExecutionMode::NativeLibrary,
+            tool_profile_hash: kio_core::eg2::profile_hash().to_owned(),
+            version: kio_core::litert::VERSION.to_owned(),
+            capability_flags: ["text", "multimodal", IMAGE_OBJECT_CAPABILITY]
+                .map(str::to_owned)
+                .into(),
+            allow_network: false,
+            billable_kinds: Vec::new(),
+            reject_billing: None,
+            provider_idempotency: ProviderIdempotency::NotProvided,
+        }),
         EmbeddingExecution::Online(AdoptedEmbeddingExecution::Real) => {
             let declared = settings.declared_adapter("embedding");
             if let Some(declared) = &declared {
@@ -2299,17 +2313,16 @@ mod tests {
         local.declarations.insert(
             "embedding".into(),
             crate::tool_lock::DeclaredAdapter {
-                tool_id: Some("qwen3_vl_embedding_local".into()),
+                tool_id: Some(GENERIC_LOCAL_EMBEDDING_TOOL_ID.into()),
+                model: Some("test-embedding".into()),
+                local_embedding: Some(crate::tool_lock::test_local_embedding_options()),
                 kind: Some("offline_api".into()),
                 url: Some("https://127.0.0.1:8443".into()),
                 ..crate::tool_lock::DeclaredAdapter::default()
             },
         );
         for (settings, execution) in [
-            (
-                local,
-                EmbeddingExecution::Offline(LocalEmbeddingExecution::Real),
-            ),
+            (local, EmbeddingExecution::Offline),
             (
                 AdapterRuntimeSettings::default(),
                 EmbeddingExecution::Online(AdoptedEmbeddingExecution::Real),
@@ -2338,11 +2351,13 @@ mod tests {
             let mut metadata_settings = settings;
             // Metadata must not consume even a declared but unavailable key.
             metadata_settings.tools_toml_path = None;
-            metadata_settings
-                .declarations
-                .entry("embedding".into())
-                .or_default()
-                .auth = Some("plain:METADATA_MUST_NOT_CONSUME_THIS".into());
+            if execution.is_online() {
+                metadata_settings
+                    .declarations
+                    .entry("embedding".into())
+                    .or_default()
+                    .auth = Some("plain:METADATA_MUST_NOT_CONSUME_THIS".into());
+            }
             metadata_settings.local_peer_ca_path = None;
             metadata_settings.local_peer_trust_digest = None;
             metadata_settings.local_peer_trust_binding = None;
@@ -2365,4 +2380,17 @@ mod tests {
             );
         }
     }
+}
+
+#[cfg(all(test, debug_assertions))]
+#[test]
+fn undeclared_embedding_defaults_to_native() {
+    let _env_lock = kio_core::test_control::test_env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let execution = active_embedding_execution(&AdapterRuntimeSettings::default());
+    assert_eq!(
+        execution.map(EmbeddingExecution::execution_mode),
+        Some(ExecutionMode::NativeLibrary)
+    );
 }

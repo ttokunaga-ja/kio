@@ -79,6 +79,9 @@ jobs:
             --locked --all-features --format-version 1 \
             --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" >/dev/null
 
+      - name: Prefetch LiteRT-LM for offline builds
+        run: bash scripts/ci/fetch-litert-runtime.sh
+
       - name: Build two isolated, reproducible release archives bound to the candidate
         env:
           CANDIDATE_SHA: ${{ inputs.candidate_sha }}
@@ -289,6 +292,9 @@ jobs:
           "KIO_OFFICE_CONVERTER=$converter" | Add-Content -LiteralPath $env:GITHUB_ENV
           "$(Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash" | Out-File -LiteralPath "$env:RUNNER_TEMP\kio-v1-provisioning.txt" -Encoding utf8
           & $converter '--version' | Add-Content -LiteralPath "$env:RUNNER_TEMP\kio-v1-provisioning.txt" -Encoding utf8
+
+      - name: Prefetch pinned LiteRT-LM
+        run: bash scripts/ci/fetch-litert-runtime.sh
 
       - name: Build the evaluator and separately bound debug contract binary
         run: cargo +1.98.0 build --locked -p kio-cli -p kio-eval --bins

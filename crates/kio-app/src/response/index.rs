@@ -130,6 +130,8 @@ pub struct IndexPublishedResponse {
     pub skipped_unrecognized_binary_files: usize,
     pub embedding_tasks_executed: usize,
     pub embedding_tasks_failed: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedding_unavailable_reason: Option<&'static str>,
     pub tree_hash: String,
     pub commit_hash: Option<String>,
     pub commit: Option<CommitObject>,

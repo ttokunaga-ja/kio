@@ -1179,7 +1179,7 @@ fn embedding_cas_failure_cannot_publish_source_or_replica_vectors() {
             index.connection(),
             &profile,
             &group,
-            &vector,
+            (&vector, None),
             &BTreeSet::new(),
             &projection,
             &mut replica,
@@ -3417,6 +3417,10 @@ fn r11_2_completion_priority_batch_vs_enrichment() {
     // Batch priority: auth (5) > budget-paused (6) > some-retryable (3) >
     // all-permanent (4).
     let all = ExecOutcome {
+        resource_busy: 0,
+        model_not_ready: 0,
+        native_failure: None,
+        embedding_unavailable_reason: None,
         resource_limit: None,
         executed: 1,
         failed: 3,

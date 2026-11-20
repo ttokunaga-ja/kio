@@ -60,8 +60,21 @@ fn real_offline_index_stdout_obeys_eval_canonical_contract() {
         if initialize_ledger {
             run(&root, &device, &["--json", "ledger", "init"]);
         }
-        let bytes = run(&root, &device, &["--json", "index", "--offline", "--yes"]);
-        kio_eval::scale_prepare::validate_offline_repair_index_output(&bytes, 1, 0).unwrap_or_else(
+        let output = command(
+            &root,
+            &device,
+            &["--json", "index", "--offline", "--yes"],
+            false,
+        )
+        .env(
+            kio_adapter::catalog::DETERMINISTIC_EVAL_EMBEDDING_ENV,
+            "scale-v3",
+        )
+        .output()
+        .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let bytes = output.stdout;
+        kio_eval::scale_prepare::validate_offline_repair_index_output(&bytes, 1, 1).unwrap_or_else(
             |error| {
                 panic!(
                     "ledger={initialize_ledger}; {error}; stdout={}",

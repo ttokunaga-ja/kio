@@ -550,6 +550,21 @@ pub fn package_candidate(
         (provenance, 0o644),
     );
     payload.insert(format!("{root}/release/sbom.cdx.json"), (sbom, 0o644));
+    let runtime = kio_core::litert::Bundle::for_target(&binding.target)
+        .ok_or_else(|| ReleaseError::Invalid("unsupported LiteRT-LM target".into()))?;
+    let runtime_root = options
+        .binary
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| ReleaseError::Invalid("candidate binary has no distribution root".into()))?;
+    for name in runtime.names() {
+        let relative = format!("{}/{name}", runtime.directory());
+        let bytes = bounded_bytes(&runtime_root.join(&relative), MAX_ENTRY)?;
+        if let Some(library) = runtime.libraries().find(|library| library.name() == name) {
+            require_runtime_digest(&relative, &bytes, library.sha256)?;
+        }
+        payload.insert(format!("{root}/{relative}"), (bytes, 0o644));
+    }
     let internal = internal_checksums(&payload)?;
     payload.insert(format!("{root}/release/checksums.json"), (internal, 0o644));
     let archive = options.output_dir.join(format!("{root}.tar.gz"));
@@ -598,6 +613,13 @@ pub fn package_candidate(
 }
 
 pub fn verify_candidate(options: &VerifyCandidateOptions) -> Result<VerifySummary, ReleaseError> {
+    verify_candidate_with_runtime(options, verify_pinned_runtime)
+}
+
+fn verify_candidate_with_runtime(
+    options: &VerifyCandidateOptions,
+    verify_runtime: impl FnOnce(&BTreeMap<String, Vec<u8>>, &str, &str) -> Result<(), ReleaseError>,
+) -> Result<VerifySummary, ReleaseError> {
     require_regular(&options.archive, MAX_ARCHIVE)?;
     let bytes = bounded_bytes(&options.archive, MAX_ARCHIVE)?;
     let archive_sha = digest(&bytes);
@@ -646,7 +668,7 @@ pub fn verify_candidate(options: &VerifyCandidateOptions) -> Result<VerifySummar
             "archive root does not bind version and target".into(),
         ));
     }
-    let expected = expected_names(&root, binary_name_for_target(&binding.target));
+    let expected = expected_names(&root, &binding.target);
     if files.keys().collect::<Vec<_>>() != expected.iter().collect::<Vec<_>>() {
         return Err(ReleaseError::Verify(
             "archive entries are not the fixed canonical layout".into(),
@@ -796,12 +818,39 @@ pub fn verify_candidate(options: &VerifyCandidateOptions) -> Result<VerifySummar
             "sidecar payload digest mismatch".into(),
         ));
     }
+    verify_runtime(&files, &root, &binding.target)?;
     Ok(VerifySummary {
         root,
         archive_sha256: archive_sha,
         binding,
         support: support.into(),
     })
+}
+
+fn verify_pinned_runtime(
+    files: &BTreeMap<String, Vec<u8>>,
+    root: &str,
+    target: &str,
+) -> Result<(), ReleaseError> {
+    let runtime = kio_core::litert::Bundle::for_target(target)
+        .ok_or_else(|| ReleaseError::Verify("unsupported LiteRT-LM target".into()))?;
+    for library in runtime.libraries() {
+        let name = format!("{root}/{}/{}", runtime.directory(), library.name());
+        let bytes = files
+            .get(&name)
+            .ok_or_else(|| ReleaseError::Verify(format!("missing required runtime {name}")))?;
+        require_runtime_digest(&name, bytes, library.sha256)?;
+    }
+    Ok(())
+}
+
+fn require_runtime_digest(name: &str, bytes: &[u8], expected: &str) -> Result<(), ReleaseError> {
+    if digest(bytes) != expected {
+        return Err(ReleaseError::Verify(format!(
+            "LiteRT-LM SHA-256 mismatch for {name}"
+        )));
+    }
+    Ok(())
 }
 
 pub fn smoke_candidate(options: &SmokeCandidateOptions) -> Result<SmokeSummary, ReleaseError> {
@@ -2710,10 +2759,10 @@ fn archive_root(files: &BTreeMap<String, Vec<u8>>) -> Result<String, ReleaseErro
     }
     Ok(root.into())
 }
-fn expected_names(root: &str, binary: &str) -> BTreeSet<String> {
+fn expected_names(root: &str, target: &str) -> BTreeSet<String> {
     let mut s = BTreeSet::new();
     for suffix in [
-        format!("bin/{binary}"),
+        format!("bin/{}", binary_name_for_target(target)),
         "LICENSE.md".into(),
         "NOTICE.txt".into(),
         "OPERATIONS.md".into(),
@@ -2725,6 +2774,13 @@ fn expected_names(root: &str, binary: &str) -> BTreeSet<String> {
         "release/sbom.cdx.json".into(),
     ] {
         s.insert(format!("{root}/{suffix}"));
+    }
+    if let Some(runtime) = kio_core::litert::Bundle::for_target(target) {
+        s.extend(
+            runtime
+                .names()
+                .map(|name| format!("{root}/{}/{name}", runtime.directory())),
+        );
     }
     s
 }
@@ -3895,7 +3951,7 @@ mod tests {
     fn payload() -> BTreeMap<String, (Vec<u8>, u32)> {
         let root = root();
         let mut p = BTreeMap::new();
-        for name in expected_names(&root, binary_name_for_target("x86_64-unknown-linux-gnu")) {
+        for name in expected_names(&root, "x86_64-unknown-linux-gnu") {
             if name.ends_with("/release/checksums.json") {
                 continue;
             }
@@ -3947,6 +4003,15 @@ mod tests {
         create_new_bytes(&checksum, &canonical_json(&side).unwrap()).unwrap();
         (t, archive, checksum)
     }
+    #[test]
+    fn verify_rejects_self_consistent_archive_with_an_unpinned_runtime() {
+        let (_temp, archive, checksum) = archive_pair();
+        let result = super::verify_candidate(&verify_options(archive, Some(checksum)));
+        assert!(
+            matches!(result, Err(ReleaseError::Verify(message)) if message.contains("LiteRT-LM SHA-256"))
+        );
+    }
+
     fn archive_pair() -> (TempDir, PathBuf, PathBuf) {
         archive_pair_from_payload(payload())
     }
@@ -4469,12 +4534,28 @@ mod tests {
         }
         assert_native_tool_environment_removed(&windows_env, &windows.target);
     }
+    fn verify_fixture_candidate(
+        options: &VerifyCandidateOptions,
+    ) -> Result<VerifySummary, ReleaseError> {
+        // Unit fixtures have deterministic placeholder bytes. Production uses
+        // the actual release pin, exercised by the substitution test above.
+        verify_candidate_with_runtime(options, |files, root, target| {
+            let bundle = kio_core::litert::Bundle::for_target(target).unwrap();
+            for library in bundle.libraries() {
+                let name = format!("{root}/{}/{}", bundle.directory(), library.name());
+                let expected = canonical_json(&json!({"x":name})).unwrap();
+                require_runtime_digest(&name, &files[&name], &digest(&expected))?;
+            }
+            Ok(())
+        })
+    }
+
     #[test]
     fn verifier_accepts_bound_archive_and_rejects_tamper_or_substitution() {
         let (_t, archive, checksum) = archive_pair();
         let archive_sha256 = digest(&fs::read(&archive).unwrap());
         assert!(
-            verify_candidate(&VerifyCandidateOptions {
+            verify_fixture_candidate(&VerifyCandidateOptions {
                 archive: archive.clone(),
                 checksum: Some(checksum.clone()),
                 expected_archive_sha256: archive_sha256.clone(),
@@ -4570,7 +4651,10 @@ mod tests {
         let internal = internal_checksums(&replacement).unwrap();
         replacement.insert(checksums_path, (internal, 0o644));
         let (_replacement_dir, archive, checksum) = archive_pair_from_payload(replacement);
-        assert!(verify_candidate(&verify_options(archive.clone(), Some(checksum.clone()))).is_ok());
+        assert!(
+            verify_fixture_candidate(&verify_options(archive.clone(), Some(checksum.clone())))
+                .is_ok()
+        );
         let mut options = verify_options(archive, Some(checksum));
         options.expected_archive_sha256 = trusted_sha256;
         assert!(verify_candidate(&options).is_err());

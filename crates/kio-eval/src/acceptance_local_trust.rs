@@ -36,7 +36,7 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
 const SERVER_TIMEOUT: Duration = Duration::from_secs(25);
 const MAX_OUTPUT: usize = 128 * 1024;
 const MAX_REQUEST: usize = 64 * 1024;
-const TOOL_ID: &str = "qwen3_vl_embedding_local";
+const TOOL_ID: &str = "local_embedding";
 static PROBE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Clone)]
@@ -270,7 +270,7 @@ fn configure(private: &Path, endpoint: &str) -> Result<(), AcceptanceError> {
     }
     let tools = config.join("tools.toml");
     let body = format!(
-        "[embedding.{TOOL_ID}]\nkind = \"offline_api\"\nurl = \"{endpoint}\"\nmodel = \"Qwen/Qwen3-VL-Embedding-2B\"\n"
+        "[embedding.{TOOL_ID}]\nkind = \"offline_api\"\nurl = \"{endpoint}\"\nmodel = \"test-embedding\"\nwire_format = 'messages'\nmodel_version_pin = 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\nchat_template_hash = 'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'\ninstruction = ''\n"
     );
     fs::write(&tools, body).map_err(io)?;
     private_file(&tools)
@@ -590,7 +590,7 @@ fn embedding_request_body(request: &[u8]) -> Option<Vec<u8>> {
     let end = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")? + 4;
     let body = request[end..].to_vec();
     let payload: serde_json::Value = serde_json::from_slice(&body).ok()?;
-    (payload.get("model").and_then(serde_json::Value::as_str) == Some("Qwen/Qwen3-VL-Embedding-2B")
+    (payload.get("model").and_then(serde_json::Value::as_str) == Some("test-embedding")
         && payload
             .get("encoding_format")
             .and_then(serde_json::Value::as_str)

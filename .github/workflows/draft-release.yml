@@ -88,6 +88,9 @@ jobs:
             --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" \
             >/dev/null
 
+      - name: Prefetch LiteRT-LM for offline builds
+        run: bash scripts/ci/fetch-litert-runtime.sh
+
       - name: Build two independent, byte-identical candidate archives
         env:
           CANDIDATE_SHA: ${{ inputs.candidate_sha }}

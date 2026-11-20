@@ -18,7 +18,6 @@ use std::{
 };
 use tempfile::TempDir;
 
-const TOOL: &str = "qwen3_vl_embedding_local";
 const GENERIC_TOOL: &str = "local_embedding";
 const MAX_BODY: usize = 2 * 1024 * 1024;
 const SECRET_A: &str = "C_TEST_PRIVATE_SECRET_SCOPE_A_9271";
@@ -297,9 +296,7 @@ impl Device {
         }
     }
     fn embedding_url(&self, url: &str) {
-        self.tools_text(&format!(
-            "[embedding.{TOOL}]\nkind = \"offline_api\"\nurl = \"{url}\"\nmodel = \"Qwen/Qwen3-VL-Embedding-2B\"\n"
-        ));
+        self.generic_embedding_url(url, "messages", "");
     }
     fn generic_embedding_url(&self, url: &str, wire: &str, instruction: &str) {
         self.tools_text(&format!(
@@ -403,7 +400,7 @@ fn http_device_approval_spans_private_scopes_offline_but_not_secret_consent() {
     device.success(&b, &["init"]);
     device.embedding_url(&peer.url());
 
-    let preview = device.success(&a, &["adapter", "approve", TOOL, "--preview"]);
+    let preview = device.success(&a, &["adapter", "approve", GENERIC_TOOL, "--preview"]);
     let disclosure = preview.to_string().to_ascii_lowercase();
     assert!(
         disclosure.contains(&peer.url()),
@@ -417,7 +414,7 @@ fn http_device_approval_spans_private_scopes_offline_but_not_secret_consent() {
         preview["device_endpoints"][0]["peer_authenticated"], false,
         "HTTP approval preview requires the documented machine boolean"
     );
-    device.success(&a, &["adapter", "approve", TOOL, "--yes"]);
+    device.success(&a, &["adapter", "approve", GENERIC_TOOL, "--yes"]);
     assert!(!device.tools.join("local-peer-ca.pem").exists());
     assert!(!device.tools.join("ca.pem").exists());
 
@@ -473,7 +470,16 @@ fn http_device_approval_spans_private_scopes_offline_but_not_secret_consent() {
 
     // Endpoint approval alone does not authorize either secret. A separate
     // explicit send-secrets choice releases A only; B remains held.
-    device.success(&a, &["adapter", "approve", TOOL, "--yes", "--send-secrets"]);
+    device.success(
+        &a,
+        &[
+            "adapter",
+            "approve",
+            GENERIC_TOOL,
+            "--yes",
+            "--send-secrets",
+        ],
+    );
     device.success(&a, &["index", "--offline"]);
     peer.wait_for(|rows| {
         rows.iter()
@@ -633,7 +639,7 @@ fn http_transport_keeps_no_proxy_no_redirect_and_literal_loopback_guards() {
     device.success(&root, &["init"]);
 
     device.embedding_url(&origin.url());
-    device.success(&root, &["adapter", "approve", TOOL, "--yes"]);
+    device.success(&root, &["adapter", "approve", GENERIC_TOOL, "--yes"]);
     let mut cmd = device.command(&root, &["index", "--offline"]);
     cmd.env("HTTP_PROXY", proxy.url())
         .env("http_proxy", proxy.url())
@@ -655,7 +661,7 @@ fn http_transport_keeps_no_proxy_no_redirect_and_literal_loopback_guards() {
     device.embedding_url(&redirect.url());
     // New input forces execution under the changed destination profile.
     fs::write(root.join("redirect-note.md"), "redirect guard input\n").unwrap();
-    device.success(&root, &["adapter", "approve", TOOL, "--yes"]);
+    device.success(&root, &["adapter", "approve", GENERIC_TOOL, "--yes"]);
     let _ = device.output(&root, &["index", "--offline"]);
     redirect.wait_for(|rows| !rows.is_empty());
     assert!(
@@ -664,7 +670,7 @@ fn http_transport_keeps_no_proxy_no_redirect_and_literal_loopback_guards() {
     );
 
     device.embedding_url("http://192.0.2.1:9");
-    let rejected = device.output(&root, &["adapter", "approve", TOOL, "--preview"]);
+    let rejected = device.output(&root, &["adapter", "approve", GENERIC_TOOL, "--preview"]);
     assert_eq!(rejected.status.code(), Some(2));
     let diagnostic = format!(
         "{}{}",
@@ -688,7 +694,7 @@ fn configured_unapproved_http_peer_status_is_unauthenticated_without_scope() {
     device.embedding_url(&peer.url().replacen("http://", "HTTP://", 1));
     let grants = device.data.join("kio/grants");
     assert!(!grants.exists());
-    let status = device.success(&device.home, &["adapter", "status", TOOL]);
+    let status = device.success(&device.home, &["adapter", "status", GENERIC_TOOL]);
     assert!(
         status["scope_id"].is_null(),
         "device status must work outside a scope: {status}"

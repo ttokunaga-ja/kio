@@ -31,7 +31,7 @@ use crate::search::projection::mark_replica_unavailable_or_log;
 use crate::search::projection::write_through_repository_projection;
 use crate::search::scope::current_embedding_policy;
 use crate::settings::embedding_profile_summary;
-use crate::settings::persisted_embedding_is_deterministic;
+use crate::settings::persisted_embedding_is_local_library;
 use crate::settings::{
     rebuild_embedding_entry_from_tool_lock, rebuild_embedding_profile_from_tool_lock,
 };
@@ -1229,11 +1229,7 @@ pub(super) fn rebuild_step3_index_with_regeneration_skips(
         rebuilt_chunks: appended_count,
         rebuilt_tree_entries: tree_entries.len() as u64,
         skipped_units,
-        enrichment_replay: if authorities.publication.unavailable_pins.is_empty() {
-            None
-        } else {
-            Some(authorities)
-        },
+        enrichment_replay: Some(authorities),
     })
 }
 
@@ -2261,7 +2257,7 @@ fn build_sqlite_index_at(
     let locked_embedding = rebuild_embedding_entry_from_tool_lock(kio_dir)?;
     let expected_embedding_profile = locked_embedding.as_ref().map(embedding_profile_summary);
     let secrets_allowed = match locked_embedding.as_ref() {
-        Some(entry) if persisted_embedding_is_deterministic(entry) => true,
+        Some(entry) if persisted_embedding_is_local_library(entry) => true,
         Some(entry) => approvals::allowed(
             adapter_settings,
             repository,

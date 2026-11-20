@@ -40,7 +40,7 @@ use crate::search::query::snapshot_chunking_config_hash;
 use crate::search::scope::aggregator_path;
 use crate::search::scope::current_embedding_policy;
 use crate::settings::embedding_profile_summary;
-use crate::settings::persisted_embedding_is_deterministic;
+use crate::settings::persisted_embedding_is_local_library;
 use crate::settings::rebuild_embedding_entry_from_tool_lock;
 use kio_adapter::catalog::DeclaredEmbeddingProfile;
 use kio_adapter::catalog::EmbeddingExecution;
@@ -1494,6 +1494,12 @@ fn persisted_embedding_consent_requires_the_exact_builtin_identity() {
         kio_adapter::catalog::declared_deterministic_embedding_profile(),
         Some(ExecutionMode::DeterministicLibrary),
     );
+    let native = entry_for(
+        kio_adapter::catalog::declared_native_embedding_profile(),
+        Some(ExecutionMode::NativeLibrary),
+    );
+    let mut forged_native = native.clone();
+    forged_native.profile_hash = builtin.profile_hash.clone();
     let external = entry_for(
         kio_adapter::catalog::declared_adopted_embedding_profile(AdoptedEmbeddingExecution::Real),
         Some(ExecutionMode::OnlineApi),
@@ -1507,6 +1513,8 @@ fn persisted_embedding_consent_requires_the_exact_builtin_identity() {
     let lock_path = repo.kio_dir().join("tool-lock.json");
     for (entry, exempt) in [
         (builtin.clone(), true),
+        (native, true),
+        (forged_native, false),
         (external.clone(), false),
         (forged, false),
         (missing_kind, false),
@@ -1523,7 +1531,7 @@ fn persisted_embedding_consent_requires_the_exact_builtin_identity() {
             .unwrap()
             .unwrap();
         assert_eq!(persisted, entry);
-        assert_eq!(persisted_embedding_is_deterministic(&persisted), exempt);
+        assert_eq!(persisted_embedding_is_local_library(&persisted), exempt);
         assert_eq!(
             embedding_profile_summary(&persisted).profile_hash,
             entry.profile_hash,
@@ -1556,7 +1564,7 @@ fn persisted_embedding_consent_requires_the_exact_builtin_identity() {
             _ => unreachable!(),
         }
         assert!(
-            !persisted_embedding_is_deterministic(&changed),
+            !persisted_embedding_is_local_library(&changed),
             "{field} is part of the exact built-in identity"
         );
     }
@@ -1736,4 +1744,132 @@ fn o3_fresh_local_image_claim_survives_competing_enrichment() {
         cost_ledger_rows_for_key(&ledger, &key).unwrap().is_empty(),
         "free image cannot settle SQL cost"
     );
+}
+
+#[test]
+fn eg2_slot_contention_pauses_without_consuming_a_local_attempt() {
+    use crate::eg2::WorkerError;
+    use crate::embedding::executor::{
+        finish_native_embedding_failure, mirror_local_embedding_start,
+    };
+    use crate::embedding::plan::chunk_task_target;
+    use crate::local_execution::{Claim, LocalExecution, LocalTarget};
+    use crate::task_execution::{ExecOutcome, enrichment_completion};
+    use kio_pipeline::ledger::embedding_job::EmbeddingJobMember;
+
+    let root = private_tempdir();
+    let control = ControlHandle::default();
+    let ExplicitRoot::Created(repo) = initialize_explicit_root(root.path(), &control).unwrap()
+    else {
+        panic!("expected new fixture");
+    };
+    let profile = kio_adapter::catalog::declared_native_embedding_profile();
+    let text = "EG2 slot contention";
+    let chunks = bind_embedding_work(
+        vec![RetainedEmbeddingChunk {
+            chunk_id: hash_bytes(b"chunk identity"),
+            text: text.into(),
+            text_hash: hash_bytes(text.as_bytes()),
+            raw_path: "one.md".into(),
+            requires_secret_approval: false,
+            is_head_owner: true,
+        }],
+        &profile,
+    )
+    .unwrap();
+    let chunk = &chunks[0];
+    let hash = chunk.work_key.embedding_hash().to_owned();
+    let target = chunk_task_target(chunk, &profile);
+    let refs = BTreeSet::from([target.output_ref()]);
+    let tasks = TaskStore::new(repo.kio_dir());
+    let now = "2026-11-20T00:00:00Z";
+    enqueue_embedding_tasks(&tasks, &repo, &chunks, &profile, true, now).unwrap();
+    let identity = crate::embedding::transport::local_embedding_identity(
+        LocalTarget::Document {
+            scope_id: repo.scope_identity().unwrap().scope_id,
+            target: hash.clone(),
+        },
+        hash.clone(),
+        &profile,
+        EmbeddingExecution::Native,
+        vec![EmbeddingJobMember {
+            id: chunk.chunk_id.clone(),
+            target,
+        }],
+    )
+    .unwrap();
+    let store = LocalExecution::new(
+        root.path().join("local-execution"),
+        root.path().to_path_buf(),
+        control,
+    )
+    .unwrap();
+    let Claim::Claimed(mut claim) = store.claim(&identity, 0, None, 3, 0).unwrap() else {
+        panic!("expected first free claim");
+    };
+    mirror_local_embedding_start(&tasks, &refs, claim.attempts(), now).unwrap();
+    let mut outcome = ExecOutcome::default();
+    finish_native_embedding_failure(
+        &tasks,
+        &refs,
+        &mut claim,
+        WorkerError::ResourceBusy,
+        &mut outcome,
+    )
+    .unwrap();
+    drop(claim);
+    let paused = &tasks.all().unwrap()[0];
+    assert_eq!(paused.status, TaskStatus::Paused);
+    assert_eq!(paused.fallback_reason.as_deref(), Some("resource_busy"));
+    assert_eq!(paused.attempts, 0);
+    assert!(paused.reservation_claim().is_none());
+    assert!(matches!(
+        enrichment_completion(&outcome),
+        crate::response::Completion::Partial
+    ));
+
+    assert_eq!(
+        outcome.native_error_code().as_deref(),
+        Some("KIO-E-EMBED-RESOURCE-001")
+    );
+    assert_eq!(
+        crate::task_execution::batch_completion(&outcome),
+        crate::response::Completion::Partial
+    );
+
+    let Claim::Claimed(claim) = store.claim(&identity, paused.attempts, None, 3, 1).unwrap() else {
+        panic!("expected resumed free claim");
+    };
+    assert_eq!(claim.attempts(), 1);
+    mirror_local_embedding_start(&tasks, &refs, claim.attempts(), now).unwrap();
+    let resumed = &tasks.all().unwrap()[0];
+    assert_eq!(resumed.status, TaskStatus::Running);
+    assert_eq!(resumed.hold_reason, None);
+    let mut claim = claim;
+    for error in [
+        WorkerError::ModelHashMismatch,
+        WorkerError::RuntimeHashMismatch,
+    ] {
+        let mut outcome = ExecOutcome::default();
+        finish_native_embedding_failure(&tasks, &refs, &mut claim, error, &mut outcome).unwrap();
+        assert_eq!(claim.attempts(), 0);
+        assert_eq!(
+            outcome.native_error_code().as_deref(),
+            Some("KIO-E-MODEL-HASH-001")
+        );
+        assert!(matches!(
+            enrichment_completion(&outcome),
+            crate::response::Completion::Permanent
+        ));
+        assert!(matches!(
+            crate::task_execution::batch_completion(&outcome),
+            crate::response::Completion::Permanent
+        ));
+        drop(claim);
+        let Claim::Claimed(next) = store.claim(&identity, 0, None, 3, 2).unwrap() else {
+            panic!("hash rejection must leave an unsent record");
+        };
+        claim = next;
+        mirror_local_embedding_start(&tasks, &refs, claim.attempts(), now).unwrap();
+    }
 }

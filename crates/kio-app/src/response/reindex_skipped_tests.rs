@@ -85,6 +85,8 @@ fn reindex_head_projection_preserves_nullable_commit_counts_and_empty_skips() {
             });
             assert_projection(
                 HeadReindexResponse {
+                    embedding_unavailable_reason: None,
+                    error_code: None,
                     deferred_inputs: kio_core::disk_records::DiskRecords::empty(),
                     status: "reindexed".to_owned(),
                     reindexed_files: u64::MAX,
@@ -120,6 +122,7 @@ fn reindex_historical_projection_preserves_selected_snapshot_and_distinct_skip_s
             rebuilt_chunks: u64::MAX,
             embedding_tasks_executed: 1,
             embedding_tasks_failed: 2,
+            error_code: None,
             paused_tasks: 3,
             blocked_raw_hashes: 4,
             skipped: SkippedDisclosure {

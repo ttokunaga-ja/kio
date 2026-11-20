@@ -33,8 +33,10 @@ pub(crate) fn secret_embedding_hold_required(
     secrets_approved: bool,
     requires_secret_approval: bool,
 ) -> bool {
-    execution_mode != ExecutionMode::DeterministicLibrary
-        && !secrets_approved
+    matches!(
+        execution_mode,
+        ExecutionMode::OnlineApi | ExecutionMode::OfflineApi
+    ) && !secrets_approved
         && requires_secret_approval
 }
 

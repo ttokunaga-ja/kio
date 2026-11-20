@@ -1,4 +1,5 @@
 use crate::commands::IndexArgs;
+use crate::eg2::{EmbeddingInput, EmbeddingSession, EngineSlot, WorkerError};
 use crate::egress::admit_embedding_transport;
 use crate::egress::embedding_online_allowed;
 use crate::egress::embedding_secrets_allowed;
@@ -9,10 +10,10 @@ use crate::embedding::admission::declared_embedding_profile;
 use crate::embedding::admission::effective_invocation_lane;
 use crate::embedding::admission::embedding_billed_from_usage;
 use crate::embedding::admission::embedding_execution;
+use crate::embedding::admission::embedding_is_online;
 use crate::embedding::admission::embedding_text_reservation;
 use crate::embedding::admission::secret_embedding_hold_required;
 use crate::embedding::admission::validate_embedding_aliases;
-use crate::embedding::admission::{embedding_is_deterministic, embedding_is_online};
 use crate::embedding::batch::submit_embedding_batch_jobs;
 use crate::embedding::image_executor::{ImageEnrichmentRequest, run_image_embedding_enrichment};
 use crate::embedding::plan::EMBEDDING_BATCH_SIZE;
@@ -32,9 +33,12 @@ use crate::embedding::plan::retained_chunks_without_embedding;
 use crate::embedding::plan::selected_embedding_contexts;
 use crate::embedding::plan::validate_embedding_task_bindings;
 use crate::embedding::transport::{EmbeddingRunFailure, run_embedding_adapter};
+use crate::embedding::transport::{
+    LocalEmbeddingResult, LocalEmbeddingRunFailure, run_native_embedding,
+};
 use crate::embedding_owners;
 use crate::historical_reindex::RetainedNormalizedInstance;
-use crate::historical_reindex::retained_history_instances;
+use crate::historical_reindex::retained_history_instances_for_roots;
 use crate::index::chunk_ledger::rotate_index_generation_unconditionally;
 use crate::index::chunk_ledger::sqlite_path;
 use crate::index::rebuild::RebuildAuthorities;
@@ -235,7 +239,7 @@ fn run_embedding_enrichment_for_instances(
     } else {
         open_optional_ledger_db(invocation.control)?
     };
-    let execute_now = online || embedding_is_deterministic(execution);
+    let execute_now = online || !execution.uses_endpoint();
     let db_path = sqlite_path(repo.kio_dir());
     if !db_path.exists() {
         return Ok(ExecOutcome::default());
@@ -258,6 +262,10 @@ fn run_embedding_enrichment_for_instances(
         Some(hash) => hash.to_owned(),
         None => snapshot_chunking_config_hash(repo, &head)?,
     };
+    // Keep enrichment on the same verified history as the source rebuild.
+    // A finalized shallow ancestor has no tree to contribute.
+    let head_root = BTreeSet::from([head.clone()]);
+    let retained_roots = replay.as_deref().map_or(&head_root, |replay| &replay.roots);
     let mut retained_instances_owned;
     let retained_instances = if let Some(selected) = selected_instances {
         selected
@@ -266,11 +274,18 @@ fn run_embedding_enrichment_for_instances(
         // `tree_entries`. Enrichment is writer work, so materialize that source
         // cache relation here before its live-chunk JOIN.
         ensure_snapshot_tree_entries(repo, &conn, &head)?;
-        retained_instances_owned = retained_history_instances(repo, &head)?;
+        retained_instances_owned = retained_history_instances_for_roots(repo, retained_roots)?;
         if let Some(replay) = &replay {
             retained_instances_owned.retain(|instance| !replay.excludes(instance));
         }
         &retained_instances_owned
+    };
+    let projection_instances_owned;
+    let projection_instances = if selected_instances.is_some() {
+        projection_instances_owned = retained_history_instances_for_roots(repo, retained_roots)?;
+        &projection_instances_owned
+    } else {
+        retained_instances
     };
     let current_policy = current_embedding_policy(repo)?;
     let retained_chunks = embedding_owners::collect_retained_embedding_chunks_with_replay(
@@ -281,13 +296,6 @@ fn run_embedding_enrichment_for_instances(
         Some(&current_policy),
         replay.as_deref_mut(),
     )?;
-    let projection_instances_owned;
-    let projection_instances = if selected_instances.is_some() {
-        projection_instances_owned = retained_history_instances(repo, &head)?;
-        &projection_instances_owned
-    } else {
-        retained_instances
-    };
     let projection_chunks = embedding_owners::collect_retained_embedding_chunks_with_replay(
         repo,
         &conn,
@@ -318,7 +326,8 @@ fn run_embedding_enrichment_for_instances(
         .collect::<BTreeMap<_, _>>();
     let task_store = TaskStore::new_with_control(repo.kio_dir(), repo.control().clone());
     validate_embedding_task_bindings(&task_store, &retained_chunks, &profile)?;
-    let secrets_approved = embedding_secrets_allowed(adapter_settings, repo, &profile)?;
+    let secrets_approved =
+        !execution.uses_endpoint() || embedding_secrets_allowed(adapter_settings, repo, &profile)?;
     let mut pending = retained_chunks_without_embedding(&conn, retained_chunks.clone(), &profile)?;
     let existing_tasks = task_store.all().map_err(pipeline_to_kio)?;
     // Fresh bookkeeping must never revive, complete, or restamp an existing
@@ -402,6 +411,7 @@ fn run_embedding_enrichment_for_instances(
         execution,
         profile: &profile,
         current_policy: &current_policy,
+        native_session: std::cell::RefCell::new(EmbeddingSession::new(EngineSlot::Index)),
         projection: EmbeddingProjection {
             repo,
             execution,
@@ -433,6 +443,18 @@ fn run_embedding_enrichment_for_instances(
         &embedding_context.projection,
         &projection_held,
     )?;
+    // A staged result has a durable started Task. Recover it even if
+    // the model has since been removed or is no longer accessible.
+    let model_missing = execution == EmbeddingExecution::Native
+        && crate::model::engine_model_absent(invocation.control)
+        && !existing_tasks.iter().any(|task| {
+            task.attempts > 0
+                && matches!(task.status, TaskStatus::Running | TaskStatus::Pending)
+                && task
+                    .embedding_target
+                    .as_ref()
+                    .is_some_and(|target| target.profile_hash() == profile.profile_hash)
+        });
     let mut outcome = run_image_embedding_enrichment(
         Invocation {
             settings: adapter_settings,
@@ -449,9 +471,13 @@ fn run_embedding_enrichment_for_instances(
             ledger: ledger.as_ref(),
             secrets_approved,
             execution_allowed: execute_now,
+            model_missing,
             override_budget,
         },
     )?;
+    if model_missing {
+        outcome.embedding_unavailable_reason = Some(WorkerError::ModelMissing.reason());
+    }
     prune_terminal_embedding_secret_holds(repo)?;
     if pending.is_empty() {
         return Ok(outcome);
@@ -477,6 +503,11 @@ fn run_embedding_enrichment_for_instances(
         return Ok(outcome);
     }
     enqueue_embedding_tasks(&task_store, repo, &sendable, &profile, execute_now, &now)?;
+    if model_missing {
+        let refs = sendable.iter().map(embedding_task_output_ref).collect();
+        pause_for_missing_model(&task_store, &refs, &mut outcome)?;
+        return Ok(outcome);
+    }
     if !execute_now {
         // Network opt-in is evaluated before ledger admission. Keep an existing
         // ledger pause as pending work if the current invocation cannot send.
@@ -827,10 +858,11 @@ fn run_embedding_enrichment_for_instances(
                         &embedding_context,
                         group,
                         claim.token().to_owned(),
-                        invocation.control,
+                        &invocation,
                     ) {
-                        Ok(result) => {
+                        Ok(mut result) => {
                             let vector = result
+                                .completed
                                 .members
                                 .iter()
                                 .find_map(|member| match &member.result {
@@ -840,28 +872,27 @@ fn run_embedding_enrichment_for_instances(
                                 .ok_or_else(|| {
                                     KioError::schema("local embedding completion has no vector")
                                 })?;
-                            let completed = EmbeddingCompleted {
-                                members: members
-                                    .iter()
-                                    .map(|member| EmbeddingMemberOutcome {
-                                        id: member.id.clone(),
-                                        result: EmbeddingMemberResult::Vector {
-                                            vector: vector.clone(),
-                                        },
-                                    })
-                                    .collect(),
-                                dimensions: u32::try_from(profile.dimensions).map_err(|_| {
-                                    KioError::schema("embedding dimensions exceed u32")
-                                })?,
-                                distance: profile.distance.clone(),
-                                modality: profile.modality.clone(),
-                                embedding_profile_hash: profile.profile_hash.clone(),
-                                usage: EmbeddingUsage::Unmetered,
-                            };
-                            claim.stage_result(&serde_json::to_vec(&completed).map_err(
-                                |_| KioError::schema("cannot serialize local embedding completion"),
-                            )?)?;
-                            completed
+                            result.completed.members = members
+                                .iter()
+                                .map(|member| EmbeddingMemberOutcome {
+                                    id: member.id.clone(),
+                                    result: EmbeddingMemberResult::Vector {
+                                        vector: vector.clone(),
+                                    },
+                                })
+                                .collect();
+                            result.stage(&mut claim)?;
+                            result
+                        }
+                        Err(LocalEmbeddingRunFailure::Native(error)) => {
+                            finish_native_embedding_failure(
+                                &task_store,
+                                &refs,
+                                &mut claim,
+                                error,
+                                &mut outcome,
+                            )?;
+                            continue;
                         }
                         Err(crate::embedding::transport::LocalEmbeddingRunFailure::Classified(
                             failure,
@@ -919,6 +950,7 @@ fn run_embedding_enrichment_for_instances(
                     }
                 };
                 let vector = completed
+                    .completed
                     .members
                     .iter()
                     .find_map(|member| match &member.result {
@@ -943,7 +975,7 @@ fn run_embedding_enrichment_for_instances(
                     &conn,
                     &profile,
                     group,
-                    vector,
+                    (vector, completed.native_producer),
                     &BTreeSet::new(),
                     &embedding_context.projection,
                     &mut replica,
@@ -1456,6 +1488,7 @@ pub(crate) struct EmbeddingExecutionContext<'a> {
     pub(crate) execution: EmbeddingExecution,
     pub(crate) profile: &'a DeclaredEmbeddingProfile,
     pub(crate) current_policy: &'a CurrentPolicyEvaluator,
+    pub(crate) native_session: std::cell::RefCell<EmbeddingSession>,
     pub(crate) projection: EmbeddingProjection<'a>,
 }
 
@@ -1810,7 +1843,7 @@ impl GroupPublication<'_, '_> {
             self.conn,
             self.embedding.profile,
             group,
-            vector,
+            (vector, None),
             &BTreeSet::new(),
             &self.embedding.projection,
             self.replica,
@@ -1842,11 +1875,12 @@ pub(crate) fn persist_group_vector(
     conn: &Connection,
     profile: &DeclaredEmbeddingProfile,
     group: &EmbeddingSendGroup<'_>,
-    vector: &[f32],
+    output: (&[f32], Option<ProducerProvenance>),
     held: &BTreeSet<String>,
     projection: &EmbeddingProjection<'_>,
     replica: &mut kio_index::aggregator::ScopeDelta,
 ) -> std::result::Result<(), TaskExecutionFailure> {
+    let (vector, native_producer) = output;
     let repo = projection.repo;
     let chunk = group.representative;
     if chunk_embedding_hash(chunk, profile).map_err(|_| TaskExecutionFailure {
@@ -1872,7 +1906,7 @@ pub(crate) fn persist_group_vector(
         repo,
         &group.embedding_hash,
         &chunk.text_hash,
-        vector,
+        (vector, native_producer),
         profile,
         context_key.as_deref(),
         projection.execution,
@@ -1961,11 +1995,12 @@ pub(crate) fn publish_embedding_object(
     repo: &Repository,
     embedding_hash: &str,
     text_hash: &str,
-    vector: &[f32],
+    output: (&[f32], Option<ProducerProvenance>),
     profile: &DeclaredEmbeddingProfile,
     context: Option<&str>,
     execution: EmbeddingExecution,
 ) -> Result<()> {
+    let (vector, native_producer) = output;
     let object = kio_core::cas::EmbeddingObject {
         spec_version: 1,
         target_type: "chunk".to_owned(),
@@ -1976,7 +2011,7 @@ pub(crate) fn publish_embedding_object(
         distance: profile.distance.clone(),
         context: context.map(|text| kio_core::cas::EmbeddingContext::Text(text.to_owned())),
         vector: vector.to_vec(),
-        metadata: embedding_metadata(execution, &profile.profile_hash)?,
+        metadata: embedding_metadata(execution, &profile.profile_hash, native_producer)?,
     };
     publish_verified_embedding(repo, embedding_hash, &object)
 }
@@ -1986,12 +2021,13 @@ pub(crate) fn publish_image_embedding_object(
     repo: &Repository,
     embedding_hash: &str,
     image_hash: &str,
-    vector: &[f32],
+    output: (&[f32], Option<ProducerProvenance>),
     profile: &DeclaredEmbeddingProfile,
     execution: EmbeddingExecution,
     plan: &crate::embedding::input::ImageEmbeddingPlan,
 ) -> Result<()> {
-    let mut metadata = embedding_metadata(execution, &profile.profile_hash)?;
+    let (vector, native_producer) = output;
+    let mut metadata = embedding_metadata(execution, &profile.profile_hash, native_producer)?;
     metadata.image_input_receipt = plan.receipt().cloned();
     let object = kio_core::cas::EmbeddingObject {
         spec_version: 1,
@@ -2090,6 +2126,7 @@ pub(crate) fn publish_image_job_member(
 fn embedding_metadata(
     execution: EmbeddingExecution,
     profile_hash: &str,
+    native_producer: Option<ProducerProvenance>,
 ) -> Result<EmbeddingMetadata> {
     let mode = match execution.execution_mode() {
         kio_adapter::types::ExecutionMode::OnlineApi => ProducerExecutionMode::OnlineApi,
@@ -2101,7 +2138,11 @@ fn embedding_metadata(
     };
     Ok(EmbeddingMetadata {
         record_format: 2,
-        producer: ProducerProvenance::non_native(mode, profile_hash)?,
+        producer: match (mode, native_producer) {
+            (ProducerExecutionMode::NativeLibrary, Some(producer)) => producer,
+            (_, None) => ProducerProvenance::non_native(mode, profile_hash)?,
+            _ => return Err(KioError::schema("unexpected native embedding producer")),
+        },
         image_input_receipt: None,
     })
 }
@@ -2119,6 +2160,95 @@ fn publish_verified_embedding(
             json!({ "expected_hash":expected_hash, "actual_hash":actual_hash }),
             ExitCode::PermanentFailure,
         ));
+    }
+    Ok(())
+}
+
+pub(crate) fn pause_for_missing_model(
+    store: &TaskStore,
+    refs: &BTreeSet<String>,
+    outcome: &mut ExecOutcome,
+) -> Result<()> {
+    let mut paused = 0;
+    store
+        .update_matching(|task| {
+            if !refs.contains(&task.output_ref)
+                || !matches!(task.status, TaskStatus::Pending | TaskStatus::Paused)
+                || task.resource_limit.is_some()
+                || task.reservation_claim().is_some()
+            {
+                return false;
+            }
+            paused += 1;
+            if task.hold_reason == Some(kio_pipeline::task::HoldReason::ModelNotReady) {
+                return false;
+            }
+            task.status = TaskStatus::Paused;
+            task.hold_reason = Some(kio_pipeline::task::HoldReason::ModelNotReady);
+            task.fallback_reason = Some("model_not_ready".to_owned());
+            task.next_retry_at = None;
+            task.heartbeat_at = None;
+            true
+        })
+        .map_err(pipeline_to_kio)?;
+    outcome.paused += paused;
+    outcome.model_not_ready += paused;
+    outcome.embedding_unavailable_reason = Some(WorkerError::ModelMissing.reason());
+    Ok(())
+}
+
+pub(crate) fn finish_native_embedding_failure(
+    store: &TaskStore,
+    refs: &BTreeSet<String>,
+    claim: &mut crate::local_execution::LocalGuard,
+    error: WorkerError,
+    outcome: &mut ExecOutcome,
+) -> Result<()> {
+    crate::embedding::transport::record_native_failure(claim, error)?;
+    let (status, reason) = if error.is_resource_busy() {
+        outcome.paused += refs.len();
+        outcome.resource_busy += refs.len();
+        (TaskStatus::Paused, "resource_busy")
+    } else if error.is_unsent() {
+        outcome.paused += refs.len();
+        outcome.model_not_ready += refs.len();
+        outcome.embedding_unavailable_reason = Some(error.reason());
+        if error.is_hash_mismatch() {
+            outcome.native_failure = Some(error);
+        }
+        (TaskStatus::Paused, "model_not_ready")
+    } else {
+        outcome.failed += refs.len();
+        if !outcome
+            .native_failure
+            .is_some_and(WorkerError::is_hash_mismatch)
+        {
+            outcome.native_failure = Some(error);
+        }
+        if error.retryable() && claim.attempts() < 3 {
+            outcome.failed_retryable += refs.len();
+        }
+        (TaskStatus::Failed, error.reason())
+    };
+    store
+        .update_matching(|task| {
+            if task.task_type != TaskType::Embedding
+                || !refs.contains(&task.output_ref)
+                || task.reservation_claim().is_some()
+            {
+                return false;
+            }
+            task.status = status;
+            task.fallback_reason = Some(reason.to_owned());
+            task.hold_reason = hold_reason_for_reason(reason);
+            task.attempts = claim.attempts();
+            task.next_retry_at = None;
+            task.heartbeat_at = None;
+            true
+        })
+        .map_err(pipeline_to_kio)?;
+    if error == WorkerError::Cancelled {
+        return Err(error.interruption_error());
     }
     Ok(())
 }
@@ -2263,6 +2393,8 @@ pub(crate) fn mirror_local_embedding_start(
                 return false;
             }
             task.status = TaskStatus::Running;
+            task.hold_reason = None;
+            task.resource_limit = None;
             task.attempts = attempts;
             task.next_retry_at = None;
             task.heartbeat_at = Some(now.to_owned());
@@ -2323,10 +2455,8 @@ fn send_local_embed_group(
     embedding: &EmbeddingExecutionContext<'_>,
     group: &EmbeddingSendGroup<'_>,
     token: String,
-    control: &ControlHandle,
-) -> std::result::Result<EmbeddingCompleted, crate::embedding::transport::LocalEmbeddingRunFailure>
-{
-    use crate::embedding::transport::LocalEmbeddingRunFailure;
+    invocation: &Invocation<'_>,
+) -> std::result::Result<LocalEmbeddingResult, LocalEmbeddingRunFailure> {
     validate_embedding_aliases(
         embedding.current_policy,
         embedding.profile,
@@ -2346,6 +2476,19 @@ fn send_local_embed_group(
         requires_secret,
     )
     .map_err(LocalEmbeddingRunFailure::Admission)?;
+    if embedding.execution == EmbeddingExecution::Native {
+        let context = embedding_store::chunk_embedding_context(&group.representative.raw_path);
+        return run_native_embedding(
+            invocation.context.interaction.as_ref(),
+            &mut embedding.native_session.borrow_mut(),
+            EmbeddingInput::Document {
+                body: &group.representative.text,
+                filename_context: context.as_deref(),
+            },
+            group.embedding_hash.clone(),
+            embedding.profile,
+        );
+    }
     crate::embedding::transport::run_local_embedding_adapter(
         settings,
         Some(crate::embedding::transport::LocalSendAuthority {
@@ -2356,7 +2499,7 @@ fn send_local_embed_group(
         group_embedding_items(group),
         EmbeddingInputType::MarkdownChunk,
         Some(token),
-        control,
+        invocation.control,
     )
 }
 

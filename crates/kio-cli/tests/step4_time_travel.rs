@@ -922,7 +922,30 @@ fn ct4_timetravel_017_historical_reindex_introduces_config_transition_at_descend
         ),
     );
 
+    // A new publication cannot introduce an unpublished descendant.
+    let ledger = dir.path().join(".kio/index/chunks.jsonl");
+    let before = fs::read(&ledger).unwrap();
+    let error = json_failure(&dir, &["reindex", "--at", &c2], 2);
+    assert_eq!(error["error_code"], "KIO-E-CONFIG-SCHEMA-001");
+    assert_eq!(fs::read(&ledger).unwrap(), before);
+
+    // Publish a later tip so C2 is a genuinely retained historical commit.
+    let transition = repo.read_commit(&c2).unwrap();
+    let c3 = write_commit(
+        &store,
+        &synthetic_commit(
+            transition.tree,
+            Some(c2.clone()),
+            "2026-07-12T02:00:00Z",
+            "published tip",
+            transition.tool_lock_hash,
+            CommitType::Manual,
+        ),
+    );
+    let head_path = dir.path().join(".kio/HEAD");
+    fs::write(&head_path, format!("{c3}\n")).unwrap();
     json_success(&dir, &["reindex", "--at", &c2]);
+    assert_eq!(fs::read_to_string(head_path).unwrap().trim(), c3);
     let publications = fs::read_to_string(dir.path().join(".kio/index/chunks.jsonl"))
         .unwrap()
         .lines()

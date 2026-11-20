@@ -807,7 +807,7 @@ impl QueryPeer {
                                 }
                             }
                             let mut vector = vec![0.0_f32; 768]; vector[0] = 1.0;
-                            let body = serde_json::json!({"data":[{"embedding":vector}]}).to_string();
+                            let body = serde_json::json!({"data":[{"index":0,"embedding":vector}]}).to_string();
                             let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
                             if let Err(error) = stream.write_all(response.as_bytes()).and_then(|()| stream.flush()) {
                                 let mut diagnostics = diagnostics.lock().unwrap();
@@ -914,7 +914,7 @@ impl LocalQueryFixture {
         }
         let config = support::create_private_child_dir(&home.join("config"), "kio");
         let tools = format!(
-            "[embedding.qwen3_vl_embedding_local]\nkind = \"offline_api\"\nurl = \"https://127.0.0.1:{}\"\nmodel = \"Qwen/Qwen3-VL-Embedding-2B\"\n",
+            "[embedding.local_embedding]\nkind = \"offline_api\"\nurl = \"https://127.0.0.1:{}\"\nmodel = \"test-embedding\"\nwire_format = 'messages'\nmodel_version_pin = 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\nchat_template_hash = 'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'\ninstruction = ''\n",
             peer.port
         );
         #[cfg(windows)]
@@ -960,10 +960,7 @@ impl LocalQueryFixture {
             )
             .unwrap();
             fixture.json(scope, &["init", "--independent", "--yes"]);
-            fixture.json(
-                scope,
-                &["adapter", "approve", "qwen3_vl_embedding_local", "--yes"],
-            );
+            fixture.json(scope, &["adapter", "approve", "local_embedding", "--yes"]);
             let indexed = fixture.command(scope, &["index"]).output().unwrap();
             assert!(
                 indexed.status.success(),
@@ -1358,7 +1355,7 @@ fn endpoint_revoke_from_other_scope_cannot_complete_while_actual_query_send_is_h
     assert!(query.0.as_mut().unwrap().try_wait().unwrap().is_none());
     let mut revoke = QueryChild(Some(
         fixture
-            .command(1, &["adapter", "revoke", "qwen3_vl_embedding_local"])
+            .command(1, &["adapter", "revoke", "local_embedding"])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -1411,7 +1408,7 @@ fn endpoint_revoke_from_other_scope_cannot_complete_while_actual_query_send_is_h
         // The prior attempt explicitly refused without mutation; this is one
         // fresh authorized retry, never replay of an ambiguous mutation.
         fixture
-            .command(1, &["adapter", "revoke", "qwen3_vl_embedding_local"])
+            .command(1, &["adapter", "revoke", "local_embedding"])
             .output()
             .unwrap()
     } else {
@@ -1473,7 +1470,7 @@ fn endpoint_revoke_from_other_scope_before_final_query_consent_sends_nothing() {
     assert!(ready.exists());
     assert_eq!(peer.queries.load(Ordering::SeqCst), 0);
     let start = std::time::Instant::now();
-    let revoked = fixture.json(1, &["adapter", "revoke", "qwen3_vl_embedding_local"]);
+    let revoked = fixture.json(1, &["adapter", "revoke", "local_embedding"]);
     assert_eq!(revoked["status"], "revoked", "{revoked}");
     assert!(
         start.elapsed() < std::time::Duration::from_secs(20),
@@ -1615,4 +1612,161 @@ fn resource_limit_image_result_retry_authenticates_input_and_publishes_without_r
         );
         assert_eq!(billing(&f), before);
     }
+}
+
+#[test]
+fn default_eg2_reports_missing_model_without_install_or_billing() {
+    let fixture = Fixture::new(false);
+    let output = fixture
+        .command(&["index", "--offline"])
+        .env_remove("KIO_EVAL_DETERMINISTIC_EMBED")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let index: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(index["embedding_unavailable_reason"], "model_missing");
+    assert_eq!(index["embedding_tasks_executed"], 0);
+    assert!(index["paused_tasks"].as_u64().unwrap() > 0);
+    let status = fixture.json(&["status"]);
+    assert!(
+        status["paused_by_hold_reason"]["model_not_ready"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+
+    let model = fixture
+        .command(&["model", "status"])
+        .env_remove("KIO_EVAL_DETERMINISTIC_EMBED")
+        .output()
+        .unwrap();
+    assert!(model.status.success(), "{model:?}");
+    let model: Value = serde_json::from_slice(&model.stdout).unwrap();
+    assert_eq!(model["readiness"], "missing");
+    assert!(!fixture.ledger().exists());
+}
+
+#[test]
+#[ignore = "requires the official EG2 artifact (KIO_EG2_TEST_MODEL) and pinned LiteRT-LM build"]
+fn default_eg2_publishes_native_text_and_images_and_searches_offline() {
+    let fixture = Fixture::new(false);
+    let source =
+        std::env::var("KIO_EG2_TEST_MODEL").expect("absolute official model artifact path");
+    let run = |args: &[&str]| {
+        let output = fixture
+            .command(args)
+            .env_remove("KIO_EVAL_DETERMINISTIC_EMBED")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    run(&[
+        "model",
+        "install",
+        "embeddinggemma-2",
+        "--from",
+        &source,
+        "--offline",
+        "--yes",
+    ]);
+    let model = run(&["model", "status"]);
+    assert_eq!(model["readiness"], "ready");
+
+    // Hold the real device-wide indexing slot while a second process indexes.
+    // Drop the owner automatically on a startup or contention assertion failure.
+    use std::io::{Read, Write};
+    use std::process::Stdio;
+    let resolved = fixture.command(&[]);
+    let mut worker = std::process::Command::new(env!("CARGO_BIN_EXE_kio"));
+    worker.env_clear();
+    worker.envs(
+        resolved
+            .get_envs()
+            .filter_map(|(key, value)| value.map(|value| (key, value))),
+    );
+    let mut owner = QueryChild(Some(
+        worker
+            .args([kio_app::eg2::WORKER_ARGUMENT, "index"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    ));
+    let child = owner.0.as_mut().unwrap();
+    child.stdin.as_mut().unwrap().write_all(&[1]).unwrap();
+    let mut worker_result = child.stdout.take().unwrap();
+    let (startup, status) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut ready = [0; 2];
+        startup
+            .send(worker_result.read_exact(&mut ready).map(|()| ready))
+            .ok();
+    });
+    assert_eq!(
+        status
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .unwrap()
+            .unwrap(),
+        [1, 2]
+    );
+    let held = fixture
+        .command(&["index", "--offline"])
+        .env_remove("KIO_EVAL_DETERMINISTIC_EMBED")
+        .output()
+        .unwrap();
+    assert_eq!(held.status.code(), Some(3), "{held:?}");
+    let held: Value = serde_json::from_slice(&held.stdout).unwrap();
+    assert_eq!(held["error_code"], "KIO-E-EMBED-RESOURCE-001");
+    assert!(
+        run(&["status"])["paused_by_hold_reason"]["resource_busy"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    drop(owner);
+
+    // A crash after a validated completion has been staged must preserve
+    // both the vector and the worker's producer when the next process resumes.
+    let interrupted = fixture
+        .command(&["index", "--offline"])
+        .env_remove("KIO_EVAL_DETERMINISTIC_EMBED")
+        .env(
+            "KIO_TEST_EMBEDDING_PUBLICATION_FAULT",
+            "before_source_write",
+        )
+        .output()
+        .unwrap();
+    assert!(!interrupted.status.success(), "{interrupted:?}");
+    let model_path = PathBuf::from(model["path"].as_str().unwrap());
+    let held_model = model_path.with_extension("unavailable");
+    fs::rename(&model_path, &held_model).unwrap();
+    // The staged image is published even while the model is temporarily absent.
+    let replayed = run(&["index", "--offline"]);
+    assert!(replayed["embedding_tasks_executed"].as_u64().unwrap() > 0);
+    fs::rename(held_model, model_path).unwrap();
+    run(&["index", "--offline"]);
+    let store = kio_core::cas::ObjectStore::new(fixture.scope.join(".kio"));
+    let mut targets = std::collections::BTreeSet::new();
+    for hash in store.embedding_hashes().unwrap() {
+        let object = store.read_embedding(&hash).unwrap();
+        let producer = object.metadata.producer;
+        assert_eq!(object.profile_hash, kio_core::eg2::profile_hash());
+        assert_eq!(
+            producer.execution_mode,
+            kio_core::cas::ProducerExecutionMode::NativeLibrary
+        );
+        assert_eq!(producer.runtime_version.as_deref(), Some("0.19.1"));
+        assert_eq!(producer.threads, Some(2));
+        producer.validate(&object.profile_hash).unwrap();
+        targets.insert(object.target_type);
+    }
+    assert!(targets.contains("chunk") && targets.contains("image"));
+    for mode in ["vector", "image"] {
+        let response = run(&["search", "localvectorneedle", "--mode", mode, "--offline"]);
+        assert_eq!(response["resolved_mode"], mode);
+        assert!(!response["results"].as_array().unwrap().is_empty());
+    }
+    run(&["repair", "rebuild-db", "--offline"]);
+    assert!(!fixture.ledger().exists());
 }

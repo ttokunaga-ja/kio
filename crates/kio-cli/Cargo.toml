@@ -40,3 +40,8 @@ miniz_oxide.workspace = true
 serde_jcs.workspace = true
 tempfile = "3"
 zip.workspace = true
+
+[build-dependencies]
+sha2.workspace = true
+ureq.workspace = true
+zip.workspace = true

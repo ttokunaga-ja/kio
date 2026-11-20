@@ -62,6 +62,8 @@ fn empty_status(quarantine: Vec<Value>) -> StatusResponse {
         files: records([]),
         head_shallow: false,
         paused_by_hold_reason: PausedTasksByHoldReason {
+            resource_busy: 0,
+            model_not_ready: 0,
             budget: 0,
             auth: 0,
             tier_b_approval: 0,
@@ -81,7 +83,7 @@ fn empty_status(quarantine: Vec<Value>) -> StatusResponse {
 
 fn legacy_empty_status(quarantine: Vec<Value>) -> Value {
     json!({"scope_path":PathBuf::from("scope/日本語/.kio"),"files":[],"head_shallow":false,
-        "paused_by_hold_reason":{"budget":0,"auth":0,"tier_b_approval":0,"ledger_initialization_required":0,"resource_limit":0},
+        "paused_by_hold_reason":{"budget":0,"auth":0,"tier_b_approval":0,"ledger_initialization_required":0,"resource_limit":0,"resource_busy":0,"model_not_ready":0},
         "tasks":[],"quarantine":quarantine,"unsupported_inputs":[],"unsupported_inputs_complete":true,
         "budget":legacy_uninitialized_budget(),"stalled_batch":[],"active_purge_journal":null,"active_gc_sweep":null})
 }
@@ -232,6 +234,8 @@ fn status_complete_projection_keeps_shallow_and_paused_inspection_successful() {
         dto.head_shallow = shallow;
         dto.unsupported_inputs_complete = !shallow;
         dto.paused_by_hold_reason = PausedTasksByHoldReason {
+            resource_busy: 0,
+            model_not_ready: 0,
             budget: 1,
             auth: 2,
             tier_b_approval: 3,
@@ -240,7 +244,7 @@ fn status_complete_projection_keeps_shallow_and_paused_inspection_successful() {
         };
         legacy["head_shallow"] = json!(shallow);
         legacy["unsupported_inputs_complete"] = json!(!shallow);
-        legacy["paused_by_hold_reason"] = json!({"budget":1,"auth":2,"tier_b_approval":3,"ledger_initialization_required":4,"resource_limit":0});
+        legacy["paused_by_hold_reason"] = json!({"budget":1,"auth":2,"tier_b_approval":3,"ledger_initialization_required":4,"resource_limit":0,"resource_busy":0,"model_not_ready":0});
         let response = CommandResponse {
             body: ResponseBody::Status(Box::new(dto)),
             completion: Completion::Complete,

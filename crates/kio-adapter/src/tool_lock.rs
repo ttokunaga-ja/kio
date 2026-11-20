@@ -361,8 +361,6 @@ struct EmbeddingRuntimeTarget {
     modality: &'static str,
 }
 
-pub(crate) const LOCAL_EMBEDDING_TOOL_ID: &str = "qwen3_vl_embedding_local";
-
 /// Dimensions stay 768 across embedding targets: `chunk_vec`'s sqlite-vec width is
 /// fixed at `kio_index::fts::CHUNK_VEC_DIMENSIONS` (04 §4.3), so a target
 /// declaring anything else would produce vectors vector search cannot read.
@@ -372,15 +370,6 @@ const EMBEDDING_RUNTIME_TARGETS: &[EmbeddingRuntimeTarget] = &[
         kind: "online_api",
         mode: "online",
         model: Some("gemini-embedding-2"),
-        dimensions: 768,
-        distance: "cosine",
-        modality: "multimodal",
-    },
-    EmbeddingRuntimeTarget {
-        tool_id: LOCAL_EMBEDDING_TOOL_ID,
-        kind: "offline_api",
-        mode: "offline",
-        model: Some("Qwen/Qwen3-VL-Embedding-2B"),
         dimensions: 768,
         distance: "cosine",
         modality: "multimodal",
@@ -503,7 +492,7 @@ fn declared_markdown_runtime_target(
 /// A `[embedding.<tool_id>]` section names it outright. The flat `[embedding]`
 /// form cannot, so it is resolved by declared `kind`, defaulting to the online
 /// target — which is what the flat form has always meant. That resolution is
-/// reserved for the built-in Gemini and Qwen targets. A generic endpoint
+/// reserved for Gemini. A generic endpoint
 /// requires the explicit `[embedding.local_embedding]` section.
 fn embedding_runtime_target(
     tool_id: Option<&str>,
@@ -529,7 +518,7 @@ fn embedding_runtime_target(
         .find(|target| target.kind == kind && target.tool_id != GENERIC_LOCAL_EMBEDDING_TOOL_ID)
         .ok_or_else(|| {
             AdapterError::ConfigSchema(format!(
-                "tools.toml `embedding.kind` must be `online_api` or `offline_api` (got `{kind}`)"
+                "tools.toml `embedding.kind` must be `online_api` in the flat form (got `{kind}`)"
             ))
         })
 }
@@ -1032,6 +1021,17 @@ pub struct LocalEmbeddingOptions {
     pub(crate) chat_template_hash: Option<String>,
     pub(crate) instruction: Option<String>,
     pub(crate) truncate_dimensions: bool,
+}
+
+#[cfg(test)]
+pub(crate) fn test_local_embedding_options() -> LocalEmbeddingOptions {
+    LocalEmbeddingOptions {
+        wire_format: Some("messages".into()),
+        model_version_pin: Some(kio_core::cas::hash_bytes(b"weights")),
+        chat_template_hash: Some(kio_core::cas::hash_bytes(b"template")),
+        instruction: Some(String::new()),
+        truncate_dimensions: false,
+    }
 }
 
 /// R13-2: locate the declared adapter for `role` in an already-parsed `tools.toml`
@@ -2070,10 +2070,14 @@ auth = "env:MISTRAL_API_KEY"
     fn offline_embedding_accepts_only_a_loopback_url() {
         let entry = |url: &str| {
             format!(
-                "[embedding.{LOCAL_EMBEDDING_TOOL_ID}]\n\
+                "[embedding.{GENERIC_LOCAL_EMBEDDING_TOOL_ID}]\n\
                  kind = \"offline_api\"\n\
                  url = \"{url}\"\n\
-                 model = \"Qwen/Qwen3-VL-Embedding-2B\"\n\
+                 model = \"test-embedding\"\n\
+                 wire_format = \"messages\"\n\
+                 model_version_pin = \"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n\
+                 chat_template_hash = \"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"\n\
+                 instruction = \"\"\n\
                  dimensions = 768\n\
                  distance = \"cosine\"\n\
                  modality = \"multimodal\"\n\
@@ -2135,7 +2139,7 @@ auth = "env:MISTRAL_API_KEY"
             .is_err()
         );
         let cmd_entry = format!(
-            "[embedding.{LOCAL_EMBEDDING_TOOL_ID}]\n\
+            "[embedding.{GENERIC_LOCAL_EMBEDDING_TOOL_ID}]\n\
              kind = \"offline_api\"\n\
              cmd = \"vllm\"\n"
         );
@@ -2252,10 +2256,11 @@ auth = "env:MISTRAL_API_KEY"
     #[test]
     fn declared_runtime_target_agrees_with_the_config_gate() {
         let offline = |url: &str| DeclaredAdapter {
-            tool_id: Some(LOCAL_EMBEDDING_TOOL_ID.to_owned()),
+            tool_id: Some(GENERIC_LOCAL_EMBEDDING_TOOL_ID.to_owned()),
             kind: Some("offline_api".to_owned()),
             url: Some(url.to_owned()),
-            model: Some("Qwen/Qwen3-VL-Embedding-2B".to_owned()),
+            model: Some("test-embedding".to_owned()),
+            local_embedding: Some(test_local_embedding_options()),
             ..DeclaredAdapter::default()
         };
         validate_declared_runtime_target("embedding", &offline("https://127.0.0.1:8000")).unwrap();
@@ -2272,7 +2277,7 @@ auth = "env:MISTRAL_API_KEY"
         };
         assert!(validate_declared_runtime_target("embedding", &online_with_url).is_err());
         let wrong_model = DeclaredAdapter {
-            tool_id: Some(LOCAL_EMBEDDING_TOOL_ID.to_owned()),
+            tool_id: Some(GENERIC_LOCAL_EMBEDDING_TOOL_ID.to_owned()),
             kind: Some("offline_api".to_owned()),
             model: Some("gemini-embedding-2".to_owned()),
             ..DeclaredAdapter::default()
@@ -2654,10 +2659,14 @@ pages = 0.004
     fn rejected_local_url_diagnostics_do_not_echo_userinfo_or_query_canaries() {
         let entry = |url: &str| {
             format!(
-                "[embedding.{LOCAL_EMBEDDING_TOOL_ID}]\n\
+                "[embedding.{GENERIC_LOCAL_EMBEDDING_TOOL_ID}]\n\
                  kind = \"offline_api\"\n\
                  url = \"{url}\"\n\
-                 model = \"Qwen/Qwen3-VL-Embedding-2B\"\n\
+                 model = \"test-embedding\"\n\
+                 wire_format = \"messages\"\n\
+                 model_version_pin = \"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n\
+                 chat_template_hash = \"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"\n\
+                 instruction = \"\"\n\
                  dimensions = 768\n\
                  distance = \"cosine\"\n\
                  modality = \"multimodal\"\n\

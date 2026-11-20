@@ -500,3 +500,47 @@ fn text_record_rejects_converted_receipt_even_with_valid_chunk_context() {
     header["context"] = Value::from("report name");
     assert!(EmbeddingObject::from_bytes(&record(&header, &[1.0, 0.0], &saved)).is_err());
 }
+
+#[test]
+fn eg2_record_round_trips_with_pinned_producer() {
+    let profile = crate::eg2::profile_hash();
+    let target = crate::litert::Bundle::for_target("x86_64-unknown-linux-gnu").unwrap();
+    let header = EmbeddingObject::identity_value(
+        "chunk",
+        &hash_bytes(b"text"),
+        profile,
+        "multimodal",
+        768,
+        "cosine",
+        None,
+    );
+    let mut metadata = metadata();
+    metadata["producer"] = serde_json::json!({
+        "execution_mode": "native_library",
+        "os": "linux",
+        "arch": "x86_64",
+        "runtime_version": crate::litert::VERSION,
+        "runtime_library_sha256": format!("sha256:{}", target.library.sha256),
+        "profile_hash": profile,
+        "cpu_backend": "cpu",
+        "threads": 2
+    });
+    let mut vector = vec![0.0; 768];
+    vector[0] = 1.0;
+    let bytes = record(&header, &vector, &metadata);
+    let object = EmbeddingObject::from_bytes(&bytes).unwrap();
+    assert_eq!(object.to_bytes().unwrap(), bytes);
+    for (key, invalid) in [
+        ("runtime_version", Value::from("0.18.0")),
+        (
+            "runtime_library_sha256",
+            Value::from(hash_bytes(b"another library")),
+        ),
+        ("arch", Value::from("aarch64")),
+        ("threads", Value::from(0)),
+    ] {
+        let mut invalid_metadata = metadata.clone();
+        invalid_metadata["producer"][key] = invalid;
+        assert!(EmbeddingObject::from_bytes(&record(&header, &vector, &invalid_metadata)).is_err());
+    }
+}

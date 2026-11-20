@@ -16,6 +16,16 @@ use kio_core::{ExitCode, KioError, Result};
 use serde_json::{Value, json};
 
 fn main() {
+    let mut worker_args = std::env::args_os().skip(1);
+    if worker_args.next().as_deref() == Some(kio_app::eg2::WORKER_ARGUMENT.as_ref()) {
+        let slot = worker_args.next();
+        let valid = worker_args.next().is_none()
+            && slot
+                .as_deref()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|slot| kio_app::eg2::run_worker(slot).is_ok());
+        process::exit(i32::from(!valid));
+    }
     #[cfg(debug_assertions)]
     scan_heap::start();
     release_binding::retain();
@@ -66,6 +76,9 @@ fn main() {
                     write_output_json(|writer| serde_json::to_writer(writer, &report))?;
                 } else {
                     println!("{}", terminal_safe_text(&report.status, false));
+                    if let Some(reason) = report.embedding_unavailable_reason {
+                        eprintln!("embedding: {reason}");
+                    }
                     write_deferred_inputs(&report.deferred_inputs, None)?;
                     for child in report.child_scopes.iter().flatten() {
                         write_deferred_inputs(&child.deferred_inputs, Some(&child.discovery.path))?;
@@ -80,12 +93,15 @@ fn main() {
             }
             ResponseBody::Reindex(ReindexResponse::Head(report)) => {
                 if code != ExitCode::Success {
-                    append_completion_error(&Value::Null, code);
+                    append_completion_error(&json!({"error_code": report.error_code}), code);
                 }
                 if json_mode {
                     write_output_json(|writer| serde_json::to_writer(writer, &report))?;
                 } else {
                     println!("{}", terminal_safe_text(&report.status, false));
+                    if let Some(reason) = report.embedding_unavailable_reason {
+                        eprintln!("embedding: {reason}");
+                    }
                     write_deferred_inputs(&report.deferred_inputs, None)?;
                 }
                 None
@@ -250,6 +266,10 @@ struct TerminalInteraction {
 }
 
 impl Interaction for TerminalInteraction {
+    fn embedding_cancellation(&self) -> Result<Box<dyn Fn() -> bool>> {
+        kio_app::eg2::cancellation()
+    }
+
     #[cfg(debug_assertions)]
     fn working_scan_started(&self) {
         scan_heap::scan_started();

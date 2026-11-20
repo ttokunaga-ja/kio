@@ -199,7 +199,7 @@ enum Commands {
 
 #[derive(Debug, Subcommand)]
 enum AcceptanceCommands {
-    /// Execute one phase of A08 against managed HTTPS local model peers.
+    /// Execute A08 with authenticated local OCR and client-side EG2.
     /// OCR writes a checkpoint; embedding verifies it and emits the final receipt.
     AuthenticatedLocal {
         #[arg(long, value_enum)]
@@ -218,8 +218,6 @@ enum AcceptanceCommands {
         receipt: PathBuf,
         #[arg(long)]
         ocr_endpoint: String,
-        #[arg(long)]
-        embedding_endpoint: String,
         #[arg(long)]
         ca_pem: PathBuf,
         #[arg(long)]
@@ -2315,7 +2313,6 @@ pub fn run(args: Args) -> Result<ExitCode, AppError> {
                     work_dir,
                     receipt,
                     ocr_endpoint,
-                    embedding_endpoint,
                     ca_pem,
                     service_identity,
                     service_identity_sha256,
@@ -2340,7 +2337,6 @@ pub fn run(args: Args) -> Result<ExitCode, AppError> {
                         work_dir: work_dir.clone(),
                         receipt: receipt.clone(),
                         ocr_endpoint: ocr_endpoint.clone(),
-                        embedding_endpoint: embedding_endpoint.clone(),
                         ca_pem: ca_pem.clone(),
                         service_identity: service_identity.clone(),
                         service_identity_sha256: service_identity_sha256.clone(),

@@ -670,15 +670,11 @@ fn ct3_hybrid_002_auto_vector_configured_but_absent_falls_back_visibly() {
     let dir = indexed_scope(); // indexed without an embedding adapter → no vectors
     initialize_paid_ledger(&dir);
     approve_embed(&dir, "mock");
-    // (a) endpoint truly unconfigured → the 05 §1.7 example string.
-    // "off" is an unrecognized seam value → no adapter, regardless of any
-    // ambient GEMINI_API_KEY.
+    // (a) No HTTP declaration selects the default native model. The isolated
+    // device does not have an imported model.
     let unconfigured = json_success_embed(&dir, "off", &["search", "トークン TTL 3600"]);
     assert_eq!(unconfigured["resolved_mode"], "text");
-    assert_eq!(
-        unconfigured["fallback_reason"],
-        "embedding_endpoint_not_configured"
-    );
+    assert_eq!(unconfigured["fallback_reason"], "model_missing");
     // (b) endpoint configured (mock) but this scope carries no embeddings →
     // the precise cause, not the generic endpoint string.
     let search = json_success_embed(&dir, "mock", &["search", "トークン TTL 3600"]);
@@ -834,14 +830,15 @@ fn r11_7_fail_behavior_error_makes_hybrid_hard_error() {
     write_search_config(&dir, "fail_behavior = \"error\"\n");
     // PC49/PC50: `--scope .` (single scope) keeps folder config effective —
     // see `r11_7_default_mode_config_seeds_requested_mode`.
-    // --hybrid with no vector backend + fail_behavior=error is now the same hard
-    // error the explicit --vector path returns, not a silent exit-0 text fallback.
+    // A missing EG2 model is a technical failure and must surface its typed
+    // error when fail_behavior is "error".
     let err = json_failure(
         &dir,
         &["search", "トークン TTL", "--mode", "hybrid", "--scope", "."],
-        1,
+        4,
     );
-    assert_eq!(err["error_code"], "KIO-E-SEARCH-VEC-UNAVAIL-001");
+    assert_eq!(err["error_code"], "KIO-E-MODEL-NOT-READY-001");
+    assert_eq!(err["context"]["fallback_reason"], "model_missing");
 }
 
 #[test]
@@ -6084,7 +6081,7 @@ fn ct3_l2_image_reservation_cap_denies_both_lanes_until_rechecked() {
     initialize_paid_ledger(&dir);
     // Commit the standalone PNG's typed ownership before online admission,
     // matching the existing original_online_png_fixture source-graph setup.
-    json_success(&dir, &["index", "--offline"]);
+    json_success_embed(&dir, "mock", &["index", "--offline"]);
     let scope_id = Repository::open(dir.path())
         .unwrap()
         .scope_identity()
@@ -6420,7 +6417,15 @@ fn ct3_l4_embedding_without_own_optin_is_enqueue_only() {
     // reindex. The scope has no embedding opt-in row → enqueue-only.
     json_success_embed(&dir, "mock", &["reindex", "--regenerate", "--yes"]);
     let status = json_success_embed(&dir, "mock", &["status"]);
-    let emb = tasks_of_type(&status, "embedding");
+    fn paid_tasks(status: &Value) -> Vec<&Value> {
+        tasks_of_type(status, "embedding")
+            .into_iter()
+            .filter(|task| {
+                task["embedding_target"]["profile_hash"] != kio_core::eg2::profile_hash()
+            })
+            .collect::<Vec<_>>()
+    }
+    let emb = paid_tasks(&status);
     assert!(!emb.is_empty(), "embedding tasks must be enqueued");
     assert!(
         emb.iter().all(|task| task["status"] == "pending"),
@@ -6432,7 +6437,7 @@ fn ct3_l4_embedding_without_own_optin_is_enqueue_only() {
     json_success_embed(&dir, "mock", &["index"]);
     let status = json_success_embed(&dir, "mock", &["status"]);
     assert!(
-        tasks_of_type(&status, "embedding")
+        paid_tasks(&status)
             .iter()
             .any(|task| task["status"] == "done"),
         "granting the embedding opt-in must embed the pending tasks (L4): {status}"
@@ -10187,7 +10192,7 @@ fn original_online_png_fixture() -> OriginalOnlinePngFixture {
     }
     // Existing standalone-image baseline behavior (also exercised by M7)
     // establishes immutable PNG CAS and its source citation before online work.
-    json_success(&dir, &["index", "--offline"]);
+    json_success_embed(&dir, "mock", &["index", "--offline"]);
     let source = json_success(&dir, &["search", "scan", "--mode", "text"]);
     let original = source["results"]
         .as_array()

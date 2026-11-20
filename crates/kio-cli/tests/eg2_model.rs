@@ -118,6 +118,8 @@ fn model_cli_recognizes_the_documented_commands() {
 fn offline_import_and_read_only_status_are_device_local() {
     let fixture = Fixture::new();
     let status = fixture.status();
+    assert_eq!(status["selected_profile"], kio_core::eg2::TOOL_ID);
+    assert_eq!(status["profile_hash"], kio_core::eg2::profile_hash());
     assert_eq!(status["readiness"], "missing");
     assert!(status["reason"].as_str().unwrap().contains("install"));
     assert_eq!(status["model_revision"], REVISION);
@@ -143,7 +145,9 @@ fn offline_import_and_read_only_status_are_device_local() {
     assert_eq!(fs::read(&source).unwrap(), BYTES);
     let artifact = fixture.artifact();
     assert_eq!(fs::read(&artifact).unwrap(), BYTES);
-    assert_eq!(fixture.status()["readiness"], "ready");
+    let status = fixture.status();
+    assert_eq!(status["readiness"], "ready");
+    assert_eq!(status["runtime_version"], "0.19.1");
 
     #[cfg(unix)]
     let inode = {
@@ -223,6 +227,115 @@ fn hash_mismatch_has_the_documented_error_and_preserves_existing_model() {
     assert_eq!(fs::read(&source).unwrap(), b"bad  model");
     assert_eq!(fs::read(fixture.artifact()).unwrap(), BYTES);
     assert_eq!(fixture.status()["readiness"], "ready");
+}
+
+#[test]
+fn corrupt_model_rejects_embedding_commands_with_the_model_hash_code() {
+    let fixture = Fixture::new();
+    let source = fixture.source(BYTES);
+    json_success(fixture.import(&source).output().unwrap());
+    json_success(fixture.command(&["--json", "init"]).output().unwrap());
+    fs::write(fixture.temp.path().join("work.md"), "Index this text.").unwrap();
+    // Native workers always use the production pin. Put an invalid artifact
+    // at that location so the worker rejects it before loading the runtime.
+    let fixture_artifact = fixture.artifact();
+    let fixture_directory = fixture_artifact.parent().unwrap();
+    let production_directory = fixture_directory.with_file_name(kio_core::eg2::MODEL_SHA256);
+    fs::rename(fixture_directory, production_directory).unwrap();
+
+    for args in [
+        &["--json", "index", "--offline"][..],
+        &["--json", "reindex", "--regenerate", "--yes", "--offline"],
+        &["--json", "reindex", "--at", "HEAD", "--offline"],
+        &["--json", "batch", "resume", "--offline"],
+        &["--json", "batch", "retry", "--offline"],
+    ] {
+        let output = fixture
+            .command(args)
+            .env_remove("KIO_TEST_MODEL_SOURCE")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(4), "{args:?}: {output:?}");
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["error_code"], "KIO-E-MODEL-HASH-001", "{args:?}");
+    }
+}
+
+#[test]
+fn status_counts_saved_producers_and_inputs_left_to_reembed() {
+    use kio_core::cas::{
+        EmbeddingContext, EmbeddingMetadata, EmbeddingObject, ProducerExecutionMode,
+        ProducerProvenance,
+    };
+    use kio_core::scope::Repository;
+
+    let fixture = Fixture::new();
+    let repo = Repository::init(fixture.temp.path()).unwrap();
+    let current = kio_core::eg2::profile_hash();
+    let previous = format!("sha256:{}", "a".repeat(64));
+    let write = |target: char, filename: &str, producer: ProducerProvenance| {
+        let native = producer.execution_mode == ProducerExecutionMode::NativeLibrary;
+        let mut vector = vec![0.0; if native { 768 } else { 3 }];
+        vector[0] = 1.0;
+        repo.object_store()
+            .write_embedding(&EmbeddingObject {
+                spec_version: 1,
+                target_type: "chunk".into(),
+                target_hash: format!("sha256:{}", target.to_string().repeat(64)),
+                profile_hash: producer.profile_hash.clone(),
+                modality: if native { "multimodal" } else { "text" }.into(),
+                dimensions: vector.len() as u64,
+                distance: "cosine".into(),
+                context: Some(EmbeddingContext::Text(filename.into())),
+                vector,
+                metadata: EmbeddingMetadata {
+                    record_format: 2,
+                    producer,
+                    image_input_receipt: None,
+                },
+            })
+            .unwrap();
+    };
+    let old = ProducerProvenance::non_native(ProducerExecutionMode::OfflineApi, &previous).unwrap();
+    write('b', "first.md", old.clone());
+    write('b', "other.md", old);
+    for (hash, os, arch, target) in [
+        ('b', "linux", "x86_64", "x86_64-unknown-linux-gnu"),
+        ('c', "macos", "aarch64", "aarch64-apple-darwin"),
+    ] {
+        let bundle = kio_core::litert::Bundle::for_target(target).unwrap();
+        write(
+            hash,
+            "first.md",
+            ProducerProvenance {
+                execution_mode: ProducerExecutionMode::NativeLibrary,
+                os: os.into(),
+                arch: arch.into(),
+                runtime_version: Some("0.19.1".into()),
+                runtime_library_sha256: Some(format!("sha256:{}", bundle.library.sha256)),
+                profile_hash: current.to_owned(),
+                cpu_backend: Some("cpu".into()),
+                threads: Some(2),
+            },
+        );
+    }
+    let report = fixture.status();
+    assert_eq!(report["profile_hash"], current);
+    assert_eq!(report["reembedding_count"], 1);
+    assert_eq!(report["mixed_producers"], true);
+    let producers = report["producers"].as_array().unwrap();
+    assert_eq!(producers.len(), 2);
+    for (producer, os) in producers.iter().zip(["linux", "macos"]) {
+        assert_eq!(producer["os"], os);
+        assert_eq!(producer["runtime_version"], "0.19.1");
+        assert_eq!(producer["count"], 1);
+        assert!(
+            producer["library_sha256"]
+                .as_str()
+                .unwrap()
+                .starts_with("sha256:")
+        );
+    }
 }
 
 #[test]

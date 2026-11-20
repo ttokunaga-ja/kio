@@ -169,6 +169,7 @@ fn run_foreground(
         control: control.clone(),
         binding,
         scope_id: record.scope_id.clone(),
+        interaction: Arc::new(Unattended(Arc::clone(&ctx.interaction))),
     };
     let engine = WatchEngine::open_with_interval_private_directory(
         &directory,
@@ -206,7 +207,13 @@ fn run_foreground(
             engine.request_shutdown();
             break;
         }
-        let worked = engine.reconcile_once().map_err(watch_error)?;
+        let worked = match engine.reconcile_once() {
+            Ok(worked) => worked,
+            Err(WatchError::Interrupted) => {
+                return Err(crate::eg2::WorkerError::Cancelled.interruption_error());
+            }
+            Err(error) => return Err(watch_error(error)),
+        };
         if worked || Instant::now() >= next_observation {
             publish_state(&directory, &engine, &mut state)?;
             next_observation = Instant::now() + Duration::from_secs(1);
@@ -232,6 +239,7 @@ struct LocalReconciler {
     control: ControlHandle,
     binding: ManagementBinding,
     scope_id: String,
+    interaction: Arc<Unattended>,
 }
 
 impl Reconcile for LocalReconciler {
@@ -256,7 +264,7 @@ impl Reconcile for LocalReconciler {
             }
             let context = AppContext {
                 working_directory: root.canonical_root.clone(),
-                interaction: Arc::new(Unattended),
+                interaction: self.interaction.clone(),
             };
             // execute reloads user configuration and runtime TLS settings for
             // every pass; a service never freezes startup consent or profiles.
@@ -281,8 +289,12 @@ impl Reconcile for LocalReconciler {
                 if error.resource_limit().is_some()
                     && error.context()["published_with_resource_hold"].as_bool() == Some(true) =>
             {
-                Unattended.diagnostic(&format!("watch reconciliation paused: {error}"));
+                self.interaction
+                    .diagnostic(&format!("watch reconciliation paused: {error}"));
                 return Ok(ReconcileCompletion::Complete);
+            }
+            Err(error) if error.exit_code() == ExitCode::Interrupted => {
+                return Err(WatchError::Interrupted);
             }
             Err(error) => return Err(WatchError::invariant(error.to_string())),
         };
@@ -295,37 +307,38 @@ impl Reconcile for LocalReconciler {
             // Keep the durable queue retry semantics, while making a partial
             // index result diagnosable without copying its potentially large
             // child-scope rows into watcher output or device state.
-            Unattended.diagnostic(&format!("watch reconciliation incomplete: {}", {
-                let (status, has_more, rows_total) = match index {
-                    IndexResponse::Published(report) => (
-                        report.status.as_str(),
-                        report
-                            .child_scope_discovery
-                            .as_ref()
-                            .map(|discovery| discovery.has_more),
-                        report
-                            .child_scope_discovery
-                            .as_ref()
-                            .map(|discovery| discovery.rows_total),
-                    ),
-                    IndexResponse::Preview(report) => (
-                        report.status.as_str(),
-                        report
-                            .child_scope_discovery
-                            .as_ref()
-                            .map(|discovery| discovery.has_more),
-                        None,
-                    ),
-                    IndexResponse::Deferred(report) => (report.status.as_str(), None, None),
-                };
-                incomplete_output_reason(
-                    status,
-                    index.error_code(),
-                    output.completion,
-                    has_more,
-                    rows_total,
-                )
-            }));
+            self.interaction
+                .diagnostic(&format!("watch reconciliation incomplete: {}", {
+                    let (status, has_more, rows_total) = match index {
+                        IndexResponse::Published(report) => (
+                            report.status.as_str(),
+                            report
+                                .child_scope_discovery
+                                .as_ref()
+                                .map(|discovery| discovery.has_more),
+                            report
+                                .child_scope_discovery
+                                .as_ref()
+                                .map(|discovery| discovery.rows_total),
+                        ),
+                        IndexResponse::Preview(report) => (
+                            report.status.as_str(),
+                            report
+                                .child_scope_discovery
+                                .as_ref()
+                                .map(|discovery| discovery.has_more),
+                            None,
+                        ),
+                        IndexResponse::Deferred(report) => (report.status.as_str(), None, None),
+                    };
+                    incomplete_output_reason(
+                        status,
+                        index.error_code(),
+                        output.completion,
+                        has_more,
+                        rows_total,
+                    )
+                }));
             return Ok(ReconcileCompletion::Incomplete);
         }
         Ok(ReconcileCompletion::Complete)
@@ -365,8 +378,12 @@ fn incomplete_output_reason(
     )
 }
 
-struct Unattended;
+struct Unattended(Arc<dyn Interaction + Send + Sync>);
 impl Interaction for Unattended {
+    fn embedding_cancellation(&self) -> Result<Box<dyn Fn() -> bool>> {
+        self.0.embedding_cancellation()
+    }
+
     fn confirm(&self, _: &str) -> Result<bool> {
         Ok(false)
     }

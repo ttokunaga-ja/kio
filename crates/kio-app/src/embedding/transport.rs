@@ -1,4 +1,5 @@
 use crate::approvals;
+use crate::eg2::{EmbeddingInput, EmbeddingSession, EngineSlot, WorkerError};
 use crate::egress::persistent_network_allowed_for;
 use crate::embedding::admission::EMBEDDING_ADAPTER_KIND;
 use crate::embedding::admission::declared_embedding_profile;
@@ -33,6 +34,7 @@ use kio_adapter::types::EmbeddingLogicalJobId;
 use kio_adapter::types::EmbeddingMemberResult;
 use kio_adapter::types::EmbeddingUsage;
 use kio_core::Result;
+use kio_core::cas::{ProducerExecutionMode, ProducerProvenance};
 use kio_core::control::ControlHandle;
 use kio_core::scope::Repository;
 use kio_pipeline::budget::read_budget_policy;
@@ -333,6 +335,7 @@ pub(crate) enum QueryEmbeddingOutcome {
     /// Maps to
     /// `VectorAvailability::Unauthorized`, not `Unavailable`, at the caller.
     NotAuthorized,
+    Unavailable(WorkerError),
 }
 
 /// Fresh vector/hybrid page-one query admission. The device claim and send
@@ -358,7 +361,7 @@ pub(crate) fn compute_query_embedding_page1(
     let Some(execution) = embedding_execution(adapter_settings, invocation.control) else {
         return Ok(None);
     };
-    if embedding_is_deterministic(execution) {
+    if !execution.uses_endpoint() {
         revalidate_current_policy_map(current_policies, false)?;
         return run_query_embedding_job(invocation, execution, query, None);
     }
@@ -598,10 +601,12 @@ pub(crate) fn local_embedding_identity(
     members: Vec<kio_pipeline::ledger::embedding_job::EmbeddingJobMember>,
 ) -> Result<crate::local_execution::LocalIdentity> {
     Ok(crate::local_execution::LocalIdentity {
-        execution: if embedding_is_deterministic(execution) {
-            crate::local_execution::LocalExecutionKind::InProcess
-        } else {
-            crate::local_execution::LocalExecutionKind::Loopback
+        execution: match execution {
+            EmbeddingExecution::Native => crate::local_execution::LocalExecutionKind::NativeWorker,
+            EmbeddingExecution::DeterministicEvaluator => {
+                crate::local_execution::LocalExecutionKind::InProcess
+            }
+            _ => crate::local_execution::LocalExecutionKind::Loopback,
         },
         target,
         input_sha256: input_hash
@@ -625,26 +630,137 @@ pub(crate) fn local_embedding_identity(
     })
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LocalEmbeddingResult {
+    pub(crate) completed: EmbeddingCompleted,
+    pub(crate) native_producer: Option<ProducerProvenance>,
+}
+
+impl LocalEmbeddingResult {
+    fn validate(
+        &self,
+        profile: &kio_adapter::catalog::DeclaredEmbeddingProfile,
+        member_ids: Vec<String>,
+    ) -> Result<()> {
+        if self.completed.usage != EmbeddingUsage::Unmetered
+            || self
+                .completed
+                .members
+                .iter()
+                .any(|member| matches!(member.result, EmbeddingMemberResult::Failed { .. }))
+        {
+            return Err(kio_core::KioError::schema(
+                "invalid free embedding completion",
+            ));
+        }
+        if self.native_producer.is_some() != (profile.profile_hash == crate::eg2::profile_hash()) {
+            return Err(kio_core::KioError::schema(
+                "local embedding producer does not match profile",
+            ));
+        }
+        if let Some(producer) = &self.native_producer {
+            producer.validate(&profile.profile_hash)?;
+        }
+        validate_completed_embedding(
+            &self.completed,
+            &EmbeddingAcceptance {
+                dimensions: u32::try_from(profile.dimensions)
+                    .map_err(|_| kio_core::KioError::schema("embedding dimensions exceed u32"))?,
+                distance: &profile.distance,
+                modality: &profile.modality,
+                profile_hash: &profile.profile_hash,
+                member_ids,
+            },
+        )
+        .map_err(crate::object_persistence::adapter_to_kio)?;
+        Ok(())
+    }
+
+    pub(crate) fn stage(&self, claim: &mut crate::local_execution::LocalGuard) -> Result<()> {
+        let bytes = serde_json::to_vec(self)
+            .map_err(|_| kio_core::KioError::schema("cannot serialize local embedding result"))?;
+        claim.stage_result(&bytes)
+    }
+}
+
 pub(crate) fn decode_local_embedding_result(
     bytes: &[u8],
     profile: &kio_adapter::catalog::DeclaredEmbeddingProfile,
     member_ids: Vec<String>,
-) -> Result<EmbeddingCompleted> {
-    let completed: EmbeddingCompleted = serde_json::from_slice(bytes)
+) -> Result<LocalEmbeddingResult> {
+    let result: LocalEmbeddingResult = serde_json::from_slice(bytes)
         .map_err(|_| kio_core::KioError::schema("invalid local embedding completion"))?;
-    validate_completed_embedding(
-        &completed,
-        &EmbeddingAcceptance {
-            dimensions: u32::try_from(profile.dimensions)
-                .map_err(|_| kio_core::KioError::schema("embedding dimensions exceed u32"))?,
-            distance: &profile.distance,
-            modality: &profile.modality,
-            profile_hash: &profile.profile_hash,
-            member_ids,
+    result.validate(profile, member_ids)?;
+    Ok(result)
+}
+
+pub(crate) fn run_native_embedding(
+    interaction: &dyn crate::context::Interaction,
+    session: &mut EmbeddingSession,
+    input: EmbeddingInput<'_>,
+    member_id: String,
+    profile: &kio_adapter::catalog::DeclaredEmbeddingProfile,
+) -> std::result::Result<LocalEmbeddingResult, LocalEmbeddingRunFailure> {
+    let cancelled = interaction
+        .embedding_cancellation()
+        .map_err(LocalEmbeddingRunFailure::Admission)?;
+    let output = session
+        .embed(input, &cancelled)
+        .map_err(LocalEmbeddingRunFailure::Native)?;
+    let result = LocalEmbeddingResult {
+        completed: EmbeddingCompleted {
+            members: vec![kio_adapter::types::EmbeddingMemberOutcome {
+                id: member_id.clone(),
+                result: EmbeddingMemberResult::Vector {
+                    vector: output.vector,
+                },
+            }],
+            dimensions: crate::eg2::DIMENSIONS as u32,
+            distance: "cosine".to_owned(),
+            modality: "multimodal".to_owned(),
+            embedding_profile_hash: output.producer.profile_hash.to_owned(),
+            usage: EmbeddingUsage::Unmetered,
         },
-    )
-    .map_err(crate::object_persistence::adapter_to_kio)?;
-    Ok(completed)
+        native_producer: Some(ProducerProvenance {
+            execution_mode: ProducerExecutionMode::NativeLibrary,
+            os: output.producer.os.to_owned(),
+            arch: output.producer.arch.to_owned(),
+            runtime_version: Some(output.producer.runtime_version.to_owned()),
+            runtime_library_sha256: Some(format!("sha256:{}", output.producer.library_sha256)),
+            profile_hash: output.producer.profile_hash.to_owned(),
+            cpu_backend: Some(output.producer.cpu_backend.to_owned()),
+            threads: Some(u64::from(output.producer.threads)),
+        }),
+    };
+    result
+        .validate(profile, vec![member_id])
+        .map_err(|_| LocalEmbeddingRunFailure::Native(WorkerError::Protocol))?;
+    Ok(result)
+}
+
+pub(crate) fn record_native_failure(
+    claim: &mut crate::local_execution::LocalGuard,
+    error: WorkerError,
+) -> Result<()> {
+    if error.is_unsent() {
+        claim.cancel_unsent()
+    } else if error.is_resource_busy() {
+        claim.fail(RetryErrorKind::ResourceLimit, None, false, false)
+    } else {
+        claim.interrupt()
+    }
+}
+
+pub(crate) fn finish_native_query_failure(
+    claim: &mut crate::local_execution::LocalGuard,
+    error: WorkerError,
+) -> Result<Option<QueryEmbeddingOutcome>> {
+    record_native_failure(claim, error)?;
+    if error == WorkerError::Cancelled {
+        return Err(error.interruption_error());
+    }
+    Ok(Some(QueryEmbeddingOutcome::Unavailable(error)))
 }
 
 fn run_free_query_embedding_job(
@@ -697,26 +813,35 @@ fn run_free_query_embedding_job(
         decode_local_embedding_result(&bytes, &profile, vec!["query".to_owned()])?
     } else {
         record_query_embed_trace(query, invocation.control);
-        match run_local_embedding_adapter(
-            invocation.settings,
-            // Direct query text comes from this invocation, not a scoped
-            // TierB file or search hit; existing query semantics are ordinary.
-            authorizing_repo.map(|repo| LocalSendAuthority {
-                repo,
-                requires_secret: false,
-            }),
-            execution,
-            vec![EmbeddingItem::text("query", query)],
-            EmbeddingInputType::Query,
-            Some(claim.token().to_owned()),
-            invocation.control,
-        ) {
-            Ok(completed) => {
-                let bytes = serde_json::to_vec(&completed).map_err(|_| {
-                    kio_core::KioError::schema("cannot serialize local embedding result")
-                })?;
-                claim.stage_result(&bytes)?;
-                completed
+        let result = if execution == EmbeddingExecution::Native {
+            run_native_embedding(
+                invocation.context.interaction.as_ref(),
+                &mut EmbeddingSession::new(EngineSlot::Query),
+                EmbeddingInput::Query(query),
+                "query".to_owned(),
+                &profile,
+            )
+        } else {
+            run_local_embedding_adapter(
+                invocation.settings,
+                authorizing_repo.map(|repo| LocalSendAuthority {
+                    repo,
+                    requires_secret: false,
+                }),
+                execution,
+                vec![EmbeddingItem::text("query", query)],
+                EmbeddingInputType::Query,
+                Some(claim.token().to_owned()),
+                invocation.control,
+            )
+        };
+        match result {
+            Ok(result) => {
+                result.stage(&mut claim)?;
+                result
+            }
+            Err(LocalEmbeddingRunFailure::Native(error)) => {
+                return finish_native_query_failure(&mut claim, error);
             }
             Err(LocalEmbeddingRunFailure::Classified(failure)) => {
                 crate::embedding::executor::fail_local_embedding_claim(
@@ -745,6 +870,7 @@ fn run_free_query_embedding_job(
         }
     };
     let vector = completed
+        .completed
         .members
         .into_iter()
         .find_map(|member| match member.result {
@@ -757,17 +883,14 @@ fn run_free_query_embedding_job(
 }
 
 pub(crate) enum LocalEmbeddingRunFailure {
+    Native(WorkerError),
     Classified(TaskExecutionFailure),
     Admission(kio_core::KioError),
     InProcessIo(AdapterError),
 }
 
 pub(crate) fn local_max_attempts(execution: EmbeddingExecution) -> u32 {
-    if embedding_is_deterministic(execution) {
-        3
-    } else {
-        5
-    }
+    if !execution.uses_endpoint() { 3 } else { 5 }
 }
 
 /// Exact selected input requirement for the final retained-grant evaluation.
@@ -785,10 +908,10 @@ pub(crate) fn run_local_embedding_adapter(
     input_type: EmbeddingInputType,
     token: Option<String>,
     control: &ControlHandle,
-) -> std::result::Result<EmbeddingCompleted, LocalEmbeddingRunFailure> {
+) -> std::result::Result<LocalEmbeddingResult, LocalEmbeddingRunFailure> {
     // This owned shared lease survives the factory, physical HTTP exchange and
     // common completion validation. Cached results never reach this function.
-    let _endpoint_dispatch_lease = if matches!(execution, EmbeddingExecution::Offline(_)) {
+    let _endpoint_dispatch_lease = if matches!(execution, EmbeddingExecution::Offline) {
         let authority = send_authority.ok_or_else(|| {
             LocalEmbeddingRunFailure::Admission(kio_core::KioError::invalid_usage(
                 "loopback embedding dispatch has no authorizing scope",
@@ -816,6 +939,10 @@ pub(crate) fn run_local_embedding_adapter(
         None
     };
     run_embedding_adapter_unclassified(settings, execution, items, input_type, token, control)
+        .map(|completed| LocalEmbeddingResult {
+            completed,
+            native_producer: None,
+        })
         .map_err(|error| match error {
             EmbeddingRunError::BeforeDispatch(error) => LocalEmbeddingRunFailure::Admission(
                 crate::object_persistence::adapter_to_kio(error),

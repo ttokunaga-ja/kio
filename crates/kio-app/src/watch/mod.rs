@@ -362,6 +362,7 @@ impl<R: Reconcile> WatchEngine<R> {
                 status.degraded = true;
                 status.last_failure = Some("reconciliation incomplete; retained for retry".into());
             }
+            Err(WatchError::Interrupted) => return Err(WatchError::Interrupted),
             Err(error) => {
                 status.degraded = true;
                 status.last_failure = Some(error.to_string());
@@ -510,24 +511,30 @@ pub(crate) fn is_control_path(relative: &Path) -> bool {
 }
 
 #[derive(Debug, Clone)]
-pub struct WatchError(String);
+pub enum WatchError {
+    Failure(String),
+    Interrupted,
+}
 impl WatchError {
     pub(crate) fn invariant(message: impl Into<String>) -> Self {
-        Self(message.into())
+        Self::Failure(message.into())
     }
     pub(crate) fn sqlite(error: rusqlite::Error) -> Self {
-        Self(format!("watch queue sqlite error: {error}"))
+        Self::Failure(format!("watch queue sqlite error: {error}"))
     }
     pub(crate) fn json(error: serde_json::Error) -> Self {
-        Self(format!("watch queue JSON error: {error}"))
+        Self::Failure(format!("watch queue JSON error: {error}"))
     }
     pub(crate) fn io(error: std::io::Error) -> Self {
-        Self(format!("watch queue IO error: {error}"))
+        Self::Failure(format!("watch queue IO error: {error}"))
     }
 }
 impl fmt::Display for WatchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        match self {
+            Self::Failure(message) => f.write_str(message),
+            Self::Interrupted => f.write_str("watch reconciliation interrupted"),
+        }
     }
 }
 impl std::error::Error for WatchError {}
@@ -598,6 +605,33 @@ mod tests {
         );
         assert_eq!(engine.status().unwrap().backlog, 1); // startup only
     }
+    #[test]
+    fn interrupted_embedding_ends_reconciliation_and_retains_the_claim_for_retry() {
+        let dir = private_dir();
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = WatchRoot::new("scope", root_dir.path().canonicalize().unwrap(), 1).unwrap();
+        struct Interrupted;
+        impl Reconcile for Interrupted {
+            fn reconcile(
+                &self,
+                _: &WatchRoot,
+                _: DirtyReason,
+                _: &[PathBuf],
+            ) -> Result<ReconcileCompletion, WatchError> {
+                Err(WatchError::Interrupted)
+            }
+        }
+
+        let engine =
+            WatchEngine::open(&dir.path().join("queue.sqlite"), [root], Interrupted).unwrap();
+        thread::sleep(Duration::from_millis(300));
+        assert!(matches!(
+            engine.reconcile_once(),
+            Err(WatchError::Interrupted)
+        ));
+        assert_eq!(engine.status().unwrap().backlog, 1);
+    }
+
     #[test]
     fn one_native_notification_batches_hints_and_ignores_generated_only_events() {
         let dir = private_dir();

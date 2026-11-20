@@ -1,3 +1,6 @@
+#[path = "build/litert.rs"]
+mod litert;
+
 use std::{env, fs, path::PathBuf};
 
 const RC_ENVIRONMENT: &[&str] = &[
@@ -34,6 +37,8 @@ fn main() {
     };
 
     write_binding_source(&binding);
+    litert::stage(&target)
+        .unwrap_or_else(|error| panic!("LiteRT-LM runtime staging failed: {error}"));
 }
 
 fn write_binding_source(binding: &str) {

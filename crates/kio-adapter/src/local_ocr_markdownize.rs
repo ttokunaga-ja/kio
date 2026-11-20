@@ -111,7 +111,7 @@ impl ImageAdmissionBudget {
 pub const LOCAL_OCR_MAX_PAGES: usize = 4096;
 
 /// Which local implementation runs. Same posture as
-/// [`crate::local_embedding::LocalEmbeddingExecution`]: `Copy`, and the url /
+/// the loopback embedding adapter: `Copy`, and the url /
 /// model that only `Real` needs are read where the adapter is built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalOcrExecution {

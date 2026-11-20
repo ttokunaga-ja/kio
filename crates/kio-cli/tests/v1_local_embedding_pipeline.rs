@@ -123,7 +123,7 @@ fn setup(dir: &TempDir, peer: &ClosingLoopback) {
     #[cfg(not(windows))]
     fs::create_dir_all(config.parent().unwrap()).unwrap();
     fs::write(&config, format!(
-        "[embedding.qwen3_vl_embedding_local]\nkind = \"offline_api\"\nurl = \"https://127.0.0.1:{}\"\nmodel = \"Qwen/Qwen3-VL-Embedding-2B\"\n",
+        "[embedding.local_embedding]\nkind = \"offline_api\"\nurl = \"https://127.0.0.1:{}\"\nmodel = \"test-embedding\"\nwire_format = 'messages'\nmodel_version_pin = 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\nchat_template_hash = 'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'\ninstruction = ''\n",
         peer.port,
     )).unwrap();
     #[cfg(windows)]
@@ -160,12 +160,9 @@ fn setup(dir: &TempDir, peer: &ClosingLoopback) {
     .unwrap();
     kio(dir, &["init"]).assert().success();
     kio(dir, &["ledger", "init"]).assert().success();
-    kio(
-        dir,
-        &["adapter", "approve", "qwen3_vl_embedding_local", "--yes"],
-    )
-    .assert()
-    .success();
+    kio(dir, &["adapter", "approve", "local_embedding", "--yes"])
+        .assert()
+        .success();
 }
 
 fn embedding_rows(dir: &TempDir) -> (i64, i64) {

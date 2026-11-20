@@ -15,21 +15,19 @@ modality も `profile_hash` も、すべて一致するからである
 identity を持ち first-instance-wins で永続化されるので、**誤った空間の画像ベクトルが
 恒久的に凍結される**。気付いた時点で再埋め込みしか手が無い。
 
-だから採用条件は「動くこと」ではなく数値一致である。**vLLM は公式サポートなので
-優先度が下がるが、llama.cpp 経路を採るなら必須。**
+同じ意味的 profile で別の serving runtime を採る候補を、text と image の数値一致で評価する。
 
 ## 使い方 (GPU 実機)
 
 ```bash
-# 対象の serving 経路を起動しておく (例: vLLM)
-vllm serve Qwen/Qwen3-VL-Embedding-2B --runner pooling
+# 比較対象のローカル messages endpoint を起動しておく。
 
 kio-eval u7 \
   --base-url http://127.0.0.1:8000 \
-  --model Qwen/Qwen3-VL-Embedding-2B \
+  --model "my-embedding-model" \
   --reference-python /absolute/path/to/the/reference/venv/bin/python3 \
   --reference-adapter /absolute/path/to/kio/eval/u7/reference_adapter.py \
-  --reference-model /absolute/path/to/a/pinned-local-Qwen3-VL-Embedding-2B \
+  --reference-model /absolute/path/to/pinned-local-reference-model \
   --text "same-space text control" \
   --image /absolute/path/to/control-image.png \
   --out /absolute/path/to/u7-same-space-report.json
@@ -58,7 +56,6 @@ Rust runner が暗黙に directory 探索することはない。report は crea
 `harness-suspect` を独立した結論にしてあるのが要点である。報告されている失敗は
 「text は合う・image だけずれる」なので、**text すら合わないなら、それは経路ではなく
 参照ハーネスの描画・pooling・正規化が serving 側と揃っていない疑いが濃い**。
-V4 は `/tokenize` の `add_generation_prompt` 既定で実際にこの種のずれを踏んでいる。
 ここを取り違えると、健全な経路を捨てるか、壊れた経路を通すことになる。
 
 **`harness-suspect` のとき image の数字を読まないこと。**
@@ -86,9 +83,7 @@ V4 は `/tokenize` の `add_generation_prompt` 既定で実際にこの種のず
 Kio は 768 へ切り詰めて再正規化するが、本検査は native 次元のまま比較する。
 切り詰めは決定的な後処理であって、**空間が違うことを直せないし作りもしない**。
 
-## 現状
+## 適用範囲
 
-**未実行。** 判定ロジックと wire の形は Rust の vector test が守るが、
-**数値一致そのものは GPU 実機でしか測れない**。
-vLLM 経路は公式サポートなので急がない。**llama.cpp 経路を検討する時点で、
-その採用可否を決める前にこれを回すこと。**
+この検査は利用者が設定するローカル endpoint 向けである。EG2 の確認手順は
+[CLI と runtime の仕様](../../docs/07-adapter-spec.md#embeddinggemma-2-eg2既定-local) を参照する。

@@ -107,7 +107,7 @@ jobs:
           hash="$($KIO_EVAL release archive-sha256 --archive "$(find "$root" -maxdepth 1 -name '*.tar.gz' -type f -print)")"; workflow_hash="$(shasum -a 256 .github/workflows/v1-local-acceptance.yml | awk '{print $1}')"
           "$KIO_EVAL" acceptance target-binding --candidate-sha "$CANDIDATE_SHA" --os '${{ matrix.os }}' --target "$(jq -er .target "$root/target-binding.json")" --archive-sha256 "$hash" --binary-sha256 "$(jq -er .binary_sha256 "$root/target-binding.json")" --version "$(jq -er .version "$root/target-binding.json")" --out "$target"
           "$KIO_EVAL" acceptance expected-case --target-binding "$target" --case A08 --lane provider-live --subcase authenticated-local --os '${{ matrix.os }}' --fixture-id v1-authenticated-local-public --fixture-sha256 8a61250a8a21ac49d3edaa03b55e5a9e0b45e7bda92f678c53811ffc080e2cc3 --workflow-path .github/workflows/v1-local-acceptance.yml --workflow-sha256 "$workflow_hash" --workflow-commit "$CANDIDATE_SHA" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --architecture "$(uname -m)" --service-identity-sha256 '${{ steps.prepare.outputs.service_identity_sha256 }}' --out "$expected"
-      - name: Run ordered authenticated local A08 and clean only this lease
+      - name: Run authenticated OCR, clean its lease, and validate native EG2
         if: always()
         env:
           KIO_LAB_JUMP_HOST: ${{ vars.KIO_LAB_JUMP_HOST }}
@@ -122,7 +122,7 @@ jobs:
           name: kio-gpu-runtime-identity-${{ inputs.candidate_sha }}-${{ matrix.os }}
           path: |
             ${{ runner.temp }}/kio-local-route/kio-v1-local-identity.json
-            ${{ runner.temp }}/kio-local-route/kio-v1-local-observed-*.json
+            ${{ runner.temp }}/kio-local-route/kio-v1-local-observed-ocr.json
           if-no-files-found: error
           overwrite: false
       - name: Upload expected A08 binding

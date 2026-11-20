@@ -145,7 +145,10 @@ pub(crate) enum VectorAvailability {
     /// 07 §5.3 acceptance check). PC2: unlike `Offline`/`Unauthorized`, ALL of
     /// these (including `Incompatible` above) are subject to `fail_behavior`
     /// for auto/`--hybrid`.
-    Unavailable { reason: &'static str },
+    Unavailable {
+        reason: &'static str,
+    },
+    NativeUnavailable(crate::eg2::WorkerError),
 }
 
 /// One scope's chunk-embedding disposition (03 §7 compat).
@@ -339,6 +342,11 @@ pub(crate) fn resolve_search_mode(
     // `embedding_in_flight`/`embedding_contract_violation`) is a technical
     // failure and IS governed by `fail_behavior`.
     let (reason, error_code, user_intent) = match vector {
+        VectorAvailability::NativeUnavailable(error) => (
+            Some(error.reason().to_owned()),
+            Some(error.public_error().0.to_owned()),
+            false,
+        ),
         VectorAvailability::Available => (None, None, false),
         VectorAvailability::Offline => (Some("offline".to_owned()), None, true),
         VectorAvailability::Unauthorized => (
@@ -368,10 +376,10 @@ pub(crate) fn resolve_search_mode(
         // through this shared hard-error envelope -- every other cause here
         // (UNAVAIL / UNAUTHORIZED reached via `fail_behavior = "error"`)
         // keeps the generic exit 1.
-        let exit = if error_code.as_deref() == Some("KIO-E-SEARCH-VEC-INCOMPAT-001") {
-            ExitCode::IncompatibleProfile
-        } else {
-            ExitCode::Failure
+        let exit = match vector {
+            VectorAvailability::NativeUnavailable(error) => error.public_error().1,
+            VectorAvailability::Incompatible => ExitCode::IncompatibleProfile,
+            _ => ExitCode::Failure,
         };
         KioError::new(
             error_code

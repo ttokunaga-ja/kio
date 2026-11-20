@@ -1,8 +1,8 @@
 //! Administrative acceptance helpers. Never part of the distributed Kio CLI.
 use clap::{Parser, Subcommand};
 use kio_eval::acceptance_tools::{
-    dispatch, gpu_identity, gpu_memory, local_client, ocr_proxy, package_extract,
-    prepare_embedding, provider_ledger, route_preflight,
+    dispatch, gpu_identity, gpu_memory, local_client, ocr_proxy, package_extract, provider_ledger,
+    route_preflight,
 };
 
 #[derive(Parser)]
@@ -28,8 +28,6 @@ enum Command {
     Dispatch(dispatch::Args),
     /// Print a read-only, candidate-bound deployment proposal.
     RoutePreflight(route_preflight::Args),
-    /// Verify or materialize the pinned embedding model bundle offline.
-    PrepareEmbedding(prepare_embedding::Args),
     /// Serve the bounded TLS facade for the local OCR backend.
     OcrProxy(ocr_proxy::Args),
     /// Create, check, or observe the fixed GPU runtime identity.
@@ -47,7 +45,6 @@ fn main() -> std::process::ExitCode {
         Command::RouteMaterialize(args) => local_client::materialize_route(args),
         Command::Dispatch(args) => dispatch::run(args),
         Command::RoutePreflight(args) => route_preflight::run(args),
-        Command::PrepareEmbedding(args) => prepare_embedding::run(args),
         Command::OcrProxy(args) => ocr_proxy::run(args),
         Command::GpuIdentity(args) => gpu_identity::run(args),
         Command::GpuMemory(args) => gpu_memory::run(args),
