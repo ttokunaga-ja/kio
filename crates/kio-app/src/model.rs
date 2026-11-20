@@ -14,8 +14,10 @@ use crate::context::AppContext;
 use crate::response::model::{ModelReadiness, ModelResponse};
 use crate::response::{CommandResponse, Completion, ResponseBody};
 
-const MODEL: &str = "embeddinggemma-2";
-const REVISION: &str = "e301f74d5551b0c2641bd5cb4652a76239d5c5f8";
+pub(crate) const MODEL: &str = "embeddinggemma-2";
+pub(crate) const REVISION: &str = "e301f74d5551b0c2641bd5cb4652a76239d5c5f8";
+pub(crate) const MODEL_SHA256: &str =
+    "92dcbea108899e5d6e30d919b0744f90d9967e80c67a4ab5503ac16d54f62eb0";
 const ARTIFACT: &str = "embeddinggemma-2-text-vision-440m.litertlm";
 const SOURCE: &str =
     "https://huggingface.co/litert-community/embeddinggemma-2-text-vision-440m-litert-lm";
@@ -37,7 +39,7 @@ impl Pin {
         let _ = control;
         Self {
             bytes: 387_710_976,
-            sha256: "92dcbea108899e5d6e30d919b0744f90d9967e80c67a4ab5503ac16d54f62eb0",
+            sha256: MODEL_SHA256,
         }
     }
 

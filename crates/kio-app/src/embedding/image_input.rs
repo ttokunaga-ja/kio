@@ -71,7 +71,7 @@ pub(crate) fn prepare_embedding_image(
 
 /// The pin includes the exact locked dependency records, rather than a human
 /// version label that could silently remain unchanged after a codec update.
-fn transcoder_pin() -> String {
+pub(crate) fn transcoder_pin() -> String {
     use kio_pipeline::prepare::hash_bytes;
     const LOCK: &str = include_str!("../../../../Cargo.lock");
     let names = [

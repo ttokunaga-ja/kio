@@ -6,7 +6,6 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
 
 pub(super) struct Worker {
     pub(super) child: Option<Child>,
@@ -127,7 +126,7 @@ impl Worker {
                 })
                 .map_err(|_| WorkerError::Startup)?,
         );
-        let ready = worker.wait_response(timeout, cancelled)?;
+        let ready = worker.wait_response(Instant::now() + timeout, cancelled)?;
         match ready.as_slice() {
             [1, threads @ 1..=4] => {
                 worker.threads = *threads;
@@ -141,13 +140,13 @@ impl Worker {
     pub(super) fn embed(
         &mut self,
         frame: &[u8],
-        timeout: Duration,
+        deadline: Instant,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<Vec<f32>, WorkerError> {
         if frame.is_empty() || frame.len() > MAX_REQUEST_BYTES {
             return Err(WorkerError::InputLimit);
         }
-        let result = self.exchange(frame, timeout, cancelled);
+        let result = self.exchange(frame, deadline, cancelled);
         if let Err(error) = result
             && error != WorkerError::InputOverflow
         {
@@ -159,9 +158,15 @@ impl Worker {
     fn exchange(
         &mut self,
         frame: &[u8],
-        timeout: Duration,
+        deadline: Instant,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<Vec<f32>, WorkerError> {
+        if cancelled() {
+            return Err(WorkerError::Cancelled);
+        }
+        if Instant::now() >= deadline {
+            return Err(WorkerError::Timeout);
+        }
         self.last_id = self.last_id.checked_add(1).ok_or(WorkerError::Protocol)?;
         let id = self.last_id.to_le_bytes();
         let mut message = Vec::with_capacity(REQUEST_ID_BYTES + frame.len());
@@ -172,7 +177,7 @@ impl Worker {
             .ok_or(WorkerError::Eof)?
             .try_send(message)
             .map_err(|_| WorkerError::Eof)?;
-        let response = self.wait_response(timeout, cancelled)?;
+        let response = self.wait_response(deadline, cancelled)?;
         let (reply_id, payload) = split_message(&response)?;
         if reply_id != &id {
             return Err(WorkerError::Protocol);
@@ -199,10 +204,9 @@ impl Worker {
 
     fn wait_response(
         &mut self,
-        timeout: Duration,
+        deadline: Instant,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<Vec<u8>, WorkerError> {
-        let deadline = Instant::now() + timeout;
         loop {
             if cancelled() {
                 return Err(WorkerError::Cancelled);

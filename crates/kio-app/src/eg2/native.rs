@@ -2,7 +2,7 @@
 //! module. Handles and their destructors never outlive the loaded image.
 
 use super::runtime::VerifiedLibrary;
-use super::{DIMENSIONS, EmbeddingInput, WorkerError, valid_vector};
+use super::{DIMENSIONS, TOKEN_CAP, WireInput, WorkerError, valid_vector};
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::path::Path;
 use std::ptr::{null, null_mut};
@@ -10,6 +10,10 @@ use std::ptr::{null, null_mut};
 type Handle = *mut c_void;
 type Delete = unsafe extern "C" fn(Handle);
 type Status = c_int;
+
+pub(super) const C_API_VERSION: &str = "1.0.0";
+pub(super) const NORMALIZE: bool = true;
+pub(super) const INSERT_SPECIAL_TOKENS: bool = true;
 
 macro_rules! api {
     ($($name:ident: $signature:ty),+ $(,)?) => {
@@ -123,7 +127,7 @@ impl Engine {
                 ))?;
                 api.check((api.embedding_engine_settings_set_max_input_length)(
                     settings.ptr,
-                    2048,
+                    TOKEN_CAP as c_int,
                 ))?;
                 api.check((api.embedding_engine_settings_set_cache_dir)(
                     settings.ptr,
@@ -132,10 +136,13 @@ impl Engine {
                 let options = Object::create(&api, api.embedding_options_delete, |out| {
                     (api.embedding_options_create)(out)
                 })?;
-                api.check((api.embedding_options_set_normalize)(options.ptr, true))?;
+                api.check((api.embedding_options_set_normalize)(
+                    options.ptr,
+                    NORMALIZE,
+                ))?;
                 api.check((api.embedding_options_set_insert_special_tokens)(
                     options.ptr,
-                    true,
+                    INSERT_SPECIAL_TOKENS,
                 ))?;
                 api.check((api.embedding_options_set_input_overflow_strategy)(
                     options.ptr,
@@ -162,11 +169,11 @@ impl Engine {
         })
     }
 
-    pub(super) fn embed(&mut self, input: EmbeddingInput<'_>) -> Result<Vec<f32>, WorkerError> {
+    pub(super) fn embed(&mut self, input: WireInput<'_>) -> Result<Vec<f32>, WorkerError> {
         let api = &self.api;
         let (kind, bytes) = match input {
-            EmbeddingInput::Text(text) => (0, text.as_bytes()),
-            EmbeddingInput::Image(bytes) => (1, bytes),
+            WireInput::Text(text) => (0, text.as_bytes()),
+            WireInput::Image(bytes) => (1, bytes),
         };
         // SAFETY: constructors copy the bounded byte slice; the pointer array
         // and all handles stay live through compute. The response owns values.
@@ -217,33 +224,36 @@ impl Api {
         }
         // SAFETY: the API returns a thread-local NUL-terminated diagnostic.
         // Only inspect a small prefix; raw diagnostics never leave this process.
-        let overflow = unsafe {
-            let mut overflow = false;
+        let mut bytes = [0; 128];
+        let mut len = 0;
+        unsafe {
             if status == 3 {
                 let message = (self.get_last_error_message)();
                 if !message.is_null() {
-                    let mut bytes = [0; 128];
                     for (index, byte) in bytes.iter_mut().enumerate() {
                         *byte = *message.add(index) as u8;
                         if *byte == 0 {
-                            overflow = is_input_overflow(&bytes[..index]);
+                            len = index;
                             break;
                         }
                     }
                 }
             }
             (self.clear_last_error)();
-            overflow
-        };
-        Err(match status {
-            3 if overflow => WorkerError::InputOverflow,
-            8 => WorkerError::MemoryLimit,
-            _ => WorkerError::Inference,
-        })
+        }
+        Err(classify_error(status, &bytes[..len]))
     }
 }
 
-pub(super) fn is_input_overflow(bytes: &[u8]) -> bool {
+pub(super) fn classify_error(status: Status, diagnostic: &[u8]) -> WorkerError {
+    match status {
+        3 if is_input_overflow(diagnostic) => WorkerError::InputOverflow,
+        8 => WorkerError::MemoryLimit,
+        _ => WorkerError::Inference,
+    }
+}
+
+fn is_input_overflow(bytes: &[u8]) -> bool {
     const PREFIX: &str = "Input sequence length (";
     const SUFFIX: &str = ") exceeds maximum supported signature length (2048).";
     std::str::from_utf8(bytes)
@@ -251,7 +261,7 @@ pub(super) fn is_input_overflow(bytes: &[u8]) -> bool {
         .and_then(|message| message.strip_prefix(PREFIX)?.strip_suffix(SUFFIX))
         .filter(|digits| digits.bytes().all(|byte| byte.is_ascii_digit()))
         .and_then(|digits| digits.parse::<u64>().ok())
-        .is_some_and(|length| length > 2048)
+        .is_some_and(|length| length > u64::from(TOKEN_CAP))
 }
 
 fn c_path(path: &Path) -> Result<CString, WorkerError> {

@@ -1,25 +1,32 @@
 //! Command-scoped access to the bundled EG2 engine. The application sends one
 //! prepared input at a time and can publish only a validated complete vector.
 
+mod input;
 mod native;
 mod platform;
+mod profile;
 mod runtime;
 mod supervisor;
 #[cfg(test)]
 mod tests;
+mod window;
 
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::process::Command;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kio_core::control::ControlHandle;
 
+pub use input::EmbeddingInput;
+use input::PreparedInput;
+pub use profile::{profile_hash, profile_value};
 use supervisor::Worker;
 
 pub const WORKER_ARGUMENT: &str = "--internal-eg2-worker";
 pub const DIMENSIONS: usize = 768;
+const TOKEN_CAP: u32 = 2048;
 const MAX_TEXT_BYTES: usize = 32 * 1024;
 const MAX_REQUEST_BYTES: usize = 1 + kio_adapter::types::MAX_EMBEDDING_ITEM_BYTES;
 const REQUEST_ID_BYTES: usize = size_of::<u64>();
@@ -55,7 +62,7 @@ impl EngineSlot {
 }
 
 #[derive(Clone, Copy)]
-pub enum EmbeddingInput<'a> {
+enum WireInput<'a> {
     Text(&'a str),
     Image(&'a [u8]),
 }
@@ -99,6 +106,8 @@ pub enum WorkerError {
     InputOverflow,
     #[error("native_inference")]
     Inference,
+    #[error("invalid_input")]
+    InvalidInput,
 }
 
 impl WorkerError {
@@ -138,6 +147,7 @@ pub struct Producer {
     pub library_sha256: &'static str,
     pub cpu_backend: &'static str,
     pub threads: u8,
+    pub profile_hash: &'static str,
 }
 
 #[derive(Debug)]
@@ -172,7 +182,7 @@ impl EmbeddingSession {
             self.worker.take();
             return Err(WorkerError::Cancelled);
         }
-        let payload = request(input)?;
+        let input = input.prepare()?;
         let pin = kio_core::litert::Bundle::for_target(runtime::TARGET)
             .ok_or(WorkerError::RuntimeUnsupported)?;
         if self.worker.is_none() {
@@ -182,30 +192,50 @@ impl EmbeddingSession {
             self.worker = Some(Worker::spawn(command, STARTUP_TIMEOUT, cancelled, false)?);
         }
         let worker = self.worker.as_mut().expect("worker started");
-        let result = worker
-            .embed(&payload, INFERENCE_TIMEOUT, cancelled)
-            .map(|vector| Embedding {
-                vector,
-                producer: Producer {
-                    os: std::env::consts::OS,
-                    arch: std::env::consts::ARCH,
-                    runtime_version: kio_core::litert::VERSION,
-                    library_sha256: pin.library.sha256,
-                    cpu_backend: "cpu",
-                    threads: worker.threads,
-                },
-            });
-        if worker.child.is_none() {
+        let threads = worker.threads;
+        let result =
+            embed_with_worker(worker, input, Instant::now() + INFERENCE_TIMEOUT, cancelled);
+        if worker.child.is_none()
+            || matches!(result, Err(WorkerError::Timeout | WorkerError::Cancelled))
+        {
             self.worker.take();
         }
-        result
+        result.map(|vector| Embedding {
+            vector,
+            producer: Producer {
+                os: std::env::consts::OS,
+                arch: std::env::consts::ARCH,
+                runtime_version: kio_core::litert::VERSION,
+                library_sha256: pin.library.sha256,
+                cpu_backend: "cpu",
+                threads,
+                profile_hash: profile_hash(),
+            },
+        })
     }
 }
 
-fn request(input: EmbeddingInput<'_>) -> Result<Vec<u8>, WorkerError> {
+fn embed_with_worker(
+    worker: &mut Worker,
+    input: PreparedInput<'_>,
+    deadline: Instant,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Vec<f32>, WorkerError> {
+    // Every window shares the member deadline, including IPC and aggregation.
+    let vector = input.embed(|payload| worker.embed(payload, deadline, cancelled))?;
+    if cancelled() {
+        return Err(WorkerError::Cancelled);
+    }
+    if Instant::now() >= deadline {
+        return Err(WorkerError::Timeout);
+    }
+    Ok(vector)
+}
+
+fn request(input: WireInput<'_>) -> Result<Vec<u8>, WorkerError> {
     let (tag, data, limit) = match input {
-        EmbeddingInput::Text(text) => (0, text.as_bytes(), MAX_TEXT_BYTES),
-        EmbeddingInput::Image(image) => (1, image, MAX_REQUEST_BYTES - 1),
+        WireInput::Text(text) => (0, text.as_bytes(), MAX_TEXT_BYTES),
+        WireInput::Image(image) => (1, image, MAX_REQUEST_BYTES - 1),
     };
     if data.is_empty() || data.len() > limit {
         return Err(WorkerError::InputLimit);
@@ -216,14 +246,14 @@ fn request(input: EmbeddingInput<'_>) -> Result<Vec<u8>, WorkerError> {
     Ok(payload)
 }
 
-fn parse_request(frame: &[u8]) -> Result<EmbeddingInput<'_>, WorkerError> {
+fn parse_request(frame: &[u8]) -> Result<WireInput<'_>, WorkerError> {
     match frame.split_first() {
         Some((0, bytes)) if !bytes.is_empty() && bytes.len() <= MAX_TEXT_BYTES => {
             std::str::from_utf8(bytes)
-                .map(EmbeddingInput::Text)
+                .map(WireInput::Text)
                 .map_err(|_| WorkerError::Protocol)
         }
-        Some((1, bytes)) if !bytes.is_empty() => Ok(EmbeddingInput::Image(bytes)),
+        Some((1, bytes)) if !bytes.is_empty() => Ok(WireInput::Image(bytes)),
         _ => Err(WorkerError::Protocol),
     }
 }
