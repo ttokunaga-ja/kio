@@ -1,6 +1,7 @@
 //! A killed process cannot run Drop; saved stage identities must survive it.
 use kio_core::{
-    cas::ObjectStore,
+    cas::{ObjectStore, hash_bytes},
+    dag::{TreeEntry, build_tree},
     disk_records::{RecordWriter, SORT_BUFFER_RECORDS},
     scope::Repository,
     store_dir::StoreDirectory,
@@ -82,6 +83,13 @@ fn wait_until_ready(child: &mut Child, ready: &std::path::Path) {
 fn killed_record_writer_is_reported_and_reclaimed_on_retry() {
     let fixture = tempfile::tempdir().unwrap();
     let repo = Repository::init(fixture.path()).unwrap();
+    let store = repo.object_store();
+    let tree = build_tree(
+        &store.record_stages().unwrap(),
+        [TreeEntry::raw_file("file.txt", hash_bytes(b"contents")).unwrap()],
+    )
+    .unwrap();
+    let tree_hash = store.write_tree(&tree).unwrap();
     let ready = fixture.path().join("ready");
     let exe = std::env::current_exe().unwrap();
     let mut child = Child(
@@ -103,6 +111,36 @@ fn killed_record_writer_is_reported_and_reclaimed_on_retry() {
         residues.iter().any(|entry| entry.path.contains("record")),
         "killed writer's record stage was lost: {residues:?}"
     );
+    let search = Repository::open_for_search(fixture.path()).unwrap();
+    assert_eq!(search.read_tree(&tree_hash).unwrap(), tree);
+    assert_eq!(
+        repo.object_store().inspect_raw_stages().unwrap().len(),
+        residues.len(),
+        "reading a tree must leave abandoned writer stages for recovery"
+    );
+    let publication_path = repo.kio_dir().join("publication-v1.json");
+    fs::write(
+        &publication_path,
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "expected_head": null,
+            "new_head": hash_bytes(b"pending commit"),
+            "manifest": { "files": [] }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        Repository::open_for_search(fixture.path())
+            .unwrap_err()
+            .error_code(),
+        "KIO-E-PUBLICATION-RECOVERY-REQUIRED-001"
+    );
+    assert_eq!(
+        repo.object_store().inspect_raw_stages().unwrap().len(),
+        residues.len()
+    );
+    fs::remove_file(publication_path).unwrap();
     let status = repo.status().unwrap();
     assert!(
         status

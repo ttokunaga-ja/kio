@@ -296,6 +296,10 @@ renderer 版内で prepared_hash が安定し、renderer 更新による出力�
 renderer の検出は配布元名、固定 install prefix、最低 version の文字列だけで可否を決めない。
 実 executable identity と必要 runtime resource を特定・検証し、隔離内の bounded な実変換 probe で
 headless PDF 出力 capability を確認する。名称・version・配布物 digest は provenance と診断に残す。
+実変換 probe は Office 入力の索引・処理と、明示的な診断コマンド `kio status` で行う。
+`kio search` は renderer の解決や probe を行わず、`index_status.office_conversion_unavailable` に
+現在の公開済み HEAD に対応するファイル別の記録を返す。現在の renderer の利用可否と理由は
+`kio status` で確認する。利用不能時は同コマンドの `office_readiness` に理由を表示する。
 macOS は app bundle の Apple 発行コード署名と seal を全 architecture・nested code について検証し、
 署名された bundle の主実行ファイルを起動する。PATH に shell wrapper がある場合は
 `KIO_OFFICE_CONVERTER` に bundle 内の実行ファイルを指定できる。特定の Team ID や bundle ID の

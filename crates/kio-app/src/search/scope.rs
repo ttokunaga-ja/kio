@@ -2,7 +2,6 @@ use crate::embedding::admission::embedding_execution;
 use crate::historical_reindex::retained_history_instances;
 use crate::image_authority;
 use crate::management::binding_for_repo;
-use crate::management::open_existing_managed_root;
 use crate::multi_scope;
 use crate::object_persistence::pipeline_to_kio;
 use crate::response::search::ExcludedScopeResponse;
@@ -686,7 +685,7 @@ pub(crate) fn current_search_policy(
     target: &ScopeTarget,
     control: &kio_core::control::ControlHandle,
 ) -> Result<(Repository, CurrentPolicyEvaluator)> {
-    let repo = open_existing_managed_root(&target.repo_root, control)?;
+    let repo = Repository::open_for_search_with_control(&target.repo_root, control.clone())?;
     if repo.scope_identity()?.scope_id != target.scope_id {
         return Err(KioError::new(
             "KIO-E-MANAGEMENT-AUTHORITY-001",
@@ -710,6 +709,7 @@ pub(crate) fn search_policy_exclusion_reason(error: &KioError) -> Option<&'stati
         "KIO-E-STORE-IO-001"
         | "KIO-E-STORE-NOT-FOUND-001"
         | "KIO-E-STORE-UNSAFE-001"
+        | "KIO-E-PUBLICATION-RECOVERY-REQUIRED-001"
         | "KIO-E-CONFIG-SCHEMA-001" => Some("unreachable"),
         "KIO-E-STORE-CORRUPT-001" => Some("store_corrupt"),
         "KIO-E-MANAGEMENT-AUTHORITY-001" => Some("policy_unavailable"),

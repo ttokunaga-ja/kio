@@ -565,22 +565,6 @@ pub(crate) fn endpoint_dispatch_lease_with_checkpoint(
     Ok(Some(lease))
 }
 
-pub(crate) fn allowed_at(
-    adapter_settings: &Arc<AdapterRuntimeSettings>,
-    kio_dir: &Path,
-    role: AdapterRole,
-    tool_id: &str,
-    profile: &str,
-    operation: GrantOperation,
-    control: &kio_core::control::ControlHandle,
-) -> Result<bool> {
-    let root = kio_dir
-        .parent()
-        .ok_or_else(|| KioError::invalid_usage("scope store has no parent"))?;
-    let repo = super::management::open_existing_managed_root(root, control)?;
-    allowed(adapter_settings, &repo, role, tool_id, profile, operation)
-}
-
 /// Whether this exact external recipient may receive secret content. A grant
 /// for another configured adapter is neither required nor sufficient.
 pub(crate) fn secrets_allowed(

@@ -1417,7 +1417,6 @@ pub(crate) fn compute_index_status(
     ledger_path: &Path,
     budget_month: &str,
     control: &ControlHandle,
-    locks: &kio_core::scope::LockSession,
 ) -> Result<IndexStatusResponse> {
     let mut total = 0u64;
     let mut total_enrichment_tasks = 0u64;
@@ -1470,10 +1469,9 @@ pub(crate) fn compute_index_status(
         };
         let first_unsupported = unsupported_inputs.len();
         let mut current_inputs = BTreeMap::new();
-        // R23-20: `scope.scope_path` is the `.kio` directory; `Repository::open`
-        // wants the scope ROOT (it appends `.kio` itself), so this uses the
-        // separately-carried `repo_root` field.
-        match Repository::open_in_session(&scope.repo_root, control.clone(), locks) {
+        // Status in a search response observes the current published HEAD.
+        // An interrupted publication is reported as incomplete status.
+        match Repository::open_for_search_with_control(&scope.repo_root, control.clone()) {
             Ok(repo) => {
                 // 07 §5.1: a single shared read (`current_dispositions`) feeds
                 // BOTH `unsupported_inputs` and the new `office_conversion_unavailable`
@@ -1673,7 +1671,6 @@ pub(crate) fn compute_index_status(
     let unsupported_inputs_complete = unsupported_input_errors.is_empty();
     let tasks_complete = task_errors.is_empty();
     Ok(IndexStatusResponse {
-        office_readiness: crate::response::status::office_readiness(control),
         enriched_ratio,
         total_enrichment_tasks,
         skipped_enrichment_tasks,
