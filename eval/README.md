@@ -80,8 +80,7 @@ descriptor-exec 相当の安全な境界がないため、corpus を変更する
 fail-closed にする。`--bin` はsingle-link regular executableに限定し、Cargoが
 `target/release/kio`を`deps/`とhardlinkした環境では、`install -m 0755`で`/tmp`へ
 single-link copyを作ってそのpathを渡す。pathname fallbackやhardlink例外は設けない。
-`replay-history` の子プロセスは、抽出結果と索引の耐久化を行う `index` に 60 秒、
-その他のコマンドに 30 秒の上限を適用する。
+`replay-history` の子プロセスには、コマンドごとに 30 秒の上限を適用する。
 
 `crossscope` と `rerank dump` の出力は measured corpus 外の既存directoryに置き、
 既存fileを上書きしない。再測定は新しい出力名を使い、比較後に採用するartifactだけを

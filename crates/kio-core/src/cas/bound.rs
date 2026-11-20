@@ -846,7 +846,7 @@ impl BoundObjectDirs {
         }
         let hash = hash_bytes(bytes);
         let (parent, leaf) = self.content_fanout(kind, &hash, true)?;
-        write_bound_content_at(&parent, &leaf, kind, &hash, bytes).map(|()| hash)
+        write_bound_content_at(&parent, &leaf, &hash, bytes).map(|()| hash)
     }
 
     pub(super) fn read_content_object_bytes(

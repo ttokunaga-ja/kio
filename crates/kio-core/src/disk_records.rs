@@ -258,13 +258,18 @@ pub struct PayloadRef {
     digest: [u8; 32],
 }
 
-/// Pack already size-validated bodies in an existing record stage. Sorters
-/// keep only their references, and the writer keeps one serialized body live.
+/// Pack already size-validated bodies in a bounded buffer, spilling to a
+/// private record stage when the buffer or shared memory budget is exhausted.
 pub struct PayloadWriter<T> {
-    writer: StageWriter,
-    run: Arc<RunFile>,
+    root: RecordStageRoot,
+    buffer: PayloadBuffer,
     size: u64,
     _value: PhantomData<T>,
+}
+
+enum PayloadBuffer {
+    Memory(Vec<u8>),
+    Disk(Box<(Arc<RunFile>, StageWriter)>),
 }
 
 impl<T: Serialize> PayloadWriter<T> {
@@ -273,10 +278,9 @@ impl<T: Serialize> PayloadWriter<T> {
             root.preserve_scratch();
             return Err(error);
         }
-        let (run, writer) = new_run(root)?;
         Ok(Self {
-            run,
-            writer,
+            root: root.clone(),
+            buffer: PayloadBuffer::Memory(Vec::new()),
             size: 0,
             _value: PhantomData,
         })
@@ -294,35 +298,73 @@ impl<T: Serialize> PayloadWriter<T> {
             .size
             .checked_add(bytes.len() as u64)
             .ok_or_else(changed_records)?;
+        if let PayloadBuffer::Memory(buffer) = &mut self.buffer {
+            if end <= RECORD_BYTES as u64 {
+                buffer.extend_from_slice(&bytes);
+                self.size = end;
+                return Ok(reference);
+            }
+            let (run, mut writer) = new_run(&self.root)?;
+            writer.write_chunk(buffer)?;
+            self.buffer = PayloadBuffer::Disk(Box::new((run, writer)));
+        }
+        let PayloadBuffer::Disk(disk) = &mut self.buffer else {
+            unreachable!("payloads above the memory bound must spill");
+        };
         for part in bytes.chunks(RECORD_BYTES) {
-            self.writer.write_chunk(part)?;
+            disk.1.write_chunk(part)?;
         }
         self.size = end;
         Ok(reference)
     }
 
     pub fn finish(self) -> Result<RecordPayloads<T>> {
-        self.writer.sync()?;
-        drop(self.writer);
-        let file = self
-            .run
-            .directory
-            .open_regular_read(Path::new("records"), self.size)?;
-        self.run.identity.verify(&file)?;
+        let storage = match self.buffer {
+            PayloadBuffer::Memory(bytes) => match self.root.memory.store(bytes) {
+                Ok(memory) => PayloadStorage::Memory(memory),
+                Err(bytes) => {
+                    let (run, mut writer) = new_run(&self.root)?;
+                    writer.write_chunk(&bytes)?;
+                    seal_payload_file(run, writer, self.size)?
+                }
+            },
+            PayloadBuffer::Disk(disk) => {
+                let (run, writer) = *disk;
+                seal_payload_file(run, writer, self.size)?
+            }
+        };
         Ok(RecordPayloads {
-            file: std::sync::Mutex::new(file),
-            run: self.run,
+            storage,
             size: self.size,
             _value: PhantomData,
         })
     }
 }
 
-/// A sealed payload stage. A referenced body is verified on each read so
-/// consumers can trust the decoded value even after seeking past other bodies.
+fn seal_payload_file(run: Arc<RunFile>, writer: StageWriter, size: u64) -> Result<PayloadStorage> {
+    writer.sync()?;
+    drop(writer);
+    let file = run
+        .directory
+        .open_regular_read(Path::new("records"), size)?;
+    run.identity.verify(&file)?;
+    Ok(PayloadStorage::Disk {
+        file: Mutex::new(file),
+        run,
+    })
+}
+
+enum PayloadStorage {
+    Memory(Arc<MemoryRun>),
+    Disk {
+        file: Mutex<File>,
+        run: Arc<RunFile>,
+    },
+}
+
+/// Sealed payloads with digest-verified random access.
 pub struct RecordPayloads<T> {
-    file: std::sync::Mutex<File>,
-    run: Arc<RunFile>,
+    storage: PayloadStorage,
     size: u64,
     _value: PhantomData<T>,
 }
@@ -337,43 +379,51 @@ impl<T> std::fmt::Debug for RecordPayloads<T> {
 
 impl<T: DeserializeOwned> RecordPayloads<T> {
     pub fn read(&self, reference: PayloadRef) -> Result<T> {
-        if reference
+        let end = reference
             .offset
             .checked_add(reference.size as u64)
-            .is_none_or(|end| end > self.size)
-        {
-            return Err(changed_records());
-        }
-        let mut file = self.file.lock().map_err(|_| changed_records())?;
-        self.run._location.identity.verify(&self.run.directory)?;
-        self.run.identity.verify(&file)?;
-        if file
-            .metadata()
-            .map_err(|error| crate::store_dir::ioerr(Path::new("records"), error))?
-            .len()
-            != self.size
-        {
-            return Err(changed_records());
-        }
-        let mut bytes = Vec::new();
-        bytes.try_reserve_exact(reference.size).map_err(|_| {
-            ResourceLimit {
-                resource: Resource::Memory,
-                stage: "record_payload".to_owned(),
-                limit: None,
-                observed: Some(reference.size as u64),
-                resource_tier: None,
+            .filter(|end| *end <= self.size)
+            .ok_or_else(changed_records)?;
+        let data;
+        let bytes = match &self.storage {
+            PayloadStorage::Memory(memory) => {
+                &memory.bytes[reference.offset as usize..end as usize]
             }
-            .into_error("cannot allocate a private record payload")
-        })?;
-        bytes.resize(reference.size, 0);
-        file.seek(SeekFrom::Start(reference.offset))
-            .and_then(|_| file.read_exact(&mut bytes))
-            .map_err(|error| crate::store_dir::ioerr(Path::new("records"), error))?;
-        if <[u8; 32]>::from(Sha256::digest(&bytes)) != reference.digest {
+            PayloadStorage::Disk { file, run } => {
+                let mut file = file.lock().map_err(|_| changed_records())?;
+                run._location.identity.verify(&run.directory)?;
+                run.identity.verify(&file)?;
+                if file
+                    .metadata()
+                    .map_err(|error| crate::store_dir::ioerr(Path::new("records"), error))?
+                    .len()
+                    != self.size
+                {
+                    return Err(changed_records());
+                }
+                let mut bytes = Vec::new();
+                bytes.try_reserve_exact(reference.size).map_err(|_| {
+                    ResourceLimit {
+                        resource: Resource::Memory,
+                        stage: "record_payload".to_owned(),
+                        limit: None,
+                        observed: Some(reference.size as u64),
+                        resource_tier: None,
+                    }
+                    .into_error("cannot allocate a private record payload")
+                })?;
+                bytes.resize(reference.size, 0);
+                file.seek(SeekFrom::Start(reference.offset))
+                    .and_then(|_| file.read_exact(&mut bytes))
+                    .map_err(|error| crate::store_dir::ioerr(Path::new("records"), error))?;
+                data = bytes;
+                &data
+            }
+        };
+        if <[u8; 32]>::from(Sha256::digest(bytes)) != reference.digest {
             return Err(changed_records());
         }
-        serde_json::from_slice(&bytes).map_err(|error| KioError::schema(error.to_string()))
+        serde_json::from_slice(bytes).map_err(|error| KioError::schema(error.to_string()))
     }
 }
 
@@ -1414,6 +1464,29 @@ mod tests {
         writer.push(&String::new()).unwrap();
         let records = writer.finish().unwrap();
         assert_eq!(records.to_vec().unwrap(), vec![value, String::new()]);
+        assert_eq!(std::fs::read_dir(&stage_dir).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn small_payloads_use_memory_and_large_payloads_spill() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = test_store_root(&fixture);
+        let stage_dir = test_store_directory(&root)
+            .path()
+            .join("internal/record-stages/stages");
+        let mut writer = PayloadWriter::new(&root).unwrap();
+        let small = "x".repeat(100);
+        let first = writer.push(&small).unwrap();
+        let payloads = writer.finish().unwrap();
+        assert_eq!(payloads.read(first).unwrap(), small);
+        assert!(!stage_dir.exists(), "small payloads need no stage");
+        let mut writer = PayloadWriter::new(&root).unwrap();
+        let first = writer.push(&small).unwrap();
+        let large = "y".repeat(RECORD_BYTES);
+        let second = writer.push(&large).unwrap();
+        let payloads = writer.finish().unwrap();
+        assert_eq!(payloads.read(second).unwrap(), large);
+        assert_eq!(payloads.read(first).unwrap(), small);
         assert_eq!(std::fs::read_dir(&stage_dir).unwrap().count(), 1);
     }
 

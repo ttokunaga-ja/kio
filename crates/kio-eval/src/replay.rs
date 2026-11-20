@@ -5,7 +5,6 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env,
     path::{Path, PathBuf},
-    time::Duration,
 };
 
 use kio_core::cas::hash_bytes;
@@ -27,15 +26,6 @@ const CORPUS_MANIFEST: &str = "corpus-manifest.json";
 const MAX_OBSERVED_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 // One explicit device ledger setup, followed by the 62 frozen replay commands.
 const MAX_REPLAY_SUBPROCESSES: usize = 63;
-
-fn replay_process_options(command_name: &str) -> BoundedProcessOptions {
-    let mut options = BoundedProcessOptions::default();
-    if command_name == "index" {
-        // Durable extraction writes can exceed the default on busy storage.
-        options.timeout = Duration::from_secs(60);
-    }
-    options
-}
 
 #[derive(Debug, Error)]
 pub enum ReplayError {
@@ -547,7 +537,7 @@ impl ReplayCommandContext<'_> {
             ));
         }
         self.subprocesses.set(next);
-        let output = run_bounded_command(&mut command, replay_process_options(command_name), None)?;
+        let output = run_bounded_command(&mut command, BoundedProcessOptions::default(), None)?;
         if !output.status.success() {
             return Err(ReplayError::Result {
                 command: command_name,
@@ -975,20 +965,6 @@ mod tests {
             "Adapter HTTPS readiness: not evaluated; reason: no managed CA was acquired for this operation\nextra\n"
         ));
     }
-    #[test]
-    fn replay_index_has_its_own_finite_process_timeout() {
-        assert_eq!(
-            replay_process_options("index").timeout,
-            Duration::from_secs(60)
-        );
-        for command in ["ledger_init", "init", "snapshot", "log"] {
-            assert_eq!(
-                replay_process_options(command).timeout,
-                Duration::from_secs(30)
-            );
-        }
-    }
-
     #[test]
     fn malformed_json_is_rejected() {
         let status = successful_status();

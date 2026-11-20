@@ -5,7 +5,8 @@ use super::{
 #[cfg(test)]
 use crate::IoResultExt;
 use crate::extraction_stage::{
-    SavedStage, child_directory, read_record, stage_error, write_record,
+    SMALL_EXTRACTION_BYTES, SavedStage, child_directory, existing_workspace, read_record,
+    stage_error, write_record,
 };
 use crate::{PipelineError, Result};
 #[cfg(test)]
@@ -13,6 +14,7 @@ use kio_core::cas::MAX_CONTENT_OBJECT_BYTES;
 use kio_core::cas::{ContentObjectKind, ObjectStore, is_hash};
 use kio_core::store_dir::{Publication, StoreDirectory};
 use serde::{Deserialize, Serialize};
+use std::cell::Cell;
 use std::collections::BTreeSet;
 #[cfg(test)]
 use std::io::Read;
@@ -33,9 +35,15 @@ struct UnitRecord {
 /// A completed extraction whose payloads remain private until persisted.
 #[derive(Debug)]
 pub struct StagedPreparation {
-    directory: StoreDirectory,
+    payloads: PreparedPayloads,
     raw_hash: String,
     pub output: PrepareStageOutput,
+}
+
+#[derive(Debug)]
+enum PreparedPayloads {
+    Small(Vec<(PreparedUnit, Vec<u8>)>),
+    Staged(StoreDirectory),
 }
 
 pub fn prepare_staged(
@@ -75,26 +83,108 @@ pub fn prepare_staged_with(
     }
     let key =
         hash_bytes(format!("{}\0{}\0{}", request.raw_hash, request.media_type, profile).as_bytes());
-    let directory = child_directory(
-        root,
-        &Path::new("extraction-stages/prepared")
-            .join(request.raw_hash.trim_start_matches("sha256:"))
-            .join(key.trim_start_matches("sha256:")),
-    )?;
-    let output = stage_units(&directory, extract)?;
+    let path = Path::new("extraction-stages/prepared")
+        .join(request.raw_hash.trim_start_matches("sha256:"))
+        .join(key.trim_start_matches("sha256:"));
+    let (output, payloads) = match existing_workspace(root, &path)? {
+        Some(directory) => {
+            let output = stage_units(&directory, extract)?;
+            (output, PreparedPayloads::Staged(directory))
+        }
+        None => prepare_fresh(root, &path, extract)?,
+    };
     if output.prepared_units.iter().any(|unit| {
         unit.preparation_profile_hash != profile || unit.mime.as_deref() != Some(request.media_type)
     }) {
-        return Err(stage_corrupt(
-            &directory,
-            "prepared extraction profile mismatch",
-        ));
+        return Err(stage_corrupt(root, "prepared extraction profile mismatch"));
     }
     Ok(StagedPreparation {
-        directory,
+        payloads,
         raw_hash: request.raw_hash.to_owned(),
         output,
     })
+}
+
+fn prepare_fresh(
+    root: &StoreDirectory,
+    path: &Path,
+    extract: impl FnOnce(&[PreparedUnit], &mut PreparedUnitSink<'_>) -> Result<PrepareStageOutput>,
+) -> Result<(PrepareStageOutput, PreparedPayloads)> {
+    let count = Cell::new(None);
+    let mut buffered = Vec::<(PreparedUnit, Vec<u8>)>::new();
+    let mut size = 0usize;
+    let mut workspace = None;
+    let mut written = 0;
+    let mut keys = BTreeSet::new();
+    let output = extract(
+        &[],
+        &mut PreparedUnitSink {
+            declare: &mut |units| {
+                if count.replace(Some(units)).is_some() {
+                    return Err(stage_corrupt(
+                        root,
+                        "producer declared extraction layout twice",
+                    ));
+                }
+                Ok(())
+            },
+            write: &mut |unit, bytes| {
+                if unit.order != written as u64
+                    || count.get().is_none_or(|units| units <= written)
+                    || !keys.insert(unit.unit_key.clone())
+                    || !is_hash(&unit.prepared_hash)
+                {
+                    return Err(stage_corrupt(
+                        root,
+                        "prepared unit is outside its declared layout",
+                    ));
+                }
+                written += 1;
+                size = size.saturating_add(bytes.len());
+                if workspace.is_none() && size <= SMALL_EXTRACTION_BYTES {
+                    buffered.push((unit.clone(), bytes.to_vec()));
+                    return Ok(());
+                }
+                if workspace.is_none() {
+                    let directory = child_directory(root, path)?;
+                    write_record(
+                        &directory,
+                        Path::new(LAYOUT),
+                        &count.get().expect("declared layout"),
+                        Publication::CreateOnly,
+                    )?;
+                    for (unit, bytes) in buffered.drain(..) {
+                        write_prepared_unit(&directory, &unit, &bytes)?;
+                    }
+                    workspace = Some(directory);
+                }
+                write_prepared_unit(workspace.as_ref().expect("opened workspace"), unit, bytes)
+            },
+        },
+    )?;
+    if written != output.prepared_units.len() || count.get().is_some_and(|units| units != written) {
+        return Err(stage_corrupt(
+            root,
+            "producer did not finish its declared layout",
+        ));
+    }
+    let payloads = if let Some(directory) = workspace {
+        complete_prepared_workspace(&directory, &output)?;
+        PreparedPayloads::Staged(directory)
+    } else {
+        if !buffered
+            .iter()
+            .map(|(unit, _)| unit)
+            .eq(&output.prepared_units)
+        {
+            return Err(stage_corrupt(
+                root,
+                "extractor returned a different unit layout",
+            ));
+        }
+        PreparedPayloads::Small(buffered)
+    };
+    Ok((output, payloads))
 }
 
 /// Publish verified source bytes shared by units discovered by an OCR adapter.
@@ -105,6 +195,17 @@ pub fn publish_prepared_source(root: &StoreDirectory, hash: &str, bytes: &[u8]) 
             "prepared source does not match its declared hash",
         ));
     }
+    let store = ObjectStore::from_bound_kio_with_control(
+        root.root_handle().as_ref(),
+        root.control().clone(),
+    )
+    .map_err(|error| stage_error(root, error))?;
+    if bytes.len() <= SMALL_EXTRACTION_BYTES {
+        return store
+            .write_content_object(ContentObjectKind::Prepared, bytes)
+            .map(|_| ())
+            .map_err(|error| stage_error(root, error));
+    }
     let digest = hash.trim_start_matches("sha256:");
     let key = hash_bytes(b"ocr-discovered-source");
     let workspace = child_directory(
@@ -113,11 +214,6 @@ pub fn publish_prepared_source(root: &StoreDirectory, hash: &str, bytes: &[u8]) 
             .join(digest)
             .join(key.trim_start_matches("sha256:")),
     )?;
-    let store = ObjectStore::from_bound_kio_with_control(
-        root.root_handle().as_ref(),
-        root.control().clone(),
-    )
-    .map_err(|error| stage_error(root, error))?;
     crate::extraction_stage::publish_payload(
         &workspace,
         Path::new("source.json"),
@@ -210,43 +306,7 @@ fn stage_units(
             write_record(directory, layout, &count, Publication::CreateOnly)
         }
     };
-    let mut write = |unit: &PreparedUnit, bytes: &[u8]| {
-        let leaf = unit_record_name(unit.order);
-        if let Some(record) = read_record::<UnitRecord>(directory, &leaf, RECORD_BYTES)? {
-            if record.unit != *unit {
-                return Err(stage_corrupt(directory, "staged unit identity changed"));
-            }
-            if record.complete {
-                return Ok(());
-            }
-            record.stage.discard(directory)?;
-        }
-        let (stage, mut writer) = SavedStage::create(directory)?;
-        let mut record = UnitRecord {
-            unit: unit.clone(),
-            stage,
-            complete: false,
-        };
-        write_record(directory, &leaf, &record, Publication::Upsert)?;
-        directory
-            .control()
-            .checkpoint(kio_core::durability::DurabilityPoint::ExtractionStageWriting)
-            .map_err(|error| stage_error(directory, error))?;
-        for chunk in bytes.chunks(kio_core::cas::CAS_STREAM_BUFFER_BYTES) {
-            writer
-                .write_chunk(chunk)
-                .map_err(|error| stage_error(directory, error))?;
-        }
-        writer
-            .sync()
-            .map_err(|error| stage_error(directory, error))?;
-        record.complete = true;
-        write_record(directory, &leaf, &record, Publication::Upsert)?;
-        directory
-            .control()
-            .checkpoint(kio_core::durability::DurabilityPoint::ExtractionUnitReady)
-            .map_err(|error| stage_error(directory, error))
-    };
+    let mut write = |unit: &PreparedUnit, bytes: &[u8]| write_prepared_unit(directory, unit, bytes);
     let output = extract(
         &completed,
         &mut PreparedUnitSink {
@@ -262,9 +322,21 @@ fn stage_units(
             "producer did not finish its declared layout",
         ));
     }
-    if completed_units(directory, output.prepared_units.len())? != output.prepared_units
-        || !output.prepared_units.starts_with(&completed)
-    {
+    if !output.prepared_units.starts_with(&completed) {
+        return Err(stage_corrupt(
+            directory,
+            "extractor returned a different unit layout",
+        ));
+    }
+    complete_prepared_workspace(directory, &output)?;
+    Ok(output)
+}
+
+fn complete_prepared_workspace(
+    directory: &StoreDirectory,
+    output: &PrepareStageOutput,
+) -> Result<()> {
+    if completed_units(directory, output.prepared_units.len())? != output.prepared_units {
         return Err(stage_corrupt(
             directory,
             "extractor returned a different unit layout",
@@ -275,8 +347,49 @@ fn stage_units(
         Path::new(COMPLETE),
         &output.prepared_units.len(),
         Publication::CreateOnly,
-    )?;
-    Ok(output)
+    )
+}
+
+fn write_prepared_unit(
+    directory: &StoreDirectory,
+    unit: &PreparedUnit,
+    bytes: &[u8],
+) -> Result<()> {
+    let leaf = unit_record_name(unit.order);
+    if let Some(record) = read_record::<UnitRecord>(directory, &leaf, RECORD_BYTES)? {
+        if record.unit != *unit {
+            return Err(stage_corrupt(directory, "staged unit identity changed"));
+        }
+        if record.complete {
+            return Ok(());
+        }
+        record.stage.discard(directory)?;
+    }
+    let (stage, mut writer) = SavedStage::create(directory)?;
+    let mut record = UnitRecord {
+        unit: unit.clone(),
+        stage,
+        complete: false,
+    };
+    write_record(directory, &leaf, &record, Publication::Upsert)?;
+    directory
+        .control()
+        .checkpoint(kio_core::durability::DurabilityPoint::ExtractionStageWriting)
+        .map_err(|error| stage_error(directory, error))?;
+    for chunk in bytes.chunks(kio_core::cas::CAS_STREAM_BUFFER_BYTES) {
+        writer
+            .write_chunk(chunk)
+            .map_err(|error| stage_error(directory, error))?;
+    }
+    writer
+        .sync()
+        .map_err(|error| stage_error(directory, error))?;
+    record.complete = true;
+    write_record(directory, &leaf, &record, Publication::Upsert)?;
+    directory
+        .control()
+        .checkpoint(kio_core::durability::DurabilityPoint::ExtractionUnitReady)
+        .map_err(|error| stage_error(directory, error))
 }
 
 fn completed_units(directory: &StoreDirectory, count: usize) -> Result<Vec<PreparedUnit>> {
@@ -305,22 +418,45 @@ fn prepared_output(units: Vec<PreparedUnit>) -> PrepareStageOutput {
 
 impl StagedPreparation {
     pub fn persist_objects(&self, store: &ObjectStore) -> Result<()> {
-        for unit in &self.output.prepared_units {
-            let record = completed_unit(&self.directory, unit.order)?;
-            if &record.unit != unit {
-                return Err(stage_corrupt(
-                    &self.directory,
-                    "staged unit metadata changed",
-                ));
+        match &self.payloads {
+            PreparedPayloads::Small(payloads) => {
+                for (unit, bytes) in payloads {
+                    if hash_bytes(bytes) != unit.prepared_hash {
+                        return Err(PipelineError::contract(
+                            "KIO-E-PREPARE-IDENTITY-001",
+                            "prepared bytes differ from the declared hash",
+                        ));
+                    }
+                    store
+                        .write_content_object(ContentObjectKind::Prepared, bytes)
+                        .map_err(|error| {
+                            crate::extraction_stage::stage_error_path(
+                                Path::new("objects/prepared"),
+                                error,
+                            )
+                        })?;
+                }
             }
-            record.stage.publish_content(
-                &self.directory,
-                store,
-                ContentObjectKind::Prepared,
-                &unit.prepared_hash,
-            )?;
+            PreparedPayloads::Staged(directory) => {
+                for unit in &self.output.prepared_units {
+                    let record = completed_unit(directory, unit.order)?;
+                    if &record.unit != unit {
+                        return Err(stage_corrupt(directory, "staged unit metadata changed"));
+                    }
+                    record.stage.publish_content(
+                        directory,
+                        store,
+                        ContentObjectKind::Prepared,
+                        &unit.prepared_hash,
+                    )?;
+                }
+            }
         }
         Ok(())
+    }
+
+    pub fn has_staged_payloads(&self) -> bool {
+        matches!(self.payloads, PreparedPayloads::Staged(_))
     }
 
     pub fn raw_hash(&self) -> &str {
@@ -471,12 +607,53 @@ mod tests {
     }
 
     #[test]
+    fn p0_prepared_spills_only_after_exceeding_one_buffer() {
+        for extra in [0, 1] {
+            let temp = tempfile::tempdir().unwrap();
+            let repo = kio_core::scope::Repository::init(temp.path()).unwrap();
+            let root = StoreDirectory::open(repo.kio_dir()).unwrap();
+            let path = Path::new("extraction-stages/prepared-test");
+            let first = vec![b'x'; SMALL_EXTRACTION_BYTES / 2];
+            let second = vec![b'y'; SMALL_EXTRACTION_BYTES / 2 + extra];
+            let (output, payloads) = prepare_fresh(&root, path, |_, emit| {
+                let units = vec![unit(0, &first), unit(1, &second)];
+                emit.declare(2)?;
+                for (entry, bytes) in units.iter().zip([&first, &second]) {
+                    emit.write(entry, bytes)?;
+                }
+                Ok(prepared_output(units))
+            })
+            .unwrap();
+            let result = StagedPreparation {
+                payloads,
+                raw_hash: hash_bytes(b"source"),
+                output,
+            };
+            assert_eq!(result.has_staged_payloads(), extra == 1);
+            assert_eq!(root.path().join(path).exists(), extra == 1);
+            result.persist_objects(&repo.object_store()).unwrap();
+            for (entry, bytes) in result.output.prepared_units.iter().zip([first, second]) {
+                assert_eq!(
+                    repo.object_store()
+                        .read_content_object_bytes(
+                            ContentObjectKind::Prepared,
+                            &entry.prepared_hash,
+                            SMALL_EXTRACTION_BYTES as u64,
+                        )
+                        .unwrap(),
+                    bytes
+                );
+            }
+        }
+    }
+
+    #[test]
     fn p0_prepared_cas_rejects_matching_physical_id_with_wrong_nonce() {
         let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let repo = kio_core::scope::Repository::init(temp.path()).unwrap();
         let root = StoreDirectory::open(repo.kio_dir()).unwrap();
-        let bytes = b"same content, wrong nonce";
-        let raw = hash_bytes(bytes);
+        let bytes = vec![b'x'; SMALL_EXTRACTION_BYTES + 1];
+        let raw = hash_bytes(&bytes);
         let profile = hash_bytes(b"profile");
         let staged = prepare_staged(
             &root,
@@ -485,19 +662,22 @@ mod tests {
                 media_type: "text/plain",
                 input_path: "doc.txt",
                 tool_profile_hash: &profile,
-                bytes,
+                bytes: &bytes,
             },
             ExtractionBudget::new(kio_core::error::ResourceTier::Standard),
         )
         .unwrap();
+        let PreparedPayloads::Staged(directory) = &staged.payloads else {
+            panic!("large prepared source must be staged");
+        };
         let leaf = unit_record_name(0);
-        let record = completed_unit(&staged.directory, 0).unwrap();
+        let record = completed_unit(directory, 0).unwrap();
         let mut forged = serde_json::to_value(&record).unwrap();
         forged["stage"]["identity"]["nonce"][0] =
             serde_json::json!(forged["stage"]["identity"]["nonce"][0].as_u64().unwrap() ^ 1);
-        write_record(&staged.directory, &leaf, &forged, Publication::Upsert).unwrap();
+        write_record(directory, &leaf, &forged, Publication::Upsert).unwrap();
         assert!(staged.persist_objects(&repo.object_store()).is_err());
-        assert_eq!(read_staged_unit(&staged.directory, &record).unwrap(), bytes);
+        assert_eq!(read_staged_unit(directory, &record).unwrap(), bytes);
     }
 
     #[test]
