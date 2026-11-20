@@ -159,6 +159,7 @@ fn managed_preview_applies_parent_deny_before_opening_raw_bytes() {
         &BTreeMap::new(),
         &BTreeMap::new(),
         &target,
+        kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
         ScanPreviewRequest {
             scope_path: "ignored-display-path".to_owned(),
             include_raw_hashes: true,
@@ -168,8 +169,8 @@ fn managed_preview_applies_parent_deny_before_opening_raw_bytes() {
     .unwrap();
     let candidate = preview
         .candidates
-        .iter()
         .find(|candidate| candidate.input_path == "private.md")
+        .unwrap()
         .unwrap();
     assert!(candidate.ignored);
     assert!(candidate.raw_hash.is_none());
@@ -186,6 +187,7 @@ fn managed_preview_is_read_only_and_presend_policy_is_live() {
         &BTreeMap::new(),
         &BTreeMap::new(),
         &target,
+        kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
         ScanPreviewRequest {
             scope_path: String::new(),
             include_raw_hashes: false,
@@ -241,8 +243,8 @@ fn planned_child_preview_uses_retained_rules_before_hashing() {
     .unwrap();
     let candidate = preview
         .candidates
-        .iter()
         .find(|candidate| candidate.input_path == "private.md")
+        .unwrap()
         .unwrap();
     assert!(candidate.ignored);
     assert!(candidate.raw_hash.is_none());

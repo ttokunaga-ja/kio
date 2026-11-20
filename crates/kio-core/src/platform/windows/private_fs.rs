@@ -15,8 +15,8 @@ use cap_primitives::{ambient_authority, fs as cap_fs};
 use windows_sys::Wdk::{
     Foundation::OBJECT_ATTRIBUTES,
     Storage::FileSystem::{
-        FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT,
-        FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+        FILE_CREATE, FILE_DELETE_ON_CLOSE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE,
+        FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
     },
 };
 use windows_sys::Win32::{
@@ -77,6 +77,7 @@ pub(crate) enum NewPrivateObjectKind {
     StageDirectory,
     RegularFile,
     StageFile,
+    ScratchFile,
     LockFile,
 }
 
@@ -144,19 +145,35 @@ pub(crate) fn create_new_private_at(
             windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY,
             FILE_SYNCHRONOUS_IO_NONALERT | FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
         ),
-        NewPrivateObjectKind::RegularFile | NewPrivateObjectKind::StageFile => (
+        NewPrivateObjectKind::RegularFile
+        | NewPrivateObjectKind::StageFile
+        | NewPrivateObjectKind::ScratchFile => (
             GENERIC_READ
                 | GENERIC_WRITE
                 | SYNCHRONIZE
                 | READ_CONTROL
                 | FILE_READ_ATTRIBUTES
-                | (if matches!(kind, NewPrivateObjectKind::StageFile) {
+                | (if matches!(
+                    kind,
+                    NewPrivateObjectKind::StageFile | NewPrivateObjectKind::ScratchFile
+                ) {
                     DELETE
                 } else {
                     0
                 }),
-            windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL,
-            FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
+            if matches!(kind, NewPrivateObjectKind::ScratchFile) {
+                windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_TEMPORARY
+            } else {
+                windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL
+            },
+            FILE_SYNCHRONOUS_IO_NONALERT
+                | FILE_NON_DIRECTORY_FILE
+                | FILE_OPEN_REPARSE_POINT
+                | if matches!(kind, NewPrivateObjectKind::ScratchFile) {
+                    FILE_DELETE_ON_CLOSE
+                } else {
+                    0
+                },
         ),
         NewPrivateObjectKind::LockFile => (
             GENERIC_READ
@@ -183,6 +200,7 @@ pub(crate) fn create_new_private_at(
             ptr::null_mut(),
             file_attributes,
             match kind {
+                NewPrivateObjectKind::ScratchFile => 0,
                 NewPrivateObjectKind::LockFile => FILE_SHARE_READ,
                 _ => FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             },
@@ -220,6 +238,7 @@ pub(crate) fn create_new_private_at(
         }
         NewPrivateObjectKind::RegularFile
         | NewPrivateObjectKind::StageFile
+        | NewPrivateObjectKind::ScratchFile
         | NewPrivateObjectKind::LockFile => {
             crate::platform::regular_file_handle_identity(&file).is_some()
         }

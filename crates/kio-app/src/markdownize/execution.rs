@@ -510,7 +510,7 @@ pub(crate) fn execute_pending_offline_markdownize_tasks(
     adapter_settings: &Arc<AdapterRuntimeSettings>,
     repo: &Repository,
     store: &TaskStore,
-    normalize_by_path: &mut BTreeMap<String, PendingNormalizeRef>,
+    normalize: &mut dyn FnMut(String, PendingNormalizeRef) -> Result<()>,
     network_allowed: bool,
     allow_auth_revive: bool,
 ) -> Result<ExecOutcome> {
@@ -772,7 +772,7 @@ pub(crate) fn execute_pending_offline_markdownize_tasks(
         })?;
         let manifest_hash =
             compute_manifest_hash(repo, &task.input_hash, &profile.tool_profile_hash, 0)?;
-        normalize_by_path.insert(
+        normalize(
             task.input_path.clone(),
             PendingNormalizeRef {
                 expected_raw_hash: task.input_hash.clone(),
@@ -782,7 +782,7 @@ pub(crate) fn execute_pending_offline_markdownize_tasks(
                     manifest_hash,
                 },
             },
-        );
+        )?;
         crate::task_execution::update_tasks_preserving_resource_holds(store, |candidate| {
             if candidate.task_id != task.task_id {
                 return false;

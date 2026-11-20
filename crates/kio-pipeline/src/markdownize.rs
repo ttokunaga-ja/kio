@@ -1495,6 +1495,37 @@ fn persist_normalized_units<'a>(
         stamped.r#gen,
     );
     let parent = instance.parent().expect("normalized instance parent");
+    // Validate existing cache roots before preparing any of the publication.
+    let objects = Path::new("objects");
+    let objects_dir = StoreDirectory::from_retained_with_control(
+        directory
+            .open_directory(objects)
+            .map_err(|error| stage_error(directory, error))?,
+        directory.path().join(objects),
+        directory.control().clone(),
+    )
+    .map_err(|error| stage_error(directory, error))?;
+    let views = Path::new("normalized");
+    if objects_dir
+        .contains_entry(views)
+        .map_err(|error| stage_error(&objects_dir, error))?
+    {
+        objects_dir
+            .open_directory(views)
+            .map_err(|error| stage_error(&objects_dir, error))?;
+    }
+    // Reject unsafe destinations before adding immutable objects.
+    for relative in [parent, &instance] {
+        directory
+            .entries_optional(relative)
+            .map_err(|error| stage_error(directory, error))?;
+    }
+    let store = ObjectStore::from_bound_kio_with_control(
+        directory.root_handle().as_ref(),
+        directory.control().clone(),
+    )
+    .map_err(|error| stage_error(directory, error))?;
+
     let stamps = resumable_source.map(|_| {
         (
             std::mem::take(&mut stamped.run_id),
@@ -1533,18 +1564,6 @@ fn persist_normalized_units<'a>(
             )?;
         }
     }
-    // Reject unsafe destinations before adding immutable objects.
-    for relative in [parent, &instance] {
-        directory
-            .entries_optional(relative)
-            .map_err(|error| stage_error(directory, error))?;
-    }
-    let store = ObjectStore::from_bound_kio_with_control(
-        directory.root_handle().as_ref(),
-        directory.control().clone(),
-    )
-    .map_err(|error| stage_error(directory, error))?;
-
     // Verify the manifest size before potentially producing large bodies.
     manifest_stream::admit(&stamped)?;
 
@@ -4577,6 +4596,7 @@ mod tests {
                     .is_symlink()
             );
             assert!(!kio.path().join("objects").join(untouched_root).exists());
+            assert!(!kio.path().join("extraction-stages").exists());
         }
     }
 

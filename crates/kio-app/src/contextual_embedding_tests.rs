@@ -846,7 +846,7 @@ fn collector_missing_manifest_requires_retired_purge_for_every_introduction() {
         .auto_snapshot_with_bound_normalize(
             Some("resurrection without replacement manifest"),
             None,
-            &BTreeSet::new(),
+            &|_| true,
             &BTreeMap::new(),
             &BTreeSet::new(),
             None,
@@ -889,7 +889,7 @@ fn collector_missing_manifest_requires_retired_purge_for_every_introduction() {
         .auto_snapshot_with_bound_normalize(
             Some("post-purge normalized binding"),
             None,
-            &BTreeSet::new(),
+            &|_| true,
             &pending,
             &BTreeSet::new(),
             None,

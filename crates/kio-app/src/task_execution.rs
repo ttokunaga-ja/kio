@@ -11,7 +11,7 @@ use crate::embedding::admission::lane_adjusted_pricing;
 use crate::embedding::admission::realtime_lane_requested;
 use crate::embedding::executor::run_embedding_enrichment;
 use crate::index::command::OFFICE_CONVERSION_UNAVAILABLE_REASON;
-use crate::index::command::record_unsupported_if_changed;
+use crate::index::command::stage_unsupported_if_changed;
 use crate::index::pipeline::IndexPipelineResult;
 use crate::index::pipeline::offline_markdownize_enqueue_status;
 use crate::index::pipeline::offline_output_ref;
@@ -99,7 +99,6 @@ use kio_pipeline::task::retry_policy;
 pub(crate) use kio_pipeline::task::task_retry_allowed;
 use kio_pipeline::unsupported::UNSUPPORTED_REASON_RESOLVED;
 use kio_pipeline::unsupported::UnsupportedInputDisposition;
-use kio_pipeline::unsupported::UnsupportedInputStore;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -278,12 +277,11 @@ pub(crate) fn execute_pending_tasks(
     if crate::index::pipeline::optional_role_planning_ready(adapter_settings, "markdown")? {
         if active_local_ocr_execution_with_control(adapter_settings, repo.control()).is_some() {
             let local_allowed = persistent_network_allowed(adapter_settings, repo)?;
-            let mut normalize_by_path = BTreeMap::new();
             outcome.add(execute_pending_offline_markdownize_tasks(
                 adapter_settings,
                 repo,
                 store,
-                &mut normalize_by_path,
+                &mut |_, _| Ok(()),
                 local_allowed,
                 allow_auth_revive,
             )?);
@@ -1496,9 +1494,8 @@ pub(crate) fn enqueue_online_placeholder_task(
     created_at: &str,
     result: &mut IndexPipelineResult,
     ledger: Option<&LedgerDb>,
-    unsupported_store: &UnsupportedInputStore,
-    unsupported_by_path: &mut BTreeMap<String, UnsupportedInputDisposition>,
-    office_conversion_unavailable_paths: &mut BTreeSet<String>,
+    observations: &mut kio_core::disk_records::RecordWriter<UnsupportedInputDisposition>,
+    latest_unsupported: &mut Option<UnsupportedInputDisposition>,
 ) -> Result<()> {
     // R9-2: text-native files (Markdown / plain text) are fully handled by
     // the deterministic Adapter (07 §2.1) and must never enqueue an online OCR task
@@ -1510,7 +1507,7 @@ pub(crate) fn enqueue_online_placeholder_task(
     }
     // 07 §5.1: an Office (DOCX/PPTX) file whose converter is not resolvable
     // right now must NEVER get a doomed online task -- there is no converted
-    // PDF to send. Record the skip (idempotent: `record_unsupported_if_changed`
+    // PDF to send. Record the skip (idempotent: `stage_unsupported_if_changed`
     // no-ops when the same disposition is already the latest row for this
     // path) so `compute_index_status`'s `office_conversion_unavailable`
     // discloses WHY this file has no enrichment task, instead of a silent gap.
@@ -1518,9 +1515,9 @@ pub(crate) fn enqueue_online_placeholder_task(
     // normal enqueue path below and record the transition back to resolved.
     if is_office_media(&candidate.media_type) {
         if resolve_office_converter_with_control(repo.control()).is_err() {
-            record_unsupported_if_changed(
-                unsupported_store,
-                unsupported_by_path,
+            stage_unsupported_if_changed(
+                observations,
+                latest_unsupported,
                 UnsupportedInputDisposition {
                     path: candidate.input_path.clone(),
                     raw_hash: raw_hash.to_owned(),
@@ -1529,13 +1526,15 @@ pub(crate) fn enqueue_online_placeholder_task(
                     reason: OFFICE_CONVERSION_UNAVAILABLE_REASON.to_owned(),
                 },
             )?;
-            office_conversion_unavailable_paths.insert(candidate.input_path.clone());
             return Ok(());
         }
-        if office_conversion_unavailable_paths.remove(&candidate.input_path) {
-            record_unsupported_if_changed(
-                unsupported_store,
-                unsupported_by_path,
+        if latest_unsupported
+            .as_ref()
+            .is_some_and(|row| row.reason == OFFICE_CONVERSION_UNAVAILABLE_REASON)
+        {
+            stage_unsupported_if_changed(
+                observations,
+                latest_unsupported,
                 UnsupportedInputDisposition {
                     path: candidate.input_path.clone(),
                     raw_hash: raw_hash.to_owned(),
@@ -1774,8 +1773,9 @@ pub(crate) fn enqueue_online_placeholder_task(
                     "ready_for_online_adapter"
                 } else {
                     "network_opt_in_required"
-                },
-            });
+                }
+                .to_owned(),
+            })?;
     }
     match status {
         TaskStatus::Paused => result.paused_tasks += 1,

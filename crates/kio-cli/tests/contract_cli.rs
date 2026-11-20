@@ -414,8 +414,8 @@ fn ct_lock_001_concurrent_snapshots_fail_fast() {
 // M1(a) + acceptance (a): the whole `kio index` command holds the store lock
 // end-to-end (not just its snapshot sub-step), so two concurrent index processes
 // on the same scope cannot interleave. The loser fails fast with
-// KIO-E-STORE-LOCKED-001 (exit 3) and the persisted store files remain valid
-// JSONL. Two REAL processes (not threads) so the O_EXCL contention is genuine.
+// KIO-E-STORE-LOCKED-001 (exit 3), and the winner publishes a readable tree.
+// Two processes exercise the real store lock.
 #[cfg(debug_assertions)]
 #[test]
 fn m1_concurrent_index_loser_is_locked_and_store_intact() {
@@ -440,18 +440,18 @@ fn m1_concurrent_index_loser_is_locked_and_store_intact() {
     )
     .unwrap();
 
-    // Process A holds the lock across its snapshot sub-step until this test releases
-    // it, guaranteeing the contention window without timing assumptions.
+    // Keep both handshake files outside the indexed scope. The winner has
+    // already scanned its inputs when it reaches the snapshot lock hook.
+    let ready = device_home.path().join("lock.ready");
     let first = process_command_with_device_home(&bin, device_home.path())
         .args(["index", "--json"])
-        .env("KIO_TEST_HOLD_LOCK_READY", temp.path().join("lock.ready"))
+        .env("KIO_TEST_HOLD_LOCK_READY", &ready)
         .current_dir(temp.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
 
-    let ready = temp.path().join("lock.ready");
     let mut first = HeldLockChild::new(wait_for_lock_ready(first, &ready), &ready);
 
     let second = process_command_with_device_home(&bin, device_home.path())
@@ -461,10 +461,27 @@ fn m1_concurrent_index_loser_is_locked_and_store_intact() {
         .unwrap();
     let first = first.release_and_wait();
 
-    assert!(first.status.success(), "winner index must succeed");
+    assert!(
+        first.status.success(),
+        "winner index must succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
     assert_eq!(second.status.code(), Some(3), "loser must exit 3 (locked)");
     let error: Value = serde_json::from_slice(&second.stderr).unwrap();
     assert_eq!(error["error_code"], "KIO-E-STORE-LOCKED-001");
+
+    let repo = kio_core::scope::Repository::open_read_only(temp.path()).unwrap();
+    let head = repo
+        .read_commit(&repo.head_commit_hash().unwrap().unwrap())
+        .unwrap();
+    let tree = repo.read_tree(&head.tree).unwrap();
+    let paths = tree
+        .entries
+        .iter()
+        .map(|entry| entry.unwrap().path)
+        .collect::<Vec<_>>();
+    assert_eq!(paths, ["a.md"]);
 
     // Store intact: every persisted JSONL record still parses as one line.
     for rel in [".kio/tasks.jsonl"] {

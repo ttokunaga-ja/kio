@@ -596,6 +596,8 @@ pub struct AccountedReadError {
 pub struct ObjectStore {
     reads: CasReadAccess,
     control: crate::control::ControlHandle,
+    record_memory: Arc<crate::disk_records::RecordMemoryBudget>,
+    scratch_record_reads: bool,
     kio_dir: Option<PathBuf>,
     /// Scheduled writers retain these handles before taking their writer
     /// boundary.  The ambient `.kio/objects` pathname is deliberately never
@@ -620,7 +622,7 @@ struct BoundObjectDirs {
     stage_directories: Arc<Mutex<Option<bound::RawStageDirectories>>>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawStageResidue {
     pub path: String,
     pub reason: String,

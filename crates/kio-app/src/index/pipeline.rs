@@ -5,11 +5,10 @@ use crate::egress::SECRETS_TIER_B_HOLD;
 use crate::egress::network_allowed;
 use crate::historical_reindex::pinned_manifest_is_complete;
 use crate::image_ingest;
-use crate::index::command::OFFICE_CONVERSION_UNAVAILABLE_REASON;
 use crate::index::command::read_repository_extraction_input;
-use crate::index::command::record_unsupported_if_changed;
 use crate::index::command::repository_input_display_path;
 use crate::index::command::repository_scan_policy_allows_file;
+use crate::index::command::stage_unsupported_if_changed;
 use crate::index::rebuild::read_head_tree_for_rebuild;
 use crate::ledger_access::release_task_charge_if_open;
 use crate::ledger_access::task_ledger_key;
@@ -73,9 +72,12 @@ use kio_adapter::types::RawInput;
 use kio_core::Result;
 use kio_core::control::ControlHandle;
 use kio_core::dag::{NormalizeRef, TreeObject};
-use kio_core::scope::PendingNormalizeRef;
+use kio_core::disk_records::{
+    DiskRecords, RecordSorter, RecordStageRoot, RecordWriter, SortedRecordCursor,
+};
 use kio_core::scope::Repository;
 use kio_core::scope::new_ulid;
+use kio_core::scope::{DeferredInput, DeferredInputReason, PendingNormalizeRef};
 #[cfg(debug_assertions)]
 use kio_core::test_control::MarkdownizeAdapterMode;
 use kio_pipeline::budget::read_budget_policy;
@@ -112,55 +114,48 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 
-pub(crate) fn index_preview_response(root: &Path, preview: &ScanPreview) -> IndexPreviewResponse {
-    let included = preview
-        .candidates
-        .iter()
-        .filter(|candidate| !candidate.ignored)
-        .collect::<Vec<_>>();
-    let estimated_size_bytes = included
-        .iter()
-        .map(|candidate| candidate.size_bytes)
-        .sum::<u64>();
-    let excluded_candidates = preview
-        .candidates
-        .iter()
-        .filter(|candidate| candidate.ignored)
-        .map(|candidate| candidate.input_path.clone())
-        .collect::<Vec<_>>();
-    let sensitive_candidates = preview
-        .candidates
-        .iter()
-        .filter_map(|candidate| {
-            candidate
-                .quarantine_reason
-                .as_ref()
-                .map(|reason| SensitiveCandidate {
-                    path: candidate.input_path.clone(),
-                    reason: reason.clone(),
-                    ignored: candidate.ignored,
-                })
-        })
-        .collect();
-    let large_files = preview
-        .candidates
-        .iter()
-        .filter(|candidate| candidate.size_bytes >= 10 * 1024 * 1024)
-        .map(|candidate| LargeFile {
-            path: candidate.input_path.clone(),
-            size_bytes: candidate.size_bytes,
-        })
-        .collect();
-    IndexPreviewResponse {
+pub(crate) fn index_preview_response(
+    root: &Path,
+    preview: &ScanPreview,
+) -> Result<IndexPreviewResponse> {
+    let stages = RecordStageRoot::temporary()?;
+    let mut large = RecordWriter::new(&stages)?;
+    let mut excluded = RecordWriter::new(&stages)?;
+    let mut sensitive = RecordWriter::new(&stages)?;
+    let mut count = 0;
+    let mut bytes = 0;
+    for candidate in &preview.candidates {
+        let candidate = candidate?;
+        if candidate.ignored {
+            excluded.push(&candidate.input_path)?;
+        } else {
+            count += 1;
+            bytes += candidate.size_bytes;
+        }
+        if let Some(reason) = candidate.quarantine_reason {
+            sensitive.push(&SensitiveCandidate {
+                path: candidate.input_path.clone(),
+                reason,
+                ignored: candidate.ignored,
+            })?;
+        }
+        if candidate.size_bytes >= 10 * 1024 * 1024 {
+            large.push(&LargeFile {
+                path: candidate.input_path,
+                size_bytes: candidate.size_bytes,
+            })?;
+        }
+    }
+    Ok(IndexPreviewResponse {
         status: "preview".to_owned(),
         root: root.to_path_buf(),
         scope: preview.scope_id.clone(),
-        estimated_file_count: included.len(),
-        estimated_size_bytes,
-        large_files,
+        estimated_file_count: count,
+        estimated_size_bytes: bytes,
+        large_files: large.finish()?,
         effective_ignore: ".kioignore + built-in secrets Tier A".to_owned(),
-        excluded_candidates,
-        sensitive_candidates,
+        excluded_candidates: excluded.finish()?,
+        sensitive_candidates: sensitive.finish()?,
         network_transmission_policy: NetworkTransmissionPolicy {
             default: "disabled until adapter approve".to_owned(),
             yes_grants_network: false,
@@ -178,41 +173,66 @@ pub(crate) fn index_preview_response(root: &Path, preview: &ScanPreview) -> Inde
             "baseline completes in this run; online enhancement depends on budget and opt-in"
                 .to_owned(),
         candidates: preview.candidates.clone(),
-        extraction_issues: Vec::new(),
+        extraction_issues: DiskRecords::empty(),
         child_scopes: None,
         estimated_aggregate_file_count: None,
         estimated_aggregate_size_bytes: None,
         estimated_aggregate_cost_usd: None,
         child_scope_discovery: None,
-    }
+    })
 }
 
-#[derive(Debug, Default)]
 pub(crate) struct IndexPipelineResult {
     pub(crate) resource_limit: Option<kio_core::error::ResourceLimit>,
-    pub(crate) normalize_by_path: BTreeMap<String, PendingNormalizeRef>,
-    pub(crate) unsupported_raws: BTreeMap<String, String>,
+    pub(crate) normalizes: RecordWriter<(String, PendingNormalizeRef)>,
+    pub(crate) deferred_inputs: RecordWriter<DeferredInput>,
     pub(crate) network_allowed: bool,
     pub(crate) pending_online_tasks: usize,
     pub(crate) paused_tasks: usize,
     pub(crate) normalized_files: usize,
     pub(crate) pending_files: usize,
     pub(crate) failed_files: usize,
-    pub(crate) deferred_budget: Vec<DeferredPaidPlaceholder>,
-    retired_extractions: Option<kio_core::disk_records::DiskRecords<Retirement>>,
+    pub(crate) deferred_budget: RecordSorter<DeferredPaidPlaceholder>,
+    pub(super) retired_extractions: RecordWriter<Retirement>,
     // R22-4: binary inputs with no locally-extractable text whose media type is not an
     // OCR-able one (R21-4 skips their online task). Archived, but never enriched — surfaced
     // so `enriched_ratio: 1.0` cannot silently mean "this file does not exist".
     pub(crate) skipped_unrecognized_binary_files: usize,
 }
 
+pub(crate) fn sorted_normalizes(
+    stages: &RecordStageRoot,
+    rows: impl IntoIterator<Item = Result<(String, PendingNormalizeRef)>>,
+) -> Result<DiskRecords<(String, PendingNormalizeRef)>> {
+    let mut sorter =
+        RecordSorter::new(stages, |a: &(String, PendingNormalizeRef), b| a.0.cmp(&b.0));
+    for row in rows {
+        sorter.push(row?)?;
+    }
+    let mut result = RecordWriter::new(stages)?;
+    let mut previous: Option<(String, PendingNormalizeRef)> = None;
+    for row in sorter.finish()? {
+        let (path, pending) = row?;
+        if let Some(previous) = previous.take()
+            && previous.0 != path
+        {
+            result.push(&previous)?;
+        }
+        previous = Some((path, pending));
+    }
+    if let Some(row) = previous {
+        result.push(&row)?;
+    }
+    result.finish()
+}
+
 /// A new, unsubmitted paid placeholder. Existing/local task lifecycles are
 /// deliberately excluded from final budget classification.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct DeferredPaidPlaceholder {
     pub(crate) expected: kio_pipeline::task::TaskDescriptor,
     pub(crate) estimated_usd: f64,
-    pub(crate) ready_reason: &'static str,
+    pub(crate) ready_reason: String,
 }
 
 /// Optional index planning may skip only a typed unavailable declaration.
@@ -234,18 +254,17 @@ pub(crate) fn optional_role_planning_ready(
 fn reusable_current_normalize(
     adapter_settings: &Arc<AdapterRuntimeSettings>,
     repo: &Repository,
-    head: &BTreeMap<String, (String, NormalizeRef)>,
-    path: &str,
+    head: Option<&kio_core::dag::TreeEntry>,
     raw_hash: &str,
     media_type: &str,
     markdown_planning_ready: bool,
 ) -> Result<Option<(NormalizeRef, bool)>> {
-    let Some((head_raw, normalize)) = head.get(path) else {
+    let Some(normalize) = head
+        .filter(|entry| entry.raw_hash == raw_hash)
+        .and_then(|entry| entry.normalize.as_ref())
+    else {
         return Ok(None);
     };
-    if head_raw != raw_hash {
-        return Ok(None);
-    }
     if !markdown_planning_ready {
         // This validates the exact immutable CAS closure even when it is
         // partial. Retain its accepted units without claiming it completed.
@@ -299,16 +318,17 @@ pub(crate) fn offline_markdownize_enqueue_status(
     }
 }
 
-pub(crate) fn explicitly_allowed_tier_a_paths(preview: &ScanPreview) -> BTreeSet<String> {
-    preview
-        .candidates
-        .iter()
-        .filter(|candidate| {
-            !candidate.ignored
-                && candidate.quarantine_reason.as_deref() == Some("secrets_tier_a_online_hold")
-        })
-        .map(|candidate| candidate.input_path.clone())
-        .collect()
+pub(crate) fn explicitly_allowed_tier_a_paths(preview: &ScanPreview) -> Result<BTreeSet<String>> {
+    let mut allowed = BTreeSet::new();
+    for candidate in &preview.candidates {
+        let candidate = candidate?;
+        if !candidate.ignored
+            && candidate.quarantine_reason.as_deref() == Some("secrets_tier_a_online_hold")
+        {
+            allowed.insert(candidate.input_path);
+        }
+    }
+    Ok(allowed)
 }
 
 pub(crate) fn online_markdownize_profile() -> AdapterProfile {
@@ -685,30 +705,18 @@ pub(crate) fn test_markdown_unit(hint: &PreparedUnitHint, prefix: &str) -> Markd
     }
 }
 
-fn hash_unsupported_input(
-    repo: &Repository,
+fn unsupported_input(
     candidate: &ScanCandidate,
+    raw_hash: &str,
     reason: &str,
-) -> Result<UnsupportedInputDisposition> {
-    let root = repo.bound_root_handle().ok_or_else(|| {
-        pipeline_to_kio(kio_pipeline::PipelineError::contract(
-            "KIO-E-SCOPE-BOUND-STATE-001",
-            "managed index is missing its retained scope handle",
-        ))
-    })?;
-    let identity = kio_pipeline::scan::hash_bound_verified_scan_input(
-        root,
-        &candidate.input_path,
-        candidate.size_bytes,
-    )
-    .map_err(pipeline_to_kio)?;
-    Ok(UnsupportedInputDisposition {
+) -> UnsupportedInputDisposition {
+    UnsupportedInputDisposition {
         path: candidate.input_path.clone(),
-        raw_hash: identity.raw_hash,
+        raw_hash: raw_hash.to_owned(),
         media_type: candidate.media_type.clone(),
-        size_bytes: identity.size_bytes,
+        size_bytes: candidate.size_bytes,
         reason: reason.to_owned(),
-    })
+    }
 }
 
 fn classify_verified_unsupported(
@@ -727,10 +735,26 @@ fn classify_verified_unsupported(
     })
 }
 
-#[derive(Default)]
 pub(super) struct ReindexInputClassifications {
-    pub(super) raw_by_path: BTreeMap<String, String>,
-    pub(super) unsupported_paths: BTreeSet<String>,
+    pub(super) deferred_inputs: DiskRecords<DeferredInput>,
+    pub(super) unsupported: DiskRecords<UnsupportedInputDisposition>,
+}
+
+fn changed_scan_read(error: &kio_pipeline::PipelineError) -> Option<DeferredInputReason> {
+    match error {
+        kio_pipeline::PipelineError::Contract {
+            code: "KIO-E-SCAN-FILE-MISSING-001",
+            ..
+        } => Some(DeferredInputReason::MissingAfterScan),
+        kio_pipeline::PipelineError::Contract {
+            code:
+                "KIO-E-SCAN-FILE-IDENTITY-001"
+                | "KIO-E-SCAN-INPUT-CHANGED-001"
+                | "KIO-E-SCAN-INPUT-OVERSIZED-001",
+            ..
+        } => Some(DeferredInputReason::ChangedAfterScan),
+        _ => None,
+    }
 }
 
 pub(super) fn record_reindex_unsupported_inputs(
@@ -739,56 +763,64 @@ pub(super) fn record_reindex_unsupported_inputs(
     head_tree: &TreeObject,
     tier: kio_core::error::ResourceTier,
 ) -> Result<ReindexInputClassifications> {
+    let stages = repo.object_store().record_stages()?;
     let store = UnsupportedInputStore::new(repo.kio_dir())
         .with_published_tree(Some(head_tree))
-        .map_err(pipeline_to_kio)?;
-    let mut observations = Vec::new();
-    let mut classified = ReindexInputClassifications::default();
-    for candidate in preview
-        .candidates
-        .iter()
-        .filter(|candidate| !candidate.ignored)
-    {
-        let disposition =
-            if let Some(reason) = unsupported_reason_for_path(Path::new(&candidate.input_path)) {
-                hash_unsupported_input(repo, candidate, reason)?
-            } else if candidate.media_type == "application/octet-stream" {
-                let verified =
-                    match read_repository_extraction_input(repo, &candidate.input_path, tier) {
-                        Ok(verified) => verified,
-                        Err(kio_pipeline::PipelineError::ResourceLimit(_)) => continue,
-                        Err(error) => return Err(pipeline_to_kio(error)),
-                    };
-                let Some(reason) =
-                    unsupported_reason_for_content(&candidate.media_type, &verified.bytes)
-                else {
-                    classified
-                        .raw_by_path
-                        .insert(candidate.input_path.clone(), verified.raw_hash);
+        .with_record_stages(stages.clone());
+    let mut observations = RecordWriter::new(&stages)?;
+    let mut deferred = RecordWriter::new(&stages)?;
+    for candidate in &preview.candidates {
+        let candidate = &candidate?;
+        if candidate.ignored {
+            continue;
+        }
+        let Some(scan_hash) = candidate.raw_hash.as_deref() else {
+            continue;
+        };
+        let disposition = if let Some(reason) =
+            unsupported_reason_for_path(Path::new(&candidate.input_path))
+        {
+            unsupported_input(candidate, scan_hash, reason)
+        } else if candidate.media_type == "application/octet-stream" {
+            let verified = match read_repository_extraction_input(repo, &candidate.input_path, tier)
+            {
+                Ok(verified) if verified.raw_hash == scan_hash => verified,
+                Ok(_) => {
+                    deferred.push(&DeferredInput {
+                        path: candidate.input_path.clone(),
+                        reason: DeferredInputReason::ChangedAfterScan,
+                    })?;
                     continue;
-                };
-                UnsupportedInputDisposition {
-                    path: candidate.input_path.clone(),
-                    raw_hash: verified.raw_hash,
-                    media_type: candidate.media_type.clone(),
-                    size_bytes: verified.size_bytes,
-                    reason: reason.to_owned(),
                 }
-            } else {
+                Err(kio_pipeline::PipelineError::ResourceLimit(_)) => continue,
+                Err(error) => {
+                    let reason = changed_scan_read(&error).ok_or_else(|| pipeline_to_kio(error))?;
+                    deferred.push(&DeferredInput {
+                        path: candidate.input_path.clone(),
+                        reason,
+                    })?;
+                    continue;
+                }
+            };
+            let Some(reason) =
+                unsupported_reason_for_content(&candidate.media_type, &verified.bytes)
+            else {
                 continue;
             };
-        classified
-            .raw_by_path
-            .insert(disposition.path.clone(), disposition.raw_hash.clone());
-        classified
-            .unsupported_paths
-            .insert(disposition.path.clone());
-        observations.push(disposition);
+            unsupported_input(candidate, scan_hash, reason)
+        } else {
+            continue;
+        };
+        observations.push(&disposition)?;
     }
+    let unsupported = observations.finish()?;
     store
-        .record_observations(observations)
+        .record_observations(unsupported.iter())
         .map_err(pipeline_to_kio)?;
-    Ok(classified)
+    Ok(ReindexInputClassifications {
+        deferred_inputs: deferred.finish()?,
+        unsupported,
+    })
 }
 
 pub(crate) fn run_index_pipeline(
@@ -798,7 +830,10 @@ pub(crate) fn run_index_pipeline(
     args: &IndexArgs,
     ledger: Option<&kio_pipeline::ledger::LedgerDb>,
     explicit_resource_retry: bool,
-) -> Result<IndexPipelineResult> {
+) -> Result<(
+    IndexPipelineResult,
+    DiskRecords<UnsupportedInputDisposition>,
+)> {
     let task_store = TaskStore::new_with_control(repo.kio_dir(), repo.control().clone());
     // Q3: index holds the folder store lock end-to-end, so any Running online task
     // is an orphan from a crashed run. Reclaim it to Pending before the enqueue /
@@ -842,14 +877,14 @@ pub(crate) fn run_index_pipeline(
         let online_profile = online_markdownize_profile_for(repo)?;
         let placeholder_output_ref = online_output_ref(&online_profile.adapter_id);
         let reservation_scope_id = repo.scope_identity()?.scope_id;
-        let live_paths: BTreeSet<&str> = preview
-            .candidates
-            .iter()
-            .filter(|candidate| !candidate.ignored && candidate.media_type != "inode/directory")
-            .map(|candidate| candidate.input_path.as_str())
-            .collect();
+        let mut live_paths = kio_core::disk_records::SortedRecordCursor::new(
+            preview.candidates.iter(),
+            |candidate| &candidate.input_path,
+        );
         let mut orphan_ids = BTreeSet::new();
-        for task in task_store.all().map_err(pipeline_to_kio)? {
+        let mut tasks = task_store.all().map_err(pipeline_to_kio)?;
+        tasks.sort_unstable_by(|a, b| a.input_path.cmp(&b.input_path));
+        for task in tasks {
             let orphaned = task.task_type == TaskType::Markdownize
                 && targets_standard_online_markdownize(
                     task_store.kio_dir(),
@@ -861,7 +896,9 @@ pub(crate) fn run_index_pipeline(
                     TaskStatus::Failed | TaskStatus::Pending | TaskStatus::Paused
                 )
                 && is_reservation_bearing_send_failure(&task)
-                && !live_paths.contains(task.input_path.as_str());
+                && !live_paths
+                    .at(&task.input_path)?
+                    .is_some_and(|file| !file.ignored && file.media_type != "inode/directory");
             if !orphaned {
                 continue;
             }
@@ -885,11 +922,22 @@ pub(crate) fn run_index_pipeline(
             .map_err(pipeline_to_kio)?;
     }
 
-    let mut retire =
-        kio_core::disk_records::RecordWriter::new(&repo.object_store().record_stages()?)?;
+    let stages = repo.object_store().record_stages()?;
     let mut result = IndexPipelineResult {
+        normalizes: RecordWriter::new(&stages)?,
+        deferred_inputs: RecordWriter::new(&stages)?,
         network_allowed,
-        ..IndexPipelineResult::default()
+        resource_limit: None,
+        pending_online_tasks: 0,
+        paused_tasks: 0,
+        normalized_files: 0,
+        pending_files: 0,
+        failed_files: 0,
+        deferred_budget: RecordSorter::new(&stages, |a: &DeferredPaidPlaceholder, b| {
+            a.expected.task_id.cmp(&b.expected.task_id)
+        }),
+        retired_extractions: RecordWriter::new(&stages)?,
+        skipped_unrecognized_binary_files: 0,
     };
     let head_tree = repo
         .head_commit_hash()?
@@ -897,38 +945,18 @@ pub(crate) fn run_index_pipeline(
         .transpose()?;
     let unsupported_store = UnsupportedInputStore::new(repo.kio_dir())
         .with_published_tree(head_tree.as_ref())
-        .map_err(pipeline_to_kio)?;
-    let mut unsupported_by_path = unsupported_store
+        .with_record_stages(stages.clone());
+    let latest_unsupported = unsupported_store
         .latest_by_path()
-        .map_err(pipeline_to_kio)?
-        .into_iter()
-        .map(|entry| (entry.path.clone(), entry))
-        .collect::<BTreeMap<_, _>>();
-    // 07 §5.1: record the resolved transition once a converter becomes available.
-    let mut office_conversion_unavailable_paths = unsupported_by_path
-        .values()
-        .filter(|entry| entry.reason == OFFICE_CONVERSION_UNAVAILABLE_REASON)
-        .map(|entry| entry.path.clone())
-        .collect::<BTreeSet<_>>();
+        .map_err(pipeline_to_kio)?;
+    let mut unsupported_by_path =
+        SortedRecordCursor::new(latest_unsupported.iter(), |row| &row.path);
     // R12-1: the documented `[markdownize.incremental]` overrides (were hardcoded).
     let incremental_config = effective_incremental_config(repo)?;
-    let candidate_paths = preview
-        .candidates
-        .iter()
-        .filter(|candidate| !candidate.ignored && candidate.media_type != "inode/directory")
-        .map(|candidate| candidate.input_path.as_str())
-        .collect::<BTreeSet<_>>();
-    let mut head_ocr_normalizes = BTreeMap::new();
-    if let Some(head_tree) = head_tree {
-        for entry in &head_tree.entries {
-            let entry = entry?;
-            if candidate_paths.contains(entry.path.as_str())
-                && let Some(normalize) = entry.normalize
-            {
-                head_ocr_normalizes.insert(entry.path, (entry.raw_hash, normalize));
-            }
-        }
-    }
+    let mut head_ocr_normalizes = kio_core::disk_records::SortedRecordCursor::new(
+        head_tree.iter().flat_map(|tree| tree.entries.iter()),
+        |entry| &entry.path,
+    );
 
     let extraction_store = bound_extraction_store(repo)?;
     let object_store = repo.object_store();
@@ -941,23 +969,25 @@ pub(crate) fn run_index_pipeline(
         })
         .map(|task| (task.input_path.clone(), task))
         .collect::<BTreeMap<_, _>>();
-    let live_inputs = preview
-        .candidates
-        .iter()
-        .filter(|candidate| !candidate.ignored && candidate.media_type != "inode/directory")
-        .map(|candidate| candidate.input_path.as_str())
-        .collect::<BTreeSet<_>>();
+    let mut live_inputs = SortedRecordCursor::new(preview.candidates.iter(), |row| &row.input_path);
     for held in extraction_holds.values() {
-        if !live_inputs.contains(held.input_path.as_str()) {
+        if live_inputs
+            .at(&held.input_path)?
+            .is_none_or(|row| row.ignored || row.media_type == "inode/directory")
+        {
             discard_stages_if_unheld_after_retirement(&extraction_store, &task_store, held)?;
         }
     }
-    let mut unsupported_observations = Vec::new();
-    for candidate in preview
-        .candidates
-        .iter()
-        .filter(|candidate| !candidate.ignored && candidate.media_type != "inode/directory")
-    {
+    let mut unsupported_observations = RecordWriter::new(&stages)?;
+    for candidate in &preview.candidates {
+        let candidate = &candidate?;
+        if candidate.ignored || candidate.media_type == "inode/directory" {
+            continue;
+        }
+        let Some(scan_hash) = candidate.raw_hash.as_deref() else {
+            continue;
+        };
+        let mut latest_unsupported = unsupported_by_path.at(&candidate.input_path)?.cloned();
         let unsupported_reason = unsupported_reason_for_path(Path::new(&candidate.input_path));
         let path = repository_input_display_path(repo, &candidate.input_path);
         if !repository_scan_policy_allows_file(repo, &candidate.input_path)
@@ -974,17 +1004,24 @@ pub(crate) fn run_index_pipeline(
         }
         let held = extraction_holds.get(&candidate.input_path);
         if let Some(reason) = unsupported_reason {
-            let disposition = hash_unsupported_input(repo, candidate, reason)?;
+            let disposition = unsupported_input(candidate, scan_hash, reason);
             if let Some(task) = held {
                 discard_stages_if_unheld_after_retirement(&extraction_store, &task_store, task)?;
             }
-            unsupported_observations.push(disposition);
+            unsupported_observations.push(&disposition)?;
             continue;
         }
         if let Some(task) = held {
             let current =
                 crate::index::command::hash_repository_scan_input(repo, &candidate.input_path);
             if let Ok(current) = current {
+                if current.raw_hash != scan_hash {
+                    result.deferred_inputs.push(&DeferredInput {
+                        path: candidate.input_path.clone(),
+                        reason: DeferredInputReason::ChangedAfterScan,
+                    })?;
+                    continue;
+                }
                 if current.raw_hash != task.input_hash {
                     discard_stages_if_unheld_after_retirement(
                         &extraction_store,
@@ -1004,17 +1041,30 @@ pub(crate) fn run_index_pipeline(
             {
                 Ok(verified) => verified,
                 Err(kio_pipeline::PipelineError::ResourceLimit(limit)) => {
-                    let identity = crate::index::command::hash_repository_scan_input(
+                    match crate::index::command::hash_repository_scan_input(
                         repo,
                         &candidate.input_path,
-                    )
-                    .map_err(pipeline_to_kio)?;
-                    ensure_raw_ingest_allowed(repo, &identity.raw_hash)?;
+                    ) {
+                        Ok(identity) if identity.raw_hash == scan_hash => {}
+                        other => {
+                            let reason = match other {
+                                Ok(_) => DeferredInputReason::ChangedAfterScan,
+                                Err(error) => changed_scan_read(&error)
+                                    .ok_or_else(|| pipeline_to_kio(error))?,
+                            };
+                            result.deferred_inputs.push(&DeferredInput {
+                                path: candidate.input_path.clone(),
+                                reason,
+                            })?;
+                            continue;
+                        }
+                    }
+                    ensure_raw_ingest_allowed(repo, scan_hash)?;
                     pause_extraction(
                         repo,
                         &task_store,
                         candidate,
-                        &identity.raw_hash,
+                        scan_hash,
                         &now,
                         &limit.into_error("cannot read extraction input"),
                         &mut result,
@@ -1022,6 +1072,13 @@ pub(crate) fn run_index_pipeline(
                     continue;
                 }
                 Err(error) => {
+                    if let Some(reason) = changed_scan_read(&error) {
+                        result.deferred_inputs.push(&DeferredInput {
+                            path: candidate.input_path.clone(),
+                            reason,
+                        })?;
+                        continue;
+                    }
                     repo.control().append_event_log_in_session(
                         repo.lock_session(),
                         "KIO-I-INDEX-INPUT-CHANGED-001",
@@ -1033,28 +1090,13 @@ pub(crate) fn run_index_pipeline(
                     continue;
                 }
             };
-        // R15-8: `candidate.raw_hash` was computed at SCAN time; `bytes` is read HERE. If
-        // the file was externally edited in that window, persisting the normalized
-        // instance under the stale SCAN hash while the closing snapshot hashes the CURRENT
-        // bytes for the tree entry would diverge their identities (the offline twin of
-        // R14-2). Re-hash what we actually read and, on a mismatch, SKIP this candidate —
-        // the next clean index re-scans and normalizes it under its correct identity. The
-        // window is one store-lock-held `kio index` plus an external write, so this is a
-        // rare defensive guard. (No deterministic test: reproducing it needs an external
-        // edit landing inside the lock-held critical section between the scan and this
-        // read, which no public seam exposes.)
+        // Only prepare bytes that still match the admitted scan identity.
         let current_hash = verified.raw_hash.clone();
-        if let Some(scan_hash) = &candidate.raw_hash
-            && scan_hash != &current_hash
-        {
-            repo.control().append_event_log_in_session(
-                repo.lock_session(),
-                "KIO-I-INDEX-INPUT-CHANGED-001",
-                "input file changed between scan and normalize; skipped to preserve \
-                     content-addressing (re-run index)",
-                json!({ "input_path": candidate.input_path }),
-            )?;
-            result.failed_files += 1;
+        if scan_hash != current_hash {
+            result.deferred_inputs.push(&DeferredInput {
+                path: candidate.input_path.clone(),
+                reason: DeferredInputReason::ChangedAfterScan,
+            })?;
             continue;
         }
         let raw_hash = current_hash;
@@ -1065,7 +1107,7 @@ pub(crate) fn run_index_pipeline(
             classify_verified_unsupported(&candidate.input_path, &candidate.media_type, &verified)
         {
             result.skipped_unrecognized_binary_files += 1;
-            unsupported_observations.push(disposition);
+            unsupported_observations.push(&disposition)?;
             repo.control().append_event_log_in_session(
                 repo.lock_session(),
                 "KIO-I-INDEX-INPUT-UNRECOGNIZED-BINARY-001",
@@ -1120,25 +1162,24 @@ pub(crate) fn run_index_pipeline(
         if let Some((normalize, complete)) = reusable_current_normalize(
             adapter_settings,
             repo,
-            &head_ocr_normalizes,
-            &candidate.input_path,
+            head_ocr_normalizes.at(&candidate.input_path)?,
             &raw_hash,
             &candidate.media_type,
             markdown_planning_ready,
         )? {
-            result.normalize_by_path.insert(
+            result.normalizes.push(&(
                 candidate.input_path.clone(),
                 PendingNormalizeRef {
                     expected_raw_hash: raw_hash.clone(),
                     normalize,
                 },
-            );
+            ))?;
             if complete {
                 result.normalized_files += 1;
             } else {
                 result.pending_files += 1;
             }
-            retire.push(&Retirement {
+            result.retired_extractions.push(&Retirement {
                 raw: raw_hash.clone(),
                 path: candidate.input_path.clone(),
                 hold: held
@@ -1177,13 +1218,13 @@ pub(crate) fn run_index_pipeline(
                 }
                 Err(error) => return Err(error),
             };
-            result.normalize_by_path.insert(
+            result.normalizes.push(&(
                 candidate.input_path.clone(),
                 PendingNormalizeRef {
                     expected_raw_hash: raw_hash.clone(),
                     normalize,
                 },
-            );
+            ))?;
             result.normalized_files += 1;
             // Native image ingestion establishes the pixel authority locally;
             // OCR remains an optional later enrichment and has its own online
@@ -1199,12 +1240,11 @@ pub(crate) fn run_index_pipeline(
                     &now,
                     &mut result,
                     ledger,
-                    &unsupported_store,
-                    &mut unsupported_by_path,
-                    &mut office_conversion_unavailable_paths,
+                    &mut unsupported_observations,
+                    &mut latest_unsupported,
                 )?;
             }
-            retire.push(&Retirement {
+            result.retired_extractions.push(&Retirement {
                 raw: raw_hash.clone(),
                 path: candidate.input_path.clone(),
                 hold: held
@@ -1217,13 +1257,13 @@ pub(crate) fn run_index_pipeline(
 
         if prepare.prepared_units.is_empty() {
             // Recognized media without local text may still be eligible for OCR.
-            if unsupported_by_path
-                .get(&candidate.input_path)
+            if latest_unsupported
+                .as_ref()
                 .is_some_and(UnsupportedInputDisposition::is_unsupported)
             {
-                record_unsupported_if_changed(
-                    &unsupported_store,
-                    &mut unsupported_by_path,
+                stage_unsupported_if_changed(
+                    &mut unsupported_observations,
+                    &mut latest_unsupported,
                     UnsupportedInputDisposition {
                         path: candidate.input_path.clone(),
                         raw_hash: raw_hash.clone(),
@@ -1244,12 +1284,11 @@ pub(crate) fn run_index_pipeline(
                     &now,
                     &mut result,
                     ledger,
-                    &unsupported_store,
-                    &mut unsupported_by_path,
-                    &mut office_conversion_unavailable_paths,
+                    &mut unsupported_observations,
+                    &mut latest_unsupported,
                 )?;
             }
-            retire.push(&Retirement {
+            result.retired_extractions.push(&Retirement {
                 raw: raw_hash.clone(),
                 path: candidate.input_path.clone(),
                 hold: held
@@ -1260,13 +1299,13 @@ pub(crate) fn run_index_pipeline(
             continue;
         }
 
-        if unsupported_by_path
-            .get(&candidate.input_path)
+        if latest_unsupported
+            .as_ref()
             .is_some_and(UnsupportedInputDisposition::is_unsupported)
         {
-            record_unsupported_if_changed(
-                &unsupported_store,
-                &mut unsupported_by_path,
+            stage_unsupported_if_changed(
+                &mut unsupported_observations,
+                &mut latest_unsupported,
                 UnsupportedInputDisposition {
                     path: candidate.input_path.clone(),
                     raw_hash: raw_hash.clone(),
@@ -1328,7 +1367,7 @@ pub(crate) fn run_index_pipeline(
                     }
                     return Err(error);
                 }
-                retire.push(&Retirement {
+                result.retired_extractions.push(&Retirement {
                     raw: raw_hash.clone(),
                     path: candidate.input_path.clone(),
                     hold: held
@@ -1350,7 +1389,7 @@ pub(crate) fn run_index_pipeline(
             .r#gen;
             let manifest_hash =
                 compute_manifest_hash(repo, &raw_hash, &markdown_profile_hash, latest_gen)?;
-            result.normalize_by_path.insert(
+            result.normalizes.push(&(
                 candidate.input_path.clone(),
                 PendingNormalizeRef {
                     expected_raw_hash: raw_hash.clone(),
@@ -1360,7 +1399,7 @@ pub(crate) fn run_index_pipeline(
                         manifest_hash,
                     },
                 },
-            );
+            ))?;
             result.normalized_files += 1;
             // R21-4: an online OCR "enhancement" task after a SUCCESSFUL local markdownize
             // is only meaningful for a real text-layer PDF (docs/07 §8) or, per 07 §5.1, an
@@ -1385,12 +1424,11 @@ pub(crate) fn run_index_pipeline(
                     &now,
                     &mut result,
                     ledger,
-                    &unsupported_store,
-                    &mut unsupported_by_path,
-                    &mut office_conversion_unavailable_paths,
+                    &mut unsupported_observations,
+                    &mut latest_unsupported,
                 )?;
             }
-            retire.push(&Retirement {
+            result.retired_extractions.push(&Retirement {
                 raw: raw_hash.clone(),
                 path: candidate.input_path.clone(),
                 hold: held
@@ -1488,7 +1526,7 @@ pub(crate) fn run_index_pipeline(
                         &now,
                     )?;
                     result.failed_files += 1;
-                    retire.push(&Retirement {
+                    result.retired_extractions.push(&Retirement {
                         raw: raw_hash.clone(),
                         path: candidate.input_path.clone(),
                         hold: held
@@ -1600,7 +1638,7 @@ pub(crate) fn run_index_pipeline(
                         "detail": error.to_string(),
                     }),
                 )?;
-                    retire.push(&Retirement {
+                    result.retired_extractions.push(&Retirement {
                         raw: raw_hash.clone(),
                         path: candidate.input_path.clone(),
                         hold: held
@@ -1637,7 +1675,7 @@ pub(crate) fn run_index_pipeline(
                         &now,
                     )?;
                     result.failed_files += 1;
-                    retire.push(&Retirement {
+                    result.retired_extractions.push(&Retirement {
                         raw: raw_hash.clone(),
                         path: candidate.input_path.clone(),
                         hold: held
@@ -1720,7 +1758,7 @@ pub(crate) fn run_index_pipeline(
                 .collect(),
         );
         task_store.append(&task).map_err(pipeline_to_kio)?;
-        result.normalize_by_path.insert(
+        result.normalizes.push(&(
             candidate.input_path.clone(),
             PendingNormalizeRef {
                 expected_raw_hash: raw_hash.clone(),
@@ -1730,7 +1768,7 @@ pub(crate) fn run_index_pipeline(
                     manifest_hash,
                 },
             },
-        );
+        ))?;
         result.normalized_files += 1;
         // R21-4: only a real text-layer PDF, or (07 §5.1) an Office file whose converter
         // resolved, warrants an online OCR "enhancement" task after a successful local
@@ -1752,12 +1790,11 @@ pub(crate) fn run_index_pipeline(
                 &now,
                 &mut result,
                 ledger,
-                &unsupported_store,
-                &mut unsupported_by_path,
-                &mut office_conversion_unavailable_paths,
+                &mut unsupported_observations,
+                &mut latest_unsupported,
             )?;
         }
-        retire.push(&Retirement {
+        result.retired_extractions.push(&Retirement {
             raw: raw_hash.clone(),
             path: candidate.input_path.clone(),
             hold: held
@@ -1766,12 +1803,9 @@ pub(crate) fn run_index_pipeline(
             normalize: None,
         })?;
     }
-    result.unsupported_raws = unsupported_observations
-        .iter()
-        .map(|row| (row.path.clone(), row.raw_hash.clone()))
-        .collect();
+    let unsupported_observations = unsupported_observations.finish()?;
     unsupported_store
-        .record_observations(unsupported_observations)
+        .record_observations(unsupported_observations.iter())
         .map_err(pipeline_to_kio)?;
     // Stage 3: drain approved loopback OCR even when external networking is
     // offline. Current endpoint approval still gates the selected peer. The task is
@@ -1782,15 +1816,14 @@ pub(crate) fn run_index_pipeline(
             adapter_settings,
             repo,
             &task_store,
-            &mut result.normalize_by_path,
+            &mut |path, pending| result.normalizes.push(&(path, pending)),
             network_allowed,
             true,
         )?;
         result.resource_limit = result.resource_limit.or(outcome.resource_limit);
         result.pending_online_tasks = result.pending_online_tasks.saturating_sub(outcome.executed);
     }
-    result.retired_extractions = Some(retire.finish()?);
-    Ok(result)
+    Ok((result, unsupported_observations))
 }
 
 /// Resume local holds whose original is still the archived and live input.
@@ -2006,23 +2039,16 @@ pub(crate) fn retry_local_extractions(
         .transpose()?;
     let unsupported_store = UnsupportedInputStore::new(repo.kio_dir())
         .with_published_tree(prior.as_ref())
-        .map_err(pipeline_to_kio)?;
+        .with_record_stages(stages);
     repo.control()
         .checkpoint(kio_core::durability::DurabilityPoint::BeforeIndexSnapshot)?;
     let outcome = repo.snapshot_retried_extractions(
         &selected,
-        &|head, tree| {
+        &|head, tree, deferred| {
             unsupported_store
-                .record_observations_from(unsupported.iter().map(|item| {
-                    item.map_err(|error| {
-                        kio_pipeline::PipelineError::corrupt(
-                            unsupported_store.path().display().to_string(),
-                            error.to_string(),
-                        )
-                    })
-                }))
+                .record_observations(unsupported.iter())
                 .map_err(pipeline_to_kio)?;
-            extraction_retirement::record(repo, head, tree, &completed)
+            extraction_retirement::record(repo, head, tree, &completed, deferred)
         },
         &|tree| {
             policy.revalidate().map_err(pipeline_to_kio)?;
@@ -2114,23 +2140,6 @@ fn pause_extraction(
     result.paused_tasks += 1;
     result.pending_files += 1;
     Ok(())
-}
-
-impl IndexPipelineResult {
-    pub(crate) fn record_extraction_retirement(
-        &self,
-        repo: &Repository,
-        head: &str,
-        tree: &kio_core::dag::TreeObject,
-    ) -> Result<()> {
-        let Some(retire) = &self.retired_extractions else {
-            return Ok(());
-        };
-        if retire.is_empty() && self.resource_limit.is_none() {
-            return Ok(());
-        }
-        extraction_retirement::record(repo, head, tree, retire)
-    }
 }
 
 fn normalize_native_image(
@@ -2469,7 +2478,7 @@ fn create_prepared_hash_drift_instance(
             .collect(),
     );
     task_store.append(&task).map_err(pipeline_to_kio)?;
-    result.normalize_by_path.insert(
+    result.normalizes.push(&(
         candidate.input_path.clone(),
         PendingNormalizeRef {
             expected_raw_hash: raw_hash.to_owned(),
@@ -2479,7 +2488,7 @@ fn create_prepared_hash_drift_instance(
                 manifest_hash,
             },
         },
-    );
+    ))?;
     result.normalized_files += 1;
     Ok(())
 }

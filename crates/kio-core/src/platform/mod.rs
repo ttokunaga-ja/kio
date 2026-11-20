@@ -278,6 +278,6 @@ pub fn producer_platform() -> (&'static str, &'static str) {
 }
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
-pub(crate) use unix::durability::sync_directory;
+pub(crate) use unix::durability_tests::sync_directory;
 #[cfg(all(test, target_os = "windows"))]
-pub(crate) use windows::durability::sync_directory;
+pub(crate) use windows::durability_tests::sync_directory;

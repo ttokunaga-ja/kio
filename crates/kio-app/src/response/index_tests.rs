@@ -4,9 +4,9 @@ use super::gc::{
     GcRuntimeDeferredReport, PrepublicationDeferredResponse,
 };
 use super::index::{
-    AdapterExecutionMode, ChildPreviewRow, ChildPublishedRow, IndexPreviewResponse,
-    IndexPublishedResponse, LargeFile, NetworkTransmissionPolicy, PreviewChildDiscovery,
-    PublishedChildDiscovery, SensitiveCandidate,
+    AdapterExecutionMode, ChildPreviewRow, ChildPublishedRow, ExtractionIssue,
+    IndexPreviewResponse, IndexPublishedResponse, LargeFile, NetworkTransmissionPolicy,
+    PreviewChildDiscovery, PublishedChildDiscovery, SensitiveCandidate,
 };
 use super::skipped_units::SkippedDisclosure;
 use kio_core::dag::{CommitObject, CommitStats, CommitType};
@@ -25,6 +25,13 @@ fn assert_projection<T: Serialize>(payload: T, legacy: Value) {
     );
 }
 
+fn records<T: serde::Serialize + serde::de::DeserializeOwned>(
+    rows: impl IntoIterator<Item = T>,
+) -> kio_core::disk_records::DiskRecords<T> {
+    use kio_core::disk_records::{DiskRecords, RecordStageRoot};
+    DiskRecords::from_records(&RecordStageRoot::temporary().unwrap(), rows).unwrap()
+}
+
 fn empty_preview() -> IndexPreviewResponse {
     IndexPreviewResponse {
         status: "preview".to_owned(),
@@ -32,10 +39,10 @@ fn empty_preview() -> IndexPreviewResponse {
         scope: "scope-fixture".to_owned(),
         estimated_file_count: 0,
         estimated_size_bytes: 0,
-        large_files: Vec::new(),
+        large_files: records([]),
         effective_ignore: ".kioignore + built-in secrets Tier A".to_owned(),
-        excluded_candidates: Vec::new(),
-        sensitive_candidates: Vec::new(),
+        excluded_candidates: records([]),
+        sensitive_candidates: records([]),
         network_transmission_policy: NetworkTransmissionPolicy {
             default: "disabled until adapter approve".to_owned(),
             yes_grants_network: false,
@@ -49,8 +56,8 @@ fn empty_preview() -> IndexPreviewResponse {
         estimated_completion:
             "baseline completes in this run; online enhancement depends on budget and opt-in"
                 .to_owned(),
-        candidates: Vec::new(),
-        extraction_issues: Vec::new(),
+        candidates: records([]),
+        extraction_issues: records([]),
         child_scopes: None,
         estimated_aggregate_file_count: None,
         estimated_aggregate_size_bytes: None,
@@ -74,6 +81,29 @@ fn empty_preview_legacy() -> Value {
 #[test]
 fn index_preview_projection_preserves_empty_arrays_null_cost_and_absent_parent_fields() {
     assert_projection(empty_preview(), empty_preview_legacy());
+}
+
+#[test]
+fn index_preview_records_preserve_xlsx_progress_and_retry() {
+    let mut preview = empty_preview();
+    preview.extraction_issues = records([ExtractionIssue {
+        path: PathBuf::from("ranges.xlsx"),
+        error_code: "KIO-E-RESOURCE-LIMIT-001".to_owned(),
+        resource_limit: None,
+        xlsx_progress: Some(kio_pipeline::prepare::XlsxExtractionProgress {
+            completed_sheets: 1,
+            first_unprocessed_sheet: 2,
+            first_unprocessed_row: Some(1027),
+            ..Default::default()
+        }),
+        retry: Some("kio index --resource-tier large".into()),
+    }]);
+
+    let actual = serde_json::to_value(preview).unwrap();
+    let issue = &actual["extraction_issues"][0];
+    assert_eq!(issue["xlsx_progress"]["first_unprocessed_sheet"], 2);
+    assert_eq!(issue["xlsx_progress"]["first_unprocessed_row"], 1027);
+    assert_eq!(issue["retry"], "kio index --resource-tier large");
 }
 
 #[test]
@@ -125,17 +155,17 @@ fn index_preview_projection_preserves_domain_candidates_costs_and_parent_child_s
     legacy["child_scope_discovery"] =
         json!({"page_size": 128_usize, "has_more": true, "preview": true});
     let mut payload = empty_preview();
-    payload.large_files = vec![LargeFile {
+    payload.large_files = records([LargeFile {
         path: candidate.input_path.clone(),
         size_bytes: candidate.size_bytes,
-    }];
-    payload.excluded_candidates = vec![candidate.input_path.clone()];
-    payload.sensitive_candidates = vec![SensitiveCandidate {
+    }]);
+    payload.excluded_candidates = records([candidate.input_path.clone()]);
+    payload.sensitive_candidates = records([SensitiveCandidate {
         path: candidate.input_path.clone(),
         reason: candidate.quarantine_reason.clone().unwrap(),
         ignored: candidate.ignored,
-    }];
-    payload.candidates = vec![candidate];
+    }]);
+    payload.candidates = records([candidate]);
     payload.estimated_cost = Some(cost);
     payload.budget_cap = Some(0.0625);
     payload.child_scopes = Some(vec![
@@ -165,6 +195,7 @@ fn index_preview_projection_preserves_domain_candidates_costs_and_parent_child_s
 
 fn published() -> IndexPublishedResponse {
     IndexPublishedResponse {
+        deferred_inputs: kio_core::disk_records::DiskRecords::empty(),
         status: "noop".to_owned(),
         approval_method: "existing".to_owned(),
         network_allowed: false,
@@ -292,6 +323,7 @@ fn index_published_projection_preserves_child_errors_gc_and_discovery_widths() {
     let mut payload = published();
     payload.child_scopes = Some(vec![
         ChildPublishedRow {
+            deferred_inputs: kio_core::disk_records::DiskRecords::empty(),
             discovery: ChildScopeDiscovery {
                 path: "子".to_owned(),
                 status: "indexed_partial".to_owned(),
@@ -307,6 +339,7 @@ fn index_published_projection_preserves_child_errors_gc_and_discovery_widths() {
             })),
         },
         ChildPublishedRow {
+            deferred_inputs: kio_core::disk_records::DiskRecords::empty(),
             discovery: ChildScopeDiscovery {
                 path: "empty".to_owned(),
                 status: "indexed".to_owned(),
@@ -346,6 +379,7 @@ fn index_child_projection_preserves_current_non_success_fallback_codes() {
     ] {
         assert_projection(
             ChildPublishedRow {
+                deferred_inputs: kio_core::disk_records::DiskRecords::empty(),
                 discovery: ChildScopeDiscovery {
                     path: "子".to_owned(),
                     status: "indexed_partial".to_owned(),

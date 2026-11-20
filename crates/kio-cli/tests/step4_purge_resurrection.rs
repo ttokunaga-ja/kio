@@ -140,7 +140,7 @@ fn ct4_purge_reingest_after_default_tombstone_republishes_and_retires() {
         .auto_snapshot_with_bound_normalize(
             Some("resurrection"),
             None,
-            &BTreeSet::new(),
+            &|_| true,
             &BTreeMap::new(),
             &BTreeSet::new(),
             None,

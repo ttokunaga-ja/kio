@@ -197,7 +197,7 @@ pub fn prepare_units_with_budget(
 }
 
 /// Workbook-order sheet counts and original worksheet row coordinates.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct XlsxExtractionProgress {
     pub total_sheets: Option<usize>,
     pub completed_sheets: usize,

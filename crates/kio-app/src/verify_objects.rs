@@ -349,6 +349,7 @@ fn verify_objects_with_limits(
         ..State::default()
     };
     for residue in store.inspect_raw_stages()? {
+        let residue = residue?;
         state.finding(
             "raw_stage_residue",
             "",
@@ -2736,8 +2737,11 @@ mod tests {
         fs::write(&path, b"unidentified residue").unwrap();
         let store = repo.object_store();
         drop(
-            kio_core::disk_records::RecordWriter::<u64>::new(&store.record_stages().unwrap())
-                .unwrap(),
+            kio_core::disk_records::DiskRecords::from_records(
+                &store.record_stages().unwrap(),
+                0..=kio_core::disk_records::SORT_BUFFER_RECORDS,
+            )
+            .unwrap(),
         );
         let record = repo
             .kio_dir()
