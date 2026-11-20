@@ -47,7 +47,7 @@ Kio:   commit + raw_hash + chunk_hash   → ファイル移動・リネーム・
 }
 ```
 
-`path_at_commit` は **commit 時点の scope フォルダ直下でのファイル名** であり、パス区切り (`/`) を含まない ([03-data-model.md §3](03-data-model.md))。区切り等を含む path は表示専用としても受理せず schema violation として fail-closed にする。フォルダ階層上の位置は `scope_path` が示す。人間向け表示ではこの 2 つを組み合わせて表示する (§7.2)。
+`path_at_commit` は **commit 時点の scope フォルダ直下でのファイル名** であり、[03-data-model.md §3](03-data-model.md) の論理名の規則に従う。空、単独の `.` / `..`、`/` または NUL を含む名前は表示専用でも schema violation として拒否する。`\` や control 文字は論理名として許容し、物理化時は宛先 OS の安全規則を適用する。フォルダ階層上の位置は `scope_path` が示す。人間向け表示ではこの 2 つを組み合わせて表示する (§7.2)。
 
 ## 2.1 必須フィールド
 

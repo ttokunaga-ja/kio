@@ -2042,14 +2042,34 @@ fn commit_roots(repo: &Repository, state: &mut State) -> Result<BTreeSet<String>
         }
         Err(error) => state.finding("ref_corrupt", "", &error.to_string(), &[]),
     }
-    for relative in ["refs/heads", "refs/tags-v1"] {
-        let base = repo.kio_dir().join(relative);
+    match fs::read_dir(repo.kio_dir().join("refs")) {
+        Ok(entries) => {
+            for entry in entries {
+                match entry {
+                    Ok(entry) if entry.file_name() != "tags-v1" => {
+                        state.visit_entry();
+                        state.unsafe_namespace = true;
+                        state.finding("ref_corrupt", "", "unknown ref namespace", &[]);
+                    }
+                    Err(error) => state.finding("ref_io", "", &error.to_string(), &[]),
+                    _ => {}
+                }
+                if state.exceeded_bounds {
+                    return Ok(roots);
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => state.finding("ref_io", "", &error.to_string(), &[]),
+    }
+    {
+        let base = repo.kio_dir().join("refs/tags-v1");
         let metadata = match fs::symlink_metadata(&base) {
             Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(roots),
             Err(error) => {
                 state.finding("ref_io", "", &error.to_string(), &[]);
-                continue;
+                return Ok(roots);
             }
         };
         if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
@@ -2059,7 +2079,7 @@ fn commit_roots(repo: &Repository, state: &mut State) -> Result<BTreeSet<String>
                 "ref root is not a real directory",
                 &[],
             );
-            continue;
+            return Ok(roots);
         }
         let mut stack = vec![base];
         while let Some(directory) = stack.pop() {
@@ -2103,13 +2123,13 @@ fn commit_roots(repo: &Repository, state: &mut State) -> Result<BTreeSet<String>
                     state.finding("ref_non_regular", "", "ref is not a real regular file", &[]);
                     continue;
                 }
-                if relative == "refs/tags-v1" && entry.file_name() == "names.jsonl" {
+                if entry.file_name() == "names.jsonl" {
                     // §C (PB07-09): names.jsonl co-resides in refs/tags-v1/
                     // (03 §2 L80) but is a ledger, not a tag ref — its own
                     // verification lives in `verify_names_jsonl`, not here.
                     continue;
                 }
-                if relative == "refs/tags-v1" {
+                {
                     let leaf = entry.file_name().to_string_lossy().into_owned();
                     let valid = leaf.strip_prefix("tag-").is_some_and(|digest| {
                         digest.len() == 64
@@ -2141,9 +2161,7 @@ fn commit_roots(repo: &Repository, state: &mut State) -> Result<BTreeSet<String>
                     }
                 };
                 if value.is_empty() {
-                    if relative != "refs/heads" || entry.file_name() != "main" {
-                        state.finding("ref_corrupt", "", "ref value is empty", &[]);
-                    }
+                    state.finding("ref_corrupt", "", "ref value is empty", &[]);
                     continue;
                 }
                 if !is_hash(value) {
@@ -3573,6 +3591,24 @@ mod tests {
             classify(&malformed, &trees, &reachable, Some(&resurrected)).is_empty(),
             "mismatched lifecycle binding cannot authorize absence"
         );
+    }
+
+    #[test]
+    fn unknown_ref_directories_are_corruption_and_not_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        for name in ["heads", "unknown"] {
+            let path = repo.kio_dir().join("refs").join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("main"), "").unwrap();
+            let mut state = State::default();
+            assert!(commit_roots(&repo, &mut state).unwrap().is_empty());
+            assert!(
+                state.findings.iter().any(|f| f.kind == "ref_corrupt"),
+                "{name}"
+            );
+            std::fs::remove_dir_all(path).unwrap();
+        }
     }
 
     #[test]

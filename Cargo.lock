@@ -1220,6 +1220,7 @@ name = "kio-search"
 version = "0.1.0-rc.3"
 dependencies = [
  "base64",
+ "kio-core",
  "serde",
  "serde_jcs",
  "serde_json",

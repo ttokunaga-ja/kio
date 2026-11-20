@@ -1026,7 +1026,7 @@ mod tests {
                 kio_dir.clone(),
             )
             .unwrap();
-            for relative in ["refs/heads", "refs/tags-v1", "objects/trees"] {
+            for relative in ["refs/tags-v1", "objects/trees"] {
                 directory
                     .create_directory_all(std::path::Path::new(relative))
                     .unwrap();

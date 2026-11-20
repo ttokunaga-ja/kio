@@ -78,7 +78,6 @@ raw / prepared / image / normalized_unit_object / chunk / embedding / manifest /
     trees/ab/cd/<tree64>
     commits/ab/cd/<commit64>
   refs/
-    heads/main
     tags-v1/tag-<digest64>          # canonical: digest64 = sha256(NFC + simple case folding 後の論理 tag 名の UTF-8 バイト列)
     tags-v1/names.jsonl             # 論理 tag 名の truth (append-only ledger — 下記 tag 規則。
                                     #  leaf が tag- で始まらないため ref 列挙と衝突しない)
@@ -124,9 +123,7 @@ tag の新規物理 leaf は上記の固定 ASCII hash 形式を使う。論理 
 leaf 規則 (Windows 予約名、`<>:"/\\|?*`、control、末尾 dot/space を禁止) を満たす必要があり、
 NFC 正規化 + Unicode **simple case folding (locale 非依存 — full folding・locale 別規則は使わない)** が同じ名前は case-insensitive collision として同一 slot を占める (folding は Unicode 安定性方針により割当済み文字で版間不変 — 版の記録は不要。**実装同梱の UCD 版で未割当の code point を含む tag 名は `KIO-E-CONFIG-USAGE-001` で拒否する** — 未割当→割当の版間遷移は folding を変え得るため、拒否により「割当済みのみ」の安定性前提を全域で成立させる)。正規化規則を変える場合は `kio_format_version` の非互換変更として扱う。未公開期間に旧規則の names.jsonl から ref を再導出する reader/migration は置かない。不一致は current store の corruption ではなく **incompatible format** として、store bytes を変更せず fail-closed で報告する ([10-operations.md §11.5](10-operations.md))。
 `HEAD` の case variant は論理 tag 名として予約する。tag ref は `refs/tags-v1/tag-<digest64>` の
-1 表現のみであり、第二の tag namespace は存在しない。論理 tag 名と tree entry は current schema の
-portable-name 規則を満たす。対象 OS で物理化できない名前を例外的に読取専用で受理する旧 tree/path
-分岐は持たない。
+1 表現のみであり、第二の tag namespace は存在しない。論理 tag 名には上記の portable-name 規則を適用する。tree entry の論理名と物理化の規則は §3 に従う。
 
 **論理名の truth**: digest は一方向であり、canonical ref (leaf + commit_hash 値) からは論理 tag 名を
 復元できない。tag 作成時に `refs/tags-v1/names.jsonl` (append-only JSONL) へ
@@ -314,7 +311,7 @@ view の存在は使わない。
    `[scope] index_vcs_repos = true` の明示設定がない限り除外し、status に理由を表示する。既存の子にも適用する。
    現行 policy、管理の許可と再照合は [運用契約](10-operations.md#4-フォルダごとの-kio-運用) と
    [変更検知](12-change-detection.md) に従う。
-3. したがって tree entry の `path`、Evidence Pointer の `path_at_commit`、task の `input_path` は **パス区切り (`/`) を含まないファイル名** である。`/` を含む path を持つ tree / pointer は schema violation (`KIO-E-STORE-PATH-001`) として拒否する。同様に `\` ・単独の `.` / `..`・NUL・control 文字を含む path、および **well-formed UTF-8 でない byte 列の path** も拒否する (tag の portable leaf 規則と同水準 — §2。JCS 直列化と UTF-8 バイト列昇順ソート (§8.1・§8) は well-formed UTF-8 を前提とするため、不正 byte 列は可逆に表現できない)。restore 等の物理化は canonical join 後に対象ディレクトリ配下であることを検査する ([06-cli-spec.md §5](06-cli-spec.md))。この検証は read/write を問わず current canonical object に適用する。区切りを含む旧 tree/path や raw-name pointer を読取専用で受理・安全名 mapping・legacy warning に落とす分岐は持たない。
+3. tree entry の `path` と Evidence Pointer の `path_at_commit` は scope 直下の UTF-8 論理名であり、空、単独の `.` / `..`、`/` または NUL を含む名前を schema violation として拒否する（tree は `KIO-E-STORE-PATH-001`）。それ以外の名前は `\` や control 文字を含んでも履歴に保存できる。物理化時は宛先 OS で安全な直接の子として作れない名前を `KIO-E-STORE-PATH-001` で拒否する。作業ツリーの入力 `input_path` は別の検証を行い、全 OS で `\` も拒否する。well-formed UTF-8 でない byte 列は JSON の名前として表現できない。restore 等は対象ディレクトリ配下であることも検査する ([06-cli-spec.md §5](06-cli-spec.md))。
 
 ファイルの位置は `scope_path` (正本 `.kio` の絶対パス) + ファイル名で一意に表現される。「フォルダ木を横断してファイルを探す」体験は、個々の `.kio` の再帰包含ではなく、scope_registry が列挙し aggregator が採点する横断検索 ([05-runtime.md §1.8](05-runtime.md)) が担う。
 
