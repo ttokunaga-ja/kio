@@ -486,8 +486,10 @@ task journal の normalized output はこの physical path ではなく `normali
 
 ## 5.1 EG2 のモデル・runtime 配置と取得
 
-runtime library は Kio release 所有の `lib/litert-lm/0.18.0/<target>/` に同梱し、配布 manifest の
- target ごとの SHA-256 と照合する。macOS arm64 / Windows x64 / Linux x64 の各配布物は library、
+runtime library は LiteRT-LM v0.19.1 の C API 1.0.0 の共有 library（`liblitert-lm.so`・`liblitert-lm.dylib`・`litert-lm.dll`）を使い、
+Kio release 所有の `lib/litert-lm/0.19.1/<target>/` に同梱し、配布 manifest の target ごとの SHA-256 と照合する。
+取得元は公式 release の `litert_lm_c_api-1.0.0.zip`（SHA-256 `1d430d80eaf536f696a4922270ba55eb3d112189ac198c3066d487a45e3b4d4c`）で、
+repo には binary を置かず、build のときに取得して照合する（D-20261120-01、D-20261120-02）。macOS arm64 / Windows x64 / Linux x64 の各配布物は library、
 必要 export、依存関係と license/third-party NOTICE を固定し、検証済みとして配布する。
 未検証の path/hash を推測せず、`.kio`、repo、current directory、PATH から native library を探索しない。
 利用者による Python 導入、runtime download、自動 update は要求しない。

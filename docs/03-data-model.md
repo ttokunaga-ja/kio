@@ -828,7 +828,7 @@ metadata は次の key をすべて持ち、未知 key を拒否する。null �
     "execution_mode": "native_library",
     "os": "linux",
     "arch": "x86_64",
-    "runtime_version": "0.18.0",
+    "runtime_version": "0.19.1",
     "runtime_library_sha256": "sha256:<64 lowercase hex>",
     "profile_hash": "sha256:<64 lowercase hex>",
     "cpu_backend": "<backend identifier>",
