@@ -1,8 +1,10 @@
 use crate::object_persistence::{bound_extraction_store, normalized_output_ref, pipeline_to_kio};
 use kio_core::cas::is_hash;
 use kio_core::dag::{NormalizeRef, TreeObject};
-use kio_core::disk_records::{DiskRecords, RecordSorter, RecordWriter, decode_bounded_json};
-use kio_core::scope::Repository;
+use kio_core::disk_records::{
+    DiskRecords, RecordSorter, RecordWriter, SortedRecordCursor, decode_bounded_json,
+};
+use kio_core::scope::{DeferredInput, Repository};
 use kio_core::store_dir::Publication;
 use kio_core::{KioError, Result};
 use kio_pipeline::task::{EXTRACTION_HOLD_OUTPUT_REF, TaskStatus, TaskStore};
@@ -29,17 +31,25 @@ struct Journal {
     retire: DiskRecords<Retirement>,
 }
 
+/// Record only adopted work for a scan. When deferrals are present, both streams
+/// are ordered by path. A prior HEAD entry can have the same raw hash as a
+/// deferred extraction without adopting its newly finished normalization.
 pub(super) fn record(
     repo: &Repository,
     head: &str,
     tree: &TreeObject,
     completed: &DiskRecords<Retirement>,
+    deferred: &DiskRecords<DeferredInput>,
 ) -> Result<()> {
     let stages = repo.object_store().record_stages()?;
     let mut by_path = RecordSorter::new(&stages, |a: &Retirement, b| a.path.cmp(&b.path));
     let mut retire = RecordWriter::new(&stages)?;
+    let mut deferred = SortedRecordCursor::new(deferred.iter(), |row| &row.path);
     for item in completed {
         let item = item?;
+        if deferred.at(&item.path)?.is_some() {
+            continue;
+        }
         if item.hold.is_none() {
             retire.push(&item)?;
         } else {

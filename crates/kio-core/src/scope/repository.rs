@@ -94,10 +94,9 @@ impl Repository {
             return Ok(None);
         }
         let file = directory.open_regular_read(Path::new(PUBLICATION_JOURNAL_LEAF), u64::MAX)?;
-        let value: PublicationJournal = crate::disk_records::decode_bounded_json(
-            &self.store.record_stages()?,
-            std::io::BufReader::with_capacity(64 * 1024, file),
-        )?;
+        let value: PublicationJournal = self
+            .store
+            .decode_record_json(std::io::BufReader::with_capacity(64 * 1024, file))?;
         if value.version != 1
             || !is_hash(&value.new_head)
             || value

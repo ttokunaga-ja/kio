@@ -317,7 +317,8 @@ impl Repository {
         control: crate::control::ControlHandle,
     ) -> Result<Self> {
         let root = path.as_ref().canonicalize().kio_io(path.as_ref())?;
-        let repo = Self::open_retained_for_recovery(root, control)?;
+        let mut repo = Self::open_retained_for_recovery(root, control)?;
+        repo.store.use_scratch_record_reads();
         repo.ensure_no_pending_managed_restore()?;
         repo.head_commit_hash()?;
         repo.ensure_no_pending_publication()?;

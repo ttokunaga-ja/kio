@@ -1,6 +1,7 @@
 //! Private, identity-bound records and a bounded external merge sort.
-//! Runs use the shared stage API. Only a fixed chunk and two merge heads live
-//! in memory; the number of merge slots is bounded by the width of usize.
+//! Small record sequences stay in memory. Larger sequences spill to recoverable
+//! stages or anonymous scratch files. The sorter keeps a fixed chunk, bounded
+//! merge slots and two heads.
 use crate::{
     KioError, Result,
     error::{Resource, ResourceLimit},
@@ -11,15 +12,25 @@ use sha2::{Digest, Sha256};
 use std::{
     cmp::Ordering,
     fs::File,
-    io::{BufRead, BufReader, Read, Seek, SeekFrom},
+    io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     marker::PhantomData,
-    path::Path,
-    sync::Arc,
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering::Relaxed},
+    },
 };
 
 pub const SORT_BUFFER_RECORDS: usize = 256;
 pub const MERGE_SLOTS: usize = usize::BITS as usize;
 const RECORD_BYTES: usize = 64 * 1024;
+const FRAME_TAG_BYTES: usize = 32;
+// One maximum-sized record and its line terminator.
+const MEMORY_RUN_BYTES: usize = RECORD_BYTES + 1;
+// Even callers retaining many small runs (e.g. a history walk) only keep
+// one sort chunk's worth of serialized run data in memory.
+const LIVE_MEMORY_BYTES: usize = SORT_BUFFER_RECORDS * RECORD_BYTES;
+const RECORD_STAGES: &str = "record-stages";
 
 mod stages;
 use stages::RunDirectory;
@@ -40,64 +51,148 @@ impl Drop for StageInspection {
         PRESERVE_STAGES.with(|depth| depth.set(depth.get() - 1));
     }
 }
-/// Retained authority for a store's registry or an isolated scratch workspace.
+/// Storage and memory authority shared by a group of record runs.
 #[derive(Clone, Debug)]
 pub struct RecordStageRoot {
-    directory: StoreDirectory,
-    scratch: Option<Arc<ScratchDirectory>>,
+    location: RecordLocation,
+    memory: Arc<RecordMemoryBudget>,
+}
+
+#[derive(Clone, Debug)]
+enum RecordLocation {
+    Store(StoreDirectory),
+    Temporary(Arc<ScratchDirectory>),
+    Anonymous,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct RecordMemoryBudget(AtomicUsize);
+
+impl RecordMemoryBudget {
+    fn store(self: &Arc<Self>, bytes: Vec<u8>) -> std::result::Result<Arc<MemoryRun>, Vec<u8>> {
+        if self
+            .0
+            .fetch_update(Relaxed, Relaxed, |used| {
+                let total = used + bytes.len();
+                (total <= LIVE_MEMORY_BYTES).then_some(total)
+            })
+            .is_err()
+        {
+            return Err(bytes);
+        }
+        Ok(Arc::new(MemoryRun {
+            bytes: bytes.into_boxed_slice(),
+            budget: self.clone(),
+        }))
+    }
+}
+
+struct MemoryRun {
+    bytes: Box<[u8]>,
+    budget: Arc<RecordMemoryBudget>,
+}
+
+impl Drop for MemoryRun {
+    fn drop(&mut self) {
+        self.budget.0.fetch_sub(self.bytes.len(), Relaxed);
+    }
 }
 
 #[derive(Debug)]
 struct ScratchDirectory {
-    directory: tempfile::TempDir,
+    parent: StoreDirectory,
+    leaf: PathBuf,
+    directory: StoreDirectory,
     preserve: std::sync::atomic::AtomicBool,
 }
 
 impl Drop for ScratchDirectory {
     fn drop(&mut self) {
         if *self.preserve.get_mut() {
-            self.directory.disable_cleanup(true);
+            return;
         }
+        // Traverse only within the retained private directory. Retiring its
+        // name separately prevents cleanup from descending into a replacement.
+        let registry = Path::new(RECORD_STAGES);
+        if matches!(self.directory.contains_entry(registry), Ok(true))
+            && self.directory.remove_directory_all(registry).is_err()
+        {
+            return;
+        }
+        let _ = crate::platform::stage_operations::discard_empty_directory(
+            &self.parent,
+            &self.leaf,
+            &self.directory.root_handle(),
+        );
     }
 }
 
+fn scratch_name() -> Result<PathBuf> {
+    let mut nonce = [0; 32];
+    getrandom::fill(&mut nonce)
+        .map_err(|error| KioError::io(error.to_string(), "record scratch"))?;
+    Ok(PathBuf::from(format!(
+        "kio-records-{}",
+        crate::cas::lower_hex(&nonce)
+    )))
+}
+
+fn scratch_parent() -> Result<StoreDirectory> {
+    let path = std::path::absolute(std::env::temp_dir()).map_err(scratch_io)?;
+    crate::private_fs::retain_external_directory(&path)
+}
+
 impl RecordStageRoot {
-    pub(crate) fn in_store(directory: StoreDirectory) -> Self {
+    pub(crate) fn in_store(directory: StoreDirectory, memory: Arc<RecordMemoryBudget>) -> Self {
         Self {
-            directory,
-            scratch: None,
+            location: RecordLocation::Store(directory),
+            memory,
+        }
+    }
+
+    pub(crate) fn anonymous(memory: Arc<RecordMemoryBudget>) -> Self {
+        Self {
+            location: RecordLocation::Anonymous,
+            memory,
         }
     }
 
     /// Allocate a private workspace for callers without a writable store.
     /// DiskRecords retain it until the last record reader has finished.
     pub fn temporary() -> Result<Self> {
-        let temp = tempfile::Builder::new()
-            .prefix("kio-records-")
-            .tempdir()
-            .map_err(|error| crate::store_dir::ioerr(Path::new("record scratch"), error))?;
-        let directory = StoreDirectory::open(temp.path())?;
-        crate::store_dir::restrict_new_private_directory(&directory.root_handle())?;
-        Ok(Self {
+        let parent = scratch_parent()?;
+        let leaf = scratch_name()?;
+        let file = parent.create_directory(&leaf)?;
+        let directory = StoreDirectory::from_retained(file, parent.path().join(&leaf))?;
+        let scratch = Arc::new(ScratchDirectory {
+            parent,
+            leaf,
             directory,
-            scratch: Some(Arc::new(ScratchDirectory {
-                directory: temp,
-                preserve: false.into(),
-            })),
+            preserve: false.into(),
+        });
+        crate::private_fs::verify_private_directory_handle(&scratch.directory)?;
+        Ok(Self {
+            location: RecordLocation::Temporary(scratch),
+            memory: Arc::default(),
         })
     }
 
     fn registry(&self, create: bool) -> Result<Option<StoreDirectory>> {
-        crate::private_fs::verify_private_directory_handle(&self.directory)?;
-        let parent = if self.scratch.is_none() {
-            let Some(internal) = stages::container(&self.directory, "internal", create)? else {
-                return Ok(None);
-            };
-            internal
-        } else {
-            self.directory.clone()
+        let parent = match &self.location {
+            RecordLocation::Store(directory) => {
+                crate::private_fs::verify_private_directory_handle(directory)?;
+                let Some(internal) = stages::container(directory, "internal", create)? else {
+                    return Ok(None);
+                };
+                internal
+            }
+            RecordLocation::Temporary(scratch) => {
+                crate::private_fs::verify_private_directory_handle(&scratch.directory)?;
+                scratch.directory.clone()
+            }
+            RecordLocation::Anonymous => return Ok(None),
         };
-        stages::container(&parent, "record-stages", create)
+        stages::container(&parent, RECORD_STAGES, create)
     }
 
     pub(crate) fn inspect(&self) -> Result<Vec<crate::cas::RawStageResidue>> {
@@ -113,8 +208,17 @@ impl RecordStageRoot {
             .collect())
     }
 
+    fn recover(&self) -> Result<()> {
+        if PRESERVE_STAGES.with(|depth| depth.get() == 0)
+            && let Some(registry) = self.registry(false)?
+        {
+            stages::inspect(&registry, true)?;
+        }
+        Ok(())
+    }
+
     fn preserve_scratch(&self) {
-        if let Some(scratch) = &self.scratch {
+        if let RecordLocation::Temporary(scratch) = &self.location {
             scratch
                 .preserve
                 .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -125,11 +229,14 @@ impl RecordStageRoot {
 struct RunFile {
     directory: StoreDirectory,
     identity: StageIdentity,
+    frames: FrameAuthenticator,
     _location: RunDirectory,
 }
 fn new_run(root: &RecordStageRoot) -> Result<(Arc<RunFile>, StageWriter)> {
-    let reclaim = PRESERVE_STAGES.with(|depth| depth.get() == 0);
-    let created = RunDirectory::create(root, reclaim);
+    let mut key = [0; 32];
+    getrandom::fill(&mut key)
+        .map_err(|error| KioError::io(error.to_string(), "record stage key"))?;
+    let created = RunDirectory::create(root);
     if created.is_err() {
         root.preserve_scratch();
     }
@@ -137,6 +244,7 @@ fn new_run(root: &RecordStageRoot) -> Result<(Arc<RunFile>, StageWriter)> {
     let run = Arc::new(RunFile {
         directory: location.directory.clone(),
         identity: writer.identity().clone(),
+        frames: FrameAuthenticator::new(&key),
         _location: location,
     });
     Ok((run, writer))
@@ -161,6 +269,10 @@ pub struct PayloadWriter<T> {
 
 impl<T: Serialize> PayloadWriter<T> {
     pub fn new(root: &RecordStageRoot) -> Result<Self> {
+        if let Err(error) = root.recover() {
+            root.preserve_scratch();
+            return Err(error);
+        }
         let (run, writer) = new_run(root)?;
         Ok(Self {
             run,
@@ -265,23 +377,159 @@ impl<T: DeserializeOwned> RecordPayloads<T> {
     }
 }
 
+// HMAC-SHA256 states for a per-run key that never goes to disk.
+struct FrameAuthenticator {
+    inner: Sha256,
+    outer: Sha256,
+}
+
+impl FrameAuthenticator {
+    fn new(key: &[u8; 32]) -> Self {
+        let mut inner_pad = [0x36; 64];
+        let mut outer_pad = [0x5c; 64];
+        for (index, byte) in key.iter().enumerate() {
+            inner_pad[index] ^= byte;
+            outer_pad[index] ^= byte;
+        }
+        Self {
+            inner: Sha256::new().chain_update(inner_pad),
+            outer: Sha256::new().chain_update(outer_pad),
+        }
+    }
+
+    fn tag(&self, ordinal: usize, frame: &[u8]) -> [u8; FRAME_TAG_BYTES] {
+        // Binding the ordinal prevents replay at a different position.
+        let inner = self
+            .inner
+            .clone()
+            .chain_update(ordinal.to_le_bytes())
+            .chain_update(frame)
+            .finalize();
+        self.outer.clone().chain_update(inner).finalize().into()
+    }
+
+    fn verify(&self, ordinal: usize, frame: &[u8], tag: [u8; FRAME_TAG_BYTES]) -> Result<()> {
+        let difference = self
+            .tag(ordinal, frame)
+            .into_iter()
+            .zip(tag)
+            .fold(0, |difference, (expected, actual)| {
+                difference | (expected ^ actual)
+            });
+        if difference != 0 {
+            return Err(changed_records());
+        }
+        Ok(())
+    }
+}
+
 fn changed_records() -> KioError {
     KioError::schema("private record stage changed after sealing")
 }
-pub struct DiskRecords<T> {
+struct DiskRun {
     run: Arc<RunFile>,
-    count: usize,
     size: u64,
     digest: [u8; 32],
+}
+impl DiskRun {
+    fn open(&self) -> Result<BufReader<File>> {
+        self.run._location.identity.verify(&self.run.directory)?;
+        let mut file = self
+            .run
+            .directory
+            .open_regular_read(Path::new("records"), u64::MAX)?;
+        self.run.identity.verify(&file)?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| crate::store_dir::ioerr(Path::new("records"), error))?;
+        let before = crate::platform::cas_io::observe_regular_file_stability(
+            &metadata,
+            Path::new("records"),
+        )?;
+        if metadata.len() != self.size {
+            return Err(changed_records());
+        }
+        let mut hasher = Sha256::new();
+        let mut buffer = [0; RECORD_BYTES];
+        let mut size = 0u64;
+        loop {
+            let count = file
+                .read(&mut buffer)
+                .map_err(|error| crate::store_dir::ioerr(Path::new("records"), error))?;
+            if count == 0 {
+                break;
+            }
+            size = size.checked_add(count as u64).ok_or_else(changed_records)?;
+            if size > self.size {
+                return Err(changed_records());
+            }
+            hasher.update(&buffer[..count]);
+        }
+        let digest: [u8; 32] = hasher.finalize().into();
+        let after = file
+            .metadata()
+            .map_err(|error| crate::store_dir::ioerr(Path::new("records"), error))?;
+        if size != self.size
+            || digest != self.digest
+            || crate::platform::cas_io::observe_regular_file_stability(
+                &after,
+                Path::new("records"),
+            )? != before
+        {
+            return Err(changed_records());
+        }
+        self.run.identity.verify(&file)?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| crate::store_dir::ioerr(Path::new("records"), error))?;
+        Ok(BufReader::with_capacity(RECORD_BYTES, file))
+    }
+    fn reader(&self) -> Result<RecordReader> {
+        Ok(RecordReader::Disk {
+            reader: self.open()?,
+            run: self.run.clone(),
+            ordinal: 0,
+            buffer: Vec::new(),
+        })
+    }
+}
+
+// Each iterator owns its cursor. Seek and read under the same lock so cloned
+// records and interleaved iterators can share the anonymous scratch handle.
+struct ScratchReader {
+    file: Arc<Mutex<File>>,
+    offset: u64,
+}
+impl Read for ScratchReader {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| std::io::Error::other("record scratch lock poisoned"))?;
+        file.seek(SeekFrom::Start(self.offset))?;
+        let count = file.read(bytes)?;
+        self.offset += count as u64;
+        Ok(count)
+    }
+}
+
+#[derive(Clone)]
+enum RecordStorage {
+    Memory(Arc<MemoryRun>),
+    Disk(Arc<DiskRun>),
+    Scratch(Arc<Mutex<File>>),
+}
+
+/// Repeatable, bounded storage for a sequence of private records.
+pub struct DiskRecords<T> {
+    storage: RecordStorage,
+    count: usize,
     _value: PhantomData<T>,
 }
 impl<T> Clone for DiskRecords<T> {
     fn clone(&self) -> Self {
         Self {
-            run: self.run.clone(),
+            storage: self.storage.clone(),
             count: self.count,
-            size: self.size,
-            digest: self.digest,
             _value: PhantomData,
         }
     }
@@ -294,6 +542,17 @@ impl<T> std::fmt::Debug for DiskRecords<T> {
     }
 }
 impl<T> DiskRecords<T> {
+    pub fn empty() -> Self {
+        Self {
+            storage: RecordStorage::Memory(Arc::new(MemoryRun {
+                bytes: Box::default(),
+                budget: Arc::default(),
+            })),
+            count: 0,
+            _value: PhantomData,
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.count
     }
@@ -301,75 +560,21 @@ impl<T> DiskRecords<T> {
         self.count == 0
     }
     pub fn iter(&self) -> RecordIter<T> {
-        let opened = (|| {
-            self.run._location.identity.verify(&self.run.directory)?;
-            let mut file = self
-                .run
-                .directory
-                .open_regular_read(Path::new("records"), u64::MAX)?;
-            self.run.identity.verify(&file)?;
-            let metadata = file
-                .metadata()
-                .map_err(|error| crate::store_dir::ioerr(Path::new("records"), error))?;
-            let before = crate::platform::cas_io::observe_regular_file_stability(
-                &metadata,
-                Path::new("records"),
-            )?;
-            if metadata.len() != self.size {
-                return Err(changed_records());
-            }
-            let mut hasher = Sha256::new();
-            let mut buffer = [0; RECORD_BYTES];
-            let mut size = 0u64;
-            loop {
-                let count = file
-                    .read(&mut buffer)
-                    .map_err(|error| crate::store_dir::ioerr(Path::new("records"), error))?;
-                if count == 0 {
-                    break;
-                }
-                size = size.checked_add(count as u64).ok_or_else(changed_records)?;
-                if size > self.size {
-                    return Err(changed_records());
-                }
-                hasher.update(&buffer[..count]);
-            }
-            let digest: [u8; 32] = hasher.finalize().into();
-            let after = file
-                .metadata()
-                .map_err(|error| crate::store_dir::ioerr(Path::new("records"), error))?;
-            if size != self.size
-                || digest != self.digest
-                || crate::platform::cas_io::observe_regular_file_stability(
-                    &after,
-                    Path::new("records"),
-                )? != before
-            {
-                return Err(changed_records());
-            }
-            self.run.identity.verify(&file)?;
-            file.seek(SeekFrom::Start(0))
-                .map_err(|error| crate::store_dir::ioerr(Path::new("records"), error))?;
-            Ok(file)
-        })();
-        match opened {
-            Ok(file) => RecordIter {
-                _run: self.run.clone(),
-                reader: Some(BufReader::with_capacity(64 * 1024, file)),
-                remaining: self.count,
-                error: None,
+        let reader = match &self.storage {
+            RecordStorage::Memory(bytes) => Ok(RecordReader::memory(bytes)),
+            RecordStorage::Disk(run) => run.reader(),
+            RecordStorage::Scratch(file) => Ok(RecordReader::Scratch {
+                reader: BufReader::with_capacity(
+                    RECORD_BYTES,
+                    ScratchReader {
+                        file: file.clone(),
+                        offset: 0,
+                    },
+                ),
                 buffer: Vec::new(),
-                _value: PhantomData,
-            },
-            Err(error) => RecordIter {
-                _run: self.run.clone(),
-                reader: None,
-                remaining: self.count,
-                error: Some(error),
-                buffer: Vec::new(),
-                _value: PhantomData,
-            },
-        }
+            }),
+        };
+        RecordIter::new(reader, self.count)
     }
 }
 impl<T: Serialize + DeserializeOwned> DiskRecords<T> {
@@ -429,39 +634,169 @@ impl<T: DeserializeOwned> IntoIterator for DiskRecords<T> {
     }
 }
 
-pub struct RecordWriter<T> {
+enum WriterStorage {
+    Memory(Vec<u8>),
+    Disk(Box<DiskWriter>),
+    Scratch(BufWriter<File>),
+}
+
+impl RecordStageRoot {
+    fn spill(&self, bytes: &[u8]) -> Result<WriterStorage> {
+        match self.location {
+            RecordLocation::Store(_) | RecordLocation::Temporary(_) => {
+                let mut writer = DiskWriter::create(self)?;
+                writer.write_lines(bytes)?;
+                Ok(WriterStorage::Disk(Box::new(writer)))
+            }
+            RecordLocation::Anonymous => {
+                let file = scratch_file()?;
+                let mut writer = BufWriter::with_capacity(RECORD_BYTES, file);
+                writer.write_all(bytes).map_err(scratch_io)?;
+                Ok(WriterStorage::Scratch(writer))
+            }
+        }
+    }
+}
+
+fn scratch_io(error: std::io::Error) -> KioError {
+    crate::store_dir::ioerr(Path::new("record scratch"), error)
+}
+
+#[cfg(unix)]
+fn scratch_file() -> Result<File> {
+    tempfile::tempfile().map_err(scratch_io)
+}
+
+#[cfg(windows)]
+fn scratch_file() -> Result<File> {
+    use crate::platform::private_fs::{NewPrivateObjectKind, create_new_private_at};
+    create_new_private_at(
+        &scratch_parent()?.root_handle(),
+        scratch_name()?.as_os_str(),
+        NewPrivateObjectKind::ScratchFile,
+    )
+    .map_err(scratch_io)
+}
+
+impl WriterStorage {
+    fn append(&mut self, bytes: &[u8]) -> Result<()> {
+        match self {
+            Self::Disk(writer) => writer.write_lines(bytes),
+            Self::Scratch(writer) => writer.write_all(bytes).map_err(scratch_io),
+            Self::Memory(buffer) => {
+                buffer.extend_from_slice(bytes);
+                Ok(())
+            }
+        }
+    }
+
+    fn finish(self) -> Result<RecordStorage> {
+        match self {
+            Self::Disk(writer) => writer.finish(),
+            Self::Scratch(writer) => {
+                let file = writer
+                    .into_inner()
+                    .map_err(|error| scratch_io(error.into_error()))?;
+                Ok(RecordStorage::Scratch(Arc::new(Mutex::new(file))))
+            }
+            Self::Memory(_) => unreachable!("in-memory records must be accounted before sealing"),
+        }
+    }
+}
+
+struct DiskWriter {
+    writer: StageWriter,
     run: Arc<RunFile>,
-    writer: Option<StageWriter>,
-    count: usize,
     size: u64,
     hasher: Sha256,
+    ordinal: usize,
+    frame: Vec<u8>,
+}
+impl DiskWriter {
+    fn create(root: &RecordStageRoot) -> Result<Self> {
+        let (run, writer) = new_run(root)?;
+        Ok(Self {
+            writer,
+            run,
+            size: 0,
+            hasher: Sha256::new(),
+            ordinal: 0,
+            frame: Vec::new(),
+        })
+    }
+
+    fn write_lines(&mut self, bytes: &[u8]) -> Result<()> {
+        for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+            self.frame.clear();
+            self.frame
+                .extend_from_slice(&self.run.frames.tag(self.ordinal, line));
+            self.frame.extend_from_slice(line);
+            let size = self
+                .size
+                .checked_add(self.frame.len() as u64)
+                .ok_or_else(|| record_limit(usize::MAX))?;
+            self.writer.write_chunk(&self.frame)?;
+            self.hasher.update(&self.frame);
+            self.size = size;
+            self.ordinal += 1;
+        }
+        Ok(())
+    }
+
+    fn sealed_run(&self) -> DiskRun {
+        DiskRun {
+            run: self.run.clone(),
+            size: self.size,
+            digest: self.hasher.clone().finalize().into(),
+        }
+    }
+
+    fn finish(self) -> Result<RecordStorage> {
+        self.writer.sync()?;
+        Ok(RecordStorage::Disk(Arc::new(self.sealed_run())))
+    }
+}
+
+pub struct RecordWriter<T> {
+    root: RecordStageRoot,
+    storage: WriterStorage,
+    count: usize,
     _value: PhantomData<T>,
 }
 impl<T: Serialize> RecordWriter<T> {
     pub fn new(root: &RecordStageRoot) -> Result<Self> {
-        let (run, writer) = new_run(root)?;
+        if let Err(error) = root.recover() {
+            root.preserve_scratch();
+            return Err(error);
+        }
         Ok(Self {
-            run,
-            writer: Some(writer),
+            root: root.clone(),
+            storage: WriterStorage::Memory(Vec::new()),
             count: 0,
-            size: 0,
-            hasher: Sha256::new(),
             _value: PhantomData,
         })
     }
+
     pub fn len(&self) -> usize {
         self.count
     }
     pub fn is_empty(&self) -> bool {
         self.count == 0
     }
-    pub fn snapshot(&self) -> DiskRecords<T> {
-        DiskRecords {
-            run: self.run.clone(),
-            count: self.count,
-            size: self.size,
-            digest: self.hasher.clone().finalize().into(),
-            _value: PhantomData,
+    pub(crate) fn iter(&self) -> Box<dyn Iterator<Item = Result<T>> + '_>
+    where
+        T: DeserializeOwned,
+    {
+        match &self.storage {
+            WriterStorage::Memory(bytes) => {
+                Box::new(bytes.split_inclusive(|b| *b == b'\n').map(decode_record))
+            }
+            WriterStorage::Disk(writer) => {
+                Box::new(RecordIter::new(writer.sealed_run().reader(), self.count))
+            }
+            WriterStorage::Scratch(_) => {
+                unreachable!("anonymous record runs are read after sealing")
+            }
         }
     }
     pub fn push(&mut self, value: &T) -> Result<()> {
@@ -494,33 +829,38 @@ impl<T: Serialize> RecordWriter<T> {
         encoded.map_err(|e| KioError::schema(e.to_string()))?;
         let mut bytes = buffer.bytes;
         bytes.push(b'\n');
-        self.writer
-            .as_mut()
-            .expect("record writer")
-            .write_chunk(&bytes)?;
-        self.hasher.update(&bytes);
-        self.size = self
-            .size
-            .checked_add(bytes.len() as u64)
-            .ok_or_else(|| record_limit(usize::MAX))?;
-        self.count = self
+        let count = self
             .count
             .checked_add(1)
             .ok_or_else(|| record_limit(usize::MAX))?;
+        if let WriterStorage::Memory(buffer) = &self.storage
+            && (count > SORT_BUFFER_RECORDS || buffer.len() + bytes.len() > MEMORY_RUN_BYTES)
+        {
+            let mut storage = self.root.spill(buffer)?;
+            storage.append(&bytes)?;
+            self.storage = storage;
+        } else {
+            self.storage.append(&bytes)?;
+        }
+        self.count = count;
         Ok(())
     }
-    pub fn finish(mut self) -> Result<DiskRecords<T>> {
-        self.writer.as_ref().expect("record writer").sync()?;
-        drop(self.writer.take());
+    pub fn finish(self) -> Result<DiskRecords<T>> {
+        let storage = match self.storage {
+            WriterStorage::Memory(bytes) => match self.root.memory.store(bytes) {
+                Ok(run) => RecordStorage::Memory(run),
+                Err(bytes) => self.root.spill(&bytes)?.finish()?,
+            },
+            spilled => spilled.finish()?,
+        };
         Ok(DiskRecords {
-            run: self.run,
+            storage,
             count: self.count,
-            size: self.size,
-            digest: self.hasher.finalize().into(),
             _value: PhantomData,
         })
     }
 }
+
 fn record_limit(observed: usize) -> KioError {
     ResourceLimit {
         resource: Resource::Memory,
@@ -531,13 +871,107 @@ fn record_limit(observed: usize) -> KioError {
     }
     .into_error("tree metadata record exceeds the streaming buffer")
 }
+enum RecordReader {
+    Memory {
+        run: Arc<MemoryRun>,
+        position: usize,
+    },
+    Disk {
+        reader: BufReader<File>,
+        run: Arc<RunFile>,
+        ordinal: usize,
+        buffer: Vec<u8>,
+    },
+    Scratch {
+        reader: BufReader<ScratchReader>,
+        buffer: Vec<u8>,
+    },
+}
+impl RecordReader {
+    fn memory(run: &Arc<MemoryRun>) -> Self {
+        Self::Memory {
+            run: run.clone(),
+            position: 0,
+        }
+    }
+
+    fn next_line(&mut self) -> Result<&[u8]> {
+        fn truncated() -> KioError {
+            KioError::schema("truncated private record stage")
+        }
+
+        match self {
+            Self::Memory { run, position } => {
+                let tail = &run.bytes[*position..];
+                let end = tail
+                    .iter()
+                    .position(|b| *b == b'\n')
+                    .ok_or_else(truncated)?;
+                *position += end + 1;
+                Ok(&tail[..end])
+            }
+            Self::Disk {
+                reader,
+                run,
+                ordinal,
+                buffer,
+            } => {
+                let mut tag = [0; FRAME_TAG_BYTES];
+                reader
+                    .read_exact(&mut tag)
+                    .map_err(|error| crate::store_dir::ioerr(Path::new("records"), error))?;
+                let line = read_record_line(reader, buffer)?;
+                run.frames.verify(*ordinal, line, tag)?;
+                *ordinal += 1;
+                Ok(line)
+            }
+            Self::Scratch { reader, buffer } => read_record_line(reader, buffer),
+        }
+    }
+}
+
+fn read_record_line<'a>(reader: &mut impl BufRead, buffer: &'a mut Vec<u8>) -> Result<&'a [u8]> {
+    buffer.clear();
+    // A malformed run cannot grow a reader's line buffer beyond one record.
+    loop {
+        let bytes = reader
+            .fill_buf()
+            .map_err(|error| crate::store_dir::ioerr(Path::new("records"), error))?;
+        if bytes.is_empty() {
+            return Err(KioError::schema("truncated private record stage"));
+        }
+        let end = bytes.iter().position(|byte| *byte == b'\n');
+        let count = end.map_or(bytes.len(), |index| index + 1);
+        if buffer.len().saturating_add(count) > RECORD_BYTES + 1 {
+            return Err(record_limit(buffer.len().saturating_add(count)));
+        }
+        buffer.extend_from_slice(&bytes[..count]);
+        reader.consume(count);
+        if end.is_some() {
+            return Ok(buffer);
+        }
+    }
+}
+
 pub struct RecordIter<T> {
-    _run: Arc<RunFile>,
-    reader: Option<BufReader<File>>,
+    reader: Option<RecordReader>,
     remaining: usize,
     error: Option<KioError>,
-    buffer: Vec<u8>,
     _value: PhantomData<T>,
+}
+impl<T> RecordIter<T> {
+    fn new(opened: Result<RecordReader>, remaining: usize) -> Self {
+        let (reader, error) = match opened {
+            Ok(reader) => (Some(reader), None),
+            Err(error) => (None, Some(error)),
+        };
+        Self {
+            reader,
+            remaining,
+            error,
+            _value: PhantomData,
+        }
+    }
 }
 impl<T: DeserializeOwned> Iterator for RecordIter<T> {
     type Item = Result<T>;
@@ -550,35 +984,76 @@ impl<T: DeserializeOwned> Iterator for RecordIter<T> {
             return None;
         }
         self.remaining -= 1;
-        self.buffer.clear();
-        let result = (|| {
-            let reader = self.reader.as_mut().expect("opened record reader");
-            // Do not let a damaged private run grow a read_line allocation.
-            loop {
-                let bytes = reader
-                    .fill_buf()
-                    .map_err(|e| crate::store_dir::ioerr(Path::new("records"), e))?;
-                if bytes.is_empty() {
-                    return Err(KioError::schema("truncated private record stage"));
-                }
-                let end = bytes.iter().position(|b| *b == b'\n');
-                let n = end.map_or(bytes.len(), |i| i + 1);
-                if self.buffer.len().saturating_add(n) > RECORD_BYTES + 1 {
-                    return Err(record_limit(self.buffer.len().saturating_add(n)));
-                }
-                self.buffer.extend_from_slice(&bytes[..n]);
-                reader.consume(n);
-                if end.is_some() {
-                    break;
-                }
-            }
-            serde_json::from_slice(&self.buffer).map_err(|e| KioError::schema(e.to_string()))
-        })();
+        let result = self
+            .reader
+            .as_mut()
+            .expect("opened record reader")
+            .next_line()
+            .and_then(decode_record);
         if result.is_err() {
             self.remaining = 0;
         }
         Some(result)
     }
+}
+
+/// Merge two ordered streams while keeping at most one record from each.
+pub fn merge_sorted_records<T>(
+    left: impl Iterator<Item = Result<T>>,
+    right: impl Iterator<Item = Result<T>>,
+    compare: impl Fn(&T, &T) -> Ordering,
+) -> impl Iterator<Item = Result<T>> {
+    let mut left = left.peekable();
+    let mut right = right.peekable();
+    std::iter::from_fn(move || match (left.peek(), right.peek()) {
+        (Some(Err(_)), _) | (Some(Ok(_)), None) => left.next(),
+        (_, Some(Err(_))) | (None, Some(Ok(_))) => right.next(),
+        (Some(Ok(a)), Some(Ok(b))) if compare(a, b) != Ordering::Greater => left.next(),
+        (Some(Ok(_)), Some(Ok(_))) => right.next(),
+        (None, None) => None,
+    })
+}
+
+/// Look up increasing keys in a path-sorted stream while retaining one record.
+pub struct SortedRecordCursor<T, I, F> {
+    records: I,
+    current: Option<T>,
+    key: F,
+}
+
+impl<T, I, F> SortedRecordCursor<T, I, F>
+where
+    I: Iterator<Item = Result<T>>,
+    F: Fn(&T) -> &str,
+{
+    pub fn new(records: I, key: F) -> Self {
+        Self {
+            records,
+            current: None,
+            key,
+        }
+    }
+
+    pub fn at(&mut self, path: &str) -> Result<Option<&T>> {
+        while self
+            .current
+            .as_ref()
+            .is_none_or(|item| (self.key)(item) < path)
+        {
+            self.current = self.records.next().transpose()?;
+            if self.current.is_none() {
+                break;
+            }
+        }
+        Ok(self
+            .current
+            .as_ref()
+            .filter(|item| (self.key)(item) == path))
+    }
+}
+
+fn decode_record<T: DeserializeOwned>(line: &[u8]) -> Result<T> {
+    serde_json::from_slice(line).map_err(|e| KioError::schema(e.to_string()))
 }
 impl<T: Serialize + DeserializeOwned> Serialize for DiskRecords<T> {
     fn serialize<S: serde::Serializer>(
@@ -637,6 +1112,7 @@ impl<T: DeserializeOwned + PartialEq> PartialEq for DiskRecords<T> {
 }
 impl<T: DeserializeOwned + Eq> Eq for DiskRecords<T> {}
 
+/// Stable external sort with one fixed-size run buffer and two merge heads.
 pub struct RecordSorter<T> {
     root: RecordStageRoot,
     chunk: Vec<T>,
@@ -690,7 +1166,7 @@ impl<T: Serialize + DeserializeOwned> RecordSorter<T> {
         if self.chunk.is_empty() {
             return Ok(());
         }
-        self.chunk.sort_unstable_by(self.compare);
+        self.chunk.sort_by(self.compare);
         let mut out = RecordWriter::new(&self.root)?;
         for item in self.chunk.drain(..) {
             out.push(&item)?;
@@ -715,7 +1191,7 @@ impl<T: Serialize + DeserializeOwned> RecordSorter<T> {
         for level in 0..MERGE_SLOTS {
             if let Some(run) = self.runs[level].take() {
                 result = Some(match result {
-                    Some(previous) => self.merge(previous, run)?,
+                    Some(recent) => self.merge(run, recent)?,
                     None => run,
                 });
             }
@@ -836,25 +1312,171 @@ pub fn decode_bounded_json<T: DeserializeOwned>(
 
 #[cfg(test)]
 fn test_store_root(fixture: &tempfile::TempDir) -> RecordStageRoot {
-    let directory = StoreDirectory::open(fixture.path()).unwrap();
-    crate::store_dir::restrict_new_private_directory(&directory.root_handle()).unwrap();
-    RecordStageRoot::in_store(directory)
+    let parent = crate::private_fs::retain_external_directory(fixture.path()).unwrap();
+    let directory = StoreDirectory::from_retained(
+        parent.create_directory(Path::new("store")).unwrap(),
+        parent.path().join("store"),
+    )
+    .unwrap();
+    RecordStageRoot::in_store(directory, Arc::default())
+}
+
+#[cfg(test)]
+fn test_store_directory(root: &RecordStageRoot) -> &StoreDirectory {
+    let RecordLocation::Store(directory) = &root.location else {
+        panic!("expected a store directory");
+    };
+    directory
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn temporary_record_root_is_private_and_removed_after_last_reader() {
+        let root = RecordStageRoot::temporary().unwrap();
+        let RecordLocation::Temporary(scratch) = &root.location else {
+            panic!("expected a retained temporary directory");
+        };
+        crate::private_fs::verify_private_directory_handle(&scratch.directory).unwrap();
+        let path = scratch.directory.path().to_owned();
+        let records = spilled_records(&root);
+        let mut reader = records.iter();
+        drop(root);
+        drop(records);
+        assert!(path.is_dir());
+        assert_eq!(reader.next().unwrap().unwrap(), 11);
+        drop(reader);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn anonymous_record_spill_uses_disposable_scratch() {
+        let root = RecordStageRoot::anonymous(Arc::default());
+        let records = spilled_records(&root);
+        assert!(matches!(&records.storage, RecordStorage::Scratch(_)));
+        #[cfg(windows)]
+        if let RecordStorage::Scratch(file) = &records.storage {
+            crate::platform::verify_owner_private_handle(&file.lock().unwrap()).unwrap();
+        }
+        assert_eq!(records.first().unwrap(), Some(11));
+        assert!(root.inspect().unwrap().is_empty());
+    }
+
+    fn spilled_records(root: &RecordStageRoot) -> DiskRecords<usize> {
+        DiskRecords::from_records(root, 11..=11 + SORT_BUFFER_RECORDS).unwrap()
+    }
+
+    fn disk_run<T>(records: &DiskRecords<T>) -> &RunFile {
+        match &records.storage {
+            RecordStorage::Disk(run) => &run.run,
+            RecordStorage::Memory(_) | RecordStorage::Scratch(_) => {
+                panic!("expected a durable record stage")
+            }
+        }
+    }
+
+    #[test]
+    fn small_records_stay_in_memory_and_larger_inputs_spill() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = test_store_root(&fixture);
+        let stage_dir = test_store_directory(&root)
+            .path()
+            .join("internal/record-stages/stages");
+        let mut writer = RecordWriter::new(&root).unwrap();
+        for value in 0..SORT_BUFFER_RECORDS {
+            writer.push(&value).unwrap();
+        }
+        assert!(!stage_dir.exists(), "a full in-memory chunk needs no stage");
+        writer.push(&SORT_BUFFER_RECORDS).unwrap();
+        let records = writer.finish().unwrap();
+        assert_eq!(
+            records.to_vec().unwrap(),
+            (0..=SORT_BUFFER_RECORDS).collect::<Vec<_>>()
+        );
+        assert_eq!(std::fs::read_dir(&stage_dir).unwrap().count(), 1);
+        drop(records);
+        assert_eq!(std::fs::read_dir(&stage_dir).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn record_byte_limit_spills_even_below_the_count_limit() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = test_store_root(&fixture);
+        let stage_dir = test_store_directory(&root)
+            .path()
+            .join("internal/record-stages/stages");
+        let value = "x".repeat(RECORD_BYTES - 2);
+        let mut writer = RecordWriter::new(&root).unwrap();
+        writer.push(&value).unwrap();
+        assert!(!stage_dir.exists(), "one maximum-sized record fits");
+        writer.push(&String::new()).unwrap();
+        let records = writer.finish().unwrap();
+        assert_eq!(records.to_vec().unwrap(), vec![value, String::new()]);
+        assert_eq!(std::fs::read_dir(&stage_dir).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn small_sort_stays_in_memory_and_multiple_runs_spill() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = test_store_root(&fixture);
+        let stage_dir = test_store_directory(&root)
+            .path()
+            .join("internal/record-stages/stages");
+        for count in [SORT_BUFFER_RECORDS, SORT_BUFFER_RECORDS + 1] {
+            let mut sorter = RecordSorter::new(&root, usize::cmp);
+            for value in (0..count).rev() {
+                sorter.push(value).unwrap();
+            }
+            let records = sorter.finish().unwrap();
+            assert_eq!(records.to_vec().unwrap(), (0..count).collect::<Vec<_>>());
+            if count <= SORT_BUFFER_RECORDS {
+                assert!(!stage_dir.exists(), "one sorted chunk needs no stage");
+            } else {
+                assert_eq!(std::fs::read_dir(&stage_dir).unwrap().count(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn live_small_runs_share_a_budget_until_the_last_reader_drops() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = test_store_root(&fixture);
+        let store = crate::cas::ObjectStore::new(test_store_directory(&root).path());
+        let value = "x".repeat(RECORD_BYTES - 3);
+        let mut readers = Vec::new();
+        for _ in 0..LIVE_MEMORY_BYTES / RECORD_BYTES {
+            let root = store.clone().record_stages().unwrap();
+            let records = DiskRecords::from_records(&root, [value.clone()]).unwrap();
+            assert!(matches!(records.storage, RecordStorage::Memory(_)));
+            readers.push(records.iter());
+        }
+        let root = store.record_stages().unwrap();
+        let spilled = DiskRecords::from_records(&root, [42u64]).unwrap();
+        assert!(disk_run(&spilled).directory.path().exists());
+        assert_eq!(spilled.first().unwrap(), Some(42));
+
+        drop(readers.pop());
+        let records = DiskRecords::from_records(&root, [43u64]).unwrap();
+        assert!(matches!(records.storage, RecordStorage::Memory(_)));
+        assert_eq!(records.first().unwrap(), Some(43));
+    }
+
     #[test]
     fn sealed_records_reject_valid_same_length_edits_and_appends() {
-        let records =
-            DiskRecords::from_records(&RecordStageRoot::temporary().unwrap(), [11u64, 22]).unwrap();
-        let path = records.run.directory.path().join("records");
-        std::fs::write(&path, b"33\n22\n").unwrap();
+        let fixture = tempfile::tempdir().unwrap();
+        let records = spilled_records(&test_store_root(&fixture));
+        let path = disk_run(&records).directory.path().join("records");
+        let original = std::fs::read(&path).unwrap();
+        let mut changed = original.clone();
+        changed[FRAME_TAG_BYTES..FRAME_TAG_BYTES + 2].copy_from_slice(b"33");
+        std::fs::write(&path, changed).unwrap();
         assert!(
             records.first().is_err(),
             "valid JSON cannot replace sealed authority"
         );
-        std::fs::write(&path, b"11\n22\n33\n").unwrap();
+        std::fs::write(&path, [original.as_slice(), b"33\n"].concat()).unwrap();
         assert!(
             records.first().is_err(),
             "trailing records cannot be ignored"
@@ -862,21 +1484,40 @@ mod tests {
     }
 
     #[test]
-    fn snapshots_seal_the_exact_bytes_observed_at_creation() {
-        let mut writer = RecordWriter::new(&RecordStageRoot::temporary().unwrap()).unwrap();
-        writer.push(&11u64).unwrap();
-        let snapshot = writer.snapshot();
-        assert_eq!(snapshot.first().unwrap(), Some(11));
-        writer.push(&22).unwrap();
-        assert!(snapshot.first().is_err());
-        assert_eq!(writer.finish().unwrap().to_vec().unwrap(), vec![11, 22]);
+    fn cursor_rejects_an_edit_after_opening_a_verified_run() {
+        let fixture = tempfile::tempdir().unwrap();
+        let records = spilled_records(&test_store_root(&fixture));
+        let path = disk_run(&records).directory.path().join("records");
+        let mut cursor = SortedRecordCursor::new(records.iter(), |_: &usize| "path");
+        let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.seek(SeekFrom::Start(FRAME_TAG_BYTES as u64)).unwrap();
+        std::io::Write::write_all(&mut file, b"33").unwrap();
+        let error = cursor
+            .at("path")
+            .expect_err("the cursor used bytes changed after open");
+        assert_eq!(error.message(), changed_records().message());
+    }
+
+    #[test]
+    fn writer_iteration_reads_the_current_records_before_and_after_spilling() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = test_store_root(&fixture);
+        let mut writer = RecordWriter::new(&root).unwrap();
+        writer.push(&0).unwrap();
+        assert_eq!(writer.iter().collect::<Result<Vec<_>>>().unwrap(), [0]);
+        for value in 1..=SORT_BUFFER_RECORDS {
+            writer.push(&value).unwrap();
+        }
+        let expected = (0..=SORT_BUFFER_RECORDS).collect::<Vec<_>>();
+        assert_eq!(writer.iter().collect::<Result<Vec<_>>>().unwrap(), expected);
+        assert_eq!(writer.finish().unwrap().to_vec().unwrap(), expected);
     }
 
     #[test]
     fn cleanup_removes_only_verified_stages_and_empty_owned_directories() {
-        let records =
-            DiskRecords::from_records(&RecordStageRoot::temporary().unwrap(), [11u64]).unwrap();
-        let path = records.run.directory.path().to_owned();
+        let fixture = tempfile::tempdir().unwrap();
+        let records = spilled_records(&test_store_root(&fixture));
+        let path = disk_run(&records).directory.path().to_owned();
         drop(records);
         assert!(!path.exists());
     }
@@ -884,15 +1525,12 @@ mod tests {
     #[test]
     fn cleanup_preserves_replaced_record_file() {
         let fixture = tempfile::tempdir().unwrap();
-        let root = test_store_root(&fixture);
-        let mut writer = RecordWriter::new(&root).unwrap();
-        writer.push(&11u64).unwrap();
-        let records = writer.finish().unwrap();
-        let directory = records.run.directory.path().to_owned();
+        let records = spilled_records(&test_store_root(&fixture));
+        let run = disk_run(&records);
+        let directory = run.directory.path().to_owned();
         let path = directory.join("records");
         std::fs::rename(&path, fixture.path().join("original-records")).unwrap();
-        let mut replacement =
-            StageWriter::create(&records.run.directory, Path::new("records")).unwrap();
+        let mut replacement = StageWriter::create(&run.directory, Path::new("records")).unwrap();
         replacement.write_chunk(b"foreign replacement").unwrap();
         replacement.sync().unwrap();
         drop(replacement);
@@ -905,11 +1543,8 @@ mod tests {
     #[test]
     fn cleanup_preserves_replaced_directory_and_its_contents() {
         let fixture = tempfile::tempdir().unwrap();
-        let root = test_store_root(&fixture);
-        let mut writer = RecordWriter::new(&root).unwrap();
-        writer.push(&11u64).unwrap();
-        let records = writer.finish().unwrap();
-        let path = records.run.directory.path().to_owned();
+        let records = spilled_records(&test_store_root(&fixture));
+        let path = disk_run(&records).directory.path().to_owned();
         std::fs::rename(&path, fixture.path().join("original-directory")).unwrap();
         std::fs::create_dir(&path).unwrap();
         let foreign = path.join("foreign");
@@ -939,19 +1574,30 @@ mod tests {
         }
     }
     #[test]
+    fn external_sort_preserves_equal_key_order_across_runs() {
+        let root = RecordStageRoot::temporary().unwrap();
+        let mut sorter = RecordSorter::new(&root, |a: &(usize, usize), b| a.0.cmp(&b.0));
+        let count = SORT_BUFFER_RECORDS * 2 + 1;
+        for position in 0..count {
+            sorter.push((position % 2, position)).unwrap();
+        }
+        let sorted = sorter.finish().unwrap();
+        let expected =
+            (0..2).flat_map(|key| (key..count).step_by(2).map(move |position| (key, position)));
+        assert!(sorted.iter().map(|row| row.unwrap()).eq(expected));
+    }
+
+    #[test]
     fn record_token_buffer_and_read_errors_never_grow_with_record_count() {
         let error = RecordWriter::new(&RecordStageRoot::temporary().unwrap())
             .unwrap()
             .push(&"x".repeat(RECORD_BYTES + 1))
             .unwrap_err();
         assert_eq!(error.resource_limit().unwrap().resource, Resource::Memory);
-        let records = DiskRecords::from_records(
-            &RecordStageRoot::temporary().unwrap(),
-            ["a".to_owned(), "b".to_owned()],
-        )
-        .unwrap();
+        let fixture = tempfile::tempdir().unwrap();
+        let records = spilled_records(&test_store_root(&fixture));
         std::fs::write(
-            records.run.directory.path().join("records"),
+            disk_run(&records).directory.path().join("records"),
             b"not a record\n",
         )
         .unwrap();

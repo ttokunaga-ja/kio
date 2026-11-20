@@ -296,7 +296,20 @@ renderer 版内で prepared_hash が安定し、renderer 更新による出力�
 renderer の検出は配布元名、固定 install prefix、最低 version の文字列だけで可否を決めない。
 実 executable identity と必要 runtime resource を特定・検証し、隔離内の bounded な実変換 probe で
 headless PDF 出力 capability を確認する。名称・version・配布物 digest は provenance と診断に残す。
-macOS の署名検証は有効性と実コードの binding を確認し、特定 vendor の署名だけを許可条件にしない。
+実変換 probe は Office 入力の索引・処理と、明示的な診断コマンド `kio status` で行う。
+`kio search` は renderer の解決や probe を行わず、`index_status.office_conversion_unavailable` に
+現在の公開済み HEAD に対応するファイル別の記録を返す。現在の renderer の利用可否と理由は
+`kio status` で確認する。利用不能時は同コマンドの `office_readiness` に理由を表示する。
+macOS は app bundle の Apple 発行コード署名と seal を全 architecture・nested code について検証し、
+署名された bundle の主実行ファイルを起動する。PATH に shell wrapper がある場合は
+`KIO_OFFICE_CONVERTER` に bundle 内の実行ファイルを指定できる。特定の Team ID や bundle ID の
+指定、追加の notarization ticket 照会は行わない。Windows は `program/soffice.exe` と同じ
+`program/` 内に `soffice.bin`・`fundamental.ini` があり、隣に `share/` がある配置を検証する。
+launcher・renderer 本体・配置内の PE image の Authenticode 署名を実ファイル上で確認する。
+Windows の trust 判定はローカル情報で行い、publisher 名やインストーラの署名は判定に使わない。
+両 OS とも検証した runtime の配置と実体を probe・変換に結び付ける。macOS の bundle 内のリンクは
+bundle の内側に閉じる。Windows の配置内では reparse point と複数の hard link を持つファイルを拒否する。
+Windows の AppContainer のアクセス制御は OS の ACL に従う。
 version 応答の形式差だけを「未導入」と扱わず、検出済みだが利用不能なら具体的な理由を表示する。
 CI の配布物 SHA pin は再現性のため維持し、製品の一般的な版許可リストにはしない。
 
@@ -305,6 +318,15 @@ Linux の distro / TDF / portable の配置は実際に必要な read-only runti
 固定 `/opt/libreoffice<major>.<minor>` と sibling 名だけで決めない。runtime 内の symlink は
 解決した対象を同じ許可済み runtime closure に固定できる場合だけ許可し、任意の host path へ
 読み取り権限を広げない。network / unrelated private files / write の隔離を弱めて probe を通さない。
+Debian・Ubuntu のパッケージと標準の `/opt/libreoffice<major>.<minor>` に配置された TDF の DEB は、
+構成済みの dpkg 台帳で所属と内容を照合する。この配置では `SHA256SUMS` があっても dpkg の照合を必須とする。
+portable では、信頼できる配布物のファイル一覧を展開先直下の `SHA256SUMS` として用意する。
+各行は SHA-256、空白 2 字、展開先からの相対パスとする。symlink は SHA-256 に `link:` を付け、
+リンク先のパス文字列（末尾改行なし）をハッシュする。空ディレクトリは `dir`、空白 2 字、相対パスで指定できる。
+対象は `program`、`share`、`presets` の中で、一覧にないファイルが混在する配置は拒否する。
+相対パスは最大 1,024 バイト・32 要素、暗黙の親を含めて最大 32,768 エントリとする。
+一覧は信頼できる配布物から作成し、現在の展開ツリーを自動的に承認するためには使わない。
+
 renderer scratch は [14 の storage 契約](14-v1-runtime-contracts.md#protection-of-kio-created-objects) に従う。
 
 **Office package preflight (DOCX / PPTX)**: LibreOffice に渡す前に raw ZIP を最大 100 MiB、central-directory を最大 4,096 entry、各 member を最大 32 MiB、全 member の declared aggregate を最大 256 MiB として検証する。必要な `[Content_Types].xml`、`_rels/.rels`、main XML の読取り合計は 6 MiB に制限し、CRC を検証して読む。encrypted / split ZIP、ZIP64、重複・非 UTF-8・unsafe part name、非 Stored/Deflated member は拒否する。XML は UTF-8、nesting 256、attribute 1,024 を上限とし、DTD/entity declaration を受けない。DOCX / PPTX ごとに genuine な MIME override、内部 root relationship、main part と namespace を検証する。preflight failure は renderer を起動せず contract violation とする。
