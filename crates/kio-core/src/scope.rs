@@ -4381,7 +4381,8 @@ mod tests {
         let saved = repo.read_tree(&outcome.tree_hash).unwrap();
         assert_eq!(saved, preview);
         assert_eq!(crate::dag::tree_hash(&saved).unwrap(), outcome.tree_hash);
-        let plan = crate::gc::GcPlanner::bind(dir.path())
+        // The temporary path can pass through macOS's /var symlink.
+        let plan = crate::gc::GcPlanner::bind(repo.canonical_root())
             .unwrap()
             .plan_at(1_800_000_000)
             .unwrap();

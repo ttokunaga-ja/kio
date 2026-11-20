@@ -360,8 +360,8 @@ fn mf4_search_spills_unsupported_observations_without_record_stages() {
     );
 
     // Force the search's disposition projection to sort across spilled runs
-    // without indexing hundreds of originals. The temp directory alias can
-    // hold anonymous files but cannot be opened as a retained stage directory.
+    // without indexing hundreds of originals, using an alias of the external
+    // temporary directory to exercise the scratch path.
     let journal = root.join(".kio/unsupported-inputs.jsonl");
     let mut pair = fs::read(&journal).unwrap();
     let mut stale: serde_json::Value = serde_json::from_slice(&pair).unwrap();
