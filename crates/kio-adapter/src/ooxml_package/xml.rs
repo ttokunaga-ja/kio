@@ -9,15 +9,16 @@ use quick_xml::{events::Event, name::ResolveResult, reader::NsReader};
 use super::{Result, contract};
 
 const CONTENT_TYPES_NS: &[u8] = b"http://schemas.openxmlformats.org/package/2006/content-types";
-const RELATIONSHIPS_NS: &[u8] = b"http://schemas.openxmlformats.org/package/2006/relationships";
-const OFFICE_DOCUMENT_REL: &str =
+pub(crate) const RELATIONSHIPS_NS: &[u8] =
+    b"http://schemas.openxmlformats.org/package/2006/relationships";
+pub(crate) const OFFICE_DOCUMENT_REL: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument";
 const MAX_XML_DEPTH: usize = 256;
 const MAX_XML_ATTRIBUTES: usize = 1_024;
 
 /// The visitor receives only unqualified attributes: namespace declarations
 /// and namespaced lookalikes must never stand in for OPC authority attributes.
-fn walk(
+pub(crate) fn walk(
     xml: &[u8],
     root_local: &[u8],
     root_namespace: &[u8],
@@ -25,12 +26,14 @@ fn walk(
 ) -> Result<()> {
     let mut reader = NsReader::from_reader(xml);
     reader.config_mut().check_comments = true;
-    let mut buffer = Vec::new();
+    reader
+        .resolver_mut()
+        .set_max_declarations_per_element(MAX_XML_ATTRIBUTES);
     let mut depth = 0usize;
     let mut roots = 0usize;
     let mut declaration = false;
     loop {
-        let event = reader.read_event_into(&mut buffer).map_err(xml_error)?;
+        let event = reader.read_event().map_err(xml_error)?;
         let empty = matches!(event, Event::Empty(_));
         match event {
             Event::Start(element) | Event::Empty(element) => {
@@ -68,7 +71,7 @@ fn walk(
                     }
                     let (resolved, local) = reader.resolver().resolve_attribute(attribute.key);
                     let namespace = namespace_bytes(resolved)?;
-                    if !expanded.insert((namespace.to_vec(), local.as_ref().to_vec())) {
+                    if !expanded.insert((namespace, local.into_inner())) {
                         return Err(contract("Office", "XML has duplicate expanded attributes"));
                     }
                     if namespace.is_empty() {
@@ -138,7 +141,6 @@ fn walk(
             }
             Event::Comment(_) | Event::PI(_) => {}
         }
-        buffer.clear();
     }
 }
 
@@ -146,7 +148,7 @@ fn xml_space(byte: u8) -> bool {
     matches!(byte, b' ' | b'\t' | b'\r' | b'\n')
 }
 
-fn namespace_bytes(resolved: ResolveResult<'_>) -> Result<&[u8]> {
+pub(crate) fn namespace_bytes(resolved: ResolveResult<'_>) -> Result<&[u8]> {
     match resolved {
         ResolveResult::Bound(namespace) => Ok(namespace.into_inner()),
         ResolveResult::Unbound => Ok(b""),
@@ -159,10 +161,45 @@ fn xml_error(error: impl std::fmt::Display) -> super::AdapterError {
 }
 
 pub(super) fn validate_content_type(xml: &[u8], main_part: &str, expected: &str) -> Result<()> {
-    let main_name = format!("/{main_part}");
-    let mut overrides = HashSet::new();
-    let mut defaults = HashSet::new();
-    let mut matched = false;
+    let types = content_types(xml, |_| Ok(()))?;
+    if types
+        .overrides
+        .get(&format!("/{main_part}"))
+        .is_none_or(|kind| kind != expected)
+    {
+        return Err(contract(
+            "Office",
+            "main part has no required content type mapping",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) struct ContentTypes {
+    pub overrides: HashMap<String, String>,
+    defaults: HashMap<String, String>,
+}
+
+impl ContentTypes {
+    pub fn for_part(&self, part: &str) -> Option<&str> {
+        self.overrides
+            .get(&format!("/{part}"))
+            .or_else(|| {
+                let (_, ext) = part.rsplit_once('.')?;
+                self.defaults.get(&ext.to_ascii_lowercase())
+            })
+            .map(String::as_str)
+    }
+}
+
+pub(crate) fn content_types(
+    xml: &[u8],
+    mut admit: impl FnMut(usize) -> Result<()>,
+) -> Result<ContentTypes> {
+    let mut types = ContentTypes {
+        overrides: HashMap::new(),
+        defaults: HashMap::new(),
+    };
     walk(
         xml,
         b"Types",
@@ -177,52 +214,68 @@ pub(super) fn validate_content_type(xml: &[u8], main_part: &str, expected: &str)
                     "content types have an unexpected element",
                 ));
             }
-            match local {
-                b"Override" => {
-                    let part = required(attrs, "PartName")?;
-                    let kind = required(attrs, "ContentType")?;
-                    if !overrides.insert(part.to_owned()) {
-                        return Err(contract("Office", "content types repeat a part mapping"));
-                    }
-                    if part == main_name {
-                        if kind != expected {
-                            return Err(contract("Office", "main part has the wrong content type"));
-                        }
-                        matched = true;
-                    }
-                }
-                b"Default" => {
-                    let extension = required(attrs, "Extension")?;
-                    required(attrs, "ContentType")?;
-                    if !defaults.insert(extension.to_ascii_lowercase()) {
-                        return Err(contract(
-                            "Office",
-                            "content types repeat an extension mapping",
-                        ));
-                    }
-                }
+            let kind = required(attrs, "ContentType")?;
+            let (map, key) = match local {
+                b"Override" => (&mut types.overrides, required(attrs, "PartName")?),
+                b"Default" => (&mut types.defaults, required(attrs, "Extension")?),
                 _ => {
                     return Err(contract(
                         "Office",
                         "content types have an unexpected element",
                     ));
                 }
+            };
+            admit(key.len() + kind.len())?;
+            let key = if local == b"Default" {
+                key.to_ascii_lowercase()
+            } else {
+                key.to_owned()
+            };
+            if map.insert(key, kind.to_owned()).is_some() {
+                return Err(contract("Office", "content types repeat a mapping"));
             }
             Ok(())
         },
     )?;
-    if !matched {
+    Ok(types)
+}
+
+pub(super) fn validate_root_relationship(xml: &[u8], main_part: &str) -> Result<()> {
+    if office_document_target(xml, |_| Ok(()))? != main_part {
         return Err(contract(
             "Office",
-            "main part has no required content type mapping",
+            "main relationship points to an unexpected part",
         ));
     }
     Ok(())
 }
 
-pub(super) fn validate_root_relationship(xml: &[u8], main_part: &str) -> Result<()> {
+pub(crate) fn office_document_target(
+    xml: &[u8],
+    admit: impl FnMut(usize) -> Result<()>,
+) -> Result<String> {
+    let mut target = None;
+    relationships(xml, admit, |_, kind, part, mode| {
+        if kind == OFFICE_DOCUMENT_REL {
+            if target.is_some() || mode != "Internal" {
+                return Err(contract(
+                    "Office",
+                    "main relationship is ambiguous or external",
+                ));
+            }
+            target = Some(part.strip_prefix('/').unwrap_or(part).to_owned());
+        }
+        Ok(())
+    })?;
+    target.ok_or_else(|| contract("Office", "main part has no internal root relationship"))
+}
+
+pub(crate) fn relationships(
+    xml: &[u8],
+    mut admit: impl FnMut(usize) -> Result<()>,
+    mut visit: impl FnMut(&str, &str, &str, &str) -> Result<()>,
+) -> Result<()> {
     let mut ids = HashSet::new();
-    let mut matched = false;
     walk(
         xml,
         b"Relationships",
@@ -234,42 +287,23 @@ pub(super) fn validate_root_relationship(xml: &[u8], main_part: &str) -> Result<
             if depth != 1 || ns != RELATIONSHIPS_NS || local != b"Relationship" {
                 return Err(contract(
                     "Office",
-                    "root relationships have an unexpected element",
+                    "relationships have an unexpected element",
                 ));
             }
             let id = required(attrs, "Id")?;
             let kind = required(attrs, "Type")?;
             let target = required(attrs, "Target")?;
+            let mode = attrs.get("TargetMode").map_or("Internal", String::as_str);
+            admit(id.len() + kind.len() + target.len() + mode.len())?;
             if !ids.insert(id.to_owned()) {
-                return Err(contract("Office", "root relationships repeat an identity"));
+                return Err(contract("Office", "relationships repeat an identity"));
             }
-            if kind == OFFICE_DOCUMENT_REL {
-                if matched
-                    || target.strip_prefix('/').unwrap_or(target) != main_part
-                    || attrs
-                        .get("TargetMode")
-                        .is_some_and(|mode| mode != "Internal")
-                {
-                    return Err(contract(
-                        "Office",
-                        "main relationship is ambiguous or external",
-                    ));
-                }
-                matched = true;
-            }
-            Ok(())
+            visit(id, kind, target, mode)
         },
-    )?;
-    if !matched {
-        return Err(contract(
-            "Office",
-            "main part has no internal root relationship",
-        ));
-    }
-    Ok(())
+    )
 }
 
-fn required<'a>(attributes: &'a HashMap<String, String>, key: &str) -> Result<&'a str> {
+pub(crate) fn required<'a>(attributes: &'a HashMap<String, String>, key: &str) -> Result<&'a str> {
     attributes
         .get(key)
         .map(String::as_str)

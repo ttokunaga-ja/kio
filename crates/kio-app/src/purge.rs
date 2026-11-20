@@ -23,10 +23,9 @@ use crate::platform::{
     purge_regular_matches_named, purge_regular_matches_opened, purge_removal_matches,
     validate_purge_directory_native, validate_purge_regular_native,
 };
-use kio_core::cas::{
-    ChunkObject, ContentObjectKind, ObjectKind, ObjectStore, canonical_json_bytes, hash_bytes,
-    is_hash,
-};
+#[cfg(test)]
+use kio_core::cas::hash_bytes;
+use kio_core::cas::{ChunkObject, ContentObjectKind, ObjectKind, ObjectStore, is_hash};
 use kio_core::dag::CommitType;
 use kio_core::dag::TreeEntry;
 use kio_core::history::HistoryReader;
@@ -1478,11 +1477,11 @@ fn scan_derived_inventory(
     let mut identities = BTreeSet::new();
     for leaf in leaves {
         let manifest_path = leaf.join("manifest.json");
-        let bytes = read_bounded_regular(&manifest_path, 8 * 1024 * 1024)?.ok_or_else(|| {
-            store_corrupt(&manifest_path, "normalized instance manifest is missing")
-        })?;
-        let manifest: NormalizedInstanceManifest = serde_json::from_slice(&bytes)
-            .map_err(|error| store_corrupt(&manifest_path, &error.to_string()))?;
+        let file = open_bounded_regular(&manifest_path, MAX_NORMALIZED_MANIFEST_OBJECT_BYTES)?
+            .ok_or_else(|| {
+                store_corrupt(&manifest_path, "normalized instance manifest is missing")
+            })?;
+        let manifest = decode_normalized_manifest(&manifest_path, file)?;
         validate_instance_leaf(&leaf, &manifest)?;
         let identity = (
             manifest.raw_hash.clone(),
@@ -1536,6 +1535,56 @@ fn scan_derived_inventory(
         }
     }
     Ok(inventory)
+}
+
+fn decode_normalized_manifest(
+    path: &Path,
+    reader: impl Read,
+) -> Result<NormalizedInstanceManifest> {
+    let mut source = reader.take(MAX_NORMALIZED_MANIFEST_OBJECT_BYTES + 1);
+    let manifest =
+        serde_json::from_reader(std::io::BufReader::new(&mut source)).map_err(|error| {
+            if error.io_error_kind().is_some() {
+                KioError::io(
+                    std::io::Error::from(error).to_string(),
+                    path.display().to_string(),
+                )
+            } else {
+                store_corrupt(path, &format!("invalid normalized manifest: {error}"))
+            }
+        })?;
+    if source.limit() == 0 {
+        return Err(store_corrupt(
+            path,
+            "normalized manifest exceeds its byte bound",
+        ));
+    }
+    Ok(manifest)
+}
+
+#[cfg(test)]
+#[test]
+fn normalized_manifest_read_failure_is_io() {
+    struct FailingReader;
+    impl Read for FailingReader {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "manifest read failed",
+            ))
+        }
+    }
+
+    let path = Path::new("manifest.json");
+    let reader = b"{".as_slice().chain(FailingReader);
+    let error = decode_normalized_manifest(path, reader).unwrap_err();
+    assert_eq!(error.error_code(), "KIO-E-STORE-IO-001");
+    assert_eq!(error.message(), "manifest read failed");
+    assert_eq!(error.context()["path"], "manifest.json");
+    for invalid_json in ["{", "{!", "{}"] {
+        let error = decode_normalized_manifest(path, invalid_json.as_bytes()).unwrap_err();
+        assert_eq!(error.error_code(), "KIO-E-STORE-CORRUPT-001");
+    }
 }
 
 /// Add every immutable normalized manifest/unit closure that remains reachable
@@ -1710,12 +1759,11 @@ fn historical_manifest_was_purged_before_resurrection(
     )
 }
 
-const MAX_NORMALIZED_MANIFEST_OBJECT_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_NORMALIZED_MANIFEST_OBJECT_BYTES: u64 = kio_core::cas::MAX_MANIFEST_OBJECT_BYTES;
 
 fn manifest_content_hash(manifest: &NormalizedInstanceManifest) -> Result<String> {
-    let value =
-        serde_json::to_value(manifest).map_err(|error| KioError::schema(error.to_string()))?;
-    kio_core::cas::hash_json(&value)
+    kio_pipeline::markdownize::normalized_manifest_hash(manifest)
+        .map_err(crate::object_persistence::pipeline_to_kio)
 }
 
 /// Read the immutable manifest object which the mutable instance manifest
@@ -1728,32 +1776,18 @@ fn read_verified_manifest_object(
     manifest_hash: &str,
     source_path: &Path,
 ) -> Result<NormalizedInstanceManifest> {
-    let bytes = store
-        .read_content_object_bytes(
-            ContentObjectKind::Manifest,
-            manifest_hash,
-            MAX_NORMALIZED_MANIFEST_OBJECT_BYTES,
+    kio_pipeline::markdownize::read_canonical_manifest(
+        store,
+        manifest_hash,
+        MAX_NORMALIZED_MANIFEST_OBJECT_BYTES,
+    )
+    .map(|(manifest, _)| manifest)
+    .map_err(|error| {
+        store_corrupt(
+            source_path,
+            &format!("manifest CAS object: {}", error.error),
         )
-        .map_err(|error| store_corrupt(source_path, &format!("manifest CAS object: {error}")))?;
-    if hash_bytes(&bytes) != manifest_hash {
-        return Err(store_corrupt(
-            source_path,
-            "manifest CAS object does not match its content hash",
-        ));
-    }
-    let manifest: NormalizedInstanceManifest = serde_json::from_slice(&bytes)
-        .map_err(|error| store_corrupt(source_path, &format!("manifest CAS object: {error}")))?;
-    let canonical = canonical_json_bytes(
-        &serde_json::to_value(&manifest)
-            .map_err(|error| store_corrupt(source_path, &error.to_string()))?,
-    )?;
-    if canonical != bytes {
-        return Err(store_corrupt(
-            source_path,
-            "manifest CAS object is not canonical JSON",
-        ));
-    }
-    Ok(manifest)
+    })
 }
 
 fn validate_instance_leaf(path: &Path, manifest: &NormalizedInstanceManifest) -> Result<()> {
@@ -2468,12 +2502,34 @@ fn validate_existing_regular(path: &Path, max_bytes: Option<u64>) -> Result<fs::
 }
 
 fn read_bounded_regular(path: &Path, max_bytes: u64) -> Result<Option<Vec<u8>>> {
+    let Some(mut file) = open_bounded_regular(path, max_bytes)? else {
+        return Ok(None);
+    };
+    let capacity = usize::try_from(
+        file.metadata()
+            .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?
+            .len()
+            .min(max_bytes),
+    )
+    .unwrap_or(0);
+    let mut bytes = Vec::with_capacity(capacity);
+    Read::by_ref(&mut file)
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(store_corrupt(path, "regular file exceeds its byte bound"));
+    }
+    Ok(Some(bytes))
+}
+
+fn open_bounded_regular(path: &Path, max_bytes: u64) -> Result<Option<fs::File>> {
     if !path_exists(path)? {
         return Ok(None);
     }
     let listed = validate_existing_regular(path, Some(max_bytes))?;
     let observed = observe_purge_regular(path, &listed)?;
-    let mut file = kio_core::cas::open_regular_nofollow(path)
+    let file = kio_core::cas::open_regular_nofollow(path)
         .map_err(|_| store_corrupt(path, "regular file changed while it was opened"))?;
     let opened = file
         .metadata()
@@ -2485,16 +2541,7 @@ fn read_bounded_regular(path: &Path, max_bytes: u64) -> Result<Option<Vec<u8>>> 
             "regular file changed while it was opened",
         ));
     }
-    let capacity = usize::try_from(opened.len().min(max_bytes)).unwrap_or(0);
-    let mut bytes = Vec::with_capacity(capacity);
-    Read::by_ref(&mut file)
-        .take(max_bytes.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?;
-    if bytes.len() as u64 > max_bytes {
-        return Err(store_corrupt(path, "regular file exceeds its byte bound"));
-    }
-    Ok(Some(bytes))
+    Ok(Some(file))
 }
 
 struct TreeRemoval {

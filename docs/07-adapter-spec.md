@@ -383,7 +383,9 @@ workbook main part と worksheet relationship は XLSX の MIME / namespace / �
 不正 ZIP/XML と上記の不受理 variant は `KIO-E-PREPARE-XLSX-EXTRACT-001`、
 容量・work 予算超過は [04 §5.3](04-pipeline.md#53-エラー種別と-retry-budget) の
 `resource_limit` と区別し、部分抽出を完成済み workbook として公開しない。
-preview は完了 sheet/row、未処理範囲とその理由を表示する。再開時も元 sheet/row identity を保持する。
+preview は完了 sheet/row、未処理範囲とその理由を表示する。worksheet 内では解析済みの行と
+出力済みの行を区別し、判明している未処理開始行を元の行番号で示す。再開時も元 sheet/row identity
+を保持し、完了シートの work と出力サイズも、その実行で選んだ tier の検査に含める。
 
 - **unit = worksheet 1 枚**。`unit_key` は 04 §2 / QB27 の `sheet:` 規則 —
   NFC 正規化 → 元名の `#` を `##` へ escape → **その後で**同名 2 枚目以降に `#2` / `#3` を付す
@@ -399,7 +401,7 @@ preview は完了 sheet/row、未処理範囲とその理由を表示する。�
 - **sheet に埋め込まれた chart / 画像は本追記の対象外。** これは真に視覚的で直接抽出では読めないが、
   「file X の sheet M の中の image N」という evidence 上の同一性が未定義であり、
   `image_object_hashes` は 3 つの構造体に**宣言があるだけで書き手も読み手も無い**。
-  半端に配線せず、抽出器が**件数を報告して穴を可視に保つ** (`XlsxDocument::media_paths`)。
+  半端に配線せず、抽出器が**件数を報告して穴を可視に保つ** (`XlsxWorkbook::media_paths`)。
 
 ### PDF / XLSX の抽出資源 tier
 

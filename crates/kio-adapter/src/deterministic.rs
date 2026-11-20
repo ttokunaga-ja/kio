@@ -146,6 +146,7 @@ impl MarkdownizeAdapter for DeterministicAdapter {
     }
 
     fn markdownize(&self, request: MarkdownizeRequest) -> Result<MarkdownizeResponse> {
+        require_prepared_xlsx(&request.media_type)?;
         match request.raw.path.as_deref() {
             Some(path) => {
                 let bytes = std::fs::read(path).map_err(|err| AdapterError::Io {
@@ -165,8 +166,25 @@ pub fn markdownize_from_bytes(
     request: MarkdownizeRequest,
     verified_raw_bytes: &[u8],
 ) -> Result<MarkdownizeResponse> {
+    require_prepared_xlsx(&request.media_type)?;
+    let actual_hash = crate::identity::hash_bytes(verified_raw_bytes);
+    if actual_hash != request.raw.raw_hash {
+        return Err(AdapterError::ContractViolation(format!(
+            "deterministic input identity changed: expected {}, got {actual_hash}",
+            request.raw.raw_hash
+        )));
+    }
     let source = source_document_from_verified_bytes(&request, verified_raw_bytes)?;
     markdownize_with_source(request, Some(source))
+}
+
+fn require_prepared_xlsx(media_type: &str) -> Result<()> {
+    if crate::xlsx_extract::is_xlsx_media(media_type) {
+        return Err(AdapterError::ContractViolation(
+            "XLSX markdownization requires a staged prepared worksheet".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Markdownize a converted PDF using the same page reader as native PDF.
@@ -188,41 +206,16 @@ enum SourceDocument<'a> {
         pages: Box<PdfPages<'a>>,
         office_kind: Option<UnitKind>,
     },
-    /// XLSX worksheets, already rendered to Markdown by
-    /// [`crate::xlsx_extract`], in workbook order. A `sheet:` unit resolves by
-    /// ORDER rather than by name: the unit key carries QB27's escaping and
-    /// duplicate-occurrence suffix, so matching the raw sheet name against it
-    /// would need that transform reapplied here — and the prepare stage
-    /// already emitted the units in this exact order.
-    Sheets(Vec<String>),
 }
 
 fn source_document_from_verified_bytes<'a>(
     request: &MarkdownizeRequest,
     bytes: &'a [u8],
 ) -> Result<SourceDocument<'a>> {
-    let actual_hash = crate::identity::hash_bytes(bytes);
-    if actual_hash != request.raw.raw_hash {
-        return Err(AdapterError::ContractViolation(format!(
-            "deterministic input identity changed: expected {}, got {actual_hash}",
-            request.raw.raw_hash
-        )));
-    }
     if request.media_type == "application/pdf" {
         return Ok(SourceDocument::Pdf {
             pages: Box::new(PdfPages::open(bytes, ResourceTier::Standard)?),
             office_kind: None,
-        });
-    }
-    if crate::xlsx_extract::is_xlsx_media(&request.media_type) {
-        return crate::xlsx_extract::extract_xlsx(bytes).map(|document| {
-            SourceDocument::Sheets(
-                document
-                    .sheets
-                    .into_iter()
-                    .map(|sheet| sheet.markdown)
-                    .collect(),
-            )
         });
     }
     let text = String::from_utf8_lossy(bytes).into_owned();
@@ -370,10 +363,6 @@ fn markdown_unit_from_hint(
             let unit = finish_markdown_unit(hint, page_markdown(&page));
             pages.retain_output(unit.markdown.len())?;
             return Ok(unit);
-        }
-        Some(SourceDocument::Sheets(sheets)) => {
-            let sheet = sheets.get(hint.order as usize).map_or("", String::as_str);
-            format!("{}\n", sheet.trim())
         }
         // text/plain and sniffed octet-stream TEXT (R20-6 passthrough:
         // .xml/.html/.eml/.csv/...) — preserve it as literal text. Raw
@@ -755,6 +744,37 @@ stream\nBT (/Type /Page and /PageX) Tj ET\nendstream\nendobj\n";
         let mut pages = PdfPages::open(pdf, ResourceTier::Standard).unwrap();
         assert_eq!(pages.len(), 1);
         assert_eq!(pages.read_page(0).unwrap(), "/Type /Page and /PageX");
+    }
+
+    #[test]
+    fn review_requires_prepared_xlsx_units() {
+        use crate::types::RawInput;
+        let input =
+            include_bytes!("../../kio-eval/acceptance-fixtures/v1/office-public/table.xlsx");
+        let request = MarkdownizeRequest {
+            raw: RawInput {
+                raw_hash: crate::identity::hash_bytes(input),
+                path: None,
+            },
+            media_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet".into(),
+            prepared_unit_hint: None,
+            mode: MarkdownizeMode::Full,
+            previous: None,
+            hints: None,
+            restrict_to_hint_pages: false,
+            bbox_annotation_enabled: false,
+            tool_profile_hash: "sha256:tool".into(),
+            spec_version: 1,
+            idempotency_token: None,
+        };
+        assert!(matches!(
+            markdownize_from_bytes(request.clone(), input),
+            Err(AdapterError::ContractViolation(_))
+        ));
+        assert!(matches!(
+            DeterministicAdapter.markdownize(request),
+            Err(AdapterError::ContractViolation(_))
+        ));
     }
 
     #[test]

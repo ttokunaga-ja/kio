@@ -747,7 +747,7 @@ impl ObjectStore {
         )
     }
 
-    fn existing_content_path(
+    pub(super) fn existing_content_path(
         &self,
         kind: ContentObjectKind,
         hash: &str,
@@ -755,7 +755,11 @@ impl ObjectStore {
         occupied_slot(self.content_path(kind, hash)?)
     }
 
-    fn validate_content_parent(&self, kind: ContentObjectKind, hash: &str) -> Result<bool> {
+    pub(super) fn validate_content_parent(
+        &self,
+        kind: ContentObjectKind,
+        hash: &str,
+    ) -> Result<bool> {
         let digest = hash_path_component(hash)?;
         let objects = self.ambient_kio_dir()?.join("objects");
         let kind_base = objects.join(kind.directory());

@@ -29,7 +29,11 @@ use crate::prepare::{
 use crate::store_path::{StorePathKind, resolve_existing_store_path};
 use crate::{IoResultExt, PipelineError, Result};
 
-const MAX_NORMALIZED_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
+mod manifest_stream;
+
+use manifest_stream::{Bounded as ManifestWriter, Encoding as ManifestEncoding};
+
+const MAX_NORMALIZED_MANIFEST_BYTES: u64 = kio_core::cas::MAX_MANIFEST_OBJECT_BYTES;
 const MAX_NORMALIZED_UNIT_BYTES: u64 = MAX_NORMALIZED_UNIT_OBJECT_BYTES;
 // CT4-FSCK's invocation-wide object ceiling is also the outer bound for the
 // physical manifest/unit entries inspected before the loader can identify the
@@ -154,8 +158,10 @@ impl<'de> Deserialize<'de> for NormalizedUnitManifestEntry {
             ));
         }
         if entry.error_kind.as_ref().is_some_and(|kind| {
-            serde_json::from_value::<crate::task::RetryErrorKind>(Value::String(kind.clone()))
-                .is_err()
+            crate::task::RetryErrorKind::deserialize(serde::de::value::StrDeserializer::<
+                serde::de::value::Error,
+            >::new(kind))
+            .is_err()
         }) || (entry.status == UnitStatus::Done
             && (entry.error_kind.is_some() || entry.resource_limit.is_some()))
         {
@@ -170,10 +176,9 @@ impl<'de> Deserialize<'de> for NormalizedUnitManifestEntry {
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase());
         if entry.unit_key.is_empty() || !canonical_shape || entry.unit_ref != expected {
-            return Err(serde::de::Error::custom(format!(
-                "manifest unit_ref is not derived from unit_key {:?}",
-                entry.unit_key
-            )));
+            return Err(serde::de::Error::custom(
+                "manifest unit_ref is not derived from unit_key",
+            ));
         }
         match (entry.status, entry.unit_object_hash.as_deref()) {
             (UnitStatus::Done, Some(hash)) if kio_core::cas::is_hash(hash) => {}
@@ -188,6 +193,11 @@ impl<'de> Deserialize<'de> for NormalizedUnitManifestEntry {
                     "failed manifest entry must have a null normalized unit object hash",
                 ));
             }
+        }
+        if !kio_core::cas::is_hash(&entry.prepared_hash) {
+            return Err(serde::de::Error::custom(
+                "manifest entry prepared_hash is invalid",
+            ));
         }
         if !kio_core::cas::is_hash(&entry.preparation_profile_hash) {
             return Err(serde::de::Error::custom(
@@ -805,16 +815,40 @@ pub fn read_normalized_instance_manifest(
         .as_ref()
         .join(&canonical_relative)
         .join("manifest.json");
-    let bytes = read_contained_normalized_file(
+    let file = open_contained_normalized_file(
         kio_dir.as_ref(),
         &canonical_dir,
         &manifest_path,
         MAX_NORMALIZED_MANIFEST_BYTES,
     )?;
-    let manifest = serde_json::from_slice(&bytes)
-        .map_err(|error| normalized_corrupt(&manifest_path, error.to_string()))?;
+    let (manifest, consumed) = decode_normalized_instance_manifest(&manifest_path, file)?;
     validate_normalized_manifest(&manifest_path, &identity, &manifest)?;
-    Ok((manifest, bytes.len() as u64))
+    Ok((manifest, consumed))
+}
+
+fn decode_normalized_instance_manifest(
+    manifest_path: &Path,
+    reader: impl Read,
+) -> Result<(NormalizedInstanceManifest, u64)> {
+    let limit = MAX_NORMALIZED_MANIFEST_BYTES + 1;
+    let mut input = reader.take(limit);
+    let manifest = serde_json::from_reader(std::io::BufReader::with_capacity(
+        kio_core::cas::CAS_STREAM_BUFFER_BYTES,
+        &mut input,
+    ))
+    .map_err(|error| {
+        if error.io_error_kind().is_some() {
+            PipelineError::Io {
+                path: manifest_path.display().to_string(),
+                message: std::io::Error::from(error).to_string(),
+            }
+        } else {
+            normalized_corrupt(manifest_path, error.to_string())
+        }
+    })?;
+    let consumed = limit - input.limit();
+    checked_manifest_size(manifest_path, consumed, NORMALIZED_SIZE_LIMITS)?;
+    Ok((manifest, consumed))
 }
 
 /// Conservatively account every bounded physical file that the normalized
@@ -1246,6 +1280,7 @@ pub fn normalized_unit_object_hash(unit: &NormalizedUnitObject) -> Result<String
     )?))
 }
 
+#[cfg(test)]
 fn canonical_normalized_manifest_bytes(manifest: &NormalizedInstanceManifest) -> Result<Vec<u8>> {
     let value =
         serde_json::to_value(manifest).map_err(|err| PipelineError::Schema(err.to_string()))?;
@@ -1271,12 +1306,12 @@ fn validate_manifest_identity(
     Ok(())
 }
 
-fn read_contained_normalized_file(
+fn open_contained_normalized_file(
     kio_dir: &Path,
     canonical_dir: &Path,
     path: &Path,
     max_bytes: u64,
-) -> Result<Vec<u8>> {
+) -> Result<fs::File> {
     let relative = path
         .strip_prefix(kio_dir)
         .map_err(|_| normalized_corrupt(path, "normalized object is outside the Kio directory"))?;
@@ -1296,16 +1331,7 @@ fn read_contained_normalized_file(
             "normalized object exceeds its byte limit",
         ));
     }
-    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
-    let mut limited = file.take(max_bytes.saturating_add(1));
-    limited.read_to_end(&mut bytes).pipeline_io(&canonical)?;
-    if bytes.len() as u64 > max_bytes {
-        return Err(normalized_corrupt(
-            path,
-            "normalized object grew beyond its byte limit",
-        ));
-    }
-    Ok(bytes)
+    Ok(file)
 }
 
 fn normalized_corrupt(path: &Path, message: impl Into<String>) -> PipelineError {
@@ -1427,14 +1453,16 @@ pub fn persist_normalized_instance_from_units_bound<'a>(
     manifest: &NormalizedInstanceManifest,
     mut unit_for: impl FnMut(&NormalizedUnitManifestEntry) -> Result<Cow<'a, NormalizedUnitObject>>,
 ) -> Result<NormalizedInstanceManifest> {
-    persist_normalized_units(directory, manifest, None, |_, entry| unit_for(entry))
+    persist_normalized_units(directory, manifest.clone(), None, |_, entry| {
+        unit_for(entry)
+    })
 }
 
 /// Retain a deterministic run's stamp across retries. Its source, profile, unit
 /// identities and destination generation identify the unfinished work.
 pub fn persist_resumable_normalized_units<'a>(
     directory: &StoreDirectory,
-    manifest: &NormalizedInstanceManifest,
+    manifest: NormalizedInstanceManifest,
     source: &str,
     unit_for: impl FnMut(
         &NormalizedInstanceManifest,
@@ -1454,27 +1482,14 @@ struct SavedNormalizedUnit {
 
 fn persist_normalized_units<'a>(
     directory: &StoreDirectory,
-    manifest: &NormalizedInstanceManifest,
+    mut stamped: NormalizedInstanceManifest,
     resumable_source: Option<&str>,
     mut unit_for: impl FnMut(
         &NormalizedInstanceManifest,
         &NormalizedUnitManifestEntry,
     ) -> Result<Cow<'a, NormalizedUnitObject>>,
 ) -> Result<NormalizedInstanceManifest> {
-    let mut stamped = manifest.clone();
-    let identity = NormalizedInstanceIdentity {
-        raw_hash: stamped.raw_hash.clone(),
-        tool_profile_hash: stamped.tool_profile_hash.clone(),
-        r#gen: stamped.r#gen,
-    };
-    // Body pins are filled as units arrive. Validate the rest of the manifest
-    // before using its identity or entry names as storage paths.
-    for entry in &mut stamped.units {
-        if entry.status == UnitStatus::Done {
-            entry.unit_object_hash = Some(entry.prepared_hash.clone());
-        }
-    }
-    validate_normalized_manifest(directory.path(), &identity, &stamped)?;
+    let identity = validate_normalized_manifest_draft(directory.path(), &mut stamped)?;
     let instance = normalized_instance_relative_path(
         &stamped.raw_hash,
         &stamped.tool_profile_hash,
@@ -1512,15 +1527,20 @@ fn persist_normalized_units<'a>(
     )
     .map_err(|error| stage_error(directory, error))?;
 
-    let mut draft = stamped.clone();
-    if resumable_source.is_some() {
-        draft.run_id.clear();
-        draft.generated_at.clear();
+    let stamps = resumable_source.map(|_| {
+        (
+            std::mem::take(&mut stamped.run_id),
+            std::mem::take(&mut stamped.generated_at),
+        )
+    });
+    let mut key = ManifestWriter::new(std::io::sink(), u64::MAX, true);
+    let serialized = serde_json::to_writer(&mut key, &(&stamped, resumable_source));
+    key.check(serialized)?;
+    let draft_key = key.hash();
+    if let Some((run_id, generated_at)) = stamps {
+        stamped.run_id = run_id;
+        stamped.generated_at = generated_at;
     }
-    let draft_key = kio_core::cas::hash_bytes(
-        &serde_json::to_vec(&(draft, resumable_source))
-            .map_err(|error| PipelineError::Schema(error.to_string()))?,
-    );
     let stage_workspace = child_directory(
         directory,
         &Path::new("extraction-stages/views")
@@ -1528,10 +1548,12 @@ fn persist_normalized_units<'a>(
             .join(normalized_path_digest(&draft_key)),
     )?;
     let stamp_record = Path::new("stamp.json");
+    let mut recovering = false;
     if resumable_source.is_some() {
         if let Some((run_id, generated_at)) =
             read_record::<(String, String)>(&stage_workspace, stamp_record, 4096)?
         {
+            recovering = true;
             stamped.run_id = run_id;
             stamped.generated_at = generated_at;
         } else {
@@ -1543,9 +1565,8 @@ fn persist_normalized_units<'a>(
             )?;
         }
     }
-    let unit_context = stamped.clone();
     // Verify the manifest size before potentially producing large bodies.
-    check_normalized_manifest_size(&stamped, directory.path())?;
+    manifest_stream::admit(&stamped)?;
 
     let instance_parent = child_directory(directory, parent)?;
     let instance_leaf = Path::new(instance.file_name().expect("normalized instance leaf"));
@@ -1561,19 +1582,23 @@ fn persist_normalized_units<'a>(
         (stage, Some(saved))
     };
     let mut total_bytes = 0;
-    for entry in &mut stamped.units {
+    for index in 0..stamped.units.len() {
+        let entry = &stamped.units[index];
         if entry.status == UnitStatus::Failed {
             continue;
         }
         let journal = normalized_unit_journal(entry);
         let saved = read_record::<SavedNormalizedUnit>(&stage_workspace, &journal, 4096)?;
         let saved = match saved {
-            Some(saved) if saved.ready => saved,
+            Some(saved) if saved.ready => {
+                recovering = true;
+                saved
+            }
             incomplete => {
                 if let Some(incomplete) = incomplete {
                     incomplete.stage.discard(&stage_workspace)?;
                 }
-                let unit = unit_for(&unit_context, entry)?;
+                let unit = unit_for(&stamped, entry)?;
                 validate_normalized_unit(directory.path(), &identity, entry, &unit)?;
                 checked_unit_size(
                     directory.path(),
@@ -1619,6 +1644,7 @@ fn persist_normalized_units<'a>(
             ContentObjectKind::NormalizedUnit,
             &saved.hash,
         )?;
+        let entry = &mut stamped.units[index];
         entry.unit_object_hash = Some(saved.hash);
         let unit = read_validated_normalized_unit(&store, &identity, entry)?;
         let unit_path = format!("{}.json", entry.unit_ref);
@@ -1635,28 +1661,7 @@ fn persist_normalized_units<'a>(
             .map_err(|error| stage_error(&instance_directory, error))?;
     }
 
-    let manifest_bytes = check_normalized_manifest_size(&stamped, directory.path())?;
-    let manifest_cas = canonical_normalized_manifest_bytes(&stamped)?;
-    let manifest_hash = cas_hash_bytes(&manifest_cas);
-    crate::extraction_stage::publish_payload(
-        &stage_workspace,
-        Path::new("manifest-cas.json"),
-        |writer| {
-            writer
-                .write_chunk(&manifest_cas)
-                .map_err(|error| stage_error(&stage_workspace, error))
-        },
-        || Ok(()),
-        |stage| {
-            crate::extraction_stage::publish_content(
-                &stage_workspace,
-                &store,
-                ContentObjectKind::Manifest,
-                &manifest_hash,
-                stage,
-            )
-        },
-    )?;
+    let manifest_hash = publish_manifest_cas(&stage_workspace, &store, &stamped, recovering)?;
     let view = normalized_view_relative_path(
         &stamped.raw_hash,
         &stamped.tool_profile_hash,
@@ -1674,13 +1679,25 @@ fn persist_normalized_units<'a>(
     // The manifest is the visibility boundary. Unit and view caches may be
     // rebuilt after an interruption while the prior manifest still pins its CAS
     // bodies. No reader can observe the new generation before this write.
-    instance_directory
-        .write_atomic(
-            Path::new("manifest.json"),
-            &manifest_bytes,
-            Publication::Upsert,
-        )
-        .map_err(|error| stage_error(&instance_directory, error))?;
+    let mut limit_failure = None;
+    let projection = instance_directory.write_atomic_with(
+        Path::new("manifest.json"),
+        Publication::Upsert,
+        |output| {
+            use std::io::Write as _;
+            let mut output =
+                std::io::BufWriter::with_capacity(kio_core::cas::CAS_STREAM_BUFFER_BYTES, output);
+            let mut writer = ManifestWriter::new(&mut output, MAX_NORMALIZED_MANIFEST_BYTES, false);
+            let result = manifest_stream::encode(&mut writer, &stamped, ManifestEncoding::Pretty);
+            limit_failure = writer.limit_failure();
+            result.map_err(std::io::Error::from)?;
+            writer.flush()
+        },
+    );
+    if let Some(error) = limit_failure {
+        return Err(error);
+    }
+    projection.map_err(|error| stage_error(&instance_directory, error))?;
     if let Some(saved) = staged_instance {
         saved
             .identity
@@ -1721,9 +1738,135 @@ fn normalized_unit_journal(entry: &NormalizedUnitManifestEntry) -> PathBuf {
 }
 
 pub fn normalized_manifest_hash(manifest: &NormalizedInstanceManifest) -> Result<String> {
-    Ok(cas_hash_bytes(&canonical_normalized_manifest_bytes(
-        manifest,
-    )?))
+    let mut writer = ManifestWriter::new(std::io::sink(), MAX_NORMALIZED_MANIFEST_BYTES, true);
+    let result = manifest_stream::encode(&mut writer, manifest, ManifestEncoding::Canonical);
+    writer.check(result)?;
+    Ok(writer.hash())
+}
+
+/// Decode and validate a canonical manifest without retaining a serialized copy.
+pub fn read_canonical_manifest(
+    store: &ObjectStore,
+    hash: &str,
+    max_bytes: u64,
+) -> std::result::Result<(NormalizedInstanceManifest, u64), kio_core::cas::AccountedReadError> {
+    let path = Path::new("objects/manifests");
+    let corrupt = |message: String| {
+        kio_core::KioError::new(
+            "KIO-E-STORE-CORRUPT-001",
+            message,
+            serde_json::json!({ "manifest_hash": hash }),
+            kio_core::ExitCode::PermanentFailure,
+        )
+    };
+    let (manifest, consumed) =
+        store.decode_content_accounted(ContentObjectKind::Manifest, hash, max_bytes, |input| {
+            serde_json::from_reader(input)
+                .map_err(|error| corrupt(format!("manifest schema: {error}")))
+        })?;
+    let result = (|| {
+        if normalized_manifest_hash(&manifest).map_err(|error| corrupt(error.to_string()))? != hash
+        {
+            return Err(corrupt("manifest is not canonical JSON".to_owned()));
+        }
+        let identity = NormalizedInstanceIdentity {
+            raw_hash: manifest.raw_hash.clone(),
+            tool_profile_hash: manifest.tool_profile_hash.clone(),
+            r#gen: manifest.r#gen,
+        };
+        validate_normalized_manifest(path, &identity, &manifest)
+            .map_err(|error| corrupt(error.to_string()))?;
+        Ok((manifest, consumed))
+    })();
+    result.map_err(|error| kio_core::cas::AccountedReadError {
+        error,
+        consumed_bytes: consumed,
+    })
+}
+
+fn publish_manifest_cas(
+    workspace: &StoreDirectory,
+    store: &ObjectStore,
+    manifest: &NormalizedInstanceManifest,
+    recovering: bool,
+) -> Result<String> {
+    let hash = std::cell::RefCell::new(None);
+    crate::extraction_stage::publish_payload(
+        workspace,
+        Path::new("manifest-cas.json"),
+        |stage| {
+            let mut failure = None;
+            // BufWriter keeps per-token serializer writes from repeatedly
+            // rechecking the stage identity or issuing tiny disk writes.
+            let (digest, outcome) = {
+                use std::io::Write as _;
+                let mut output = std::io::BufWriter::with_capacity(
+                    kio_core::cas::CAS_STREAM_BUFFER_BYTES,
+                    stage_output(stage, &mut failure),
+                );
+                let mut writer =
+                    ManifestWriter::new(&mut output, MAX_NORMALIZED_MANIFEST_BYTES, true);
+                let encoded =
+                    manifest_stream::encode(&mut writer, manifest, ManifestEncoding::Canonical);
+                let output = writer.check(encoded).and_then(|()| {
+                    writer.flush().map_err(|error| PipelineError::Io {
+                        path: workspace.path().display().to_string(),
+                        message: error.to_string(),
+                    })
+                });
+                (writer.hash(), output)
+            };
+            if let Some(error) = failure {
+                return Err(stage_error(workspace, error));
+            }
+            outcome?;
+            *hash.borrow_mut() = Some(digest);
+            Ok(())
+        },
+        || Ok(()),
+        |stage| {
+            if stage.is_none() && !recovering {
+                return Ok(false);
+            }
+            let mut hash = hash.borrow_mut();
+            if hash.is_none() {
+                // A ready stage survived interruption. Its digest is
+                // deterministically recovered without retaining JSON bytes.
+                *hash = Some(normalized_manifest_hash(manifest)?);
+            }
+            crate::extraction_stage::publish_content(
+                workspace,
+                store,
+                ContentObjectKind::Manifest,
+                hash.as_deref().expect("manifest digest"),
+                stage,
+            )
+        },
+    )?;
+    Ok(hash.into_inner().expect("published manifest digest"))
+}
+
+fn stage_output<'a>(
+    stage: &'a mut kio_core::store_dir::StageWriter,
+    failure: &'a mut Option<kio_core::KioError>,
+) -> impl std::io::Write + 'a {
+    struct Output<'a> {
+        stage: &'a mut kio_core::store_dir::StageWriter,
+        failure: &'a mut Option<kio_core::KioError>,
+    }
+    impl std::io::Write for Output<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.stage.write_chunk(bytes).map_err(|error| {
+                *self.failure = Some(error);
+                std::io::Error::other("manifest stage write failed")
+            })?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    Output { stage, failure }
 }
 
 fn write_normalized_view(
@@ -2131,14 +2274,33 @@ pub fn discard_normalized_stages(root: &StoreDirectory, raw_hash: &str) -> Resul
     })
 }
 
-fn check_normalized_manifest_size(
-    manifest: &NormalizedInstanceManifest,
+fn validate_normalized_manifest_draft(
     path: &Path,
-) -> Result<Vec<u8>> {
-    let bytes = serde_json::to_vec_pretty(manifest)
-        .map_err(|error| PipelineError::Schema(error.to_string()))?;
-    checked_manifest_size(path, bytes.len() as u64, NORMALIZED_SIZE_LIMITS)?;
-    Ok(bytes)
+    manifest: &mut NormalizedInstanceManifest,
+) -> Result<NormalizedInstanceIdentity> {
+    // Body pins are filled as units arrive. Use the matching fixed hash width
+    // when checking the draft before any bodies are published.
+    for entry in &mut manifest.units {
+        if entry.status == UnitStatus::Done {
+            entry.unit_object_hash = Some(entry.prepared_hash.clone());
+        }
+    }
+    let identity = NormalizedInstanceIdentity {
+        raw_hash: manifest.raw_hash.clone(),
+        tool_profile_hash: manifest.tool_profile_hash.clone(),
+        r#gen: manifest.r#gen,
+    };
+    validate_normalized_manifest(path, &identity, manifest)?;
+    manifest_stream::admit(manifest)?;
+    Ok(identity)
+}
+
+/// Check the same size and layout that the writer checks with every body pin filled.
+pub fn check_normalized_manifest_write_size(
+    path: &Path,
+    mut manifest: NormalizedInstanceManifest,
+) -> Result<()> {
+    validate_normalized_manifest_draft(path, &mut manifest).map(|_| ())
 }
 
 pub fn persist_normalized_instance(
@@ -2421,6 +2583,33 @@ fn contract_violation(message: &str) -> PipelineError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalized_manifest_read_failure_is_io() {
+        struct FailingReader;
+        impl Read for FailingReader {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "manifest read failed",
+                ))
+            }
+        }
+
+        let path = Path::new("manifest.json");
+        let reader = b"{".as_slice().chain(FailingReader);
+        let error = decode_normalized_instance_manifest(path, reader).unwrap_err();
+        assert!(
+            matches!(&error, PipelineError::Io { path, message }
+                if path == "manifest.json" && message == "manifest read failed"),
+            "{error}"
+        );
+        for invalid_json in ["{", "{!", "{}"] {
+            let error =
+                decode_normalized_instance_manifest(path, invalid_json.as_bytes()).unwrap_err();
+            assert!(matches!(error, PipelineError::Corrupt { .. }), "{error}");
+        }
+    }
 
     #[test]
     fn preparation_provenance_is_required_and_complete() {
@@ -4217,6 +4406,120 @@ mod tests {
     }
 
     #[test]
+    fn review_manifest_admission_stops_at_the_first_byte_over_budget() {
+        let (_, mut manifest, _) = normalized_fixture();
+        manifest.units[0].unit_key = "\\".repeat(MAX_NORMALIZED_MANIFEST_BYTES as usize / 2);
+        manifest.units[0].unit_ref = prepared_unit_ref(&manifest.units[0].unit_key);
+        let outcome = check_normalized_manifest_write_size(Path::new("manifest.json"), manifest);
+        assert!(matches!(outcome, Err(PipelineError::ResourceLimit(limit))
+            if limit.observed == Some(MAX_NORMALIZED_MANIFEST_BYTES + 1)));
+    }
+
+    #[test]
+    fn review_admits_a_manifest_with_many_legal_sheet_entries() {
+        let (_, mut manifest, _) = normalized_fixture();
+        let entry = manifest.units[0].clone();
+        manifest.units = (0..40_000)
+            .map(|order| {
+                let mut entry = entry.clone();
+                entry.order = order;
+                entry.unit_type = UnitType::Sheet;
+                entry.unit_object_hash = Some(cas_hash_bytes(b"normalized sheet"));
+                entry.unit_key = format!("sheet:Worksheet {order:05}");
+                entry.unit_ref = prepared_unit_ref(&entry.unit_key);
+                entry
+            })
+            .collect();
+        let path = Path::new("manifest.json");
+        check_normalized_manifest_write_size(path, manifest.clone()).unwrap();
+        validate_normalized_manifest_draft(path, &mut manifest).unwrap();
+        let dir = canonical_tempdir();
+        initialize_persist_store(dir.path());
+        let workspace = StoreDirectory::open(dir.path()).unwrap();
+        let store = ObjectStore::from_bound_kio(&workspace.root_handle()).unwrap();
+        let hash = publish_manifest_cas(&workspace, &store, &manifest, false).unwrap();
+        assert_eq!(hash, normalized_manifest_hash(&manifest).unwrap());
+        let (decoded, consumed) =
+            read_canonical_manifest(&store, &hash, MAX_NORMALIZED_MANIFEST_BYTES).unwrap();
+        assert!(consumed > 8 * 1024 * 1024);
+        assert_eq!(decoded, manifest);
+    }
+
+    #[test]
+    fn streaming_manifest_preserves_jcs_hashes_and_rejects_noncanonical_input() {
+        let (_, mut manifest, _) = normalized_fixture();
+        manifest.run_id = "non-ASCII 楽譜\n\"\u{2028}🚀".into();
+        manifest.r#gen = u64::MAX;
+        let failed = &mut manifest.units[0];
+        failed.status = UnitStatus::Failed;
+        failed.unit_object_hash = None;
+        failed.error_kind = Some("resource_limit".to_owned());
+        failed.resource_limit = Some(kio_core::error::ResourceLimit {
+            resource: kio_core::error::Resource::Work,
+            stage: "xlsx_extract".into(),
+            limit: Some(5),
+            observed: Some(6),
+            resource_tier: Some(kio_core::error::ResourceTier::Standard),
+            page_progress: None,
+        });
+        let expected = canonical_normalized_manifest_bytes(&manifest).unwrap();
+        assert_eq!(
+            normalized_manifest_hash(&manifest).unwrap(),
+            cas_hash_bytes(&expected)
+        );
+
+        let dir = canonical_tempdir();
+        initialize_persist_store(dir.path());
+        let store = ObjectStore::new(dir.path());
+        let pretty = serde_json::to_vec_pretty(&manifest).unwrap();
+        let hash = store
+            .write_content_object(ContentObjectKind::Manifest, &pretty)
+            .unwrap();
+        let failure =
+            read_canonical_manifest(&store, &hash, MAX_NORMALIZED_MANIFEST_BYTES).unwrap_err();
+        assert_eq!(failure.consumed_bytes, pretty.len() as u64);
+        assert!(failure.error.to_string().contains("not canonical JSON"));
+    }
+
+    #[test]
+    fn streaming_manifest_hash_includes_pdf_page_progress() {
+        use kio_core::error::{
+            PageExtractionProgress, PageExtractionRetry, Resource, ResourceLimit, ResourceTier,
+        };
+
+        let (_, mut manifest, _) = normalized_fixture();
+        let failed = &mut manifest.units[0];
+        failed.status = UnitStatus::Failed;
+        failed.unit_object_hash = None;
+        failed.error_kind = Some("resource_limit".to_owned());
+        let limit = ResourceLimit {
+            resource: Resource::UnitText,
+            stage: "pdf_extract".into(),
+            limit: Some(5),
+            observed: Some(6),
+            resource_tier: Some(ResourceTier::Standard),
+            page_progress: None,
+        };
+        for staged_through in [None, Some(1)] {
+            manifest.units[0].resource_limit = Some(ResourceLimit {
+                page_progress: Some(Box::new(PageExtractionProgress {
+                    total_pages: 3,
+                    extracted_through: 1,
+                    staged_through,
+                    next_page: Some(2),
+                    retry: PageExtractionRetry::TryLarge,
+                })),
+                ..limit.clone()
+            });
+            let expected = canonical_normalized_manifest_bytes(&manifest).unwrap();
+            assert_eq!(
+                normalized_manifest_hash(&manifest).unwrap(),
+                cas_hash_bytes(&expected)
+            );
+        }
+    }
+
+    #[test]
     fn p0_normalized_size_accounting_accepts_units_over_256_mib_in_total() {
         let path = Path::new("test normalized instance");
         let mut total = checked_manifest_size(path, 1024, NORMALIZED_SIZE_LIMITS).unwrap();
@@ -4249,7 +4552,7 @@ mod tests {
         assert!(checked_unit_size(&unit_path, u64::MAX, 1, limits).is_err());
 
         let (identity, mut manifest, mut units) = normalized_fixture();
-        let oversized_key = "x".repeat(MAX_NORMALIZED_MANIFEST_BYTES as usize);
+        let oversized_key = r#"\""#.repeat(MAX_NORMALIZED_MANIFEST_BYTES as usize / 4);
         manifest.units[0].unit_key = oversized_key.clone();
         manifest.units[0].unit_ref = prepared_unit_ref(&oversized_key);
         units[0].unit_key = oversized_key;
@@ -4260,7 +4563,9 @@ mod tests {
             identity.r#gen,
         );
         let err = persist_normalized_instance(dir.path(), &manifest, &units).unwrap_err();
-        assert!(err.to_string().contains("normalized manifest exceeds"));
+        assert!(
+            matches!(err, PipelineError::ResourceLimit(limit) if limit.stage == "normalized_manifest")
+        );
         assert!(!expected_dir.exists());
     }
 

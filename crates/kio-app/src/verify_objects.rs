@@ -842,7 +842,6 @@ fn verify_objects_with_limits(
                         {
                             match validate_purge_explained_missing_closure(
                                 &store,
-                                repo.kio_dir(),
                                 &entry.raw_hash,
                                 reference,
                                 &mut state,
@@ -1366,7 +1365,7 @@ impl std::fmt::Display for PinnedNormalizedError {
     }
 }
 
-const MAX_MANIFEST_OBJECT_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_MANIFEST_OBJECT_BYTES: u64 = kio_core::cas::MAX_MANIFEST_OBJECT_BYTES;
 
 /// PB01 (§A, 10 §7.5.1 L489 → 03 §8.1): `objects/embeddings/` CAS objects.
 ///

@@ -26,7 +26,6 @@ use crate::index::rebuild::skipped_disclosure;
 use crate::index::rebuild::unit_authorities_from_inputs;
 use crate::object_persistence::index_to_kio;
 use crate::object_persistence::pipeline_to_kio;
-use crate::open_view::MAX_MANIFEST_OBJECT_READ_BYTES;
 use crate::response::reindex::{HistoricalReindexResponse, ReindexExecution, ReindexResponse};
 use crate::response::skipped_units::SkippedUnit;
 use crate::scope_access::active_erase_purge_explains_historical_missing_manifest;
@@ -36,8 +35,7 @@ use crate::scope_access::purge_blocks_rebuild_raw;
 use crate::task_execution::enrichment_completion;
 use kio_core::ExitCode;
 use kio_core::KioError;
-use kio_core::cas::ContentObjectKind;
-use kio_core::cas::canonical_json_bytes;
+use kio_core::cas::MAX_MANIFEST_OBJECT_BYTES;
 use kio_core::control::ControlHandle;
 use kio_core::dag::NormalizeRef;
 use kio_core::history::HistoryReader;
@@ -88,35 +86,13 @@ pub(super) fn pinned_manifest(
     normalize: &NormalizeRef,
 ) -> Result<NormalizedInstanceManifest> {
     let manifest_hash = &normalize.manifest_hash;
-    let store = repo.object_store();
-    store
-        .inspect_content_accounted(ContentObjectKind::Manifest, manifest_hash)
-        .map_err(|error| error.error)?;
-    let bytes = store.read_content_object_bytes(
-        ContentObjectKind::Manifest,
+    let (manifest, _) = kio_pipeline::markdownize::read_canonical_manifest(
+        &repo.object_store(),
         manifest_hash,
-        MAX_MANIFEST_OBJECT_READ_BYTES,
-    )?;
+        MAX_MANIFEST_OBJECT_BYTES,
+    )
+    .map_err(|error| error.error)?;
     let manifest_path = Path::new("objects/manifests/<retained>");
-    if kio_core::cas::hash_bytes(&bytes) != *manifest_hash {
-        return Err(crate::index::rebuild::store_corrupt_error(
-            manifest_path,
-            "pinned manifest CAS object does not match its tree hash",
-        ));
-    }
-    let manifest: NormalizedInstanceManifest = serde_json::from_slice(&bytes).map_err(|error| {
-        crate::index::rebuild::store_corrupt_error(manifest_path, error.to_string())
-    })?;
-    let canonical_manifest =
-        canonical_json_bytes(&serde_json::to_value(&manifest).map_err(|error| {
-            crate::index::rebuild::store_corrupt_error(manifest_path, error.to_string())
-        })?)?;
-    if canonical_manifest != bytes {
-        return Err(crate::index::rebuild::store_corrupt_error(
-            manifest_path,
-            "pinned manifest CAS object is not canonical JSON",
-        ));
-    }
     if manifest.raw_hash != raw_hash
         || manifest.tool_profile_hash != normalize.tool_profile_hash
         || manifest.r#gen != normalize.r#gen

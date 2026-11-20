@@ -1,6 +1,7 @@
 use super::{
-    ExtractionBudget, PrepareStageBytesRequest, PrepareStageOutput, PreparedUnit, hash_bytes,
-    office_preparation_profile_hash, prepare_units_emitting, resolve_prepare_converter,
+    ExtractionBudget, PrepareStageBytesRequest, PrepareStageOutput, PreparedUnit,
+    XlsxExtractionProgress, hash_bytes, office_preparation_profile_hash, prepare_units_emitting,
+    resolve_prepare_converter, xlsx_preparation_profile_hash,
 };
 #[cfg(test)]
 use crate::IoResultExt;
@@ -8,9 +9,11 @@ use crate::extraction_stage::{
     SavedStage, child_directory, read_record, stage_error, write_record,
 };
 use crate::{PipelineError, Result};
+use kio_adapter::xlsx_extract::SheetUsage;
 #[cfg(test)]
 use kio_core::cas::MAX_CONTENT_OBJECT_BYTES;
 use kio_core::cas::{ContentObjectKind, ObjectStore, is_hash};
+use kio_core::disk_records::RecordStageRoot;
 use kio_core::store_dir::{Publication, StoreDirectory};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -28,6 +31,8 @@ struct UnitRecord {
     unit: PreparedUnit,
     stage: SavedStage,
     complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sheet_usage: Option<SheetUsage>,
 }
 
 /// A completed extraction whose payloads remain private until persisted.
@@ -45,7 +50,13 @@ pub fn prepare_staged(
 ) -> Result<StagedPreparation> {
     let converter = resolve_prepare_converter(request.media_type, root.control());
     let profile = converter.as_ref().map_or_else(
-        || request.tool_profile_hash.to_owned(),
+        || {
+            if kio_adapter::xlsx_extract::is_xlsx_media(request.media_type) {
+                xlsx_preparation_profile_hash(request.tool_profile_hash)
+            } else {
+                request.tool_profile_hash.to_owned()
+            }
+        },
         |converter| {
             office_preparation_profile_hash(
                 request.tool_profile_hash,
@@ -54,7 +65,33 @@ pub fn prepare_staged(
         },
     );
     prepare_staged_with(root, request, &profile, |completed, emit| {
-        prepare_units_emitting(request, converter.as_ref(), budget, completed, emit)
+        let record_stages = kio_adapter::xlsx_extract::is_xlsx_media(request.media_type)
+            .then(|| {
+                ObjectStore::from_bound_kio_with_control(
+                    root.root_handle().as_ref(),
+                    root.control().clone(),
+                )?
+                .record_stages()
+            })
+            .transpose()
+            .map_err(|error| match error.resource_limit() {
+                Some(limit) => PipelineError::ResourceLimit(limit.clone()),
+                None => PipelineError::RecordStage(error),
+            })?;
+        prepare_units_emitting(
+            request,
+            converter.as_ref(),
+            budget,
+            completed,
+            &mut XlsxExtractionProgress::default(),
+            &mut PreparedUnitSink {
+                durable: emit.durable,
+                declare: emit.declare,
+                write: emit.write,
+                read_sheet_usage: emit.read_sheet_usage,
+                record_stages: record_stages.as_ref(),
+            },
+        )
     })
 }
 
@@ -81,7 +118,11 @@ pub fn prepare_staged_with(
             .join(request.raw_hash.trim_start_matches("sha256:"))
             .join(key.trim_start_matches("sha256:")),
     )?;
-    let output = stage_units(&directory, extract)?;
+    let output = stage_units_checked(
+        &directory,
+        kio_adapter::xlsx_extract::is_xlsx_media(request.media_type),
+        extract,
+    )?;
     if output.prepared_units.iter().any(|unit| {
         unit.preparation_profile_hash != profile || unit.mime.as_deref() != Some(request.media_type)
     }) {
@@ -142,7 +183,7 @@ pub fn publish_prepared_source(root: &StoreDirectory, hash: &str, bytes: &[u8]) 
     )
 }
 
-type UnitWriter<'a> = dyn FnMut(&PreparedUnit, &[u8]) -> Result<()> + 'a;
+type UnitWriter<'a> = dyn FnMut(&PreparedUnit, &[u8], Option<SheetUsage>) -> Result<()> + 'a;
 
 /// A producer declares its expected unit count before writing any bodies.
 /// It can then skip the durable prefix and supply the remaining units in order.
@@ -150,6 +191,8 @@ pub struct PreparedUnitSink<'a> {
     pub(super) durable: bool,
     pub(super) declare: &'a mut dyn FnMut(usize) -> Result<()>,
     pub(super) write: &'a mut UnitWriter<'a>,
+    pub(super) record_stages: Option<&'a RecordStageRoot>,
+    pub(super) read_sheet_usage: &'a dyn Fn(u64) -> Result<SheetUsage>,
 }
 
 impl PreparedUnitSink<'_> {
@@ -158,15 +201,36 @@ impl PreparedUnitSink<'_> {
     }
 
     pub fn write(&mut self, unit: &PreparedUnit, bytes: &[u8]) -> Result<()> {
-        (self.write)(unit, bytes)
+        (self.write)(unit, bytes, None)
+    }
+
+    pub(super) fn write_sheet(
+        &mut self,
+        unit: &PreparedUnit,
+        bytes: &[u8],
+        usage: SheetUsage,
+    ) -> Result<()> {
+        (self.write)(unit, bytes, Some(usage))
     }
 }
 
+#[cfg(test)]
 fn stage_units(
     directory: &StoreDirectory,
     extract: impl FnOnce(&[PreparedUnit], &mut PreparedUnitSink<'_>) -> Result<PrepareStageOutput>,
 ) -> Result<PrepareStageOutput> {
-    if let Some(count) = read_record::<usize>(directory, Path::new(COMPLETE), 64)? {
+    stage_units_checked(directory, false, extract)
+}
+
+fn stage_units_checked(
+    directory: &StoreDirectory,
+    check_sheet_usage: bool,
+    extract: impl FnOnce(&[PreparedUnit], &mut PreparedUnitSink<'_>) -> Result<PrepareStageOutput>,
+) -> Result<PrepareStageOutput> {
+    let already_complete = read_record::<usize>(directory, Path::new(COMPLETE), 64)?;
+    if let Some(count) = already_complete
+        && !check_sheet_usage
+    {
         return Ok(prepared_output(completed_units(directory, count)?));
     }
 
@@ -188,7 +252,13 @@ fn stage_units(
     }
     let layout = Path::new(LAYOUT);
     let declared = read_record::<usize>(directory, layout, 64)?;
-    if declared == Some(completed.len()) {
+    if already_complete.is_some_and(|count| count != completed.len() || declared != Some(count)) {
+        return Err(stage_corrupt(
+            directory,
+            "prepared completion does not match its layout",
+        ));
+    }
+    if declared == Some(completed.len()) && !check_sheet_usage {
         let units = completed_units(directory, completed.len())?;
         write_record(
             directory,
@@ -212,10 +282,18 @@ fn stage_units(
         }
     };
     let mut ready_through = completed.len() as u64;
-    let mut write = |unit: &PreparedUnit, bytes: &[u8]| {
+    let mut write = |unit: &PreparedUnit, bytes: &[u8], sheet_usage: Option<SheetUsage>| {
+        if check_sheet_usage != sheet_usage.is_some()
+            || sheet_usage.is_some_and(|usage| usage.output_bytes != bytes.len() as u64)
+        {
+            return Err(stage_corrupt(
+                directory,
+                "invalid worksheet resource accounting",
+            ));
+        }
         let leaf = unit_record_name(unit.order);
         if let Some(record) = read_record::<UnitRecord>(directory, &leaf, RECORD_BYTES)? {
-            if record.unit != *unit {
+            if record.unit != *unit || record.sheet_usage != sheet_usage {
                 return Err(stage_corrupt(directory, "staged unit identity changed"));
             }
             if record.complete {
@@ -229,6 +307,7 @@ fn stage_units(
             unit: unit.clone(),
             stage,
             complete: false,
+            sheet_usage,
         };
         write_record(directory, &leaf, &record, Publication::Upsert)?;
         directory
@@ -257,6 +336,14 @@ fn stage_units(
             durable: true,
             declare: &mut declare,
             write: &mut write,
+            record_stages: None,
+            read_sheet_usage: &|order| {
+                completed_unit(directory, order)?
+                    .sheet_usage
+                    .ok_or_else(|| {
+                        stage_corrupt(directory, "missing worksheet resource accounting")
+                    })
+            },
         },
     );
     let output = result.map_err(|mut error| {
@@ -283,12 +370,14 @@ fn stage_units(
             "extractor returned a different unit layout",
         ));
     }
-    write_record(
-        directory,
-        Path::new(COMPLETE),
-        &output.prepared_units.len(),
-        Publication::CreateOnly,
-    )?;
+    if already_complete.is_none() {
+        write_record(
+            directory,
+            Path::new(COMPLETE),
+            &output.prepared_units.len(),
+            Publication::CreateOnly,
+        )?;
+    }
     Ok(output)
 }
 
@@ -452,6 +541,44 @@ mod tests {
 
     #[cfg(any(unix, windows))]
     #[test]
+    fn review_completed_sheet_stage_still_runs_budget_admission() {
+        use kio_adapter::xlsx_extract::{SheetProgress, XlsxWorkbook};
+        use kio_core::error::ResourceTier;
+
+        let raw =
+            include_bytes!("../../../kio-eval/acceptance-fixtures/v1/office-public/table.xlsx");
+        let mut book = XlsxWorkbook::open(raw, ResourceTier::Standard).unwrap();
+        let (markdown, usage) = book.read_sheet(0, &mut SheetProgress::default()).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let directory = StoreDirectory::open(tmp.path()).unwrap();
+
+        stage_units_checked(&directory, true, |_, sink| {
+            sink.declare(1)?;
+            let mut prepared = unit(0, markdown.as_bytes());
+            prepared.unit_type = UnitType::Sheet;
+            sink.write_sheet(&prepared, markdown.as_bytes(), usage)?;
+            Ok(prepared_output(vec![prepared]))
+        })
+        .unwrap();
+
+        let limit = ResourceLimit {
+            resource: Resource::Work,
+            stage: "xlsx_extract".to_owned(),
+            limit: Some(5),
+            observed: Some(6),
+            resource_tier: Some(ResourceTier::Standard),
+            page_progress: None,
+        };
+        let outcome = stage_units_checked(&directory, true, |completed, sink| {
+            assert_eq!(completed.len(), 1);
+            assert_eq!((sink.read_sheet_usage)(0)?, usage);
+            Err(PipelineError::ResourceLimit(limit.clone()))
+        });
+        assert!(matches!(outcome, Err(PipelineError::ResourceLimit(actual)) if actual == limit));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
     fn p0_producer_cannot_mark_unwritten_units_complete() {
         let tmp = tempfile::tempdir().unwrap();
         let directory = StoreDirectory::open(tmp.path()).unwrap();
@@ -542,6 +669,7 @@ mod tests {
                     unit: second.clone(),
                     stage,
                     complete: false,
+                    sheet_usage: None,
                 },
                 Publication::CreateOnly,
             )?;

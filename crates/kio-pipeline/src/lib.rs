@@ -23,6 +23,8 @@ pub type Result<T> = std::result::Result<T, PipelineError>;
 pub enum PipelineError {
     #[error("resource limit: {0:?}")]
     ResourceLimit(kio_core::error::ResourceLimit),
+    #[error("{0}")]
+    RecordStage(#[source] kio_core::KioError),
     #[error("{code}: {message}")]
     Contract { code: &'static str, message: String },
     #[error("io error at {path}: {message}")]

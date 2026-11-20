@@ -368,7 +368,7 @@ pub(crate) fn ingest_standalone_image(
         repo.control().clone(),
     )?;
     let stamped =
-        persist_resumable_normalized_units(&directory, &manifest, input_path, |draft, _| {
+        persist_resumable_normalized_units(&directory, manifest, input_path, |draft, _| {
             unit.generated_at.clone_from(&draft.generated_at);
             Ok(std::borrow::Cow::Owned(unit.clone()))
         })
