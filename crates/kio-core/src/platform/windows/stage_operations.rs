@@ -39,7 +39,7 @@ pub(crate) fn open_file(directory: &StoreDirectory, leaf: &Path) -> Result<File>
 }
 
 pub(crate) fn publish(
-    _directory: &StoreDirectory,
+    directory: &StoreDirectory,
     _source: &Path,
     held: &File,
     target: &StoreDirectory,
@@ -59,7 +59,8 @@ pub(crate) fn publish(
         publication != Publication::CreateOnly,
         target.path(),
     )?;
-    target.sync_stage_destination()
+    target.sync_stage_destination()?;
+    directory.sync()
 }
 
 fn retire(held: &File) -> Result<()> {

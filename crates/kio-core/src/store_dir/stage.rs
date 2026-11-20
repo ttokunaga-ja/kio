@@ -302,9 +302,7 @@ impl StageWriter {
             leaf,
             publication,
             identity,
-        )?;
-        directory.sync()?;
-        target.sync()
+        )
     }
 
     /// Sync and publish only this file. The caller retires its durable journal
@@ -348,8 +346,7 @@ impl StageWriter {
             leaf,
             publication,
             &identity,
-        )?;
-        directory.sync()
+        )
     }
 }
 
@@ -476,8 +473,7 @@ impl StoreDirectory {
             leaf,
             publication,
             identity,
-        )?;
-        self.sync()
+        )
     }
 
     /// Discard a crash residue only when both components of its saved identity

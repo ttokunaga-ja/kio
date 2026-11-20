@@ -156,7 +156,7 @@ impl Capture {
             file.sync_all()
                 .map_err(|e| io_failure("cannot sync capture record", e))?;
             capture.directory.sync()?;
-            parent.sync()?;
+            // Creating the capture directory already synced its parent.
         }
         parent.rename_regular_between_raw(
             source,

@@ -880,6 +880,7 @@ pub(crate) fn poll_batch_embedding_jobs(
         execution,
         policy: &current_policy,
         selected_contexts: &selected_contexts,
+        rebuild: None,
         invalidated: std::cell::Cell::new(false),
     };
     refresh_embedding_projection(ctx, repo, &conn, &chunks, &profile, &projection, &held)?;
@@ -1166,7 +1167,7 @@ pub(crate) fn poll_batch_embedding_jobs(
         )?;
         write_through_projection_or_log_for_repo(ctx, repo);
     } else {
-        publish_in_place_delta(ctx, repo.kio_dir(), replica_before.as_deref(), &replica)?;
+        publish_in_place_delta(ctx, repo, replica_before.as_deref(), &replica, None)?;
         if source_written && replica.is_empty() {
             write_through_projection_or_log_for_repo(ctx, repo);
         }

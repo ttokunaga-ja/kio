@@ -11758,7 +11758,7 @@ fn r17_5_shallow_commit_via_hash_tag_and_implicit_head_folds_to_commit_shallow()
     );
 }
 
-// R17-2: `reindex --force` must not let ONE document's corrupt normalized unit abort the
+// R17-2: `reindex --regenerate` must not let ONE document's corrupt normalized manifest abort the
 // whole scope's re-normalization (docs/10 §7.2). R16-4 gave `rebuild_step3_index` this
 // skip-continue resilience, but the pre-rebuild copy loop in `run_reindex` never inherited
 // it — a single STORE-CORRUPT unit killed the reindex (exit 4) and the healthy documents
@@ -11766,7 +11766,16 @@ fn r17_5_shallow_commit_via_hash_tag_and_implicit_head_folds_to_commit_shallow()
 // command. Now the corrupt document is skipped (its previous gen kept) and reported under
 // skipped_units; the healthy document is re-normalized and the scope stays searchable.
 #[test]
-fn r17_2_reindex_force_skips_corrupt_unit_and_renormalizes_healthy() {
+fn r17_2_reindex_regenerate_skips_corrupt_manifest_and_renormalizes_healthy() {
+    check_reindex_regenerate_skips_corrupt_manifest(false);
+}
+
+#[test]
+fn r17_2_reindex_regenerate_projects_healthy_text_after_enrichment() {
+    check_reindex_regenerate_skips_corrupt_manifest(true);
+}
+
+fn check_reindex_regenerate_skips_corrupt_manifest(embed: bool) {
     let dir = canonical_tempdir();
     fs::write(
         dir.path().join("healthy.md"),
@@ -11779,20 +11788,59 @@ fn r17_2_reindex_force_skips_corrupt_unit_and_renormalizes_healthy() {
     )
     .unwrap();
     kio(&dir, &["init"]).assert().success();
-    json_success(&dir, &["index", "--yes"]);
-
-    // Corrupt ONE document's normalized-instance manifest → copy_normalized_instance_gen
-    // raises KIO-E-STORE-CORRUPT-001 for that raw_hash during re-normalization.
-    let units_root = dir.path().join(".kio/objects/normalized_units");
-    let manifest = first_manifest_json(&units_root);
-    let corrupt_raw_hash = {
-        let value: Value = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
-        value["raw_hash"].as_str().unwrap().to_owned()
+    let run = if embed {
+        json_success_deterministic_embed
+    } else {
+        json_success
     };
+    run(&dir, &["index", "--yes"]);
+
+    let repo = kio_core::scope::Repository::open(dir.path()).unwrap();
+    let read_head_entries = || {
+        let head = repo.head_commit_hash().unwrap().unwrap();
+        let commit = repo.read_commit(&head).unwrap();
+        repo.read_tree(&commit.tree)
+            .unwrap()
+            .entries
+            .to_vec()
+            .unwrap()
+    };
+    let before = read_head_entries();
+    let corrupt = before
+        .iter()
+        .find(|entry| entry.path == "corrupt.md")
+        .unwrap();
+    let previous = corrupt.normalize.as_ref().unwrap();
+    // Regeneration reads the immutable manifest pinned by HEAD.
+    let manifest = object_path(repo.kio_dir(), "manifests", &previous.manifest_hash);
+    let old_head = head_commit(repo.kio_dir());
+    let corrupt_query = [
+        "search",
+        "corrupttoken",
+        "--mode",
+        "text",
+        "--scope",
+        dir.path().to_str().unwrap(),
+        "--at",
+        &old_head,
+    ];
+    let before_corruption = json_success(&dir, &corrupt_query);
+    assert!(!before_corruption["results"].as_array().unwrap().is_empty());
     fs::write(&manifest, r#"{"torn":"#).unwrap();
+    let repair = json_failure(&dir, &["repair", "rebuild-db"], 4);
+    assert_eq!(repair["error_code"], "KIO-E-STORE-CORRUPT-001");
+    if embed {
+        // Exercise a fresh write-through from enrichment after reindex.
+        let store = ObjectStore::new(repo.kio_dir());
+        let hashes = store.embedding_hashes().unwrap();
+        assert!(!hashes.is_empty());
+        for hash in hashes {
+            fs::remove_file(store.embedding_path(&hash).unwrap()).unwrap();
+        }
+    }
 
     // Before the fix: exit 4 (KIO-E-STORE-CORRUPT-001), no re-normalization at all.
-    let out = json_success(&dir, &["reindex", "--regenerate", "--yes"]);
+    let out = run(&dir, &["reindex", "--regenerate", "--yes"]);
     // The healthy document IS re-normalized (the loop no longer dies on the corrupt one).
     assert_eq!(
         out["reindexed_files"].as_u64().unwrap(),
@@ -11807,19 +11855,44 @@ fn r17_2_reindex_force_skips_corrupt_unit_and_renormalizes_healthy() {
     );
     assert_eq!(skipped[0]["reason"], "KIO-E-STORE-CORRUPT-001");
     assert_eq!(
-        skipped[0]["raw_hash"], corrupt_raw_hash,
+        skipped[0]["raw_hash"], corrupt.raw_hash,
         "the skip names the corrupted document: {out}"
     );
     assert!(
         out["skipped_units_guidance"].as_str().is_some(),
         "the skip is loudly disclosed: {out}"
     );
+    let after = read_head_entries();
+    let kept = after
+        .iter()
+        .find(|entry| entry.path == "corrupt.md")
+        .unwrap();
+    assert_eq!(kept.normalize, corrupt.normalize);
+    let healthy_before = before
+        .iter()
+        .find(|entry| entry.path == "healthy.md")
+        .unwrap();
+    let healthy_after = after
+        .iter()
+        .find(|entry| entry.path == "healthy.md")
+        .unwrap();
+    assert_eq!(
+        healthy_after.normalize.as_ref().unwrap().r#gen,
+        healthy_before.normalize.as_ref().unwrap().r#gen + 1
+    );
     // The scope is not bricked — the healthy document still searches after the reindex.
-    let search = json_success(&dir, &["search", "healthytoken"]);
+    let search = if embed {
+        assert!(out["embedding_tasks_executed"].as_u64().unwrap() > 0);
+        run(&dir, &["search", "healthytoken", "--mode", "text"])
+    } else {
+        json_success(&dir, &["search", "healthytoken"])
+    };
     assert!(
         !search["results"].as_array().unwrap().is_empty(),
         "healthy document searchable after reindex: {search}"
     );
+    let corrupt_history = json_success(&dir, &corrupt_query);
+    assert!(corrupt_history["results"].as_array().unwrap().is_empty());
 }
 
 // R17-4: when EVERY searched scope is excluded for a store-corruption class the search

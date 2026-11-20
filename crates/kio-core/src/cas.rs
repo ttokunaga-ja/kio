@@ -3329,13 +3329,10 @@ mod tests {
     }
 
     #[test]
-    fn st04_keeps_derived_object_limits() {
+    fn raw_and_prepared_have_no_fixed_cas_limit() {
         assert_eq!(ObjectKind::Raw.max_bytes(), u64::MAX);
-        for kind in [
-            ContentObjectKind::Prepared,
-            ContentObjectKind::Image,
-            ContentObjectKind::Toollock,
-        ] {
+        assert_eq!(ContentObjectKind::Prepared.max_bytes(), u64::MAX);
+        for kind in [ContentObjectKind::Image, ContentObjectKind::Toollock] {
             assert_eq!(kind.max_bytes(), 512 * 1024 * 1024);
         }
     }

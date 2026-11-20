@@ -54,7 +54,7 @@ use crate::object_persistence::pipeline_to_kio;
 use crate::search::projection::publish_in_place_delta;
 use crate::search::projection::replica_now_ms;
 use crate::search::projection::replica_scope_stamp;
-use crate::search::projection::write_through_projection_or_log_for_repo;
+use crate::search::projection::write_through_repository_projection;
 use crate::search::query::ensure_snapshot_tree_entries;
 use crate::search::query::snapshot_chunking_config_hash;
 use crate::search::scope::aggregator_path;
@@ -294,7 +294,7 @@ fn run_embedding_enrichment_for_instances(
         projection_instances,
         None,
         Some(&current_policy),
-        replay,
+        replay.as_deref_mut(),
     )?;
     let selected_contexts = selected_embedding_contexts(&projection_chunks, &current_policy)?;
     let projection_chunks = bind_embedding_work(projection_chunks, &profile)?;
@@ -407,6 +407,7 @@ fn run_embedding_enrichment_for_instances(
             execution,
             policy: &current_policy,
             selected_contexts: &selected_contexts,
+            rebuild: replay.as_deref(),
             invalidated: std::cell::Cell::new(false),
         },
     };
@@ -596,7 +597,13 @@ fn run_embedding_enrichment_for_instances(
             // `chunk_vec` with no adapter call and no rebuild, and a vector
             // appearing is exactly the kind of change LC25 retires cursors for.
             current_policy.revalidate().map_err(pipeline_to_kio)?;
-            publish_in_place_delta(ctx, repo.kio_dir(), replica_before.as_deref(), &replica)?;
+            publish_in_place_delta(
+                ctx,
+                repo,
+                replica_before.as_deref(),
+                &replica,
+                embedding_context.projection.rebuild,
+            )?;
             outcome.add(submitted);
             return Ok(outcome);
         }
@@ -1207,9 +1214,15 @@ fn run_embedding_enrichment_for_instances(
     // there nothing else rotates at all — leaving both the cursor contract and
     // the replica's only staleness signal on a stamp that never moves.
     current_policy.revalidate().map_err(pipeline_to_kio)?;
-    publish_in_place_delta(ctx, repo.kio_dir(), replica_before.as_deref(), &replica)?;
+    publish_in_place_delta(
+        ctx,
+        repo,
+        replica_before.as_deref(),
+        &replica,
+        embedding_context.projection.rebuild,
+    )?;
     if outcome.executed > 0 && replica.is_empty() {
-        write_through_projection_or_log_for_repo(ctx, repo);
+        write_through_repository_projection(ctx, repo, embedding_context.projection.rebuild);
     }
     for mut claim in local_publications {
         claim.publish()?;
@@ -1453,6 +1466,7 @@ pub(crate) struct EmbeddingProjection<'a> {
     pub(crate) execution: EmbeddingExecution,
     pub(crate) policy: &'a CurrentPolicyEvaluator,
     pub(crate) selected_contexts: &'a BTreeMap<String, Option<String>>,
+    pub(crate) rebuild: Option<&'a RebuildAuthorities>,
     pub(crate) invalidated: std::cell::Cell<bool>,
 }
 
@@ -1551,7 +1565,7 @@ pub(crate) fn refresh_embedding_projection(
     if expected == existing {
         if !embedding_replica_projection_is_current(repo) {
             projection.policy.revalidate().map_err(pipeline_to_kio)?;
-            write_through_projection_or_log_for_repo(ctx, repo);
+            write_through_repository_projection(ctx, repo, projection.rebuild);
         }
         return Ok(());
     }
@@ -1571,7 +1585,7 @@ pub(crate) fn refresh_embedding_projection(
     )
     .map_err(index_to_kio)?;
     projection.policy.revalidate().map_err(pipeline_to_kio)?;
-    write_through_projection_or_log_for_repo(ctx, repo);
+    write_through_repository_projection(ctx, repo, projection.rebuild);
     Ok(())
 }
 
