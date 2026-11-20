@@ -3,6 +3,8 @@
 use std::path::PathBuf;
 
 /// A request accepted by Kio's application layer.
+pub use kio_core::error::ResourceTier;
+
 #[derive(Debug, Clone)]
 pub enum CommandRequest {
     /// Initialize a scope.
@@ -162,6 +164,7 @@ pub struct GcArgs {
 
 #[derive(Debug, Clone)]
 pub struct IndexArgs {
+    pub resource_tier: ResourceTier,
     pub max_file_bytes: Option<u64>,
     pub max_total_bytes: Option<u64>,
     pub preview: bool,
@@ -359,6 +362,7 @@ pub struct RepairCancelChildInitializationArgs {
 
 #[derive(Debug, Clone)]
 pub struct RepairRebuildDbArgs {
+    pub resource_tier: ResourceTier,
     pub online: bool,
     pub offline: bool,
     pub realtime: bool,
@@ -378,6 +382,7 @@ pub struct RepairRegistryPruneArgs {
 
 #[derive(Debug, Clone)]
 pub struct ReindexArgs {
+    pub resource_tier: ResourceTier,
     pub regenerate: bool,
     pub at: Option<String>,
     pub yes: bool,

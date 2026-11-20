@@ -229,15 +229,20 @@ fn open_cache_derives_a_portable_leaf_from_hostile_logical_basename() {
     let parent = repo.read_commit(&parent_hash).unwrap();
     let mut tree = repo.read_tree(&parent.tree).unwrap();
     let raw_hash = pointer["raw_hash"].as_str().unwrap();
-    tree.entries
+    let mut entries = tree.entries.to_vec().unwrap();
+    entries
         .iter_mut()
         .find(|entry| entry.raw_hash == raw_hash)
         .unwrap()
         .path = hostile.to_owned();
     // Historical logical names are validated independently of this host's
     // materialization rules. Preserve the authentic parent chunking identity.
-    tree.entries
-        .sort_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
+    entries.sort_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
+    tree.entries = kio_core::disk_records::DiskRecords::from_records(
+        &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+        entries,
+    )
+    .unwrap();
     tree.validate().unwrap();
     let store = ObjectStore::new(repo.kio_dir());
     let (tree_hash, _) = store

@@ -613,6 +613,14 @@ fn request_mistral_ocr_at_with_limits(
         .send(&body)
         .map_err(|error| match error {
             ureq::Error::Timeout(_) => OcrEvalError::Timeout(limits.global_timeout),
+            ureq::Error::Io(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                OcrEvalError::Timeout(limits.global_timeout)
+            }
             _ => OcrEvalError::Invalid("Mistral OCR network request failed"),
         })?;
     if !response.status().is_success() {
@@ -831,9 +839,9 @@ pub fn write_report_create_only(
         serde_jcs::to_vec(report).map_err(|error| OcrEvalError::Artifact(error.to_string()))?;
     let mut canonical = bytes;
     canonical.push(b'\n');
-    match crate::persona_artifact::publish_create_only(path, &canonical, MAX_JSON_BYTES) {
+    match crate::strict_artifact::publish_create_only(path, &canonical, MAX_JSON_BYTES) {
         Ok(_) => Ok(()),
-        Err(crate::persona_artifact::PersonaArtifactError::AlreadyExists(_)) => {
+        Err(crate::strict_artifact::StrictArtifactError::AlreadyExists(_)) => {
             Err(OcrEvalError::ReportAlreadyExists(path.to_owned()))
         }
         Err(error) => Err(OcrEvalError::Artifact(error.to_string())),
@@ -850,9 +858,9 @@ pub fn write_response_create_only(path: &Path, response: &OcrResponse) -> Result
     let mut canonical =
         serde_jcs::to_vec(&parsed).map_err(|error| OcrEvalError::Artifact(error.to_string()))?;
     canonical.push(b'\n');
-    match crate::persona_artifact::publish_create_only(path, &canonical, MAX_JSON_BYTES) {
+    match crate::strict_artifact::publish_create_only(path, &canonical, MAX_JSON_BYTES) {
         Ok(_) => Ok(()),
-        Err(crate::persona_artifact::PersonaArtifactError::AlreadyExists(_)) => {
+        Err(crate::strict_artifact::StrictArtifactError::AlreadyExists(_)) => {
             Err(OcrEvalError::ReportAlreadyExists(path.to_owned()))
         }
         Err(error) => Err(OcrEvalError::Artifact(error.to_string())),
@@ -1009,13 +1017,13 @@ fn pdf_page_count(bytes: &[u8]) -> Result<u32, OcrEvalError> {
 fn bind_strict_input(
     path: &Path,
     maximum: u64,
-) -> Result<crate::persona_artifact::StrictArtifact, OcrEvalError> {
+) -> Result<crate::strict_artifact::StrictArtifact, OcrEvalError> {
     if !path.is_absolute() {
         return Err(OcrEvalError::AdapterPath(path.to_owned()));
     }
     let maximum = usize::try_from(maximum)
         .map_err(|_| OcrEvalError::DocumentBinding("input byte bound is unsupported"))?;
-    crate::persona_artifact::bind_strict(path, maximum).map_err(|_| {
+    crate::strict_artifact::bind_strict(path, maximum).map_err(|_| {
         OcrEvalError::DocumentBinding("input is not a stable bounded single-link regular file")
     })
 }

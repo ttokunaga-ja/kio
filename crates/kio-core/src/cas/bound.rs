@@ -13,10 +13,44 @@ pub(crate) fn fail_next_raw_write() {
 }
 
 use super::*;
+use crate::disk_records::{RecordSorter, RecordStageRoot};
+use crate::store_dir::{StageEntryState, StageIdentity};
+use std::ffi::OsString;
 
-struct RawStageDirectories {
+#[derive(Serialize, Deserialize)]
+enum RawStageEntry {
+    JournalError(String),
+    Expected {
+        source: OsString,
+        identity: StageIdentity,
+        capture: bool,
+    },
+    Present,
+}
+
+impl RawStageEntry {
+    // For a matched name consume saved identities before the observed leaf.
+    // Capture identities take precedence, in journal-name order.
+    fn order(&self) -> (u8, Option<&OsString>) {
+        match self {
+            Self::JournalError(_) => (0, None),
+            Self::Expected {
+                source, capture, ..
+            } => (1 + u8::from(*capture), Some(source)),
+            Self::Present => (3, None),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct RawStageDirectories {
     stages: crate::store_dir::StoreDirectory,
     journals: Option<crate::store_dir::StoreDirectory>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static RAW_STAGE_BUFFER_PEAK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl BoundObjectDirs {
@@ -72,6 +106,17 @@ impl BoundObjectDirs {
         Ok(())
     }
 
+    pub(super) fn record_stage_directory(
+        &self,
+        control: crate::control::ControlHandle,
+    ) -> Result<crate::store_dir::StoreDirectory> {
+        crate::store_dir::StoreDirectory::from_retained_with_control(
+            self.kio.try_clone().kio_io(Path::new(".kio"))?,
+            PathBuf::from(".kio"),
+            control,
+        )
+    }
+
     fn raw_stage_directories(&self, create: bool) -> Result<Option<RawStageDirectories>> {
         let internal = match bound_open_or_create_dir(&self.kio, "internal", create) {
             Err(error) if !create && error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => {
@@ -97,69 +142,172 @@ impl BoundObjectDirs {
         let Some(stages) = open("raw-stages")? else {
             return Ok(None);
         };
-        Ok(Some(RawStageDirectories { stages, journals }))
+        let fresh = RawStageDirectories { stages, journals };
+        if let Some(fresh_journals) = &fresh.journals {
+            let mut cached = self
+                .stage_directories
+                .lock()
+                .map_err(|_| bound_stage_corrupt("stage directories lock poisoned"))?;
+            if let Some(retained) = cached.as_ref() {
+                if !same_bound_directory(
+                    &retained.stages.root_handle(),
+                    &fresh.stages.root_handle(),
+                )? || !same_bound_directory(
+                    &retained
+                        .journals
+                        .as_ref()
+                        .expect("cached journals")
+                        .root_handle(),
+                    &fresh_journals.root_handle(),
+                )? {
+                    return Err(bound_stage_corrupt(
+                        "stage directory replaced during ingest",
+                    ));
+                }
+                return Ok(Some(retained.clone()));
+            }
+            *cached = Some(fresh.clone());
+        }
+        Ok(Some(fresh))
     }
 
-    pub(super) fn inspect_raw_stages(
+    pub(super) fn visit_raw_stages(
         &self,
+        root: &RecordStageRoot,
         cleanup: bool,
-    ) -> Result<Vec<crate::cas::RawStageResidue>> {
-        use crate::store_dir::{StageEntryState, StageIdentity};
-        let mut residues = Vec::new();
+        mut emit: impl FnMut(RawStageResidue) -> Result<()>,
+    ) -> Result<()> {
         if let Some(RawStageDirectories { stages, journals }) = self.raw_stage_directories(false)? {
-            let mut expected = Vec::new();
+            let mut inventory =
+                RecordSorter::new(root, |a: &((bool, OsString), RawStageEntry), b| {
+                    a.0.cmp(&b.0).then_with(|| a.1.order().cmp(&b.1.order()))
+                });
             if let Some(journals) = &journals {
                 if cleanup {
                     journals.recover_atomic(&[journals])?;
                 }
-                for entry in journals.inspect_stages(&[], &[])? {
-                    if entry.name == crate::store_dir::ATOMIC_WORKSPACE_DIR {
+                for entry in cap_primitives::fs::read_base_dir(&journals.root_handle())
+                    .map_err(|e| KioError::io(e.to_string(), "raw-stage-identities"))?
+                {
+                    let name = entry
+                        .map_err(|e| KioError::io(e.to_string(), "raw-stage-identities"))?
+                        .file_name();
+                    if name == crate::store_dir::ATOMIC_WORKSPACE_DIR {
                         continue;
                     }
-                    let leaf = PathBuf::from(&entry.name);
-                    match journals.read_optional(&leaf, 4096).and_then(|bytes| {
-                        serde_json::from_slice::<StageIdentity>(&bytes.unwrap_or_default())
-                            .map_err(|error| bound_stage_corrupt(&error.to_string()))
-                    }) {
-                        Ok(identity) => expected.push((leaf, identity)),
-                        Err(error) => residues.push(RawStageResidue {
-                            path: format!("internal/raw-stage-identities/{}", leaf.display()),
-                            reason: error.to_string(),
-                        }),
+                    let identity =
+                        journals
+                            .read_optional(Path::new(&name), 4096)
+                            .and_then(|bytes| {
+                                serde_json::from_slice::<StageIdentity>(&bytes.unwrap_or_default())
+                                    .map_err(|error| bound_stage_corrupt(&error.to_string()))
+                            });
+                    match identity {
+                        Ok(identity) => {
+                            if let Some(capture) =
+                                crate::platform::stage_operations::capture_name(&identity)?
+                            {
+                                inventory.push((
+                                    (true, capture.into_os_string()),
+                                    RawStageEntry::Expected {
+                                        source: name.clone(),
+                                        identity: identity.clone(),
+                                        capture: true,
+                                    },
+                                ))?;
+                            }
+                            inventory.push((
+                                (true, name.clone()),
+                                RawStageEntry::Expected {
+                                    source: name,
+                                    identity,
+                                    capture: false,
+                                },
+                            ))?;
+                        }
+                        Err(error) => inventory.push((
+                            (false, name),
+                            RawStageEntry::JournalError(error.to_string()),
+                        ))?,
                     }
                 }
             }
-            let mut retired = std::collections::BTreeSet::new();
-            for entry in stages.inspect_stages(&expected, &[])? {
-                let leaf = PathBuf::from(&entry.name);
-                let source = match &entry.state {
-                    StageEntryState::Captured { source, .. } => source,
-                    _ => &leaf,
-                };
-                if retired.contains(source) {
-                    continue;
-                }
-                let identity = expected
-                    .iter()
-                    .find(|(name, _)| name == source)
-                    .map(|(_, id)| id);
-                if cleanup
-                    && let Some(identity) = identity
-                    && !matches!(entry.state, StageEntryState::Unidentified { .. })
-                {
-                    stages.discard_stage(source, identity)?;
-                    journals
-                        .as_ref()
-                        .expect("saved stage journal")
-                        .remove_file(source)?;
-                    retired.insert(source.clone());
-                    continue;
-                }
-                if !matches!(entry.state, StageEntryState::Missing) {
-                    residues.push(RawStageResidue {
-                        path: format!("internal/raw-stages/{}", leaf.display()),
-                        reason: format!("{:?}", entry.state),
-                    });
+            for entry in cap_primitives::fs::read_base_dir(&stages.root_handle())
+                .map_err(|e| KioError::io(e.to_string(), "raw-stages"))?
+            {
+                let name = entry
+                    .map_err(|e| KioError::io(e.to_string(), "raw-stages"))?
+                    .file_name();
+                inventory.push(((true, name), RawStageEntry::Present))?;
+            }
+            #[cfg(test)]
+            RAW_STAGE_BUFFER_PEAK.set(inventory.peak_buffered_records());
+            let mut expected = None;
+            for row in inventory.finish()? {
+                let ((_, name), entry) = row?;
+                match entry {
+                    RawStageEntry::JournalError(reason) => emit(RawStageResidue {
+                        path: format!("internal/raw-stage-identities/{}", name.to_string_lossy()),
+                        reason,
+                    })?,
+                    RawStageEntry::Expected {
+                        source,
+                        identity,
+                        capture,
+                    } => {
+                        expected = Some((name, source, identity, capture));
+                    }
+                    RawStageEntry::Present => {
+                        let leaf = Path::new(&name);
+                        let saved = expected.take().filter(|(key, ..)| key == &name);
+                        let state = match &saved {
+                            Some((_, source, identity, capture)) => {
+                                let journals = journals.as_ref().expect("saved stage journal");
+                                // A capture may already have retired this source and its journal.
+                                if cleanup && !journals.contains_entry(Path::new(source))? {
+                                    continue;
+                                }
+                                if *capture {
+                                    match crate::platform::stage_operations::inspect_capture(
+                                        &stages, leaf, identity,
+                                    ) {
+                                        Ok(payload_present) => StageEntryState::Captured {
+                                            source: PathBuf::from(source),
+                                            payload_present,
+                                        },
+                                        Err(error) => StageEntryState::Unidentified {
+                                            reason: error.message().to_owned(),
+                                        },
+                                    }
+                                } else {
+                                    match stages.verify_named_file_stage(leaf, identity) {
+                                        Ok(()) => StageEntryState::Owned,
+                                        Err(error) => StageEntryState::Unidentified {
+                                            reason: error.message().to_owned(),
+                                        },
+                                    }
+                                }
+                            }
+                            None => StageEntryState::Unidentified {
+                                reason: "no saved stage identity; residue preserved".to_owned(),
+                            },
+                        };
+                        if cleanup
+                            && let Some((_, source, identity, _)) = saved
+                            && !matches!(state, StageEntryState::Unidentified { .. })
+                        {
+                            stages.discard_stage(Path::new(&source), &identity)?;
+                            journals
+                                .as_ref()
+                                .expect("saved stage journal")
+                                .remove_file(Path::new(&source))?;
+                        } else {
+                            emit(RawStageResidue {
+                                path: format!("internal/raw-stages/{}", leaf.display()),
+                                reason: format!("{state:?}"),
+                            })?;
+                        }
+                    }
                 }
             }
         }
@@ -172,13 +320,36 @@ impl BoundObjectDirs {
                 .map_err(|e| KioError::io(e.to_string(), "raw"))?
                 .file_name();
             if name.as_encoded_bytes().starts_with(b".ingest-") {
-                residues.push(RawStageResidue {
+                emit(RawStageResidue {
                     path: format!("objects/raw/{}", name.to_string_lossy()),
                     reason: "unidentified stage: no saved identity".into(),
-                });
+                })?;
             }
         }
-        Ok(residues)
+        Ok(())
+    }
+
+    pub(super) fn reopen_saved_stage(&self, saved: &SavedRawStage) -> Result<BoundRawStage> {
+        // A record is private, but still validate its leaf before any access.
+        if !saved.name.starts_with("raw-") || saved.name.contains('/') || saved.name.contains('\\')
+        {
+            return Err(bound_stage_corrupt("invalid saved stage name"));
+        }
+        let dirs = self
+            .raw_stage_directories(false)?
+            .ok_or_else(|| bound_stage_corrupt("missing stage directory"))?;
+        Ok(BoundRawStage {
+            parent: Arc::clone(&self.raw),
+            directory: dirs.stages,
+            journals: dirs
+                .journals
+                .ok_or_else(|| bound_stage_corrupt("missing stage journals"))?,
+            name: saved.name.clone(),
+            writer: None,
+            identity: saved.identity.clone(),
+            raw_hash: saved.raw_hash.clone(),
+            size_bytes: saved.size_bytes,
+        })
     }
 
     pub(super) fn stage_raw_from_reader<R: Read>(
@@ -231,7 +402,7 @@ impl BoundObjectDirs {
                 .min(buffer.len() as u64) as usize;
             let count = reader
                 .read(&mut buffer[..cap])
-                .kio_io(Path::new(&stage.name))?;
+                .map_err(|error| stream_error(error, Path::new(&stage.name)))?;
             if count == 0 {
                 break;
             }
@@ -266,23 +437,33 @@ impl BoundObjectDirs {
             }
         }
         stage.writer.as_ref().expect("live stage").sync()?;
+        // Keep the durable identity, not one open handle per input file.
+        drop(stage.writer.take());
         stage.raw_hash = format!("sha256:{}", lower_hex(&hasher.finalize()));
         Ok(stage)
     }
 
-    pub(super) fn publish_raw_stage(&self, mut stage: BoundRawStage) -> Result<(String, u64)> {
+    pub(super) fn publish_raw_stage(&self, stage: BoundRawStage) -> Result<(String, u64)> {
+        self.publish_stage(ObjectKind::Raw, stage)
+    }
+
+    pub(super) fn publish_stage(
+        &self,
+        kind: ObjectKind,
+        mut stage: BoundRawStage,
+    ) -> Result<(String, u64)> {
         if !same_bound_directory(&stage.parent, &self.raw)? {
             return Err(KioError::invalid_usage(
                 "raw stage belongs to another store",
             ));
         }
         stage.verify()?;
-        let (parent, leaf) = self.fanout(ObjectKind::Raw, &stage.raw_hash, true)?;
+        let (parent, leaf) = self.fanout(kind, &stage.raw_hash, true)?;
         match bound_read_verified(
             &CasReadAccess::Unmetered,
             &parent,
             &leaf,
-            ObjectKind::Raw,
+            kind,
             &stage.raw_hash,
             false,
         ) {
@@ -298,11 +479,7 @@ impl BoundObjectDirs {
                     parent.try_clone().kio_io(Path::new(&leaf))?,
                     PathBuf::from("raw fanout"),
                 )?;
-                stage.writer.take().expect("live stage").publish(
-                    &target,
-                    Path::new(&leaf),
-                    crate::store_dir::Publication::CreateOnly,
-                )?;
+                stage.publish_saved_to(&target, Path::new(&leaf))?;
             }
             Err(error) => return Err(error),
         }
@@ -310,7 +487,7 @@ impl BoundObjectDirs {
             &CasReadAccess::Unmetered,
             &parent,
             &leaf,
-            ObjectKind::Raw,
+            kind,
             &stage.raw_hash,
             false,
         )?;
@@ -320,10 +497,6 @@ impl BoundObjectDirs {
         stage.journals.remove_file(Path::new(&stage.name))?;
         stage.name.clear();
         Ok((stage.raw_hash.clone(), size))
-    }
-
-    pub(super) fn cleanup_raw_ingest_orphans(&self) -> Result<()> {
-        self.inspect_raw_stages(true).map(|_| ())
     }
 
     fn dir(&self, kind: ObjectKind) -> &File {
@@ -673,7 +846,7 @@ impl BoundObjectDirs {
         }
         let hash = hash_bytes(bytes);
         let (parent, leaf) = self.content_fanout(kind, &hash, true)?;
-        write_bound_content_at(&parent, &leaf, kind, &hash, bytes).map(|()| hash)
+        write_bound_content_at(&parent, &leaf, &hash, bytes).map(|()| hash)
     }
 
     pub(super) fn read_content_object_bytes(
@@ -735,6 +908,20 @@ impl BoundObjectDirs {
             return Err(KioError::invalid_usage("invalid hash"));
         }
         for kind in [ObjectKind::Tree, ObjectKind::Commit, ObjectKind::Raw] {
+            if kind == ObjectKind::Tree {
+                match self
+                    .fanout(kind, hash, false)
+                    .and_then(|(parent, leaf)| bound_open_regular_handle(&parent, &leaf))
+                {
+                    Ok(_) => {
+                        return Err(KioError::invalid_usage(
+                            "tree objects require streaming read_tree or copy_object_to",
+                        ));
+                    }
+                    Err(error) if error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => continue,
+                    Err(error) => return Err(error),
+                }
+            }
             match self.read_object_with_size(reads, kind, hash) {
                 Ok((object, _)) => return Ok(object),
                 Err(error) if error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => continue,
@@ -836,6 +1023,37 @@ mod tests {
     }
 
     #[test]
+    fn raw_stage_inventory_and_recovery_use_a_fixed_record_buffer() {
+        let limit = crate::disk_records::SORT_BUFFER_RECORDS;
+        for count in [limit + 1, limit * 2 + 1] {
+            let fixture = tempfile::tempdir().unwrap();
+            let repo = crate::scope::Repository::init(fixture.path()).unwrap();
+            let store = repo.object_store();
+            for _ in 0..count {
+                abandoned_stage(&repo);
+            }
+            let residues = repo.status().unwrap().stage_residues;
+            assert_eq!(residues.len(), count);
+            let mut previous = String::new();
+            for entry in residues {
+                let entry = entry.unwrap();
+                assert!(previous < entry.path);
+                previous = entry.path;
+            }
+            assert!(
+                RAW_STAGE_BUFFER_PEAK.get() <= limit,
+                "inventory retained too many saved identities"
+            );
+            store.cleanup_bound_raw_stages().unwrap();
+            assert!(
+                RAW_STAGE_BUFFER_PEAK.get() <= limit,
+                "recovery retained too many saved identities"
+            );
+            assert!(store.inspect_raw_stages().unwrap().is_empty());
+        }
+    }
+
+    #[test]
     fn st04_recovery_uses_saved_identity_and_preserves_replacement() {
         let dir = tempfile::tempdir().unwrap();
         let repo = crate::scope::Repository::init(dir.path()).unwrap();
@@ -849,8 +1067,8 @@ mod tests {
             repo.object_store()
                 .inspect_raw_stages()
                 .unwrap()
-                .iter()
                 .any(|entry| entry.path.ends_with(&name))
+                .unwrap()
         );
         repo.object_store().cleanup_bound_raw_stages().unwrap();
         assert!(!stage.exists());
@@ -870,8 +1088,8 @@ mod tests {
         let entries = repo.object_store().inspect_raw_stages().unwrap();
         assert!(
             entries
-                .iter()
                 .any(|entry| entry.path.ends_with(&name) && entry.reason.contains("Unidentified"))
+                .unwrap()
         );
         drop(held);
     }

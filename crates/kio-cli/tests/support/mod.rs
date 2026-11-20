@@ -130,3 +130,76 @@ pub fn home_env(root: &std::path::Path) -> [(&'static str, std::path::PathBuf); 
         ("XDG_CACHE_HOME", root.join(".test-cache")),
     ]
 }
+
+/// Publish the already-indexed generation under the renamed working filename.
+#[allow(dead_code)]
+pub fn bind_renamed_normalize(root: &std::path::Path, old_name: &str, new_name: &str) {
+    use kio_core::scope::{PendingNormalizeRef, Repository};
+    use std::collections::BTreeSet;
+    let repo = Repository::open(root).unwrap();
+    let head = repo
+        .read_commit(&repo.head_commit_hash().unwrap().unwrap())
+        .unwrap();
+    let tree = repo.read_tree(&head.tree).unwrap();
+    assert!(
+        tree.find_entry(old_name)
+            .unwrap()
+            .unwrap()
+            .normalize
+            .is_some()
+    );
+    std::fs::rename(root.join(old_name), root.join(new_name)).unwrap();
+    let references = tree
+        .entries
+        .iter()
+        .map(Result::unwrap)
+        .filter_map(|entry| {
+            let path = if entry.path == old_name {
+                new_name.to_owned()
+            } else {
+                entry.path
+            };
+            Some((
+                path,
+                PendingNormalizeRef {
+                    expected_raw_hash: entry.raw_hash,
+                    normalize: entry.normalize?,
+                },
+            ))
+        })
+        .collect();
+    repo.auto_snapshot_with_bound_normalize(
+        None,
+        None,
+        &|_| true,
+        &references,
+        &BTreeSet::new(),
+        None,
+    )
+    .unwrap();
+}
+
+/// 05 §1.7.2 / §4.2 (2026-08-11): `kio view --json` stopped returning a
+/// `text` field -- it resolves to a full-text normalized view path plus a
+/// view-local byte span instead. This is the only way left to recover
+/// chunk-adjacent text from `view`'s JSON, and exercising it (read the file,
+/// slice by the reported offsets) is what actually proves the unit-local ->
+/// view-local offset translation is correct, unlike a plain field-content
+/// assertion on the old `text` field ever did.
+#[allow(dead_code)]
+pub fn view_slice(viewed: &serde_json::Value) -> String {
+    let view_path = viewed["view_path"]
+        .as_str()
+        .unwrap_or_else(|| panic!("view_path must be a resolvable path: {viewed}"));
+    let start = viewed["view_byte_start"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("view_byte_start must be present: {viewed}"))
+        as usize;
+    let end = viewed["view_byte_end"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("view_byte_end must be present: {viewed}"))
+        as usize;
+    let bytes = std::fs::read(view_path)
+        .unwrap_or_else(|err| panic!("failed to read view_path {view_path}: {err}"));
+    String::from_utf8(bytes[start..end].to_vec()).unwrap()
+}

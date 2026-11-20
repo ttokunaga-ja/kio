@@ -21,6 +21,7 @@ enum Change {
 
 fn index_args(online: bool) -> IndexArgs {
     IndexArgs {
+        resource_tier: kio_core::error::ResourceTier::Standard,
         max_file_bytes: None,
         max_total_bytes: None,
         preview: false,

@@ -236,6 +236,7 @@ pub(crate) fn open_regular_for_removal(
     relative: &Path,
     max: u64,
     label: &Path,
+    _verify_stage_nonce: bool,
 ) -> Result<File> {
     open_regular_read(root, relative, max, label)
 }
@@ -245,6 +246,22 @@ pub(crate) fn read_optional(
     max: u64,
     label: &Path,
 ) -> Result<Option<Vec<u8>>> {
+    read_optional_with(root, relative, max, label, |reader| {
+        let mut bytes = Vec::new();
+        reader
+            .read_to_end(&mut bytes)
+            .map_err(|error| ioerr(&full(label, relative), error))?;
+        Ok(bytes)
+    })
+}
+
+pub(crate) fn read_optional_with<T>(
+    root: &File,
+    relative: &Path,
+    max: u64,
+    label: &Path,
+    read: impl FnOnce(&mut dyn Read) -> Result<T>,
+) -> Result<Option<T>> {
     let Some((parent, leaf)) = parent_optional(root, relative, label)? else {
         return Ok(None);
     };
@@ -256,16 +273,15 @@ pub(crate) fn read_optional(
     if before.len() > max {
         return Err(err(&p, "store file exceeds byte limit"));
     }
-    let mut data = Vec::with_capacity(before.len() as usize);
-    Read::by_ref(&mut file)
-        .take(max.saturating_add(1))
-        .read_to_end(&mut data)
-        .map_err(|e| ioerr(&p, e))?;
+    let limit = max.saturating_add(1);
+    let mut reader = Read::by_ref(&mut file).take(limit);
+    let value = read(&mut reader)?;
+    let read_bytes = limit - reader.limit();
     let after = safe_regular(&file, &p)?;
-    if data.len() as u64 > max || !same(&before, &after) || after.len() != data.len() as u64 {
+    if read_bytes > max || !same(&before, &after) || after.len() != read_bytes {
         return Err(err(&p, "store file changed while it was read"));
     }
-    Ok(Some(data))
+    Ok(Some(value))
 }
 pub(crate) fn create_private_file_raw(root: &File, leaf: &Path, label: &Path) -> Result<File> {
     let leaf = direct_leaf(leaf, label)?;
@@ -309,6 +325,28 @@ fn ensure_private_regular(file: &File, label: &Path) -> Result<std::fs::Metadata
     Ok(meta)
 }
 pub(crate) fn rename_regular_between_raw(
+    source_parent: &File,
+    source_leaf: &Path,
+    destination_parent: &File,
+    destination_leaf: &Path,
+    publication: Publication,
+    source_label: &Path,
+    destination_label: &Path,
+) -> Result<()> {
+    rename_regular_between_unsynced(
+        source_parent,
+        source_leaf,
+        destination_parent,
+        destination_leaf,
+        publication,
+        source_label,
+        destination_label,
+    )?;
+    sync_directory(destination_parent, destination_label)?;
+    sync_directory(source_parent, source_label)
+}
+
+pub(crate) fn rename_regular_between_unsynced(
     source_parent: &File,
     source_leaf: &Path,
     destination_parent: &File,
@@ -402,8 +440,7 @@ pub(crate) fn rename_regular_between_raw(
             "published regular-file identity changed",
         ));
     }
-    sync_directory(source_parent, source_label)?;
-    sync_directory(destination_parent, destination_label)
+    Ok(())
 }
 fn rename_regular_replace(
     source_parent: &File,
@@ -535,6 +572,7 @@ pub(crate) fn rename_directory_between_create_only(
     destination_leaf: &Path,
     source_label: &Path,
     destination_label: &Path,
+    before_sync: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
     let source = direct_leaf(source_leaf, source_label)?;
     let destination = direct_leaf(destination_leaf, destination_label)?;
@@ -582,6 +620,7 @@ pub(crate) fn rename_directory_between_create_only(
             "published directory identity changed",
         ));
     }
+    before_sync()?;
     sync_directory(source_parent, source_label)?;
     sync_directory(destination_parent, destination_label)
 }

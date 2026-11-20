@@ -1,4 +1,5 @@
 //! Scan preview contracts.
+use kio_core::disk_records::{DiskRecords, RecordSorter, RecordStageRoot};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -126,12 +127,56 @@ pub struct ScanCandidate {
     pub quarantine_reason: Option<String>,
 }
 
+#[cfg(test)]
+thread_local! {
+    static SCAN_BUFFER_PEAK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScanPreview {
     pub scope_id: String,
-    pub candidates: Vec<ScanCandidate>,
+    pub candidates: DiskRecords<ScanCandidate>,
     pub estimated_cost: Option<CostPreview>,
     pub approval_required: bool,
+}
+
+impl ScanPreview {
+    pub fn included_totals(&self) -> kio_core::Result<(usize, u64)> {
+        let mut count = 0;
+        let mut bytes = 0;
+        for candidate in &self.candidates {
+            let candidate = candidate?;
+            if !candidate.ignored {
+                count += 1;
+                bytes += candidate.size_bytes;
+            }
+        }
+        Ok((count, bytes))
+    }
+}
+
+fn scan_stage_error(error: kio_core::KioError) -> crate::PipelineError {
+    crate::journal::error(Path::new("scan records"), error)
+}
+
+struct ScanCandidates(RecordSorter<ScanCandidate>);
+
+impl ScanCandidates {
+    fn new(root: RecordStageRoot) -> Self {
+        Self(RecordSorter::new(&root, |a: &ScanCandidate, b| {
+            a.input_path.cmp(&b.input_path)
+        }))
+    }
+
+    fn push(&mut self, candidate: ScanCandidate) -> Result<()> {
+        self.0.push(candidate).map_err(scan_stage_error)
+    }
+
+    fn finish(self) -> Result<DiskRecords<ScanCandidate>> {
+        #[cfg(test)]
+        SCAN_BUFFER_PEAK.set(self.0.peak_buffered_records());
+        self.0.finish().map_err(scan_stage_error)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -252,18 +297,19 @@ pub fn build_scan_preview_with_inherited_rules(
     let mut ignore_rules = inherited_rules.to_vec();
     ignore_rules.extend(load_local_config_ignore(&scope_path)?);
     ignore_rules.extend(load_kioignore(&scope_path)?);
-    let mut candidates = Vec::new();
+    let mut candidates =
+        ScanCandidates::new(RecordStageRoot::temporary().map_err(scan_stage_error)?);
     collect_direct_candidates(
         &scope_path,
         &ignore_rules,
         request.include_raw_hashes,
         case_insensitive,
+        inherited_rules,
         &mut candidates,
     )?;
-    apply_inherited_denials(&mut candidates, inherited_rules, case_insensitive)?;
-    candidates.sort_by(|a, b| a.input_path.cmp(&b.input_path));
+    let candidates = candidates.finish()?;
     let (estimated_markdownize_usd, estimated_embedding_usd) =
-        estimated_enrichment_cost_usd(&candidates, markdownize_pricing, embedding_pricing);
+        estimated_enrichment_cost_usd(candidates.iter(), markdownize_pricing, embedding_pricing)?;
     Ok(ScanPreview {
         scope_id: scope_id_from_scope_json(&scope_path).unwrap_or_else(|| "unknown".to_owned()),
         candidates,
@@ -295,18 +341,19 @@ pub fn build_bound_scan_preview(
     let mut ignore_rules = inherited_rules.to_vec();
     ignore_rules.extend(load_bound_config_ignore(kio)?);
     ignore_rules.extend(load_bound_kioignore(root)?);
-    let mut candidates = Vec::new();
+    let mut candidates =
+        ScanCandidates::new(RecordStageRoot::temporary().map_err(scan_stage_error)?);
     collect_bound_direct_candidates(
         root,
         &ignore_rules,
         request.include_raw_hashes,
         case_insensitive,
+        inherited_rules,
         &mut candidates,
     )?;
-    apply_inherited_denials(&mut candidates, inherited_rules, case_insensitive)?;
-    candidates.sort_by(|left, right| left.input_path.cmp(&right.input_path));
+    let candidates = candidates.finish()?;
     let (estimated_markdownize_usd, estimated_embedding_usd) =
-        estimated_enrichment_cost_usd(&candidates, markdownize_pricing, embedding_pricing);
+        estimated_enrichment_cost_usd(candidates.iter(), markdownize_pricing, embedding_pricing)?;
     Ok(ScanPreview {
         scope_id: bound_scope_id_from_scope_json(kio).unwrap_or_else(|| "unknown".to_owned()),
         candidates,
@@ -328,11 +375,12 @@ pub fn build_managed_scan_preview(
     markdownize_pricing: &BTreeMap<String, f64>,
     embedding_pricing: &BTreeMap<String, f64>,
     binding: &ManagementBinding,
+    stages: RecordStageRoot,
     request: ScanPreviewRequest,
 ) -> Result<ScanPreview> {
     let record = read_record(binding).map_err(management_pipeline_error)?;
     let policy = CurrentPolicyEvaluator::load(binding, record.case_insensitive)?;
-    let mut candidates = Vec::new();
+    let mut candidates = ScanCandidates::new(stages);
     for entry in cap_fs::read_base_dir(binding.root_handle()).pipeline_io(Path::new("."))? {
         let entry = entry.pipeline_io(Path::new("."))?;
         let name = match entry.file_name().into_string() {
@@ -340,17 +388,32 @@ pub fn build_managed_scan_preview(
             Err(_) => continue,
         };
         let path = Path::new(&name);
-        let metadata = cap_fs::stat(binding.root_handle(), path, cap_fs::FollowSymlinks::No)
-            .pipeline_io(path)?;
-        if !metadata.file_type().is_file() {
-            continue;
-        }
+        let metadata = match cap_fs::stat(binding.root_handle(), path, cap_fs::FollowSymlinks::No) {
+            Ok(metadata) if metadata.file_type().is_file() => Some(metadata),
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !request.include_raw_hashes {
+                    continue;
+                }
+                None
+            }
+            Err(error) => return Err(bound_scan_io(error, path)),
+        };
         let allowed = policy.allows_path(&name)?;
-        let raw_hash = if allowed && request.include_raw_hashes {
-            Some(
-                hash_bound_verified_scan_input(binding.root_handle(), &name, metadata.len())?
-                    .raw_hash,
-            )
+        let size_bytes = metadata.as_ref().map_or(0, cap_fs::Metadata::len);
+        let raw_hash = if allowed && request.include_raw_hashes && metadata.is_some() {
+            match hash_bound_verified_scan_input(binding.root_handle(), &name, size_bytes) {
+                Ok(input) => Some(input.raw_hash),
+                Err(crate::PipelineError::Contract {
+                    code:
+                        "KIO-E-SCAN-FILE-MISSING-001"
+                        | "KIO-E-SCAN-FILE-IDENTITY-001"
+                        | "KIO-E-SCAN-INPUT-CHANGED-001"
+                        | "KIO-E-SCAN-INPUT-OVERSIZED-001",
+                    ..
+                }) => None,
+                Err(error) => return Err(error),
+            }
         } else {
             None
         };
@@ -359,7 +422,7 @@ pub fn build_managed_scan_preview(
         candidates.push(ScanCandidate {
             input_path: name,
             media_type,
-            size_bytes: metadata.len(),
+            size_bytes,
             raw_hash,
             ignored: !allowed,
             quarantine_reason: match secret {
@@ -368,12 +431,12 @@ pub fn build_managed_scan_preview(
                 Some(SecretTier::TierB) => Some("secrets_tier_b_warning".to_owned()),
                 None => None,
             },
-        });
+        })?;
     }
-    candidates.sort_by(|left, right| left.input_path.cmp(&right.input_path));
+    let candidates = candidates.finish()?;
     policy.revalidate()?;
     let (estimated_markdownize_usd, estimated_embedding_usd) =
-        estimated_enrichment_cost_usd(&candidates, markdownize_pricing, embedding_pricing);
+        estimated_enrichment_cost_usd(candidates.iter(), markdownize_pricing, embedding_pricing)?;
     Ok(ScanPreview {
         scope_id: record.scope_id,
         candidates,
@@ -400,7 +463,8 @@ pub fn build_planned_child_scan_preview(
     case_insensitive: bool,
 ) -> Result<ScanPreview> {
     let local_rules = load_bound_kioignore(&child.root)?;
-    let mut candidates = Vec::new();
+    let mut candidates =
+        ScanCandidates::new(RecordStageRoot::temporary().map_err(scan_stage_error)?);
     for entry in cap_fs::read_base_dir(&child.root).pipeline_io(Path::new("."))? {
         let entry = entry.pipeline_io(Path::new("."))?;
         let name = match entry.file_name().into_string() {
@@ -440,11 +504,11 @@ pub fn build_planned_child_scan_preview(
                 Some(SecretTier::TierB) => Some("secrets_tier_b_warning".to_owned()),
                 None => None,
             },
-        });
+        })?;
     }
-    candidates.sort_by(|left, right| left.input_path.cmp(&right.input_path));
+    let candidates = candidates.finish()?;
     let (estimated_markdownize_usd, estimated_embedding_usd) =
-        estimated_enrichment_cost_usd(&candidates, markdownize_pricing, embedding_pricing);
+        estimated_enrichment_cost_usd(candidates.iter(), markdownize_pricing, embedding_pricing)?;
     Ok(ScanPreview {
         scope_id: "unmanaged-child".to_owned(),
         candidates,
@@ -473,31 +537,13 @@ fn management_pipeline_error(error: kio_core::KioError) -> crate::PipelineError 
     crate::PipelineError::contract("KIO-E-POLICY-MANAGEMENT-001", error.to_string())
 }
 
-fn apply_inherited_denials(
-    candidates: &mut [ScanCandidate],
-    inherited_rules: &[IgnoreRule],
-    case_insensitive: bool,
-) -> Result<()> {
-    for candidate in candidates {
-        if rules_ignore_path(
-            &candidate.input_path,
-            false,
-            inherited_rules,
-            case_insensitive,
-        )? {
-            candidate.ignored = true;
-            candidate.raw_hash = None;
-        }
-    }
-    Ok(())
-}
-
 fn collect_bound_direct_candidates(
     root: &File,
     ignore_rules: &[IgnoreRule],
     include_raw_hashes: bool,
     case_insensitive: bool,
-    candidates: &mut Vec<ScanCandidate>,
+    inherited_rules: &[IgnoreRule],
+    candidates: &mut ScanCandidates,
 ) -> Result<()> {
     for entry in cap_fs::read_base_dir(root).pipeline_io(Path::new("."))? {
         let entry = entry.pipeline_io(Path::new("."))?;
@@ -547,14 +593,15 @@ fn collect_bound_direct_candidates(
             None
         };
         let media_type = media_type_for_path(path).to_owned();
+        let ancestor_denied = rules_ignore_path(&name, false, inherited_rules, case_insensitive)?;
         candidates.push(ScanCandidate {
             input_path: name,
             media_type,
             size_bytes,
-            raw_hash,
-            ignored,
+            raw_hash: if ancestor_denied { None } else { raw_hash },
+            ignored: ignored || ancestor_denied,
             quarantine_reason,
-        });
+        })?;
     }
     Ok(())
 }
@@ -1345,31 +1392,39 @@ pub fn load_index_vcs_repos(scope_path: &Path) -> Result<bool> {
 /// either is `0.0` when its role has no declared `pricing` — an honest
 /// "unknown", not a fabricated number.
 fn estimated_enrichment_cost_usd(
-    candidates: &[ScanCandidate],
+    candidates: impl IntoIterator<Item = kio_core::Result<ScanCandidate>>,
     markdownize_pricing: &BTreeMap<String, f64>,
     embedding_pricing: &BTreeMap<String, f64>,
-) -> (f64, f64) {
+) -> Result<(f64, f64)> {
     // Mirrors `kio-cli`'s `is_text_native_media` exactly (docs/04 §2: text-
     // native files skip Markdownize/OCR and are indexed as-is).
-    const TEXT_NATIVE_MEDIA_TYPES: [&str; 3] = ["text/markdown", "text/plain", "text/x-code"];
+    const TEXT_NATIVE_MEDIA_TYPES: [&str; 2] = ["text/markdown", "text/plain"];
     // Rough, order-of-magnitude assumptions for THIS preview estimate only
     // (10 §1's own framing — not a precision requirement).
     const ESTIMATED_BYTES_PER_PAGE: f64 = 3_000.0;
     const ESTIMATED_BYTES_PER_TOKEN: f64 = 4.0;
 
-    let included: Vec<&ScanCandidate> = candidates.iter().filter(|c| !c.ignored).collect();
-    let markdownize_bytes: u64 = included
-        .iter()
-        .filter(|c| !TEXT_NATIVE_MEDIA_TYPES.contains(&c.media_type.as_str()))
-        .map(|c| c.size_bytes)
-        .sum();
-    let embedding_bytes: u64 = included.iter().map(|c| c.size_bytes).sum();
+    let mut markdownize_bytes = 0u64;
+    let mut embedding_bytes = 0u64;
+    for candidate in candidates {
+        let candidate = candidate.map_err(scan_stage_error)?;
+        if candidate.ignored
+            || crate::unsupported::unsupported_reason_for_path(Path::new(&candidate.input_path))
+                .is_some()
+        {
+            continue;
+        }
+        embedding_bytes += candidate.size_bytes;
+        if !TEXT_NATIVE_MEDIA_TYPES.contains(&candidate.media_type.as_str()) {
+            markdownize_bytes += candidate.size_bytes;
+        }
+    }
 
     let estimated_markdownize_usd = markdownize_pricing.get("pages").copied().unwrap_or(0.0)
         * (markdownize_bytes as f64 / ESTIMATED_BYTES_PER_PAGE).ceil();
     let estimated_embedding_usd = embedding_pricing.get("tokens_in").copied().unwrap_or(0.0)
         * (embedding_bytes as f64 / ESTIMATED_BYTES_PER_TOKEN);
-    (estimated_markdownize_usd, estimated_embedding_usd)
+    Ok((estimated_markdownize_usd, estimated_embedding_usd))
 }
 
 fn collect_direct_candidates(
@@ -1377,7 +1432,8 @@ fn collect_direct_candidates(
     ignore_rules: &[IgnoreRule],
     include_raw_hashes: bool,
     case_insensitive: bool,
-    candidates: &mut Vec<ScanCandidate>,
+    inherited_rules: &[IgnoreRule],
+    candidates: &mut ScanCandidates,
 ) -> Result<()> {
     for entry in std::fs::read_dir(scope_path).pipeline_io(scope_path)? {
         let entry = entry.pipeline_io(scope_path)?;
@@ -1454,14 +1510,16 @@ fn collect_direct_candidates(
         } else {
             None
         };
+        let ancestor_denied =
+            rules_ignore_path(&relative, false, inherited_rules, case_insensitive)?;
         candidates.push(ScanCandidate {
-            input_path: relative.clone(),
+            input_path: relative,
             media_type: media_type_for_path(&path).to_owned(),
             size_bytes,
-            raw_hash,
-            ignored,
+            raw_hash: if ancestor_denied { None } else { raw_hash },
+            ignored: ignored || ancestor_denied,
             quarantine_reason,
-        });
+        })?;
     }
     Ok(())
 }
@@ -1602,25 +1660,59 @@ pub fn read_bound_verified_scan_input(
     input_path: &str,
     max_bytes: u64,
 ) -> Result<VerifiedScanInput> {
+    read_bound_scan_input(root, input_path, max_bytes, None)
+}
+
+/// Read a verified parser input within the invocation's working-memory tier.
+pub fn read_bound_extraction_input(
+    root: &File,
+    input_path: &str,
+    tier: kio_core::error::ResourceTier,
+) -> Result<VerifiedScanInput> {
+    read_bound_extraction_input_at_most(root, input_path, tier, u64::MAX)
+}
+
+/// Apply both the parser budget and the size of a verified source identity.
+pub fn read_bound_extraction_input_at_most(
+    root: &File,
+    input_path: &str,
+    tier: kio_core::error::ResourceTier,
+    max_bytes: u64,
+) -> Result<VerifiedScanInput> {
+    let max_bytes = max_bytes.min(crate::prepare::ExtractionBudget::new(tier).memory_bytes());
+    read_bound_scan_input(root, input_path, max_bytes, Some(tier))
+}
+
+fn read_bound_scan_input(
+    root: &File,
+    input_path: &str,
+    max_bytes: u64,
+    tier: Option<kio_core::error::ResourceTier>,
+) -> Result<VerifiedScanInput> {
+    let limit = |observed, bounded| {
+        if tier.is_none() && bounded {
+            return bound_input_oversized(input_path, observed, max_bytes);
+        }
+        crate::PipelineError::ResourceLimit(kio_core::error::ResourceLimit {
+            resource: kio_core::error::Resource::Memory,
+            stage: "read_extraction_input".to_owned(),
+            limit: bounded.then_some(max_bytes),
+            observed: Some(observed),
+            resource_tier: tier,
+        })
+    };
     validate_direct_child_name(input_path)?;
     let path = Path::new(input_path);
     let (mut file, metadata) = open_bound_verified_regular_file(root, input_path)?;
     if metadata.len() > max_bytes {
-        return Err(bound_input_oversized(input_path, metadata.len(), max_bytes));
+        return Err(limit(metadata.len(), true));
     }
-    let initial_capacity = usize::try_from(metadata.len()).map_err(|_| {
-        crate::PipelineError::contract(
-            "KIO-E-SCAN-INPUT-OVERSIZED-001",
-            format!("input {input_path} cannot fit in process memory"),
-        )
-    })?;
+    let initial_capacity =
+        usize::try_from(metadata.len()).map_err(|_| limit(metadata.len(), false))?;
     let mut bytes = Vec::new();
-    bytes.try_reserve_exact(initial_capacity).map_err(|_| {
-        crate::PipelineError::contract(
-            "KIO-E-SCAN-INPUT-OVERSIZED-001",
-            format!("input {input_path} cannot fit in process memory"),
-        )
-    })?;
+    bytes
+        .try_reserve_exact(initial_capacity)
+        .map_err(|_| limit(metadata.len(), false))?;
     let mut buffer = [0_u8; 64 * 1024];
     loop {
         let remaining = max_bytes.saturating_sub(bytes.len() as u64);
@@ -1630,18 +1722,11 @@ pub fn read_bound_verified_scan_input(
             break;
         }
         if read as u64 > remaining {
-            return Err(bound_input_oversized(
-                input_path,
-                max_bytes.saturating_add(1),
-                max_bytes,
-            ));
+            return Err(limit(max_bytes.saturating_add(1), true));
         }
-        bytes.try_reserve_exact(read).map_err(|_| {
-            crate::PipelineError::contract(
-                "KIO-E-SCAN-INPUT-OVERSIZED-001",
-                format!("input {input_path} cannot fit in process memory"),
-            )
-        })?;
+        bytes
+            .try_reserve_exact(read)
+            .map_err(|_| limit(bytes.len() as u64 + read as u64, false))?;
         bytes.extend_from_slice(&buffer[..read]);
     }
     ensure_bound_file_unchanged(&file, &metadata, path)?;
@@ -1801,13 +1886,38 @@ fn bound_input_oversized(input_path: &str, size: u64, max_bytes: u64) -> crate::
     )
 }
 
+/// Test for a live source without following its name or allocating its bytes.
+pub fn bound_scan_input_is_regular(root: &File, input_path: &str) -> Result<bool> {
+    validate_direct_child_name(input_path)?;
+    let path = Path::new(input_path);
+    match cap_fs::stat(root, path, cap_fs::FollowSymlinks::No) {
+        Ok(metadata) => Ok(metadata.file_type().is_file()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).pipeline_io(path),
+    }
+}
+
+fn bound_scan_io(error: std::io::Error, path: &Path) -> crate::PipelineError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        return crate::PipelineError::contract(
+            "KIO-E-SCAN-FILE-MISSING-001",
+            format!("scan candidate disappeared: {}", path.display()),
+        );
+    }
+    crate::PipelineError::Io {
+        path: path.display().to_string(),
+        message: error.to_string(),
+    }
+}
+
 fn open_bound_verified_regular_file(
     root: &File,
     input_path: &str,
 ) -> Result<(File, cap_fs::Metadata)> {
     validate_direct_child_name(input_path)?;
     let path = Path::new(input_path);
-    let listed = cap_fs::stat(root, path, cap_fs::FollowSymlinks::No).pipeline_io(path)?;
+    let listed = cap_fs::stat(root, path, cap_fs::FollowSymlinks::No)
+        .map_err(|error| bound_scan_io(error, path))?;
     if !listed.file_type().is_file() {
         return Err(crate::PipelineError::contract(
             "KIO-E-SCAN-FILE-IDENTITY-001",
@@ -1817,9 +1927,10 @@ fn open_bound_verified_regular_file(
     let mut options = cap_fs::OpenOptions::new();
     options.read(true);
     options._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
-    let file = cap_fs::open(root, path, &options).pipeline_io(path)?;
-    let opened = cap_fs::Metadata::from_file(&file).pipeline_io(path)?;
-    let after = cap_fs::stat(root, path, cap_fs::FollowSymlinks::No).pipeline_io(path)?;
+    let file = cap_fs::open(root, path, &options).map_err(|error| bound_scan_io(error, path))?;
+    let opened = cap_fs::Metadata::from_file(&file).map_err(|error| bound_scan_io(error, path))?;
+    let after = cap_fs::stat(root, path, cap_fs::FollowSymlinks::No)
+        .map_err(|error| bound_scan_io(error, path))?;
     if !opened.file_type().is_file()
         || !same_cap_file_identity(&listed, &opened)
         || !same_cap_file_identity(&opened, &after)
@@ -2452,7 +2563,7 @@ fn glob_budget_error() -> crate::PipelineError {
 
 fn media_type_for_path(path: &Path) -> &'static str {
     // R21-4: lowercase the extension so an uppercase-extension text-native file
-    // (`README.MD`, `NOTE.TXT`, `MAIN.RS`) is recognized as text/markdown/plain/code and
+    // (`README.MD`, `NOTE.TXT`) is recognized as text/markdown/plain and
     // handled locally — not folded to octet-stream and shipped to online OCR (R9-2).
     match path
         .extension()
@@ -2463,7 +2574,6 @@ fn media_type_for_path(path: &Path) -> &'static str {
     {
         "md" | "markdown" => "text/markdown",
         "txt" => "text/plain",
-        "rs" | "py" | "js" | "ts" | "go" | "java" | "c" | "h" | "cpp" => "text/x-code",
         "pdf" => "application/pdf",
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
@@ -2496,6 +2606,32 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use crate::platform::scan::verify_opened_regular_file;
+
+    #[test]
+    fn working_scan_buffers_the_same_number_of_candidates_as_the_scope_grows() {
+        let limit = kio_core::disk_records::SORT_BUFFER_RECORDS;
+        for count in [limit + 1, limit * 16 + 1] {
+            let fixture = tempfile::tempdir().unwrap();
+            for i in (0..count).rev() {
+                std::fs::write(fixture.path().join(format!("{i:05}.txt")), "").unwrap();
+            }
+            let preview = build_scan_preview(
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                ScanPreviewRequest {
+                    scope_path: fixture.path().display().to_string(),
+                    include_raw_hashes: false,
+                    require_network_approval: false,
+                },
+            )
+            .unwrap();
+            assert_eq!(preview.candidates.len(), count);
+            assert_eq!(SCAN_BUFFER_PEAK.get(), limit);
+            for (i, candidate) in preview.candidates.iter().enumerate() {
+                assert_eq!(candidate.unwrap().input_path, format!("{i:05}.txt"));
+            }
+        }
+    }
 
     #[cfg(unix)]
     #[test]
@@ -2537,9 +2673,12 @@ mod tests {
         .unwrap();
         assert_eq!(preview.scope_id, "original");
         assert_eq!(preview.candidates.len(), 1);
-        assert_eq!(preview.candidates[0].input_path, "original.txt");
         assert_eq!(
-            preview.candidates[0].raw_hash,
+            preview.candidates.get(0).unwrap().unwrap().input_path,
+            "original.txt"
+        );
+        assert_eq!(
+            preview.candidates.get(0).unwrap().unwrap().raw_hash,
             Some(hash_bytes(b"original"))
         );
         assert_eq!(
@@ -2672,8 +2811,12 @@ mod tests {
     #[test]
     fn qa19_no_pricing_declared_yields_zero_estimates() {
         let candidates = vec![candidate("application/pdf", 300_000, false)];
-        let (markdownize_usd, embedding_usd) =
-            estimated_enrichment_cost_usd(&candidates, &BTreeMap::new(), &BTreeMap::new());
+        let (markdownize_usd, embedding_usd) = estimated_enrichment_cost_usd(
+            candidates.into_iter().map(Ok),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
         assert_eq!(markdownize_usd, 0.0);
         assert_eq!(embedding_usd, 0.0);
     }
@@ -2694,8 +2837,12 @@ mod tests {
             // Ignored: excluded from both sums.
             candidate("application/pdf", 1_000_000, true),
         ];
-        let (markdownize_usd, _embedding_usd) =
-            estimated_enrichment_cost_usd(&candidates, &markdownize_pricing, &BTreeMap::new());
+        let (markdownize_usd, _embedding_usd) = estimated_enrichment_cost_usd(
+            candidates.into_iter().map(Ok),
+            &markdownize_pricing,
+            &BTreeMap::new(),
+        )
+        .unwrap();
         assert!(
             (markdownize_usd - 0.008).abs() < 1e-9,
             "got {markdownize_usd}"
@@ -2713,8 +2860,12 @@ mod tests {
             candidate("text/markdown", 4_000, false),   // 1_000 tokens
             candidate("application/pdf", 4_000, false), // 1_000 tokens
         ];
-        let (_markdownize_usd, embedding_usd) =
-            estimated_enrichment_cost_usd(&candidates, &BTreeMap::new(), &embedding_pricing);
+        let (_markdownize_usd, embedding_usd) = estimated_enrichment_cost_usd(
+            candidates.into_iter().map(Ok),
+            &BTreeMap::new(),
+            &embedding_pricing,
+        )
+        .unwrap();
         assert!(
             (embedding_usd - 2_000.0 * 0.00000015).abs() < 1e-12,
             "got {embedding_usd}"
@@ -2961,16 +3112,16 @@ mod tests {
         assert!(
             preview
                 .candidates
-                .iter()
                 .find(|candidate| candidate.input_path == "é.txt")
+                .unwrap()
                 .unwrap()
                 .ignored
         );
         assert!(
             !preview
                 .candidates
-                .iter()
                 .find(|candidate| candidate.input_path == "ab.txt")
+                .unwrap()
                 .unwrap()
                 .ignored
         );
@@ -3015,8 +3166,8 @@ mod tests {
         .unwrap();
         let candidate = preview
             .candidates
-            .iter()
             .find(|candidate| candidate.input_path == "large.bin")
+            .unwrap()
             .unwrap();
         assert_eq!(candidate.size_bytes, bytes.len() as u64);
         assert_eq!(
@@ -3132,8 +3283,8 @@ mod tests {
         assert!(
             child_preview
                 .candidates
-                .iter()
                 .find(|candidate| candidate.input_path == "private.md")
+                .unwrap()
                 .unwrap()
                 .ignored
         );
@@ -3162,16 +3313,16 @@ mod tests {
         assert!(
             nested_preview
                 .candidates
-                .iter()
                 .find(|candidate| candidate.input_path == "secret.md")
+                .unwrap()
                 .unwrap()
                 .ignored
         );
         assert!(
             !nested_preview
                 .candidates
-                .iter()
                 .find(|candidate| candidate.input_path == "keep.md")
+                .unwrap()
                 .unwrap()
                 .ignored
         );

@@ -199,6 +199,7 @@ fn index_reconciles_more_than_legacy_child_cap_and_deep_pages_in_one_run() {
     let output = crate::execute(
         &test_context(&root),
         crate::commands::CommandRequest::Index(IndexArgs {
+            resource_tier: kio_core::error::ResourceTier::Standard,
             max_file_bytes: None,
             max_total_bytes: None,
             preview: false,
@@ -1171,6 +1172,7 @@ fn embedding_cas_failure_cannot_publish_source_or_replica_vectors() {
             execution: kio_adapter::catalog::EmbeddingExecution::DeterministicEvaluator,
             policy: &policy,
             selected_contexts: &contexts,
+            rebuild: None,
             invalidated: std::cell::Cell::new(false),
         };
         let result = persist_group_vector(
@@ -2018,7 +2020,6 @@ fn search_index_status_uses_preflight_month() {
                 &ledger_path,
                 month,
                 &kio_core::control::ControlHandle::default(),
-                &kio_core::scope::LockSession::default(),
             )
             .unwrap();
             assert_eq!(
@@ -2075,6 +2076,67 @@ fn search_budget_observation_retries_a_month_rollover_once() {
     .expect("rollover retry exhaustion must fail");
     assert_eq!(error.error_code(), "KIO-E-LEDGER-SNAPSHOT-ROLLOVER-001");
     assert_eq!(error.exit_code(), kio_core::ExitCode::PartialFailure);
+}
+
+#[test]
+fn search_index_status_leaves_an_interrupted_publication_pending() {
+    use crate::index::command::compute_index_status;
+    use crate::search::scope::SearchedScopeInfo;
+
+    let root = tempfile::tempdir().unwrap();
+    let repo = kio_core::scope::Repository::init(root.path()).unwrap();
+    std::fs::write(root.path().join("note.txt"), b"before").unwrap();
+    let before = repo.snapshot(None, None).unwrap().commit_hash.unwrap();
+    let old_manifest = std::fs::read(repo.kio_dir().join("manifest.json")).unwrap();
+    std::fs::write(root.path().join("note.txt"), b"after").unwrap();
+    let after = repo.snapshot(None, None).unwrap().commit_hash.unwrap();
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(repo.kio_dir().join("manifest.json")).unwrap())
+            .unwrap();
+    let journal_path = repo.kio_dir().join("publication-v1.json");
+    std::fs::write(
+        &journal_path,
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1, "expected_head": before, "new_head": after, "manifest": manifest
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(repo.kio_dir().join("HEAD"), format!("{before}\n")).unwrap();
+    std::fs::write(repo.kio_dir().join("manifest.json"), &old_manifest).unwrap();
+
+    let scope = SearchedScopeInfo {
+        scope_id: repo.scope_identity().unwrap().scope_id,
+        scope_path: repo.kio_dir().to_path_buf(),
+        repo_root: root.path().to_path_buf(),
+        snapshot_at: before.clone(),
+        max_rowid: 0,
+        max_association_rowid: 0,
+        chunking_config_hash: "sha256:config".to_owned(),
+        index_generation: "01TEST0000000000000000000".to_owned(),
+        shallow_skipped: 0,
+        journal_active_at_prepare: false,
+        runtime_binding_filter: None,
+    };
+    let status = compute_index_status(
+        &[scope],
+        None,
+        &root.path().join("cost-ledger.sqlite"),
+        "2026-09",
+        repo.control(),
+    )
+    .unwrap();
+    assert_eq!(repo.head_commit_hash().unwrap(), Some(before));
+    assert_eq!(
+        std::fs::read(repo.kio_dir().join("manifest.json")).unwrap(),
+        old_manifest
+    );
+    assert!(journal_path.is_file());
+    assert!(!status.unsupported_inputs_complete);
+    assert_eq!(
+        status.unsupported_input_errors[0].error_code,
+        "KIO-E-PUBLICATION-RECOVERY-REQUIRED-001"
+    );
 }
 
 #[test]
@@ -2146,7 +2208,6 @@ fn r23_aggregate_index_status_fails_closed_for_corrupt_scope_state() {
         std::path::Path::new("/private/test/cost-ledger.sqlite"),
         "2026-09",
         &kio_core::control::ControlHandle::default(),
-        &kio_core::scope::LockSession::default(),
     )
     .unwrap();
     assert!(!status.tasks_complete);
@@ -3716,8 +3777,7 @@ fn r10_8_snapshot_tree_entries_insert_is_atomic() {
 
 #[test]
 fn r9_8_atomic_write_cas_object_removes_temp_on_failure() {
-    use crate::object_persistence::write_canonical_cas_object_or_reuse;
-    use kio_core::cas::ContentObjectKind;
+    use kio_pipeline::prepare::publish_prepared_source;
     let dir = tempfile::tempdir().unwrap();
     let repo = kio_core::scope::Repository::init(dir.path()).unwrap();
     let bytes = b"derived-bytes";
@@ -3729,9 +3789,8 @@ fn r9_8_atomic_write_cas_object_removes_temp_on_failure() {
     parent
         .create_directory(std::path::Path::new(dest.file_name().unwrap()))
         .unwrap();
-    let result = write_canonical_cas_object_or_reuse(
-        repo.kio_dir(),
-        ContentObjectKind::Prepared,
+    let result = publish_prepared_source(
+        &kio_core::store_dir::StoreDirectory::open(repo.kio_dir()).unwrap(),
         &hash,
         bytes,
     );
@@ -3754,8 +3813,8 @@ fn r9_8_atomic_write_cas_object_removes_temp_on_failure() {
 
 #[test]
 fn r23_cand_031_existing_prepared_slot_must_match_exact_bytes() {
-    use crate::object_persistence::write_canonical_cas_object_or_reuse;
     use kio_core::cas::ContentObjectKind;
+    use kio_pipeline::prepare::publish_prepared_source;
     let dir = tempfile::tempdir().unwrap();
     let repo = kio_core::scope::Repository::init(dir.path()).unwrap();
     let bytes = b"secure";
@@ -3765,26 +3824,25 @@ fn r23_cand_031_existing_prepared_slot_must_match_exact_bytes() {
         .unwrap();
     let path = crate::open_view::cas_object_path(repo.kio_dir(), "prepared", &hash).unwrap();
     std::fs::write(&path, b"poison").unwrap();
-    let error = write_canonical_cas_object_or_reuse(
-        repo.kio_dir(),
-        ContentObjectKind::Prepared,
+    let error = publish_prepared_source(
+        &kio_core::store_dir::StoreDirectory::open(repo.kio_dir()).unwrap(),
         &hash,
         bytes,
     )
+    .map_err(crate::object_persistence::pipeline_to_kio)
     .unwrap_err();
     assert_eq!(error.error_code(), "KIO-E-STORE-CORRUPT-001");
     assert_eq!(std::fs::read(&path).unwrap(), b"poison");
 }
 
 #[cfg(unix)]
-#[cfg(unix)]
 #[test]
 fn r23_prepared_writer_rejects_symlinked_store_ancestor() {
     use std::os::unix::fs::symlink;
 
-    use crate::object_persistence::write_prepared_objects;
+    use crate::object_persistence::bound_extraction_store;
     use kio_core::scope::Repository;
-    use kio_pipeline::prepare::{PreparedUnit, UnitFingerprint, UnitType, hash_bytes};
+    use kio_pipeline::prepare::{PrepareStageBytesRequest, hash_bytes, prepare_staged};
 
     let root = tempfile::tempdir().unwrap();
     let repo = Repository::init(root.path()).unwrap();
@@ -3797,24 +3855,21 @@ fn r23_prepared_writer_rejects_symlinked_store_ancestor() {
     symlink(outside.path(), &prepared_root).unwrap();
     let bytes = b"outside-write";
     let prepared_hash = hash_bytes(bytes);
-    let unit = PreparedUnit {
-        renderer: None,
-        order: 0,
-        unit_key: "file:0".to_owned(),
-        unit_type: UnitType::File,
-        prepared_hash: prepared_hash.clone(),
-        preparation_profile_hash: "sha256:test-prepare-profile".to_owned(),
-        fingerprint: UnitFingerprint {
-            perceptual_hash: prepared_hash.clone(),
-            text_hash: prepared_hash.clone(),
-            visual_hash: prepared_hash.clone(),
+    let stage = prepare_staged(
+        &bound_extraction_store(&repo).unwrap(),
+        PrepareStageBytesRequest {
+            raw_hash: &prepared_hash,
+            media_type: "text/plain",
+            input_path: "doc.txt",
+            tool_profile_hash: "sha256:test-prepare-profile",
+            bytes,
         },
-        mime: Some("text/plain".to_owned()),
-        page_number: None,
-    };
-
-    let error =
-        write_prepared_objects(&repo, &[unit], &[prepared_hash], bytes, "text/plain").unwrap_err();
+        kio_pipeline::prepare::ExtractionBudget::new(kio_core::error::ResourceTier::Standard),
+    )
+    .unwrap();
+    let error = crate::object_persistence::pipeline_to_kio(
+        stage.persist_objects(&repo.object_store()).unwrap_err(),
+    );
     assert_eq!(error.error_code(), "KIO-E-STORE-CORRUPT-001");
     assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
 }
@@ -4200,18 +4255,17 @@ fn canonical_cas_read_succeeds_and_hash_mismatch_fails_closed() {
 
 #[test]
 fn prepared_writer_publishes_new_objects_to_canonical_leaf() {
-    use crate::object_persistence::write_canonical_cas_object_or_reuse;
     use crate::open_view::cas_object_path;
     use kio_pipeline::prepare::hash_bytes;
+    use kio_pipeline::prepare::publish_prepared_source;
 
     let dir = tempfile::tempdir().unwrap();
     let repo = kio_core::scope::Repository::init(dir.path()).unwrap();
     let kio_dir = repo.kio_dir().to_path_buf();
     let bytes = b"new prepared bytes";
     let hash = hash_bytes(bytes);
-    write_canonical_cas_object_or_reuse(
-        &kio_dir,
-        kio_core::cas::ContentObjectKind::Prepared,
+    publish_prepared_source(
+        &kio_core::store_dir::StoreDirectory::open(&kio_dir).unwrap(),
         &hash,
         bytes,
     )
@@ -4228,11 +4282,11 @@ fn prepared_writer_publishes_new_objects_to_canonical_leaf() {
 #[cfg(not(windows))]
 #[test]
 fn non_current_conflict_cannot_influence_canonical_read_or_write() {
-    use crate::object_persistence::write_canonical_cas_object_or_reuse;
     use crate::open_view::cas_object_path;
     use crate::open_view::read_cas_byte_object;
     use kio_core::cas::MAX_CONTENT_OBJECT_BYTES;
     use kio_pipeline::prepare::hash_bytes;
+    use kio_pipeline::prepare::publish_prepared_source;
 
     let dir = tempfile::tempdir().unwrap();
     let repo = kio_core::scope::Repository::init(dir.path()).unwrap();
@@ -4250,9 +4304,8 @@ fn non_current_conflict_cannot_influence_canonical_read_or_write() {
     std::io::Write::write_all(&mut file, b"conflicting non-current bytes").unwrap();
     drop(file);
 
-    write_canonical_cas_object_or_reuse(
-        &kio_dir,
-        kio_core::cas::ContentObjectKind::Prepared,
+    publish_prepared_source(
+        &kio_core::store_dir::StoreDirectory::open(&kio_dir).unwrap(),
         &hash,
         bytes,
     )
@@ -5214,6 +5267,7 @@ fn resource_limit_watch_and_preview_keep_hold_until_explicit_index() {
     let raw = b"resource test";
     std::fs::write(root.path().join("document.md"), raw).unwrap();
     let args = IndexArgs {
+        resource_tier: kio_core::error::ResourceTier::Standard,
         max_file_bytes: None,
         max_total_bytes: None,
         preview: false,
@@ -5237,6 +5291,7 @@ fn resource_limit_watch_and_preview_keep_hold_until_explicit_index() {
     crate::execute(
         &context,
         CommandRequest::Index(IndexArgs {
+            resource_tier: kio_core::error::ResourceTier::Standard,
             max_file_bytes: None,
             max_total_bytes: None,
             preview: true,
@@ -5280,4 +5335,22 @@ fn st04_working_tree_lookup_does_not_clamp_large_raw_files() {
     let attempt = budget.reserve_file(size).unwrap();
     assert_eq!(attempt.max_bytes, size);
     assert_eq!(attempt.reserved_bytes, size + 1);
+}
+
+#[test]
+fn p0_recheck_office_source_has_a_finite_preconversion_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+    let path = dir.path().join("over-budget.docx");
+    let size = 256 * 1024 * 1024 + 1;
+    std::fs::File::create(path).unwrap().set_len(size).unwrap();
+    let result =
+        crate::index::command::read_verified_adapter_source(&repo, "over-budget.docx", size);
+    let Err(error) = result else {
+        panic!("reject before allocating the original");
+    };
+    assert!(
+        matches!(error, kio_pipeline::PipelineError::ResourceLimit(limit)
+        if limit.stage == "read_adapter_source" && limit.observed == Some(size))
+    );
 }

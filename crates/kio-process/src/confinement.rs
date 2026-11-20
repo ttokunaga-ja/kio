@@ -9,7 +9,7 @@ use std::{
     ffi::OsString,
     fs,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::BoundedProcessError;
@@ -70,8 +70,22 @@ impl RenderSandbox {
         runtime_roots: impl IntoIterator<Item = PathBuf>,
         limits: RenderResourceLimits,
     ) -> Result<Self, ConfinementError> {
+        Self::from_sources(
+            &RenderSources::resolve(program, runtime_roots)?,
+            scratch,
+            limits,
+        )
+    }
+
+    pub fn from_sources(
+        sources: &RenderSources,
+        scratch: &Path,
+        limits: RenderResourceLimits,
+    ) -> Result<Self, ConfinementError> {
+        let scratch = canonical_directory(scratch)
+            .ok_or_else(|| ConfinementError::Scratch(scratch.into()))?;
         Ok(Self {
-            native: NativeRenderSandbox::new(program, scratch, runtime_roots, limits)?,
+            native: NativeRenderSandbox::new(sources, scratch, limits),
             limits,
         })
     }
@@ -93,46 +107,183 @@ impl RenderSandbox {
         I: IntoIterator<Item = S>,
         S: AsRef<std::ffi::OsStr>,
     {
+        let deadline = Instant::now()
+            .checked_add(options.timeout.min(self.limits.wall_timeout))
+            .ok_or(BoundedProcessError::InvalidLifetime)?;
+        self.run_checked_until(args, environment, options, deadline, || Ok(()))
+    }
+
+    /// Use one deadline through launcher preparation and execution. The
+    /// supplied check runs at the platform's final renderer launch gate.
+    pub fn run_checked_until<I, S>(
+        &self,
+        args: I,
+        environment: &[(OsString, OsString)],
+        options: BoundedProcessOptions,
+        deadline: Instant,
+        verify: impl Fn() -> std::io::Result<()>,
+    ) -> Result<BoundedProcessOutput, ConfinementError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
         let options = BoundedProcessOptions {
             timeout: options.timeout.min(self.limits.wall_timeout),
             ..options
         };
-        self.native.run(args, environment, options)
+        let cap = Instant::now()
+            .checked_add(options.timeout)
+            .ok_or(BoundedProcessError::InvalidLifetime)?;
+        let start = RendererStart {
+            deadline: deadline.min(cap),
+            budget: options.timeout,
+            verify: &verify,
+        };
+        start.remaining()?;
+        self.native.run(args, environment, options, start)
     }
 }
 
-pub(crate) fn canonical_paths(
-    program: &Path,
-    scratch: &Path,
-    runtime_roots: impl IntoIterator<Item = PathBuf>,
-) -> Result<CanonicalRenderPaths, ConfinementError> {
-    let program =
-        canonical_file(program).ok_or_else(|| ConfinementError::Program(program.into()))?;
-    let scratch =
-        canonical_directory(scratch).ok_or_else(|| ConfinementError::Scratch(scratch.into()))?;
-    let mut roots = Vec::new();
-    for root in runtime_roots {
-        if !is_normal_absolute_path(&root) {
-            return Err(ConfinementError::Runtime(root));
-        }
-        let source =
-            fs::canonicalize(&root).map_err(|_| ConfinementError::Runtime(root.clone()))?;
-        if !source.is_absolute() {
-            return Err(ConfinementError::Runtime(source));
-        }
-        roots.push((root, source));
-    }
-    Ok(CanonicalRenderPaths {
-        program,
-        scratch,
-        roots,
-    })
+#[derive(Clone, Copy)]
+pub(crate) struct RendererStart<'a> {
+    pub(crate) deadline: Instant,
+    budget: Duration,
+    verify: &'a dyn Fn() -> std::io::Result<()>,
 }
 
-pub(crate) struct CanonicalRenderPaths {
+impl RendererStart<'_> {
+    pub(crate) fn remaining(self) -> Result<Duration, BoundedProcessError> {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            Err(self.timeout_error())
+        } else {
+            Ok(remaining)
+        }
+    }
+
+    fn timeout_error(self) -> BoundedProcessError {
+        BoundedProcessError::Timeout {
+            timeout_ms: self.budget.as_millis(),
+        }
+    }
+
+    pub(crate) fn verify(self) -> Result<(), BoundedProcessError> {
+        self.remaining()?;
+        (self.verify)().map_err(|error| {
+            if error.kind() == std::io::ErrorKind::TimedOut {
+                self.timeout_error()
+            } else {
+                BoundedProcessError::Isolation(error)
+            }
+        })?;
+        self.remaining()?;
+        Ok(())
+    }
+}
+
+/// The resolved executable and the exact runtime mappings used at launch.
+/// Each mapping stores the requested path followed by its resolved source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderSources {
     pub(crate) program: PathBuf,
-    pub(crate) scratch: PathBuf,
     pub(crate) roots: Vec<(PathBuf, PathBuf)>,
+    #[cfg(target_os = "linux")]
+    pub(crate) masked_runtime_directory: Option<PathBuf>,
+}
+
+impl RenderSources {
+    pub fn resolve(
+        program: &Path,
+        runtime_roots: impl IntoIterator<Item = PathBuf>,
+    ) -> Result<Self, ConfinementError> {
+        let program =
+            canonical_file(program).ok_or_else(|| ConfinementError::Program(program.into()))?;
+        let mut roots = Vec::new();
+        for root in runtime_roots {
+            if !is_normal_absolute_path(&root) {
+                return Err(ConfinementError::Runtime(root));
+            }
+            let source =
+                fs::canonicalize(&root).map_err(|_| ConfinementError::Runtime(root.clone()))?;
+            if !source.is_absolute() {
+                return Err(ConfinementError::Runtime(source));
+            }
+            roots.push((root, source));
+        }
+        Ok(Self {
+            program,
+            roots,
+            #[cfg(target_os = "linux")]
+            masked_runtime_directory: None,
+        })
+    }
+
+    /// Overlay an empty read-only directory at each Linux bind of the backing path.
+    #[cfg(target_os = "linux")]
+    pub fn with_masked_runtime_directory(mut self, path: &Path) -> Result<Self, ConfinementError> {
+        if !is_normal_absolute_path(path)
+            || canonical_directory(path).as_deref() != Some(path)
+            || self.program.starts_with(path)
+            || self
+                .roots
+                .iter()
+                .any(|(_, source)| source != path && source.starts_with(path))
+        {
+            return Err(ConfinementError::Runtime(path.into()));
+        }
+
+        self.masked_runtime_directory = Some(path.into());
+        let destinations = self.runtime_mask_destinations();
+        if destinations.is_empty()
+            || destinations.iter().any(|mask| {
+                self.program.starts_with(mask)
+                    || self.roots.iter().any(|(destination, source)| {
+                        destination.starts_with(mask) && (destination != mask || source != path)
+                    })
+            })
+        {
+            return Err(ConfinementError::Runtime(path.into()));
+        }
+        Ok(self)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn runtime_mask_destinations(&self) -> Vec<PathBuf> {
+        let Some(path) = &self.masked_runtime_directory else {
+            return Vec::new();
+        };
+        let mut destinations: Vec<_> = self
+            .roots
+            .iter()
+            .filter_map(|(destination, source)| {
+                let relative = path.strip_prefix(source).ok()?;
+                if relative.as_os_str().is_empty() {
+                    Some(destination.clone())
+                } else {
+                    Some(destination.join(relative))
+                }
+            })
+            .collect();
+        destinations.sort_unstable();
+        destinations.dedup();
+        destinations
+    }
+
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn masked_runtime_directory(&self) -> Option<&Path> {
+        self.masked_runtime_directory.as_deref()
+    }
+
+    #[must_use]
+    pub fn program(&self) -> &Path {
+        &self.program
+    }
+
+    #[must_use]
+    pub fn roots(&self) -> &[(PathBuf, PathBuf)] {
+        &self.roots
+    }
 }
 
 fn is_normal_absolute_path(path: &Path) -> bool {
@@ -163,4 +314,66 @@ fn canonical_directory(path: &Path) -> Option<PathBuf> {
 #[cfg(all(debug_assertions, target_os = "linux"))]
 pub fn injected_linux_isolation_failure_for_test(selector: &str) -> ConfinementError {
     crate::platform::injected_isolation_failure(selector)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exhausted_renderer_budget_stops_before_launch_verification() {
+        let start = RendererStart {
+            deadline: Instant::now(),
+            budget: Duration::from_secs(10),
+            verify: &|| panic!("launch verification started after deadline"),
+        };
+        assert!(matches!(
+            start.verify(),
+            Err(BoundedProcessError::Timeout { .. })
+        ));
+    }
+
+    #[test]
+    fn launch_verification_preserves_a_typed_deadline_failure() {
+        let start = RendererStart {
+            deadline: Instant::now() + Duration::from_secs(10),
+            budget: Duration::from_secs(10),
+            verify: &|| Err(std::io::ErrorKind::TimedOut.into()),
+        };
+        assert!(matches!(
+            start.verify(),
+            Err(BoundedProcessError::Timeout { timeout_ms: 10_000 })
+        ));
+    }
+
+    #[test]
+    fn invalid_runtime_stops_at_launch_verification() {
+        let start = RendererStart {
+            deadline: Instant::now() + Duration::from_secs(10),
+            budget: Duration::from_secs(10),
+            verify: &|| Err(std::io::Error::other("runtime changed")),
+        };
+        let error = start.verify().unwrap_err();
+        assert!(
+            matches!(error, BoundedProcessError::Isolation(ref error) if error.to_string() == "runtime changed")
+        );
+    }
+    #[test]
+    fn expired_launch_budget_does_not_mask_isolation_failure() {
+        let deadline = Instant::now() + Duration::from_millis(50);
+        let start = RendererStart {
+            deadline,
+            budget: Duration::from_millis(50),
+            verify: &|| {
+                std::thread::sleep(
+                    deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
+                );
+                Err(std::io::Error::other("unverified launch isolation"))
+            },
+        };
+        assert!(matches!(
+            start.verify(),
+            Err(BoundedProcessError::Isolation(_))
+        ));
+    }
 }

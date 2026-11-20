@@ -234,8 +234,18 @@ pub(crate) struct GcArgs {
     #[arg(long, requires = "dry_run", conflicts_with = "yes")]
     pub(crate) prune_unreachable: bool,
 }
+fn parse_resource_tier(value: &str) -> Result<app::ResourceTier, String> {
+    match value {
+        "standard" => Ok(app::ResourceTier::Standard),
+        "large" => Ok(app::ResourceTier::Large),
+        _ => Err("expected standard or large".to_owned()),
+    }
+}
+
 #[derive(Debug, Clone, Args)]
 pub(crate) struct IndexArgs {
+    #[arg(long, default_value = "standard", value_parser = parse_resource_tier)]
+    pub(crate) resource_tier: app::ResourceTier,
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     pub(crate) max_file_bytes: Option<u64>,
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
@@ -522,6 +532,8 @@ pub(crate) struct RepairCancelChildInitializationArgs {
 }
 #[derive(Debug, Args)]
 pub(crate) struct RepairRebuildDbArgs {
+    #[arg(long, default_value = "standard", value_parser = parse_resource_tier)]
+    pub(crate) resource_tier: app::ResourceTier,
     #[arg(long, conflicts_with = "offline")]
     pub(crate) online: bool,
     #[arg(long)]
@@ -545,6 +557,8 @@ pub(crate) struct RepairRegistryPruneArgs {
 }
 #[derive(Debug, Args)]
 pub(crate) struct ReindexArgs {
+    #[arg(long, default_value = "standard", value_parser = parse_resource_tier)]
+    pub(crate) resource_tier: app::ResourceTier,
     #[arg(long)]
     pub(crate) regenerate: bool,
     #[arg(long, value_name = "COMMIT", conflicts_with = "regenerate")]
@@ -664,7 +678,7 @@ plain_from!(TagArgs => TagArgs { name, commit, delete });
 plain_from!(ExportArgs => ExportArgs { source, to, force, yes });
 plain_from!(RestoreArgs => RestoreArgs { source, paths, delete_missing, expected_head, preview, message });
 plain_from!(GcArgs => GcArgs { dry_run, yes, prune_unreachable });
-plain_from!(IndexArgs => IndexArgs { max_file_bytes, max_total_bytes, preview, yes, online, offline, realtime, batch });
+plain_from!(IndexArgs => IndexArgs { resource_tier, max_file_bytes, max_total_bytes, preview, yes, online, offline, realtime, batch });
 plain_from!(ResumeArgs => ResumeArgs { recheck_budget, override_budget, online, offline, realtime, batch });
 plain_from!(RetryArgs => RetryArgs { reset_violations, resend_unknown, yes, online, offline, realtime, batch });
 plain_from!(AbandonArgs => AbandonArgs { selector, yes });
@@ -699,11 +713,11 @@ plain_from!(ReconcileArgs => ReconcileArgs {});
 plain_from!(PointerArgs => PointerArgs { pointer });
 plain_from!(EvidenceVerifyArgs => EvidenceVerifyArgs { pointer, batch, strict });
 plain_from!(EvidenceRetargetArgs => EvidenceRetargetArgs { pointer, at });
-plain_from!(RepairRebuildDbArgs => RepairRebuildDbArgs { online, offline, realtime, batch });
+plain_from!(RepairRebuildDbArgs => RepairRebuildDbArgs { resource_tier, online, offline, realtime, batch });
 plain_from!(RepairVerifyObjectsArgs => RepairVerifyObjectsArgs { prune_orphans, yes });
 plain_from!(RepairRegistryPruneArgs => RepairRegistryPruneArgs { yes });
 plain_from!(RepairCancelChildInitializationArgs => RepairCancelChildInitializationArgs { path, preview, yes, operation });
-plain_from!(ReindexArgs => ReindexArgs { regenerate, at, yes, online, offline, realtime, batch });
+plain_from!(ReindexArgs => ReindexArgs { resource_tier, regenerate, at, yes, online, offline, realtime, batch });
 plain_from!(PurgeArgs => PurgeArgs { path, raw_hash, reason, erase_tombstone, yes });
 
 impl From<SnapshotAction> for app::SnapshotAction {

@@ -21,15 +21,18 @@ use kio_core::control::ControlHandle;
 use std::{
     ffi::OsString,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use kio_process::{
-    BoundedProcessOptions,
-    confinement::{RenderResourceLimits, RenderSandbox},
+    BoundedProcessError, BoundedProcessOptions, BoundedProcessOutput,
+    confinement::{ConfinementError, RenderResourceLimits, RenderSandbox, RenderSources},
 };
 use sha2::{Digest, Sha256};
 
+use crate::office_runtime_identity::{
+    ExecutableFingerprint, RuntimeSnapshot, check_verification_deadline,
+};
 use crate::platform::{
     OfficeRuntime, canonical_renderer_program, file_url, finish_scratch, private_temp_dir,
     restrict_renderer_state_directory, scratch_recovery_note,
@@ -46,7 +49,12 @@ pub const TEST_OFFICE_CONVERT_ENV: &str = "KIO_TEST_OFFICE_CONVERT";
 /// Explicit converter binary path, checked before the `soffice` PATH lookup.
 pub const OFFICE_CONVERTER_ENV: &str = "KIO_OFFICE_CONVERTER";
 /// The PATH-resolved program name probed as the last resolution step.
+#[cfg(not(windows))]
 const DEFAULT_OFFICE_CONVERTER_PROGRAM: &str = "soffice";
+#[cfg(windows)]
+const DEFAULT_OFFICE_CONVERTER_PROGRAM: &str = "soffice.exe";
+pub(crate) const MAX_OFFICE_PROBE_PDF_BYTES: usize = 2 * 1024 * 1024;
+const MAX_OFFICE_PROBE_SCRATCH_BYTES: u64 = 8 * 1024 * 1024;
 const OFFICE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const OFFICE_CONVERT_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_OFFICE_INPUT_BYTES: usize = 100 * 1024 * 1024;
@@ -59,6 +67,12 @@ const DOCX_MEDIA_TYPE: &str =
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
 const PPTX_MEDIA_TYPE: &str =
     "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+
+const DOCX_PROBE_FIXTURE: &[u8] = include_bytes!("../fixtures/office-probe.docx");
+const PPTX_PROBE_FIXTURE: &[u8] = include_bytes!("../fixtures/office-probe.pptx");
+
+const DOCX_PROBE_TEXT: &str = "KCS office convert test document";
+const PPTX_PROBE_TEXT: &str = "KCS office convert test presentation";
 
 /// True exactly for the DOCX and PPTX OOXML mimes (07 §5.1's 2026-07-23
 /// addendum). XLSX is deliberately excluded — its conversion machinery is
@@ -73,35 +87,43 @@ enum ConverterBackend {
     /// Test seam: [`OfficeConverter::convert_to_pdf`] returns this file's
     /// bytes verbatim for ANY input.
     #[cfg(debug_assertions)]
-    Seam { fixture_path: PathBuf },
-    /// A real `soffice`-compatible binary invoked via [`Command`].
-    Real {
-        program: PathBuf,
-        program_digest: String,
-        runtime: OfficeRuntime,
+    Seam {
+        fixture_path: PathBuf,
     },
+    Real(RealRenderer),
+}
+
+#[derive(Debug, Clone)]
+struct RealRenderer {
+    sources: RenderSources,
+    program_fingerprint: ExecutableFingerprint,
+    runtime_snapshot: Box<RuntimeSnapshot>,
+    runtime: OfficeRuntime,
+    control: ControlHandle,
+    #[cfg(test)]
+    native_acceptance_diagnostics: bool,
 }
 
 /// A resolved Office → PDF converter (07 §5.1). Obtain one via
 /// [`resolve_office_converter`].
 #[derive(Debug, Clone)]
 pub struct OfficeConverter {
-    control: ControlHandle,
-    #[cfg(test)]
-    native_acceptance_diagnostics: bool,
     backend: ConverterBackend,
     version: String,
 }
 
 impl OfficeConverter {
-    #[cfg(test)]
+    #[cfg(all(test, debug_assertions))]
     fn with_native_acceptance_diagnostics(mut self) -> Self {
-        self.native_acceptance_diagnostics = true;
+        if let ConverterBackend::Real(renderer) = &mut self.backend {
+            renderer.native_acceptance_diagnostics = true;
+        }
         self
     }
 
     /// The renderer's self-reported version (provenance-only — never a hash
-    /// input, 07 §5.1). `"test-converter"` for the test seam.
+    /// input, 07 §5.1). `"unknown"` if no usable version was reported, or
+    /// `"test-converter"` for the test seam.
     #[must_use]
     pub fn version(&self) -> &str {
         &self.version
@@ -125,14 +147,16 @@ impl OfficeConverter {
             ConverterBackend::Seam { fixture_path } => {
                 digest.update(fixture_path.as_os_str().as_encoded_bytes())
             }
-            ConverterBackend::Real {
-                program,
-                program_digest,
-                runtime,
-            } => {
-                digest.update(program.as_os_str().as_encoded_bytes());
+            ConverterBackend::Real(renderer) => {
+                let RealRenderer {
+                    sources,
+                    program_fingerprint,
+                    runtime,
+                    ..
+                } = renderer;
+                digest.update(sources.program().as_os_str().as_encoded_bytes());
                 digest.update(b"\0");
-                digest.update(program_digest.as_bytes());
+                digest.update(program_fingerprint.digest.as_bytes());
                 digest.update(b"\0");
                 digest.update(runtime.catalog_digest().unwrap_or("none").as_bytes());
             }
@@ -162,15 +186,13 @@ impl OfficeConverter {
                     fixture_path.display()
                 ))
             }),
-            ConverterBackend::Real {
-                program,
-                program_digest,
-                runtime,
-            } => {
+            ConverterBackend::Real(renderer) => {
                 crate::ooxml_package::validate_real_office_package(input, media_type)?;
-                verify_renderer_fingerprint(program, program_digest, "before conversion")?;
-                let pdf = convert_with_real_binary(program, runtime, input, media_type, self)?;
-                verify_renderer_fingerprint(program, program_digest, "after conversion")?;
+                let deadline = Instant::now() + OFFICE_CONVERT_TIMEOUT;
+                renderer
+                    .verify_runtime("before conversion", deadline)
+                    .map_err(verification_error)?;
+                let pdf = renderer.render_pdf(input, media_type, MAX_OFFICE_PDF_BYTES, deadline)?;
                 Ok(normalize_converted_pdf(&pdf))
             }
         }
@@ -197,6 +219,11 @@ pub fn resolve_office_converter() -> std::result::Result<OfficeConverter, Office
 pub fn resolve_office_converter_with_control(
     control: &ControlHandle,
 ) -> std::result::Result<OfficeConverter, OfficeUnavailable> {
+    let deadline = Instant::now() + OFFICE_PROBE_TIMEOUT;
+    let unusable = |error: AdapterError| OfficeUnavailable {
+        state: "unusable",
+        reason: error.to_string(),
+    };
     #[cfg(debug_assertions)]
     if let Some(fixture_path) = &control.debug().adapters.office_convert {
         if fixture_path.is_empty() {
@@ -206,9 +233,6 @@ pub fn resolve_office_converter_with_control(
             });
         }
         return Ok(OfficeConverter {
-            control: control.clone(),
-            #[cfg(test)]
-            native_acceptance_diagnostics: false,
             backend: ConverterBackend::Seam {
                 fixture_path: fixture_path.clone(),
             },
@@ -224,17 +248,16 @@ pub fn resolve_office_converter_with_control(
             reason: "Office renderer is not configured".into(),
         });
     }
-    let program = resolve_program(requested.clone()).ok_or_else(|| OfficeUnavailable {
-        state: if renderer_candidate_exists(&requested) {
-            "unusable"
-        } else {
-            "missing"
-        },
-        reason: format!(
-            "Office renderer {} could not be resolved",
-            requested.display()
-        ),
-    })?;
+    let Some(program) = resolve_program(&requested, deadline).map_err(unusable)? else {
+        let detected = renderer_candidate_exists(&requested, deadline).map_err(unusable)?;
+        return Err(OfficeUnavailable {
+            state: if detected { "unusable" } else { "missing" },
+            reason: format!(
+                "Office renderer {} could not be resolved",
+                requested.display()
+            ),
+        });
+    };
     #[cfg(all(debug_assertions, target_os = "linux"))]
     if let Some(fault) = control.debug().adapters.office_isolation_failure.known() {
         return Err(OfficeUnavailable {
@@ -243,136 +266,304 @@ pub fn resolve_office_converter_with_control(
                 .to_string(),
         });
     }
-    probe_real_converter_diagnostic(program, control).map_err(|error| OfficeUnavailable {
-        state: "unusable",
-        reason: error.to_string(),
-    })
+    probe_real_converter_diagnostic(program, control, deadline).map_err(unusable)
 }
 
-fn renderer_candidate_exists(program: &Path) -> bool {
-    let detected = |path: &Path| !matches!(std::fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound);
-    if program.components().count() > 1 || program.is_absolute() {
-        return detected(program);
-    }
-    std::env::var_os("PATH").is_some_and(|path| {
-        std::env::split_paths(&path).any(|directory| detected(&directory.join(program)))
-    })
+fn renderer_candidate_exists(program: &Path, deadline: Instant) -> Result<bool> {
+    Ok(find_program_candidate(program, deadline, |path| {
+        (!matches!(std::fs::symlink_metadata(&path), Err(error) if error.kind() == std::io::ErrorKind::NotFound))
+            .then_some(())
+    })?.is_some())
 }
 
-/// Resolve the executable before dropping the ambient environment.  The
-/// spawned renderer receives a fixed runtime PATH, while this lookup preserves
-/// the documented `soffice`-on-PATH resolution at the trusted CLI boundary.
-fn resolve_program(program: PathBuf) -> Option<PathBuf> {
-    if program.is_absolute() {
-        return canonical_renderer_program(program);
+fn resolve_program(program: &Path, deadline: Instant) -> Result<Option<PathBuf>> {
+    find_program_candidate(program, deadline, canonical_renderer_program)
+}
+
+/// Discover candidates and inspect each one against the same probe deadline.
+fn find_program_candidate<T>(
+    program: &Path,
+    deadline: Instant,
+    inspect: impl Fn(PathBuf) -> Option<T>,
+) -> Result<Option<T>> {
+    let inspect = |path| {
+        check_renderer_deadline(deadline)?;
+        let result = inspect(path);
+        check_renderer_deadline(deadline)?;
+        Ok(result)
+    };
+    if program.is_absolute() || program.components().count() > 1 {
+        return inspect(program.to_owned());
     }
-    if program.components().count() > 1 {
-        return canonical_renderer_program(program);
+    if let Some(path) = std::env::var_os("PATH") {
+        for directory in std::env::split_paths(&path) {
+            if let Some(result) = inspect(directory.join(program))? {
+                return Ok(Some(result));
+            }
+        }
     }
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|directory| directory.join(&program))
-        .find_map(canonical_renderer_program)
+    check_renderer_deadline(deadline)?;
+    Ok(None)
 }
 
 fn probe_real_converter_diagnostic(
     program: PathBuf,
     control: &ControlHandle,
+    deadline: Instant,
 ) -> Result<OfficeConverter> {
-    let program_digest = fingerprint_renderer_program(&program)?;
-    let runtime = OfficeRuntime::new(&program)?;
-    let scratch = private_temp_dir()?;
-    let profile_dir = create_private_renderer_state(scratch.path(), "probe")?;
-    let profile_url = file_url(&profile_dir)?;
-    let sandbox = RenderSandbox::new(
+    let runtime = OfficeRuntime::new(&program, deadline)?;
+    let renderer = RealRenderer::new(
         &program,
-        scratch.path(),
+        runtime.package_roots(&program)?,
         runtime.runtime_roots(&program)?,
-        RenderResourceLimits::default(),
-    )
-    .map_err(|error| {
-        AdapterError::ContractViolation(format!(
-            "office converter confinement setup failed: {error}"
-        ))
-    })?;
-    let mut environment = runtime.environment(&program, Some(&profile_dir));
-    runtime.configure_services(scratch.path(), &mut environment)?;
-    let output = match sandbox.run(
-        [
-            OsString::from("--headless"),
-            OsString::from("--norestore"),
-            OsString::from(format!("-env:UserInstallation={profile_url}")),
-            OsString::from("--version"),
-        ],
-        &environment,
-        BoundedProcessOptions {
-            timeout: OFFICE_PROBE_TIMEOUT,
-            max_stdout_bytes: MAX_OFFICE_LOG_BYTES,
-            max_stderr_bytes: MAX_OFFICE_LOG_BYTES,
+        runtime,
+        control,
+        deadline,
+    )?;
+    #[cfg(not(target_os = "linux"))]
+    renderer.verify_runtime_signatures(deadline)?;
+    let version = probe_renderer_capability(
+        || renderer.renderer_version(deadline),
+        |fixture, media_type| {
+            renderer.render_pdf(fixture, media_type, MAX_OFFICE_PROBE_PDF_BYTES, deadline)
         },
-    ) {
-        Ok(output) => output,
-        Err(error) => {
-            let recovery_note = scratch_recovery_note(scratch);
-            return Err(AdapterError::ContractViolation(format!(
-                "office converter bounded probe failed: {error}{recovery_note}"
-            )));
-        }
-    };
-    if !output.status.success() {
-        return Err(AdapterError::ContractViolation(format!(
-            "office converter probe exited with {}",
-            output.status
-        )));
-    }
-    // The supported official macOS 26.8 build includes the SVP headless
-    // backend. The tested 26.2.5 build lacks it: its version probe succeeds,
-    // but document conversion enters Cocoa and aborts under confinement.
-    runtime.validate_probe(&output.stdout)?;
-    let version = output
-        .stdout
-        .lines()
-        .next()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            AdapterError::ContractViolation(
-                "office converter probe returned no version line".to_owned(),
-            )
-        })?;
-    finish_scratch(scratch)?;
+        deadline,
+    )?;
     Ok(OfficeConverter {
-        control: control.clone(),
-        #[cfg(test)]
-        native_acceptance_diagnostics: false,
-        backend: ConverterBackend::Real {
-            program,
-            program_digest,
-            runtime,
-        },
-        version: version.to_owned(),
+        backend: ConverterBackend::Real(renderer),
+        version,
     })
 }
 
-fn fingerprint_renderer_program(program: &Path) -> Result<String> {
-    const MAX_RENDERER_PROGRAM_BYTES: u64 = 32 * 1024 * 1024;
-    let bytes = kio_core::cas::read_bounded_regular_file(program, MAX_RENDERER_PROGRAM_BYTES)
+impl RealRenderer {
+    fn new(
+        program: &Path,
+        package_roots: Vec<PathBuf>,
+        runtime_roots: Vec<PathBuf>,
+        runtime: OfficeRuntime,
+        control: &ControlHandle,
+        deadline: Instant,
+    ) -> Result<Self> {
+        check_renderer_deadline(deadline)?;
+        // On Windows these roots are checked for existence by the launcher.
+        // The AppContainer still depends on the package's pre-existing ACLs.
+        #[cfg(windows)]
+        let runtime_roots = runtime_roots
+            .into_iter()
+            .chain(package_roots.iter().cloned());
+        let sources = RenderSources::resolve(program, runtime_roots)
+            .map_err(|error| AdapterError::ContractViolation(error.to_string()))?;
+        #[cfg(target_os = "linux")]
+        let sources = runtime.bind_runtime(sources)?;
+        if sources.program() != program {
+            return Err(AdapterError::ContractViolation(
+                "office converter executable changed before runtime verification".to_owned(),
+            ));
+        }
+        let program_fingerprint =
+            ExecutableFingerprint::new(sources.program(), deadline).map_err(verification_error)?;
+        #[cfg(target_os = "linux")]
+        let runtime_snapshot = runtime
+            .snapshot(package_roots, &sources, deadline)
+            .map_err(verification_error)?;
+        #[cfg(not(target_os = "linux"))]
+        let runtime_snapshot =
+            RuntimeSnapshot::new(package_roots, &sources, deadline).map_err(verification_error)?;
+        Ok(Self {
+            sources,
+            program_fingerprint,
+            runtime,
+            runtime_snapshot: Box::new(runtime_snapshot),
+            control: control.clone(),
+            #[cfg(test)]
+            native_acceptance_diagnostics: false,
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn verify_runtime_signatures(&self, deadline: Instant) -> Result<()> {
+        let program = self.sources.program();
+        self.runtime_snapshot
+            .verify_signatures(&self.sources, deadline, || {
+                #[cfg(target_os = "macos")]
+                self.runtime
+                    .verify_runtime_signature(program, &self.runtime_snapshot, deadline)
+                    .map_err(std::io::Error::other)?;
+                #[cfg(windows)]
+                self.runtime.verify_runtime_signatures(
+                    program,
+                    &self.runtime_snapshot.pin_windows_package(deadline)?,
+                    deadline,
+                )?;
+                self.program_fingerprint
+                    .verify(program, "during signature verification", deadline)
+            })
+            .map_err(verification_error)
+    }
+
+    fn renderer_version(&self, deadline: Instant) -> Result<String> {
+        if Instant::now() >= deadline {
+            return Ok(String::new());
+        }
+        let scratch = private_temp_dir()?;
+        let profile_dir = create_private_renderer_state(scratch.path(), "probe")?;
+        let profile_url = file_url(&profile_dir)?;
+        let sandbox = RenderSandbox::from_sources(
+            &self.sources,
+            scratch.path(),
+            RenderResourceLimits::default(),
+        )
         .map_err(|error| {
             AdapterError::ContractViolation(format!(
-                "cannot safely fingerprint Office renderer executable: {error}"
+                "office converter confinement setup failed: {error}"
             ))
         })?;
-    Ok(hex_digest(&Sha256::digest(bytes)))
+        let mut environment = self
+            .runtime
+            .environment(self.sources.program(), Some(&profile_dir));
+        self.runtime
+            .configure_services(scratch.path(), &mut environment, deadline)?;
+        #[cfg(windows)]
+        let _runtime_pins = self
+            .runtime_snapshot
+            .pin_windows_package(deadline)
+            .map_err(verification_error)?;
+        let result = sandbox.run_checked_until(
+            [
+                OsString::from("--headless"),
+                OsString::from("--norestore"),
+                OsString::from(format!("-env:UserInstallation={profile_url}")),
+                OsString::from("--version"),
+            ],
+            &environment,
+            renderer_process_options(OFFICE_PROBE_TIMEOUT),
+            deadline,
+            || self.verify_runtime("before version query", deadline),
+        );
+        match advisory_version_output(result) {
+            Ok(stdout) => {
+                finish_scratch(scratch)?;
+                Ok(stdout)
+            }
+            Err(error) => {
+                let recovery_note = scratch_recovery_note(scratch);
+                Err(AdapterError::ContractViolation(format!(
+                    "office converter bounded version query failed: {error}{recovery_note}"
+                )))
+            }
+        }
+    }
+
+    fn verify_runtime(&self, stage: &str, deadline: Instant) -> std::io::Result<()> {
+        check_verification_deadline(deadline)?;
+        self.program_fingerprint
+            .verify(self.sources.program(), stage, deadline)?;
+        #[cfg(target_os = "linux")]
+        self.runtime.verify_roots(deadline)?;
+        self.runtime_snapshot.verify(&self.sources, stage, deadline)
+    }
 }
 
-fn verify_renderer_fingerprint(program: &Path, expected: &str, stage: &str) -> Result<()> {
-    let actual = fingerprint_renderer_program(program)?;
-    if actual != expected {
-        return Err(AdapterError::ContractViolation(format!(
-            "office converter executable changed {stage}; resolve a fresh converter before retrying"
-        )));
+fn verification_error(error: std::io::Error) -> AdapterError {
+    AdapterError::ContractViolation(error.to_string())
+}
+
+fn advisory_version_output(
+    result: std::result::Result<BoundedProcessOutput, ConfinementError>,
+) -> std::result::Result<String, ConfinementError> {
+    match result {
+        Ok(output) if output.status.success() => Ok(output.stdout),
+        Ok(_)
+        | Err(ConfinementError::Process(
+            BoundedProcessError::Timeout { .. }
+            | BoundedProcessError::OutputLimit { .. }
+            | BoundedProcessError::NonUtf8 { .. }
+            | BoundedProcessError::Read { .. }
+            | BoundedProcessError::Spawn(_),
+        )) => Ok(String::new()),
+        Err(error) => Err(error),
+    }
+}
+
+fn probe_renderer_capability(
+    query_version: impl FnOnce() -> Result<String>,
+    mut convert_fixture: impl FnMut(&[u8], &str) -> Result<Vec<u8>>,
+    deadline: Instant,
+) -> Result<String> {
+    for (extension, media_type, fixture, expected) in [
+        ("docx", DOCX_MEDIA_TYPE, DOCX_PROBE_FIXTURE, DOCX_PROBE_TEXT),
+        ("pptx", PPTX_MEDIA_TYPE, PPTX_PROBE_FIXTURE, PPTX_PROBE_TEXT),
+    ] {
+        check_renderer_deadline(deadline)?;
+        let pdf = convert_fixture(fixture, media_type).map_err(|error| {
+            AdapterError::ContractViolation(format!(
+                "Office renderer probe could not convert the {extension} fixture: {error}"
+            ))
+        })?;
+        if pdf.len() > MAX_OFFICE_PROBE_PDF_BYTES {
+            return Err(AdapterError::ContractViolation(
+                "Office renderer probe PDF exceeds its byte limit".to_owned(),
+            ));
+        }
+        let text = crate::pdf_decode::office_probe_page_text(&pdf, deadline)?;
+        check_renderer_deadline(deadline)?;
+        if !match text {
+            Some(text) => probe_text_matches(&text, expected, deadline)?,
+            None => false,
+        } {
+            return Err(AdapterError::ContractViolation(format!(
+                "Office renderer probe PDF did not contain the expected {extension} page"
+            )));
+        }
+    }
+    let stdout = query_version()?;
+    Ok(stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.chars().any(char::is_control))
+        .unwrap_or("unknown")
+        .to_owned())
+}
+
+/// Match the fixture words in order without making a copy of the output text.
+fn probe_text_matches(text: &str, expected: &str, deadline: Instant) -> Result<bool> {
+    let mut remaining = expected.split_whitespace();
+    let first = remaining.next().expect("fixture text contains words");
+    let mut next = Some(first);
+    for word in text.split_whitespace() {
+        check_renderer_deadline(deadline)?;
+        if Some(word) == next {
+            next = remaining.next();
+            if next.is_none() {
+                return Ok(true);
+            }
+        } else {
+            remaining = expected.split_whitespace();
+            next = remaining.next();
+            if word == first {
+                next = remaining.next();
+            }
+        }
+    }
+    check_renderer_deadline(deadline)?;
+    Ok(false)
+}
+
+pub(crate) fn check_renderer_deadline(deadline: Instant) -> Result<()> {
+    if Instant::now() >= deadline {
+        return Err(AdapterError::ContractViolation(
+            "office converter exceeded its time limit".to_owned(),
+        ));
     }
     Ok(())
+}
+
+fn renderer_process_options(timeout: Duration) -> BoundedProcessOptions {
+    BoundedProcessOptions {
+        timeout,
+        max_stdout_bytes: MAX_OFFICE_LOG_BYTES,
+        max_stderr_bytes: MAX_OFFICE_LOG_BYTES,
+    }
 }
 
 fn office_extension(media_type: &str) -> Option<&'static str> {
@@ -433,182 +624,182 @@ pub(crate) fn hex_digest(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// Run the real renderer: stage `input` under the correct extension, convert
-/// via `--headless --convert-to pdf --outdir`, and read back the produced
-/// PDF. `-env:UserInstallation` points at a private, per-invocation profile
-/// dir — LibreOffice refuses to start a second instance against a shared
-/// profile (which would otherwise serialize or deadlock concurrent prepare
-/// calls); verified against the real `/opt/homebrew/bin/soffice` 26.2.4.2 on
-/// the implementing machine. Any failure (spawn, non-zero exit, missing or
-/// non-PDF output) is `AdapterError::ContractViolation`.
-fn convert_with_real_binary(
-    program: &Path,
-    runtime: &OfficeRuntime,
-    input: &[u8],
-    media_type: &str,
-    converter: &OfficeConverter,
-) -> Result<Vec<u8>> {
-    let extension = office_extension(media_type).ok_or_else(|| {
-        AdapterError::ContractViolation(format!(
-            "office converter invoked for a non-office media type: {media_type}"
-        ))
-    })?;
-    if input.len() > MAX_OFFICE_INPUT_BYTES {
-        return Err(AdapterError::ContractViolation(format!(
-            "office input exceeds the {} byte limit",
-            MAX_OFFICE_INPUT_BYTES
-        )));
-    }
-    let validated_runtime = OfficeRuntime::new(program)?;
-    if validated_runtime != *runtime {
-        return Err(AdapterError::ContractViolation(
-            "Office runtime changed after converter probe".to_owned(),
-        ));
-    }
-    let scratch = private_temp_dir()?;
-    let workdir = scratch.path();
-
-    let scratch_directory = bind_private_scratch_with_control(workdir, &converter.control)
-        .map_err(|error| {
+impl RealRenderer {
+    /// Stage one document and render it inside the native sandbox with a
+    /// private, per-invocation profile and a retained output directory.
+    fn render_pdf(
+        &self,
+        input: &[u8],
+        media_type: &str,
+        output_limit: usize,
+        deadline: Instant,
+    ) -> Result<Vec<u8>> {
+        check_renderer_deadline(deadline)?;
+        let program = self.sources.program();
+        let runtime = &self.runtime;
+        let extension = office_extension(media_type).ok_or_else(|| {
             AdapterError::ContractViolation(format!(
-                "failed to retain private Office scratch: {error}"
+                "office converter invoked for a non-office media type: {media_type}"
             ))
         })?;
-    let input_leaf = format!("input.{extension}");
-    let input_path = workdir.join(&input_leaf);
-    let mut staged_input = scratch_directory
-        .create_private_file(Path::new(&input_leaf))
-        .map_err(|error| {
-            AdapterError::ContractViolation(format!(
-                "failed to create private Office input: {error}"
-            ))
-        })?;
-    {
-        use std::io::Write as _;
-        staged_input.write_all(input).map_err(|error| {
-            AdapterError::ContractViolation(format!(
-                "failed to stage private Office input: {error}"
-            ))
-        })?;
-    }
-    drop(staged_input);
-    let outdir = workdir.join("out");
-    let output_handle = scratch_directory
-        .create_directory(Path::new("out"))
-        .map_err(|error| {
-            AdapterError::ContractViolation(format!(
-                "failed to create private Office output directory: {error}"
-            ))
-        })?;
-    // Keep the original output directory capability across renderer execution.
-    // Child path replacements cannot redirect the descriptor-relative PDF read.
-    let output_directory = kio_core::store_dir::StoreDirectory::from_retained_with_control(
-        output_handle,
-        outdir.clone(),
-        converter.control.clone(),
-    )
-    .map_err(|error| {
-        AdapterError::ContractViolation(format!(
-            "failed to retain private Office output directory: {error}"
-        ))
-    })?;
-    let profile_dir = create_private_renderer_state(workdir, "conversion")?;
-
-    let profile_url = file_url(&profile_dir)?;
-    let sandbox = RenderSandbox::new(
-        program,
-        workdir,
-        validated_runtime.runtime_roots(program)?,
-        RenderResourceLimits::default(),
-    )
-    .map_err(|err| {
-        AdapterError::ContractViolation(format!(
-            "office converter confinement is unavailable: {err}"
-        ))
-    })?;
-    let arguments = vec![
-        OsString::from("--headless"),
-        OsString::from(format!("-env:UserInstallation={profile_url}")),
-        OsString::from("--convert-to"),
-        OsString::from("pdf"),
-        OsString::from("--outdir"),
-        outdir.as_os_str().to_owned(),
-        input_path.as_os_str().to_owned(),
-    ];
-    let mut environment = runtime.environment(program, Some(&profile_dir));
-    #[cfg(test)]
-    if converter.native_acceptance_diagnostics {
-        // This is a fixed diagnostic switch for checked-in synthetic OOXML
-        // fixtures only. It never accepts ambient log configuration.
-        environment.push((
-            OsString::from("SAL_LOG"),
-            OsString::from("+WARN+INFO.sal.osl.pipe"),
-        ));
-    }
-    runtime.configure_services(workdir, &mut environment)?;
-    let output = match sandbox.run(
-        arguments,
-        &environment,
-        BoundedProcessOptions {
-            timeout: OFFICE_CONVERT_TIMEOUT,
-            max_stdout_bytes: MAX_OFFICE_LOG_BYTES,
-            max_stderr_bytes: MAX_OFFICE_LOG_BYTES,
-        },
-    ) {
-        Ok(output) => output,
-        Err(err) => {
-            // Platform cleanup retains scratch whenever recovery owns it.
-            let recovery_note = scratch_recovery_note(scratch);
+        if input.len() > MAX_OFFICE_INPUT_BYTES {
             return Err(AdapterError::ContractViolation(format!(
-                "office converter {} failed within confinement: {err}{recovery_note}",
-                program.display()
+                "office input exceeds the {} byte limit",
+                MAX_OFFICE_INPUT_BYTES
             )));
         }
-    };
-    if !output.status.success() {
+        let scratch = private_temp_dir()?;
+        let workdir = scratch.path();
+
+        let scratch_directory =
+            bind_private_scratch_with_control(workdir, &self.control).map_err(|error| {
+                AdapterError::ContractViolation(format!(
+                    "failed to retain private Office scratch: {error}"
+                ))
+            })?;
+        let input_leaf = format!("input.{extension}");
+        let input_path = workdir.join(&input_leaf);
+        let mut staged_input = scratch_directory
+            .create_private_file(Path::new(&input_leaf))
+            .map_err(|error| {
+                AdapterError::ContractViolation(format!(
+                    "failed to create private Office input: {error}"
+                ))
+            })?;
+        {
+            use std::io::Write as _;
+            staged_input.write_all(input).map_err(|error| {
+                AdapterError::ContractViolation(format!(
+                    "failed to stage private Office input: {error}"
+                ))
+            })?;
+        }
+        drop(staged_input);
+        let outdir = workdir.join("out");
+        let output_handle = scratch_directory
+            .create_directory(Path::new("out"))
+            .map_err(|error| {
+                AdapterError::ContractViolation(format!(
+                    "failed to create private Office output directory: {error}"
+                ))
+            })?;
+        // Keep the original output directory capability across renderer execution.
+        // Child path replacements cannot redirect the descriptor-relative PDF read.
+        let output_directory = kio_core::store_dir::StoreDirectory::from_retained_with_control(
+            output_handle,
+            outdir.clone(),
+            self.control.clone(),
+        )
+        .map_err(|error| {
+            AdapterError::ContractViolation(format!(
+                "failed to retain private Office output directory: {error}"
+            ))
+        })?;
+        let profile_dir = create_private_renderer_state(workdir, "conversion")?;
+
+        let profile_url = file_url(&profile_dir)?;
+        let mut limits = RenderResourceLimits::default();
+        if output_limit == MAX_OFFICE_PROBE_PDF_BYTES {
+            limits.max_file_bytes = MAX_OFFICE_PROBE_SCRATCH_BYTES;
+        }
+        let sandbox =
+            RenderSandbox::from_sources(&self.sources, workdir, limits).map_err(|err| {
+                AdapterError::ContractViolation(format!(
+                    "office converter confinement is unavailable: {err}"
+                ))
+            })?;
+        let arguments = vec![
+            OsString::from("--headless"),
+            OsString::from(format!("-env:UserInstallation={profile_url}")),
+            OsString::from("--convert-to"),
+            OsString::from("pdf"),
+            OsString::from("--outdir"),
+            outdir.as_os_str().to_owned(),
+            input_path.as_os_str().to_owned(),
+        ];
+        let mut environment = runtime.environment(program, Some(&profile_dir));
         #[cfg(test)]
-        if converter.native_acceptance_diagnostics {
+        if self.native_acceptance_diagnostics {
+            // This is a fixed diagnostic switch for checked-in synthetic OOXML
+            // fixtures only. It never accepts ambient log configuration.
+            environment.push((
+                OsString::from("SAL_LOG"),
+                OsString::from("+WARN+INFO.sal.osl.pipe"),
+            ));
+        }
+        runtime.configure_services(workdir, &mut environment, deadline)?;
+        #[cfg(windows)]
+        let _runtime_pins = self
+            .runtime_snapshot
+            .pin_windows_package(deadline)
+            .map_err(verification_error)?;
+        let output = match sandbox.run_checked_until(
+            arguments,
+            &environment,
+            renderer_process_options(OFFICE_CONVERT_TIMEOUT),
+            deadline,
+            || self.verify_runtime("before conversion", deadline),
+        ) {
+            Ok(output) => output,
+            Err(err) => {
+                // Platform cleanup retains scratch whenever recovery owns it.
+                let recovery_note = scratch_recovery_note(scratch);
+                return Err(AdapterError::ContractViolation(format!(
+                    "office converter {} failed within confinement: {err}{recovery_note}",
+                    program.display()
+                )));
+            }
+        };
+        if !output.status.success() {
+            #[cfg(test)]
+            if self.native_acceptance_diagnostics {
+                return Err(AdapterError::ContractViolation(format!(
+                    "office converter {} exited with {} after {:?}; bounded stdout for the synthetic native acceptance fixture: {}; bounded stderr: {}",
+                    program.display(),
+                    output.status,
+                    output.duration,
+                    output.stdout.trim(),
+                    output.stderr.trim(),
+                )));
+            }
             return Err(AdapterError::ContractViolation(format!(
-                "office converter {} exited with {} after {:?}; bounded stdout for the synthetic native acceptance fixture: {}; bounded stderr: {}",
+                "office converter {} exited with {}",
                 program.display(),
-                output.status,
-                output.duration,
-                output.stdout.trim(),
-                output.stderr.trim(),
+                output.status
             )));
         }
-        return Err(AdapterError::ContractViolation(format!(
-            "office converter {} exited with {}",
-            program.display(),
-            output.status
-        )));
-    }
 
-    kio_core::private_fs::verify_private_directory_handle(&output_directory).map_err(|error| {
-        AdapterError::ContractViolation(format!(
-            "Office output directory lost private protection: {error}"
-        ))
-    })?;
-    let pdf_bytes = kio_core::private_fs::read_private_file_at(
-        &output_directory,
-        "input.pdf",
-        MAX_OFFICE_PDF_BYTES as u64,
-    )
-    .map_err(|error| {
-        AdapterError::ContractViolation(format!(
-            "office converter output is absent, unsafe, or exceeded the {} byte limit: {error}",
-            MAX_OFFICE_PDF_BYTES,
-        ))
-    })?;
-    if !pdf_bytes.starts_with(b"%PDF") {
-        return Err(AdapterError::ContractViolation(
-            "office converter output is not a PDF (missing %PDF magic)".to_owned(),
-        ));
+        check_renderer_deadline(deadline)?;
+        kio_core::private_fs::verify_private_directory_handle(&output_directory).map_err(
+            |error| {
+                AdapterError::ContractViolation(format!(
+                    "Office output directory lost private protection: {error}"
+                ))
+            },
+        )?;
+        let pdf_bytes = kio_core::private_fs::read_private_file_at_until(
+            &output_directory,
+            "input.pdf",
+            output_limit as u64,
+            deadline,
+        )
+        .map_err(|error| {
+            AdapterError::ContractViolation(format!(
+                "office converter output is absent, unsafe, or exceeded the {output_limit} byte limit: {error}",
+            ))
+        })?;
+        if !pdf_bytes.starts_with(b"%PDF") {
+            return Err(AdapterError::ContractViolation(
+                "office converter output is not a PDF (missing %PDF magic)".to_owned(),
+            ));
+        }
+        drop(output_directory);
+        drop(scratch_directory);
+        finish_scratch(scratch)?;
+        self.verify_runtime("after conversion", deadline)
+            .map_err(verification_error)?;
+        Ok(pdf_bytes)
     }
-    drop(output_directory);
-    drop(scratch_directory);
-    finish_scratch(scratch)?;
-    Ok(pdf_bytes)
 }
 
 /// Deterministically normalize a converter's raw PDF output (07 §5.1):
@@ -873,7 +1064,6 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 mod tests {
     use super::*;
     use crate::platform::*;
-    use base64::Engine;
 
     #[cfg(unix)]
     fn executable_script(path: &Path, body: &str) {
@@ -881,6 +1071,41 @@ mod tests {
         std::fs::write(path, body).expect("write renderer fixture");
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
             .expect("mark renderer fixture executable");
+    }
+
+    fn test_deadline() -> Instant {
+        Instant::now() + Duration::from_secs(10)
+    }
+
+    fn fixture_converter(script: &Path) -> (OfficeConverter, PathBuf) {
+        let program = script.canonicalize().unwrap();
+        let package = program.with_extension("runtime");
+        std::fs::create_dir(&package).unwrap();
+        std::fs::write(package.join("component"), b"original").unwrap();
+        let deadline = test_deadline();
+        #[cfg(any(target_os = "linux", windows))]
+        let runtime = OfficeRuntime::fixture(package.clone());
+        #[cfg(target_os = "macos")]
+        let runtime = OfficeRuntime::new(&program, deadline).unwrap();
+        let roots = runtime.runtime_roots(&program).unwrap();
+        #[cfg(not(target_os = "linux"))]
+        let roots = roots.into_iter().chain([package.clone()]).collect();
+        let renderer = RealRenderer::new(
+            &program,
+            vec![package.clone()],
+            roots,
+            runtime,
+            &ControlHandle::default(),
+            deadline,
+        )
+        .unwrap();
+        (
+            OfficeConverter {
+                backend: ConverterBackend::Real(renderer),
+                version: "unknown".to_owned(),
+            },
+            package,
+        )
     }
 
     #[cfg(target_os = "macos")]
@@ -898,23 +1123,25 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn homebrew_name_does_not_substitute_an_unrecognized_wrapper() {
-        assert!(is_macos_office_passthrough_wrapper(
-            b"#!/bin/bash\nexec \"/Applications/LibreOffice.app/Contents/MacOS/soffice\"  \"$@\"\n"
-        ));
-        assert!(!is_macos_office_passthrough_wrapper(
-            b"#!/bin/bash\nexec \"/Applications/OtherOffice.app/Contents/MacOS/soffice\"  \"$@\"\n"
-        ));
-        assert!(!is_macos_office_passthrough_wrapper(
-            b"#!/bin/bash\nexec \"/Applications/LibreOffice.app/Contents/MacOS/soffice\" --changed \"$@\"\n"
-        ));
+    fn macos_path_discovery_does_not_substitute_a_bundle_for_a_script() {
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("soffice");
+        executable_script(&program, "#!/bin/sh\nexit 0\n");
+        let canonical = canonical_renderer_program(program.clone()).unwrap();
+        assert_eq!(canonical, program.canonicalize().unwrap());
+        assert!(macos_office_bundle_candidate(&canonical).is_none());
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_uno_catalog_requires_well_formed_direct_uno_components() {
         let valid = macos_catalog(macos_spell_component());
-        assert!(macos_spell_component_range(&valid).is_ok());
+        assert!(macos_spell_component_range(&valid).unwrap().is_some());
+        assert!(
+            macos_spell_component_range(&macos_catalog(""))
+                .unwrap()
+                .is_none()
+        );
 
         let malformed_root =
             br#"<components xmlns=http://openoffice.org/2010/uno-components></components>"#;
@@ -1061,7 +1288,11 @@ mod tests {
         let _clear_seam = kio_core::test_control::TestEnvGuard::remove(TEST_OFFICE_CONVERT_ENV);
         let _clear_explicit = kio_core::test_control::TestEnvGuard::remove(OFFICE_CONVERTER_ENV);
         let directory = tempfile::tempdir().unwrap();
-        std::fs::create_dir(directory.path().join("soffice")).unwrap();
+        #[cfg(windows)]
+        let name = "soffice.exe";
+        #[cfg(not(windows))]
+        let name = "soffice";
+        std::fs::create_dir(directory.path().join(name)).unwrap();
         let _path = kio_core::test_control::TestEnvGuard::set("PATH", directory.path());
         let error = resolve_office_converter_with_control(&ControlHandle::new(
             kio_core::test_control::DebugTestControl::from_env(),
@@ -1074,7 +1305,6 @@ mod tests {
     #[test]
     fn real_renderer_does_not_inherit_secret_environment_and_handles_special_paths() {
         let _lock = kio_core::test_control::test_env_lock().lock().unwrap();
-        let _clear_seam = kio_core::test_control::TestEnvGuard::remove(TEST_OFFICE_CONVERT_ENV);
         let directory = tempfile::Builder::new()
             .prefix("kio office ; $ ")
             .tempdir()
@@ -1084,21 +1314,18 @@ mod tests {
             &script,
             "#!/bin/sh\n\
              if [ \"$KIO_CONVERTER_SECRET\" = leak ]; then exit 91; fi\n\
-             if [ \"$1\" = --version ] || [ \"$4\" = --version ]; then printf 'fixture renderer 1\\n'; exit 0; fi\n\
              out=\n\
              while [ \"$#\" -gt 0 ]; do\n\
                if [ \"$1\" = --outdir ]; then shift; out=$1; fi\n\
                shift\n\
              done\n\
-             printf '%%PDF-1.4\\nfixture\\n%%%%EOF\\n' > \"$out/input.pdf\"\n",
+             printf '%%PDF-1.4\\nfixture\\n1 0 obj\\n<< /Type /Page >>\\nendobj\\n%%%%EOF\\n' > \"$out/input.pdf\"\n",
         );
         let _secret = kio_core::test_control::TestEnvGuard::set("KIO_CONVERTER_SECRET", "leak");
-        let _explicit =
-            kio_core::test_control::TestEnvGuard::set(OFFICE_CONVERTER_ENV, script.as_os_str());
-        let converter = probe_real_converter_diagnostic(script.clone(), &ControlHandle::default())
-            .expect("fixture renderer probes with a secret-free bounded environment");
+        let (converter, _) = fixture_converter(&script);
+        assert_eq!(converter.version(), "unknown");
         let pdf = converter
-            .convert_to_pdf(&decode_fixture(DOCX_FIXTURE_B64), DOCX_MEDIA_TYPE)
+            .convert_to_pdf(DOCX_PROBE_FIXTURE, DOCX_MEDIA_TYPE)
             .expect("secret must not be inherited and special paths must work");
         assert!(pdf.starts_with(b"%PDF"));
     }
@@ -1123,26 +1350,23 @@ mod tests {
             return;
         }
         let _lock = kio_core::test_control::test_env_lock().lock().unwrap();
-        let _clear_seam = kio_core::test_control::TestEnvGuard::remove(TEST_OFFICE_CONVERT_ENV);
         let directory = tempfile::tempdir().unwrap();
         let script = directory.path().join("renderer");
         executable_script(
             &script,
             "#!/usr/bin/perl\n\
-             if (grep { $_ eq '--version' } @ARGV) { print qq(fixture renderer 1\\n); exit 0; }\n\
              my $out; for (my $i=0; $i < @ARGV-1; $i++) { $out=$ARGV[$i+1] if $ARGV[$i] eq '--outdir'; }\n\
              defined($out) or die 'no output directory';\n\
              my $input = $ARGV[-1];\n\
              ((stat($input))[2] & 0777) == 0600 or die 'staged input is not private';\n\
              ((stat($out))[2] & 0777) == 0700 or die 'staged output directory is not private';\n\
              open(my $pdf, '>', qq($out/input.pdf)) or die qq(open output: $!);\n\
-             print $pdf qq(%PDF-1.4\\nfixture\\n%%EOF\\n); close($pdf) or die qq(close output: $!);\n",
+             print $pdf qq(%PDF-1.4\\n1 0 obj\\n<< /Type /Page >>\\nendobj\\n%%EOF\\n); close($pdf) or die qq(close output: $!);\n",
         );
-        let mut converter = probe_real_converter_diagnostic(script, &ControlHandle::default())
-            .expect("private staging fixture renderer probes");
-        converter.native_acceptance_diagnostics = true;
+        let (converter, _) = fixture_converter(&script);
+        let converter = converter.with_native_acceptance_diagnostics();
         let pdf = converter
-            .convert_to_pdf(&decode_fixture(DOCX_FIXTURE_B64), DOCX_MEDIA_TYPE)
+            .convert_to_pdf(DOCX_PROBE_FIXTURE, DOCX_MEDIA_TYPE)
             .expect("renderer must receive private input and output directory under umask 022");
         assert!(pdf.starts_with(b"%PDF"));
     }
@@ -1151,20 +1375,19 @@ mod tests {
     #[test]
     fn real_renderer_rejects_executable_replacement_after_probe() {
         let _lock = kio_core::test_control::test_env_lock().lock().unwrap();
-        let _clear_seam = kio_core::test_control::TestEnvGuard::remove(TEST_OFFICE_CONVERT_ENV);
         let directory = tempfile::tempdir().expect("fixture directory");
         let script = directory.path().join("renderer");
-        executable_script(&script, "#!/bin/sh\nprintf 'fixture renderer 1\\n'\n");
-        let _explicit =
-            kio_core::test_control::TestEnvGuard::set(OFFICE_CONVERTER_ENV, script.as_os_str());
-        let converter = resolve_office_converter_with_control(&ControlHandle::new(
-            kio_core::test_control::DebugTestControl::from_env(),
-        ))
-        .expect("fixture renderer probes");
+
+        executable_script(
+            &script,
+            "#!/bin/sh\n\
+             printf '%%PDF-1.4\\n1 0 obj\\n<< /Type /Page >>\\nendobj\\n%%%%EOF\\n' > \"$6/input.pdf\"\n",
+        );
+        let (converter, _) = fixture_converter(&script);
 
         executable_script(&script, "#!/bin/sh\nprintf 'replacement renderer 2\\n'\n");
         let error = converter
-            .convert_to_pdf(&decode_fixture(DOCX_FIXTURE_B64), DOCX_MEDIA_TYPE)
+            .convert_to_pdf(DOCX_PROBE_FIXTURE, DOCX_MEDIA_TYPE)
             .expect_err("a converter replacement must invalidate the resolved identity");
         assert!(
             error
@@ -1177,7 +1400,6 @@ mod tests {
     #[test]
     fn renderer_output_symlink_is_rejected_without_reading_its_target() {
         let _lock = kio_core::test_control::test_env_lock().lock().unwrap();
-        let _clear_seam = kio_core::test_control::TestEnvGuard::remove(TEST_OFFICE_CONVERT_ENV);
         let directory = tempfile::Builder::new()
             .prefix("kio-office-symlink-")
             .tempdir()
@@ -1189,19 +1411,13 @@ mod tests {
         executable_script(
             &script,
             "#!/usr/bin/perl\n\
-             if (grep { $_ eq '--version' } @ARGV) { print qq(fixture renderer 1\\n); exit 0; }\n\
              my $out; for (my $i=0; $i < @ARGV-1; $i++) { $out=$ARGV[$i+1] if $ARGV[$i] eq '--outdir'; }\n\
              defined($out) or die 'no output directory';\n\
              symlink(qq($0-private.pdf), qq($out/input.pdf)) or die qq(symlink: $!);\n",
         );
-        let _explicit =
-            kio_core::test_control::TestEnvGuard::set(OFFICE_CONVERTER_ENV, script.as_os_str());
-        let converter = resolve_office_converter_with_control(&ControlHandle::new(
-            kio_core::test_control::DebugTestControl::from_env(),
-        ))
-        .expect("fixture renderer probes");
+        let (converter, _) = fixture_converter(&script);
         let error = converter
-            .convert_to_pdf(&decode_fixture(DOCX_FIXTURE_B64), DOCX_MEDIA_TYPE)
+            .convert_to_pdf(DOCX_PROBE_FIXTURE, DOCX_MEDIA_TYPE)
             .expect_err("a renderer-controlled output symlink must be rejected");
         let message = error.to_string();
         assert!(
@@ -1217,7 +1433,6 @@ mod tests {
     #[test]
     fn renderer_cannot_redirect_replaced_output_directory() {
         let _lock = kio_core::test_control::test_env_lock().lock().unwrap();
-        let _clear_seam = kio_core::test_control::TestEnvGuard::remove(TEST_OFFICE_CONVERT_ENV);
         let directory = tempfile::Builder::new()
             .prefix("kio-office-output-dir-")
             .tempdir()
@@ -1233,20 +1448,14 @@ mod tests {
         executable_script(
             &script,
             "#!/usr/bin/perl\n\
-             if (grep { $_ eq '--version' } @ARGV) { print qq(fixture renderer 1\\n); exit 0; }\n\
              my $out; for (my $i=0; $i < @ARGV-1; $i++) { $out=$ARGV[$i+1] if $ARGV[$i] eq '--outdir'; }\n\
              defined($out) or die 'no output directory';\n\
              rmdir($out) or die qq(rmdir: $!);\n\
              symlink(qq($0-private-dir), $out) or die qq(symlink: $!);\n",
         );
-        let _explicit =
-            kio_core::test_control::TestEnvGuard::set(OFFICE_CONVERTER_ENV, script.as_os_str());
-        let converter = resolve_office_converter_with_control(&ControlHandle::new(
-            kio_core::test_control::DebugTestControl::from_env(),
-        ))
-        .expect("fixture renderer probes");
+        let (converter, _) = fixture_converter(&script);
         let error = converter
-            .convert_to_pdf(&decode_fixture(DOCX_FIXTURE_B64), DOCX_MEDIA_TYPE)
+            .convert_to_pdf(DOCX_PROBE_FIXTURE, DOCX_MEDIA_TYPE)
             .expect_err("a replaced output directory must not redirect the retained read");
         let message = error.to_string();
         assert!(
@@ -1288,117 +1497,12 @@ mod tests {
         );
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn linux_tdf_layout_is_exact_and_version_components_are_bounded() {
-        assert_eq!(
-            linux_tdf_bundle_candidate(Path::new("/opt/libreoffice26.2/program/soffice")),
-            Some(PathBuf::from("/opt/libreoffice26.2"))
-        );
-        for path in [
-            "/opt/libreoffice/program/soffice",
-            "/opt/libreoffice26/program/soffice",
-            "/opt/libreoffice26.2.5/program/soffice",
-            "/opt/libreoffice26./program/soffice",
-            "/opt/libreoffice.2/program/soffice",
-            "/opt/libreoffice12345.2/program/soffice",
-            "/opt/libreoffice26.beta/program/soffice",
-            "/home/user/libreoffice26.2/program/soffice",
-            "/opt/libreoffice26.2//program/soffice",
-            "/opt/libreoffice26.2/program/../program/soffice",
-            "/opt/libreoffice26.2/program/custom",
-            "/opt/libreoffice26.2/sibling/soffice",
-        ] {
-            assert!(
-                linux_tdf_bundle_candidate(Path::new(path)).is_none(),
-                "{path}"
-            );
-        }
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn linux_package_authority_requires_root_and_rejects_unsafe_modes() {
-        assert!(trusted_linux_package_mode(0, 0o100755, false));
-        assert!(trusted_linux_package_mode(0, 0o40755, true));
-        for (owner, mode) in [
-            (501, 0o100755),
-            (0, 0o100775),
-            (0, 0o100757),
-            (0, 0o104755),
-            (0, 0o102755),
-        ] {
-            assert!(!trusted_linux_package_mode(owner, mode, false));
-        }
-        assert!(!trusted_linux_package_mode(0, 0o40777, true));
-        assert!(
-            linux_tdf_runtime_roots(Path::new("/tmp/custom/soffice"))
-                .unwrap()
-                .is_empty()
-        );
-        assert!(verify_linux_package_path(Path::new("/"), true).is_ok());
-        let fixture = tempfile::tempdir().unwrap();
-        let alias = fixture.path().join("alias");
-        std::os::unix::fs::symlink("/", &alias).unwrap();
-        assert!(verify_linux_package_path(&alias, true).is_err());
-        assert!(verify_linux_package_path(&fixture.path().join("missing"), false).is_err());
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_office_requires_supported_headless_release() {
-        let old = validate_macos_office_version(
-            "LibreOffice 26.2.5.2 cd7284b4cbbfeb507e630c1aac019f4157393acb\n\n",
-        )
-        .unwrap_err();
-        assert!(
-            old.to_string()
-                .contains("requires LibreOffice 26.8 or newer")
-        );
-        for version in [
-            "LibreOffice 26.8.0.3",
-            "LibreOffice 26.8.0\n\n",
-            "LibreOffice 26.8.0.3 cd7284b4cbbfeb507e630c1aac019f4157393acb\n",
-            "LibreOffice 27.2.0.1",
-        ] {
-            assert!(validate_macos_office_version(version).is_ok(), "{version}");
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_office_rejects_malformed_or_ambiguous_version() {
-        for version in [
-            "",
-            "26.8.0.3",
-            "LibreOffice 26.8",
-            "LibreOffice 26.8.0.3.1",
-            "LibreOffice 026.8.0.3",
-            "LibreOffice 26.08.0.3",
-            "LibreOffice 26.8..3",
-            "LibreOffice 26.8.0-beta",
-            "LibreOffice +26.8.0.3",
-            "LibreOffice 99999.8.0.3",
-            "LibreOffice 26.8.0.3 forged",
-            "LibreOffice 26.8.0.3 extra tokens",
-            "LibreOffice 26.8.0.3\nLibreOffice 26.2.5.2",
-            "LibreOffice\n26.8.0.3",
-            "LibreOffice 26.8.0.3\0",
-        ] {
-            let error = validate_macos_office_version(version).unwrap_err();
-            assert!(
-                error.to_string().contains("malformed or ambiguous"),
-                "{version}"
-            );
-        }
-    }
-
     #[cfg(windows)]
     #[test]
     fn windows_renderer_environment_uses_only_private_profile_state() {
-        let program = Path::new(r"C:\Program Files\LibreOffice\program\soffice.exe");
+        let windows = Path::new(r"C:\Windows");
         let home = Path::new(r"C:\kio scratch\private プロファイル");
-        let environment = renderer_environment(program, Some(home));
+        let environment = renderer_environment(windows, Some(home));
         for name in ["HOME", "USERPROFILE", "LOCALAPPDATA"] {
             let values: Vec<_> = environment
                 .iter()
@@ -1414,8 +1518,6 @@ mod tests {
                 [
                     "SystemRoot",
                     "WINDIR",
-                    "COMSPEC",
-                    "PATHEXT",
                     "PATH",
                     "HOME",
                     "USERPROFILE",
@@ -1426,7 +1528,7 @@ mod tests {
                 "unexpected renderer environment key: {key:?}"
             );
         }
-        let without_home = renderer_environment(program, None);
+        let without_home = renderer_environment(windows, None);
         assert!(without_home.iter().all(|(key, _)| {
             !["HOME", "USERPROFILE", "LOCALAPPDATA"]
                 .iter()
@@ -1449,14 +1551,13 @@ mod tests {
     fn macos_bundle_candidate_requires_exact_app_layout() {
         let app = Path::new("/private/task/LibreOffice.app");
         assert_eq!(
-            macos_office_bundle_candidate(&app.join("Contents/MacOS/soffice")),
+            macos_office_bundle_candidate(&app.join("Contents/MacOS/alternate-renderer")),
             Some(app.to_path_buf())
         );
         for path in [
             "relative.app/Contents/MacOS/soffice",
             "/private/LibreOffice/Contents/MacOS/soffice",
             "/private/LibreOffice.app/MacOS/soffice",
-            "/private/LibreOffice.app/Contents/MacOS/other",
             "/private/LibreOffice.app/Contents/bin/soffice",
             "/private/bin/soffice",
         ] {
@@ -1466,6 +1567,23 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_rejects_an_executable_other_than_the_declared_bundle_main() {
+        let (_directory, bundle, program, _source) = fake_office_bundle();
+        std::fs::write(
+            bundle.join("Contents/Info.plist"),
+            br#"<?xml version="1.0"?><plist version="1.0"><dict>
+            <key>CFBundleExecutable</key><string>alternate-renderer</string></dict></plist>"#,
+        )
+        .unwrap();
+        let error = verify_macos_office_bundle(&bundle, &program, test_deadline()).unwrap_err();
+        assert!(
+            error.to_string().contains("bundle's main executable"),
+            "{error}"
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -1485,7 +1603,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_forged_bundle_identity_does_not_authorize_runtime() {
-        let (_directory, bundle, program, _source) = fake_office_bundle();
+        let (_directory, bundle, program, source) = fake_office_bundle();
+        std::fs::write(source, macos_catalog(macos_spell_component())).unwrap();
         std::fs::write(
             bundle.join("Contents/Info.plist"),
             br#"<?xml version="1.0"?><plist version="1.0"><dict>
@@ -1494,8 +1613,16 @@ mod tests {
             <key>CFBundleExecutable</key><string>soffice</string></dict></plist>"#,
         )
         .unwrap();
-        assert!(verify_macos_office_bundle(&bundle).is_err());
-        assert!(private_uno_catalog_for_program(&program).is_err());
+        assert!(verify_macos_office_bundle(&bundle, &program, test_deadline()).is_err());
+        let deadline = test_deadline();
+        let runtime = OfficeRuntime::new(&program, deadline).unwrap();
+        let sources = RenderSources::resolve(&program, [bundle.clone()]).unwrap();
+        let snapshot = RuntimeSnapshot::new(vec![bundle], &sources, deadline).unwrap();
+        assert!(
+            runtime
+                .verify_runtime_signature(&program, &snapshot, deadline)
+                .is_err()
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -1528,7 +1655,9 @@ mod tests {
             source_digest: hex_digest(&Sha256::digest(&bytes)),
         };
         let scratch = private_temp_dir().unwrap();
-        let filtered = write_private_uno_catalog(&catalog, scratch.path()).unwrap();
+        let filtered = write_private_uno_catalog(&catalog, scratch.path(), test_deadline())
+            .unwrap()
+            .unwrap();
         assert!(
             !std::fs::read_to_string(filtered)
                 .unwrap()
@@ -1536,12 +1665,15 @@ mod tests {
         );
         std::fs::write(&source, b"<malformed").unwrap();
         let next_scratch = private_temp_dir().unwrap();
-        assert!(write_private_uno_catalog(&catalog, next_scratch.path()).is_err());
+        assert!(write_private_uno_catalog(&catalog, next_scratch.path(), test_deadline()).is_err());
         let malformed_catalog = PrivateUnoCatalog {
             source_digest: hex_digest(&Sha256::digest(b"<malformed")),
             ..catalog
         };
-        assert!(write_private_uno_catalog(&malformed_catalog, next_scratch.path()).is_err());
+        assert!(
+            write_private_uno_catalog(&malformed_catalog, next_scratch.path(), test_deadline())
+                .is_err()
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -1549,7 +1681,7 @@ mod tests {
     fn macos_runtime_roots_admit_only_the_validated_bundle() {
         let (_directory, bundle, program, source) = fake_office_bundle();
         // This constructs the post-verification value only to test root
-        // selection; production can obtain it only through codesign above.
+        // selection; signature verification is tested separately.
         let catalog = PrivateUnoCatalog {
             bundle: bundle.clone(),
             source,
@@ -1744,86 +1876,528 @@ mod tests {
         assert_eq!(normalized, pdf);
     }
 
-    // ---- real soffice integration (env-gated) ------------------------------
-    //
-    // Helper script used ONCE to produce the embedded *_FIXTURE_B64 constants
-    // below (python3 stdlib only — `zip` is not a dependency anywhere in this
-    // workspace's Cargo.toml files, confirmed before writing this). Fixed ZIP
-    // entry timestamps (1980-01-01) make the script's OWN output reproducible
-    // run to run. DOCX:
-    //
-    // ```python
-    // import zipfile, base64
-    // def w(zf, name, data):
-    //     info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
-    //     info.compress_type = zipfile.ZIP_STORED
-    //     zf.writestr(info, data)
-    // CONTENT_TYPES = b'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-    // <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
-    // <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
-    // <Default Extension="xml" ContentType="application/xml"/>
-    // <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
-    // </Types>'''
-    // RELS = b'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-    // <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-    // <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
-    // </Relationships>'''
-    // DOCUMENT = b'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-    // <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
-    // <w:body><w:p><w:r><w:t>Kio office convert test</w:t></w:r></w:p></w:body>
-    // </w:document>'''
-    // with zipfile.ZipFile("minimal.docx", "w", zipfile.ZIP_STORED) as zf:
-    //     w(zf, "[Content_Types].xml", CONTENT_TYPES)
-    //     w(zf, "_rels/.rels", RELS)
-    //     w(zf, "word/document.xml", DOCUMENT)
-    // print(base64.b64encode(open("minimal.docx", "rb").read()).decode())
-    // ```
-    //
-    // PPTX needs the fuller OOXML presentation skeleton (presentation.xml +
-    // one slide + one slideLayout + one slideMaster + one theme, each with
-    // its own `_rels`) — same `w()` helper, additional parts:
-    //
-    // ```python
-    // PRESENTATION = b'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-    // <p:presentation xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
-    // <p:sldMasterIdLst><p:sldMasterId id="2147483648" r:id="rId1"/></p:sldMasterIdLst>
-    // <p:sldIdLst><p:sldId id="256" r:id="rId2"/></p:sldIdLst>
-    // <p:sldSz cx="9144000" cy="6858000"/><p:notesSz cx="6858000" cy="9144000"/>
-    // </p:presentation>'''
-    // # ... slide1.xml / slideLayout1.xml / slideMaster1.xml / theme1.xml and
-    // # their _rels, and [Content_Types].xml Overrides for all five parts —
-    // # full text lives in this crate's git history / task notes for
-    // # office_convert.rs; omitted here for brevity.
-    // ```
-
-    fn decode_fixture(b64: &str) -> Vec<u8> {
-        base64::engine::general_purpose::STANDARD
-            .decode(b64)
-            .expect("embedded fixture base64 decodes")
+    fn probe_pdf(text: &str, compressed_page: bool) -> Vec<u8> {
+        probe_pdf_with_length(text, compressed_page, false)
     }
 
-    const DOCX_FIXTURE_B64: &str = "UEsDBBQAAAAAAAAAIQDMg9OxswEAALMBAAATAAAAW0NvbnRlbnRfVHlwZXNdLnhtbDw/eG1sIHZlcnNpb249IjEuMCIgZW5jb2Rpbmc9IlVURi04IiBzdGFuZGFsb25lPSJ5ZXMiPz4KPFR5cGVzIHhtbG5zPSJodHRwOi8vc2NoZW1hcy5vcGVueG1sZm9ybWF0cy5vcmcvcGFja2FnZS8yMDA2L2NvbnRlbnQtdHlwZXMiPgo8RGVmYXVsdCBFeHRlbnNpb249InJlbHMiIENvbnRlbnRUeXBlPSJhcHBsaWNhdGlvbi92bmQub3BlbnhtbGZvcm1hdHMtcGFja2FnZS5yZWxhdGlvbnNoaXBzK3htbCIvPgo8RGVmYXVsdCBFeHRlbnNpb249InhtbCIgQ29udGVudFR5cGU9ImFwcGxpY2F0aW9uL3htbCIvPgo8T3ZlcnJpZGUgUGFydE5hbWU9Ii93b3JkL2RvY3VtZW50LnhtbCIgQ29udGVudFR5cGU9ImFwcGxpY2F0aW9uL3ZuZC5vcGVueG1sZm9ybWF0cy1vZmZpY2Vkb2N1bWVudC53b3JkcHJvY2Vzc2luZ21sLmRvY3VtZW50Lm1haW4reG1sIi8+CjwvVHlwZXM+ClBLAwQUAAAAAAAAACEAA9VLhC0BAAAtAQAACwAAAF9yZWxzLy5yZWxzPD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiIHN0YW5kYWxvbmU9InllcyI/Pgo8UmVsYXRpb25zaGlwcyB4bWxucz0iaHR0cDovL3NjaGVtYXMub3BlbnhtbGZvcm1hdHMub3JnL3BhY2thZ2UvMjAwNi9yZWxhdGlvbnNoaXBzIj4KPFJlbGF0aW9uc2hpcCBJZD0icklkMSIgVHlwZT0iaHR0cDovL3NjaGVtYXMub3BlbnhtbGZvcm1hdHMub3JnL29mZmljZURvY3VtZW50LzIwMDYvcmVsYXRpb25zaGlwcy9vZmZpY2VEb2N1bWVudCIgVGFyZ2V0PSJ3b3JkL2RvY3VtZW50LnhtbCIvPgo8L1JlbGF0aW9uc2hpcHM+ClBLAwQUAAAAAAAAACEAjUhHZOYAAADmAAAAEQAAAHdvcmQvZG9jdW1lbnQueG1sPD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiIHN0YW5kYWxvbmU9InllcyI/Pgo8dzpkb2N1bWVudCB4bWxuczp3PSJodHRwOi8vc2NoZW1hcy5vcGVueG1sZm9ybWF0cy5vcmcvd29yZHByb2Nlc3NpbmdtbC8yMDA2L21haW4iPgo8dzpib2R5Pgo8dzpwPjx3OnI+PHc6dD5LQ1Mgb2ZmaWNlIGNvbnZlcnQgdGVzdDwvdzp0PjwvdzpyPjwvdzpwPgo8L3c6Ym9keT4KPC93OmRvY3VtZW50PgpQSwECFAMUAAAAAAAAACEAzIPTsbMBAACzAQAAEwAAAAAAAAAAAAAAgAEAAAAAW0NvbnRlbnRfVHlwZXNdLnhtbFBLAQIUAxQAAAAAAAAAIQAD1UuELQEAAC0BAAALAAAAAAAAAAAAAACAAeQBAABfcmVscy8ucmVsc1BLAQIUAxQAAAAAAAAAIQCNSEdk5gAAAOYAAAARAAAAAAAAAAAAAACAAToDAAB3b3JkL2RvY3VtZW50LnhtbFBLBQYAAAAAAwADALkAAABPBAAAAAA=";
-    const PPTX_FIXTURE_B64: &str = "UEsDBBQAAAAAAAAAIQCMwBYR2AMAANgDAAATAAAAW0NvbnRlbnRfVHlwZXNdLnhtbDw/eG1sIHZlcnNpb249IjEuMCIgZW5jb2Rpbmc9IlVURi04IiBzdGFuZGFsb25lPSJ5ZXMiPz4KPFR5cGVzIHhtbG5zPSJodHRwOi8vc2NoZW1hcy5vcGVueG1sZm9ybWF0cy5vcmcvcGFja2FnZS8yMDA2L2NvbnRlbnQtdHlwZXMiPgo8RGVmYXVsdCBFeHRlbnNpb249InJlbHMiIENvbnRlbnRUeXBlPSJhcHBsaWNhdGlvbi92bmQub3BlbnhtbGZvcm1hdHMtcGFja2FnZS5yZWxhdGlvbnNoaXBzK3htbCIvPgo8RGVmYXVsdCBFeHRlbnNpb249InhtbCIgQ29udGVudFR5cGU9ImFwcGxpY2F0aW9uL3htbCIvPgo8T3ZlcnJpZGUgUGFydE5hbWU9Ii9wcHQvcHJlc2VudGF0aW9uLnhtbCIgQ29udGVudFR5cGU9ImFwcGxpY2F0aW9uL3ZuZC5vcGVueG1sZm9ybWF0cy1vZmZpY2Vkb2N1bWVudC5wcmVzZW50YXRpb25tbC5wcmVzZW50YXRpb24ubWFpbit4bWwiLz4KPE92ZXJyaWRlIFBhcnROYW1lPSIvcHB0L3NsaWRlcy9zbGlkZTEueG1sIiBDb250ZW50VHlwZT0iYXBwbGljYXRpb24vdm5kLm9wZW54bWxmb3JtYXRzLW9mZmljZWRvY3VtZW50LnByZXNlbnRhdGlvbm1sLnNsaWRlK3htbCIvPgo8T3ZlcnJpZGUgUGFydE5hbWU9Ii9wcHQvc2xpZGVMYXlvdXRzL3NsaWRlTGF5b3V0MS54bWwiIENvbnRlbnRUeXBlPSJhcHBsaWNhdGlvbi92bmQub3BlbnhtbGZvcm1hdHMtb2ZmaWNlZG9jdW1lbnQucHJlc2VudGF0aW9ubWwuc2xpZGVMYXlvdXQreG1sIi8+CjxPdmVycmlkZSBQYXJ0TmFtZT0iL3BwdC9zbGlkZU1hc3RlcnMvc2xpZGVNYXN0ZXIxLnhtbCIgQ29udGVudFR5cGU9ImFwcGxpY2F0aW9uL3ZuZC5vcGVueG1sZm9ybWF0cy1vZmZpY2Vkb2N1bWVudC5wcmVzZW50YXRpb25tbC5zbGlkZU1hc3Rlcit4bWwiLz4KPE92ZXJyaWRlIFBhcnROYW1lPSIvcHB0L3RoZW1lL3RoZW1lMS54bWwiIENvbnRlbnRUeXBlPSJhcHBsaWNhdGlvbi92bmQub3BlbnhtbGZvcm1hdHMtb2ZmaWNlZG9jdW1lbnQudGhlbWUreG1sIi8+CjwvVHlwZXM+ClBLAwQUAAAAAAAAACEACaoHxzABAAAwAQAACwAAAF9yZWxzLy5yZWxzPD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiIHN0YW5kYWxvbmU9InllcyI/Pgo8UmVsYXRpb25zaGlwcyB4bWxucz0iaHR0cDovL3NjaGVtYXMub3BlbnhtbGZvcm1hdHMub3JnL3BhY2thZ2UvMjAwNi9yZWxhdGlvbnNoaXBzIj4KPFJlbGF0aW9uc2hpcCBJZD0icklkMSIgVHlwZT0iaHR0cDovL3NjaGVtYXMub3BlbnhtbGZvcm1hdHMub3JnL29mZmljZURvY3VtZW50LzIwMDYvcmVsYXRpb25zaGlwcy9vZmZpY2VEb2N1bWVudCIgVGFyZ2V0PSJwcHQvcHJlc2VudGF0aW9uLnhtbCIvPgo8L1JlbGF0aW9uc2hpcHM+ClBLAwQUAAAAAAAAACEATomFuAUCAAAFAgAAFAAAAHBwdC9wcmVzZW50YXRpb24ueG1sPD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiIHN0YW5kYWxvbmU9InllcyI/Pgo8cDpwcmVzZW50YXRpb24geG1sbnM6YT0iaHR0cDovL3NjaGVtYXMub3BlbnhtbGZvcm1hdHMub3JnL2RyYXdpbmdtbC8yMDA2L21haW4iIHhtbG5zOnI9Imh0dHA6Ly9zY2hlbWFzLm9wZW54bWxmb3JtYXRzLm9yZy9vZmZpY2VEb2N1bWVudC8yMDA2L3JlbGF0aW9uc2hpcHMiIHhtbG5zOnA9Imh0dHA6Ly9zY2hlbWFzLm9wZW54bWxmb3JtYXRzLm9yZy9wcmVzZW50YXRpb25tbC8yMDA2L21haW4iPgo8cDpzbGRNYXN0ZXJJZExzdD48cDpzbGRNYXN0ZXJJZCBpZD0iMjE0NzQ4MzY0OCIgcjppZD0icklkMSIvPjwvcDpzbGRNYXN0ZXJJZExzdD4KPHA6c2xkSWRMc3Q+PHA6c2xkSWQgaWQ9IjI1NiIgcjppZD0icklkMiIvPjwvcDpzbGRJZExzdD4KPHA6c2xkU3ogY3g9IjkxNDQwMDAiIGN5PSI2ODU4MDAwIi8+CjxwOm5vdGVzU3ogY3g9IjY4NTgwMDAiIGN5PSI5MTQ0MDAwIi8+CjwvcDpwcmVzZW50YXRpb24+ClBLAwQUAAAAAAAAACEAFMCPq7wBAAC8AQAAHwAAAHBwdC9fcmVscy9wcmVzZW50YXRpb24ueG1sLnJlbHM8P3htbCB2ZXJzaW9uPSIxLjAiIGVuY29kaW5nPSJVVEYtOCIgc3RhbmRhbG9uZT0ieWVzIj8+CjxSZWxhdGlvbnNoaXBzIHhtbG5zPSJodHRwOi8vc2NoZW1hcy5vcGVueG1sZm9ybWF0cy5vcmcvcGFja2FnZS8yMDA2L3JlbGF0aW9uc2hpcHMiPgo8UmVsYXRpb25zaGlwIElkPSJySWQxIiBUeXBlPSJodHRwOi8vc2NoZW1hcy5vcGVueG1sZm9ybWF0cy5vcmcvb2ZmaWNlRG9jdW1lbnQvMjAwNi9yZWxhdGlvbnNoaXBzL3NsaWRlTWFzdGVyIiBUYXJnZXQ9InNsaWRlTWFzdGVycy9zbGlkZU1hc3RlcjEueG1sIi8+CjxSZWxhdGlvbnNoaXAgSWQ9InJJZDIiIFR5cGU9Imh0dHA6Ly9zY2hlbWFzLm9wZW54bWxmb3JtYXRzLm9yZy9vZmZpY2VEb2N1bWVudC8yMDA2L3JlbGF0aW9uc2hpcHMvc2xpZGUiIFRhcmdldD0ic2xpZGVzL3NsaWRlMS54bWwiLz4KPC9SZWxhdGlvbnNoaXBzPgpQSwMEFAAAAAAAAAAhAFyz5RdbAgAAWwIAABUAAABwcHQvc2xpZGVzL3NsaWRlMS54bWw8P3htbCB2ZXJzaW9uPSIxLjAiIGVuY29kaW5nPSJVVEYtOCIgc3RhbmRhbG9uZT0ieWVzIj8+CjxwOnNsZCB4bWxuczphPSJodHRwOi8vc2NoZW1hcy5vcGVueG1sZm9ybWF0cy5vcmcvZHJhd2luZ21sLzIwMDYvbWFpbiIgeG1sbnM6cj0iaHR0cDovL3NjaGVtYXMub3BlbnhtbGZvcm1hdHMub3JnL29mZmljZURvY3VtZW50LzIwMDYvcmVsYXRpb25zaGlwcyIgeG1sbnM6cD0iaHR0cDovL3NjaGVtYXMub3BlbnhtbGZvcm1hdHMub3JnL3ByZXNlbnRhdGlvbm1sLzIwMDYvbWFpbiI+CjxwOmNTbGQ+CjxwOnNwVHJlZT4KPHA6bnZHcnBTcFByPjxwOmNOdlByIGlkPSIxIiBuYW1lPSIiLz48cDpjTnZHcnBTcFByLz48cDpudlByLz48L3A6bnZHcnBTcFByPgo8cDpncnBTcFByLz4KPHA6c3A+CjxwOm52U3BQcj48cDpjTnZQciBpZD0iMiIgbmFtZT0iVGl0bGUiLz48cDpjTnZTcFByLz48cDpudlByLz48L3A6bnZTcFByPgo8cDpzcFByLz4KPHA6dHhCb2R5PjxhOmJvZHlQci8+PGE6cD48YTpyPjxhOnQ+S0NTIG9mZmljZSBjb252ZXJ0IHRlc3Q8L2E6dD48L2E6cj48L2E6cD48L3A6dHhCb2R5Pgo8L3A6c3A+CjwvcDpzcFRyZWU+CjwvcDpjU2xkPgo8L3A6c2xkPgpQSwMEFAAAAAAAAAAhADTsLLQ5AQAAOQEAACAAAABwcHQvc2xpZGVzL19yZWxzL3NsaWRlMS54bWwucmVsczw/eG1sIHZlcnNpb249IjEuMCIgZW5jb2Rpbmc9IlVURi04IiBzdGFuZGFsb25lPSJ5ZXMiPz4KPFJlbGF0aW9uc2hpcHMgeG1sbnM9Imh0dHA6Ly9zY2hlbWFzLm9wZW54bWxmb3JtYXRzLm9yZy9wYWNrYWdlLzIwMDYvcmVsYXRpb25zaGlwcyI+CjxSZWxhdGlvbnNoaXAgSWQ9InJJZDEiIFR5cGU9Imh0dHA6Ly9zY2hlbWFzLm9wZW54bWxmb3JtYXRzLm9yZy9vZmZpY2VEb2N1bWVudC8yMDA2L3JlbGF0aW9uc2hpcHMvc2xpZGVMYXlvdXQiIFRhcmdldD0iLi4vc2xpZGVMYXlvdXRzL3NsaWRlTGF5b3V0MS54bWwiLz4KPC9SZWxhdGlvbnNoaXBzPgpQSwMEFAAAAAAAAAAhADYpqHbGAQAAxgEAACEAAABwcHQvc2xpZGVMYXlvdXRzL3NsaWRlTGF5b3V0MS54bWw8P3htbCB2ZXJzaW9uPSIxLjAiIGVuY29kaW5nPSJVVEYtOCIgc3RhbmRhbG9uZT0ieWVzIj8+CjxwOnNsZExheW91dCB4bWxuczphPSJodHRwOi8vc2NoZW1hcy5vcGVueG1sZm9ybWF0cy5vcmcvZHJhd2luZ21sLzIwMDYvbWFpbiIgeG1sbnM6cj0iaHR0cDovL3NjaGVtYXMub3BlbnhtbGZvcm1hdHMub3JnL29mZmljZURvY3VtZW50LzIwMDYvcmVsYXRpb25zaGlwcyIgeG1sbnM6cD0iaHR0cDovL3NjaGVtYXMub3BlbnhtbGZvcm1hdHMub3JnL3ByZXNlbnRhdGlvbm1sLzIwMDYvbWFpbiIgdHlwZT0iYmxhbmsiIHByZXNlcnZlPSIxIj4KPHA6Y1NsZD4KPHA6c3BUcmVlPgo8cDpudkdycFNwUHI+PHA6Y052UHIgaWQ9IjEiIG5hbWU9IiIvPjxwOmNOdkdycFNwUHIvPjxwOm52UHIvPjwvcDpudkdycFNwUHI+CjxwOmdycFNwUHIvPgo8L3A6c3BUcmVlPgo8L3A6Y1NsZD4KPC9wOnNsZExheW91dD4KUEsDBBQAAAAAAAAAIQAmX7qVOQEAADkBAAAsAAAAcHB0L3NsaWRlTGF5b3V0cy9fcmVscy9zbGlkZUxheW91dDEueG1sLnJlbHM8P3htbCB2ZXJzaW9uPSIxLjAiIGVuY29kaW5nPSJVVEYtOCIgc3RhbmRhbG9uZT0ieWVzIj8+CjxSZWxhdGlvbnNoaXBzIHhtbG5zPSJodHRwOi8vc2NoZW1hcy5vcGVueG1sZm9ybWF0cy5vcmcvcGFja2FnZS8yMDA2L3JlbGF0aW9uc2hpcHMiPgo8UmVsYXRpb25zaGlwIElkPSJySWQxIiBUeXBlPSJodHRwOi8vc2NoZW1hcy5vcGVueG1sZm9ybWF0cy5vcmcvb2ZmaWNlRG9jdW1lbnQvMjAwNi9yZWxhdGlvbnNoaXBzL3NsaWRlTWFzdGVyIiBUYXJnZXQ9Ii4uL3NsaWRlTWFzdGVycy9zbGlkZU1hc3RlcjEueG1sIi8+CjwvUmVsYXRpb25zaGlwcz4KUEsDBBQAAAAAAAAAIQBB3XZ8wAIAAMACAAAhAAAAcHB0L3NsaWRlTWFzdGVycy9zbGlkZU1hc3RlcjEueG1sPD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiIHN0YW5kYWxvbmU9InllcyI/Pgo8cDpzbGRNYXN0ZXIgeG1sbnM6YT0iaHR0cDovL3NjaGVtYXMub3BlbnhtbGZvcm1hdHMub3JnL2RyYXdpbmdtbC8yMDA2L21haW4iIHhtbG5zOnI9Imh0dHA6Ly9zY2hlbWFzLm9wZW54bWxmb3JtYXRzLm9yZy9vZmZpY2VEb2N1bWVudC8yMDA2L3JlbGF0aW9uc2hpcHMiIHhtbG5zOnA9Imh0dHA6Ly9zY2hlbWFzLm9wZW54bWxmb3JtYXRzLm9yZy9wcmVzZW50YXRpb25tbC8yMDA2L21haW4iPgo8cDpjU2xkPgo8cDpzcFRyZWU+CjxwOm52R3JwU3BQcj48cDpjTnZQciBpZD0iMSIgbmFtZT0iIi8+PHA6Y052R3JwU3BQci8+PHA6bnZQci8+PC9wOm52R3JwU3BQcj4KPHA6Z3JwU3BQci8+CjwvcDpzcFRyZWU+CjwvcDpjU2xkPgo8cDpjbHJNYXAgYmcxPSJsdDEiIHR4MT0iZGsxIiBiZzI9Imx0MiIgdHgyPSJkazIiIGFjY2VudDE9ImFjY2VudDEiIGFjY2VudDI9ImFjY2VudDIiIGFjY2VudDM9ImFjY2VudDMiIGFjY2VudDQ9ImFjY2VudDQiIGFjY2VudDU9ImFjY2VudDUiIGFjY2VudDY9ImFjY2VudDYiIGhsaW5rPSJobGluayIgZm9sSGxpbms9ImZvbEhsaW5rIi8+CjxwOnNsZExheW91dElkTHN0PjxwOnNsZExheW91dElkIGlkPSIyMTQ3NDgzNjQ5IiByOmlkPSJySWQxIi8+PC9wOnNsZExheW91dElkTHN0Pgo8L3A6c2xkTWFzdGVyPgpQSwMEFAAAAAAAAAAhAFIh0dPBAQAAwQEAACwAAABwcHQvc2xpZGVNYXN0ZXJzL19yZWxzL3NsaWRlTWFzdGVyMS54bWwucmVsczw/eG1sIHZlcnNpb249IjEuMCIgZW5jb2Rpbmc9IlVURi04IiBzdGFuZGFsb25lPSJ5ZXMiPz4KPFJlbGF0aW9uc2hpcHMgeG1sbnM9Imh0dHA6Ly9zY2hlbWFzLm9wZW54bWxmb3JtYXRzLm9yZy9wYWNrYWdlLzIwMDYvcmVsYXRpb25zaGlwcyI+CjxSZWxhdGlvbnNoaXAgSWQ9InJJZDEiIFR5cGU9Imh0dHA6Ly9zY2hlbWFzLm9wZW54bWxmb3JtYXRzLm9yZy9vZmZpY2VEb2N1bWVudC8yMDA2L3JlbGF0aW9uc2hpcHMvc2xpZGVMYXlvdXQiIFRhcmdldD0iLi4vc2xpZGVMYXlvdXRzL3NsaWRlTGF5b3V0MS54bWwiLz4KPFJlbGF0aW9uc2hpcCBJZD0icklkMiIgVHlwZT0iaHR0cDovL3NjaGVtYXMub3BlbnhtbGZvcm1hdHMub3JnL29mZmljZURvY3VtZW50LzIwMDYvcmVsYXRpb25zaGlwcy90aGVtZSIgVGFyZ2V0PSIuLi90aGVtZS90aGVtZTEueG1sIi8+CjwvUmVsYXRpb25zaGlwcz4KUEsDBBQAAAAAAAAAIQANajFPDgcAAA4HAAAUAAAAcHB0L3RoZW1lL3RoZW1lMS54bWw8P3htbCB2ZXJzaW9uPSIxLjAiIGVuY29kaW5nPSJVVEYtOCIgc3RhbmRhbG9uZT0ieWVzIj8+CjxhOnRoZW1lIHhtbG5zOmE9Imh0dHA6Ly9zY2hlbWFzLm9wZW54bWxmb3JtYXRzLm9yZy9kcmF3aW5nbWwvMjAwNi9tYWluIiBuYW1lPSJLQ1MiPgo8YTp0aGVtZUVsZW1lbnRzPgo8YTpjbHJTY2hlbWUgbmFtZT0iS0NTIj4KPGE6ZGsxPjxhOnN5c0NsciB2YWw9IndpbmRvd1RleHQiIGxhc3RDbHI9IjAwMDAwMCIvPjwvYTpkazE+CjxhOmx0MT48YTpzeXNDbHIgdmFsPSJ3aW5kb3ciIGxhc3RDbHI9IkZGRkZGRiIvPjwvYTpsdDE+CjxhOmRrMj48YTpzcmdiQ2xyIHZhbD0iMUY0OTdEIi8+PC9hOmRrMj4KPGE6bHQyPjxhOnNyZ2JDbHIgdmFsPSJFRUVDRTEiLz48L2E6bHQyPgo8YTphY2NlbnQxPjxhOnNyZ2JDbHIgdmFsPSI0RjgxQkQiLz48L2E6YWNjZW50MT4KPGE6YWNjZW50Mj48YTpzcmdiQ2xyIHZhbD0iQzA1MDREIi8+PC9hOmFjY2VudDI+CjxhOmFjY2VudDM+PGE6c3JnYkNsciB2YWw9IjlCQkI1OSIvPjwvYTphY2NlbnQzPgo8YTphY2NlbnQ0PjxhOnNyZ2JDbHIgdmFsPSI4MDY0QTIiLz48L2E6YWNjZW50ND4KPGE6YWNjZW50NT48YTpzcmdiQ2xyIHZhbD0iNEJBQ0M2Ii8+PC9hOmFjY2VudDU+CjxhOmFjY2VudDY+PGE6c3JnYkNsciB2YWw9IkY3OTY0NiIvPjwvYTphY2NlbnQ2Pgo8YTpobGluaz48YTpzcmdiQ2xyIHZhbD0iMDAwMEZGIi8+PC9hOmhsaW5rPgo8YTpmb2xIbGluaz48YTpzcmdiQ2xyIHZhbD0iODAwMDgwIi8+PC9hOmZvbEhsaW5rPgo8L2E6Y2xyU2NoZW1lPgo8YTpmb250U2NoZW1lIG5hbWU9IktDUyI+CjxhOm1ham9yRm9udD48YTpsYXRpbiB0eXBlZmFjZT0iQ2FsaWJyaSIvPjwvYTptYWpvckZvbnQ+CjxhOm1pbm9yRm9udD48YTpsYXRpbiB0eXBlZmFjZT0iQ2FsaWJyaSIvPjwvYTptaW5vckZvbnQ+CjwvYTpmb250U2NoZW1lPgo8YTpmbXRTY2hlbWUgbmFtZT0iS0NTIj4KPGE6ZmlsbFN0eWxlTHN0PjxhOnNvbGlkRmlsbD48YTpzY2hlbWVDbHIgdmFsPSJwaENsciIvPjwvYTpzb2xpZEZpbGw+PGE6c29saWRGaWxsPjxhOnNjaGVtZUNsciB2YWw9InBoQ2xyIi8+PC9hOnNvbGlkRmlsbD48YTpzb2xpZEZpbGw+PGE6c2NoZW1lQ2xyIHZhbD0icGhDbHIiLz48L2E6c29saWRGaWxsPjwvYTpmaWxsU3R5bGVMc3Q+CjxhOmxuU3R5bGVMc3Q+PGE6bG4+PGE6c29saWRGaWxsPjxhOnNjaGVtZUNsciB2YWw9InBoQ2xyIi8+PC9hOnNvbGlkRmlsbD48L2E6bG4+PGE6bG4+PGE6c29saWRGaWxsPjxhOnNjaGVtZUNsciB2YWw9InBoQ2xyIi8+PC9hOnNvbGlkRmlsbD48L2E6bG4+PGE6bG4+PGE6c29saWRGaWxsPjxhOnNjaGVtZUNsciB2YWw9InBoQ2xyIi8+PC9hOnNvbGlkRmlsbD48L2E6bG4+PC9hOmxuU3R5bGVMc3Q+CjxhOmVmZmVjdFN0eWxlTHN0PjxhOmVmZmVjdFN0eWxlPjxhOmVmZmVjdExzdC8+PC9hOmVmZmVjdFN0eWxlPjxhOmVmZmVjdFN0eWxlPjxhOmVmZmVjdExzdC8+PC9hOmVmZmVjdFN0eWxlPjxhOmVmZmVjdFN0eWxlPjxhOmVmZmVjdExzdC8+PC9hOmVmZmVjdFN0eWxlPjwvYTplZmZlY3RTdHlsZUxzdD4KPGE6YmdGaWxsU3R5bGVMc3Q+PGE6c29saWRGaWxsPjxhOnNjaGVtZUNsciB2YWw9InBoQ2xyIi8+PC9hOnNvbGlkRmlsbD48YTpzb2xpZEZpbGw+PGE6c2NoZW1lQ2xyIHZhbD0icGhDbHIiLz48L2E6c29saWRGaWxsPjxhOnNvbGlkRmlsbD48YTpzY2hlbWVDbHIgdmFsPSJwaENsciIvPjwvYTpzb2xpZEZpbGw+PC9hOmJnRmlsbFN0eWxlTHN0Pgo8L2E6Zm10U2NoZW1lPgo8L2E6dGhlbWVFbGVtZW50cz4KPC9hOnRoZW1lPgpQSwECFAMUAAAAAAAAACEAjMAWEdgDAADYAwAAEwAAAAAAAAAAAAAAgAEAAAAAW0NvbnRlbnRfVHlwZXNdLnhtbFBLAQIUAxQAAAAAAAAAIQAJqgfHMAEAADABAAALAAAAAAAAAAAAAACAAQkEAABfcmVscy8ucmVsc1BLAQIUAxQAAAAAAAAAIQBOiYW4BQIAAAUCAAAUAAAAAAAAAAAAAACAAWIFAABwcHQvcHJlc2VudGF0aW9uLnhtbFBLAQIUAxQAAAAAAAAAIQAUwI+rvAEAALwBAAAfAAAAAAAAAAAAAACAAZkHAABwcHQvX3JlbHMvcHJlc2VudGF0aW9uLnhtbC5yZWxzUEsBAhQDFAAAAAAAAAAhAFyz5RdbAgAAWwIAABUAAAAAAAAAAAAAAIABkgkAAHBwdC9zbGlkZXMvc2xpZGUxLnhtbFBLAQIUAxQAAAAAAAAAIQA07Cy0OQEAADkBAAAgAAAAAAAAAAAAAACAASAMAABwcHQvc2xpZGVzL19yZWxzL3NsaWRlMS54bWwucmVsc1BLAQIUAxQAAAAAAAAAIQA2Kah2xgEAAMYBAAAhAAAAAAAAAAAAAACAAZcNAABwcHQvc2xpZGVMYXlvdXRzL3NsaWRlTGF5b3V0MS54bWxQSwECFAMUAAAAAAAAACEAJl+6lTkBAAA5AQAALAAAAAAAAAAAAAAAgAGcDwAAcHB0L3NsaWRlTGF5b3V0cy9fcmVscy9zbGlkZUxheW91dDEueG1sLnJlbHNQSwECFAMUAAAAAAAAACEAQd12fMACAADAAgAAIQAAAAAAAAAAAAAAgAEfEQAAcHB0L3NsaWRlTWFzdGVycy9zbGlkZU1hc3RlcjEueG1sUEsBAhQDFAAAAAAAAAAhAFIh0dPBAQAAwQEAACwAAAAAAAAAAAAAAIABHhQAAHBwdC9zbGlkZU1hc3RlcnMvX3JlbHMvc2xpZGVNYXN0ZXIxLnhtbC5yZWxzUEsBAhQDFAAAAAAAAAAhAA1qMU8OBwAADgcAABQAAAAAAAAAAAAAAIABKRYAAHBwdC90aGVtZS90aGVtZTEueG1sUEsFBgAAAAALAAsALgMAAGkdAAAAAA==";
+    fn probe_pdf_with_length(text: &str, compressed_page: bool, indirect_length: bool) -> Vec<u8> {
+        let page = "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>";
+        let content = format!("BT /F1 12 Tf 20 20 Td ({text}) Tj ET");
+        let mut pdf = b"%PDF-1.6\n".to_vec();
+        let mut offsets = [0; 8];
+        let mut object = |id: usize, dict: &str, stream: Option<&[u8]>| {
+            offsets[id] = pdf.len();
+            pdf.extend(format!("{id} 0 obj\n{dict}\n").as_bytes());
+            if let Some(stream) = stream {
+                pdf.extend_from_slice(b"stream\n");
+                pdf.extend_from_slice(stream);
+                pdf.extend_from_slice(b"\nendstream\n");
+            }
+            pdf.extend_from_slice(b"endobj\n");
+        };
+        object(1, "<< /Type /Catalog /Pages 2 0 R >>", None);
+        object(2, "<< /Type /Pages /Count 1 /Kids [3 0 R] >>", None);
+        if compressed_page {
+            let packed =
+                miniz_oxide::deflate::compress_to_vec_zlib(format!("3 0 {page}").as_bytes(), 6);
+            object(
+                7,
+                &format!(
+                    "<< /Type /ObjStm /N 1 /First 4 /Filter /FlateDecode /Length {} >>",
+                    packed.len()
+                ),
+                Some(&packed),
+            );
+        } else {
+            object(3, page, None);
+        }
+        let length = if indirect_length {
+            "7 0 R".to_owned()
+        } else {
+            content.len().to_string()
+        };
+        object(
+            4,
+            &format!("<< /Length {length} >>"),
+            Some(content.as_bytes()),
+        );
+        object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /ToUnicode 6 0 R >>",
+            None,
+        );
+        let cmap = b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap\n\
+            1 begincodespacerange <20> <7E> endcodespacerange\n\
+            1 beginbfrange <20> <7E> <0020> endbfrange\n\
+            endcmap CMapName currentdict /CMap defineresource pop end end";
+        object(6, &format!("<< /Length {} >>", cmap.len()), Some(cmap));
+        if indirect_length {
+            assert!(!compressed_page);
+            object(7, &content.len().to_string(), None);
+        }
+        let xref = pdf.len();
+        if compressed_page {
+            let mut data = vec![0, 0, 0, 0, 0, 255, 255];
+            for (id, offset) in offsets
+                .iter()
+                .copied()
+                .chain(std::iter::once(xref))
+                .enumerate()
+                .skip(1)
+            {
+                let (kind, offset) = if id == 3 { (2, 7) } else { (1, offset) };
+                data.push(kind);
+                data.extend_from_slice(&(offset as u32).to_be_bytes());
+                data.extend_from_slice(&[0, 0]);
+            }
+            pdf.extend(format!("8 0 obj\n<< /Type /XRef /Size 9 /Root 1 0 R /W [1 4 2] /Length {} >>\nstream\n", data.len()).as_bytes());
+            pdf.extend(&data);
+            pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        } else {
+            let size = if indirect_length { 8 } else { 7 };
+            pdf.extend(format!("xref\n0 {size}\n0000000000 65535 f \n").as_bytes());
+            for offset in &offsets[1..size] {
+                pdf.extend(format!("{offset:010} 00000 n \n").as_bytes());
+            }
+            pdf.extend(format!("trailer\n<< /Size {size} /Root 1 0 R >>\n").as_bytes());
+        }
+        pdf.extend(format!("startxref\n{xref}\n%%EOF\n").as_bytes());
+        pdf
+    }
+
+    fn rendered_probe_fixture(media_type: &str) -> Vec<u8> {
+        if media_type == DOCX_MEDIA_TYPE {
+            probe_pdf(DOCX_PROBE_TEXT, false)
+        } else {
+            probe_pdf(PPTX_PROBE_TEXT, true)
+        }
+    }
+
+    #[test]
+    fn probe_requires_both_fixture_conversions_without_a_version_line() {
+        let mut media_types = Vec::new();
+        let version = probe_renderer_capability(
+            || Ok("  \r\n".to_owned()),
+            |bytes, media_type| {
+                crate::ooxml_package::validate_real_office_package(bytes, media_type)?;
+                media_types.push(media_type.to_owned());
+                Ok(rendered_probe_fixture(media_type))
+            },
+            test_deadline(),
+        )
+        .expect("successful fixture conversions establish capability");
+        assert_eq!(media_types, [DOCX_MEDIA_TYPE, PPTX_MEDIA_TYPE]);
+        assert_eq!(version, "unknown");
+    }
+
+    // The supplied soffice capture exercises the Writer TJ text run.
+    const LIBREOFFICE_DOCX_PROBE_PDF: &[u8] =
+        include_bytes!("../fixtures/office-probe-libreoffice-docx.pdf");
+    // LibreOfficeKit export of the probe slide with a text box sized to fit the marker.
+    const LIBREOFFICE_PPTX_PROBE_PDF: &[u8] =
+        include_bytes!("../fixtures/office-probe-libreoffice-pptx.pdf");
+    // The supplied soffice capture wraps one glyph per row and positions the tail off the page.
+    const LIBREOFFICE_CLIPPED_PPTX_PROBE_PDF: &[u8] =
+        include_bytes!("../fixtures/office-probe-libreoffice-pptx-clipped.pdf");
+
+    fn probe_captured_libreoffice_pdfs(presentation: &[u8]) -> Result<String> {
+        probe_renderer_capability(
+            || Ok("LibreOffice 24.2".to_owned()),
+            |_, media_type| match media_type {
+                DOCX_MEDIA_TYPE => Ok(LIBREOFFICE_DOCX_PROBE_PDF.to_vec()),
+                PPTX_MEDIA_TYPE => Ok(presentation.to_vec()),
+                _ => panic!("unexpected probe media type: {media_type}"),
+            },
+            test_deadline(),
+        )
+    }
+
+    #[test]
+    fn probe_accepts_captured_libreoffice_docx_and_pptx() {
+        let version = probe_captured_libreoffice_pdfs(LIBREOFFICE_PPTX_PROBE_PDF)
+            .expect("real LibreOffice PDFs contain both expected probe pages");
+        assert_eq!(version, "LibreOffice 24.2");
+    }
+
+    #[test]
+    fn probe_rejects_captured_libreoffice_pptx_with_clipped_marker() {
+        let error = probe_captured_libreoffice_pdfs(LIBREOFFICE_CLIPPED_PPTX_PROBE_PDF)
+            .expect_err("a marker that runs off the slide does not establish capability");
+        assert!(
+            error
+                .to_string()
+                .contains("did not contain the expected pptx page"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn probe_rejects_inactive_wrong_generation_and_wrong_offset_xref_entries() {
+        let good = String::from_utf8(probe_pdf(DOCX_PROBE_TEXT, false)).unwrap();
+        let rows = good
+            .split_once("xref\n0 7\n")
+            .unwrap()
+            .1
+            .lines()
+            .collect::<Vec<_>>();
+        for (id, replacement) in [
+            (3, "0000000000 00001 f ".to_owned()),
+            (4, rows[4].replace("00000 n ", "00001 n ")),
+            (4, rows[3].to_owned()),
+        ] {
+            let bad = good.replacen(rows[id], &replacement, 1);
+            assert!(
+                crate::pdf_decode::office_probe_page_text(bad.as_bytes(), test_deadline())
+                    .ok()
+                    .flatten()
+                    .is_none(),
+                "accepted broken xref row {id}: {replacement}"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_resolves_content_references_by_object_number_and_generation() {
+        let pdf = String::from_utf8(probe_pdf(DOCX_PROBE_TEXT, false)).unwrap();
+        let content_row = pdf
+            .split_once("xref\n0 7\n")
+            .unwrap()
+            .1
+            .lines()
+            .nth(4)
+            .unwrap();
+        let pdf = pdf.replacen("4 0 obj", "4 1 obj", 1).replacen(
+            content_row,
+            &content_row.replace("00000 n", "00001 n"),
+            1,
+        );
+        let error =
+            crate::pdf_decode::office_probe_page_text(pdf.as_bytes(), test_deadline()).unwrap_err();
+        assert!(
+            error.to_string().contains("content reference is absent"),
+            "{error}"
+        );
+
+        let pdf = pdf.replace("/Contents 4 0 R", "/Contents 4 1 R");
+        let text =
+            crate::pdf_decode::office_probe_page_text(pdf.as_bytes(), test_deadline()).unwrap();
+        assert_eq!(text.as_deref().map(str::trim), Some(DOCX_PROBE_TEXT));
+    }
+
+    #[test]
+    fn program_discovery_rejects_a_result_returned_after_the_budget() {
+        let deadline = Instant::now() + Duration::from_millis(30);
+        let error = find_program_candidate(Path::new("/fixture"), deadline, |path| {
+            std::thread::sleep(
+                deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
+            );
+            Some(path)
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("time limit"));
+    }
+
+    #[test]
+    fn probe_rejects_wrong_object_stream_member_index() {
+        let mut pdf = probe_pdf(PPTX_PROBE_TEXT, true);
+        let marker = b"/W [1 4 2]";
+        let width = pdf
+            .windows(marker.len())
+            .position(|bytes| bytes == marker)
+            .unwrap();
+        let data = width
+            + pdf[width..]
+                .windows(8)
+                .position(|bytes| bytes == b"\nstream\n")
+                .unwrap()
+            + 8;
+        pdf[data + 3 * 7 + 6] = 1;
+        assert!(
+            crate::pdf_decode::office_probe_page_text(&pdf, test_deadline())
+                .ok()
+                .flatten()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn probe_resolves_indirect_stream_length_after_the_stream_object() {
+        let pdf = probe_pdf_with_length(DOCX_PROBE_TEXT, false, true);
+        let text = crate::pdf_decode::office_probe_page_text(&pdf, test_deadline()).unwrap();
+        assert_eq!(text.as_deref().map(str::trim), Some(DOCX_PROBE_TEXT));
+    }
+
+    #[test]
+    fn probe_resolves_flate_xref_stream_with_png_prediction() {
+        let mut pdf = probe_pdf(PPTX_PROBE_TEXT, true);
+        let marker = b"8 0 obj\n<< /Type /XRef";
+        let xref = pdf
+            .windows(marker.len())
+            .position(|bytes| bytes == marker)
+            .unwrap();
+        let start = xref
+            + pdf[xref..]
+                .windows(8)
+                .position(|bytes| bytes == b"\nstream\n")
+                .unwrap()
+            + 8;
+        let mut encoded = Vec::new();
+        let mut previous = [0; 7];
+        for row in pdf[start..start + 9 * 7].as_chunks::<7>().0 {
+            encoded.push(2);
+            encoded.extend(
+                row.iter()
+                    .zip(previous)
+                    .map(|(byte, above)| byte.wrapping_sub(above)),
+            );
+            previous = *row;
+        }
+        let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&encoded, 6);
+        pdf.truncate(xref);
+        pdf.extend(format!(
+            "8 0 obj\n<< /Type /XRef /Size 9 /Root 1 0 R /W [1 4 2] /Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 7 >> /Length {} >>\nstream\n",
+            compressed.len()
+        ).as_bytes());
+        pdf.extend(compressed);
+        pdf.extend(format!("\nendstream\nendobj\nstartxref\n{xref}\n%%EOF\n").as_bytes());
+        let text = crate::pdf_decode::office_probe_page_text(&pdf, test_deadline()).unwrap();
+        assert_eq!(text.as_deref().map(str::trim), Some(PPTX_PROBE_TEXT));
+    }
+
+    #[test]
+    fn probe_refuses_large_renderer_output_before_decoding() {
+        let result = probe_renderer_capability(
+            || panic!("version queried with oversized PDF"),
+            |_, media| {
+                let mut pdf = rendered_probe_fixture(media);
+                pdf.resize(MAX_OFFICE_PROBE_PDF_BYTES + 1, b' ');
+                Ok(pdf)
+            },
+            test_deadline(),
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("probe PDF exceeds")
+        );
+    }
+
+    #[test]
+    fn probe_rejects_unreachable_page_with_pdf_markers() {
+        let result = probe_renderer_capability(
+            || Ok("test renderer".to_owned()),
+            |_, _| Ok(b"%PDF-1.4\n1 0 obj\n<< /Type /Page >>\nendobj\n%%EOF\n".to_vec()),
+            test_deadline(),
+        );
+        assert!(result.is_err());
+        let mut unreachable = probe_pdf(DOCX_PROBE_TEXT, false);
+        let kids = unreachable
+            .windows(12)
+            .position(|bytes| bytes == b"/Kids [3 0 R")
+            .unwrap();
+        unreachable[kids + 7] = b'5';
+        assert!(
+            crate::pdf_decode::office_probe_page_text(&unreachable, test_deadline())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn probe_rejects_pdf_with_a_root_reference_only_in_a_nested_dictionary() {
+        let pdf = String::from_utf8(probe_pdf(DOCX_PROBE_TEXT, false)).unwrap();
+        let pdf = pdf.replace(
+            "<< /Size 7 /Root 1 0 R >>",
+            "<< /Size 7 /Other << /Root 1 0 R >> >>",
+        );
+        assert!(
+            crate::pdf_decode::office_probe_page_text(pdf.as_bytes(), test_deadline())
+                .ok()
+                .flatten()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn probe_preserves_capability_after_clean_version_timeout_or_output_limit() {
+        for error in [
+            BoundedProcessError::Timeout { timeout_ms: 10 },
+            BoundedProcessError::OutputLimit {
+                stream: "stdout",
+                limit: MAX_OFFICE_LOG_BYTES,
+            },
+        ] {
+            let version = probe_renderer_capability(
+                || {
+                    advisory_version_output(Err(error.into()))
+                        .map_err(|error| AdapterError::ContractViolation(error.to_string()))
+                },
+                |_, media_type| Ok(rendered_probe_fixture(media_type)),
+                test_deadline(),
+            );
+            assert_eq!(version.unwrap(), "unknown");
+        }
+        let failure = BoundedProcessError::RendererCleanup(std::io::Error::other("unverified"));
+        assert!(advisory_version_output(Err(failure.into())).is_err());
+    }
+
+    #[test]
+    fn probe_rejects_pptx_pdf_with_docx_content_even_with_a_version_line() {
+        let error = probe_renderer_capability(
+            || Ok("LibreOffice 26.8.0.3".to_owned()),
+            |_, _| Ok(probe_pdf(DOCX_PROBE_TEXT, false)),
+            test_deadline(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("pptx"), "{error}");
+    }
+
+    #[test]
+    fn deadline_reached_during_version_verification_is_typed() {
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("renderer");
+        std::fs::write(&program, b"fixture").unwrap();
+        let (converter, _) = fixture_converter(&program);
+        let ConverterBackend::Real(renderer) = converter.backend else {
+            unreachable!()
+        };
+        let error = renderer
+            .verify_runtime("before version query", Instant::now())
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn probe_rejects_an_expired_budget_before_rendering() {
+        let result = probe_renderer_capability(
+            || panic!("version queried after the deadline"),
+            |_, _| panic!("renderer invoked after the deadline"),
+            Instant::now(),
+        );
+        assert!(result.unwrap_err().to_string().contains("time limit"));
+    }
+
+    #[test]
+    fn probe_checks_remaining_budget_again_after_reading_output() {
+        let deadline = Instant::now() + Duration::from_millis(50);
+        let result = probe_renderer_capability(
+            || panic!("version queried after the deadline"),
+            |_, _| {
+                std::thread::sleep(
+                    deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
+                );
+                Ok(probe_pdf(DOCX_PROBE_TEXT, false))
+            },
+            deadline,
+        );
+        assert!(result.unwrap_err().to_string().contains("time limit"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_refuses_a_renderer_without_an_identifiable_runtime_package() {
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().canonicalize().unwrap().join("standalone");
+        std::fs::write(&program, b"fixture").unwrap();
+        let error =
+            probe_real_converter_diagnostic(program, &ControlHandle::default(), test_deadline())
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("cannot identify its package"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn conversion_verifies_the_resolved_program_even_after_restoring_the_original_name() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let original = root.join("renderer");
+        let saved = root.join("saved");
+        let substituted = root.join("substituted");
+        std::fs::write(&original, b"original").unwrap();
+        std::fs::write(&substituted, b"alternate").unwrap();
+        let (mut converter, package) = fixture_converter(&original);
+        let ConverterBackend::Real(renderer) = &mut converter.backend else {
+            unreachable!()
+        };
+        std::fs::rename(&original, &saved).unwrap();
+        symlink(&substituted, &original).unwrap();
+        renderer.sources = RenderSources::resolve(&original, [package]).unwrap();
+        std::fs::remove_file(&original).unwrap();
+        std::fs::rename(saved, &original).unwrap();
+
+        renderer
+            .program_fingerprint
+            .verify(&original, "control", test_deadline())
+            .unwrap();
+        let error = converter
+            .convert_to_pdf(DOCX_PROBE_FIXTURE, DOCX_MEDIA_TYPE)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("executable changed before conversion"),
+            "{error}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_rejects_runtime_replacement_at_conversion_entry() {
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("soffice.exe");
+        std::fs::write(&program, b"fixture").unwrap();
+        let (converter, package) = fixture_converter(&program);
+        let component = package.join("component");
+        let replacement = directory.path().join("replacement");
+        std::fs::write(&replacement, b"original").unwrap();
+        std::fs::remove_file(&component).unwrap();
+        std::fs::rename(replacement, component).unwrap();
+        let error = converter
+            .convert_to_pdf(DOCX_PROBE_FIXTURE, DOCX_MEDIA_TYPE)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("runtime changed before conversion"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn executable_identity_rejects_same_bytes_at_a_replaced_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("renderer");
+        let replacement = directory.path().join("replacement");
+        std::fs::write(&program, b"renderer").unwrap();
+        std::fs::write(&replacement, b"renderer").unwrap();
+        let before = ExecutableFingerprint::new(&program, test_deadline()).unwrap();
+        std::fs::remove_file(&program).unwrap();
+        std::fs::rename(replacement, &program).unwrap();
+        assert!(
+            before
+                .verify(&program, "before conversion", test_deadline())
+                .is_err()
+        );
+    }
 
     #[test]
     fn bundled_office_fixtures_pass_offline_package_preflight() {
-        crate::ooxml_package::validate_real_office_package(
-            &decode_fixture(DOCX_FIXTURE_B64),
-            DOCX_MEDIA_TYPE,
-        )
-        .expect("bundled DOCX package");
-        crate::ooxml_package::validate_real_office_package(
-            &decode_fixture(PPTX_FIXTURE_B64),
-            PPTX_MEDIA_TYPE,
-        )
-        .expect("bundled PPTX package");
+        crate::ooxml_package::validate_real_office_package(DOCX_PROBE_FIXTURE, DOCX_MEDIA_TYPE)
+            .expect("bundled DOCX package");
+        crate::ooxml_package::validate_real_office_package(PPTX_PROBE_FIXTURE, PPTX_MEDIA_TYPE)
+            .expect("bundled PPTX package");
     }
 
     /// Native Office acceptance is intentionally opt-in so regular unit tests
     /// never discover or launch an ambient renderer. `KIO_REAL_OFFICE=1`
     /// makes an unavailable or broken explicit/PATH-resolved renderer a test
     /// failure rather than a skip.
-    fn required_real_office_converter() -> Option<OfficeConverter> {
+    fn required_real_office_program(deadline: Instant) -> Option<PathBuf> {
         if std::env::var_os("KIO_REAL_OFFICE").as_deref() != Some(std::ffi::OsStr::new("1")) {
             eprintln!(
                 "skipping native Office acceptance; set KIO_REAL_OFFICE=1 and \
@@ -1831,17 +2405,84 @@ mod tests {
             );
             return None;
         }
-        let _clear_seam = kio_core::test_control::TestEnvGuard::remove(TEST_OFFICE_CONVERT_ENV);
         let selected = std::env::var_os(OFFICE_CONVERTER_ENV)
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_OFFICE_CONVERTER_PROGRAM));
-        let program = resolve_program(selected).expect(
+        Some(resolve_program(&selected, deadline).unwrap().expect(
             "KIO_REAL_OFFICE=1 requires KIO_OFFICE_CONVERTER or PATH to resolve a converter",
-        );
-        let converter = probe_real_converter_diagnostic(program, &ControlHandle::default())
-            .expect("KIO_REAL_OFFICE=1 requires a working sandboxed Office converter");
+        ))
+    }
+
+    fn required_real_office_converter() -> Option<OfficeConverter> {
+        let deadline = test_deadline();
+        let program = required_real_office_program(deadline)?;
+        let _clear_seam = kio_core::test_control::TestEnvGuard::remove(TEST_OFFICE_CONVERT_ENV);
+        let converter =
+            probe_real_converter_diagnostic(program, &ControlHandle::default(), deadline)
+                .expect("KIO_REAL_OFFICE=1 requires a working sandboxed Office converter");
         assert_ne!(converter.version(), "test-converter");
         Some(converter)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_rejects_signed_bundle_runtime_replacement_at_conversion_entry() {
+        let _lock = kio_core::test_control::test_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(installed) = required_real_office_program(test_deadline()) else {
+            return;
+        };
+        let bundle =
+            macos_office_bundle_candidate(&installed).expect("installed signed Office bundle");
+        let temp = tempfile::tempdir().unwrap();
+        let private_bundle = temp
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("Renamed Office.app");
+        let output = kio_process::run_bounded_command(
+            std::process::Command::new("/usr/bin/ditto")
+                .arg(&bundle)
+                .arg(&private_bundle),
+            renderer_process_options(Duration::from_secs(120)),
+            None,
+        )
+        .expect("copy signed fixture bundle");
+        assert!(output.status.success(), "{}", output.stderr);
+        let program = private_bundle.join("Contents/MacOS/soffice");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let runtime =
+            OfficeRuntime::new(&program, deadline).expect("verify copied bundle signature");
+        let renderer = RealRenderer::new(
+            &program,
+            runtime.package_roots(&program).unwrap(),
+            runtime.runtime_roots(&program).unwrap(),
+            runtime,
+            &ControlHandle::default(),
+            deadline,
+        )
+        .unwrap();
+        renderer
+            .verify_runtime_signatures(deadline)
+            .expect("verify copied bundle signature");
+        let converter = OfficeConverter {
+            backend: ConverterBackend::Real(renderer),
+            version: "unknown".to_owned(),
+        };
+        let catalog = private_bundle.join("Contents/Resources/services/services.rdb");
+        let replacement = temp.path().join("replacement.rdb");
+        std::fs::copy(&catalog, &replacement).unwrap();
+        std::fs::rename(replacement, catalog).unwrap();
+        let error = converter
+            .convert_to_pdf(DOCX_PROBE_FIXTURE, DOCX_MEDIA_TYPE)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("runtime changed before conversion"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1855,12 +2496,12 @@ mod tests {
             return;
         };
 
-        let docx = decode_fixture(DOCX_FIXTURE_B64);
+        let docx = DOCX_PROBE_FIXTURE;
         let first = converter
-            .convert_to_pdf(&docx, DOCX_MEDIA_TYPE)
+            .convert_to_pdf(docx, DOCX_MEDIA_TYPE)
             .expect("first conversion");
         let second = converter
-            .convert_to_pdf(&docx, DOCX_MEDIA_TYPE)
+            .convert_to_pdf(docx, DOCX_MEDIA_TYPE)
             .expect("second conversion");
         assert!(first.starts_with(b"%PDF"), "converted output must be a PDF");
         assert_eq!(
@@ -1901,12 +2542,12 @@ mod tests {
             return;
         };
 
-        let pptx = decode_fixture(PPTX_FIXTURE_B64);
+        let pptx = PPTX_PROBE_FIXTURE;
         let first = converter
-            .convert_to_pdf(&pptx, PPTX_MEDIA_TYPE)
+            .convert_to_pdf(pptx, PPTX_MEDIA_TYPE)
             .expect("first conversion");
         let second = converter
-            .convert_to_pdf(&pptx, PPTX_MEDIA_TYPE)
+            .convert_to_pdf(pptx, PPTX_MEDIA_TYPE)
             .expect("second conversion");
         assert!(first.starts_with(b"%PDF"), "converted output must be a PDF");
         assert_eq!(

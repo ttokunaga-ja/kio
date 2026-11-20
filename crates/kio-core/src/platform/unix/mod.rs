@@ -3,7 +3,8 @@ pub(crate) mod atomic_semantics;
 pub(crate) mod cas_identity;
 pub(crate) mod cas_io;
 pub(crate) mod cas_semantics;
-pub(crate) mod durability;
+#[cfg(test)]
+pub(crate) mod durability_tests;
 pub(crate) mod gc_exchange;
 pub(crate) mod gc_io;
 pub(crate) mod gc_metadata;

@@ -31,7 +31,7 @@ use windows_sys::Win32::{
     },
     Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES,
-        FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_READ_DATA, FILE_READ_EA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
         GetFileInformationByHandle, GetFileInformationByHandleEx, READ_CONTROL, SYNCHRONIZE,
     },
     System::IO::IO_STATUS_BLOCK,
@@ -165,7 +165,7 @@ fn reopen_retained_directory(directory: &File, label: &Path, desired_access: u32
     }
     Ok(operation)
 }
-fn nt_status_error(status: i32) -> std::io::Error {
+pub(in crate::platform) fn nt_status_error(status: i32) -> std::io::Error {
     std::io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) as i32 })
 }
 pub(crate) fn normalize_directory_handle(file: File, label: &Path) -> Result<File> {
@@ -366,13 +366,18 @@ pub(crate) fn open_regular_for_removal(
     relative: &Path,
     max: u64,
     label: &Path,
+    verify_stage_nonce: bool,
 ) -> Result<File> {
     let (parent, leaf) = parent(root, relative, label)?;
     let path = full(label, relative);
     let mut options = cap_fs::OpenOptions::new();
+    let mut access = FILE_READ_DATA | READ_CONTROL | DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+    if verify_stage_nonce {
+        access |= FILE_READ_EA;
+    }
     options
         .read(true)
-        .access_mode(FILE_READ_DATA | READ_CONTROL | DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE)
+        .access_mode(access)
         .share_mode(FILE_SHARE_READ)
         ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
     let file = cap_fs::open(&parent, Path::new(leaf), &options).map_err(|e| ioerr(&path, e))?;
@@ -489,6 +494,22 @@ pub(crate) fn read_optional(
     max: u64,
     label: &Path,
 ) -> Result<Option<Vec<u8>>> {
+    read_optional_with(root, relative, max, label, |reader| {
+        let mut bytes = Vec::new();
+        reader
+            .read_to_end(&mut bytes)
+            .map_err(|error| ioerr(&full(label, relative), error))?;
+        Ok(bytes)
+    })
+}
+
+pub(crate) fn read_optional_with<T>(
+    root: &File,
+    relative: &Path,
+    max: u64,
+    label: &Path,
+    read: impl FnOnce(&mut dyn Read) -> Result<T>,
+) -> Result<Option<T>> {
     let Some((p, n)) = parent_optional(root, relative, label)? else {
         return Ok(None);
     };
@@ -503,24 +524,23 @@ pub(crate) fn read_optional(
     if before.len() > max {
         return Err(err(&path, "store file exceeds byte limit"));
     }
-    let mut bytes = Vec::new();
-    Read::by_ref(&mut f)
-        .take(max.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|e| ioerr(&path, e))?;
+    let limit = max.saturating_add(1);
+    let mut reader = Read::by_ref(&mut f).take(limit);
+    let value = read(&mut reader)?;
+    let read_bytes = limit - reader.limit();
     let after = regular(&f, &path)?;
     let after_identity = crate::platform::regular_file_handle_identity(&f)
         .ok_or_else(|| err(&path, "store leaf changed type while being read"))?;
     let after_change = change_time(&f, &path)?;
-    if bytes.len() as u64 > max
+    if read_bytes > max
         || before_identity != after_identity
         || before.len() != after.len()
         || before_change != after_change
-        || after.len() != bytes.len() as u64
+        || after.len() != read_bytes
     {
         return Err(err(&path, "store file changed while it was read"));
     }
-    Ok(Some(bytes))
+    Ok(Some(value))
 }
 pub(crate) fn create_private_file_raw(root: &File, leaf: &Path, label: &Path) -> Result<File> {
     let leaf = direct_leaf(leaf, label)?;
@@ -563,6 +583,28 @@ pub(crate) fn open_private_gate_raw(root: &File, leaf: &Path, label: &Path) -> R
     }
 }
 pub(crate) fn rename_regular_between_raw(
+    source_parent: &File,
+    source_leaf: &Path,
+    destination_parent: &File,
+    destination_leaf: &Path,
+    publication: Publication,
+    source_label: &Path,
+    destination_label: &Path,
+) -> Result<()> {
+    rename_regular_between_unsynced(
+        source_parent,
+        source_leaf,
+        destination_parent,
+        destination_leaf,
+        publication,
+        source_label,
+        destination_label,
+    )?;
+    sync_directory(source_parent, source_label)?;
+    sync_directory(destination_parent, destination_label)
+}
+
+pub(crate) fn rename_regular_between_unsynced(
     source_parent: &File,
     source_leaf: &Path,
     destination_parent: &File,
@@ -668,8 +710,7 @@ pub(crate) fn rename_regular_between_raw(
             "published regular-file identity changed",
         ));
     }
-    sync_directory(source_parent, source_label)?;
-    sync_directory(destination_parent, destination_label)
+    Ok(())
 }
 fn move_verified_regular_handle_to_raw_retained(
     source_parent: &File,
@@ -887,6 +928,7 @@ pub(crate) fn rename_directory_between_create_only(
     destination_leaf: &Path,
     source_label: &Path,
     destination_label: &Path,
+    before_sync: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
     let source = direct_leaf(source_leaf, source_label)?;
     let destination = direct_leaf(destination_leaf, destination_label)?;
@@ -909,6 +951,7 @@ pub(crate) fn rename_directory_between_create_only(
             "published directory identity changed",
         ));
     }
+    before_sync()?;
     sync_directory(source_parent, source_label)?;
     sync_directory(destination_parent, destination_label)
 }
@@ -1041,16 +1084,25 @@ pub(crate) fn entries(root: &File, relative: &Path, label: &Path) -> Result<Vec<
         let name = entry.file_name();
         let child_label = full(label, relative).join(&name);
         let mut o = cap_fs::OpenOptions::new();
-        // Windows requires directory-open semantics even when an entry
-        // may also be a regular file. Keep the same retained parent and
-        // no-follow policy for both kinds of entry.
+        // Inspect either kind of entry through the retained parent. Do not use
+        // maybe_dir: cap-primitives removes FILE_SHARE_DELETE for that option,
+        // conflicting with the writer's live DELETE-capable .lock handle (and
+        // stage/publication handles).
+        // BACKUP_SEMANTICS permits directories without changing sharing. Only
+        // metadata is needed; the handle checks below still reject reparse
+        // points and hardlinked/nonregular leaves.
         o.read(true)
-            ._cap_fs_ext_maybe_dir(true)
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
             ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
-        let child = cap_fs::open(&d, Path::new(&name), &o).map_err(|_| {
+        let child = cap_fs::open(&d, Path::new(&name), &o).map_err(|error| {
             err(
                 &child_label,
-                "store entry cannot be opened without following links",
+                format!(
+                    "store entry cannot be opened without following links at {}: {error}",
+                    child_label.display()
+                ),
             )
         })?;
         let meta = child.metadata().map_err(|e| ioerr(&child_label, e))?;
@@ -1105,6 +1157,69 @@ mod tests {
     fn directory(path: &Path) -> StoreDirectory {
         fs::create_dir(path).expect("directory fixture");
         StoreDirectory::open(path).expect("retained directory")
+    }
+
+    #[test]
+    fn entries_and_journal_replacement_accept_a_retained_writer_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let store = directory(&root.path().join("store"));
+        let leaf = Path::new("tasks.jsonl");
+        store.append_private(leaf, b"before\n").unwrap();
+        // Match the real repository writer: READ/WRITE/DELETE access, with
+        // FILE_SHARE_READ only. J1 recovery lists this sibling of tasks.jsonl.
+        let held = super::super::private_fs::create_new_private_at(
+            &store.root_handle(),
+            std::ffi::OsStr::new(".lock"),
+            super::super::private_fs::NewPrivateObjectKind::LockFile,
+        )
+        .unwrap();
+        let expected = crate::platform::regular_file_handle_identity(&held).unwrap();
+        let listed = store.entries(Path::new("")).unwrap();
+        assert_eq!(listed.len(), 2);
+        for entry in &listed {
+            assert!(entry.is_regular_file);
+            assert!(!entry.is_directory);
+        }
+        assert!(listed.iter().any(|entry| entry.name == leaf.as_os_str()));
+        assert_eq!(
+            crate::platform::regular_file_handle_identity(&held),
+            Some(expected)
+        );
+        store
+            .write_atomic(leaf, b"compacted\n", Publication::Upsert)
+            .unwrap();
+        store.append_private(leaf, b"after\n").unwrap();
+        assert_eq!(
+            store.read_optional(leaf, 100).unwrap().unwrap(),
+            b"compacted\nafter\n"
+        );
+        assert!(fs::remove_file(store.path().join(".lock")).is_err());
+        assert_eq!(
+            crate::platform::regular_file_handle_identity(&held),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn entries_accepts_directories_but_rejects_hardlinks_and_reparse_points() {
+        let root = tempfile::tempdir().unwrap();
+        let store = directory(&root.path().join("store"));
+        fs::create_dir(store.path().join("child")).unwrap();
+        let listed = store.entries(Path::new("")).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].is_directory);
+        assert!(!listed[0].is_regular_file);
+
+        let outside = root.path().join("outside");
+        fs::write(&outside, b"outside").unwrap();
+        let unsafe_leaf = store.path().join("unsafe");
+        fs::hard_link(&outside, &unsafe_leaf).unwrap();
+        assert!(store.entries(Path::new("")).is_err());
+        fs::remove_file(&unsafe_leaf).unwrap();
+        std::os::windows::fs::symlink_file(&outside, &unsafe_leaf)
+            .expect("native store acceptance requires symlink creation capability");
+        assert!(store.entries(Path::new("")).is_err());
+        assert_eq!(fs::read(outside).unwrap(), b"outside");
     }
 
     #[test]
@@ -1189,8 +1304,9 @@ mod tests {
         let source_path = directory.path().join("leaf");
         fs::write(&source_path, b"source").expect("source body");
         let root_handle = directory.root_handle();
-        let held = open_regular_for_removal(&root_handle, Path::new("leaf"), 64, directory.path())
-            .expect("retained removal handle");
+        let held =
+            open_regular_for_removal(&root_handle, Path::new("leaf"), 64, directory.path(), false)
+                .expect("retained removal handle");
 
         assert!(fs::rename(&source_path, directory.path().join("renamed")).is_err());
         assert!(OpenOptions::new().write(true).open(&source_path).is_err());

@@ -255,21 +255,20 @@ fn resolve_evidence_source(
             &pointer,
         ));
     }
-    let mut matching_entries = tree.entries.iter().filter(|entry| {
-        entry.raw_hash == pointer.raw_hash
-            && entry.normalize.as_ref().is_some_and(|normalize| {
-                normalize.tool_profile_hash == pointer.tool_profile_hash
-                    && normalize.r#gen == chunk.r#gen
-            })
-    });
-    let entry = match pointer.path_at_commit.as_deref() {
-        Some(path) => matching_entries
-            .find(|entry| entry.path == path)
-            .ok_or_else(|| crate::scope_access::invalid_pointer_identity_error(&pointer))?,
-        None => matching_entries
-            .next()
-            .ok_or_else(|| crate::scope_access::invalid_pointer_identity_error(&pointer))?,
-    };
+    let entry = tree
+        .entries
+        .find(|entry| {
+            entry.raw_hash == pointer.raw_hash
+                && pointer
+                    .path_at_commit
+                    .as_deref()
+                    .is_none_or(|path| entry.path == path)
+                && entry.normalize.as_ref().is_some_and(|normalize| {
+                    normalize.tool_profile_hash == pointer.tool_profile_hash
+                        && normalize.r#gen == chunk.r#gen
+                })
+        })?
+        .ok_or_else(|| crate::scope_access::invalid_pointer_identity_error(&pointer))?;
 
     Ok(ExportSource {
         source_kind: "evidence",
@@ -354,15 +353,10 @@ fn resolve_commit_source(
     let reader = HistoryReader::new_with_control(&target.kio_dir, control.clone());
     let snapshot = reader.snapshot(&commit_hash)?;
     reject_purged_commit(&commit_hash, snapshot.commit.commit_type)?;
-    let files = snapshot
-        .tree
-        .entries
-        .iter()
-        .map(|entry| ExportItem {
-            path_at_commit: entry.path.clone(),
-            raw_hash: entry.raw_hash.clone(),
-        })
-        .collect();
+    let files = snapshot.tree.entries.map_collect(|entry| ExportItem {
+        path_at_commit: entry.path,
+        raw_hash: entry.raw_hash,
+    })?;
     Ok(ExportSource {
         source_kind: "commit",
         source_commit: commit_hash,
@@ -384,7 +378,7 @@ fn resolve_path_source(
         .ok_or_else(|| export_source_not_found(path))?;
     let history = HistoryReader::new_with_control(&target.kio_dir, control.clone()).walk(&head)?;
     let binding = history
-        .newest_binding_for_path(path)
+        .newest_binding_for_path(path)?
         .ok_or_else(|| export_source_not_found(path))?;
     let node = history
         .node(&binding.commit_hash)
@@ -860,15 +854,14 @@ fn reject_managed_collisions(
     if let Some(head) = repo.head_commit_hash()? {
         let commit = repo.read_commit(&head)?;
         let tree = repo.read_tree(&commit.tree)?;
-        let tracked = tree
-            .entries
-            .iter()
-            .map(|entry| portable_collision_key(&entry.path))
-            .collect::<BTreeSet<_>>();
-        if source
+        let requested = source
             .files
             .iter()
-            .any(|item| tracked.contains(&portable_collision_key(&item.path_at_commit)))
+            .map(|item| portable_collision_key(&item.path_at_commit))
+            .collect::<BTreeSet<_>>();
+        if tree
+            .entries
+            .any(|entry| requested.contains(&portable_collision_key(&entry.path)))?
         {
             return Err(KioError::invalid_usage(
                 "export conflicts with a managed working file; use managed restore",

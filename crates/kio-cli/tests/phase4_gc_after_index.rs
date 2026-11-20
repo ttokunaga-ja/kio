@@ -1038,22 +1038,24 @@ fn automatic_sweep_receipts_all_eligible_repaired_sharers_before_one_tree_remova
     json_success(&dir, &["index", "--offline", "--yes"], NOW);
 
     let store = ObjectStore::new(dir.path().join(".kio"));
-    let shared_tree =
-        store
-            .write_json(
-                ObjectKind::Tree,
-                &serde_json::to_value(
-                    build_tree(vec![TreeEntry::raw_file(
+    let shared_tree = store
+        .write_json(
+            ObjectKind::Tree,
+            &serde_json::to_value(
+                build_tree(
+                    &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+                    vec![TreeEntry::raw_file(
                     "old.md",
                     "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                 )
-                .unwrap()])
-                    .unwrap(),
+                .unwrap()],
                 )
                 .unwrap(),
             )
-            .unwrap()
-            .0;
+            .unwrap(),
+        )
+        .unwrap()
+        .0;
     let current_tree = Repository::open(dir.path())
         .unwrap()
         .read_commit(

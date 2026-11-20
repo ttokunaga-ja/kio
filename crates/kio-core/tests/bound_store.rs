@@ -102,7 +102,18 @@ fn bound_inspection_accounted_reads_and_streaming_copy_follow_retained_namespace
     let raw = vec![b'z'; 128 * 1024 + 17];
     objects.push((ObjectKind::Raw, store.write_raw(&raw).unwrap(), raw));
     for kind in [ObjectKind::Tree, ObjectKind::Commit] {
-        let value = serde_json::json!({"namespace":format!("{kind:?}")});
+        let value = if kind == ObjectKind::Tree {
+            serde_json::to_value(
+                kio_core::dag::build_tree(
+                    &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        } else {
+            serde_json::json!({"namespace":format!("{kind:?}")})
+        };
         let (hash, bytes) = store.write_json(kind, &value).unwrap();
         objects.push((kind, hash, bytes));
     }
@@ -132,6 +143,10 @@ fn bound_inspection_accounted_reads_and_streaming_copy_follow_retained_namespace
                     .consumed_bytes,
                 0
             );
+        } else if *kind == ObjectKind::Tree {
+            let (tree, consumed) = store.read_tree_accounted(hash).unwrap();
+            assert_eq!(kio_core::dag::tree_hash(&tree).unwrap(), *hash);
+            assert_eq!(consumed, bytes.len() as u64);
         } else {
             let (object, consumed) = store.read_object_accounted(*kind, hash).unwrap();
             assert_eq!(object.bytes, *bytes);

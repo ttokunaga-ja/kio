@@ -101,15 +101,17 @@ pub struct UnitReuse {
 pub const MAX_UNIT_LCS_CELLS: usize = 2_000_000;
 
 pub fn prepare_units(request: PrepareStageRequest) -> Result<PrepareStageOutput> {
-    // R20-6: the local deterministic adapter only parses text (Markdown / plain text /
-    // code) and PDF text layers (docs/07 §7.1). A RECOGNIZED non-text-native binary (image
+    if crate::unsupported::unsupported_reason_for_path(Path::new(&request.input_path)).is_some() {
+        return Ok(empty_prepare_output());
+    }
+    // R20-6: the local deterministic adapter only parses text (Markdown / plain text) and PDF text layers (docs/07 §7.1). A RECOGNIZED non-text-native binary (image
     // / OOXML office document) is never locally parseable — a raw-bytes "passthrough" unit
     // evidences its bytes (a ZIP's PK header, an image's pixels) as searchable garbage.
     // Route it to online OCR (empty prepared_units → the R20-5 path). `octet-stream`
     // (unrecognized extension) is content-sniffed below: it may be a TEXT file with an
     // unknown extension (`.env`, `.cfg`) — still passthrough'd locally — or a binary blob.
     let media_type = request.media_type.as_str();
-    let is_text_native = matches!(media_type, "text/markdown" | "text/plain" | "text/x-code");
+    let is_text_native = matches!(media_type, "text/markdown" | "text/plain");
     let is_pdf = media_type == "application/pdf";
     if !is_text_native && !is_pdf && media_type != "application/octet-stream" {
         return Ok(empty_prepare_output());
@@ -132,12 +134,106 @@ pub fn prepare_units_from_bytes(
     prepare_units_from_bytes_with_control(request, &ControlHandle::default())
 }
 
+/// Invocation-local resource allowance shared by staged extraction and preview.
+#[derive(Debug, Clone, Copy)]
+pub struct ExtractionBudget {
+    tier: kio_core::error::ResourceTier,
+}
+
+impl ExtractionBudget {
+    pub fn new(tier: kio_core::error::ResourceTier) -> Self {
+        Self { tier }
+    }
+
+    pub fn memory_bytes(self) -> u64 {
+        match self.tier {
+            kio_core::error::ResourceTier::Standard => 256 * 1024 * 1024,
+            kio_core::error::ResourceTier::Large => 1024 * 1024 * 1024,
+        }
+    }
+
+    /// Check the bytes simultaneously held by the extraction producer.
+    pub fn check_retained_bytes(self, observed: u64) -> Result<()> {
+        let limit = self.memory_bytes();
+        if observed > limit {
+            return Err(crate::PipelineError::ResourceLimit(
+                kio_core::error::ResourceLimit {
+                    resource: kio_core::error::Resource::Memory,
+                    stage: "extract".to_owned(),
+                    limit: Some(limit),
+                    observed: Some(observed),
+                    resource_tier: Some(self.tier),
+                },
+            ));
+        }
+        Ok(())
+    }
+}
+
 pub fn prepare_units_from_bytes_with_control(
     request: PrepareStageBytesRequest<'_>,
     control: &ControlHandle,
 ) -> Result<PrepareStageOutput> {
+    prepare_units_with_budget(
+        request,
+        control,
+        ExtractionBudget::new(kio_core::error::ResourceTier::Standard),
+    )
+}
+
+/// Run the same local producer as staged extraction without publishing its units.
+pub fn prepare_units_with_budget(
+    request: PrepareStageBytesRequest<'_>,
+    control: &ControlHandle,
+    budget: ExtractionBudget,
+) -> Result<PrepareStageOutput> {
+    visit_prepared_units_with_budget(request, control, budget, |_, _| Ok(()))
+}
+
+/// Run local extraction with the same producer used by staged persistence.
+pub fn visit_prepared_units_with_budget(
+    request: PrepareStageBytesRequest<'_>,
+    control: &ControlHandle,
+    budget: ExtractionBudget,
+    mut visit: impl FnMut(&PreparedUnit, &[u8]) -> Result<()>,
+) -> Result<PrepareStageOutput> {
+    let converter = resolve_prepare_converter(request.media_type, control);
+    prepare_units_emitting(
+        request,
+        converter.as_ref(),
+        budget,
+        &[],
+        &mut PreparedUnitSink {
+            declare: &mut |_| Ok(()),
+            write: &mut visit,
+        },
+    )
+}
+
+fn resolve_prepare_converter(
+    media_type: &str,
+    control: &ControlHandle,
+) -> Option<kio_adapter::office_convert::OfficeConverter> {
+    if kio_adapter::office_convert::is_office_media(media_type) {
+        kio_adapter::office_convert::resolve_office_converter_with_control(control).ok()
+    } else {
+        None
+    }
+}
+
+fn prepare_units_emitting(
+    request: PrepareStageBytesRequest<'_>,
+    converter: Option<&kio_adapter::office_convert::OfficeConverter>,
+    budget: ExtractionBudget,
+    completed: &[PreparedUnit],
+    emit: &mut PreparedUnitSink<'_>,
+) -> Result<PrepareStageOutput> {
+    if crate::unsupported::unsupported_reason_for_path(Path::new(request.input_path)).is_some() {
+        return Ok(empty_prepare_output());
+    }
     let media_type = request.media_type;
-    let is_text_native = matches!(media_type, "text/markdown" | "text/plain" | "text/x-code");
+    let is_text_native = matches!(media_type, "text/markdown" | "text/plain");
+    let is_native_image = matches!(media_type, "image/png" | "image/jpeg" | "image/webp");
     let is_pdf = media_type == "application/pdf";
     // 07 §5.1 (2026-07-23 addendum): DOCX/PPTX route through the Office
     // converter below instead of the octet-stream/text gates — they are
@@ -151,12 +247,25 @@ pub fn prepare_units_from_bytes_with_control(
     // directly instead, below.
     let is_xlsx = kio_adapter::xlsx_extract::is_xlsx_media(media_type);
     if !is_text_native
+        && !is_native_image
         && !is_pdf
         && !is_office
         && !is_xlsx
         && media_type != "application/octet-stream"
     {
         return Ok(empty_prepare_output());
+    }
+    // Single-unit sources know their complete layout before generating a body.
+    if !is_pdf
+        && !is_office
+        && !is_xlsx
+        && let [unit] = completed
+    {
+        return Ok(PrepareStageOutput {
+            prepared_object_hashes: vec![unit.prepared_hash.clone()],
+            prepared_units: vec![unit.clone()],
+            image_object_hashes: Vec::new(),
+        });
     }
     let bytes = request.bytes;
     let prepared_hash = hash_bytes(bytes);
@@ -169,11 +278,7 @@ pub fn prepare_units_from_bytes_with_control(
             ),
         ));
     }
-    if !is_text_native && !is_pdf && !is_office && !is_xlsx && !bytes_are_text(bytes) {
-        // Binary octet-stream (an unrecognized-extension binary blob): do NOT evidence its
-        // raw bytes as text — route to OCR like the other non-text-native media above.
-        // (Office media is binary too, but never reaches this text-passthrough check either
-        // way — the `is_office` exemption above skips it in favor of the conversion path.)
+    if unsupported_reason_for_content(media_type, bytes).is_some() {
         return Ok(empty_prepare_output());
     }
     let unit_type = unit_type_for_media_type(request.media_type);
@@ -187,6 +292,9 @@ pub fn prepare_units_from_bytes_with_control(
     if is_xlsx {
         let document = kio_adapter::xlsx_extract::extract_xlsx(bytes)
             .map_err(|err| prepare_adapter_error("KIO-E-PREPARE-XLSX-EXTRACT-001", err))?;
+        budget.check_retained_bytes(document.sheets.iter().fold(0u64, |total, sheet| {
+            total.saturating_add(sheet.markdown.len() as u64)
+        }))?;
         let unit_keys = sheet_unit_keys(
             &document
                 .sheets
@@ -194,11 +302,16 @@ pub fn prepare_units_from_bytes_with_control(
                 .map(|sheet| sheet.name.clone())
                 .collect::<Vec<_>>(),
         );
+        emit.declare(document.sheets.len())?;
         let mut prepared_units = Vec::with_capacity(document.sheets.len());
-        for (index, sheet) in document.sheets.iter().enumerate() {
+        for (index, sheet) in document.sheets.into_iter().enumerate() {
+            if let Some(unit) = completed.get(index) {
+                prepared_units.push(unit.clone());
+                continue;
+            }
             let unit_key = unit_keys[index].clone();
             let markdown = sheet.markdown.as_bytes();
-            prepared_units.push(PreparedUnit {
+            let unit = PreparedUnit {
                 renderer: None,
                 order: index as u64,
                 unit_key,
@@ -208,7 +321,9 @@ pub fn prepare_units_from_bytes_with_control(
                 fingerprint: fingerprint_for_bytes(markdown, markdown),
                 mime: Some(request.media_type.to_owned()),
                 page_number: None,
-            });
+            };
+            emit.write(&unit, markdown)?;
+            prepared_units.push(unit);
         }
         return Ok(PrepareStageOutput {
             prepared_object_hashes: prepared_units
@@ -237,9 +352,9 @@ pub fn prepare_units_from_bytes_with_control(
     // `kio_pipeline::task::task_retry_kind`'s catch-all arm).
     let mut renderer = None;
     let office_converted_pdf = if is_office {
-        match kio_adapter::office_convert::resolve_office_converter_with_control(control) {
-            Err(_) => return Ok(empty_prepare_output()),
-            Ok(converter) => {
+        match converter {
+            None => return Ok(empty_prepare_output()),
+            Some(converter) => {
                 renderer = Some(RendererIdentity {
                     name: "LibreOffice".to_owned(),
                     version: converter.version().to_owned(),
@@ -292,8 +407,19 @@ pub fn prepare_units_from_bytes_with_control(
     } else {
         Vec::new()
     };
+    if paginated {
+        budget.check_retained_bytes(
+            pdf_pages
+                .iter()
+                .fold(0u64, |total, page| total.saturating_add(page.len() as u64)),
+        )?;
+    } else {
+        budget.check_retained_bytes(bytes.len() as u64)?;
+    }
     let unit_count = if paginated { pdf_pages.len().max(1) } else { 1 };
+    emit.declare(unit_count)?;
     let mut prepared_units = Vec::new();
+    let mut pages = pdf_pages.into_iter();
     for index in 0..unit_count {
         let selector = match unit_type {
             UnitType::Page | UnitType::Slide => (index + 1).to_string(),
@@ -302,10 +428,12 @@ pub fn prepare_units_from_bytes_with_control(
             UnitType::File | UnitType::HeadingSection | UnitType::Symbol => "1".to_owned(),
         };
         let unit_key = canonical_unit_key(unit_type, &selector);
-        let page_bytes = pdf_pages
-            .get(index)
-            .map(|page| page.as_bytes())
-            .unwrap_or(bytes);
+        let page = pages.next();
+        if let Some(unit) = completed.get(index) {
+            prepared_units.push(unit.clone());
+            continue;
+        }
+        let page_bytes = page.as_deref().map_or(bytes, str::as_bytes);
         // `paginated` (Page OR Slide) hashes/fingerprints off the PAGE bytes —
         // for is_pdf that is the native PDF's own page text; for is_office it is
         // the CONVERTED page text, so renderer drift changes prepared_hash (03
@@ -323,7 +451,7 @@ pub fn prepare_units_from_bytes_with_control(
         } else {
             fingerprint_for_bytes(bytes, unit_prepared_hash.as_bytes())
         };
-        prepared_units.push(PreparedUnit {
+        let unit = PreparedUnit {
             renderer: renderer.clone(),
             order: index as u64,
             unit_key,
@@ -342,7 +470,9 @@ pub fn prepare_units_from_bytes_with_control(
             // would just restate the `slide:N` ordinal under a PDF-specific
             // name.
             page_number: (unit_type == UnitType::Page).then_some(index as u64 + 1),
-        });
+        };
+        emit.write(&unit, page_bytes)?;
+        prepared_units.push(unit);
     }
     Ok(PrepareStageOutput {
         prepared_object_hashes: prepared_units
@@ -604,6 +734,11 @@ fn bytes_are_text(bytes: &[u8]) -> bool {
     }
 }
 
+pub fn unsupported_reason_for_content(media_type: &str, bytes: &[u8]) -> Option<&'static str> {
+    (media_type == "application/octet-stream" && !bytes_are_text(bytes))
+        .then_some(crate::unsupported::UNSUPPORTED_REASON_UNRECOGNIZED_BINARY)
+}
+
 pub fn pdf_text_pages_bounded(bytes: &[u8]) -> Result<Vec<String>> {
     if !bytes.starts_with(b"%PDF") {
         return Ok(vec![String::from_utf8_lossy(bytes).into_owned()]);
@@ -699,6 +834,39 @@ fn prepare_adapter_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_code_extensions_never_prepare_as_sniffed_text() {
+        let bytes = b"sourceonlyneedle readable text\n";
+        let raw_hash = hash_bytes(bytes);
+        for ext in ["rs", "py", "js", "ts", "go", "java", "c", "h", "cpp"] {
+            for ext in [ext.to_owned(), ext.to_ascii_uppercase()] {
+                let input_path = format!("main.{ext}");
+                for media_type in ["application/octet-stream", "text/plain"] {
+                    let output = prepare_units_from_bytes(PrepareStageBytesRequest {
+                        raw_hash: &raw_hash,
+                        media_type,
+                        input_path: &input_path,
+                        tool_profile_hash: "sha256:test",
+                        bytes,
+                    })
+                    .unwrap();
+                    assert!(
+                        output.prepared_units.is_empty(),
+                        "{input_path}: {media_type}"
+                    );
+                    let output = prepare_units(PrepareStageRequest {
+                        raw_hash: raw_hash.clone(),
+                        media_type: media_type.to_owned(),
+                        input_path: input_path.clone(),
+                        tool_profile_hash: "sha256:test".to_owned(),
+                    })
+                    .unwrap();
+                    assert!(output.prepared_units.is_empty());
+                }
+            }
+        }
+    }
 
     fn prepared_page(order: u64, key: &str, fp: &str) -> PreparedUnit {
         PreparedUnit {
@@ -1154,3 +1322,9 @@ mod tests {
         assert!(output.image_object_hashes.is_empty());
     }
 }
+
+mod staged;
+pub use staged::{
+    PreparedUnitSink, StagedPreparation, discard_prepared_stages, prepare_staged,
+    prepare_staged_with, publish_prepared_source,
+};

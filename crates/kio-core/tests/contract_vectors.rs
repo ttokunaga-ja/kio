@@ -98,11 +98,14 @@ fn ct_hash_006_007_008_hash_shape_round_trip_and_key_order() {
     let repo = Repository::init(temp.path()).unwrap();
     let store = ObjectStore::new(repo.kio_dir());
     let (stored_hash, stored_bytes) = store.write_json(ObjectKind::Tree, &a).unwrap();
-    let read = store.read_by_hash(&stored_hash).unwrap();
-    assert_eq!(hash_bytes(&read.bytes), stored_hash);
-    assert_eq!(read.bytes, stored_bytes);
+    let mut read = Vec::new();
+    store
+        .copy_object_to(ObjectKind::Tree, &stored_hash, &mut read)
+        .unwrap();
+    assert_eq!(hash_bytes(&read), stored_hash);
+    assert_eq!(read, stored_bytes);
 
-    let stored = String::from_utf8(read.bytes).unwrap();
+    let stored = String::from_utf8(read).unwrap();
     assert!(!stored.contains("tree_hash"));
     assert!(!stored.contains("tree_id"));
     assert!(!stored.contains("commit_hash"));
@@ -111,18 +114,24 @@ fn ct_hash_006_007_008_hash_shape_round_trip_and_key_order() {
 
 #[test]
 fn ct_tree_001_002_003_sort_duplicate_and_path_validation() {
-    let tree = build_tree(vec![
-        TreeEntry::raw_file("report.pdf", RAW_REPORT).unwrap(),
-        TreeEntry::raw_file("notes.md", RAW_NOTES).unwrap(),
-    ])
+    let tree = build_tree(
+        &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+        vec![
+            TreeEntry::raw_file("report.pdf", RAW_REPORT).unwrap(),
+            TreeEntry::raw_file("notes.md", RAW_NOTES).unwrap(),
+        ],
+    )
     .unwrap();
-    assert_eq!(tree.entries[0].path, "notes.md");
-    assert_eq!(tree.entries[1].path, "report.pdf");
+    assert_eq!(tree.entries.get(0).unwrap().unwrap().path, "notes.md");
+    assert_eq!(tree.entries.get(1).unwrap().unwrap().path, "report.pdf");
 
-    let duplicate = build_tree(vec![
-        TreeEntry::raw_file("notes.md", RAW_NOTES).unwrap(),
-        TreeEntry::raw_file("notes.md", RAW_REPORT).unwrap(),
-    ]);
+    let duplicate = build_tree(
+        &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+        vec![
+            TreeEntry::raw_file("notes.md", RAW_NOTES).unwrap(),
+            TreeEntry::raw_file("notes.md", RAW_REPORT).unwrap(),
+        ],
+    );
     // CT-TREE-002 mandates rejection but not a specific code; duplicate paths
     // use KIO-E-STORE-DUP-001, kept distinct from the `/`-in-path violation.
     assert_eq!(duplicate.unwrap_err().error_code(), "KIO-E-STORE-DUP-001");
@@ -161,13 +170,21 @@ fn ct_tree_004_normalized_entry_requires_gen() {
 
 #[test]
 fn ct_tree_empty_vector_and_step1_entries_omit_normalize() {
-    let tree = build_tree(Vec::new()).unwrap();
+    let tree = build_tree(
+        &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+        Vec::new(),
+    )
+    .unwrap();
     assert_eq!(
         hash_json(&serde_json::to_value(&tree).unwrap()).unwrap(),
         "sha256:61a745d1087a11dde2e73252e95b8f42f6a1a28e9aa08e4b692dba69aefba718"
     );
 
-    let raw_tree = build_tree(vec![TreeEntry::raw_file("notes.md", RAW_NOTES).unwrap()]).unwrap();
+    let raw_tree = build_tree(
+        &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+        vec![TreeEntry::raw_file("notes.md", RAW_NOTES).unwrap()],
+    )
+    .unwrap();
     let bytes = canonical_json_bytes(&serde_json::to_value(&raw_tree).unwrap()).unwrap();
     assert!(!String::from_utf8(bytes).unwrap().contains("normalize"));
 }
@@ -263,7 +280,7 @@ fn ct_scope_001_snapshot_scans_direct_children_only() {
 
     let tree = repo.build_working_tree(false).unwrap().tree;
     assert_eq!(tree.entries.len(), 1);
-    assert_eq!(tree.entries[0].path, "a.pdf");
+    assert_eq!(tree.entries.get(0).unwrap().unwrap().path, "a.pdf");
 }
 
 #[test]
@@ -376,27 +393,30 @@ fn find_file<'a>(files: &'a [serde_json::Value], path: &str) -> &'a serde_json::
 }
 
 fn vector_tree() -> kio_core::dag::TreeObject {
-    build_tree(vec![
-        TreeEntry {
-            path: "notes.md".to_owned(),
-            entry_type: "file".to_owned(),
-            raw_hash: RAW_NOTES.to_owned(),
-            normalize: Some(NormalizeRef {
-                tool_profile_hash: TOOL_PROFILE.to_owned(),
-                r#gen: 0,
-                manifest_hash: MANIFEST_HASH.to_owned(),
-            }),
-        },
-        TreeEntry {
-            path: "report.pdf".to_owned(),
-            entry_type: "file".to_owned(),
-            raw_hash: RAW_REPORT.to_owned(),
-            normalize: Some(NormalizeRef {
-                tool_profile_hash: TOOL_PROFILE.to_owned(),
-                r#gen: 0,
-                manifest_hash: MANIFEST_HASH.to_owned(),
-            }),
-        },
-    ])
+    build_tree(
+        &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+        vec![
+            TreeEntry {
+                path: "notes.md".to_owned(),
+                entry_type: "file".to_owned(),
+                raw_hash: RAW_NOTES.to_owned(),
+                normalize: Some(NormalizeRef {
+                    tool_profile_hash: TOOL_PROFILE.to_owned(),
+                    r#gen: 0,
+                    manifest_hash: MANIFEST_HASH.to_owned(),
+                }),
+            },
+            TreeEntry {
+                path: "report.pdf".to_owned(),
+                entry_type: "file".to_owned(),
+                raw_hash: RAW_REPORT.to_owned(),
+                normalize: Some(NormalizeRef {
+                    tool_profile_hash: TOOL_PROFILE.to_owned(),
+                    r#gen: 0,
+                    manifest_hash: MANIFEST_HASH.to_owned(),
+                }),
+            },
+        ],
+    )
     .unwrap()
 }

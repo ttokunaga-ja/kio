@@ -85,6 +85,8 @@ impl ObjectStore {
         Self {
             control,
             reads: CasReadAccess::Unmetered,
+            record_memory: Arc::default(),
+            scratch_record_reads: false,
             kio_dir: Some(kio_dir.into()),
             bound: None,
         }
@@ -142,6 +144,8 @@ impl ObjectStore {
         Ok(Self {
             control,
             reads: CasReadAccess::Unmetered,
+            record_memory: Arc::default(),
+            scratch_record_reads: false,
             kio_dir: None,
             bound: Some(BoundObjectDirs {
                 kio: {
@@ -164,6 +168,7 @@ impl ObjectStore {
                 manifests: Arc::new(Mutex::new(manifests)),
                 toollocks: Arc::new(Mutex::new(toollocks)),
                 normalized_units: Arc::new(Mutex::new(normalized_units)),
+                stage_directories: Arc::new(Mutex::new(None)),
             }),
         })
     }
@@ -174,6 +179,12 @@ impl ObjectStore {
         Ok(hash)
     }
 
+    pub(crate) fn reopen_saved_stage(&self, saved: &SavedRawStage) -> Result<BoundRawStage> {
+        self.bound
+            .as_ref()
+            .ok_or_else(|| KioError::invalid_usage("saved stage needs retained store"))?
+            .reopen_saved_stage(saved)
+    }
     pub fn stage_raw_from_reader<R: Read>(
         &self,
         reader: &mut R,
@@ -187,9 +198,55 @@ impl ObjectStore {
             .stage_raw_from_reader(reader, max_bytes)
     }
 
-    pub fn inspect_raw_stages(&self) -> Result<Vec<RawStageResidue>> {
+    /// The retained private registry for recoverable record runs.
+    pub fn record_stages(&self) -> Result<crate::disk_records::RecordStageRoot> {
+        let directory = if let Some(bound) = &self.bound {
+            bound.record_stage_directory(self.control.clone())?
+        } else {
+            crate::store_dir::StoreDirectory::open_with_control(
+                self.ambient_kio_dir()?,
+                self.control.clone(),
+            )?
+        };
+        Ok(crate::disk_records::RecordStageRoot::in_store(
+            directory,
+            self.record_memory.clone(),
+        ))
+    }
+
+    pub(crate) fn use_scratch_record_reads(&mut self) {
+        self.scratch_record_reads = true;
+    }
+
+    /// Share the store's live-run budget for disposable, anonymous read records.
+    pub fn scratch_record_stages(&self) -> crate::disk_records::RecordStageRoot {
+        crate::disk_records::RecordStageRoot::anonymous(self.record_memory.clone())
+    }
+
+    pub(crate) fn record_read_stages(&self) -> Result<crate::disk_records::RecordStageRoot> {
+        if self.scratch_record_reads {
+            Ok(self.scratch_record_stages())
+        } else {
+            self.record_stages()
+        }
+    }
+
+    pub(crate) fn decode_record_json<T: serde::de::DeserializeOwned>(
+        &self,
+        reader: impl Read,
+    ) -> Result<T> {
+        crate::disk_records::decode_bounded_json(&self.record_read_stages()?, reader)
+    }
+
+    pub fn inspect_raw_stages(&self) -> Result<crate::disk_records::DiskRecords<RawStageResidue>> {
         if let Some(bound) = &self.bound {
-            return bound.inspect_raw_stages(false);
+            let scratch = crate::disk_records::RecordStageRoot::temporary()?;
+            let mut residues = crate::disk_records::RecordWriter::new(&scratch)?;
+            bound.visit_raw_stages(&scratch, false, |row| residues.push(&row))?;
+            for row in self.record_stages()?.inspect()? {
+                residues.push(&row)?;
+            }
+            return residues.finish();
         }
         let directory = crate::store_dir::StoreDirectory::open_with_control(
             self.ambient_kio_dir()?,
@@ -205,7 +262,7 @@ impl ObjectStore {
             .ok_or_else(|| {
                 KioError::invalid_usage("bound raw cleanup requires a retained ObjectStore")
             })?
-            .cleanup_raw_ingest_orphans()
+            .visit_raw_stages(&self.record_stages()?, true, |_| Ok(()))
     }
 
     pub fn validate_bound_layout(&self) -> Result<()> {
@@ -263,6 +320,25 @@ impl ObjectStore {
             self.control.clone(),
         )?;
         Self::from_bound_kio_with_control(&directory.root_handle(), self.control.clone())
+    }
+
+    /// Publish canonical tree JSON via the identity-journaled streaming stage.
+    /// Neither a serde Value nor an object-sized canonical byte buffer is built.
+    pub fn write_tree(&self, tree: &crate::dag::TreeObject) -> Result<String> {
+        if self.bound.is_none() {
+            return self.retained_raw_writer()?.write_tree(tree);
+        }
+        let mut source = crate::dag::TreeJsonReader::new(tree)?;
+        #[cfg(test)]
+        if super::tree::FAIL_TREE_WRITE.with(|fault| fault.replace(false)) {
+            super::fail_next_raw_write();
+        }
+        let stage = self.stage_raw_from_reader(&mut source, u64::MAX)?;
+        self.bound
+            .as_ref()
+            .expect("retained store")
+            .publish_stage(ObjectKind::Tree, stage)
+            .map(|(hash, _)| hash)
     }
 
     pub fn write_json(&self, kind: ObjectKind, value: &Value) -> Result<(String, Vec<u8>)> {
@@ -837,6 +913,11 @@ impl ObjectStore {
             return bound.read_by_hash(&self.reads, hash);
         }
         let (kind, path) = self.locate_object(hash)?;
+        if kind == ObjectKind::Tree {
+            return Err(KioError::invalid_usage(
+                "tree objects require streaming read_tree or copy_object_to",
+            ));
+        }
         let (_, bytes) = read_verified_object(&self.reads, &path, kind, hash, true)?;
         Ok(StoredObject {
             kind,
@@ -989,6 +1070,55 @@ impl ObjectStore {
         result.map(|()| hash)
     }
 
+    /// Move a synced extraction stage into the CAS without a two-link window.
+    /// After a crash following rename, the verified destination is sufficient.
+    pub fn publish_content_stage(
+        &self,
+        kind: ContentObjectKind,
+        hash: &str,
+        workspace: &crate::store_dir::StoreDirectory,
+        source: Option<(&Path, &crate::store_dir::StageIdentity)>,
+    ) -> Result<bool> {
+        if !matches!(
+            kind,
+            ContentObjectKind::Prepared
+                | ContentObjectKind::NormalizedUnit
+                | ContentObjectKind::Manifest
+        ) {
+            return Err(KioError::invalid_usage(
+                "unsupported extraction object kind",
+            ));
+        }
+        let bound = self.bound.as_ref().ok_or_else(|| {
+            KioError::invalid_usage("extraction stage publication requires a bound CAS")
+        })?;
+        let (parent, name) = bound.content_fanout(kind, hash, true)?;
+        let target = crate::store_dir::StoreDirectory::from_retained_with_control(
+            parent,
+            PathBuf::from(kind.directory()),
+            self.control.clone(),
+        )?;
+        let published =
+            workspace.publish_or_adopt_stage(&target, Path::new(&name), source, |file| {
+                let found =
+                    bound_hash_open_regular(&CasReadAccess::Unmetered, file, kind.max_bytes())?;
+                if found != hash {
+                    return Err(corrupt_object_error(
+                        target.path(),
+                        "extraction object hash mismatch",
+                        hash,
+                        Some(&found),
+                    ));
+                }
+                Ok(())
+            })?;
+        if published && source.is_some() {
+            self.control
+                .checkpoint(crate::durability::DurabilityPoint::ExtractionCasPublished)?;
+        }
+        Ok(published)
+    }
+
     /// PB01/PB02: bounded read of a content object's raw bytes for semantic
     /// (JSON) parsing — [`Self::inspect_content_accounted`] verifies the
     /// byte-hash but deliberately never retains the body (it streams
@@ -1015,7 +1145,7 @@ impl ObjectStore {
         let Some(path) = self.existing_content_path(kind, hash)? else {
             return Err(KioError::not_found(hash));
         };
-        read_bounded_regular_file_inner(&path, max_bytes, &self.reads, true)
+        read_bounded_regular_file_inner(&path, max_bytes, &self.reads, true, None)
     }
 
     /// Read a bounded structured object; raw bytes require `copy_object_to`
@@ -1033,6 +1163,11 @@ impl ObjectStore {
         kind: ObjectKind,
         hash: &str,
     ) -> Result<(StoredObject, u64)> {
+        if kind == ObjectKind::Tree {
+            return Err(KioError::invalid_usage(
+                "tree objects require streaming read_tree or copy_object_to",
+            ));
+        }
         if let Some(bound) = &self.bound {
             return bound.read_object_with_size(&self.reads, kind, hash);
         }
@@ -1157,6 +1292,14 @@ impl ObjectStore {
         kind: ObjectKind,
         hash: &str,
     ) -> std::result::Result<(StoredObject, u64), AccountedReadError> {
+        if kind == ObjectKind::Tree {
+            return Err(AccountedReadError {
+                error: KioError::invalid_usage(
+                    "tree objects require streaming read_tree_accounted",
+                ),
+                consumed_bytes: 0,
+            });
+        }
         if let Some(bound) = &self.bound {
             let (size_bytes, bytes) = bound.read_object_accounted(&self.reads, kind, hash, true)?;
             return Ok((
@@ -1273,7 +1416,11 @@ impl ObjectStore {
         Err(KioError::not_found(hash))
     }
 
-    fn existing_object_path(&self, kind: ObjectKind, hash: &str) -> Result<Option<PathBuf>> {
+    pub(super) fn existing_object_path(
+        &self,
+        kind: ObjectKind,
+        hash: &str,
+    ) -> Result<Option<PathBuf>> {
         occupied_slot(self.object_path(kind, hash)?)
     }
 
@@ -1302,7 +1449,7 @@ impl ObjectStore {
         ensure_real_directory(&second, true)
     }
 
-    fn validate_object_parent(&self, kind: ObjectKind, hash: &str) -> Result<bool> {
+    pub(super) fn validate_object_parent(&self, kind: ObjectKind, hash: &str) -> Result<bool> {
         let digest = hash_path_component(hash)?;
         let objects = self.ambient_kio_dir()?.join("objects");
         let kind_base = objects.join(kind.directory());

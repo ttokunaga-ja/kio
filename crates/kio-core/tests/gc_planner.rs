@@ -68,7 +68,11 @@ impl Fixture {
     }
 
     fn tree(&self, name: &str) -> String {
-        let tree = build_tree(vec![TreeEntry::raw_file(name, RAW).unwrap()]).unwrap();
+        let tree = build_tree(
+            &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+            vec![TreeEntry::raw_file(name, RAW).unwrap()],
+        )
+        .unwrap();
         let store = ObjectStore::new(self.kio());
         store
             .write_json(ObjectKind::Tree, &serde_json::to_value(tree).unwrap())

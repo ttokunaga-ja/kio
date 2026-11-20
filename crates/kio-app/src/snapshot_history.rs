@@ -111,13 +111,8 @@ pub(crate) fn run_snapshot_create(
     )
     .map_err(pipeline_to_kio)?;
     preview.estimated_cost = None;
-    let excluded = preview
-        .candidates
-        .iter()
-        .filter(|candidate| candidate.ignored)
-        .map(|candidate| candidate.input_path.clone())
-        .collect::<BTreeSet<_>>();
-    let explicitly_allowed_tier_a = explicitly_allowed_tier_a_paths(&preview);
+    let excluded = snapshot_excluded(&preview)?;
+    let explicitly_allowed_tier_a = explicitly_allowed_tier_a_paths(&preview)?;
     // Keep the source HEAD, its ready replica header, and the optional
     // same-content projection reuse in one writer critical section.
     // `snapshot_filtered_with_policy` takes this lock reentrantly.
@@ -638,8 +633,8 @@ fn run_snapshot_auto_response(ctx: &Invocation<'_>) -> Result<(SnapshotAutoRespo
     }
     let mut state_published = false;
     let outcome = if publication_observation.eligible {
-        let excluded = scheduled_auto_excluded(&publication_observation.preview);
-        let allowed = explicitly_allowed_tier_a_paths(&publication_observation.preview);
+        let excluded = scheduled_auto_excluded(&publication_observation.preview)?;
+        let allowed = explicitly_allowed_tier_a_paths(&publication_observation.preview)?;
         let expected_raw_by_path = scheduled_auto_expected_raw(&publication_observation.preview)?;
         session.prepare_snapshot_auto_state_publication(&publication_observation.state)?;
         session.assert_public_identity()?;
@@ -1084,35 +1079,36 @@ fn scheduled_auto_add_interval(at: i64, interval: u64) -> Result<i64> {
     .ok_or_else(|| snapshot_auto_clock_error("scheduled interval overflow"))
 }
 
-fn scheduled_auto_excluded(preview: &ScanPreview) -> BTreeSet<String> {
-    let mut excluded = preview
-        .candidates
-        .iter()
-        .filter(|candidate| candidate.ignored)
-        .map(|candidate| candidate.input_path.clone())
-        .collect::<BTreeSet<_>>();
-    // The ignore policy file is scheduler control, not scope content. The
-    // bound preview intentionally omits it, so exclude it explicitly from the
-    // lower-level snapshot candidate enumeration too.
+fn snapshot_excluded(preview: &ScanPreview) -> Result<BTreeSet<String>> {
+    let mut excluded = BTreeSet::new();
+    for candidate in &preview.candidates {
+        let candidate = candidate?;
+        if candidate.ignored {
+            excluded.insert(candidate.input_path);
+        }
+    }
+    Ok(excluded)
+}
+
+fn scheduled_auto_excluded(preview: &ScanPreview) -> Result<BTreeSet<String>> {
+    let mut excluded = snapshot_excluded(preview)?;
+    // The ignore policy file is scheduler control, not scope content.
     excluded.insert(".kioignore".to_owned());
-    excluded
+    Ok(excluded)
 }
 
 fn scheduled_auto_expected_raw(preview: &ScanPreview) -> Result<BTreeMap<String, String>> {
-    preview
-        .candidates
-        .iter()
-        .filter(|candidate| !candidate.ignored)
-        .map(|candidate| {
-            Ok((
-                candidate.input_path.clone(),
-                candidate
-                    .raw_hash
-                    .clone()
-                    .ok_or_else(|| KioError::schema("bound scheduled scan omitted a raw hash"))?,
-            ))
-        })
-        .collect()
+    let mut expected = BTreeMap::new();
+    for candidate in &preview.candidates {
+        let candidate = candidate?;
+        if !candidate.ignored {
+            let raw = candidate
+                .raw_hash
+                .ok_or_else(|| KioError::schema("bound scheduled scan omitted a raw hash"))?;
+            expected.insert(candidate.input_path, raw);
+        }
+    }
+    Ok(expected)
 }
 
 fn scheduled_working_set_digest(preview: &ScanPreview) -> Result<String> {
@@ -1154,36 +1150,17 @@ fn scheduled_preview_change_count(
                 .and_then(|commit| repo.read_tree(&commit.tree))
         })
         .transpose()?;
-    let old = head_tree
-        .as_ref()
-        .map(|tree| {
-            tree.entries
-                .iter()
-                .map(|e| (&e.path, &e.raw_hash))
-                .collect::<BTreeMap<_, _>>()
-        })
-        .unwrap_or_default();
-    let new = preview
-        .candidates
-        .iter()
-        .filter(|candidate| !candidate.ignored)
-        .map(|candidate| {
-            Ok((
-                &candidate.input_path,
-                candidate
-                    .raw_hash
-                    .as_ref()
-                    .ok_or_else(|| KioError::schema("bound scheduled scan omitted a raw hash"))?,
-            ))
-        })
-        .collect::<Result<BTreeMap<_, _>>>()?;
-    let changes = old
-        .keys()
-        .chain(new.keys())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .filter(|path| old.get(*path) != new.get(*path))
-        .count() as u64;
+    let mut new = scheduled_auto_expected_raw(preview)?;
+    let mut changes = 0u64;
+    if let Some(tree) = head_tree {
+        for entry in &tree.entries {
+            let entry = entry?;
+            if new.remove(entry.path.as_str()).as_deref() != Some(entry.raw_hash.as_str()) {
+                changes += 1;
+            }
+        }
+    }
+    changes += new.len() as u64;
     session.assert_public_identity()?;
     Ok(changes)
 }

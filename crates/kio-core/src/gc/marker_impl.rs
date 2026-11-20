@@ -72,7 +72,7 @@ impl GcInProgressMarker {
             if !is_hash(&candidate.commit_hash)
                 || !is_hash(&candidate.tree_hash)
                 || candidate.commit_hash.as_str() <= previous
-                || candidate.size_bytes > MAX_TREE_OBJECT_BYTES
+                || candidate.size_bytes > MAX_SWEEP_ESTIMATED_BYTES
             {
                 return Err(corrupt("GC marker candidates are invalid or unsorted"));
             }
@@ -100,12 +100,6 @@ impl GcInProgressMarker {
         })?;
         if committed_bytes != self.estimated_bytes {
             return Err(corrupt("GC marker estimated bytes do not bind candidates"));
-        }
-        let worst_case = (tree_sizes.len() as u64)
-            .checked_mul(MAX_TREE_OBJECT_BYTES)
-            .ok_or_else(|| corrupt("GC marker tree bound overflow"))?;
-        if worst_case > MAX_SWEEP_ESTIMATED_BYTES {
-            return Err(corrupt("GC marker tree count exceeds sweep byte bound"));
         }
         if let GcIndexState::Present {
             generation,

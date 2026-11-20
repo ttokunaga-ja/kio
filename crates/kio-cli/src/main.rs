@@ -1,5 +1,7 @@
 mod args;
 mod release_binding;
+#[cfg(debug_assertions)]
+mod scan_heap;
 
 use std::io::{BufRead, IsTerminal, Read, Write};
 use std::process;
@@ -9,11 +11,13 @@ use clap::Parser;
 
 use crate::args::Cli;
 use kio_app::context::{AppContext, Interaction};
-use kio_app::response::Completion;
+use kio_app::response::{Completion, ResponseBody, index::IndexResponse, reindex::ReindexResponse};
 use kio_core::{ExitCode, KioError, Result};
 use serde_json::{Value, json};
 
 fn main() {
+    #[cfg(debug_assertions)]
+    scan_heap::start();
     release_binding::retain();
     kio_index::vec::ensure_registered();
     let cli = match Cli::try_parse() {
@@ -30,16 +34,92 @@ fn main() {
         interaction: Arc::new(TerminalInteraction { json_mode }),
     };
     let exit_code = match kio_app::execute(&context, cli.command.into()).and_then(|response| {
+        #[cfg(debug_assertions)]
+        scan_heap::output_started();
         let code = completion_exit_code(response.completion);
-        let output = serde_json::to_value(response.body)
-            .map_err(|error| KioError::schema(error.to_string()))?;
+        let output = match response.body {
+            ResponseBody::Inspect(kio_app::response::history::InspectResponse::Tree(tree)) => {
+                let stdout = std::io::stdout();
+                let mut writer = std::io::BufWriter::with_capacity(64 * 1024, stdout.lock());
+                write_inspected_tree(&tree, &mut writer, json_mode)?;
+                None
+            }
+            ResponseBody::Index(IndexResponse::Preview(preview)) => {
+                if json_mode {
+                    write_output_json(|writer| serde_json::to_writer(writer, &preview))?;
+                } else {
+                    println!("{}", terminal_safe_text(&preview.status, false));
+                }
+                None
+            }
+            ResponseBody::Index(IndexResponse::Published(report)) => {
+                if code != ExitCode::Success {
+                    append_completion_error(&json!({"error_code": report.error_code}), code);
+                }
+                if json_mode {
+                    write_output_json(|writer| serde_json::to_writer(writer, &report))?;
+                } else {
+                    println!("{}", terminal_safe_text(&report.status, false));
+                    write_deferred_inputs(&report.deferred_inputs, None)?;
+                    for child in report.child_scopes.iter().flatten() {
+                        write_deferred_inputs(&child.deferred_inputs, Some(&child.discovery.path))?;
+                    }
+                    if let Some(gc) = report.gc {
+                        let gc = serde_json::to_value(gc)
+                            .map_err(|error| KioError::schema(error.to_string()))?;
+                        print_gc_summary(&gc);
+                    }
+                }
+                None
+            }
+            ResponseBody::Reindex(ReindexResponse::Head(report)) => {
+                if code != ExitCode::Success {
+                    append_completion_error(&Value::Null, code);
+                }
+                if json_mode {
+                    write_output_json(|writer| serde_json::to_writer(writer, &report))?;
+                } else {
+                    println!("{}", terminal_safe_text(&report.status, false));
+                    write_deferred_inputs(&report.deferred_inputs, None)?;
+                }
+                None
+            }
+            ResponseBody::Status(status) => {
+                if json_mode {
+                    write_output_json(|writer| serde_json::to_writer(writer, &status))?;
+                } else {
+                    for file in &status.files {
+                        let file = file?;
+                        println!(
+                            "{} {}",
+                            terminal_safe_text(file.status.as_deref().unwrap_or_default(), false),
+                            terminal_safe_text(&file.relative_path, false)
+                        );
+                    }
+                    write_deferred_inputs(&status.deferred_inputs, None)?;
+                    if let Some(readiness) = status.office_readiness.as_ref() {
+                        print_office_readiness(
+                            readiness.state,
+                            &readiness.reason,
+                            readiness.alternatives,
+                        );
+                    }
+                }
+                None
+            }
+            body => Some(
+                serde_json::to_value(body).map_err(|error| KioError::schema(error.to_string()))?,
+            ),
+        };
         Ok((output, code))
     }) {
         Ok((output, code)) => {
-            if code != ExitCode::Success {
-                append_completion_error(&output, code);
+            if let Some(output) = output {
+                if code != ExitCode::Success {
+                    append_completion_error(&output, code);
+                }
+                print_output(output, json_mode);
             }
-            print_output(output, json_mode);
             code
         }
         Err(error) => {
@@ -48,7 +128,113 @@ fn main() {
             error.exit_code()
         }
     };
+    #[cfg(debug_assertions)]
+    scan_heap::report();
     process::exit(exit_code.code());
+}
+
+fn write_output_json(write: impl FnOnce(&mut dyn Write) -> serde_json::Result<()>) -> Result<()> {
+    let stdout = std::io::stdout();
+    let mut writer = std::io::BufWriter::with_capacity(64 * 1024, stdout.lock());
+    write(&mut writer).map_err(|error| {
+        if error.is_io() {
+            KioError::io(error.to_string(), "stdout")
+        } else {
+            KioError::schema(error.to_string())
+        }
+    })?;
+    writer
+        .write_all(b"\n")
+        .and_then(|()| writer.flush())
+        .map_err(|error| KioError::io(error.to_string(), "stdout"))
+}
+
+/// Inspect explicitly emits the complete tree, but neither JSON values nor
+/// rendered strings need to retain that complete output in memory.
+fn write_inspected_tree(
+    tree: &kio_core::dag::TreeObject,
+    writer: &mut impl Write,
+    json_mode: bool,
+) -> Result<()> {
+    if json_mode {
+        kio_core::dag::write_tree_json(tree, writer)?;
+    } else {
+        let mut terminal = TerminalSafeWriter {
+            writer: &mut *writer,
+            pending: [0; 4],
+            filled: 0,
+        };
+        serde_json::to_writer_pretty(&mut terminal, tree).map_err(|error| {
+            if error.is_io() {
+                KioError::io(error.to_string(), "stdout")
+            } else {
+                KioError::schema(error.to_string())
+            }
+        })?;
+        terminal
+            .flush()
+            .map_err(|error| KioError::io(error.to_string(), "stdout"))?;
+    }
+    writer
+        .write_all(b"\n")
+        .and_then(|()| writer.flush())
+        .map_err(|error| KioError::io(error.to_string(), "stdout"))
+}
+
+/// JSON serializers may split UTF-8 between writes. Retain at most one scalar
+/// while applying the same human-output terminal escaping as print_output.
+struct TerminalSafeWriter<'a, W> {
+    writer: &'a mut W,
+    pending: [u8; 4],
+    filled: usize,
+}
+impl<W: Write> Write for TerminalSafeWriter<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.filled == 0
+            && bytes
+                .iter()
+                .all(|b| *b == b'\n' || matches!(*b, 0x20..=0x7e))
+        {
+            self.writer.write_all(bytes)?;
+            return Ok(bytes.len());
+        }
+        for &byte in bytes {
+            self.pending[self.filled] = byte;
+            self.filled += 1;
+            let text = match std::str::from_utf8(&self.pending[..self.filled]) {
+                Ok(text) => text,
+                Err(error) if error.error_len().is_none() && self.filled < 4 => continue,
+                Err(error) => {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error));
+                }
+            };
+            let ch = text.chars().next().expect("one UTF-8 scalar");
+            if ch != '\n' && terminal_active(ch) {
+                let code = ch as u32;
+                if code <= 0xff {
+                    write!(self.writer, "\\x{code:02x}")?;
+                } else {
+                    write!(self.writer, "\\u{{{code:04x}}}")?;
+                }
+            } else {
+                self.writer.write_all(text.as_bytes())?;
+            }
+            self.filled = 0;
+        }
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.filled != 0 {
+            return Err(std::io::Error::other("incomplete UTF-8 output"));
+        }
+        self.writer.flush()
+    }
+}
+
+fn terminal_active(ch: char) -> bool {
+    let code = ch as u32;
+    matches!(code, 0x00..=0x1f | 0x7f..=0x9f)
+        || matches!(code, 0x061c | 0x200e..=0x200f | 0x2028..=0x202e | 0x2066..=0x2069)
 }
 
 struct TerminalInteraction {
@@ -56,6 +242,16 @@ struct TerminalInteraction {
 }
 
 impl Interaction for TerminalInteraction {
+    #[cfg(debug_assertions)]
+    fn working_scan_started(&self) {
+        scan_heap::scan_started();
+    }
+
+    #[cfg(debug_assertions)]
+    fn working_scan_published(&self) {
+        scan_heap::scan_published();
+    }
+
     fn confirm(&self, summary: &str) -> Result<bool> {
         if !self.is_interactive() {
             return Ok(false);
@@ -188,6 +384,11 @@ fn clap_error_reason(err: &clap::Error) -> String {
         .to_string()
 }
 
+fn print_office_readiness(state: &str, reason: &str, alternatives: &str) {
+    let rendered = format!("Office: {state} — {reason}. {alternatives}");
+    println!("{}", terminal_safe_text(&rendered, false));
+}
+
 fn print_output(value: Value, json_mode: bool) {
     if json_mode {
         println!(
@@ -307,20 +508,20 @@ fn print_output(value: Value, json_mode: bool) {
             serde_json::to_string_pretty(&value).expect("serializing command output cannot fail");
         println!("{}", terminal_safe_text(&rendered, true));
     }
-    if let Some(readiness) = value.get("office_readiness").or_else(|| {
-        value
-            .get("index_status")
-            .and_then(|status| status.get("office_readiness"))
-    }) {
-        let rendered = format!(
-            "Office: {} — {}. {}",
+    if let Some(readiness) = value.get("office_readiness") {
+        print_office_readiness(
             readiness["state"].as_str().unwrap_or("unavailable"),
             readiness["reason"].as_str().unwrap_or(""),
-            readiness["alternatives"].as_str().unwrap_or("")
+            readiness["alternatives"].as_str().unwrap_or(""),
         );
-        println!("{}", terminal_safe_text(&rendered, false));
     }
-    if let Some(gc) = value.get("gc").and_then(Value::as_object) {
+    if let Some(gc) = value.get("gc") {
+        print_gc_summary(gc);
+    }
+}
+
+fn print_gc_summary(gc: &Value) {
+    if let Some(gc) = gc.as_object() {
         let status = gc
             .get("status")
             .and_then(Value::as_str)
@@ -332,6 +533,25 @@ fn print_output(value: Value, json_mode: bool) {
         );
         println!("{}", terminal_safe_text(&line, false));
     }
+}
+
+fn write_deferred_inputs(
+    rows: &kio_core::disk_records::DiskRecords<kio_core::scope::DeferredInput>,
+    scope: Option<&str>,
+) -> Result<()> {
+    for row in rows {
+        let row = row?;
+        let path = match scope {
+            Some(scope) => format!("{scope}/{}", row.path),
+            None => row.path,
+        };
+        println!(
+            "deferred {} ({})",
+            terminal_safe_text(&path, false),
+            row.reason.as_str()
+        );
+    }
+    Ok(())
 }
 
 fn print_error(error: &KioError, json_mode: bool) {
@@ -360,9 +580,7 @@ fn terminal_safe_text(input: &str, allow_newlines: bool) -> String {
             continue;
         }
         let code = ch as u32;
-        let terminal_active = matches!(code, 0x00..=0x1f | 0x7f..=0x9f)
-            || matches!(code, 0x061c | 0x200e..=0x200f | 0x2028..=0x202e | 0x2066..=0x2069);
-        if terminal_active {
+        if terminal_active(ch) {
             if code <= 0xff {
                 output.push_str(&format!("\\x{code:02x}"));
             } else {
@@ -378,6 +596,112 @@ fn terminal_safe_text(input: &str, allow_newlines: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::{read_confirmation, terminal_safe_text};
+
+    #[test]
+    fn inspected_tree_stream_preserves_json_and_human_contracts() {
+        let tree = kio_core::dag::build_tree(
+            &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+            [kio_core::dag::TreeEntry::raw_file(
+                "日本語.txt",
+                format!("sha256:{}", "1".repeat(64)),
+            )
+            .unwrap()],
+        )
+        .unwrap();
+        let expected = serde_json::to_value(&tree).unwrap();
+        for json_mode in [false, true] {
+            let mut output = Vec::new();
+            super::write_inspected_tree(&tree, &mut output, json_mode).unwrap();
+            assert!(output.ends_with(b"\n"));
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&output).unwrap(),
+                expected
+            );
+        }
+        let tree = kio_core::dag::build_tree(
+            &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+            [kio_core::dag::TreeEntry::raw_file(
+                "bidi-\u{202e}.txt",
+                format!("sha256:{}", "1".repeat(64)),
+            )
+            .unwrap()],
+        )
+        .unwrap();
+        let mut output = Vec::new();
+        super::write_inspected_tree(&tree, &mut output, false).unwrap();
+        let human = String::from_utf8(output).unwrap();
+        assert!(human.contains("\\u{202e}"));
+        assert!(!human.contains('\u{202e}'));
+    }
+
+    #[test]
+    fn tree_human_output_sanitizes_split_utf8_scalars() {
+        use std::io::Write;
+        let text = "日本語\u{202e}\u{85}\nplain";
+        let mut output = Vec::new();
+        let mut terminal = super::TerminalSafeWriter {
+            writer: &mut output,
+            pending: [0; 4],
+            filled: 0,
+        };
+        for byte in text.as_bytes() {
+            terminal.write_all(&[*byte]).unwrap();
+        }
+        terminal.flush().unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            terminal_safe_text(text, true)
+        );
+    }
+
+    #[test]
+    fn inspected_large_tree_uses_bounded_output_writes() {
+        use std::io::Write;
+        struct Count {
+            bytes: u64,
+            largest: usize,
+        }
+        impl Write for Count {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.bytes += bytes.len() as u64;
+                self.largest = self.largest.max(bytes.len());
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut records = kio_core::disk_records::RecordWriter::new(
+            &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+        )
+        .unwrap();
+        for i in 0..60_000 {
+            records
+                .push(
+                    &kio_core::dag::TreeEntry::raw_file(
+                        format!("{i:06}-{}.txt", "x".repeat(210)),
+                        format!("sha256:{}", "1".repeat(64)),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        let mut tree = kio_core::dag::build_tree(
+            &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+            [],
+        )
+        .unwrap();
+        tree.entries = records.finish().unwrap();
+        for json_mode in [false, true] {
+            let mut output = Count {
+                bytes: 0,
+                largest: 0,
+            };
+            super::write_inspected_tree(&tree, &mut output, json_mode).unwrap();
+            assert!(output.bytes > 16 * 1024 * 1024);
+            assert!(output.largest <= 64 * 1024);
+        }
+    }
 
     #[test]
     fn confirmation_reads_only_one_bounded_line() {

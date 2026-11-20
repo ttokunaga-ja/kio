@@ -1,211 +1,91 @@
-//! EA access through Win32 backup streams (BACKUP_EA_DATA, never ADS).
-//! https://learn.microsoft.com/windows/win32/api/winbase/ns-winbase-win32_stream_id
-use std::{
-    ffi::c_void,
-    fs::File,
-    io::{self, Seek, SeekFrom},
-    os::windows::io::AsRawHandle,
-    ptr,
-};
-use windows_sys::Win32::Storage::FileSystem::{
-    BACKUP_EA_DATA, BackupRead, BackupSeek, BackupWrite,
+//! Access the named EA through the retained synchronous file or directory handle.
+use std::{fs::File, io, os::windows::io::AsRawHandle, ptr};
+use windows_sys::{
+    Wdk::Storage::FileSystem::{NtQueryEaFile, NtSetEaFile},
+    Win32::System::IO::IO_STATUS_BLOCK,
 };
 
-const NAME: &[u8] = b"KIO_STAGE_NONCE";
-const HEADER: usize = 20; // offsetof(WIN32_STREAM_ID, cStreamName)
+const NAME: &[u8] = b"KIO_STAGE_NONCE\0";
+const NAME_LEN: u8 = (NAME.len() - 1) as u8;
+const VALUE_LEN: usize = 32;
+const VALUE_OFFSET: usize = 8 + NAME.len();
+const RECORD_LEN: usize = VALUE_OFFSET + VALUE_LEN;
 
-struct Backup<'a> {
-    file: &'a File,
-    context: *mut c_void,
-    writing: bool,
-    position: Option<u64>,
-}
-impl<'a> Backup<'a> {
-    fn new(mut file: &'a File, writing: bool) -> io::Result<Self> {
-        Ok(Self {
-            position: if file.metadata()?.is_file() {
-                Some(file.stream_position()?)
-            } else {
-                None
-            },
-            file,
-            context: ptr::null_mut(),
-            writing,
-        })
-    }
-    fn read_exact(&mut self, bytes: &mut [u8]) -> io::Result<()> {
-        let mut count = 0;
-        if unsafe {
-            BackupRead(
-                self.file.as_raw_handle(),
-                bytes.as_mut_ptr(),
-                bytes.len() as u32,
-                &mut count,
-                0,
-                0,
-                &mut self.context,
-            )
-        } == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        if count as usize != bytes.len() {
-            return Err(invalid("missing or truncated EA backup stream"));
-        }
-        Ok(())
-    }
-    fn skip(&mut self, bytes: u64) -> io::Result<()> {
-        if bytes == 0 {
-            return Ok(());
-        }
-        let (mut low, mut high) = (0, 0);
-        if unsafe {
-            BackupSeek(
-                self.file.as_raw_handle(),
-                bytes as u32,
-                (bytes >> 32) as u32,
-                &mut low,
-                &mut high,
-                &mut self.context,
-            )
-        } == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        if u64::from(low) | (u64::from(high) << 32) != bytes {
-            return Err(invalid("short EA stream seek"));
-        }
-        Ok(())
-    }
-}
-impl Drop for Backup<'_> {
-    fn drop(&mut self) {
-        let mut count = 0;
-        unsafe {
-            if self.writing {
-                BackupWrite(
-                    self.file.as_raw_handle(),
-                    ptr::null(),
-                    0,
-                    &mut count,
-                    1,
-                    0,
-                    &mut self.context,
-                );
-            } else {
-                BackupRead(
-                    self.file.as_raw_handle(),
-                    ptr::null_mut(),
-                    0,
-                    &mut count,
-                    1,
-                    0,
-                    &mut self.context,
-                );
-            }
-        }
-        if let Some(position) = self.position {
-            let _ = self.file.seek(SeekFrom::Start(position));
-        }
-    }
-}
+#[repr(C, align(4))]
+struct EaBuffer<const N: usize>([u8; N]);
+
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-pub(crate) fn create(file: &File, nonce: &[u8; 32]) -> io::Result<()> {
-    // FILE_FULL_EA_INFORMATION: NextEntryOffset, Flags, EaNameLength,
-    // EaValueLength, EaName + NUL, EaValue. Only a just-created file is passed.
-    let payload_len = 8 + NAME.len() + 1 + nonce.len();
-    let mut bytes = vec![0; HEADER + payload_len];
-    bytes[..4].copy_from_slice(&BACKUP_EA_DATA.to_le_bytes());
-    bytes[8..16].copy_from_slice(&(payload_len as u64).to_le_bytes());
-    bytes[HEADER + 5] = NAME.len() as u8;
-    bytes[HEADER + 6..HEADER + 8].copy_from_slice(&32_u16.to_le_bytes());
-    bytes[HEADER + 8..HEADER + 8 + NAME.len()].copy_from_slice(NAME);
-    bytes[HEADER + 9 + NAME.len()..].copy_from_slice(nonce);
-    let mut backup = Backup::new(file, true)?;
-    let mut written = 0;
-    if unsafe {
-        BackupWrite(
+pub(crate) fn create(file: &File, nonce: &[u8; VALUE_LEN]) -> io::Result<()> {
+    // FILE_FULL_EA_INFORMATION with a single entry and a NUL-terminated name.
+    let mut buffer = EaBuffer([0; RECORD_LEN]);
+    buffer.0[5] = NAME_LEN;
+    buffer.0[6..8].copy_from_slice(&(VALUE_LEN as u16).to_le_bytes());
+    buffer.0[8..VALUE_OFFSET].copy_from_slice(NAME);
+    buffer.0[VALUE_OFFSET..].copy_from_slice(nonce);
+    let mut io_status = IO_STATUS_BLOCK::default();
+    // SAFETY: buffers remain valid for the synchronous call on the retained handle.
+    let status = unsafe {
+        NtSetEaFile(
             file.as_raw_handle(),
-            bytes.as_ptr(),
-            bytes.len() as u32,
-            &mut written,
-            0,
-            0,
-            &mut backup.context,
+            &mut io_status,
+            buffer.0.as_ptr().cast(),
+            RECORD_LEN as u32,
         )
-    } == 0
-    {
-        return Err(io::Error::last_os_error());
+    };
+    if status != 0 {
+        return Err(super::store::nt_status_error(status));
     }
-    if written as usize != bytes.len() {
-        return Err(invalid("short stage EA write"));
-    }
-    drop(backup);
-    // BackupWrite can ignore unsupported streams. Never accept that as success.
     if &read(file)? != nonce {
-        return Err(invalid(
-            "filesystem did not persist stage EA; EA support required",
-        ));
+        return Err(invalid("filesystem did not persist the stage EA"));
     }
     Ok(())
 }
 
-pub(crate) fn read(file: &File) -> io::Result<[u8; 32]> {
-    let mut backup = Backup::new(file, false)?;
-    // Skip data streams without reading payload, regardless of file length.
-    for _ in 0..64 {
-        let mut header = [0; HEADER];
-        backup.read_exact(&mut header)?;
-        let kind = u32::from_le_bytes(header[..4].try_into().unwrap());
-        let size = u64::from_le_bytes(header[8..16].try_into().unwrap());
-        let name_size = u32::from_le_bytes(header[16..20].try_into().unwrap());
-        // Stream names are part of the header and cannot be BackupSeek'ed.
-        if name_size > 64 * 1024 {
-            return Err(invalid("oversized backup stream name"));
-        }
-        let mut name = vec![0; name_size as usize];
-        if !name.is_empty() {
-            backup.read_exact(&mut name)?;
-        }
-        if kind != BACKUP_EA_DATA {
-            backup.skip(size)?;
-            continue;
-        }
-        if size > 64 * 1024 {
-            return Err(invalid("oversized stage EA data"));
-        }
-        let mut data = vec![0; size as usize];
-        backup.read_exact(&mut data)?;
-        return parse_ea(&data);
+pub(crate) fn read(file: &File) -> io::Result<[u8; VALUE_LEN]> {
+    // FILE_GET_EA_INFORMATION limits the query to the nonce's name.
+    let mut name = EaBuffer([0; 5 + NAME.len()]);
+    name.0[4] = NAME_LEN;
+    name.0[5..].copy_from_slice(NAME);
+    let mut buffer = EaBuffer([0; RECORD_LEN]);
+    let mut io_status = IO_STATUS_BLOCK::default();
+    // SAFETY: both aligned EA buffers and the status block remain valid for
+    // the synchronous call. The output buffer has room for one complete nonce.
+    let status = unsafe {
+        NtQueryEaFile(
+            file.as_raw_handle(),
+            &mut io_status,
+            buffer.0.as_mut_ptr().cast(),
+            RECORD_LEN as u32,
+            true,
+            name.0.as_ptr().cast(),
+            name.0.len() as u32,
+            ptr::null(),
+            true,
+        )
+    };
+    if status != 0 {
+        return Err(super::store::nt_status_error(status));
     }
-    Err(invalid("stage EA not found within stream bound"))
+    let data = buffer
+        .0
+        .get(..io_status.Information)
+        .ok_or_else(|| invalid("invalid stage EA byte count"))?;
+    parse_ea(data)
 }
 
-fn parse_ea(mut data: &[u8]) -> io::Result<[u8; 32]> {
-    loop {
-        if data.len() < 8 {
-            return Err(invalid("stage nonce EA is absent or malformed"));
-        }
-        let next = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
-        let name_len = data[5] as usize;
-        let value_len = u16::from_le_bytes(data[6..8].try_into().unwrap()) as usize;
-        let end = 9 + name_len + value_len;
-        if data.len() < end || data[8 + name_len] != 0 {
-            return Err(invalid("truncated stage EA"));
-        }
-        if data[8..8 + name_len] == *NAME {
-            return data[9 + name_len..end]
-                .try_into()
-                .map_err(|_| invalid("stage nonce must be exactly 256 bits"));
-        }
-        if next < end || next >= data.len() {
-            return Err(invalid("stage nonce EA is absent"));
-        }
-        data = &data[next..];
+fn parse_ea(data: &[u8]) -> io::Result<[u8; VALUE_LEN]> {
+    if data.len() != RECORD_LEN
+        || data[..4] != [0; 4]
+        || data[5] != NAME_LEN
+        || data[6..8] != (VALUE_LEN as u16).to_le_bytes()
+        || data[8..VALUE_OFFSET] != *NAME
+    {
+        return Err(invalid("stage nonce EA is absent or malformed"));
     }
+    Ok(data[VALUE_OFFSET..].try_into().unwrap())
 }
 
 pub(crate) fn storage_exhausted(error: &io::Error) -> bool {
@@ -244,7 +124,38 @@ pub(crate) fn create_directory(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    #[test]
+    fn ea_survives_rename_and_hardlink_and_is_readable_without_data_access() {
+        use std::{fs, os::windows::fs::OpenOptionsExt};
+        use windows_sys::Win32::Storage::FileSystem::FILE_READ_EA;
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("stage");
+        let renamed = directory.path().join("renamed");
+        let linked = directory.path().join("linked");
+        let mut file = File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&source)
+            .unwrap();
+        create(&file, &[23; 32]).unwrap();
+        file.write_all(b"payload").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        fs::rename(&source, &renamed).unwrap();
+        fs::hard_link(&renamed, &linked).unwrap();
+        for path in [renamed, linked] {
+            let file = File::options()
+                .access_mode(FILE_READ_EA)
+                .open(path)
+                .unwrap();
+            assert_eq!(read(&file).unwrap(), [23; 32]);
+        }
+    }
 
     #[test]
     fn ea_round_trip_preserves_stream_position_and_payload() {

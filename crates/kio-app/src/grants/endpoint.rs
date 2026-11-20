@@ -48,27 +48,26 @@ pub(super) fn validate_disclosure(
     disclosure: &EndpointDisclosure,
     binding: &DeviceEndpointBinding,
 ) -> Result<()> {
-    let expected: &[&str] = match disclosure.purpose.as_str() {
-        "embedding" if disclosure.tool_id == "qwen3_vl_embedding_local" => {
-            &["query text", "document text", "images"]
+    use kio_adapter::catalog::GENERIC_LOCAL_EMBEDDING_TOOL_ID;
+
+    let types = disclosure
+        .content_types
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let valid_content = match (disclosure.purpose.as_str(), disclosure.tool_id.as_str()) {
+        ("embedding", "qwen3_vl_embedding_local") => {
+            types == ["query text", "document text", "images"]
         }
-        "markdown" if disclosure.tool_id == "paddleocr_vl_local" => {
-            &["document page images", "document text"]
-        }
-        _ => {
-            return Err(corrupt(
-                "endpoint disclosure purpose does not match a local adapter",
-            ));
-        }
+        ("embedding", GENERIC_LOCAL_EMBEDDING_TOOL_ID) => matches!(
+            types.as_slice(),
+            ["query text", "document text"] | ["query text", "document text", "images"]
+        ),
+        ("markdown", "paddleocr_vl_local") => types == ["document page images", "document text"],
+        _ => false,
     };
     if disclosure.tool_profile_hash.is_empty()
-        || disclosure
-            .content_types
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-            .as_slice()
-            != expected
+        || !valid_content
         || disclosure.applies_to != "all scopes on this device"
         || disclosure.peer_authentication
             != if binding.destination.starts_with("http://") {

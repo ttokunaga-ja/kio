@@ -1,3 +1,4 @@
+use crate::confinement::RendererStart;
 use crate::platform::unix::scratch::sampled_scratch_bytes;
 use crate::*;
 use std::fs::File;
@@ -9,6 +10,7 @@ pub(crate) fn run_bounded_command_with_unix_renderer_limits(
     scratch: &std::path::Path,
     max_scratch_bytes: u64,
     physical_memory_limit: u64,
+    start: RendererStart<'_>,
 ) -> Result<BoundedProcessOutput, BoundedProcessError> {
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -32,11 +34,17 @@ pub(crate) fn run_bounded_command_with_unix_renderer_limits(
         scratch_path,
         max_scratch_bytes,
         physical_memory_limit,
+        start,
     );
+    let options = BoundedProcessOptions {
+        timeout: start.remaining()?,
+        ..options
+    };
     run_bounded_command_inner_impl(command, options, stdin, &mut monitor)
 }
 
-pub(crate) struct UnixRendererMonitor {
+pub(crate) struct UnixRendererMonitor<'a> {
+    start: RendererStart<'a>,
     scratch: File,
     scratch_path: std::path::PathBuf,
     max_scratch_bytes: u64,
@@ -44,14 +52,16 @@ pub(crate) struct UnixRendererMonitor {
     physical_memory: Option<MacosPhysicalMemoryMonitor>,
 }
 
-impl UnixRendererMonitor {
+impl<'a> UnixRendererMonitor<'a> {
     pub(crate) fn new(
         scratch: File,
         scratch_path: std::path::PathBuf,
         max_scratch_bytes: u64,
         physical_memory_limit: u64,
+        start: RendererStart<'a>,
     ) -> Self {
         Self {
+            start,
             scratch,
             scratch_path,
             max_scratch_bytes,
@@ -62,7 +72,15 @@ impl UnixRendererMonitor {
     }
 }
 
-impl BoundedProcessMonitor for UnixRendererMonitor {
+impl BoundedProcessMonitor for UnixRendererMonitor<'_> {
+    fn before_spawn(&mut self) -> Result<(), BoundedProcessError> {
+        self.start.verify()
+    }
+
+    fn operation_deadline(&self, _: Instant) -> Instant {
+        self.start.deadline
+    }
+
     fn observe(&mut self, child: &Child) -> Result<(), BoundedProcessError> {
         self.physical_memory.observe(child)?;
         let now = Instant::now();

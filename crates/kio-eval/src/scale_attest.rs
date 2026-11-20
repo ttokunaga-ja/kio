@@ -4,6 +4,7 @@
 //! mutable projections are evidence only after the immutable CAS graph and the
 //! frozen fixture have been checked here.
 
+use crate::attestation::tree_stream;
 use crate::{
     scale_fixture::ValidatedFixture,
     scale_spec::{self, SCOPES, ScaleScope},
@@ -14,7 +15,10 @@ use cap_primitives::fs::_WindowsByHandle;
 #[cfg(unix)]
 use cap_primitives::fs::MetadataExt;
 use cap_primitives::{ambient_authority, fs as cap_fs};
-use kio_core::cas::{canonical_json_bytes, hash_bytes, is_hash, lower_hex};
+use kio_core::{
+    cas::{canonical_json_bytes, hash_bytes, is_hash, lower_hex},
+    disk_records::{DiskRecords, RecordStageRoot},
+};
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -391,19 +395,20 @@ struct StatsWire {
 #[serde(deny_unknown_fields)]
 struct TreeWire {
     chunking_config_hash: String,
-    entries: Vec<TreeEntryWire>,
+    entries: DiskRecords<TreeEntryWire>,
     object_type: String,
 }
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TreeEntryWire {
     path: String,
     #[serde(rename = "type")]
     entry_type: String,
     raw_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     normalize: Option<NormalizeWire>,
 }
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NormalizeWire {
     tool_profile_hash: String,
@@ -857,6 +862,90 @@ fn semantic_cas(
     Ok(bytes)
 }
 
+/// Independently decode and verify the evaluator wire while keeping the
+/// existing scale-CAS byte bound. Rechecks use this path as well.
+fn observe_tree_cas(
+    parent: &fs::File,
+    hash: &str,
+    label: &str,
+) -> Result<(TreeWire, FileObservation), AttestError> {
+    let (a, b, leaf) = hash_leaf(hash)?;
+    let objects = required_dir(parent, "objects", "CAS objects")?;
+    let trees = required_dir(&objects, "trees", "CAS kind")?;
+    let a = required_dir(&trees, a, "CAS fanout")?;
+    let b = required_dir(&a, b, "CAS fanout")?;
+    let before = cap_fs::stat(&b, Path::new(leaf), cap_fs::FollowSymlinks::No)
+        .map_err(|e| other(label, e))?;
+    if !before.is_file() || before.file_type().is_symlink() || before.len() > MAX_CAS {
+        return Err(unsafe_state(format!(
+            "{label} must be a bounded regular file"
+        )));
+    }
+    #[cfg(unix)]
+    if before.nlink() != 1 {
+        return Err(unsafe_state(format!(
+            "{label} must have exactly one hard link"
+        )));
+    }
+    let mut options = cap_fs::OpenOptions::new();
+    options
+        .read(true)
+        ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
+    let mut file = cap_fs::open(&b, Path::new(leaf), &options).map_err(|e| other(label, e))?;
+    let opened = cap_fs::Metadata::from_file(&file).map_err(|e| other(label, e))?;
+    let root = RecordStageRoot::temporary().map_err(|e| other(label, e))?;
+    let outcome = tree_stream::decode::<TreeWire>(&root, &mut file, MAX_CAS);
+    if outcome.token_limit_exceeded {
+        return Err(unsafe_state(format!(
+            "{label} JSON token exceeds streaming resource buffer"
+        )));
+    }
+    let after = cap_fs::stat(&b, Path::new(leaf), cap_fs::FollowSymlinks::No)
+        .map_err(|e| other(label, e))?;
+    if !opened.is_file()
+        || opened.len() != outcome.consumed
+        || after.len() != opened.len()
+        || !same(&before, &opened)
+        || !same(&opened, &after)
+    {
+        return Err(unsafe_state(format!("{label} changed while reading")));
+    }
+    if outcome.hash != hash {
+        return Err(unsafe_state(format!("{label} hash mismatch")));
+    }
+    let tree = outcome.decoded.map_err(|e| other(label, e))?;
+    let canonical =
+        tree_stream::canonical_hash(&tree.chunking_config_hash, &tree.entries, &tree.object_type)
+            .map_err(unsafe_state)?;
+    if canonical != outcome.hash {
+        return Err(unsafe_state(format!("{label} is not canonical JSON")));
+    }
+    Ok((
+        tree,
+        FileObservation {
+            identity: leaf_identity(&opened),
+            bytes: outcome.consumed,
+            sha256: outcome.hash,
+        },
+    ))
+}
+
+fn tree_cas(
+    parent: &fs::File,
+    hash: &str,
+    label: &str,
+    bindings: &mut Vec<CasBinding>,
+) -> Result<TreeWire, AttestError> {
+    let (tree, observation) = observe_tree_cas(parent, hash, label)?;
+    bindings.push(CasBinding {
+        kind: "trees".into(),
+        hash: hash.into(),
+        content_addressed: true,
+        observation,
+    });
+    Ok(tree)
+}
+
 fn observe_semantic_cas(
     parent: &fs::File,
     kind: &str,
@@ -873,10 +962,15 @@ fn observe_semantic_cas(
 
 fn recheck_cas(parent: &fs::File, bindings: &[CasBinding]) -> Result<(), AttestError> {
     for binding in bindings {
-        let (_, observation) = if binding.content_addressed {
+        let observation = if binding.kind == "trees" && binding.content_addressed {
+            observe_tree_cas(parent, &binding.hash, "attested CAS tree")
+                .map(|(_, observation)| observation)
+        } else if binding.content_addressed {
             observe_cas(parent, &binding.kind, &binding.hash, "attested CAS object")
+                .map(|(_, observation)| observation)
         } else {
             observe_semantic_cas(parent, &binding.kind, &binding.hash, "attested CAS object")
+                .map(|(_, observation)| observation)
         }
         .map_err(corruption)?;
         if observation != binding.observation {
@@ -996,8 +1090,7 @@ fn attest_cas(
             "current-text HEAD commit differs from the frozen root snapshot",
         ));
     }
-    let tree_bytes = cas(kio, "trees", &commit.tree, "HEAD tree", bindings)?;
-    let tree: TreeWire = exact_json(&tree_bytes, "HEAD tree")?;
+    let tree = tree_cas(kio, &commit.tree, "HEAD tree", bindings)?;
     let mut normalized_sources = BTreeMap::new();
     let final_sources =
         attest_snapshot_tree(kio, &tree, scope, "HEAD", &mut normalized_sources, bindings)?;
@@ -1036,8 +1129,7 @@ fn attest_cas(
                 "history base commit differs from the frozen root snapshot",
             ));
         }
-        let parent_tree_bytes = cas(kio, "trees", &parent.tree, "history base tree", bindings)?;
-        let parent_tree: TreeWire = exact_json(&parent_tree_bytes, "history base tree")?;
+        let parent_tree = tree_cas(kio, &parent.tree, "history base tree", bindings)?;
         let sources = attest_snapshot_tree(
             kio,
             &parent_tree,
@@ -1166,7 +1258,8 @@ fn attest_snapshot_tree(
     }
     let expected_by_path = expected_files_by_path(expected_scope, label)?;
     let mut sources = BTreeMap::new();
-    for entry in &tree.entries {
+    for entry in tree.entries.iter() {
+        let entry = entry.map_err(|error| other("tree records", error))?;
         let Some(expected) = expected_by_path.get(entry.path.as_str()) else {
             return Err(unsafe_state(format!(
                 "{label} tree differs from the frozen manifest or lacks normalization"
@@ -1248,15 +1341,19 @@ fn expected_files_by_path<'a>(
 }
 
 fn validate_tree_wire(tree: &TreeWire) -> Result<(), AttestError> {
-    if tree.object_type != "tree"
-        || tree.chunking_config_hash != scale_spec::CHUNKING_CONFIG_HASH
-        || tree.entries.len() > 10_000
-        || tree
-            .entries
-            .windows(2)
-            .any(|v| v[0].path.as_bytes() >= v[1].path.as_bytes())
-    {
+    if tree.object_type != "tree" || tree.chunking_config_hash != scale_spec::CHUNKING_CONFIG_HASH {
         return Err(unsafe_state("HEAD tree violates current tree contract"));
+    }
+    let mut previous: Option<String> = None;
+    for entry in tree.entries.iter() {
+        let entry = entry.map_err(|error| other("tree records", error))?;
+        if previous
+            .as_ref()
+            .is_some_and(|path| path.as_bytes() >= entry.path.as_bytes())
+        {
+            return Err(unsafe_state("HEAD tree violates current tree contract"));
+        }
+        previous = Some(entry.path);
     }
     Ok(())
 }
@@ -3200,26 +3297,111 @@ mod publication_tests {
     }
 
     #[test]
+    fn streamed_scale_tree_accepts_above_sixteen_mib_and_rechecks_without_buffering() {
+        use std::io::{Seek, SeekFrom};
+        let temp = tempfile::tempdir().unwrap();
+        let mut tree_file = tempfile::NamedTempFile::new_in(temp.path()).unwrap();
+        write!(
+            tree_file,
+            "{{\"chunking_config_hash\":\"{}\",\"entries\":[",
+            scale_spec::CHUNKING_CONFIG_HASH
+        )
+        .unwrap();
+        let raw = format!("sha256:{}", "1".repeat(64));
+        for i in 0..60_000 {
+            if i != 0 {
+                tree_file.write_all(b",").unwrap();
+            }
+            let entry = serde_json::json!({"path": format!("{i:06}-{}.txt", "x".repeat(210)), "raw_hash": raw, "type": "file"});
+            tree_file
+                .write_all(&canonical_json_bytes(&entry).unwrap())
+                .unwrap();
+        }
+        tree_file.write_all(b"],\"object_type\":\"tree\"}").unwrap();
+        assert!(tree_file.as_file().metadata().unwrap().len() > 16 * 1024 * 1024);
+        tree_file.as_file_mut().seek(SeekFrom::Start(0)).unwrap();
+        let decoded = tree_stream::decode::<TreeWire>(
+            &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+            tree_file.as_file_mut(),
+            MAX_CAS,
+        );
+        assert_eq!(decoded.decoded.unwrap().entries.len(), 60_000);
+        let digest = decoded.hash.strip_prefix("sha256:").unwrap();
+        let dir = temp
+            .path()
+            .join("objects/trees")
+            .join(&digest[..2])
+            .join(&digest[2..4]);
+        fs::create_dir_all(&dir).unwrap();
+        tree_file.persist(dir.join(digest)).unwrap();
+        let parent = cap_fs::open_ambient_dir(temp.path(), ambient_authority()).unwrap();
+        let mut bindings = Vec::new();
+        let tree = tree_cas(&parent, &decoded.hash, "test tree", &mut bindings).unwrap();
+        validate_tree_wire(&tree).unwrap();
+        assert_eq!(tree.entries.len(), 60_000);
+        recheck_cas(&parent, &bindings).unwrap();
+        // MAX_CAS is a scale evaluation resource budget, independent of the
+        // removed generic tree ceiling. An oversized sparse file is rejected.
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join(digest))
+            .unwrap();
+        file.set_len(MAX_CAS + 1).unwrap();
+        assert!(tree_cas(&parent, &decoded.hash, "test tree", &mut bindings).is_err());
+    }
+
+    #[test]
+    fn st05_evaluator_accepts_tree_above_directory_warning_threshold() {
+        let entries = (0..10_001).map(|i| serde_json::json!({
+            "path": format!("{i:05}.txt"), "type": "file",
+            "raw_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+        })).collect::<Vec<_>>();
+        let root = kio_core::disk_records::RecordStageRoot::temporary().unwrap();
+        let tree: TreeWire = kio_core::disk_records::decode_json(
+            &root,
+            serde_json::to_vec(&serde_json::json!({
+                "object_type": "tree", "chunking_config_hash": crate::scale_spec::CHUNKING_CONFIG_HASH, "entries": entries
+            })).unwrap().as_slice(),
+        ).unwrap();
+        super::validate_tree_wire(&tree).unwrap();
+        let mut writer = kio_core::disk_records::RecordWriter::new(&root).unwrap();
+        let mut entries = tree.entries.iter();
+        let first = entries.next().unwrap().unwrap();
+        writer.push(&entries.next().unwrap().unwrap()).unwrap();
+        writer.push(&first).unwrap();
+        for entry in entries {
+            writer.push(&entry.unwrap()).unwrap();
+        }
+        let unsorted = TreeWire {
+            entries: writer.finish().unwrap(),
+            ..tree
+        };
+        assert!(super::validate_tree_wire(&unsorted).is_err());
+    }
+
+    #[test]
     fn tree_wire_requires_the_exact_current_chunking_configuration() {
         let current = format!(
             r#"{{"chunking_config_hash":"{}","entries":[],"object_type":"tree"}}"#,
             scale_spec::CHUNKING_CONFIG_HASH
         );
-        let tree: TreeWire = exact_json(current.as_bytes(), "test tree").unwrap();
+        let root = kio_core::disk_records::RecordStageRoot::temporary().unwrap();
+        let decode = |bytes: &[u8]| kio_core::disk_records::decode_json::<TreeWire>(&root, bytes);
+        let tree = decode(current.as_bytes()).unwrap();
         validate_tree_wire(&tree).unwrap();
 
         let missing = r#"{"entries":[],"object_type":"tree"}"#;
-        assert!(exact_json::<TreeWire>(missing.as_bytes(), "test tree").is_err());
+        assert!(decode(missing.as_bytes()).is_err());
 
         let wrong = r#"{"chunking_config_hash":"sha256:0000000000000000000000000000000000000000000000000000000000000000","entries":[],"object_type":"tree"}"#;
-        let wrong: TreeWire = exact_json(wrong.as_bytes(), "test tree").unwrap();
+        let wrong = decode(wrong.as_bytes()).unwrap();
         assert!(validate_tree_wire(&wrong).is_err());
 
         let unknown = format!(
             r#"{{"chunking_config_hash":"{}","entries":[],"object_type":"tree","unknown":true}}"#,
             scale_spec::CHUNKING_CONFIG_HASH
         );
-        assert!(exact_json::<TreeWire>(unknown.as_bytes(), "test tree").is_err());
+        assert!(decode(unknown.as_bytes()).is_err());
     }
 
     #[test]

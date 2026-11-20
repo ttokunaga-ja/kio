@@ -1,6 +1,7 @@
 //! Markdownize and normalized-unit contracts.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -10,13 +11,19 @@ use kio_core::cas::{
     ContentObjectKind, MAX_NORMALIZED_UNIT_OBJECT_BYTES, ObjectStore, canonical_json_bytes,
     hash_bytes as cas_hash_bytes,
 };
-use kio_core::store_dir::{ATOMIC_WORKSPACE_DIR, AtomicWorkspaceState, StoreDirectory};
+use kio_core::store_dir::{
+    ATOMIC_WORKSPACE_DIR, AtomicWorkspaceState, DirectoryStageIdentity, Publication, StoreDirectory,
+};
 use kio_core::{control::ControlHandle, scope::new_ulid};
 use serde::de::{Deserializer, Error as _};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use unicode_normalization::UnicodeNormalization;
 
+use crate::extraction_stage::{
+    SMALL_EXTRACTION_BYTES, SavedStage, child_directory, existing_workspace, read_record,
+    stage_error, write_record,
+};
 use crate::prepare::{
     PreparedUnit, UnitFingerprint, UnitType, hash_bytes, unit_ref as prepared_unit_ref,
 };
@@ -25,7 +32,6 @@ use crate::{IoResultExt, PipelineError, Result};
 
 const MAX_NORMALIZED_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_NORMALIZED_UNIT_BYTES: u64 = MAX_NORMALIZED_UNIT_OBJECT_BYTES;
-const MAX_NORMALIZED_INSTANCE_BYTES: u64 = 256 * 1024 * 1024;
 // CT4-FSCK's invocation-wide object ceiling is also the outer bound for the
 // physical manifest/unit entries inspected before the loader can identify the
 // valid subset. Canonical and conflicting representations share this one counter.
@@ -39,13 +45,11 @@ const MAX_OWNED_IMAGE_HASHES_PER_UNIT: usize = 256;
 struct NormalizedSizeLimits {
     manifest_bytes: u64,
     unit_bytes: u64,
-    instance_bytes: u64,
 }
 
 const NORMALIZED_SIZE_LIMITS: NormalizedSizeLimits = NormalizedSizeLimits {
     manifest_bytes: MAX_NORMALIZED_MANIFEST_BYTES,
     unit_bytes: MAX_NORMALIZED_UNIT_BYTES,
-    instance_bytes: MAX_NORMALIZED_INSTANCE_BYTES,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -685,15 +689,22 @@ pub fn normalized_view_path(
     raw_hash: &str,
     tool_profile_hash: &str,
     r#gen: u64,
+    manifest_hash: &str,
 ) -> PathBuf {
     kio_dir.as_ref().join(normalized_view_relative_path(
         raw_hash,
         tool_profile_hash,
         r#gen,
+        manifest_hash,
     ))
 }
 
-fn normalized_view_relative_path(raw_hash: &str, tool_profile_hash: &str, r#gen: u64) -> PathBuf {
+fn normalized_view_relative_path(
+    raw_hash: &str,
+    tool_profile_hash: &str,
+    r#gen: u64,
+    manifest_hash: &str,
+) -> PathBuf {
     let digest = normalized_path_digest(raw_hash);
     let tool_digest = normalized_path_digest(tool_profile_hash);
     let fanout_a = digest.get(0..2).unwrap_or(digest);
@@ -701,7 +712,10 @@ fn normalized_view_relative_path(raw_hash: &str, tool_profile_hash: &str, r#gen:
     Path::new("objects/normalized")
         .join(fanout_a)
         .join(fanout_b)
-        .join(format!("{digest}.{tool_digest}.g{gen}.md"))
+        .join(format!(
+            "{digest}.{tool_digest}.g{gen}.{}.md",
+            normalized_path_digest(manifest_hash)
+        ))
 }
 
 /// Return only a portable path component. I/O entry points validate hashes before
@@ -743,6 +757,28 @@ pub fn load_validated_normalized_instance_with_control(
     r#gen: u64,
     control: &ControlHandle,
 ) -> Result<ValidatedNormalizedInstance> {
+    let (manifest, manifest_bytes) =
+        read_normalized_instance_manifest(kio_dir.as_ref(), raw_hash, tool_profile_hash, r#gen)?;
+    let store = ObjectStore::new_with_control(kio_dir.as_ref(), control.clone());
+    let (units, unit_bytes) = load_validated_normalized_units_from_manifest_with_size(
+        &store,
+        Path::new("normalized manifest"),
+        &manifest,
+    )?;
+    Ok(ValidatedNormalizedInstance {
+        manifest,
+        units,
+        verified_bytes: manifest_bytes + unit_bytes,
+    })
+}
+
+/// Read and validate the instance metadata independently of its unit bodies.
+pub fn read_normalized_instance_manifest(
+    kio_dir: impl AsRef<Path>,
+    raw_hash: &str,
+    tool_profile_hash: &str,
+    r#gen: u64,
+) -> Result<(NormalizedInstanceManifest, u64)> {
     if !kio_core::cas::is_hash(raw_hash) || !kio_core::cas::is_hash(tool_profile_hash) {
         return Err(PipelineError::corrupt(
             kio_dir.as_ref().display().to_string(),
@@ -766,13 +802,20 @@ pub fn load_validated_normalized_instance_with_control(
             "normalized instance does not exist",
         )
     })?;
-    load_validated_normalized_instance_at(
+    let manifest_path = kio_dir
+        .as_ref()
+        .join(&canonical_relative)
+        .join("manifest.json");
+    let bytes = read_contained_normalized_file(
         kio_dir.as_ref(),
-        &canonical_relative,
         &canonical_dir,
-        &identity,
-        control,
-    )
+        &manifest_path,
+        MAX_NORMALIZED_MANIFEST_BYTES,
+    )?;
+    let manifest = serde_json::from_slice(&bytes)
+        .map_err(|error| normalized_corrupt(&manifest_path, error.to_string()))?;
+    validate_normalized_manifest(&manifest_path, &identity, &manifest)?;
+    Ok((manifest, bytes.len() as u64))
 }
 
 /// Conservatively account every bounded physical file that the normalized
@@ -886,46 +929,6 @@ fn normalized_instance_read_budget_with_file_limit(
     Ok(total)
 }
 
-fn load_validated_normalized_instance_at(
-    kio_dir: &Path,
-    relative_dir: &Path,
-    canonical_dir: &Path,
-    identity: &NormalizedInstanceIdentity,
-    control: &ControlHandle,
-) -> Result<ValidatedNormalizedInstance> {
-    let dir = kio_dir.join(relative_dir);
-    let manifest_path = dir.join("manifest.json");
-    let manifest_bytes = read_contained_normalized_file(
-        kio_dir,
-        canonical_dir,
-        &manifest_path,
-        MAX_NORMALIZED_MANIFEST_BYTES,
-    )?;
-    let manifest: NormalizedInstanceManifest =
-        serde_json::from_slice(&manifest_bytes).map_err(|err| {
-            PipelineError::corrupt(manifest_path.display().to_string(), err.to_string())
-        })?;
-    validate_manifest_identity(&manifest_path, identity, &manifest)?;
-
-    // The mutable per-instance files are a cache only. The manifest's exact
-    // CAS pins select the authoritative normalized unit bodies.
-    let store = ObjectStore::new_with_control(kio_dir, control.clone());
-    let (units, unit_bytes) =
-        load_validated_normalized_units_from_manifest_with_size(&store, &manifest_path, &manifest)?;
-    let total_bytes = manifest_bytes.len() as u64 + unit_bytes;
-    if total_bytes > MAX_NORMALIZED_INSTANCE_BYTES {
-        return Err(PipelineError::corrupt(
-            dir.display().to_string(),
-            format!("normalized instance exceeds {MAX_NORMALIZED_INSTANCE_BYTES} byte limit"),
-        ));
-    }
-    Ok(ValidatedNormalizedInstance {
-        manifest,
-        units,
-        verified_bytes: total_bytes,
-    })
-}
-
 /// Load the authoritative immutable normalized unit objects selected by an
 /// already supplied (and therefore externally pinned) manifest. Mutable
 /// `objects/normalized_units/.../<unit_ref>.json` files are deliberately not
@@ -947,6 +950,31 @@ fn load_validated_normalized_units_from_manifest_with_size(
     source_path: &Path,
     manifest: &NormalizedInstanceManifest,
 ) -> Result<(Vec<NormalizedUnitObject>, u64)> {
+    let mut units = Vec::new();
+    let verified_bytes =
+        visit_validated_normalized_units_at(store, source_path, manifest, |unit| {
+            units.push(unit);
+            Ok(())
+        })?;
+    Ok((units, verified_bytes))
+}
+
+/// Check each pinned unit against the manifest and visit it in manifest order.
+/// A consumer can process large instances without retaining their unit bodies.
+pub fn visit_validated_normalized_units(
+    store: &ObjectStore,
+    manifest: &NormalizedInstanceManifest,
+    visit: impl FnMut(NormalizedUnitObject) -> Result<()>,
+) -> Result<u64> {
+    visit_validated_normalized_units_at(store, Path::new("normalized manifest"), manifest, visit)
+}
+
+fn visit_validated_normalized_units_at(
+    store: &ObjectStore,
+    source_path: &Path,
+    manifest: &NormalizedInstanceManifest,
+    mut visit: impl FnMut(NormalizedUnitObject) -> Result<()>,
+) -> Result<u64> {
     store
         .verified_reads()
         .map_err(|error| normalized_corrupt(source_path, error.to_string()))?;
@@ -958,52 +986,67 @@ fn load_validated_normalized_units_from_manifest_with_size(
     validate_normalized_manifest(source_path, &identity, manifest)?;
 
     let mut total_bytes = 0_u64;
-    let mut units = Vec::new();
     for entry in manifest
         .units
         .iter()
         .filter(|entry| entry.status == UnitStatus::Done)
     {
-        let hash = entry
-            .unit_object_hash
-            .as_deref()
-            .expect("validated done normalized-unit hash");
-        store
-            .inspect_content_accounted(ContentObjectKind::NormalizedUnit, hash)
-            .map_err(|error| normalized_corrupt(source_path, error.error.to_string()))?;
-        let bytes = store
-            .read_content_object_bytes(
-                ContentObjectKind::NormalizedUnit,
-                hash,
-                MAX_NORMALIZED_UNIT_BYTES,
-            )
-            .map_err(|err| normalized_corrupt(source_path, err.to_string()))?;
-        total_bytes = total_bytes.saturating_add(bytes.len() as u64);
-        if total_bytes > MAX_NORMALIZED_INSTANCE_BYTES {
-            return Err(normalized_corrupt(
-                source_path,
-                format!("normalized instance exceeds {MAX_NORMALIZED_INSTANCE_BYTES} byte limit"),
-            ));
-        }
-        let unit: NormalizedUnitObject = serde_json::from_slice(&bytes)
-            .map_err(|err| normalized_corrupt(source_path, err.to_string()))?;
-        if normalized_unit_object_hash(&unit)? != hash {
-            return Err(normalized_corrupt(
-                source_path,
-                "normalized unit CAS object does not match its manifest hash",
-            ));
-        }
-        let canonical = canonical_normalized_unit_object_bytes(&unit)?;
-        if canonical != bytes {
-            return Err(normalized_corrupt(
-                source_path,
-                "normalized unit CAS object is not canonical JSON",
-            ));
-        }
-        units.push(unit);
+        let (unit, bytes) =
+            read_validated_normalized_unit_at(store, source_path, &identity, entry)?;
+        total_bytes = total_bytes.saturating_add(bytes);
+        visit(unit)?;
     }
-    validate_normalized_instance(source_path, &identity, manifest, &units)?;
-    Ok((units, total_bytes))
+    Ok(total_bytes)
+}
+
+/// Read one immutable Done unit selected by a validated manifest entry.
+pub fn read_validated_normalized_unit(
+    store: &ObjectStore,
+    identity: &NormalizedInstanceIdentity,
+    entry: &NormalizedUnitManifestEntry,
+) -> Result<NormalizedUnitObject> {
+    read_validated_normalized_unit_at(store, Path::new("normalized manifest"), identity, entry)
+        .map(|(unit, _)| unit)
+}
+
+fn read_validated_normalized_unit_at(
+    store: &ObjectStore,
+    source_path: &Path,
+    identity: &NormalizedInstanceIdentity,
+    entry: &NormalizedUnitManifestEntry,
+) -> Result<(NormalizedUnitObject, u64)> {
+    let hash = entry
+        .unit_object_hash
+        .as_deref()
+        .filter(|hash| entry.status == UnitStatus::Done && kio_core::cas::is_hash(hash))
+        .ok_or_else(|| normalized_corrupt(source_path, "missing or invalid done unit hash"))?;
+    store
+        .inspect_content_accounted(ContentObjectKind::NormalizedUnit, hash)
+        .map_err(|error| normalized_corrupt(source_path, error.error.to_string()))?;
+    let bytes = store
+        .read_content_object_bytes(
+            ContentObjectKind::NormalizedUnit,
+            hash,
+            MAX_NORMALIZED_UNIT_BYTES,
+        )
+        .map_err(|err| normalized_corrupt(source_path, err.to_string()))?;
+    let unit: NormalizedUnitObject = serde_json::from_slice(&bytes)
+        .map_err(|err| normalized_corrupt(source_path, err.to_string()))?;
+    if cas_hash_bytes(&bytes) != hash {
+        return Err(normalized_corrupt(
+            source_path,
+            "normalized unit CAS object does not match its manifest hash",
+        ));
+    }
+    let canonical = canonical_normalized_unit_object_bytes(&unit)?;
+    if canonical != bytes {
+        return Err(normalized_corrupt(
+            source_path,
+            "normalized unit CAS object is not canonical JSON",
+        ));
+    }
+    validate_normalized_unit(source_path, identity, entry, &unit)?;
+    Ok((unit, bytes.len() as u64))
 }
 
 /// Validate already-deserialized normalized state. This is also used by the
@@ -1037,26 +1080,41 @@ pub fn validate_normalized_instance(
                 "normalized unit does not have a matching done manifest entry",
             ));
         };
-        if !seen_units.insert(unit.unit_key.as_str())
-            || unit.raw_hash != identity.raw_hash
-            || unit.tool_profile_hash != identity.tool_profile_hash
-            || unit.r#gen != identity.r#gen
-            || unit.unit_key != entry.unit_key
-            || unit.unit_type != entry.unit_type
-            || unit.prepared_hash != entry.prepared_hash
-            || unit.preparation_profile_hash != entry.preparation_profile_hash
-            || unit.owned_image_hashes.len() > MAX_OWNED_IMAGE_HASHES_PER_UNIT
-            || unit
-                .owned_image_hashes
-                .iter()
-                .any(|hash| !kio_core::cas::is_hash(hash))
-            || unit.markdown.is_empty()
-        {
+        if !seen_units.insert(unit.unit_key.as_str()) {
             return Err(normalized_corrupt(
                 source_path,
-                "normalized unit identity does not match the requested manifest tuple",
+                "duplicate normalized unit object",
             ));
         }
+        validate_normalized_unit(source_path, identity, entry, unit)?;
+    }
+    Ok(())
+}
+
+fn validate_normalized_unit(
+    path: &Path,
+    identity: &NormalizedInstanceIdentity,
+    entry: &NormalizedUnitManifestEntry,
+    unit: &NormalizedUnitObject,
+) -> Result<()> {
+    if unit.raw_hash != identity.raw_hash
+        || unit.tool_profile_hash != identity.tool_profile_hash
+        || unit.r#gen != identity.r#gen
+        || unit.unit_key != entry.unit_key
+        || unit.unit_type != entry.unit_type
+        || unit.prepared_hash != entry.prepared_hash
+        || unit.preparation_profile_hash != entry.preparation_profile_hash
+        || unit.owned_image_hashes.len() > MAX_OWNED_IMAGE_HASHES_PER_UNIT
+        || unit
+            .owned_image_hashes
+            .iter()
+            .any(|hash| !kio_core::cas::is_hash(hash))
+        || unit.markdown.is_empty()
+    {
+        return Err(normalized_corrupt(
+            path,
+            "normalized unit identity does not match the requested manifest tuple",
+        ));
     }
     Ok(())
 }
@@ -1080,6 +1138,7 @@ pub fn validate_normalized_manifest(
 
     let mut manifest_keys = BTreeSet::new();
     let mut manifest_refs = BTreeSet::new();
+    let mut manifest_orders = BTreeSet::new();
     for entry in &manifest.units {
         if entry.unit_key.is_empty()
             || !manifest_keys.insert(entry.unit_key.as_str())
@@ -1089,6 +1148,12 @@ pub fn validate_normalized_manifest(
             return Err(normalized_corrupt(
                 source_path,
                 "manifest contains a duplicate or non-derived unit reference",
+            ));
+        }
+        if !manifest_orders.insert(entry.order) {
+            return Err(normalized_corrupt(
+                source_path,
+                "duplicate manifest unit order",
             ));
         }
         if !kio_core::cas::is_hash(&entry.prepared_hash) {
@@ -1265,42 +1330,55 @@ fn checked_manifest_size(path: &Path, bytes: u64, limits: NormalizedSizeLimits) 
             ),
         ));
     }
-    if bytes > limits.instance_bytes {
-        return Err(normalized_corrupt(
-            path,
-            format!(
-                "normalized instance exceeds {} byte limit",
-                limits.instance_bytes
-            ),
-        ));
-    }
     Ok(bytes)
 }
 
 fn checked_unit_size(
-    instance_dir: &Path,
     unit_path: &Path,
     current_total: u64,
     bytes: u64,
     limits: NormalizedSizeLimits,
 ) -> Result<u64> {
     if bytes > limits.unit_bytes {
-        return Err(normalized_corrupt(
-            unit_path,
-            format!("normalized object exceeds {} byte limit", limits.unit_bytes),
+        return Err(PipelineError::ResourceLimit(
+            kio_core::error::ResourceLimit {
+                resource: kio_core::error::Resource::Memory,
+                stage: "normalized_unit".to_owned(),
+                limit: Some(limits.unit_bytes),
+                observed: Some(bytes),
+                resource_tier: None,
+            },
         ));
     }
-    let total = current_total.saturating_add(bytes);
-    if total > limits.instance_bytes {
-        return Err(normalized_corrupt(
-            instance_dir,
-            format!(
-                "normalized instance exceeds {} byte limit",
-                limits.instance_bytes
-            ),
-        ));
+    current_total
+        .checked_add(bytes)
+        .ok_or_else(|| normalized_corrupt(unit_path, "normalized instance byte count overflow"))
+}
+
+/// Check both serialized normalized-unit representations used by persistence.
+pub fn check_normalized_unit_write_size(unit: &NormalizedUnitObject) -> Result<()> {
+    #[derive(Default)]
+    struct Count(u64);
+    impl std::io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len() as u64);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
-    Ok(total)
+    let path = Path::new("normalized unit");
+    checked_unit_size(path, 0, unit.markdown.len() as u64, NORMALIZED_SIZE_LIMITS)?;
+    let mut cache = Count::default();
+    serde_json::to_writer_pretty(&mut cache, unit)
+        .map_err(|error| PipelineError::Schema(error.to_string()))?;
+    checked_unit_size(path, 0, cache.0, NORMALIZED_SIZE_LIMITS)?;
+    let mut canonical = Count::default();
+    serde_jcs::to_writer(&mut canonical, unit)
+        .map_err(|error| PipelineError::Schema(error.to_string()))?;
+    checked_unit_size(path, 0, canonical.0, NORMALIZED_SIZE_LIMITS)?;
+    Ok(())
 }
 
 /// Persist through an already-retained `.kio` capability. The path is used
@@ -1311,201 +1389,864 @@ pub fn persist_normalized_instance_bound(
     manifest: &NormalizedInstanceManifest,
     units: &[NormalizedUnitObject],
 ) -> Result<NormalizedInstanceManifest> {
-    let mut stamped = manifest.clone();
-    let mut canonical_units = Vec::new();
-    for entry in &mut stamped.units {
-        if entry.status == UnitStatus::Done {
-            let unit = units
+    let by_key = units
+        .iter()
+        .map(|unit| (unit.unit_key.as_str(), unit))
+        .collect::<BTreeMap<_, _>>();
+    if by_key.len() != units.len()
+        || units.len()
+            != manifest
+                .units
                 .iter()
-                .find(|unit| unit.unit_key == entry.unit_key)
-                .ok_or_else(|| {
-                    normalized_corrupt(
-                        directory.path(),
-                        "done manifest entry has no normalized unit object",
-                    )
-                })?;
-            let bytes = canonical_normalized_unit_object_bytes(unit)?;
-            entry.unit_object_hash = Some(normalized_unit_object_hash(unit)?);
-            canonical_units.push(bytes);
-        }
+                .filter(|entry| entry.status == UnitStatus::Done)
+                .count()
+    {
+        return Err(normalized_corrupt(
+            directory.path(),
+            "done manifest entries and normalized unit objects are not one-to-one",
+        ));
     }
+    persist_normalized_instance_from_units_bound(directory, manifest, |entry| {
+        by_key
+            .get(entry.unit_key.as_str())
+            .copied()
+            .map(Cow::Borrowed)
+            .ok_or_else(|| {
+                normalized_corrupt(
+                    directory.path(),
+                    "done manifest entry has no normalized unit object",
+                )
+            })
+    })
+}
+
+/// Publish a normalized instance from unit bodies supplied in manifest order.
+/// The caller serializes writes with the scope lock.
+pub fn persist_normalized_instance_from_units_bound<'a>(
+    directory: &StoreDirectory,
+    manifest: &NormalizedInstanceManifest,
+    mut unit_for: impl FnMut(&NormalizedUnitManifestEntry) -> Result<Cow<'a, NormalizedUnitObject>>,
+) -> Result<NormalizedInstanceManifest> {
+    persist_normalized_units(directory, manifest, None, false, |_, entry| unit_for(entry))
+}
+
+/// Retain a deterministic run's stamp across retries. Its source, profile, unit
+/// identities and destination generation identify the unfinished work.
+pub fn persist_resumable_normalized_units<'a>(
+    directory: &StoreDirectory,
+    manifest: &NormalizedInstanceManifest,
+    source: &str,
+    large_source: bool,
+    unit_for: impl FnMut(
+        &NormalizedInstanceManifest,
+        &NormalizedUnitManifestEntry,
+    ) -> Result<Cow<'a, NormalizedUnitObject>>,
+) -> Result<NormalizedInstanceManifest> {
+    persist_normalized_units(directory, manifest, Some(source), large_source, unit_for)
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SavedNormalizedUnit {
+    hash: String,
+    stage: SavedStage,
+    ready: bool,
+}
+
+fn persist_normalized_units<'a>(
+    directory: &StoreDirectory,
+    manifest: &NormalizedInstanceManifest,
+    resumable_source: Option<&str>,
+    large_source: bool,
+    mut unit_for: impl FnMut(
+        &NormalizedInstanceManifest,
+        &NormalizedUnitManifestEntry,
+    ) -> Result<Cow<'a, NormalizedUnitObject>>,
+) -> Result<NormalizedInstanceManifest> {
+    let mut stamped = manifest.clone();
     let identity = NormalizedInstanceIdentity {
         raw_hash: stamped.raw_hash.clone(),
         tool_profile_hash: stamped.tool_profile_hash.clone(),
         r#gen: stamped.r#gen,
     };
-    validate_normalized_instance(
-        directory.path().join("manifest.json"),
-        &identity,
-        &stamped,
-        units,
-    )?;
-    let manifest_bytes =
-        serde_json::to_vec_pretty(&stamped).map_err(|e| PipelineError::Schema(e.to_string()))?;
-    let mut total_bytes = checked_manifest_size(
-        &directory.path().join("normalized manifest"),
-        manifest_bytes.len() as u64,
-        NORMALIZED_SIZE_LIMITS,
-    )?;
-    let mut serialized_units = Vec::with_capacity(units.len());
-    for unit in units {
-        let bytes =
-            serde_json::to_vec_pretty(unit).map_err(|e| PipelineError::Schema(e.to_string()))?;
-        total_bytes = checked_unit_size(
-            directory.path(),
-            &directory.path().join("normalized unit"),
-            total_bytes,
-            bytes.len() as u64,
-            NORMALIZED_SIZE_LIMITS,
-        )?;
-        serialized_units.push((format!("{}.json", prepared_unit_ref(&unit.unit_key)), bytes));
+    // Body pins are filled as units arrive. Validate the rest of the manifest
+    // before using its identity or entry names as storage paths.
+    for entry in &mut stamped.units {
+        if entry.status == UnitStatus::Done {
+            entry.unit_object_hash = Some(entry.prepared_hash.clone());
+        }
     }
+    validate_normalized_manifest(directory.path(), &identity, &stamped)?;
     let instance = normalized_instance_relative_path(
         &stamped.raw_hash,
         &stamped.tool_profile_hash,
         stamped.r#gen,
     );
-    let parent = instance
-        .parent()
-        .ok_or_else(|| normalized_corrupt(directory.path(), "normalized instance has no parent"))?;
-    let view =
-        normalized_view_relative_path(&stamped.raw_hash, &stamped.tool_profile_hash, stamped.r#gen);
-    // Validate every existing mutable target before publishing immutable CAS.
-    // A poisoned/symlinked cache path must leave sibling directories untouched.
-    for relative in [parent, view.parent().unwrap_or(Path::new(".")), &instance] {
-        let _ = directory
-            .entries_optional(relative)
-            .map_err(|e| normalized_corrupt(directory.path(), e.to_string()))?;
+    let parent = instance.parent().expect("normalized instance parent");
+    // Validate existing cache roots before preparing any of the publication.
+    let objects = Path::new("objects");
+    let objects_dir = StoreDirectory::from_retained_with_control(
+        directory
+            .open_directory(objects)
+            .map_err(|error| stage_error(directory, error))?,
+        directory.path().join(objects),
+        directory.control().clone(),
+    )
+    .map_err(|error| stage_error(directory, error))?;
+    let views = Path::new("normalized");
+    if objects_dir
+        .contains_entry(views)
+        .map_err(|error| stage_error(&objects_dir, error))?
+    {
+        objects_dir
+            .open_directory(views)
+            .map_err(|error| stage_error(&objects_dir, error))?;
     }
-    let _ = directory
-        .read_optional(&view, MAX_NORMALIZED_INSTANCE_BYTES)
-        .map_err(|e| normalized_corrupt(directory.path(), e.to_string()))?;
-    let manifest_cas = canonical_normalized_manifest_bytes(&stamped)?;
+    // Reject unsafe destinations before adding immutable objects.
+    for relative in [parent, &instance] {
+        directory
+            .entries_optional(relative)
+            .map_err(|error| stage_error(directory, error))?;
+    }
     let store = ObjectStore::from_bound_kio_with_control(
         directory.root_handle().as_ref(),
         directory.control().clone(),
     )
-    .map_err(|e| normalized_corrupt(directory.path(), e.to_string()))?;
-    for bytes in &canonical_units {
-        store
-            .write_content_object(ContentObjectKind::NormalizedUnit, bytes)
-            .map_err(|e| normalized_corrupt(directory.path(), e.to_string()))?;
+    .map_err(|error| stage_error(directory, error))?;
+
+    let mut draft = stamped.clone();
+    if resumable_source.is_some() {
+        draft.run_id.clear();
+        draft.generated_at.clear();
     }
-    store
-        .write_content_object(ContentObjectKind::Manifest, &manifest_cas)
-        .map_err(|e| normalized_corrupt(directory.path(), e.to_string()))?;
+    let draft_key = kio_core::cas::hash_bytes(
+        &serde_json::to_vec(&(draft, resumable_source))
+            .map_err(|error| PipelineError::Schema(error.to_string()))?,
+    );
+    let workspace_path = Path::new("extraction-stages/views")
+        .join(normalized_path_digest(&stamped.raw_hash))
+        .join(normalized_path_digest(&draft_key));
+    let mut buffered = VecDeque::new();
+    let stage_workspace = match existing_workspace(directory, &workspace_path)? {
+        Some(workspace) => workspace,
+        None => {
+            check_normalized_manifest_size(&stamped, directory.path())?;
+            let mut size = canonical_normalized_manifest_bytes(&stamped)?.len();
+            if !large_source && size <= SMALL_EXTRACTION_BYTES {
+                for entry in stamped
+                    .units
+                    .iter()
+                    .filter(|entry| entry.status == UnitStatus::Done)
+                {
+                    let unit = unit_for(&stamped, entry)?;
+                    validate_normalized_unit(directory.path(), &identity, entry, &unit)?;
+                    // Check the body first so choosing a stage needs no second
+                    // large serialization buffer.
+                    size = if unit.markdown.len() > SMALL_EXTRACTION_BYTES - size {
+                        SMALL_EXTRACTION_BYTES + 1
+                    } else {
+                        size.saturating_add(canonical_normalized_unit_object_bytes(&unit)?.len())
+                    };
+                    buffered.push_back(unit);
+                    if size > SMALL_EXTRACTION_BYTES {
+                        break;
+                    }
+                }
+                if size <= SMALL_EXTRACTION_BYTES {
+                    return publish_small_normalization(
+                        directory, &store, &instance, stamped, buffered,
+                    );
+                }
+            }
+            child_directory(directory, &workspace_path)?
+        }
+    };
+    let stamp_record = Path::new("stamp.json");
+    if resumable_source.is_some() {
+        if let Some((run_id, generated_at)) =
+            read_record::<(String, String)>(&stage_workspace, stamp_record, 4096)?
+        {
+            stamped.run_id = run_id;
+            stamped.generated_at = generated_at;
+        } else {
+            write_record(
+                &stage_workspace,
+                stamp_record,
+                &(&stamped.run_id, &stamped.generated_at),
+                Publication::CreateOnly,
+            )?;
+        }
+    }
+    let unit_context = stamped.clone();
+    // Verify the manifest size before potentially producing large bodies.
+    check_normalized_manifest_size(&stamped, directory.path())?;
+
+    let instance_parent = child_directory(directory, parent)?;
+    let instance_leaf = Path::new(instance.file_name().expect("normalized instance leaf"));
+    let instance_exists = instance_parent
+        .contains_entry(instance_leaf)
+        .map_err(|error| stage_error(&instance_parent, error))?;
+    let (instance_directory, staged_instance) = if instance_exists {
+        let instance_directory =
+            adopt_normalized_directory(directory, &identity, &instance_parent, instance_leaf)?;
+        (instance_directory, None)
+    } else {
+        let (stage, saved) = staged_normalized_instance(&stage_workspace, &identity)?;
+        (stage, Some(saved))
+    };
+    let mut total_bytes = 0;
+    for entry in &mut stamped.units {
+        if entry.status == UnitStatus::Failed {
+            continue;
+        }
+        let journal = normalized_unit_journal(entry);
+        let saved = read_record::<SavedNormalizedUnit>(&stage_workspace, &journal, 4096)?;
+        let saved = match saved {
+            Some(saved) if saved.ready => saved,
+            incomplete => {
+                if let Some(incomplete) = incomplete {
+                    incomplete.stage.discard(&stage_workspace)?;
+                }
+                let unit = match buffered.pop_front() {
+                    Some(unit) => unit,
+                    None => unit_for(&unit_context, entry)?,
+                };
+                validate_normalized_unit(directory.path(), &identity, entry, &unit)?;
+                checked_unit_size(
+                    directory.path(),
+                    0,
+                    unit.markdown.len() as u64,
+                    NORMALIZED_SIZE_LIMITS,
+                )?;
+                let canonical = canonical_normalized_unit_object_bytes(&unit)?;
+                checked_unit_size(
+                    directory.path(),
+                    0,
+                    canonical.len() as u64,
+                    NORMALIZED_SIZE_LIMITS,
+                )?;
+                let (stage, mut writer) = SavedStage::create(&stage_workspace)?;
+                let mut saved = SavedNormalizedUnit {
+                    hash: cas_hash_bytes(&canonical),
+                    stage,
+                    ready: false,
+                };
+                write_record(&stage_workspace, &journal, &saved, Publication::Upsert)?;
+                stage_workspace
+                    .control()
+                    .checkpoint(kio_core::durability::DurabilityPoint::ExtractionStageWriting)
+                    .map_err(|error| stage_error(&stage_workspace, error))?;
+                for chunk in canonical.chunks(kio_core::cas::CAS_STREAM_BUFFER_BYTES) {
+                    writer
+                        .write_chunk(chunk)
+                        .map_err(|error| stage_error(&stage_workspace, error))?;
+                }
+                writer
+                    .sync()
+                    .map_err(|error| stage_error(&stage_workspace, error))?;
+                drop(writer);
+                saved.ready = true;
+                write_record(&stage_workspace, &journal, &saved, Publication::Upsert)?;
+                saved
+            }
+        };
+        saved.stage.publish_content(
+            &stage_workspace,
+            &store,
+            ContentObjectKind::NormalizedUnit,
+            &saved.hash,
+        )?;
+        entry.unit_object_hash = Some(saved.hash);
+        let unit = read_validated_normalized_unit(&store, &identity, entry)?;
+        let unit_path = format!("{}.json", entry.unit_ref);
+        let bytes = serde_json::to_vec_pretty(&unit)
+            .map_err(|error| PipelineError::Schema(error.to_string()))?;
+        total_bytes = checked_unit_size(
+            &instance.join(&unit_path),
+            total_bytes,
+            bytes.len() as u64,
+            NORMALIZED_SIZE_LIMITS,
+        )?;
+        instance_directory
+            .write_atomic(Path::new(&unit_path), &bytes, Publication::Upsert)
+            .map_err(|error| stage_error(&instance_directory, error))?;
+    }
+
+    let manifest_bytes = check_normalized_manifest_size(&stamped, directory.path())?;
+    let manifest_cas = canonical_normalized_manifest_bytes(&stamped)?;
+    let manifest_hash = cas_hash_bytes(&manifest_cas);
+    crate::extraction_stage::publish_payload(
+        &stage_workspace,
+        Path::new("manifest-cas.json"),
+        |writer| {
+            writer
+                .write_chunk(&manifest_cas)
+                .map_err(|error| stage_error(&stage_workspace, error))
+        },
+        || Ok(()),
+        |stage| {
+            crate::extraction_stage::publish_content(
+                &stage_workspace,
+                &store,
+                ContentObjectKind::Manifest,
+                &manifest_hash,
+                stage,
+            )
+        },
+    )?;
+    let view = normalized_view_relative_path(
+        &stamped.raw_hash,
+        &stamped.tool_profile_hash,
+        stamped.r#gen,
+        &manifest_hash,
+    );
+    let view_directory =
+        child_directory(directory, view.parent().expect("normalized view parent"))?;
+    let leaf = Path::new(view.file_name().expect("normalized view leaf"));
+    write_normalized_view(&stage_workspace, &view_directory, leaf, &store, &stamped)?;
     directory
-        .create_directory_all(parent)
-        .map_err(|e| normalized_corrupt(directory.path(), e.to_string()))?;
-    if let Some(view_parent) = view.parent() {
-        directory
-            .create_directory_all(view_parent)
-            .map_err(|e| normalized_corrupt(directory.path(), e.to_string()))?;
-    }
-    let staged = parent.join(format!(".staged-{}", new_ulid(directory.path())));
-    let staged_handle = directory
-        .create_directory(&staged)
-        .map_err(|e| normalized_corrupt(directory.path(), e.to_string()))?;
-    let staged_dir = StoreDirectory::from_retained_with_control(
-        staged_handle,
-        directory.path().join(&staged),
-        directory.control().clone(),
-    )
-    .map_err(|e| normalized_corrupt(directory.path(), e.to_string()))?;
-    staged_dir
+        .control()
+        .checkpoint(kio_core::durability::DurabilityPoint::ExtractionBeforeManifest)
+        .map_err(|error| stage_error(directory, error))?;
+    // The manifest is the visibility boundary. Unit and view caches may be
+    // rebuilt after an interruption while the prior manifest still pins its CAS
+    // bodies. No reader can observe the new generation before this write.
+    instance_directory
         .write_atomic(
             Path::new("manifest.json"),
             &manifest_bytes,
-            kio_core::store_dir::Publication::CreateOnly,
+            Publication::Upsert,
         )
-        .map_err(|e| normalized_corrupt(directory.path(), e.to_string()))?;
-    for (name, bytes) in &serialized_units {
-        staged_dir
-            .write_atomic(
-                Path::new(name),
-                bytes,
-                kio_core::store_dir::Publication::CreateOnly,
+        .map_err(|error| stage_error(&instance_directory, error))?;
+    if let Some(saved) = staged_instance {
+        saved
+            .identity
+            .verify(&instance_directory)
+            .map_err(|error| stage_error(&stage_workspace, error))?;
+        stage_workspace
+            .rename_directory_between_create_only_checked(
+                &saved.leaf,
+                &instance_parent,
+                instance_leaf,
+                || {
+                    directory.control().checkpoint(
+                        kio_core::durability::DurabilityPoint::ExtractionDirectoryBeforeSync,
+                    )
+                },
             )
-            .map_err(|e| normalized_corrupt(directory.path(), e.to_string()))?;
+            .map_err(|error| stage_error(&stage_workspace, error))?;
+        stage_workspace
+            .remove_file(Path::new("instance.json"))
+            .map_err(|error| stage_error(&stage_workspace, error))?;
     }
-    let old = if directory
-        .entries_optional(&instance)
-        .map_err(|e| normalized_corrupt(directory.path(), e.to_string()))?
-        .is_some()
-    {
-        Some(
-            directory
-                .quarantine_directory(&instance)
-                .map_err(|e| normalized_corrupt(directory.path(), e.to_string()))?,
-        )
-    } else {
-        None
-    };
-    directory
-        .rename_directory_create_only(&staged, &instance)
-        .map_err(|e| normalized_corrupt(directory.path(), e.to_string()))?;
-    let expected_view = build_normalized_view(&stamped, units);
-    directory
-        .write_atomic(
-            &view,
-            expected_view.as_bytes(),
-            kio_core::store_dir::Publication::Upsert,
-        )
-        .map_err(|e| normalized_corrupt(directory.path(), e.to_string()))?;
-    if let Some(old) = old {
-        directory
-            .remove_directory_all(&old)
-            .map_err(|e| normalized_corrupt(directory.path(), e.to_string()))?;
-    }
-    let bytes = directory
-        .read_optional(
-            &instance.join("manifest.json"),
-            MAX_NORMALIZED_MANIFEST_BYTES,
-        )
-        .map_err(|e| normalized_corrupt(directory.path(), e.to_string()))?
-        .ok_or_else(|| {
-            normalized_corrupt(directory.path(), "published normalized manifest missing")
-        })?;
-    let published: NormalizedInstanceManifest = serde_json::from_slice(&bytes)
-        .map_err(|e| normalized_corrupt(directory.path(), e.to_string()))?;
-    if published != stamped {
-        return Err(normalized_corrupt(
-            directory.path(),
-            "published normalized manifest differs",
-        ));
-    }
-    let persisted_units = load_validated_normalized_units_from_manifest(&store, &published)?;
-    if persisted_units.as_slice() != units {
-        return Err(normalized_corrupt(
-            directory.path(),
-            "published normalized units differ",
-        ));
-    }
-    for (name, expected) in &serialized_units {
-        let actual = directory
-            .read_optional(&instance.join(name), MAX_NORMALIZED_UNIT_BYTES)
-            .map_err(|e| normalized_corrupt(directory.path(), e.to_string()))?
-            .ok_or_else(|| {
-                normalized_corrupt(directory.path(), "published normalized unit cache missing")
-            })?;
-        if actual != *expected {
-            return Err(normalized_corrupt(
-                directory.path(),
-                "published normalized unit cache differs",
-            ));
+    if resumable_source.is_none() {
+        for entry in stamped
+            .units
+            .iter()
+            .filter(|entry| entry.status == UnitStatus::Done)
+        {
+            stage_workspace
+                .remove_file(&normalized_unit_journal(entry))
+                .map_err(|error| stage_error(&stage_workspace, error))?;
         }
     }
-    let view_bytes = directory
-        .read_optional(&view, MAX_NORMALIZED_INSTANCE_BYTES)
-        .map_err(|e| normalized_corrupt(directory.path(), e.to_string()))?
-        .ok_or_else(|| normalized_corrupt(directory.path(), "published normalized view missing"))?;
-    if view_bytes != expected_view.as_bytes() {
+    Ok(stamped)
+}
+
+/// Small generations use the ordinary CAS and mutable cache writers. The
+/// working manifest is the last write, including when updating the same gen.
+fn publish_small_normalization(
+    directory: &StoreDirectory,
+    store: &ObjectStore,
+    instance: &Path,
+    mut manifest: NormalizedInstanceManifest,
+    units: VecDeque<Cow<'_, NormalizedUnitObject>>,
+) -> Result<NormalizedInstanceManifest> {
+    let mut cache = Vec::with_capacity(units.len());
+    for (entry, unit) in manifest
+        .units
+        .iter_mut()
+        .filter(|entry| entry.status == UnitStatus::Done)
+        .zip(units)
+    {
+        let name = format!("{}.json", entry.unit_ref);
+        let bytes = serde_json::to_vec_pretty(&unit)
+            .map_err(|error| PipelineError::Schema(error.to_string()))?;
+        checked_unit_size(instance, 0, bytes.len() as u64, NORMALIZED_SIZE_LIMITS)?;
+        let canonical = canonical_normalized_unit_object_bytes(&unit)?;
+        let hash = store
+            .write_content_object(ContentObjectKind::NormalizedUnit, &canonical)
+            .map_err(|error| stage_error(directory, error))?;
+        entry.unit_object_hash = Some(hash);
+        cache.push((name, bytes));
+    }
+    let manifest_bytes = check_normalized_manifest_size(&manifest, directory.path())?;
+    let canonical = canonical_normalized_manifest_bytes(&manifest)?;
+    let manifest_hash = store
+        .write_content_object(ContentObjectKind::Manifest, &canonical)
+        .map_err(|error| stage_error(directory, error))?;
+    let view = normalized_view_relative_path(
+        &manifest.raw_hash,
+        &manifest.tool_profile_hash,
+        manifest.r#gen,
+        &manifest_hash,
+    );
+    let view_dir = child_directory(directory, view.parent().expect("normalized view parent"))?;
+    let mut view_bytes = Vec::new();
+    visit_normalized_view(store, &manifest, |_, bytes| {
+        view_bytes.extend_from_slice(bytes);
+        Ok(())
+    })?;
+    view_dir
+        .write_atomic(
+            Path::new(view.file_name().expect("normalized view leaf")),
+            &view_bytes,
+            Publication::Upsert,
+        )
+        .map_err(|error| stage_error(&view_dir, error))?;
+    directory
+        .control()
+        .checkpoint(kio_core::durability::DurabilityPoint::ExtractionBeforeManifest)
+        .map_err(|error| stage_error(directory, error))?;
+    let instance_dir = child_directory(directory, instance)?;
+    for (name, bytes) in cache {
+        instance_dir
+            .write_atomic(Path::new(&name), &bytes, Publication::Upsert)
+            .map_err(|error| stage_error(&instance_dir, error))?;
+    }
+    instance_dir
+        .write_atomic(
+            Path::new("manifest.json"),
+            &manifest_bytes,
+            Publication::Upsert,
+        )
+        .map_err(|error| stage_error(&instance_dir, error))?;
+    Ok(manifest)
+}
+
+fn normalized_unit_journal(entry: &NormalizedUnitManifestEntry) -> PathBuf {
+    PathBuf::from(format!("unit-{}.json", entry.unit_ref))
+}
+
+pub fn normalized_manifest_hash(manifest: &NormalizedInstanceManifest) -> Result<String> {
+    Ok(cas_hash_bytes(&canonical_normalized_manifest_bytes(
+        manifest,
+    )?))
+}
+
+fn write_normalized_view(
+    workspace: &StoreDirectory,
+    target: &StoreDirectory,
+    leaf: &Path,
+    store: &ObjectStore,
+    manifest: &NormalizedInstanceManifest,
+) -> Result<()> {
+    crate::extraction_stage::publish_payload(
+        workspace,
+        Path::new("view.json"),
+        |writer| {
+            visit_normalized_view(store, manifest, |_, bytes| {
+                writer
+                    .write_chunk(bytes)
+                    .map_err(|error| stage_error(workspace, error))
+            })
+        },
+        || {
+            workspace
+                .control()
+                .checkpoint(kio_core::durability::DurabilityPoint::ExtractionViewReady)
+                .map_err(|error| stage_error(workspace, error))
+        },
+        |stage| {
+            let existed = target
+                .contains_entry(leaf)
+                .map_err(|error| stage_error(target, error))?;
+            let mut invalid_view = false;
+            let result =
+                crate::extraction_stage::publish_file(workspace, target, leaf, stage, |file| {
+                    let verified = verify_normalized_view_bytes(file, store, manifest, None);
+                    invalid_view = matches!(&verified, Err(PipelineError::Corrupt { path, .. })
+                    if path == "normalized view");
+                    verified.map(|_| ())
+                });
+            if existed && invalid_view {
+                // The exact manifest selects this regenerable cache. Remove its
+                // invalid contents before using the same create-only publisher.
+                target
+                    .remove_file(leaf)
+                    .map_err(|error| stage_error(target, error))?;
+                return crate::extraction_stage::publish_file(
+                    workspace,
+                    target,
+                    leaf,
+                    stage,
+                    |file| verify_normalized_view_bytes(file, store, manifest, None).map(|_| ()),
+                );
+            }
+            result
+        },
+    )
+}
+
+fn visit_normalized_view(
+    store: &ObjectStore,
+    manifest: &NormalizedInstanceManifest,
+    mut visit: impl FnMut(Option<&NormalizedUnitObject>, &[u8]) -> Result<()>,
+) -> Result<()> {
+    let identity = NormalizedInstanceIdentity {
+        raw_hash: manifest.raw_hash.clone(),
+        tool_profile_hash: manifest.tool_profile_hash.clone(),
+        r#gen: manifest.r#gen,
+    };
+    visit(None, normalized_view_header(manifest).as_bytes())?;
+    let mut ordered = manifest.units.iter().collect::<Vec<_>>();
+    ordered.sort_unstable_by_key(|entry| entry.order);
+    for (index, entry) in ordered.into_iter().enumerate() {
+        if index > 0 {
+            visit(None, b"\n\n")?;
+        }
+        if entry.status == UnitStatus::Failed {
+            visit(None, missing_unit_view(entry).as_bytes())?;
+        } else {
+            let unit = read_validated_normalized_unit(store, &identity, entry)?;
+            visit(Some(&unit), unit.markdown.trim_end_matches('\n').as_bytes())?;
+        }
+    }
+    visit(None, b"\n")
+}
+
+/// Compare a view in bounded chunks and return the sought unit's trimmed span.
+pub fn verify_normalized_view_bytes(
+    reader: &mut impl Read,
+    store: &ObjectStore,
+    manifest: &NormalizedInstanceManifest,
+    unit_identity: Option<(&str, &str)>,
+) -> Result<Option<(u64, u64)>> {
+    let label = Path::new("normalized view");
+    let mut buffer = [0; kio_core::cas::CAS_STREAM_BUFFER_BYTES];
+    let mut offset = 0_u64;
+    let mut found = None;
+    visit_normalized_view(store, manifest, |unit, bytes| {
+        for expected in bytes.chunks(buffer.len()) {
+            let read = reader.read_exact(&mut buffer[..expected.len()]);
+            if read
+                .as_ref()
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::UnexpectedEof)
+            {
+                return Err(normalized_corrupt(label, "normalized view is truncated"));
+            }
+            read.pipeline_io(label)?;
+            if &buffer[..expected.len()] != expected {
+                return Err(normalized_corrupt(label, "view differs from its manifest"));
+            }
+        }
+        if let (Some(unit), Some((key, hash))) = (unit, unit_identity)
+            && unit.unit_key == key
+            && cas_hash_bytes(unit.markdown.as_bytes()) == hash
+        {
+            found = Some((offset, bytes.len() as u64));
+        }
+        offset += bytes.len() as u64;
+        Ok(())
+    })?;
+    if reader.read(&mut buffer[..1]).pipeline_io(label)? != 0 {
         return Err(normalized_corrupt(
-            directory.path(),
-            "published normalized view differs",
+            label,
+            "unexpected data after normalized view",
         ));
     }
-    Ok(stamped)
+    Ok(found)
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SavedNormalizedDirectory {
+    leaf: PathBuf,
+    identity: DirectoryStageIdentity,
+    profile: String,
+    generation: u64,
+    discarding: bool,
+}
+
+/// Validate an existing generation before exposing it through a new reference.
+/// An already retired stage leaves no local file-identity requirement on a
+/// portable normalized generation.
+pub fn adopt_normalized_instance(
+    root: &StoreDirectory,
+    raw_hash: &str,
+    profile: &str,
+    generation: u64,
+) -> Result<()> {
+    let identity = NormalizedInstanceIdentity {
+        raw_hash: raw_hash.to_owned(),
+        tool_profile_hash: profile.to_owned(),
+        r#gen: generation,
+    };
+    let relative = normalized_instance_relative_path(raw_hash, profile, generation);
+    let parent = child_directory(root, relative.parent().expect("normalized instance parent"))?;
+    adopt_normalized_directory(
+        root,
+        &identity,
+        &parent,
+        Path::new(relative.file_name().expect("normalized instance leaf")),
+    )?;
+    Ok(())
+}
+
+fn adopt_normalized_directory(
+    root: &StoreDirectory,
+    identity: &NormalizedInstanceIdentity,
+    parent: &StoreDirectory,
+    leaf: &Path,
+) -> Result<StoreDirectory> {
+    let handle = parent
+        .open_directory(leaf)
+        .map_err(|error| stage_error(parent, error))?;
+    let instance = StoreDirectory::from_retained_with_control(
+        handle,
+        parent.path().join(leaf),
+        parent.control().clone(),
+    )
+    .map_err(|error| stage_error(parent, error))?;
+    let mut pending = false;
+    crate::extraction_stage::visit_raw_workspaces(
+        root,
+        "views",
+        &identity.raw_hash,
+        |workspace| {
+            let Some(saved) = read_record::<SavedNormalizedDirectory>(
+                workspace,
+                Path::new("instance.json"),
+                4096,
+            )?
+            else {
+                return Ok(());
+            };
+            if saved.discarding
+                || saved.profile != identity.tool_profile_hash
+                || saved.generation != identity.r#gen
+            {
+                return Ok(());
+            }
+            if !workspace
+                .contains_entry(&saved.leaf)
+                .map_err(|error| stage_error(workspace, error))?
+            {
+                saved
+                    .identity
+                    .verify(&instance)
+                    .map_err(|error| stage_error(&instance, error))?;
+                workspace
+                    .sync()
+                    .map_err(|error| stage_error(workspace, error))?;
+                pending = true;
+            }
+            Ok(())
+        },
+    )?;
+    if pending {
+        parent
+            .control()
+            .checkpoint(kio_core::durability::DurabilityPoint::ExtractionDirectoryBeforeSync)
+            .map_err(|error| stage_error(parent, error))?;
+    }
+    parent.sync().map_err(|error| stage_error(parent, error))?;
+    Ok(instance)
+}
+
+fn staged_normalized_instance(
+    workspace: &StoreDirectory,
+    target: &NormalizedInstanceIdentity,
+) -> Result<(StoreDirectory, SavedNormalizedDirectory)> {
+    let record = Path::new("instance.json");
+    if let Some(saved) = read_record::<SavedNormalizedDirectory>(workspace, record, 4096)? {
+        if saved.profile != target.tool_profile_hash || saved.generation != target.r#gen {
+            return Err(normalized_corrupt(
+                workspace.path(),
+                "normalized stage target does not match",
+            ));
+        }
+        if saved.discarding {
+            resume_normalized_stage_removal(workspace, &saved)?;
+        } else if workspace
+            .contains_entry(&saved.leaf)
+            .map_err(|error| stage_error(workspace, error))?
+        {
+            let directory = open_staged_normalized_directory(workspace, &saved)?;
+            return Ok((directory, saved));
+        }
+        // The destination was absent too. A rename that did not survive
+        // can be rebuilt using the already journaled unit payloads.
+        workspace
+            .remove_file(record)
+            .map_err(|error| stage_error(workspace, error))?;
+    }
+    let leaf = PathBuf::from(format!("instance-{}", new_ulid(workspace.path())));
+    let (directory, identity) = workspace
+        .create_stage_directory(&leaf)
+        .map_err(|error| stage_error(workspace, error))?;
+    let saved = SavedNormalizedDirectory {
+        leaf,
+        identity,
+        profile: target.tool_profile_hash.clone(),
+        generation: target.r#gen,
+        discarding: false,
+    };
+    write_record(workspace, record, &saved, Publication::CreateOnly)?;
+    Ok((directory, saved))
+}
+
+fn open_staged_normalized_directory(
+    workspace: &StoreDirectory,
+    saved: &SavedNormalizedDirectory,
+) -> Result<StoreDirectory> {
+    if saved.leaf.components().count() != 1
+        || !saved
+            .leaf
+            .to_str()
+            .is_some_and(|leaf| leaf.starts_with("instance-") && leaf.len() == 35)
+    {
+        return Err(normalized_corrupt(
+            workspace.path(),
+            "invalid normalized stage directory name",
+        ));
+    }
+    let handle = workspace
+        .open_directory(&saved.leaf)
+        .map_err(|error| stage_error(workspace, error))?;
+    let directory = StoreDirectory::from_retained_with_control(
+        handle,
+        workspace.path().join(&saved.leaf),
+        workspace.control().clone(),
+    )
+    .map_err(|error| stage_error(workspace, error))?;
+    kio_core::private_fs::verify_private_directory_handle(&directory)
+        .map_err(|error| stage_error(workspace, error))?;
+    saved
+        .identity
+        .verify(&directory)
+        .map_err(|error| stage_error(workspace, error))?;
+    Ok(directory)
+}
+
+fn resume_normalized_stage_removal(
+    workspace: &StoreDirectory,
+    saved: &SavedNormalizedDirectory,
+) -> Result<()> {
+    // A visible replacement may be the result of a rename whose parent
+    // sync failed. Make the deletion intent durable before removing the stage.
+    workspace
+        .control()
+        .checkpoint(kio_core::durability::DurabilityPoint::ExtractionBeforeDestinationSync)
+        .and_then(|()| workspace.sync())
+        .map_err(|error| stage_error(workspace, error))?;
+    remove_normalized_stage_directory(workspace, saved)
+}
+
+fn remove_normalized_stage_directory(
+    workspace: &StoreDirectory,
+    saved: &SavedNormalizedDirectory,
+) -> Result<()> {
+    if !workspace
+        .contains_entry(&saved.leaf)
+        .map_err(|error| stage_error(workspace, error))?
+    {
+        return Ok(());
+    }
+    open_staged_normalized_directory(workspace, saved)?;
+    workspace
+        .remove_directory_all(&saved.leaf)
+        .map_err(|error| stage_error(workspace, error))?;
+    workspace
+        .control()
+        .checkpoint(kio_core::durability::DurabilityPoint::AfterNormalizedStageRemoval)
+        .map_err(|error| stage_error(workspace, error))
+}
+
+/// Discard the journaled private normalization payloads of a purged raw.
+pub fn discard_normalized_stages(root: &StoreDirectory, raw_hash: &str) -> Result<()> {
+    crate::extraction_stage::visit_raw_workspaces(root, "views", raw_hash, |workspace| {
+        let record = Path::new("instance.json");
+        if let Some(mut saved) = read_record::<SavedNormalizedDirectory>(workspace, record, 4096)? {
+            if saved.discarding {
+                resume_normalized_stage_removal(workspace, &saved)?;
+            } else if workspace
+                .contains_entry(&saved.leaf)
+                .map_err(|error| stage_error(workspace, error))?
+            {
+                open_staged_normalized_directory(workspace, &saved)?;
+                saved.discarding = true;
+                write_record(workspace, record, &saved, Publication::Upsert)?;
+                remove_normalized_stage_directory(workspace, &saved)?;
+            } else {
+                if !kio_core::cas::is_hash(&saved.profile) {
+                    return Err(normalized_corrupt(
+                        workspace.path(),
+                        "invalid normalized stage profile",
+                    ));
+                }
+                let target =
+                    normalized_instance_relative_path(raw_hash, &saved.profile, saved.generation);
+                let parent =
+                    child_directory(root, target.parent().expect("normalized instance parent"))?;
+                let leaf = Path::new(target.file_name().expect("normalized instance leaf"));
+                if parent
+                    .contains_entry(leaf)
+                    .map_err(|error| stage_error(&parent, error))?
+                {
+                    adopt_normalized_instance(root, raw_hash, &saved.profile, saved.generation)?;
+                }
+            }
+        }
+        for entry in workspace
+            .entries(Path::new(""))
+            .map_err(|error| stage_error(workspace, error))?
+        {
+            let Some(name) = entry.name.to_str() else {
+                continue;
+            };
+            if name.starts_with("unit-") && name.ends_with(".json") {
+                let leaf = Path::new(name);
+                if let Some(saved) = read_record::<SavedNormalizedUnit>(workspace, leaf, 4096)? {
+                    saved.stage.discard(workspace)?;
+                    workspace
+                        .remove_file(leaf)
+                        .map_err(|error| stage_error(workspace, error))?;
+                }
+            }
+        }
+        let stamp = Path::new("stamp.json");
+        if workspace
+            .contains_entry(stamp)
+            .map_err(|error| stage_error(workspace, error))?
+        {
+            workspace
+                .remove_file(stamp)
+                .map_err(|error| stage_error(workspace, error))?;
+        }
+        for journal in ["manifest-cas.json", "view.json"] {
+            crate::extraction_stage::discard_payload(workspace, Path::new(journal))?;
+        }
+        if workspace
+            .contains_entry(record)
+            .map_err(|error| stage_error(workspace, error))?
+        {
+            workspace
+                .remove_file(record)
+                .map_err(|error| stage_error(workspace, error))?;
+        }
+        Ok(())
+    })
+}
+
+fn check_normalized_manifest_size(
+    manifest: &NormalizedInstanceManifest,
+    path: &Path,
+) -> Result<Vec<u8>> {
+    let bytes = serde_json::to_vec_pretty(manifest)
+        .map_err(|error| PipelineError::Schema(error.to_string()))?;
+    checked_manifest_size(path, bytes.len() as u64, NORMALIZED_SIZE_LIMITS)?;
+    Ok(bytes)
 }
 
 pub fn persist_normalized_instance(
@@ -1527,82 +2268,23 @@ pub fn persist_normalized_instance_with_control(
     persist_normalized_instance_bound(&directory, manifest, units)
 }
 
-/// The full-text normalized view (03 §2.1), plus a byte-accurate map of where
-/// each unit's content landed inside it. `kio view` (05 §1.7.2 / §4.2) needs
-/// this to translate a chunk's unit-local `byte_start`/`byte_end` into a
-/// view-local span: the view prefixes a header comment and joins units with
-/// `"\n\n"`, so the unit-local offset alone is never the right offset into
-/// `text`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NormalizedViewLayout {
-    pub text: String,
-    /// Byte offset of each unit's content within `text`, keyed by unit_key.
-    pub unit_starts: BTreeMap<String, usize>,
-    /// Byte length of each unit's content as it appears in `text` (post-trim
-    /// for a `Done` unit; the fixed `KIO-MISSING-UNIT` comment length for a
-    /// `Failed` one).
-    pub unit_lens: BTreeMap<String, usize>,
-}
-
-/// Single source of truth for the view assembly rule (03 §2.1 rule 1-5): both
-/// the assembled text and the per-unit offsets into it come from this one
-/// pass, so they cannot drift apart the way two independent implementations
-/// of the same rule could.
-#[must_use]
-pub fn build_normalized_view_layout(
-    manifest: &NormalizedInstanceManifest,
-    units: &[NormalizedUnitObject],
-) -> NormalizedViewLayout {
-    let by_key = units
-        .iter()
-        .map(|unit| (unit.unit_key.as_str(), unit))
-        .collect::<BTreeMap<_, _>>();
-    let mut parts = Vec::new();
-    for entry in &manifest.units {
-        let part = match entry.status {
-            UnitStatus::Done => by_key
-                .get(entry.unit_key.as_str())
-                .map(|unit| unit.markdown.trim_end_matches('\n').to_owned())
-                .unwrap_or_default(),
-            UnitStatus::Failed => format!(
-                "<!-- KIO-MISSING-UNIT {} {} -->",
-                entry.unit_key,
-                entry.error_kind.as_deref().unwrap_or("unknown")
-            ),
-        };
-        parts.push((entry.unit_key.as_str(), part));
-    }
-
-    let mut text = format!(
+fn normalized_view_header(manifest: &NormalizedInstanceManifest) -> String {
+    format!(
         "<!-- KIO-NORMALIZED-VIEW raw_hash={} tool_profile_hash={} gen={} -->\n",
         manifest.raw_hash, manifest.tool_profile_hash, manifest.r#gen,
-    );
-    let mut unit_starts = BTreeMap::new();
-    let mut unit_lens = BTreeMap::new();
-    for (index, (unit_key, part)) in parts.iter().enumerate() {
-        if index > 0 {
-            text.push_str("\n\n");
-        }
-        let start = text.len();
-        text.push_str(part);
-        unit_starts.insert((*unit_key).to_owned(), start);
-        unit_lens.insert((*unit_key).to_owned(), part.len());
-    }
-    text.push('\n');
-
-    NormalizedViewLayout {
-        text,
-        unit_starts,
-        unit_lens,
-    }
+    )
 }
 
-#[must_use]
-pub fn build_normalized_view(
-    manifest: &NormalizedInstanceManifest,
-    units: &[NormalizedUnitObject],
-) -> String {
-    build_normalized_view_layout(manifest, units).text
+fn missing_unit_view(entry: &NormalizedUnitManifestEntry) -> String {
+    format!(
+        "<!-- KIO-MISSING-UNIT {} {} -->",
+        entry.unit_key.replace("--", "%2D%2D"),
+        entry
+            .error_kind
+            .as_deref()
+            .unwrap_or("unknown")
+            .replace("--", "%2D%2D")
+    )
 }
 
 #[must_use]
@@ -1716,6 +2398,11 @@ fn validate_unit_shapes(
 /// forbidden), and no raw HTML block or CommonMark autolink. Returns the
 /// specific violated rule on failure. Content (meaning) is out of scope —
 /// this is a structural check only (04 §3.2 closing note).
+/// Validate the Markdown body of a deterministic unit before publication.
+pub fn validate_deterministic_markdown(markdown: &str) -> Result<()> {
+    validate_normalized_markdown_v1(markdown).map_err(contract_violation)
+}
+
 fn validate_normalized_markdown_v1(markdown: &str) -> std::result::Result<(), &'static str> {
     if markdown.contains('\u{feff}') {
         return Err("BOM is forbidden");
@@ -2190,9 +2877,9 @@ mod tests {
             )
         );
         assert_eq!(
-            normalized_view_path(".kio", raw, tool, 0),
+            normalized_view_path(".kio", raw, tool, 0, raw),
             PathBuf::from(
-                ".kio/objects/normalized/bb/e1/bbe1da2edd1819b58ce32163144923f850fc7f2c7b4fe130635c6b54a8e7ac59.393d7b062ec1fd573c0a061455bef3f3ee16367378ca4122a0684045178e974c.g0.md"
+                ".kio/objects/normalized/bb/e1/bbe1da2edd1819b58ce32163144923f850fc7f2c7b4fe130635c6b54a8e7ac59.393d7b062ec1fd573c0a061455bef3f3ee16367378ca4122a0684045178e974c.g0.bbe1da2edd1819b58ce32163144923f850fc7f2c7b4fe130635c6b54a8e7ac59.md"
             )
         );
     }
@@ -2205,26 +2892,16 @@ mod tests {
         let dir = normalized_instance_dir(".kio", "sha256:ab", "sha256:tool", 0);
         assert!(dir.to_string_lossy().contains("objects/normalized_units"));
         assert!(!dir.to_string_lossy().contains(':'));
-        let view = normalized_view_path(".kio", "sha256:ab", "sha256:tool", 0);
+        let view = normalized_view_path(".kio", "sha256:ab", "sha256:tool", 0, "sha256:ab");
         assert!(!view.to_string_lossy().contains(':'));
     }
 
-    /// 05 §1.7.2 / §4.2 (2026-08-11): `kio view` translates a chunk's
-    /// unit-local `byte_start`/`byte_end` into a view-local span using
-    /// `unit_starts`/`unit_lens`. This is the regression lock on that offset
-    /// math: three units (the 2nd `Failed`, so both view-assembly branches of
-    /// 03 §2.1 rule 2/3 are exercised), one of them carrying trailing
-    /// newlines that must be trimmed out of both the assembled text AND the
-    /// reported length. Slicing `text` at each reported `(start, len)` must
-    /// land exactly on that unit's own content — get the header length wrong,
-    /// or the `"\n\n"` join width wrong, or forget the trim, and at least one
-    /// of these slices stops matching, so this goes RED.
     #[test]
-    fn build_normalized_view_layout_offsets_locate_each_units_content() {
+    fn normalized_view_uses_manifest_order_and_reports_streamed_offsets() {
         let raw_hash = format!("sha256:{}", "a".repeat(64));
         let tool_profile_hash = format!("sha256:{}", "b".repeat(64));
         let prepared_hash = format!("sha256:{}", "c".repeat(64));
-        let manifest = NormalizedInstanceManifest {
+        let mut manifest = NormalizedInstanceManifest {
             preparation_provenance: PreparationProvenance::local(),
             raw_hash: raw_hash.clone(),
             tool_profile_hash: tool_profile_hash.clone(),
@@ -2254,7 +2931,7 @@ mod tests {
                     prepared_hash: prepared_hash.clone(),
                     preparation_profile_hash: format!("sha256:{}", "d".repeat(64)),
                     unit_object_hash: None,
-                    error_kind: Some("invalid_input".to_owned()),
+                    error_kind: Some("invalid--input".to_owned()),
                 },
                 NormalizedUnitManifestEntry {
                     resource_limit: None,
@@ -2307,26 +2984,44 @@ mod tests {
             },
         ];
 
-        let layout = build_normalized_view_layout(&manifest, &units);
-
-        // One assembly rule, not two: the layout's own text must be
-        // byte-identical to the plain string builder's output.
-        assert_eq!(layout.text, build_normalized_view(&manifest, &units));
-
-        for (unit_key, expected) in [
-            ("page:1", "first unit body"),
-            ("page:2", "<!-- KIO-MISSING-UNIT page:2 invalid_input -->"),
-            ("page:3", "third unit body"),
-        ] {
-            let start = layout.unit_starts[unit_key];
-            let len = layout.unit_lens[unit_key];
+        manifest.units.swap(0, 2);
+        let tmp = canonical_tempdir();
+        initialize_persist_store(tmp.path());
+        let directory = StoreDirectory::open(tmp.path()).unwrap();
+        let manifest = persist_normalized_instance_bound(&directory, &manifest, &units).unwrap();
+        let hash = normalized_manifest_hash(&manifest).unwrap();
+        let path = normalized_view_relative_path(&raw_hash, &tool_profile_hash, 3, &hash);
+        let view = std::fs::read(tmp.path().join(path)).unwrap();
+        let store = ObjectStore::from_bound_kio_with_control(
+            directory.root_handle().as_ref(),
+            directory.control().clone(),
+        )
+        .unwrap();
+        let expected = format!(
+            "{}first unit body\n\n<!-- KIO-MISSING-UNIT page:2 invalid%2D%2Dinput -->\n\nthird unit body\n",
+            normalized_view_header(&manifest)
+        );
+        assert_eq!(view, expected.as_bytes());
+        for (key, text) in [("page:1", "first unit body"), ("page:3", "third unit body")] {
+            let unit = units.iter().find(|unit| unit.unit_key == key).unwrap();
+            let hash = cas_hash_bytes(unit.markdown.as_bytes());
+            let (start, len) = verify_normalized_view_bytes(
+                &mut view.as_slice(),
+                &store,
+                &manifest,
+                Some((key, &hash)),
+            )
+            .unwrap()
+            .unwrap();
             assert_eq!(
-                &layout.text[start..start + len],
-                expected,
-                "unit {unit_key} did not slice back to its own content: {:?}",
-                layout.text
+                &view[start as usize..(start + len) as usize],
+                text.as_bytes()
             );
         }
+
+        let mut duplicate = manifest.clone();
+        duplicate.units[0].order = duplicate.units[1].order;
+        assert!(persist_normalized_instance_bound(&directory, &duplicate, &units).is_err());
     }
 
     #[test]
@@ -3288,6 +3983,7 @@ mod tests {
                 &identity.raw_hash,
                 &identity.tool_profile_hash,
                 identity.r#gen,
+                &normalized_manifest_hash(&manifest).unwrap(),
             ))
             .unwrap()
             .contains("retry output")
@@ -3404,6 +4100,240 @@ mod tests {
         );
     }
 
+    #[cfg(debug_assertions)]
+    #[test]
+    fn p0_interruption_before_manifest_preserves_previous_view() {
+        use kio_core::durability::DurabilityPoint;
+        use kio_core::test_control::{DebugTestControl, Selector};
+        let dir = canonical_tempdir();
+        initialize_persist_store(dir.path());
+        let (identity, mut manifest, mut units) = normalized_fixture();
+        let original = persist_normalized_instance(dir.path(), &manifest, &units).unwrap();
+        let pin = normalized_manifest_hash(&original).unwrap();
+        let view = normalized_view_path(
+            dir.path(),
+            &identity.raw_hash,
+            &identity.tool_profile_hash,
+            identity.r#gen,
+            &pin,
+        );
+        let before = fs::read(&view).unwrap();
+
+        manifest.run_id = "run_next".into();
+        units[0].markdown = "replacement page".to_owned();
+        let ready = dir.path().join("occupied");
+        fs::write(&ready, b"occupied").unwrap();
+        let mut debug = DebugTestControl::default();
+        debug.core.durability_point = Selector::Known(DurabilityPoint::ExtractionBeforeManifest);
+        debug.core.durability_ready = Some(ready);
+        let control = ControlHandle::new(debug);
+        assert!(
+            persist_normalized_instance_with_control(dir.path(), &manifest, &units, &control)
+                .is_err()
+        );
+        let (current, _) = read_normalized_instance_manifest(
+            dir.path(),
+            &identity.raw_hash,
+            &identity.tool_profile_hash,
+            identity.r#gen,
+        )
+        .unwrap();
+        assert_eq!(current, original);
+        assert_eq!(fs::read(view).unwrap(), before);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn p0_fifth_resumed_discard_syncs_the_visible_marker_before_deleting() {
+        use kio_core::durability::DurabilityPoint;
+        use kio_core::test_control::{DebugTestControl, Selector};
+        let dir = canonical_tempdir();
+        let (identity, _, _) = normalized_fixture();
+        let root = StoreDirectory::open(dir.path()).unwrap();
+        let path = Path::new("extraction-stages/views")
+            .join(identity.raw_hash.trim_start_matches("sha256:"))
+            .join("a".repeat(64));
+        let workspace = child_directory(&root, &path).unwrap();
+        let (_, saved) = staged_normalized_instance(&workspace, &identity).unwrap();
+        let record = Path::new("instance.json");
+        let with_fault = |point| {
+            let mut debug = DebugTestControl::default();
+            debug.core.durability_point = Selector::Known(point);
+            debug.core.durability_storage_fault = true;
+            StoreDirectory::open_with_control(dir.path(), ControlHandle::new(debug)).unwrap()
+        };
+
+        let unsynced = with_fault(DurabilityPoint::AtomicWriteBeforeDirectorySync);
+        assert!(discard_normalized_stages(&unsynced, &identity.raw_hash).is_err());
+        assert!(
+            read_record::<SavedNormalizedDirectory>(&workspace, record, 4096)
+                .unwrap()
+                .unwrap()
+                .discarding
+        );
+
+        let retry = with_fault(DurabilityPoint::ExtractionBeforeDestinationSync);
+        assert!(discard_normalized_stages(&retry, &identity.raw_hash).is_err());
+        assert!(workspace.contains_entry(&saved.leaf).unwrap());
+        let retry_workspace = child_directory(&retry, &path).unwrap();
+        assert!(staged_normalized_instance(&retry_workspace, &identity).is_err());
+        assert!(workspace.contains_entry(&saved.leaf).unwrap());
+
+        discard_normalized_stages(&root, &identity.raw_hash).unwrap();
+        assert!(!workspace.contains_entry(&saved.leaf).unwrap());
+        assert!(!workspace.contains_entry(record).unwrap());
+    }
+
+    #[test]
+    fn p0_recheck_view_cache_can_be_regenerated_via_create_only_publication() {
+        let dir = canonical_tempdir();
+        initialize_persist_store(dir.path());
+        let (identity, manifest, units) = normalized_fixture();
+        let original = persist_normalized_instance(dir.path(), &manifest, &units).unwrap();
+        let view = normalized_view_path(
+            dir.path(),
+            &identity.raw_hash,
+            &identity.tool_profile_hash,
+            identity.r#gen,
+            &normalized_manifest_hash(&original).unwrap(),
+        );
+        let expected = fs::read(&view).unwrap();
+        fs::write(&view, b"truncated").unwrap();
+        assert_eq!(
+            persist_normalized_instance(dir.path(), &manifest, &units).unwrap(),
+            original
+        );
+        assert_eq!(fs::read(view).unwrap(), expected);
+    }
+
+    #[test]
+    fn p0_normalization_resume_skips_a_durable_unit() {
+        let dir = canonical_tempdir();
+        initialize_persist_store(dir.path());
+        let (_, mut manifest, mut units) = normalized_fixture();
+        let mut first = units.pop().unwrap();
+        first.markdown = "x".repeat(SMALL_EXTRACTION_BYTES + 1);
+        let mut second = first.clone();
+        second.unit_key = "page:2".to_owned();
+        let mut entry = manifest.units[0].clone();
+        entry.order = 1;
+        entry.unit_key.clone_from(&second.unit_key);
+        entry.unit_ref = prepared_unit_ref(&entry.unit_key);
+        manifest.units.push(entry);
+        let directory = StoreDirectory::open(dir.path()).unwrap();
+        let interrupted =
+            persist_normalized_instance_from_units_bound(&directory, &manifest, |entry| {
+                if entry.order == 0 {
+                    return Ok(Cow::Borrowed(&first));
+                }
+                Err(PipelineError::ResourceLimit(
+                    kio_core::error::ResourceLimit {
+                        resource: kio_core::error::Resource::Storage,
+                        stage: "private_stage".to_owned(),
+                        limit: None,
+                        observed: None,
+                        resource_tier: None,
+                    },
+                ))
+            });
+        assert!(matches!(interrupted, Err(PipelineError::ResourceLimit(_))));
+        drop(directory);
+        let directory = StoreDirectory::open(dir.path()).unwrap();
+        persist_normalized_instance_from_units_bound(&directory, &manifest, |entry| {
+            assert_eq!(entry.order, 1, "durable unit was generated again");
+            Ok(Cow::Borrowed(&second))
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn p0_streamed_normalization_failure_preserves_previous_manifest() {
+        let dir = canonical_tempdir();
+        initialize_persist_store(dir.path());
+        let (identity, mut manifest, units) = normalized_fixture();
+        let original = persist_normalized_instance(dir.path(), &manifest, &units).unwrap();
+        manifest.run_id = "run_incomplete".to_owned();
+        let store = StoreDirectory::open(dir.path()).unwrap();
+        let limit = kio_core::error::ResourceLimit {
+            resource: kio_core::error::Resource::Storage,
+            stage: "private_stage".to_owned(),
+            limit: None,
+            observed: None,
+            resource_tier: None,
+        };
+        let error = persist_normalized_instance_from_units_bound(&store, &manifest, |_| {
+            Err(PipelineError::ResourceLimit(limit.clone()))
+        })
+        .unwrap_err();
+        assert!(matches!(error, PipelineError::ResourceLimit(actual) if actual == limit));
+        let loaded = load_validated_normalized_instance(
+            dir.path(),
+            &identity.raw_hash,
+            &identity.tool_profile_hash,
+            identity.r#gen,
+        )
+        .unwrap();
+        assert_eq!(loaded.manifest, original);
+        assert_eq!(loaded.units, units);
+        let completed = persist_normalized_instance(dir.path(), &manifest, &units).unwrap();
+        assert_eq!(completed.run_id, "run_incomplete");
+    }
+
+    #[test]
+    fn p0_streamed_instance_over_256_mib_can_be_written_and_read() {
+        let dir = canonical_tempdir();
+        initialize_persist_store(dir.path());
+        let (_, mut manifest, mut units) = normalized_fixture();
+        let template_entry = manifest.units.pop().unwrap();
+        let template_unit = units.pop().unwrap();
+        const UNIT_BYTES: usize = 16 * 1024 * 1024;
+        for order in 0..17 {
+            let mut entry = template_entry.clone();
+            entry.order = order;
+            entry.unit_key = format!("page:{}", order + 1);
+            entry.unit_ref = prepared_unit_ref(&entry.unit_key);
+            manifest.units.push(entry);
+        }
+        let directory = StoreDirectory::open(dir.path()).unwrap();
+        let stamped =
+            persist_normalized_instance_from_units_bound(&directory, &manifest, |entry| {
+                let mut unit = template_unit.clone();
+                unit.unit_key.clone_from(&entry.unit_key);
+                unit.markdown = "x".repeat(UNIT_BYTES);
+                Ok(Cow::Owned(unit))
+            })
+            .unwrap();
+        let store = ObjectStore::new(dir.path());
+        let mut count = 0;
+        let verified = visit_validated_normalized_units(&store, &stamped, |unit| {
+            count += 1;
+            assert_eq!(unit.markdown.len(), UNIT_BYTES);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(count, 17);
+        assert!(verified > 256 * 1024 * 1024);
+        let view = normalized_view_path(
+            dir.path(),
+            &stamped.raw_hash,
+            &stamped.tool_profile_hash,
+            stamped.r#gen,
+            &normalized_manifest_hash(&stamped).unwrap(),
+        );
+        assert!(std::fs::metadata(view).unwrap().len() > 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn p0_normalized_size_accounting_accepts_units_over_256_mib_in_total() {
+        let path = Path::new("test normalized instance");
+        let mut total = checked_manifest_size(path, 1024, NORMALIZED_SIZE_LIMITS).unwrap();
+        for _ in 0..17 {
+            total =
+                checked_unit_size(path, total, 16 * 1024 * 1024, NORMALIZED_SIZE_LIMITS).unwrap();
+        }
+        assert!(total > 256 * 1024 * 1024);
+    }
+
     #[test]
     fn cand_061_writer_enforces_loader_size_boundaries_before_publish() {
         let dir = canonical_tempdir();
@@ -3413,17 +4343,17 @@ mod tests {
         let limits = NormalizedSizeLimits {
             manifest_bytes: 4,
             unit_bytes: 5,
-            instance_bytes: 9,
         };
 
         let total = checked_manifest_size(&manifest_path, 4, limits).unwrap();
-        assert_eq!(
-            checked_unit_size(dir.path(), &unit_path, total, 5, limits).unwrap(),
-            9
-        );
+        assert_eq!(checked_unit_size(&unit_path, total, 5, limits).unwrap(), 9);
         assert!(checked_manifest_size(&manifest_path, 5, limits).is_err());
-        assert!(checked_unit_size(dir.path(), &unit_path, total, 6, limits).is_err());
-        assert!(checked_unit_size(dir.path(), &unit_path, 9, 1, limits).is_err());
+        assert!(matches!(
+            checked_unit_size(&unit_path, total, 6, limits),
+            Err(PipelineError::ResourceLimit(limit))
+                if limit.stage == "normalized_unit" && limit.observed == Some(6)
+        ));
+        assert!(checked_unit_size(&unit_path, u64::MAX, 1, limits).is_err());
 
         let (identity, mut manifest, mut units) = normalized_fixture();
         let oversized_key = "x".repeat(MAX_NORMALIZED_MANIFEST_BYTES as usize);
@@ -3510,6 +4440,7 @@ mod tests {
                     .is_symlink()
             );
             assert!(!kio.path().join("objects").join(untouched_root).exists());
+            assert!(!kio.path().join("extraction-stages").exists());
         }
     }
 

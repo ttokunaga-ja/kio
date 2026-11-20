@@ -67,6 +67,7 @@ fn current_raw(dir: &TempDir, path: &str) -> String {
         .unwrap()
         .entries
         .into_iter()
+        .map(Result::unwrap)
         .find(|entry| entry.path == path)
         .unwrap()
         .raw_hash
@@ -139,7 +140,7 @@ fn ct4_purge_reingest_after_default_tombstone_republishes_and_retires() {
         .auto_snapshot_with_bound_normalize(
             Some("resurrection"),
             None,
-            &BTreeSet::new(),
+            &|_| true,
             &BTreeMap::new(),
             &BTreeSet::new(),
             None,
@@ -307,6 +308,7 @@ fn ct4_purge_active_barrier_blocks_index_and_leaves_no_raw_or_temp() {
         .unwrap()
         .entries
         .into_iter()
+        .map(Result::unwrap)
         .find(|entry| entry.path == "doc.pdf")
         .unwrap();
     let mut promotion = BTreeMap::new();

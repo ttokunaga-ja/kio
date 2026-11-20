@@ -1,6 +1,6 @@
 //! Capture shared names in an exclusively owned private directory before
-//! publication. A saved stage identity determines its capture name and durable
-//! record. Deletion and initialization cleanup do not allocate a capture: they
+//! publication. A saved stage identity determines the capture name prefix and
+//! durable record. Deletion and initialization cleanup do not allocate a capture: they
 //! compare the retained object with its name and unlink it directly. Owner-private
 //! namespaces are trusted; hostile same-UID namespace/record edits are out of scope.
 use crate::{
@@ -107,6 +107,7 @@ struct Capture {
     directory: StoreDirectory,
     created_identity: DirectoryIdentity,
     record_file: Option<File>,
+    retire_on_drop: bool,
 }
 impl Capture {
     fn new(
@@ -115,7 +116,14 @@ impl Capture {
         held: &File,
         identity: &StageIdentity,
     ) -> Result<Self> {
-        let name = capture_name(identity)?.expect("Unix capture name");
+        let mut name = capture_name(identity)?.expect("Unix capture name");
+        if parent.contains_entry(&name)? {
+            name = PathBuf::from(format!(
+                "{}.{}",
+                name.display(),
+                crate::scope::new_ulid(parent.path())
+            ));
+        }
         let handle = parent.create_directory(&name)?;
         let directory = StoreDirectory::from_retained_with_control(
             handle,
@@ -130,6 +138,7 @@ impl Capture {
             directory,
             created_identity,
             record_file: None,
+            retire_on_drop: true,
         };
         {
             let bytes = serde_jcs::to_vec(&CaptureRecord {
@@ -139,12 +148,15 @@ impl Capture {
             .map_err(|_| failure("cannot encode capture record"))?;
             capture.record_file = Some(capture.directory.create_private_file(Path::new(RECORD))?);
             let file = capture.record_file.as_mut().expect("new capture record");
+            parent
+                .control()
+                .checkpoint(crate::durability::DurabilityPoint::StageCaptureRecordWriting)?;
             file.write_all(&bytes)
                 .map_err(|e| io_failure("cannot write capture record", e))?;
             file.sync_all()
                 .map_err(|e| io_failure("cannot sync capture record", e))?;
             capture.directory.sync()?;
-            parent.sync()?;
+            // Creating the capture directory already synced its parent.
         }
         parent.rename_regular_between_raw(
             source,
@@ -203,6 +215,9 @@ impl Capture {
 }
 impl Drop for Capture {
     fn drop(&mut self) {
+        if !self.retire_on_drop {
+            return;
+        }
         // Restore only into an absent source; collisions leave the durable
         // capture intact for inspection/recovery. Never recursively remove it.
         if self
@@ -226,50 +241,106 @@ pub(crate) fn recover_file(
     source: &Path,
     identity: &StageIdentity,
 ) -> Result<bool> {
-    let name = capture_name(identity)?.expect("Unix capture name");
-    if !parent.contains_entry(&name)? {
-        return Ok(false);
-    }
-    let (directory, record, created_identity) = match read_capture(parent, &name, identity) {
-        Ok(capture) => capture,
-        Err(error) => {
-            // A crash before the record was completed, or after it was retired,
-            // can leave an unclaimed directory. Keep reporting it as unidentified
-            // but do not let it block a verified stage at its original name.
-            let directory = StoreDirectory::from_retained_with_control(
-                parent.open_directory(&name)?,
-                parent.path().join(&name),
-                parent.control().clone(),
-            )?;
-            let original_matches =
-                open_file(parent, source).is_ok_and(|file| identity.verify(&file).is_ok());
-            if !directory.contains_entry(Path::new(ITEM))? || original_matches {
-                return Ok(false);
-            }
-            // An unverified capture with a payload and no matching original
-            // remains an error, rather than being mistaken for an absent stage.
-            return Err(error);
+    recover_capture(parent, source, identity, true)
+}
+
+pub(crate) fn recover_for_publication(
+    parent: &StoreDirectory,
+    source: &Path,
+    identity: &StageIdentity,
+) -> Result<()> {
+    recover_capture(parent, source, identity, false).map(|_| ())
+}
+
+fn recover_capture(
+    parent: &StoreDirectory,
+    source: &Path,
+    identity: &StageIdentity,
+    discard: bool,
+) -> Result<bool> {
+    let base = capture_name(identity)?.expect("Unix capture name");
+    let mut recovered = false;
+    let mut unverified_payload = None;
+    let entries = cap_primitives::fs::read_base_dir(&parent.root_handle())
+        .map_err(|error| io_failure("cannot enumerate stage captures", error))?;
+    for entry in entries {
+        let name = PathBuf::from(
+            entry
+                .map_err(|error| io_failure("cannot read stage capture name", error))?
+                .file_name(),
+        );
+        if !crate::store_dir::capture_matches(&name, &base) {
+            continue;
         }
-    };
+        match read_capture(parent, &name, identity) {
+            Ok((directory, record, created_identity)) => {
+                let capture = Capture {
+                    parent: parent.clone(),
+                    source: source.to_owned(),
+                    name,
+                    directory,
+                    created_identity,
+                    record_file: Some(record),
+                    retire_on_drop: false,
+                };
+                recovered |= recover_named_capture(capture, identity, discard)?;
+            }
+            Err(error) => {
+                // The name alone conveys no authority to remove a residue.
+                // An incomplete record can be ignored if the original is
+                // verified or another retry slot contains the owned payload.
+                let empty = parent
+                    .open_directory(&name)
+                    .and_then(|handle| {
+                        StoreDirectory::from_retained_with_control(
+                            handle,
+                            parent.path().join(&name),
+                            parent.control().clone(),
+                        )
+                    })
+                    .and_then(|directory| directory.contains_entry(Path::new(ITEM)))
+                    .is_ok_and(|contains| !contains);
+                if !empty {
+                    unverified_payload = Some(error);
+                }
+            }
+        }
+    }
+    if let Some(error) = unverified_payload
+        && !recovered
+        && !open_file(parent, source).is_ok_and(|file| identity.verify(&file).is_ok())
+    {
+        return Err(error);
+    }
+    Ok(recovered)
+}
+
+fn recover_named_capture(
+    capture: Capture,
+    identity: &StageIdentity,
+    discard: bool,
+) -> Result<bool> {
+    let directory = &capture.directory;
     let held = if directory.contains_entry(Path::new(ITEM))? {
         directory.ensure_owner_private(Path::new(ITEM))?;
-        let held = open_file(&directory, Path::new(ITEM))?;
+        let held = open_file(directory, Path::new(ITEM))?;
         identity.verify(&held)?;
         Some(held)
     } else {
         None
     };
-    let capture = Capture {
-        parent: parent.clone(),
-        source: source.to_owned(),
-        name,
-        directory,
-        created_identity,
-        record_file: Some(record),
-    };
     if held.is_some() {
-        cap_primitives::fs::remove_file(&capture.directory.root_handle(), Path::new(ITEM))
-            .map_err(|e| io_failure("cannot reclaim captured stage", e))?;
+        if discard {
+            cap_primitives::fs::remove_file(&capture.directory.root_handle(), Path::new(ITEM))
+                .map_err(|e| io_failure("cannot reclaim captured stage", e))?;
+        } else {
+            capture.directory.rename_regular_between_raw(
+                Path::new(ITEM),
+                &capture.parent,
+                &capture.source,
+                Publication::CreateOnly,
+            )?;
+        }
         capture.directory.sync()?;
     }
     capture.cleanup()?;
@@ -287,12 +358,22 @@ pub(crate) fn publish(
     publication: Publication,
     identity: &StageIdentity,
 ) -> Result<()> {
-    let capture = Capture::new(directory, source, held, identity)?;
-    capture
-        .directory
-        .rename_regular_between_raw(Path::new(ITEM), target, leaf, publication)?;
+    let mut capture = Capture::new(directory, source, held, identity)?;
+    super::store::rename_regular_between_unsynced(
+        &capture.directory.root_handle(),
+        Path::new(ITEM),
+        &target.root_handle(),
+        leaf,
+        publication,
+        capture.directory.path(),
+        target.path(),
+    )?;
+    // A failed destination sync must leave the capture record available. A
+    // retry can either adopt the destination or find the captured source.
+    capture.retire_on_drop = false;
+    target.sync_stage_destination()?;
     capture.directory.sync()?;
-    target.sync()
+    capture.cleanup()
 }
 pub(crate) fn discard_file(
     directory: &StoreDirectory,

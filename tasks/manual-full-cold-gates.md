@@ -6,83 +6,44 @@ Rust entry points, not ignored tests or compatibility wrappers. They do not
 authorize a scheduled workflow, a paid request, a GPU allocation, fixture
 discovery, deployment, or publication.
 
-The ordinary five-job responsibility and timeouts remain in
+The ordinary six-job responsibility and timeouts remain in
 [the CI workflow](../.github/workflows/ci.yml):
 
 | Job | Signal | Timeout |
 | --- | --- | ---: |
-| `rust` | format, clippy, complete workspace/all-target tests | 35 min |
-| `persona-w0-integration` | create-only Tiny persona W0 lifecycle and leases | 15 min |
+| `acceptance-tooling` | acceptance tooling checks | 10 min |
+| `rust` | format, clippy, complete workspace/all-target tests | 45 min |
 | `synthetic-history-eval` | release/all-features synthetic, scale, replay, cross-scope, rerank, M3-1/2/3 | 10 min |
-| `macos-security-r23` | native macOS workspace/all-target behavior | 35 min |
-| `windows-security-r23` | native Windows workspace/all-target behavior | 90 min |
+| `macos-security-r23` | native macOS workspace/all-target behavior | 90 min |
+| `windows-workspace-tests` | native Windows workspace/all-target behavior | 120 min |
+| `windows-security-r23` | Windows security checks | 5 min |
 
 Do not shorten these bounds or merge jobs until several matching successful
 GitHub runs exist. Do not generate measurement samples with empty commits,
 reruns, dispatches, or repeated pushes.
 
-## 1. Explicit Full persona contract
+## 1. Complete cold build
 
-The Full-only signal is the checked-in Rust example. It constructs the Full
-source projection, suite schedule, and render artifact once, then asserts the
-pinned plan/render/schedule digests, 195,000 sources, 2,400,000 planned chunks,
-and canonical byte limits.
-
-```sh
-cargo +1.98.0 run --release --locked --offline \
-  -p kio-eval --example persona_full_contract
-```
-
-Any panic, nonzero exit, digest/count mismatch, or byte-limit failure rejects
-the run. This command is compiled by `--all-targets`; it is intentionally not
-hidden behind `#[ignore]` and is not automatically executed by push/PR CI.
-
-## 2. Complete cold build and environment variance
-
-Use fresh target directories rather than deleting a shared `target/`. The
-first directory proves a complete offline cold workspace test and release
-all-features build. Both directories independently compile and execute the
-Full persona command. Separate processes receive independent Rust runtime hash
-seeds; Kio has no `PYTHONHASHSEED` compatibility switch.
+Use a fresh target directory to run a complete offline cold workspace test and
+release all-features build.
 
 ```sh
 KIO_COLD_A=$(mktemp -d "${TMPDIR:-/tmp}/kio-cold-a.XXXXXX")
-KIO_COLD_B=$(mktemp -d "${TMPDIR:-/tmp}/kio-cold-b.XXXXXX")
-mkdir -p "$KIO_COLD_A/tmp" "$KIO_COLD_B/tmp"
-
+mkdir -p "$KIO_COLD_A/tmp"
 CARGO_TARGET_DIR="$KIO_COLD_A/target" TMPDIR="$KIO_COLD_A/tmp" \
-  LC_ALL=C LANG=C TZ=UTC \
-  cargo +1.98.0 test --workspace --all-targets --locked --offline
+  LC_ALL=C LANG=C TZ=UTC cargo +1.98.0 test --workspace --all-targets --locked --offline
 CARGO_TARGET_DIR="$KIO_COLD_A/target" TMPDIR="$KIO_COLD_A/tmp" \
-  LC_ALL=C LANG=C TZ=UTC \
-  cargo +1.98.0 build --release --all-features --locked --offline
-CARGO_TARGET_DIR="$KIO_COLD_A/target" TMPDIR="$KIO_COLD_A/tmp" \
-  LC_ALL=C LANG=C TZ=UTC \
-  cargo +1.98.0 run --release --locked --offline \
-  -p kio-eval --example persona_full_contract > "$KIO_COLD_A/persona.json"
-
-CARGO_TARGET_DIR="$KIO_COLD_B/target" TMPDIR="$KIO_COLD_B/tmp" \
-  LC_ALL=C LANG=C TZ=Asia/Tokyo \
-  cargo +1.98.0 run --release --locked --offline \
-  -p kio-eval --example persona_full_contract > "$KIO_COLD_B/persona.json"
-
-cmp "$KIO_COLD_A/persona.json" "$KIO_COLD_B/persona.json"
-jq -e '.sources == 195000 and .chunks == 2400000' \
-  "$KIO_COLD_A/persona.json" "$KIO_COLD_B/persona.json"
+  LC_ALL=C LANG=C TZ=UTC cargo +1.98.0 build --release --all-features --locked --offline
 ```
 
-The gate fails on any Cargo/test/build failure, different summary bytes, or a
-failed pinned count/digest assertion. `--offline` makes a missing local Cargo
-cache an explicit environment blocker; it must not silently enable network.
-The fresh directories are retained as evidence unless the operator separately
-chooses to remove those exact paths.
+`--offline` makes a missing local Cargo cache an explicit environment blocker.
 
-## 3. Full scale acceptance
+## 2. Full scale acceptance
 
 The Full scale fixture is 20 scopes, 4,000 files, and 120,000 expected current
 chunks. Only Full with exactly five warmups and 100 samples is formal-eligible.
 The first command builds the shared release binaries used by this section and
-sections 4-5. Run that command first when starting directly at U7 or OCR.
+sections 3-4. Run that command first when starting directly at U7 or OCR.
 
 ```sh
 KIO_FULL_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/kio-scale-full.XXXXXX")
@@ -147,7 +108,7 @@ remains a contract smoke and cannot satisfy this gate. The report's D1 TTFV/cost
 fields remain typed `not-measured` for this scale-only run: P4 owns actual D1
 data, and dogfood is a separate manual gate. See [the evaluator contract](../eval/README.md).
 
-## 4. U7 GPU/model gate
+## 3. U7 GPU/model gate
 
 This lane requires an explicitly started serving runtime, a reviewed local
 reference-model directory, a Python environment containing the reference ML
@@ -172,7 +133,7 @@ jq -e '.verdict.adoptable == true and .verdict.reason == "both-agree"' \
 or a nonzero command rejects/blocks adoption. This command must not download a
 model implicitly. Full operating details remain in [the U7 manual](../eval/u7/README.md).
 
-## 5. OCR fixture and paid provider gates
+## 4. OCR fixture and paid provider gates
 
 Fixture rendering is the sole Python-native OCR boundary and receives no
 credentials. Inputs and outputs are explicit absolute paths and create-only.

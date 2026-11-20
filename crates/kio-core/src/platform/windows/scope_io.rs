@@ -40,7 +40,7 @@ pub(crate) fn configure_scope_no_follow(options: &mut OpenOptions) {
 }
 
 /// Scheduled source authority retains Windows single-link admission.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ScheduledSourceIdentity(crate::platform::RegularFileHandleIdentity);
 
 /// Retained metadata authority; separate from scheduled source admission.

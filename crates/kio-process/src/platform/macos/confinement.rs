@@ -1,5 +1,5 @@
 //! Native macOS renderer boundary and Seatbelt profile.
-use crate::confinement::{ConfinementError, RenderResourceLimits, canonical_paths};
+use crate::confinement::{ConfinementError, RenderResourceLimits, RenderSources, RendererStart};
 use crate::platform::{apply_unix_limits, run_bounded_command_with_unix_renderer_limits};
 use crate::{BoundedProcessOptions, BoundedProcessOutput};
 use std::{
@@ -21,32 +21,32 @@ pub(crate) struct NativeRenderSandbox {
 
 impl NativeRenderSandbox {
     pub(crate) fn new(
-        program: &Path,
-        scratch: &Path,
-        runtime_roots: impl IntoIterator<Item = PathBuf>,
+        sources: &RenderSources,
+        scratch: PathBuf,
         limits: RenderResourceLimits,
-    ) -> Result<Self, ConfinementError> {
-        let paths = canonical_paths(program, scratch, runtime_roots)?;
-        let mut roots = BTreeSet::new();
-        for (_, source) in paths.roots {
-            roots.insert(source);
-        }
+    ) -> Self {
+        let mut roots: BTreeSet<_> = sources
+            .roots
+            .iter()
+            .map(|(_, source)| source.clone())
+            .collect();
         // Selecting an executable authorizes that file, not its siblings.
         // A standalone renderer may live next to private source documents or
         // credentials; package directories must be supplied explicitly.
-        roots.insert(paths.program.clone());
-        Ok(Self {
-            program: paths.program,
-            scratch: paths.scratch,
+        roots.insert(sources.program.clone());
+        Self {
+            program: sources.program.clone(),
+            scratch,
             runtime_roots: roots.into_iter().collect(),
             limits,
-        })
+        }
     }
     pub(crate) fn run<I, S>(
         &self,
         args: I,
         environment: &[(OsString, OsString)],
         options: BoundedProcessOptions,
+        start: RendererStart<'_>,
     ) -> Result<BoundedProcessOutput, ConfinementError>
     where
         I: IntoIterator<Item = S>,
@@ -61,6 +61,7 @@ impl NativeRenderSandbox {
             &self.scratch,
             self.limits.max_file_bytes,
             self.limits.max_physical_memory_bytes,
+            start,
         )?)
     }
 

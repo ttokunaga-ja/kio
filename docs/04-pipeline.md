@@ -91,7 +91,6 @@ DOCX          | page (prepare の変換 PDF 経由 — [07-adapter-spec.md §5.2
 XLSX          | sheet
 画像          | doc:1 (単一 unit — 画像 1 ファイル = 1 unit)
 Markdown      | doc:1 (heading 分割は chunk の責務)
-code          | doc:1 (symbol 分割は chunk の責務)
 ```
 
 物理配置は [03-data-model.md §2 / §2.1](03-data-model.md) を正とする:
@@ -146,7 +145,7 @@ sheet        : シート名 (NFC 正規化のみ。空白・大小文字は保�
                escape** してから、同名重複の 2 つ目以降に "#2", "#3" を付す (可逆・決定的 —
                sheet:Sheet1, sheet:Sheet1#2 — 出現順。実名 "A#2" は sheet:A##2 となり
                "A" の 2 枚目 sheet:A#2 と衝突しない)
-doc          : text-native ファイル (Markdown / コード / plain text) は単一 unit "doc:1"。
+doc          : text-native ファイル (Markdown / plain text) は単一 unit "doc:1"。
                heading 単位の分割は chunk (Step 3) の責務であり unit では行わない
 ```
 
@@ -767,11 +766,31 @@ local crash は 0 USD で終端記録し、§5.3 の attempt 上限内で再計�
 累積 append bytes の寿命上限で利用不能にしない。保持量の整理後も未終端 task の現在状態、
 attempt / next_retry_at / ownership と unsupported の現在理由を失わない。
 現在状態の key は task が `task_id`、unsupported が scope 内の `path` であり、それぞれ最後の
-検証済み record の全フィールドを保持する。別の task ID や完了・保留・解決済みの状態を整理だけで捨てない。
+検証済み record の全フィールドを保持する。unsupported は HEAD の path と raw_hash に合う最後の record で表示する。
+次の HEAD を公開する前に理由を保存し、整理時は現在の HEAD に対応する record も保持する。
+別の task ID や完了・保留・解決済みの状態を整理だけで捨てない。
 中断・回復後も検証済みの現在状態を一意に採用し、成功や新規入力へ巻き戻さない。
 canonical path、no-follow、record schema、identity と不正 record の拒否を維持する。
 課金／秘密／送信承認の正本はこの整理の対象にしない。容量不足は §5.3 の `resource_limit` として
 破損から区別し、部分成功や必要な状態の黙った切捨てにしない。
+
+ソースコードのファイル（拡張子 `rs` / `py` / `js` / `ts` / `go` / `java` / `c` / `h` / `cpp`、大文字小文字を区別しない）は索引・抽出の対象外とし、unsupported に理由 `source_code_is_not_supported` を記録・表示する。中身がテキストでも plain text として処理しない。Markdown 内のコードブロック・インラインコードは引き続き Markdown の一部として扱う。
+
+`index`、HEAD の `reindex --regenerate`、および `watch` の再走査で unsupported と判定したファイルは、以前に索引済みでも、
+現行 tree には raw のみを記録する。公開する新しい内容は、今回の走査で採用し、走査・判定と同じ raw_hash を確認できた入力に限る。
+走査中に安定した内容を確認できないファイル、走査後に追加・変更・改名・削除されたファイルは次の走査に見送り、他のファイルの公開を続ける。
+見送った path は前の HEAD の tree entry（raw と正規化参照）を保ち、前に存在しなければ含めない。判定の結果を異なる内容に結び付けない。
+公開結果と `status` の `deferred_inputs` に、見送った path と理由（`added_after_scan`、`missing_after_scan`、`changed_after_scan`、`unstable_during_scan`）を表示する。
+`status` は現行 HEAD に対応する直近の公開結果を表示し、次の公開結果で一覧を更新する。
+見送った path は `deferred_inputs` に表示し、状態表示のためにその内容を読み直すことはしない。
+status の unsupported 一覧には、公開済みの理由を表示する。読み取り中に HEAD が変わった場合は読み直す。
+検索の現行集計から該当する旧 Markdownize タスクを外し、タスク履歴は保持する。
+同じ path と raw_hash の対応する現行入力がサポートされていれば、raw のみを記録した OCR 待ちタスクも集計する。
+
+`index`、`reindex`、`watch` の再走査、`purge` は store lock の取得後に保留中の公開を確認する。
+公開ジャーナルが残っている scope では理由の書き換えや purge 計画の確定に進まず、`kio init` による公開回復を求める。
+現行検索の FTS・vector は unsupported として公開したファイルの旧世代を返さない。過去の tree が参照する世代、raw、
+Evidence Pointer の解決に必要なデータは既存の履歴保持規則に従う (§4、[03-data-model.md §8](03-data-model.md))。
 
 ```json
 {
@@ -800,7 +819,7 @@ canonical path、no-follow、record schema、identity と不正 record の拒否
 }
 ```
 
-`output_ref` の Markdownize instance は `normalized:<raw64>.<tool64>.g<gen>` の portable taskref に固定する。`raw64` は `input_hash`、`tool64` は `tool_profile_hash` の lowercase digest-only hex、`gen` は leading zero なしの canonical decimal であり、全体が完全一致しなければ mutation 前に拒否する。absolute / relative pathref を task journal へ書く互換経路はない。`online:<adapter_id>`、`offline:<adapter_id>` は typed placeholder とする。
+`output_ref` の Markdownize instance は `normalized:<raw64>.<tool64>.g<gen>` の portable taskref に固定する。`raw64` は `input_hash`、`tool64` は `tool_profile_hash` の lowercase digest-only hex、`gen` は leading zero なしの canonical decimal であり、全体が完全一致しなければ mutation 前に拒否する。absolute / relative pathref を task journal へ書く互換経路はない。`online:<adapter_id>`、`offline:<adapter_id>` は typed placeholder とする。 ローカル抽出が資源不足のため出力未公開のときは `extraction:local` を使う。保留は原本 hash と scope 内の path に結び付ける。
 Embedding Task は chunk/image/query の typed target と profile/input identity を固定する。
 chunk の `output_ref` は `embedding:<chunk_hash>/<embedding_hash>`、image は元 image hash と
 receipt を固定する typed target、query は本文を可読 payload にせず hash/profile を使う。
@@ -966,6 +985,12 @@ resource_limit     paused                max_attempts=0 (自動 retry なし)
                                          KIO-E-RESOURCE-LIMIT-001 / exit 3
 ```
 
+無料ローカル embedding では、実行レコードで契約違反の回数を総 attempt 数と別に保持する。
+文書の再試行予算は scope・profile・埋め込み入力に紐づけ、同じ入力を共有する chunk の組が変わっても持ち越す。
+実行全体の attempt 上限内で、最初の契約違反後に同じ入力の再試行を 1 回予約する。
+Task の `next_retry_at` はその予約を反映する。
+保存済みの文書結果は保存時の member 一覧に対して検証し、同じ入力の現在の対象への公開にも current policy と所有権の検査を適用する。
+
 `resource_limit` は Task / manifest `units[]` / Adapter `failed_units[]` の閉 enum
 `error_kind` に含める。資源不足の共通記述は `resource`、`stage`（不足した処理段階）、
 `limit`、`observed`、`resource_tier` を持ち、該当する Task / manifest unit / failed unit の
@@ -978,6 +1003,16 @@ context は `stage` と `resource`（memory|work|unit_text|raw_bytes|member_byte
 利用者が大きい tier を選ぶか、容量・memory 等の制約を解消した後、明示的な同一入力の
 index / reindex / repair / retry で再実行できる。同じ制約のまま通常 resume / watch が
 繰り返し再実行しない。保存済み結果と原本を保持し、未完成結果を完成扱いしない。
+ローカル抽出の prepared unit 合計と、normalized の確定 manifest・unit の正本 bytes 合計は、
+それぞれ CAS のストリームバッファ 1 個分（64 KiB）までを小さな書き込みとして扱う。
+小さな結果は従来の atomic 書き込みで公開し、中断後は作り直せる。
+単体画像で prepared source が境界を超えたときは、画像を参照する normalized の公開まで再開可能にする。
+大きな結果は unit 本体を R1 の一時領域へ順に書き、対応する stage identity と完了記録を耐久化する。
+抽出全体の完了記録を最後に書き、再開時は検証済みの完了 stage を使う。
+大きな prepared・normalized unit・immutable manifest・view は内容検証後に上書きなしの rename で公開する。
+検証済みの公開済みファイルを再利用する場合も、公開先を同期してから一時領域を回収する。
+normalized の公開は manifest で確定し、HEAD に結び付けた回収記録は回収成功まで保持する。
+prepared CAS・unit 合計・view に固定の保存容量上限を設けない。
 不正入力・record 破損・identity 不一致を `resource_limit` に変換せず、
 `contract_violation` の 1 回再投入・違反解除手順も適用しない。
 

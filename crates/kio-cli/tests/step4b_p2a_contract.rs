@@ -115,6 +115,7 @@ fn current_raw_for(dir: &TempDir, path: &str) -> String {
         .unwrap()
         .entries
         .into_iter()
+        .map(Result::unwrap)
         .find(|entry| entry.path == path)
         .unwrap()
         .raw_hash
@@ -126,7 +127,7 @@ fn current_raw_for(dir: &TempDir, path: &str) -> String {
 fn persist_and_pin_normalized_instance(
     repo: &Repository,
     parent_hash: String,
-    mut tree: TreeObject,
+    tree: TreeObject,
     raw_hash: &str,
     manifest: &NormalizedInstanceManifest,
     units: &[NormalizedUnitObject],
@@ -134,14 +135,19 @@ fn persist_and_pin_normalized_instance(
     let persisted = persist_normalized_instance(repo.kio_dir(), manifest, units).unwrap();
     let manifest_hash =
         kio_core::cas::hash_json(&serde_json::to_value(&persisted).unwrap()).unwrap();
-    tree.entries
+    let mut entries = tree.entries.to_vec().unwrap();
+    entries
         .iter_mut()
         .find(|entry| entry.raw_hash == raw_hash)
         .and_then(|entry| entry.normalize.as_mut())
         .unwrap()
         .manifest_hash = manifest_hash;
 
-    let tree = build_tree(tree.entries).unwrap();
+    let tree = build_tree(
+        &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+        entries,
+    )
+    .unwrap();
     let store = ObjectStore::new(repo.kio_dir());
     let (tree_hash, _) = store
         .write_json(ObjectKind::Tree, &serde_json::to_value(&tree).unwrap())
@@ -178,6 +184,7 @@ fn add_image_reference(dir: &TempDir, raw_hash: &str, image_bytes: &[u8]) -> Str
     let normalize = tree
         .entries
         .iter()
+        .map(Result::unwrap)
         .find(|entry| entry.raw_hash == raw_hash)
         .and_then(|entry| entry.normalize.clone())
         .unwrap();
@@ -224,6 +231,7 @@ fn add_image_references(dir: &TempDir, raw_hash: &str, images: &[&[u8]]) -> Vec<
     let normalize = tree
         .entries
         .iter()
+        .map(Result::unwrap)
         .find(|entry| entry.raw_hash == raw_hash)
         .and_then(|entry| entry.normalize.clone())
         .unwrap();
@@ -276,6 +284,7 @@ fn authorize_missing_image(dir: &TempDir, raw_hash: &str, image_hash: &str) {
     let normalize = tree
         .entries
         .iter()
+        .map(Result::unwrap)
         .find(|entry| entry.raw_hash == raw_hash)
         .and_then(|entry| entry.normalize.clone())
         .unwrap();
@@ -1050,6 +1059,7 @@ fn pa32_shared_derived_objects_survive_purge_only_when_a_live_reference_remains(
     let entry = tree
         .entries
         .iter()
+        .map(Result::unwrap)
         .find(|entry| entry.raw_hash == fixture.raw_hash)
         .unwrap();
     let normalize = entry.normalize.clone().unwrap();
@@ -1294,7 +1304,12 @@ fn pa37_pa38_pa39_working_tree_residual_warns_instead_of_the_retired_hard_block(
     let head = repo.head_commit_hash().unwrap().unwrap();
     let commit = repo.read_commit(&head).unwrap();
     let tree = repo.read_tree(&commit.tree).unwrap();
-    assert!(tree.entries.iter().all(|entry| entry.raw_hash != raw_hash));
+    assert!(
+        tree.entries
+            .iter()
+            .map(Result::unwrap)
+            .all(|entry| entry.raw_hash != raw_hash)
+    );
 
     // The SAME purge, without any working-tree residual, completes normally
     // and carries no warning at all — confirming the warning is specific to
@@ -1477,6 +1492,7 @@ fn pa44_pa45_resumed_purge_reuses_the_fixed_closure_not_a_live_rescan() {
         let entry = tree
             .entries
             .iter()
+            .map(Result::unwrap)
             .find(|entry| entry.raw_hash == fixture.raw_hash)
             .unwrap();
         let normalize = entry.normalize.clone().unwrap();

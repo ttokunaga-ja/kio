@@ -29,7 +29,7 @@ use crate::object_persistence::adapter_to_kio;
 use crate::object_persistence::index_to_kio;
 use crate::object_persistence::pipeline_to_kio;
 use crate::search::projection::mark_replica_unavailable_or_log;
-use crate::search::projection::write_through_projection_or_log;
+use crate::search::projection::write_through_repository_projection;
 use crate::settings::user_config_toml_path;
 use crate::task_execution::ExecOutcome;
 use crate::task_execution::retry_reason;
@@ -162,10 +162,10 @@ pub(crate) fn run_image_embedding_enrichment(
     .map_err(adapter_to_kio)?;
     let free_execution = !embedding.execution.is_online() && !descriptor.effects.paid_authorization;
     let external_images_allowed = embedding.repo.image_external_send_allowed()?;
-    let exclusion = if descriptor.effects.egress && !external_images_allowed {
-        Some("images_excluded_from_external_send")
-    } else if descriptor.capability.image_mime_types.is_empty() {
+    let exclusion = if descriptor.capability.image_mime_types.is_empty() {
         Some("image_capability_unavailable")
+    } else if descriptor.effects.egress && !external_images_allowed {
+        Some("images_excluded_from_external_send")
     } else {
         None
     };
@@ -331,7 +331,7 @@ pub(crate) fn run_image_embedding_enrichment(
             embedding.repo.kio_dir(),
             embedding.repo.control(),
         )?;
-        write_through_projection_or_log(ctx, embedding.repo.kio_dir());
+        write_through_repository_projection(ctx, embedding.repo, embedding.projection.rebuild);
     }
     restoration?;
     let now = invocation.control.now_utc_seconds();
@@ -727,7 +727,14 @@ pub(crate) fn run_image_embedding_enrichment(
                         Err(crate::embedding::transport::LocalEmbeddingRunFailure::Classified(
                             failure,
                         )) => {
-                            let next = fail_local_embedding_claim(&mut claim, &failure, &now)?;
+                            let next = fail_local_embedding_claim(
+                                &mut claim,
+                                &failure,
+                                &now,
+                                crate::embedding::transport::local_max_attempts(
+                                    embedding.execution,
+                                ),
+                            )?;
                             mirror_local_embedding_failure(
                                 task_store,
                                 &refs,
@@ -1225,7 +1232,7 @@ pub(crate) fn run_image_embedding_enrichment(
             embedding.repo.kio_dir(),
             embedding.repo.control(),
         )?;
-        write_through_projection_or_log(ctx, embedding.repo.kio_dir());
+        write_through_repository_projection(ctx, embedding.repo, embedding.projection.rebuild);
     }
     result?;
     for mut claim in local_publications {

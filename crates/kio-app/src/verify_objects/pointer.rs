@@ -395,15 +395,13 @@ pub(super) fn verify_pointer_in_scope(
             // consulting the tombstone/erase-receipt markers (PB44) — the DAG
             // is never rewritten by purge, so a genuinely absent entry is
             // corruption, not an explainable purge outcome.
-            let candidates = tree
+            if !tree
                 .entries
-                .iter()
-                .filter(|entry| entry.raw_hash == pointer.raw_hash)
-                .collect::<Vec<_>>();
-            if candidates.is_empty() {
+                .any(|entry| entry.raw_hash == pointer.raw_hash)?
+            {
                 return Err(store_corrupt_pointer_entry_missing_error(pointer));
             }
-            let Some(entry) = canonical_pointer_tree_entry(&tree, pointer) else {
+            let Some(entry) = canonical_pointer_tree_entry(&tree, pointer)? else {
                 return Err(invalid_pointer_identity_error(pointer));
             };
             let entry_gen = entry.normalize.as_ref().map(|normalize| normalize.r#gen);
@@ -581,19 +579,18 @@ pub(super) fn canonical_pointer_marker_verification(
 /// Canonical historical tree selection for Evidence.  Presentation fields in
 /// a pointer are intentionally absent: authority is raw hash, profile hash,
 /// and UTF-8 byte-minimum logical path only.
-pub(super) fn canonical_pointer_tree_entry<'a>(
-    tree: &'a TreeObject,
+pub(super) fn canonical_pointer_tree_entry(
+    tree: &TreeObject,
     pointer: &EvidencePointer,
-) -> Option<&'a kio_core::dag::TreeEntry> {
-    tree.entries
-        .iter()
-        .filter(|entry| {
-            entry.raw_hash == pointer.raw_hash
-                && entry.normalize.as_ref().is_some_and(|normalize| {
-                    normalize.tool_profile_hash == pointer.tool_profile_hash
-                })
-        })
-        .min_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()))
+) -> Result<Option<kio_core::dag::TreeEntry>> {
+    // Validated trees are sorted by UTF-8 path bytes.
+    tree.entries.find(|entry| {
+        entry.raw_hash == pointer.raw_hash
+            && entry
+                .normalize
+                .as_ref()
+                .is_some_and(|normalize| normalize.tool_profile_hash == pointer.tool_profile_hash)
+    })
 }
 
 /// PB64-68: translate an `enforce_canonical_marker_barrier` `Err` into the

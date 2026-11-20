@@ -15,8 +15,8 @@ use cap_primitives::{ambient_authority, fs as cap_fs};
 use windows_sys::Wdk::{
     Foundation::OBJECT_ATTRIBUTES,
     Storage::FileSystem::{
-        FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT,
-        FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+        FILE_CREATE, FILE_DELETE_ON_CLOSE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE,
+        FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
     },
 };
 use windows_sys::Win32::{
@@ -77,6 +77,7 @@ pub(crate) enum NewPrivateObjectKind {
     StageDirectory,
     RegularFile,
     StageFile,
+    ScratchFile,
     LockFile,
 }
 
@@ -144,19 +145,35 @@ pub(crate) fn create_new_private_at(
             windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY,
             FILE_SYNCHRONOUS_IO_NONALERT | FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
         ),
-        NewPrivateObjectKind::RegularFile | NewPrivateObjectKind::StageFile => (
+        NewPrivateObjectKind::RegularFile
+        | NewPrivateObjectKind::StageFile
+        | NewPrivateObjectKind::ScratchFile => (
             GENERIC_READ
                 | GENERIC_WRITE
                 | SYNCHRONIZE
                 | READ_CONTROL
                 | FILE_READ_ATTRIBUTES
-                | (if matches!(kind, NewPrivateObjectKind::StageFile) {
+                | (if matches!(
+                    kind,
+                    NewPrivateObjectKind::StageFile | NewPrivateObjectKind::ScratchFile
+                ) {
                     DELETE
                 } else {
                     0
                 }),
-            windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL,
-            FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
+            if matches!(kind, NewPrivateObjectKind::ScratchFile) {
+                windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_TEMPORARY
+            } else {
+                windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL
+            },
+            FILE_SYNCHRONOUS_IO_NONALERT
+                | FILE_NON_DIRECTORY_FILE
+                | FILE_OPEN_REPARSE_POINT
+                | if matches!(kind, NewPrivateObjectKind::ScratchFile) {
+                    FILE_DELETE_ON_CLOSE
+                } else {
+                    0
+                },
         ),
         NewPrivateObjectKind::LockFile => (
             GENERIC_READ
@@ -183,6 +200,7 @@ pub(crate) fn create_new_private_at(
             ptr::null_mut(),
             file_attributes,
             match kind {
+                NewPrivateObjectKind::ScratchFile => 0,
                 NewPrivateObjectKind::LockFile => FILE_SHARE_READ,
                 _ => FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             },
@@ -220,6 +238,7 @@ pub(crate) fn create_new_private_at(
         }
         NewPrivateObjectKind::RegularFile
         | NewPrivateObjectKind::StageFile
+        | NewPrivateObjectKind::ScratchFile
         | NewPrivateObjectKind::LockFile => {
             crate::platform::regular_file_handle_identity(&file).is_some()
         }
@@ -389,6 +408,7 @@ pub(crate) fn read_private_file(
         path,
         max_bytes,
         &owner,
+        None,
     )
 }
 
@@ -396,6 +416,7 @@ pub(crate) fn read_private_file_at_path(
     parent: &StoreDirectory,
     name: &Path,
     max_bytes: u64,
+    deadline: Option<std::time::Instant>,
 ) -> Result<Vec<u8>> {
     let leaf = direct_leaf(name, parent.path())?;
     let owner = CurrentUserSid::current().map_err(|_| {
@@ -404,7 +425,7 @@ pub(crate) fn read_private_file_at_path(
     let handle = parent.root_handle();
     verify_real_directory(&handle, parent.path())?;
     let label = parent.path().join(leaf);
-    read_private_leaf(&handle, leaf, &label, max_bytes, &owner)
+    read_private_leaf(&handle, leaf, &label, max_bytes, &owner, deadline)
 }
 
 fn read_private_leaf(
@@ -413,7 +434,10 @@ fn read_private_leaf(
     path: &Path,
     max_bytes: u64,
     owner: &CurrentUserSid,
+    deadline: Option<std::time::Instant>,
 ) -> Result<Vec<u8>> {
+    crate::private_fs::check_read_deadline(deadline)
+        .map_err(|error| crate::KioError::io(error.to_string(), path.display().to_string()))?;
     let mut options = cap_fs::OpenOptions::new();
     options
         .read(true)
@@ -438,10 +462,18 @@ fn read_private_leaf(
     let mut body = Vec::with_capacity(
         usize::try_from(before.len()).map_err(|_| oversized_file(max_bytes, before.len(), path))?,
     );
-    file.by_ref()
-        .take(max_bytes.saturating_add(1))
-        .read_to_end(&mut body)
-        .map_err(|_| unsafe_file("cannot read private trust file", Some(path)))?;
+    crate::private_fs::read_to_end_checked(
+        file.by_ref().take(max_bytes.saturating_add(1)),
+        &mut body,
+        deadline,
+    )
+    .map_err(|error| {
+        if error.kind() == std::io::ErrorKind::TimedOut {
+            crate::KioError::io(error.to_string(), path.display().to_string())
+        } else {
+            unsafe_file("cannot read private trust file", Some(path))
+        }
+    })?;
     if body.len() as u64 > max_bytes {
         return Err(oversized_file(max_bytes, body.len() as u64, path));
     }

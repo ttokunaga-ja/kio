@@ -610,6 +610,45 @@ pub(crate) fn resolve_evidence_scope_target(
     scope_path_hint: Option<&str>,
     control: &kio_core::control::ControlHandle,
 ) -> Result<ScopeTarget> {
+    resolve_evidence_scope_target_with_retained_hint(
+        cwd,
+        registry_input,
+        scope_id,
+        scope_path_hint,
+        None,
+        control,
+    )
+}
+
+pub(crate) fn validate_extraction_recovery_registration(
+    cwd: &Path,
+    repo: &Repository,
+) -> Result<()> {
+    let identity = repo.scope_identity()?;
+    let target = ScopeTarget {
+        scope_id: identity.scope_id.clone(),
+        kio_dir: identity.canonical_root.join(".kio"),
+        repo_root: identity.canonical_root,
+    };
+    resolve_evidence_scope_target_with_retained_hint(
+        cwd,
+        &EvidenceRegistry::default(),
+        &identity.scope_id,
+        None,
+        Some(target),
+        repo.control(),
+    )
+    .map(|_| ())
+}
+
+fn resolve_evidence_scope_target_with_retained_hint(
+    cwd: &Path,
+    registry_input: &EvidenceRegistry,
+    scope_id: &str,
+    scope_path_hint: Option<&str>,
+    retained_hint: Option<ScopeTarget>,
+    control: &kio_core::control::ControlHandle,
+) -> Result<ScopeTarget> {
     let registry_path = registry_input.path(control)?;
     let registry = match RegistryDb::open_read_only_with_control(&registry_path, control) {
         Ok(registry) => Some(registry),
@@ -631,11 +670,13 @@ pub(crate) fn resolve_evidence_scope_target(
 
     // A valid scope_path is a candidate, not an authority: fold it into the
     // same deduplicated pool as the rows read from this snapshot.
-    let hinted = scope_path_hint
-        .and_then(|hint| {
-            open_scope_from_hint_with_mode(hint, ScopeResolutionMode::EvidenceReadOnly, control)
-        })
-        .filter(|target| target.scope_id == scope_id);
+    let hinted = retained_hint.or_else(|| {
+        scope_path_hint
+            .and_then(|hint| {
+                open_scope_from_hint_with_mode(hint, ScopeResolutionMode::EvidenceReadOnly, control)
+            })
+            .filter(|target| target.scope_id == scope_id)
+    });
     if let Some(target) = resolve_scope_id_from_registry_entries(
         scope_id,
         hinted,

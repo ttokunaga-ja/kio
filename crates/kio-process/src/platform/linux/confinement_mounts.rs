@@ -296,12 +296,12 @@ fn region(mount: &Mount, path: &Path) -> io::Result<Region> {
     })
 }
 
-fn included_regions(
-    mounts: &[Mount],
-    paths: &[PathBuf],
+fn included_regions<'a>(
+    mounts: &'a [Mount],
+    paths: &'a [PathBuf],
     reject_special: bool,
     resolve: &mut impl FnMut(&Path) -> io::Result<u64>,
-) -> io::Result<Vec<Region>> {
+) -> io::Result<Vec<(&'a Path, Region)>> {
     let mut points = BTreeSet::new();
     for path in paths {
         if !normalized_absolute(path) {
@@ -350,15 +350,26 @@ fn included_regions(
             // A namespace handle cannot contain control-plane filesystem paths.
             continue;
         }
-        regions.push(region(mount, path)?);
+        regions.push((path, region(mount, path)?));
     }
     Ok(regions)
 }
 
+#[cfg(test)]
 fn validate_table(
     mounts: &[Mount],
     sources: &[PathBuf],
     protected: &[PathBuf],
+    resolve: impl FnMut(&Path) -> io::Result<u64>,
+) -> io::Result<()> {
+    validate_table_with_mask(mounts, sources, protected, None, resolve)
+}
+
+fn validate_table_with_mask(
+    mounts: &[Mount],
+    sources: &[PathBuf],
+    protected: &[PathBuf],
+    mask: Option<&Path>,
     mut resolve: impl FnMut(&Path) -> io::Result<u64>,
 ) -> io::Result<()> {
     // At most one descriptor lookup for each source, protected root, or unique
@@ -372,23 +383,59 @@ fn validate_table(
         cache.insert(path.to_path_buf(), id);
         Ok(id)
     };
+    let masked_region = mask
+        .map(|path| {
+            // Mounts rooted inside the masked tree can have other backing regions.
+            if let Some(mount) = mounts.iter().find(|mount| mount.point.starts_with(path)) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "submount in masked renderer cache: {}",
+                        mount.point.display()
+                    ),
+                ));
+            }
+            let mount = resolved_mount(mounts, path, &mut cached_resolve)?;
+            Ok::<_, io::Error>((path, region(mount, path)?))
+        })
+        .transpose()?;
     let protected = included_regions(mounts, protected, false, &mut cached_resolve)?;
     let included = included_regions(mounts, sources, true, &mut cached_resolve)?;
-    for source in included {
-        if protected.iter().any(|target| {
-            source.device == target.device
-                && (source.path.starts_with(&target.path) || target.path.starts_with(&source.path))
-        }) {
+    for (visible, source) in included {
+        if protected
+            .iter()
+            .any(|(_, target)| regions_overlap(&source, target))
+        {
             return Err(denied());
+        }
+        if let Some((path, backing)) = &masked_region
+            && regions_overlap(&source, backing)
+            && !backing
+                .path
+                .strip_prefix(&source.path)
+                .is_ok_and(|relative| visible.join(relative) == *path)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "renderer bind exposes an alias of the masked cache: {}",
+                    visible.display()
+                ),
+            ));
         }
     }
     Ok(())
 }
 
+fn regions_overlap(left: &Region, right: &Region) -> bool {
+    left.device == right.device
+        && (left.path.starts_with(&right.path) || right.path.starts_with(&left.path))
+}
+
 /// Validate actual canonical bind sources before recursive bubblewrap binds.
 /// Both mountinfo failures and ambiguous mappings deny the renderer launch.
 /// No privileged operations or host mount changes are performed.
-pub(super) fn validate_sources(sources: &[PathBuf]) -> io::Result<()> {
+pub(super) fn validate_sources(sources: &[PathBuf], mask: Option<&Path>) -> io::Result<()> {
     if sources.len() > MAX_ROWS {
         return Err(invalid("too many renderer bind sources"));
     }
@@ -407,7 +454,13 @@ pub(super) fn validate_sources(sources: &[PathBuf]) -> io::Result<()> {
     File::open("/proc/self/mountinfo")?
         .take((MAX_BYTES + 1) as u64)
         .read_to_end(&mut bytes)?;
-    validate_table(&parse_table(&bytes)?, sources, &protected, kernel_mount_id)
+    validate_table_with_mask(
+        &parse_table(&bytes)?,
+        sources,
+        &protected,
+        mask,
+        kernel_mount_id,
+    )
 }
 
 #[cfg(test)]
@@ -479,6 +532,37 @@ mod tests {
         for kind in ["proc", "sysfs", "cgroup", "cgroup2"] {
             let extra = format!("6 1 0:9 / /opt/runtime/hidden rw - {kind} none rw\n");
             assert!(check(&extra, &["/opt/runtime"]).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_host_mount_aliases_of_masked_runtime_cache() {
+        let mask = Path::new("/usr/lib/libreoffice/program/__pycache__");
+        let check = |extra: &str| {
+            let mounts = parse_table(format!("{ROOT}{CONTROL}{extra}").as_bytes()).unwrap();
+            validate_table_with_mask(
+                &mounts,
+                &["/usr/lib".into(), "/usr/share".into()],
+                &["/run".into(), "/sys".into(), "/proc".into()],
+                Some(mask),
+                |path| fixture_resolve(&mounts, path),
+            )
+        };
+        assert!(check("6 1 0:6 / /usr/lib/wsl rw - 9p none rw\n").is_ok());
+        for backing in [
+            "/usr/lib/libreoffice/program",
+            "/usr/lib/libreoffice/program/__pycache__",
+            "/usr/lib/libreoffice/program/__pycache__/child",
+        ] {
+            let result = check(&format!(
+                "6 1 8:1 {backing} /usr/share/cache-alias rw - ext4 /dev/root rw\n"
+            ));
+            let error = result
+                .expect_err("a recursive bind would expose the host cache under another name");
+            assert!(
+                error.to_string().contains("/usr/share/cache-alias"),
+                "{error}"
+            );
         }
     }
 

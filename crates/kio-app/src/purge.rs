@@ -109,7 +109,7 @@ pub(crate) fn run(
     // the store lock before preview/working-copy refusal so a tombstoned raw temp
     // is removed even when the requested purge cannot proceed.
     {
-        let _store_lock = repo.lock_store_in_session(repo.lock_session())?;
+        let _store_lock = repo.lock_store_for_publication()?;
         repo.ensure_no_pending_managed_restore()?;
         let state = PurgeState::open_with_control(repo.kio_dir(), repo.control().clone())?;
         if state.read_journal()?.is_some() {
@@ -562,7 +562,7 @@ fn execute_phase_machine(
     args: &PurgeArgs,
     preview: &PurgePreview,
 ) -> Result<PurgeResponse> {
-    let _store_lock = repo.lock_store_in_session(repo.lock_session())?;
+    let _store_lock = repo.lock_store_for_publication()?;
     let locked_plan = resolve_plan(repo, args)?;
     if locked_plan != preview.plan {
         return Err(KioError::new(
@@ -930,8 +930,7 @@ fn verify_purged_commit(repo: &Repository, commit_hash: &str, targets: &[String]
     let targets = targets.iter().map(String::as_str).collect::<BTreeSet<_>>();
     if tree
         .entries
-        .iter()
-        .any(|entry| targets.contains(entry.raw_hash.as_str()))
+        .any(|entry| targets.contains(entry.raw_hash.as_str()))?
     {
         return Err(KioError::new(
             "KIO-E-PURGE-WORKING-COPY-001",
@@ -1283,9 +1282,25 @@ fn delete_derived_surfaces(
         .saturating_add(remove_target_normalized_instances(repo, &targets)?);
     report.deleted.normalized_views = remove_target_normalized_views(repo.kio_dir(), &targets)?;
 
+    let extraction_store = crate::object_persistence::bound_extraction_store(repo)?;
+    for raw_hash in &targets {
+        kio_pipeline::prepare::discard_prepared_stages(&extraction_store, raw_hash)
+            .map_err(crate::object_persistence::pipeline_to_kio)?;
+        kio_pipeline::markdownize::discard_normalized_stages(&extraction_store, raw_hash)
+            .map_err(crate::object_persistence::pipeline_to_kio)?;
+    }
+
     delete_target_tasks(repo, &targets, &chunk_ids, report)?;
     report.deleted.manifest_rows = scrub_manifest(repo.kio_dir(), &targets)?;
-    report.deleted.unsupported_rows = scrub_unsupported(repo.kio_dir(), &targets)?;
+    let published_tree = repo
+        .head_commit_hash()?
+        .map(|head| {
+            repo.read_commit(&head)
+                .and_then(|commit| repo.read_tree(&commit.tree))
+        })
+        .transpose()?;
+    report.deleted.unsupported_rows =
+        scrub_unsupported(repo.kio_dir(), published_tree.as_ref(), &targets)?;
     report.deleted.quarantine_rows = scrub_quarantine(repo.kio_dir(), &plan.historical_paths)?;
     report.deleted.staging_descriptors = delete_target_staging(repo.kio_dir(), &targets)?;
 
@@ -1559,7 +1574,8 @@ fn extend_inventory_from_reachable_refs(
     }
     let graph = HistoryReader::new_with_control(repo.kio_dir(), repo.control().clone())
         .walk_for_roots(&roots)?;
-    for binding in graph.bindings() {
+    for binding in graph.bindings()? {
+        let binding = binding?;
         let Some(normalize) = binding.binding.normalize.as_ref() else {
             continue;
         };
@@ -1812,7 +1828,7 @@ fn remove_target_normalized_views(kio_dir: &Path, targets: &BTreeSet<&str>) -> R
                 .and_then(|value| value.to_str())
                 .ok_or_else(|| store_corrupt(&path, "normalized view leaf is not valid UTF-8"))?;
             if name.starts_with(&format!("{digest}.")) && name.ends_with(".md") {
-                validate_existing_regular(&path, Some(256 * 1024 * 1024))?;
+                validate_existing_regular(&path, None)?;
                 candidates.push(path);
             }
         }
@@ -2050,11 +2066,17 @@ fn scrub_manifest(kio_dir: &Path, targets: &BTreeSet<&str>) -> Result<u64> {
     Ok(u64::try_from(removed).unwrap_or(u64::MAX))
 }
 
-fn scrub_unsupported(kio_dir: &Path, targets: &BTreeSet<&str>) -> Result<u64> {
-    let store = kio_pipeline::unsupported::UnsupportedInputStore::new(kio_dir);
+fn scrub_unsupported(
+    kio_dir: &Path,
+    published_tree: Option<&kio_core::dag::TreeObject>,
+    targets: &BTreeSet<&str>,
+) -> Result<u64> {
+    let store = kio_pipeline::unsupported::UnsupportedInputStore::new(kio_dir)
+        .with_published_tree(published_tree);
     let mut rows = store
-        .latest_by_path()
-        .map_err(crate::object_persistence::pipeline_to_kio)?;
+        .retained_rows()
+        .map_err(crate::object_persistence::pipeline_to_kio)?
+        .to_vec()?;
     let before = rows.len();
     rows.retain(|row| !targets.contains(row.raw_hash.as_str()));
     let removed = before.saturating_sub(rows.len());
@@ -2778,26 +2800,29 @@ fn resolve_plan(repo: &Repository, args: &PurgeArgs) -> Result<PurgePlan> {
             // deleted historical operand through host filesystem canonicalization.
             TreeEntry::raw_file(logical_path, VALIDATION_HASH)?;
             let roots = crate::index::rebuild::durable_history_roots(repo)?;
-            let bindings = if roots.is_empty() {
-                Vec::new()
-            } else {
-                HistoryReader::new_with_control(repo.kio_dir(), repo.control().clone())
-                    .walk_for_roots(&roots)?
-                    .bindings()
-            };
-            let targets = bindings
-                .iter()
-                .filter(|binding| binding.binding.path == logical_path)
-                .map(|binding| binding.binding.raw_hash.clone())
-                .collect::<BTreeSet<_>>();
+            let mut targets = BTreeSet::new();
+            let mut paths = BTreeSet::new();
+            if !roots.is_empty() {
+                let bindings =
+                    HistoryReader::new_with_control(repo.kio_dir(), repo.control().clone())
+                        .walk_for_roots(&roots)?
+                        .bindings()?;
+                for binding in &bindings {
+                    let binding = binding?;
+                    if binding.binding.path == logical_path {
+                        targets.insert(binding.binding.raw_hash);
+                    }
+                }
+                for binding in &bindings {
+                    let binding = binding?;
+                    if targets.contains(&binding.binding.raw_hash) {
+                        paths.insert(binding.binding.path);
+                    }
+                }
+            }
             if targets.is_empty() {
                 return Err(purge_not_found());
             }
-            let paths = bindings
-                .iter()
-                .filter(|binding| targets.contains(&binding.binding.raw_hash))
-                .map(|binding| binding.binding.path.clone())
-                .collect::<BTreeSet<_>>();
             (targets.into_iter().collect(), paths.into_iter().collect())
         }
         (None, Some(raw_hash)) => {
@@ -2809,16 +2834,19 @@ fn resolve_plan(repo: &Repository, args: &PurgeArgs) -> Result<PurgePlan> {
             // Raw identity remains authoritative even when history is shallow or
             // beyond traversal bounds. A successful best-effort walk only
             // enriches the conservative log/quarantine alias scrub.
-            let paths = HistoryReader::new_with_control(repo.kio_dir(), repo.control().clone())
-                .walk(&head_commit)
-                .ok()
-                .into_iter()
-                .flat_map(|graph| graph.bindings())
-                .filter(|binding| binding.binding.raw_hash == *raw_hash)
-                .map(|binding| binding.binding.path)
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect();
+            let mut paths = BTreeSet::new();
+            if let Ok(graph) =
+                HistoryReader::new_with_control(repo.kio_dir(), repo.control().clone())
+                    .walk(&head_commit)
+            {
+                for binding in graph.bindings()? {
+                    let binding = binding?;
+                    if binding.binding.raw_hash == *raw_hash {
+                        paths.insert(binding.binding.path);
+                    }
+                }
+            }
+            let paths = paths.into_iter().collect();
             (vec![raw_hash.clone()], paths)
         }
         _ => {
@@ -2924,13 +2952,13 @@ fn verify_targets_exist(
 fn detect_live_working_copy(repo: &Repository, targets: &[String]) -> Result<u64> {
     let targets = targets.iter().map(String::as_str).collect::<BTreeSet<_>>();
     let working_tree = repo.build_working_tree(false)?;
-    let live_alias_count = working_tree
-        .tree
-        .entries
-        .iter()
-        .filter(|entry| targets.contains(entry.raw_hash.as_str()))
-        .count();
-    Ok(u64::try_from(live_alias_count).unwrap_or(u64::MAX))
+    let mut live_alias_count = 0u64;
+    for entry in &working_tree.tree.entries {
+        if targets.contains(entry?.raw_hash.as_str()) {
+            live_alias_count = live_alias_count.saturating_add(1);
+        }
+    }
+    Ok(live_alias_count)
 }
 
 fn purge_not_found() -> KioError {
@@ -3048,16 +3076,19 @@ mod task_retirement_tests {
         store.record(&row).unwrap();
         row.raw_hash = raw_b.clone();
         store.record(&row).unwrap();
-        scrub_unsupported(directory.path(), &BTreeSet::from([raw_a.as_str()])).unwrap();
+        scrub_unsupported(directory.path(), None, &BTreeSet::from([raw_a.as_str()])).unwrap();
         let bytes = fs::read_to_string(store.path()).unwrap();
         assert!(
             !bytes.contains(&raw_a),
             "purged raw remains in an old journal row"
         );
-        assert_eq!(store.latest_by_path().unwrap(), vec![row.clone()]);
+        assert_eq!(
+            store.latest_by_path().unwrap().to_vec().unwrap(),
+            vec![row.clone()]
+        );
         assert!(bytes.contains(&raw_b));
         // Re-running purge remains safe; purging the current B must not revive A.
-        scrub_unsupported(directory.path(), &BTreeSet::from([raw_b.as_str()])).unwrap();
+        scrub_unsupported(directory.path(), None, &BTreeSet::from([raw_b.as_str()])).unwrap();
         assert!(store.latest_by_path().unwrap().is_empty());
         assert!(fs::read(store.path()).unwrap().is_empty());
     }

@@ -69,7 +69,7 @@ raw / prepared / image / normalized_unit_object / chunk / embedding / manifest /
     normalized_units/ab/cd/<raw64>.<tool64>.g<gen>/
       manifest.json                    # current working projection (最新版、§2.1)
       <unit_ref>.json                  # current mutable view/cache (unit_ref = base16(sha256(unit_key の UTF-8 バイト列))[0:16])
-    normalized/ab/cd/<raw64>.<tool64>.g<gen>.md   # 全文 view (cache, 再生成可能)
+    normalized/ab/cd/<raw64>.<tool64>.g<gen>.<manifest64>.md   # 全文 view (manifest hash で選ぶ再生成可能な cache)
     normalized_unit_objects/ab/cd/<unit-object64> # immutable NormalizedUnitObject (canonical JCS bytes、§2.1)
     manifests/ab/cd/<manifest64>    # manifest の immutable 確定版 (canonical JCS bytes、§2.1。
                                     # tree v2 の normalize.manifest_hash が指す — §8)
@@ -287,8 +287,9 @@ full NormalizedUnitObject を JCS CAS として確定する (per-.kio 重複容�
 この可逆なローカル更新は外部送信や有料再生成の承認を与えない。
 後続の外部／有料処理には current grant、secret hold と [04 §5.4](04-pipeline.md) を適用する。
 
-**全文 view**: `objects/normalized/ab/cd/<raw64>.<tool64>.g<gen>.md` は
-unit を決定論的に結合した **再生成可能な cache** であり、正本ではない。組み立て規則:
+**全文 view**: `objects/normalized/ab/cd/<raw64>.<tool64>.g<gen>.<manifest64>.md` は
+unit を決定論的に結合した **再生成可能な cache** である。現在の確定 manifest の
+canonical JCS bytes の SHA-256 で `<manifest64>` を選ぶ。組み立て規則:
 
 1. manifest.units を `order` 昇順に走査する (`order` は unit 間で一意 — 重複は KIO-E-STORE-CORRUPT-001 の corruption。値自体で順序が確定するため tie-break は存在しない)
 2. `status = done` の unit は、その `markdown` から末尾の連続する改行を除去した文字列を採用する
@@ -919,10 +920,10 @@ JCS ではキー順は canonical 化時に自動決定されるため、上記�
 
 `commit_type=purged` の commit は **`purged_raws` (当該 purge の対象 raw_hash の昇順配列 — prepared 相の closure から確定、[05-runtime.md §3.5](05-runtime.md) の planned_commit) を必須 field に持つ**。marker 検証 ([10-operations.md §7.5.1](10-operations.md)) は tombstone / receipt の raw_hash がこの配列に含まれることを対照する — 他 raw の正当な purge commit を `in_commit` に流用した偽 marker が genuine missing を隠せない。他の commit_type は本 field を持たない。**本 field は store format の初版から必須であり、これを欠く `commit_type=purged` commit は存在しない** (欠落 = corruption。2026-07 の field 追加は実装・store 公開前の定義確定)。
 
-tree entry の `normalize` ブロックは **optional**。normalized instance が存在しないファイル (未 Markdownize) の
-entry では `normalize` を**省略**する (省略 = 当該ファイルの normalized / chunk は存在しない。`null` は書かない —
-§5.1 の「省略と null を識別しない」に従う)。Markdownize されていない entry は省略形、
-完了済み entry は `normalize` 付きである。
+tree entry の `normalize` ブロックは **optional**。当該 tree が normalized instance を参照する
+entry に付ける。未 Markdownize や unsupported ([04-pipeline.md §5.1](04-pipeline.md)) の entry は
+`normalize` を**省略**し、normalized instance や chunk を参照しない。`null` は書かない
+(§5.1 の「省略と null を識別しない」に従う)。
 
 `normalize` が存在する場合、tree entry の `gen` は commit 時点で参照していた normalized instance の世代 (§2.1) であり必須である。欠落は schema violation として拒否する。`kio reindex --regenerate` 後も過去 commit の tree entry はその記録済み gen を
 指し続けるため、`kio view --at` ([05-runtime.md §4.2](05-runtime.md)) と Evidence Pointer の
@@ -962,6 +963,10 @@ tree は entries を単一の flat 配列で持つ。スコープ境界規則 (�
 - tree schema / reader / writer は同じ件数契約を使い、10,001 件目を拒否しない。列挙・sort・hash・
   canonical publication は有界 buffer と必要な private disk stage で行い、件数に比例する本文 bytes を
   常駐させない。実資源不足は件数超過／破損と区別して理由を表示し、entry を黙って捨てない。
+- `index`（preview を含む）、`reindex`、watch、`status` の working tree 走査も、候補の列挙・照合と
+  ファイルごとの結果（見送ったパスと理由を含む）を有界 buffer と逐次 reader で処理し、
+  ファイル数に比例する走査メモリを確保しない。
+  書き出しには tree と同じ private disk stage を使う。store を変更しない preview は private な作業ディレクトリに書き出す。
 - snapshot 時に tree_hash が現在の HEAD の tree と一致する場合、auto snapshot は commit を作らない (no-op。**例外 = resurrection finalize と tool_lock_hash の変化** — no-op 判定は tree_hash と commit の tool_lock_hash の両方を比較する。正本 [05-runtime.md §8.1](05-runtime.md))。tree は CAS object なので、内容不変なら新規 object も生成されない (tree_hash は保存バイト列の content hash、§8.1)
 - 1 ファイルの変更で tree 全体 (上表のサイズ) が新 object として書かれるのは仕様どおりの挙動である。
 
@@ -978,7 +983,20 @@ file を途中まで保存して成功扱いせず、未保存 file を削除扱
 原本の private stage (`internal/raw-stages/`) は、本文を書き始める前に物理 ID と nonce を
 `internal/raw-stage-identities/` の journal に永続化する。
 回復時は保存した identity が一致する stage だけを回収し、確定できない残骸は削除しない。
+回収と残骸の報告は、有界 buffer で列挙・照合し、結果を逐次処理する。
 `status` の `stage_residues` と `repair verify-objects` の finding に、その path と理由を表示する。
+
+tree の外部 sort や逐次 reader の一時記録は、run ごとの件数・byte 数と、複数の run を
+同時に保持するときの合計 byte 数に上限を設けてメモリに保持する。
+書き込み操作で上限を超える run は、操作対象の store の private 領域 `internal/record-stages/` に書き出す。
+store を変更しない GC の読取や manifest の検証、評価ツールでは、呼出し側が用意した private な
+作業ディレクトリに書き出す。
+検索用に開いた store では、上限を超えたときだけ閉じると破棄される一時ファイルに書き出す。
+検索は store の record stage を作成・回復しない。
+回復対象の stage では、ディスクに記録を書き始める前に、run directory・記録・lease の identity を journal に保存する。
+逐次 reader は、この stage から実際に読み取った各フレームを認証してから照合や出力に渡す。
+生存中の lease は回収せず、再試行時に保存した identity が一致する非稼働の記録だけを回収する。
+確定できない記録は保持する。store 内の残骸は同じ `stage_residues` と finding に表示する。
 
 ## chunk
 

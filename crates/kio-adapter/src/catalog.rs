@@ -19,7 +19,8 @@ use crate::gemini_embedding::GeminiEmbeddingClient;
 pub use crate::gemini_embedding::validate_gemini_sync_inputs;
 use crate::gemini_embedding::{ADOPTED_DIMENSIONS, ADOPTED_MODEL_PIN, GeminiEmbeddingAdapter};
 use crate::local_embedding::{
-    LOCAL_EMBEDDING_DEFAULT_MODEL, LocalEmbeddingAdapter, LocalEmbeddingExecution,
+    EnvLocalEmbeddingClient, LOCAL_EMBEDDING_DEFAULT_MODEL, LocalEmbeddingAdapter,
+    LocalEmbeddingExecution, LocalEmbeddingSpec,
 };
 use crate::mistral_ocr::{EnvMistralOcrClient, MistralOcrClient, MistralOcrMarkdownizeAdapter};
 #[cfg(debug_assertions)]
@@ -99,9 +100,8 @@ pub const DETERMINISTIC_EVAL_EMBEDDING_ENV: &str = "KIO_EVAL_DETERMINISTIC_EMBED
 #[cfg(debug_assertions)]
 pub const TEST_LOCAL_OCR_ENV: &str = "KIO_TEST_LOCAL_OCR";
 
-/// Re-exported so the index path can gate image enrichment without naming the
-/// concrete local adapter module (which stays private, like `gemini_embedding`).
-pub use crate::local_embedding::IMAGE_OBJECT_CAPABILITY;
+/// Local embedding selectors used by the application for approval and capability checks.
+pub use crate::local_embedding::{GENERIC_LOCAL_EMBEDDING_TOOL_ID, IMAGE_OBJECT_CAPABILITY};
 
 #[cfg(debug_assertions)]
 use crate::local_ocr_markdownize::MockLocalOcrClient;
@@ -1118,6 +1118,23 @@ fn declared_offline_embedding(settings: &AdapterRuntimeSettings) -> bool {
         .is_some_and(|kind| kind == "offline_api")
 }
 
+fn offline_embedding_declaration(
+    settings: &AdapterRuntimeSettings,
+) -> Result<crate::tool_lock::DeclaredAdapter> {
+    let declared = settings.declared_adapter("embedding").ok_or_else(|| {
+        AdapterError::ConfigSchema(
+            "the offline embedding adapter resolved without a declaration".to_owned(),
+        )
+    })?;
+    crate::tool_lock::validate_declared_runtime_target("embedding", &declared)?;
+    if declared.url.is_none() {
+        return Err(AdapterError::ConfigSchema(
+            "an offline_api embedding adapter must declare `url`".to_owned(),
+        ));
+    }
+    Ok(declared)
+}
+
 /// Builds the adapter for a resolved execution.
 ///
 /// The `EmbeddingAdapter` trait was already the right abstraction — it carries
@@ -1145,41 +1162,24 @@ pub fn embedding_adapter_for_with_control(
     }
     match execution {
         EmbeddingExecution::DeterministicEvaluator => Ok(Box::new(DeterministicEmbeddingAdapter)),
-        // Same shape as the online `Real` arm below: the declaration is
-        // revalidated here rather than trusted from load time, and the parts
-        // only the real backend needs (url, model) are read at the point of
-        // construction so the execution enum can stay a `Copy` unit.
         EmbeddingExecution::Offline(LocalEmbeddingExecution::Real) => {
-            let declared = settings.declared_adapter("embedding").ok_or_else(|| {
-                AdapterError::ConfigSchema(
-                    "the offline embedding adapter resolved without a declaration".to_owned(),
-                )
-            })?;
-            // Re-runs D1's literal-loopback check. An `offline_api` entry that
-            // passed at load time and points somewhere else now must not send.
-            crate::tool_lock::validate_declared_runtime_target("embedding", &declared)?;
-            let base_url = declared.url.clone().ok_or_else(|| {
-                AdapterError::ConfigSchema(
-                    "an offline_api embedding adapter must declare `url`".to_owned(),
-                )
-            })?;
-            let endpoint = settings.local_endpoint("embedding", &base_url)?;
-            let model = declared
-                .model
-                .clone()
-                .unwrap_or_else(|| LOCAL_EMBEDDING_DEFAULT_MODEL.to_owned());
-            // D7: `[adapter.policy.offline_api].timeout_seconds` (07 §7). Read
-            // at construction like `url` and `model` above, and absent means
-            // inherit the parent's documented 300 rather than a value invented
-            // here -- 07 §7 defers the offline default to Stage 3's measurement.
-            let timeout_seconds = settings.execution_timeout("offline_api");
-            Ok(Box::new(LocalEmbeddingAdapter::with_client(
-                crate::local_embedding::EnvLocalEmbeddingClient::new(
-                    endpoint,
-                    model,
-                    timeout_seconds,
-                ),
-            )))
+            let declared = offline_embedding_declaration(&settings)?;
+            let endpoint = settings
+                .local_endpoint("embedding", declared.url.as_deref().expect("validated url"))?;
+            let timeout = settings.execution_timeout("offline_api");
+            if declared.tool_id.as_deref() == Some(GENERIC_LOCAL_EMBEDDING_TOOL_ID) {
+                let spec = LocalEmbeddingSpec::from_declaration(&declared)?;
+                let client =
+                    EnvLocalEmbeddingClient::new(endpoint, spec.model.clone(), timeout, true);
+                Ok(Box::new(LocalEmbeddingAdapter::with_spec(client, spec)))
+            } else {
+                let model = declared
+                    .model
+                    .unwrap_or_else(|| LOCAL_EMBEDDING_DEFAULT_MODEL.to_owned());
+                Ok(Box::new(LocalEmbeddingAdapter::with_client(
+                    EnvLocalEmbeddingClient::new(endpoint, model, timeout, false),
+                )))
+            }
         }
         EmbeddingExecution::Online(AdoptedEmbeddingExecution::Real) => {
             let declared = settings.declared_adapter("embedding");
@@ -1291,12 +1291,14 @@ pub struct DeclaredEmbeddingProfile {
 /// The offline adapter reports its own identity — a different
 /// `profile_hash` from the online one, which is exactly what 03 §7's
 /// compatibility gate needs in order to refuse to mix the two vector spaces.
-#[must_use]
-pub fn declared_embedding_profile_for(execution: EmbeddingExecution) -> DeclaredEmbeddingProfile {
-    match execution {
+pub fn declared_embedding_profile_for(
+    settings: &AdapterRuntimeSettings,
+    execution: EmbeddingExecution,
+) -> Result<DeclaredEmbeddingProfile> {
+    Ok(match execution {
         EmbeddingExecution::Online(seam) => declared_adopted_embedding_profile(seam),
         EmbeddingExecution::Offline(local) => {
-            let profile = crate::local_embedding::profile_for(local);
+            let profile = offline_embedding_profile(settings, local)?;
             DeclaredEmbeddingProfile {
                 tool_id: profile.adapter_id,
                 dimensions: u64::from(crate::local_embedding::LOCAL_EMBEDDING_DIMENSIONS),
@@ -1305,18 +1307,21 @@ pub fn declared_embedding_profile_for(execution: EmbeddingExecution) -> Declared
                 profile_hash: profile.tool_profile_hash,
             }
         }
-        EmbeddingExecution::DeterministicEvaluator => {
-            let profile = DeterministicEmbeddingAdapter.profile();
-            DeclaredEmbeddingProfile {
-                tool_id: profile.adapter_id,
-                dimensions: u64::from(
-                    crate::deterministic_embedding::DETERMINISTIC_EVAL_EMBEDDING_DIMENSIONS,
-                ),
-                distance: "cosine".to_owned(),
-                modality: "multimodal".to_owned(),
-                profile_hash: profile.tool_profile_hash,
-            }
-        }
+        EmbeddingExecution::DeterministicEvaluator => declared_deterministic_embedding_profile(),
+    })
+}
+
+#[must_use]
+pub fn declared_deterministic_embedding_profile() -> DeclaredEmbeddingProfile {
+    let profile = DeterministicEmbeddingAdapter.profile();
+    DeclaredEmbeddingProfile {
+        tool_id: profile.adapter_id,
+        dimensions: u64::from(
+            crate::deterministic_embedding::DETERMINISTIC_EVAL_EMBEDDING_DIMENSIONS,
+        ),
+        distance: "cosine".to_owned(),
+        modality: "multimodal".to_owned(),
+        profile_hash: profile.tool_profile_hash,
     }
 }
 
@@ -1493,6 +1498,18 @@ pub fn embedding_preferred_request_kind_with_control(
     })
 }
 
+fn offline_embedding_profile(
+    settings: &AdapterRuntimeSettings,
+    execution: LocalEmbeddingExecution,
+) -> Result<AdapterProfile> {
+    let declared = offline_embedding_declaration(settings)?;
+    if declared.tool_id.as_deref() == Some(GENERIC_LOCAL_EMBEDDING_TOOL_ID) {
+        Ok(LocalEmbeddingSpec::from_declaration(&declared)?.profile())
+    } else {
+        Ok(crate::local_embedding::profile_for(execution))
+    }
+}
+
 /// The active implementation's `AdapterProfile` — the source for
 /// `execution_mode`, `allow_network`, and `billable_kinds`, which the consent,
 /// ledger, and lane decisions all key off.
@@ -1514,20 +1531,7 @@ pub fn embedding_adapter_profile_with_control(
     }
     match execution {
         EmbeddingExecution::DeterministicEvaluator => Ok(DeterministicEmbeddingAdapter.profile()),
-        EmbeddingExecution::Offline(local) => {
-            let declared = settings.declared_adapter("embedding").ok_or_else(|| {
-                AdapterError::ConfigSchema(
-                    "the offline embedding adapter resolved without a declaration".to_owned(),
-                )
-            })?;
-            crate::tool_lock::validate_declared_runtime_target("embedding", &declared)?;
-            if declared.url.is_none() {
-                return Err(AdapterError::ConfigSchema(
-                    "an offline_api embedding adapter must declare `url`".to_owned(),
-                ));
-            }
-            Ok(crate::local_embedding::profile_for(local))
-        }
+        EmbeddingExecution::Offline(local) => offline_embedding_profile(settings, local),
         EmbeddingExecution::Online(AdoptedEmbeddingExecution::Real) => {
             let declared = settings.declared_adapter("embedding");
             if let Some(declared) = &declared {
@@ -1732,6 +1736,131 @@ impl GeminiEmbeddingClient for MockAdoptedEmbeddingClient {
 mod tests {
     use super::*;
     use crate::types::AdapterKind;
+
+    fn generic_local_tools(wire: &str) -> String {
+        format!(
+            "[embedding.local_embedding]\nkind = 'offline_api'\nurl = 'http://127.0.0.1:8080'\n\
+             model = 'local/model'\nmodel_version_pin = 'sha256:{}'\n\
+             chat_template_hash = 'sha256:{}'\ninstruction = ''\n{wire}",
+            "a".repeat(64),
+            "b".repeat(64)
+        )
+    }
+
+    #[test]
+    fn generic_local_embedding_requires_an_explicit_complete_wire_profile() {
+        use crate::tool_lock::validate_tools_toml;
+
+        assert!(validate_tools_toml(generic_local_tools("").as_bytes()).is_err());
+        assert!(
+            validate_tools_toml(generic_local_tools("wire_format = 'auto'").as_bytes()).is_err()
+        );
+        for wire in ["input", "messages"] {
+            let source = generic_local_tools(&format!("wire_format = '{wire}'"));
+            validate_tools_toml(source.as_bytes()).unwrap();
+            for required in [
+                "model",
+                "model_version_pin",
+                "chat_template_hash",
+                "instruction",
+                "url",
+                "kind",
+            ] {
+                let missing = source
+                    .lines()
+                    .filter(|line| !line.starts_with(&format!("{required} = ")))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(
+                    validate_tools_toml(missing.as_bytes()).is_err(),
+                    "{required}"
+                );
+            }
+        }
+        let source = generic_local_tools("wire_format = 'messages'");
+        for invalid in [
+            source.replace("127.0.0.1:8080", "example.test:8080"),
+            source.replace(&"a".repeat(64), "latest"),
+            source.replace(&"b".repeat(64), ""),
+            format!("{source}\nauth = 'env:NOT_CONSUMED'"),
+            format!("{source}\ntruncate_dimensions = 'true'"),
+            format!("{source}\n[embedding.gemini_embedding_2]"),
+        ] {
+            assert!(
+                validate_tools_toml(invalid.as_bytes()).is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn generic_local_embedding_identity_and_capabilities_follow_the_declaration() {
+        use crate::tool_lock::{declared_adapter_for_role, validate_tools_toml};
+
+        let descriptor = |source: &str| {
+            validate_tools_toml(source.as_bytes()).unwrap();
+            let value = toml::from_str(source).unwrap();
+            let mut settings = AdapterRuntimeSettings::default();
+            settings.declarations.insert(
+                "embedding".to_owned(),
+                declared_adapter_for_role(&value, "embedding").unwrap(),
+            );
+            let execution = active_embedding_execution(&settings).unwrap();
+            let profile = embedding_adapter_profile(&settings, execution).unwrap();
+            let descriptor = embedding_descriptor(&settings, execution).unwrap();
+            let locked = declared_embedding_profile_for(&settings, execution).unwrap();
+            assert_eq!(locked.tool_id, profile.adapter_id);
+            assert_eq!(locked.profile_hash, profile.tool_profile_hash);
+            let adapter = embedding_adapter_for(Arc::new(settings), execution).unwrap();
+            assert_eq!(
+                adapter.profile().tool_profile_hash,
+                profile.tool_profile_hash
+            );
+            assert_eq!(adapter.descriptor(), descriptor);
+            assert_eq!(profile.adapter_id, "local_embedding");
+            assert!(profile.billable_kinds.is_empty());
+            assert!(descriptor.capability.text);
+            assert!(!descriptor.effects.paid_authorization);
+            (profile, descriptor)
+        };
+        let input = generic_local_tools("wire_format = 'input'");
+        let messages = input.replace("'input'", "'messages'");
+        let (input_profile, input_descriptor) = descriptor(&input);
+        let (messages_profile, messages_descriptor) = descriptor(&messages);
+        assert!(
+            !input_profile
+                .capability_flags
+                .iter()
+                .any(|flag| flag == IMAGE_OBJECT_CAPABILITY)
+        );
+        assert!(input_descriptor.capability.image_mime_types.is_empty());
+        assert_eq!(
+            messages_descriptor.capability.image_mime_types,
+            ["image/png", "image/jpeg"]
+        );
+        assert_ne!(
+            input_profile.tool_profile_hash,
+            messages_profile.tool_profile_hash
+        );
+        for changed in [
+            messages.replace("local/model", "local/other"),
+            messages.replace(&"a".repeat(64), &"c".repeat(64)),
+            messages.replace(&"b".repeat(64), &"d".repeat(64)),
+            messages.replace("instruction = ''", "instruction = 'Represent this'"),
+            format!("{messages}\ntruncate_dimensions = true"),
+        ] {
+            assert_ne!(
+                descriptor(&changed).0.tool_profile_hash,
+                messages_profile.tool_profile_hash
+            );
+        }
+        assert_eq!(
+            descriptor(&messages.replace("127.0.0.1:8080", "localhost:9090/other"))
+                .0
+                .tool_profile_hash,
+            messages_profile.tool_profile_hash,
+        );
+    }
 
     #[test]
     fn embedding_attempt_keeps_factory_provenance_and_original_typed_error() {

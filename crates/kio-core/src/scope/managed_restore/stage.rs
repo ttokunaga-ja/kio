@@ -91,6 +91,7 @@ impl Repository {
         let capture = crate::platform::stage_operations::capture_name(&stage.identity)?;
         let entries =
             owner.inspect_stages(&[(leaf.clone().into(), stage.identity.clone())], &[])?;
+        let mut unidentified = None;
         for entry in entries {
             use crate::store_dir::StageEntryState;
             match entry.state {
@@ -101,16 +102,19 @@ impl Repository {
                 } => return Ok(true),
                 StageEntryState::Unidentified { reason }
                     if entry.name == leaf.as_str()
-                        || capture
-                            .as_ref()
-                            .is_some_and(|name| name.as_os_str() == entry.name) =>
+                        || capture.as_ref().is_some_and(|name| {
+                            crate::store_dir::capture_matches(Path::new(&entry.name), name)
+                        }) =>
                 {
-                    return Err(restore_incomplete(format!(
-                        "unverified restore stage: {reason}"
-                    )));
+                    unidentified = Some(reason);
                 }
                 _ => {}
             }
+        }
+        if let Some(reason) = unidentified {
+            return Err(restore_incomplete(format!(
+                "unverified restore stage: {reason}"
+            )));
         }
         Ok(false)
     }

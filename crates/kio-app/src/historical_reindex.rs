@@ -50,11 +50,9 @@ use kio_index::chunking::chunk_normalized_instance;
 use kio_index::fts::FtsSchemaConfig;
 use kio_index::fts::FtsTokenizer;
 use kio_index::fts::SqliteFtsIndex;
-use kio_pipeline::markdownize::NormalizedInstanceIdentity;
 use kio_pipeline::markdownize::NormalizedInstanceManifest;
 use kio_pipeline::markdownize::NormalizedUnitObject;
 use kio_pipeline::markdownize::UnitStatus;
-use kio_pipeline::markdownize::validate_normalized_instance;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -84,11 +82,11 @@ pub(super) struct ParsedReindex {
 /// than inferring completion from the subset of materialized `Done` units.
 /// Missing or corrupt pinned objects are errors; this never consults a mutable
 /// normalized-instance projection as a fallback.
-pub(super) fn pinned_manifest_and_units(
+pub(super) fn pinned_manifest(
     repo: &Repository,
     raw_hash: &str,
     normalize: &NormalizeRef,
-) -> Result<(NormalizedInstanceManifest, Vec<NormalizedUnitObject>)> {
+) -> Result<NormalizedInstanceManifest> {
     let manifest_hash = &normalize.manifest_hash;
     let store = repo.object_store();
     store
@@ -128,23 +126,7 @@ pub(super) fn pinned_manifest_and_units(
             "pinned manifest identity does not match its tree normalization reference",
         ));
     }
-    let selected_units =
-        kio_pipeline::markdownize::load_validated_normalized_units_from_manifest(&store, &manifest)
-            .map_err(pipeline_to_kio)?;
-    let identity = NormalizedInstanceIdentity {
-        raw_hash: raw_hash.to_owned(),
-        tool_profile_hash: normalize.tool_profile_hash.clone(),
-        r#gen: normalize.r#gen,
-    };
-    validate_normalized_instance(manifest_path, &identity, &manifest, &selected_units).map_err(
-        |error| {
-            crate::index::rebuild::store_corrupt_error(
-                manifest_path,
-                format!("pinned manifest/unit validation failed: {error}"),
-            )
-        },
-    )?;
-    Ok((manifest, selected_units))
+    Ok(manifest)
 }
 
 /// The immutable unit bodies this tree entry's PINNED manifest reports as
@@ -162,8 +144,28 @@ pub(super) fn pinned_done_units(
     raw_hash: &str,
     normalize: &NormalizeRef,
 ) -> Result<Vec<NormalizedUnitObject>> {
-    let (_, units) = pinned_manifest_and_units(repo, raw_hash, normalize)?;
-    Ok(units)
+    let manifest = pinned_manifest(repo, raw_hash, normalize)?;
+    kio_pipeline::markdownize::load_validated_normalized_units_from_manifest(
+        &repo.object_store(),
+        &manifest,
+    )
+    .map_err(pipeline_to_kio)
+}
+
+pub(super) fn visit_pinned_done_units(
+    repo: &Repository,
+    raw_hash: &str,
+    normalize: &NormalizeRef,
+    visit: impl FnMut(NormalizedUnitObject) -> kio_pipeline::Result<()>,
+) -> Result<()> {
+    let manifest = pinned_manifest(repo, raw_hash, normalize)?;
+    kio_pipeline::markdownize::visit_validated_normalized_units(
+        &repo.object_store(),
+        &manifest,
+        visit,
+    )
+    .map_err(pipeline_to_kio)?;
+    Ok(())
 }
 
 /// Whether the exact immutable pinned manifest is a completed normalization.
@@ -174,7 +176,13 @@ pub(super) fn pinned_manifest_is_complete(
     raw_hash: &str,
     normalize: &NormalizeRef,
 ) -> Result<bool> {
-    let (manifest, _) = pinned_manifest_and_units(repo, raw_hash, normalize)?;
+    let manifest = pinned_manifest(repo, raw_hash, normalize)?;
+    kio_pipeline::markdownize::visit_validated_normalized_units(
+        &repo.object_store(),
+        &manifest,
+        |_| Ok(()),
+    )
+    .map_err(pipeline_to_kio)?;
     Ok(!manifest.units.is_empty()
         && manifest
             .units
@@ -187,18 +195,20 @@ pub(super) fn pinned_manifest_is_complete(
 /// cache must never make an older pinned snapshot appear to contain new text.
 pub(super) fn merge_reindex_skips(
     report: &mut Step3RebuildReport,
-    reindex_skipped: Vec<SkippedUnit>,
-) {
+    reindex_skipped: kio_core::disk_records::DiskRecords<SkippedUnit>,
+) -> Result<()> {
     let seen: BTreeSet<String> = report
         .skipped_units
         .iter()
         .map(|entry| entry.raw_hash.clone())
         .collect();
     for skip in reindex_skipped {
+        let skip = skip?;
         if !seen.contains(&skip.raw_hash) {
             report.skipped_units.push(skip);
         }
     }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -272,18 +282,19 @@ fn retained_history_instances_from_graph(
     control: &ControlHandle,
 ) -> Result<Vec<RetainedNormalizedInstance>> {
     let mut all_paths_by_raw = BTreeMap::<String, BTreeSet<String>>::new();
-    for appearance in graph.bindings() {
-        all_paths_by_raw
-            .entry(appearance.binding.raw_hash)
-            .or_default()
-            .insert(appearance.binding.path);
+    let mut exact_bindings = BTreeSet::<TreeBinding>::new();
+    for node in graph.nodes_in_visit_order() {
+        for entry in &node.tree.entries {
+            let binding = TreeBinding::from(&entry?);
+            all_paths_by_raw
+                .entry(binding.raw_hash.clone())
+                .or_default()
+                .insert(binding.path.clone());
+            if binding.normalize.is_some() {
+                exact_bindings.insert(binding);
+            }
+        }
     }
-    let exact_bindings = graph
-        .bindings()
-        .into_iter()
-        .map(|appearance| appearance.binding)
-        .filter(|binding| binding.normalize.is_some())
-        .collect::<BTreeSet<TreeBinding>>();
     // PC37/PC41/PC43 (05 §1.6 L265-266): collect EVERY ancestor-most
     // introduction per exact binding (not just its own byte-min winner via
     // `canonical_introduction`) so a content identity reachable through
@@ -306,7 +317,7 @@ fn retained_history_instances_from_graph(
             normalize.r#gen,
             normalize.manifest_hash.clone(),
         );
-        let introductions = graph.ancestor_most_introductions(&binding);
+        let introductions = graph.ancestor_most_introductions(&binding)?;
         if introductions.is_empty() {
             return Err(KioError::schema(
                 "retained history binding has no introduction commit",
@@ -438,6 +449,7 @@ pub(super) fn run(
     // so cache both outcomes instead of reopening its receipts per alias.
     let mut historical_purge_decisions = BTreeMap::<String, bool>::new();
     for entry in &snapshot.tree.entries {
+        let entry = entry?;
         // R23-10 (05-runtime.md §3.5 L813/L934, AUD-08's shrunk finding):
         // `purge.read_tombstone(...).is_some()` blocked on marker EXISTENCE
         // (any tombstone at all, even a retired/resurrected one), not the
@@ -755,6 +767,7 @@ pub(super) fn run(
         rebuilt_chunks: appended.len() as u64,
         rebuilt_tree_entries: tree_entries.len() as u64,
         skipped_units,
+        enrichment_replay: None,
     };
     let response = HistoricalReindexResponse {
         status: "reindexed".to_owned(),
@@ -799,6 +812,7 @@ fn selected_history_introductions(
             continue;
         }
         for entry in &node.tree.entries {
+            let entry = entry?;
             let Some(normalize) = &entry.normalize else {
                 continue;
             };
@@ -887,12 +901,13 @@ fn project_selected_snapshot(
             match selected_unit_authorities.entry(key) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
                     entry.insert(AuthenticatedNormalizedUnit {
-                        markdown: unit.markdown,
+                        text: crate::index::rebuild::UnitText::Inline(unit.markdown),
                         introductions: instance.introductions.iter().cloned().collect(),
                     });
                 }
                 std::collections::btree_map::Entry::Occupied(mut entry) => {
-                    if entry.get().markdown != unit.markdown {
+                    if !matches!(&entry.get().text, crate::index::rebuild::UnitText::Inline(markdown) if markdown == &unit.markdown)
+                    {
                         return Err(KioError::schema(
                             "selected pinned manifests disagree on normalized unit markdown",
                         ));
@@ -1070,7 +1085,7 @@ mod tests {
         let commit = |label: &str, path: &str, parent: Option<String>| {
             let mut entry = TreeEntry::raw_file(path, raw_hash.clone()).unwrap();
             entry.normalize = Some(normalize.clone());
-            let tree = build_tree(vec![entry]).unwrap();
+            let tree = build_tree(&store.record_stages().unwrap(), vec![entry]).unwrap();
             let tree_hash = store
                 .write_json(ObjectKind::Tree, &serde_json::to_value(tree).unwrap())
                 .unwrap()

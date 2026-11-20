@@ -1,19 +1,15 @@
 //! Native Linux renderer state and bubblewrap command.
-use crate::confinement::{ConfinementError, RenderResourceLimits, canonical_paths};
+use crate::confinement::{ConfinementError, RenderResourceLimits, RenderSources, RendererStart};
 use crate::{BoundedProcessOptions, BoundedProcessOutput};
-use std::{
-    collections::BTreeMap,
-    ffi::OsString,
-    path::{Path, PathBuf},
-    process::Command,
-    time::Duration,
-};
+use std::{collections::BTreeMap, ffi::OsString, path::PathBuf, process::Command, time::Duration};
 
 #[derive(Debug, Clone)]
 pub(crate) struct NativeRenderSandbox {
     pub(super) program: PathBuf,
     pub(super) scratch: PathBuf,
     pub(super) runtime_mounts: Vec<(PathBuf, PathBuf)>,
+    pub(super) masked_runtime_source: Option<PathBuf>,
+    masked_runtime_directories: Vec<PathBuf>,
     pub(super) limits: RenderResourceLimits,
     #[cfg(test)]
     pub(super) test_fixture: super::confinement_cgroup::ConfinementFixture,
@@ -21,45 +17,46 @@ pub(crate) struct NativeRenderSandbox {
 
 impl NativeRenderSandbox {
     pub(crate) fn new(
-        program: &Path,
-        scratch: &Path,
-        runtime_roots: impl IntoIterator<Item = PathBuf>,
+        sources: &RenderSources,
+        scratch: PathBuf,
         limits: RenderResourceLimits,
-    ) -> Result<Self, ConfinementError> {
-        let paths = canonical_paths(program, scratch, runtime_roots)?;
+    ) -> Self {
         let mut mounts = BTreeMap::new();
-        for (destination, source) in paths.roots {
-            mounts.insert(destination, source);
+        for (destination, source) in &sources.roots {
+            mounts.insert(destination.clone(), source.clone());
         }
         // Selecting an executable authorizes that file, not its siblings.
         // A standalone renderer may live next to private source documents or
         // credentials; package directories must be supplied explicitly.
         mounts
-            .entry(paths.program.clone())
-            .or_insert_with(|| paths.program.clone());
-        Ok(Self {
-            program: paths.program,
-            scratch: paths.scratch,
+            .entry(sources.program.clone())
+            .or_insert_with(|| sources.program.clone());
+        Self {
+            program: sources.program.clone(),
+            scratch,
             runtime_mounts: mounts
                 .into_iter()
                 .map(|(destination, source)| (source, destination))
                 .collect(),
+            masked_runtime_source: sources.masked_runtime_directory().map(PathBuf::from),
+            masked_runtime_directories: sources.runtime_mask_destinations(),
             limits,
             #[cfg(test)]
             test_fixture: Default::default(),
-        })
+        }
     }
     pub(crate) fn run<I, S>(
         &self,
         args: I,
         environment: &[(OsString, OsString)],
         options: BoundedProcessOptions,
+        start: RendererStart<'_>,
     ) -> Result<BoundedProcessOutput, ConfinementError>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<std::ffi::OsStr>,
     {
-        super::confinement_cgroup::run(self, args, environment, options)
+        super::confinement_cgroup::run(self, args, environment, options, start)
     }
 
     pub(super) fn linux_command<I, S>(&self, args: I) -> Result<Command, ConfinementError>
@@ -84,6 +81,13 @@ impl NativeRenderSandbox {
         for (source, destination) in &self.runtime_mounts {
             command.arg("--ro-bind").arg(source).arg(destination);
         }
+        for directory in &self.masked_runtime_directories {
+            command
+                .arg("--tmpfs")
+                .arg(directory)
+                .arg("--remount-ro")
+                .arg(directory);
+        }
         command
             .arg("--bind")
             .arg(&self.scratch)
@@ -105,5 +109,74 @@ pub(crate) fn default_render_resource_limits() -> RenderResourceLimits {
         max_address_space_bytes: 2 * 1024 * 1024 * 1024,
         max_physical_memory_bytes: 0,
         max_file_bytes: 250 * 1024 * 1024,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn runtime_mask_covers_a_leaf_of_the_read_only_mount() {
+        let scratch = tempfile::tempdir().unwrap();
+        let root = scratch.path().canonicalize().unwrap();
+        let runtime = root.join("usr/lib");
+        let cache = runtime.join("libreoffice/program/__pycache__");
+        fs::create_dir_all(&cache).unwrap();
+        let program = std::env::current_exe().unwrap();
+        let alias = root.join("lib");
+        std::os::unix::fs::symlink("usr/lib", &alias).unwrap();
+        let sources = RenderSources::resolve(&program, [runtime.clone(), alias.clone()]).unwrap();
+        assert!(
+            sources
+                .clone()
+                .with_masked_runtime_directory(&root)
+                .is_err()
+        );
+
+        let sources = sources.with_masked_runtime_directory(&cache).unwrap();
+        let sandbox = NativeRenderSandbox::new(&sources, root, default_render_resource_limits());
+        let command = sandbox.linux_command([] as [&str; 0]).unwrap();
+        let args: Vec<_> = command.get_args().collect();
+        let mount = args
+            .windows(3)
+            .position(|part| {
+                part == [
+                    "--ro-bind".as_ref(),
+                    runtime.as_os_str(),
+                    runtime.as_os_str(),
+                ]
+            })
+            .unwrap();
+        let mask = args
+            .windows(4)
+            .position(|part| {
+                part == [
+                    "--tmpfs".as_ref(),
+                    cache.as_os_str(),
+                    "--remount-ro".as_ref(),
+                    cache.as_os_str(),
+                ]
+            })
+            .unwrap();
+        assert!(mount < mask);
+        let alias_mount = args
+            .windows(3)
+            .position(|part| part == ["--ro-bind".as_ref(), runtime.as_os_str(), alias.as_os_str()])
+            .unwrap();
+        let alias_cache = alias.join("libreoffice/program/__pycache__");
+        let alias_mask = args
+            .windows(4)
+            .position(|part| {
+                part == [
+                    "--tmpfs".as_ref(),
+                    alias_cache.as_os_str(),
+                    "--remount-ro".as_ref(),
+                    alias_cache.as_os_str(),
+                ]
+            })
+            .expect("the same backing directory must be masked at the alias");
+        assert!(alias_mount < alias_mask);
     }
 }

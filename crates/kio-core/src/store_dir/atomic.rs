@@ -459,7 +459,11 @@ pub(super) fn parent_removal(
     // Never touch a public destination during acknowledgement. A new external
     // file may have appeared since quarantine and must remain untouched.
     if workspace.contains_entry(Path::new(REMOVED))? {
-        let mut file = workspace.open_regular_for_removal(Path::new(REMOVED), intent.max_bytes)?;
+        let mut file = workspace.open_regular_for_removal(
+            Path::new(REMOVED),
+            intent.max_bytes,
+            intent.stage_identity.is_some(),
+        )?;
         if let Some(identity) = &intent.stage_identity {
             identity.verify(&file)?;
         }
@@ -516,6 +520,22 @@ pub(super) fn recover(owner: &StoreDirectory, allowed_targets: &[&StoreDirectory
     recover_locked(owner, &workspace, allowed_targets, false)
 }
 
+fn write_artifact(file: &mut File, bytes: &[u8]) -> Result<()> {
+    file.write_all(bytes)
+        .map_err(|error| io_failure("cannot write atomic publication artifact", error))
+}
+
+pub(super) fn write_stream(
+    owner: &StoreDirectory,
+    relative: &Path,
+    publication: Publication,
+    write: impl FnOnce(&mut File) -> Result<()>,
+) -> Result<()> {
+    write_with_readonly(owner, owner, relative, write, publication, false, |_, _| {
+        Ok(())
+    })
+}
+
 pub(super) fn write(
     owner: &StoreDirectory,
     target: &StoreDirectory,
@@ -523,11 +543,23 @@ pub(super) fn write(
     bytes: &[u8],
     publication: Publication,
 ) -> Result<()> {
+    write_with(owner, target, relative, publication, |file| {
+        file.write_all(bytes)
+    })
+}
+
+pub(super) fn write_with(
+    owner: &StoreDirectory,
+    target: &StoreDirectory,
+    relative: &Path,
+    publication: Publication,
+    write: impl FnOnce(&mut dyn Write) -> std::io::Result<()>,
+) -> Result<()> {
     write_with_readonly(
         owner,
         target,
         relative,
-        bytes,
+        |file| write(file).map_err(|e| io_failure("cannot write atomic publication artifact", e)),
         publication,
         false,
         |_, _| Ok(()),
@@ -545,7 +577,7 @@ pub(super) fn write_checked(
         owner,
         owner,
         relative,
-        bytes,
+        |file| write_artifact(file, bytes),
         publication,
         false,
         before_publish,
@@ -557,7 +589,7 @@ pub(super) fn write_readonly(owner: &StoreDirectory, relative: &Path, bytes: &[u
         owner,
         owner,
         relative,
-        bytes,
+        |file| write_artifact(file, bytes),
         Publication::CreateOnly,
         true,
         |_, _| Ok(()),
@@ -568,7 +600,7 @@ fn write_with_readonly(
     owner: &StoreDirectory,
     target: &StoreDirectory,
     relative: &Path,
-    bytes: &[u8],
+    write: impl FnOnce(&mut File) -> Result<()>,
     publication: Publication,
     readonly: bool,
     before_publish: impl FnOnce(&StoreDirectory, &Path) -> Result<()>,
@@ -583,9 +615,7 @@ fn write_with_readonly(
     let (parent, leaf, _) = parent_chain(target, relative)?;
     same_volume(&workspace, &parent)?;
     let mut staged = workspace.create_private_file(Path::new(WRITE))?;
-    staged
-        .write_all(bytes)
-        .map_err(|e| io_failure("cannot write atomic publication artifact", e))?;
+    write(&mut staged)?;
     if readonly {
         let mut permissions = staged
             .metadata()
@@ -605,11 +635,14 @@ fn write_with_readonly(
         .control()
         .checkpoint(crate::durability::DurabilityPoint::AtomicWriteStaged)?;
     before_publish(&parent, Path::new(&leaf))?;
-    if let Err(error) = workspace.rename_regular_between_raw(
+    if let Err(error) = crate::platform::store::rename_regular_between_unsynced(
+        &workspace.root_handle(),
         Path::new(WRITE),
-        &parent,
+        &parent.root_handle(),
         Path::new(&leaf),
         publication,
+        workspace.path(),
+        parent.path(),
     ) {
         if readonly {
             remove_if_present(&workspace, WRITE)?;
@@ -617,8 +650,11 @@ fn write_with_readonly(
         }
         return Err(error);
     }
-    workspace.sync()?;
+    owner
+        .control()
+        .checkpoint(crate::durability::DurabilityPoint::AtomicWriteBeforeDirectorySync)?;
     parent.sync()?;
+    workspace.sync()?;
     owner
         .control()
         .checkpoint(crate::durability::DurabilityPoint::AtomicWritePublished)
@@ -698,7 +734,8 @@ pub(super) fn remove_hash_checked(
     let _ = recover_locked(owner, &workspace, &[target], false)?;
     let (parent, leaf, chain) = parent_chain(target, relative)?;
     same_volume(&workspace, &parent)?;
-    let mut source = parent.open_regular_for_removal(Path::new(&leaf), max_bytes)?;
+    let mut source =
+        parent.open_regular_for_removal(Path::new(&leaf), max_bytes, stage_identity.is_some())?;
     crate::platform::atomic_semantics::verify_removal_owner(&source)?;
     verify(&source)?;
     let source_id = file_id(&source)?;
@@ -797,7 +834,11 @@ fn recover_locked(
     }
     same_volume(workspace, &parent)?;
     let source = if parent.contains_entry(Path::new(&leaf))? {
-        Some(parent.open_regular_for_removal(Path::new(&leaf), intent.max_bytes)?)
+        Some(parent.open_regular_for_removal(
+            Path::new(&leaf),
+            intent.max_bytes,
+            intent.stage_identity.is_some(),
+        )?)
     } else {
         None
     };

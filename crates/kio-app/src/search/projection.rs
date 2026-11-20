@@ -1,9 +1,10 @@
 use crate::embedding::input::authorized_local_image_object_hash;
-use crate::historical_reindex::pinned_done_units;
 use crate::historical_reindex::retained_history_instances;
+use crate::historical_reindex::visit_pinned_done_units;
 use crate::image_authority;
 use crate::index::chunk_ledger::rotate_index_generation_unconditionally;
 use crate::index::chunk_ledger::sqlite_path;
+use crate::index::rebuild::RebuildAuthorities;
 use crate::invocation::Invocation;
 use crate::object_persistence::index_to_kio;
 use crate::scope_access::purge_blocks_rebuild_raw;
@@ -334,6 +335,7 @@ fn collect_scope_projection(
     scope_id: &str,
     completed_at_snapshots: &BTreeSet<String>,
     requested_at_snapshots: &[&str],
+    rebuild: Option<&RebuildAuthorities>,
     control: &ControlHandle,
 ) -> Result<ScopeProjection> {
     let db = kio_dir.join("index/sqlite.db");
@@ -382,7 +384,10 @@ fn collect_scope_projection(
         });
     };
     let image_policy = current_embedding_policy(repo)?;
-    let retained_images = retained_history_instances(repo, &head)?;
+    let mut retained_images = retained_history_instances(repo, &head)?;
+    if let Some(rebuild) = rebuild {
+        retained_images.retain(|instance| !rebuild.excludes(instance));
+    }
     let image_authority =
         image_authority::retained_image_authority(repo, &retained_images, &image_policy)?;
 
@@ -407,6 +412,7 @@ fn collect_scope_projection(
         "current",
         max_rowid,
         max_association_rowid,
+        rebuild,
     )?;
 
     // `--all-history` and `--since` share one visibility relation; the latter
@@ -426,6 +432,7 @@ fn collect_scope_projection(
                 "all_history",
                 max_rowid,
                 max_association_rowid,
+                rebuild,
             )?);
             completions.push(kio_index::aggregator::AggProjectionCompletion {
                 selector: kio_index::aggregator::AggSelector::AllHistory,
@@ -447,6 +454,7 @@ fn collect_scope_projection(
                 "include_deleted",
                 max_rowid,
                 max_association_rowid,
+                rebuild,
             )?);
             completions.push(kio_index::aggregator::AggProjectionCompletion {
                 selector: kio_index::aggregator::AggSelector::IncludeDeleted,
@@ -520,6 +528,7 @@ fn collect_scope_projection(
             "at",
             max_rowid,
             max_association_rowid,
+            rebuild,
         )?);
         completions.push(kio_index::aggregator::AggProjectionCompletion {
             selector: kio_index::aggregator::AggSelector::At,
@@ -712,6 +721,7 @@ fn projection_bindings_for_plan(
     selector_kind: &str,
     max_rowid: u64,
     max_association_rowid: u64,
+    rebuild: Option<&RebuildAuthorities>,
 ) -> Result<Vec<kio_index::aggregator::AggBinding>> {
     let kio_dir = repo.kio_dir();
     // Purge visibility is authoritative over immutable history.  Filter a
@@ -750,15 +760,19 @@ fn projection_bindings_for_plan(
             r#gen: key.r#gen,
             manifest_hash: key.manifest_hash.clone(),
         };
-        match pinned_done_units(repo, &binding.raw_hash, &normalize) {
-            Ok(done) => {
-                let done = done
-                    .into_iter()
-                    .map(|unit| {
-                        let content_hash = kio_core::cas::hash_bytes(unit.markdown.as_bytes());
-                        Ok((unit.unit_key, content_hash))
-                    })
-                    .collect::<Result<BTreeSet<_>>>()?;
+        if rebuild.is_some_and(|rebuild| rebuild.excludes_pin(&binding.raw_hash, &normalize)) {
+            continue;
+        }
+        let mut done = BTreeSet::new();
+        let verified = visit_pinned_done_units(repo, &binding.raw_hash, &normalize, |unit| {
+            done.insert((
+                unit.unit_key,
+                kio_core::cas::hash_bytes(unit.markdown.as_bytes()),
+            ));
+            Ok(())
+        });
+        match verified {
+            Ok(()) => {
                 done_units.insert(key.clone(), done);
             }
             Err(error) => {
@@ -1088,7 +1102,7 @@ pub(crate) fn write_through_projection_full(
     kio_dir: &Path,
     control: &kio_core::control::ControlHandle,
 ) -> std::result::Result<(), String> {
-    write_through_projection_inner(kio_dir, None, &[], false, control)
+    write_through_projection_inner(kio_dir, None, &[], false, None, control)
 }
 
 /// Writer-side variant for an operation that explicitly resolved one or more
@@ -1101,7 +1115,7 @@ pub(crate) fn write_through_projection_with_requested_at(
     requested_at_snapshots: &[&str],
     control: &kio_core::control::ControlHandle,
 ) -> std::result::Result<(), String> {
-    write_through_projection_inner(kio_dir, None, requested_at_snapshots, true, control)
+    write_through_projection_inner(kio_dir, None, requested_at_snapshots, true, None, control)
 }
 
 fn write_through_projection_inner(
@@ -1109,6 +1123,7 @@ fn write_through_projection_inner(
     repository: Option<&Repository>,
     requested_at_snapshots: &[&str],
     preserve_completed_at: bool,
+    rebuild: Option<&RebuildAuthorities>,
     control: &ControlHandle,
 ) -> std::result::Result<(), String> {
     let Some((scope_id, generation)) = replica_scope_stamp(kio_dir) else {
@@ -1128,7 +1143,7 @@ fn write_through_projection_inner(
     let mut replica =
         kio_index::aggregator::Aggregator::open_with_control(&aggregator_path(control), control)
             .map_err(|error| format!("write-through open failed: {error}"))?;
-    let completed_at_snapshots = if preserve_completed_at {
+    let mut completed_at_snapshots: BTreeSet<String> = if preserve_completed_at {
         replica
             .completed_projection_snapshots(&scope_id, kio_index::aggregator::AggSelector::At)
             .map_err(|error| format!("write-through completed At read {scope_id} failed: {error}"))?
@@ -1137,12 +1152,27 @@ fn write_through_projection_inner(
     } else {
         BTreeSet::new()
     };
+    // Recompute previously published snapshot bindings when a pin is excluded.
+    // Keeping them would preserve stale bindings to an unauthenticated unit.
+    let preserve_completed_at =
+        preserve_completed_at && !rebuild.is_some_and(RebuildAuthorities::has_exclusions);
+    let prior_at = if preserve_completed_at {
+        BTreeSet::new()
+    } else {
+        std::mem::take(&mut completed_at_snapshots)
+    };
+    let requested_at_snapshots = requested_at_snapshots
+        .iter()
+        .copied()
+        .chain(prior_at.iter().map(String::as_str))
+        .collect::<Vec<_>>();
     let projection = collect_scope_projection(
         kio_dir,
         repository,
         &scope_id,
         &completed_at_snapshots,
-        requested_at_snapshots,
+        &requested_at_snapshots,
+        rebuild,
         control,
     )
     .map_err(|error| format!("write-through read {scope_id} failed: {error}"))?;
@@ -1185,15 +1215,17 @@ fn write_through_projection_inner(
         .map_err(|error| format!("write-through durable checkpoint failed: {error}"))
 }
 
-/// [`write_through_projection`] for the callers that treat a lost cache write
-/// as survivable — every one except purge.
-pub(crate) fn write_through_projection_or_log(ctx: &Invocation<'_>, kio_dir: &Path) {
-    write_through_projection_or_log_with_requested_at(ctx, kio_dir, &[]);
+pub(crate) fn write_through_projection_or_log_for_repo(ctx: &Invocation<'_>, repo: &Repository) {
+    write_through_repository_projection(ctx, repo, None);
 }
 
-pub(crate) fn write_through_projection_or_log_for_repo(ctx: &Invocation<'_>, repo: &Repository) {
+pub(crate) fn write_through_repository_projection(
+    ctx: &Invocation<'_>,
+    repo: &Repository,
+    rebuild: Option<&RebuildAuthorities>,
+) {
     if let Err(reason) =
-        write_through_projection_inner(repo.kio_dir(), Some(repo), &[], true, ctx.control)
+        write_through_projection_inner(repo.kio_dir(), Some(repo), &[], true, rebuild, ctx.control)
     {
         log_aggregator_degraded(ctx, &reason);
         mark_replica_unavailable_or_log(ctx, repo.kio_dir());
@@ -1440,18 +1472,25 @@ pub(crate) fn capture_ready_replica_snapshot(repo: &Repository) -> Option<ReadyR
 /// (the normal manual form) or byte-for-byte the prior reference.  Any new or
 /// changed normalization identity remains a normal unindexed snapshot and
 /// therefore stays Rebuilding.
-fn manual_snapshot_tree_matches_ready_projection(prior: &TreeObject, target: &TreeObject) -> bool {
-    prior.entries.len() == target.entries.len()
-        && prior
-            .entries
-            .iter()
-            .zip(&target.entries)
-            .all(|(prior, target)| {
-                prior.path == target.path
-                    && prior.entry_type == target.entry_type
-                    && prior.raw_hash == target.raw_hash
-                    && (target.normalize.is_none() || target.normalize == prior.normalize)
-            })
+fn manual_snapshot_tree_matches_ready_projection(
+    prior: &TreeObject,
+    target: &TreeObject,
+) -> Result<bool> {
+    if prior.entries.len() != target.entries.len() {
+        return Ok(false);
+    }
+    for (prior, target) in prior.entries.iter().zip(&target.entries) {
+        let prior = prior?;
+        let target = target?;
+        if prior.path != target.path
+            || prior.entry_type != target.entry_type
+            || prior.raw_hash != target.raw_hash
+            || !(target.normalize.is_none() || target.normalize == prior.normalize)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Read the exact current-tree relation a Ready source projection uses.  This
@@ -1491,22 +1530,21 @@ fn source_tree_entry_projections(
 /// Ready predecessor is reusable only when its source cache says exactly this
 /// relation; a fallback row inferred from mutable latest-normalize state
 /// is deliberately not promoted through a new snapshot.
-fn normalized_tree_entry_projections(tree: &TreeObject) -> Vec<TreeEntryProjection> {
-    tree.entries
-        .iter()
-        .filter_map(|entry| {
-            entry
-                .normalize
-                .as_ref()
-                .map(|normalize| TreeEntryProjection {
-                    path: entry.path.clone(),
-                    raw_hash: entry.raw_hash.clone(),
-                    tool_profile_hash: Some(normalize.tool_profile_hash.clone()),
-                    r#gen: Some(normalize.r#gen),
-                    manifest_hash: Some(normalize.manifest_hash.clone()),
-                })
-        })
-        .collect()
+fn normalized_tree_entry_projections(tree: &TreeObject) -> Result<Vec<TreeEntryProjection>> {
+    let mut rows = Vec::new();
+    for entry in &tree.entries {
+        let entry = entry?;
+        if let Some(normalize) = entry.normalize {
+            rows.push(TreeEntryProjection {
+                path: entry.path,
+                raw_hash: entry.raw_hash,
+                tool_profile_hash: Some(normalize.tool_profile_hash),
+                r#gen: Some(normalize.r#gen),
+                manifest_hash: Some(normalize.manifest_hash),
+            });
+        }
+    }
+    Ok(rows)
 }
 
 /// Reuse a just-prior Ready projection after a semantically unchanged manual
@@ -1581,7 +1619,9 @@ pub(crate) fn republish_equivalent_manual_snapshot(
     let target_tree = repo
         .read_tree(&target_commit.tree)
         .map_err(|error| format!("read target tree: {error}"))?;
-    if !manual_snapshot_tree_matches_ready_projection(&prior_tree, &target_tree) {
+    if !manual_snapshot_tree_matches_ready_projection(&prior_tree, &target_tree)
+        .map_err(|error| error.to_string())?
+    {
         return Ok(false);
     }
 
@@ -1604,7 +1644,8 @@ pub(crate) fn republish_equivalent_manual_snapshot(
         return Ok(false);
     }
 
-    let expected = normalized_tree_entry_projections(&prior_tree);
+    let expected =
+        normalized_tree_entry_projections(&prior_tree).map_err(|error| error.to_string())?;
     let source_rows = source_tree_entry_projections(&conn, &before.snapshot_commit)
         .map_err(|error| format!("read prior source tree entries: {error}"))?;
     if source_rows != expected {
@@ -1667,10 +1708,12 @@ pub(crate) fn republish_equivalent_manual_snapshot(
 /// still reaches the same full writer-side projection.
 pub(crate) fn publish_in_place_delta(
     ctx: &Invocation<'_>,
-    kio_dir: &Path,
+    repo: &Repository,
     before: Option<&str>,
     delta: &kio_index::aggregator::ScopeDelta,
+    rebuild: Option<&RebuildAuthorities>,
 ) -> Result<()> {
+    let kio_dir = repo.kio_dir();
     if delta.is_empty() {
         return Ok(());
     }
@@ -1702,7 +1745,7 @@ pub(crate) fn publish_in_place_delta(
             // source sqlite database to fill those gaps. Publish the complete
             // projection before returning to a reader.
             drop(replica);
-            write_through_projection_or_log(ctx, kio_dir);
+            write_through_repository_projection(ctx, repo, rebuild);
         }
         Err(error) => {
             log_aggregator_degraded(

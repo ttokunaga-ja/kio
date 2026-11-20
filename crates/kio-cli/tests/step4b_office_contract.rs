@@ -389,8 +389,18 @@ fn office_03_online_send_uses_converted_pdf() {
     let fixtures = tempfile::tempdir().unwrap();
     let fixture =
         write_office_fixture_pdf(&fixtures, "fixture_c.pdf", &["office03 online send text"]);
-    write_office_input(&dir, "report.docx");
+    let prepared_size = fs::metadata(&fixture).unwrap().len();
+    fs::write(
+        dir.path().join("report.docx"),
+        vec![b'x'; prepared_size as usize + 1],
+    )
+    .unwrap();
     init(&dir);
+    fs::write(
+        dir.path().join(".kio/config.toml"),
+        format!("[adapter.policy]\nmax_input_bytes = {prepared_size}\n"),
+    )
+    .unwrap();
     kio(&dir, &["ledger", "init"]).assert().success();
 
     kio(&dir, &["index", "--yes"])
@@ -552,19 +562,23 @@ fn office_unavailable_reports_reason_and_keeps_text_search() {
             .stdout
             .clone();
         let value: Value = serde_json::from_slice(&output).unwrap();
-        let readiness = if args[0] == "status" {
-            &value["office_readiness"]
+        if args[0] == "status" {
+            let readiness = &value["office_readiness"];
+            assert_eq!(readiness["state"], "missing", "{value}");
+            assert!(
+                readiness["alternatives"]
+                    .as_str()
+                    .unwrap()
+                    .contains("search")
+            );
         } else {
-            &value["index_status"]["office_readiness"]
-        };
-        assert_eq!(readiness["state"], "missing", "{value}");
-        assert!(
-            readiness["alternatives"]
-                .as_str()
-                .unwrap()
-                .contains("search")
-        );
-        if args[0] == "search" {
+            assert!(
+                value["index_status"].get("office_readiness").is_none(),
+                "{value}"
+            );
+            let unavailable = &value["index_status"]["office_conversion_unavailable"];
+            assert_eq!(unavailable["count"], 1, "{value}");
+            assert_eq!(unavailable["files"][0]["path"], "report.docx", "{value}");
             assert!(!value["results"].as_array().unwrap().is_empty(), "{value}");
         }
         let output = kio(&dir, args)
@@ -575,10 +589,14 @@ fn office_unavailable_reports_reason_and_keeps_text_search() {
             .stdout
             .clone();
         let text = String::from_utf8(output).unwrap();
-        assert!(
-            text.contains("Office: missing") && text.contains("searchable"),
-            "{text}"
-        );
+        if args[0] == "status" {
+            assert!(
+                text.contains("Office: missing") && text.contains("searchable"),
+                "{text}"
+            );
+        } else {
+            assert!(!text.contains("Office:"), "{text}");
+        }
     }
 }
 
@@ -676,26 +694,28 @@ fn office_isolation_component_faults_reach_cli_without_blocking_extraction_or_se
                     }
                     let output = command.assert().success().get_output().stdout.clone();
                     let text = String::from_utf8(output).unwrap();
-                    assert!(
-                        text.contains(&format!("{expected} is {state}")),
-                        "{fault}: {text}"
-                    );
-                    assert!(
-                        text.contains("PDF text layer")
-                            && text.contains("XLSX")
-                            && text.contains("searchable"),
-                        "{text}"
-                    );
+                    if args[0] == "status" {
+                        assert!(
+                            text.contains(&format!("{expected} is {state}")),
+                            "{fault}: {text}"
+                        );
+                        assert!(
+                            text.contains("PDF text layer")
+                                && text.contains("XLSX")
+                                && text.contains("searchable"),
+                            "{text}"
+                        );
+                    } else {
+                        assert!(
+                            !text.contains(&format!("{expected} is {state}")),
+                            "{fault}: {text}"
+                        );
+                    }
                     if json {
                         let value: Value = serde_json::from_str(&text).unwrap();
-                        let readiness = if args[0] == "status" {
-                            &value["office_readiness"]
-                        } else {
-                            &value["index_status"]["office_readiness"]
-                        };
-                        // The renderer was found; its required isolation component is unavailable.
-                        assert_eq!(readiness["state"], "unusable", "{value}");
                         if args[0] == "status" {
+                            // The renderer was found; its required isolation component is unavailable.
+                            assert_eq!(value["office_readiness"]["state"], "unusable", "{value}");
                             assert!(
                                 markdownize_tasks_for(&value, "report.docx").is_empty(),
                                 "{value}"
@@ -708,6 +728,10 @@ fn office_isolation_component_faults_reach_cli_without_blocking_extraction_or_se
                             );
                         }
                         if args[0] == "search" {
+                            assert!(
+                                value["index_status"].get("office_readiness").is_none(),
+                                "{value}"
+                            );
                             assert_eq!(
                                 value["index_status"]["office_conversion_unavailable"]["count"], 1,
                                 "{value}"
@@ -1181,4 +1205,88 @@ fn office_07_scanned_pdf_done_instance_is_not_drift() {
         "an empty fresh prepare must never drive a gen+1: {gens:?}"
     );
     assert!(gens[0].ends_with(".g0"), "{gens:?}");
+}
+
+#[test]
+fn p0_office_rejects_oversized_converted_input_before_send() {
+    let dir = canonical_tempdir();
+    let fixtures = tempfile::tempdir().unwrap();
+    let fixture =
+        write_office_fixture_pdf(&fixtures, "larger.pdf", &["converted budget boundary text"]);
+    let cap = fs::metadata(&fixture).unwrap().len() - 1;
+    fs::write(dir.path().join("report.docx"), b"small original").unwrap();
+    init(&dir);
+    fs::write(
+        dir.path().join(".kio/config.toml"),
+        format!("[adapter.policy]\nmax_input_bytes = {cap}\n"),
+    )
+    .unwrap();
+    kio(&dir, &["ledger", "init"]).assert().success();
+    kio(&dir, &["index", "--yes"])
+        .env(TEST_OFFICE_CONVERT_ENV, &fixture)
+        .env(TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "mock")
+        .assert()
+        .success();
+    kio(&dir, &["adapter", "approve", "--all", "--yes"])
+        .assert()
+        .success();
+    let capture = dir.path().join("captured-sent-media.txt");
+    kio(&dir, &["batch", "resume"])
+        .env(TEST_OFFICE_CONVERT_ENV, &fixture)
+        .env(TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "mock")
+        .env("KIO_TEST_CAPTURE_SENT_MEDIA", &capture)
+        .assert()
+        .code(4);
+    assert!(!capture.exists());
+    let status = json_success(&dir, &["status"]);
+    assert!(
+        markdownize_tasks_for(&status, "report.docx")
+            .iter()
+            .any(|task| task["status"] == "failed" && task["fallback_reason"] == "invalid_input"),
+        "{status}"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn p0_renderer_drift_storage_failure_is_resumable() {
+    let dir = canonical_tempdir();
+    let fixtures = tempfile::tempdir().unwrap();
+    let before = write_office_fixture_pdf(&fixtures, "before.pdf", &["ALPHA previous rendering"]);
+    let after = write_office_fixture_pdf(&fixtures, "after.pdf", &["BETA replacement rendering"]);
+    write_office_input(&dir, "report.docx");
+    init(&dir);
+    kio(&dir, &["index"])
+        .env(TEST_OFFICE_CONVERT_ENV, &before)
+        .assert()
+        .success();
+
+    kio(&dir, &["index"])
+        .env(TEST_OFFICE_CONVERT_ENV, &after)
+        .env("KIO_TEST_DURABILITY_POINT", "extraction_before_manifest")
+        .env("KIO_TEST_DURABILITY_STORAGE_FAULT", "1")
+        .assert()
+        .code(3);
+    assert_eq!(
+        json_success(&dir, &["status"])["paused_by_hold_reason"]["resource_limit"],
+        1
+    );
+    let units_root = dir.path().join(".kio/objects/normalized_units");
+    assert_eq!(gen_dir_names_under(&units_root).len(), 1);
+
+    kio(&dir, &["batch", "retry", "--offline"])
+        .env(TEST_OFFICE_CONVERT_ENV, &after)
+        .assert()
+        .success();
+    assert_eq!(
+        json_success(&dir, &["status"])["paused_by_hold_reason"]["resource_limit"],
+        0
+    );
+    assert_eq!(gen_dir_names_under(&units_root).len(), 2);
+    assert!(
+        !json_success(&dir, &["search", "BETA", "--mode", "text"])["results"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
 }

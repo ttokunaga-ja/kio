@@ -1,5 +1,4 @@
-use super::gc_retirement::GC_RETIRE_SENTINEL;
-use crate::cas::{CasReadAccess, MAX_TREE_OBJECT_BYTES};
+use crate::cas::CasReadAccess;
 use crate::error::Result;
 use crate::gc::{
     FileObservation, GcInProgressMarker, SnapshotExchangeAuthority, corrupt,
@@ -67,32 +66,40 @@ pub(crate) fn recover_snapshot_state(
     reject_pending_snapshot_state_exchange(kio, control)
 }
 pub(crate) fn marker_archive_presence(
+    record_stages: &crate::disk_records::RecordStageRoot,
     reads: &CasReadAccess,
     archives: &File,
     archive: &str,
     captured_name: &str,
-    validate_bytes: impl Fn(&[u8]) -> Result<()>,
+    expected_size: u64,
+    validate_observation: impl Fn(&FileObservation) -> Result<()>,
 ) -> Result<(bool, bool)> {
     Ok(
-        match crate::gc::read_cas_regular_observed(reads, archives, archive, MAX_TREE_OBJECT_BYTES)
-        {
-            Ok((sentinel, _)) if sentinel == GC_RETIRE_SENTINEL => {
-                match crate::gc::read_cas_regular_observed(
+        match crate::gc::read_tree_archive_observed(
+            record_stages,
+            reads,
+            archives,
+            archive,
+            expected_size.max(64),
+        ) {
+            Ok((None, _)) => {
+                match crate::gc::read_cas_tree_observed(
+                    record_stages,
                     reads,
                     archives,
                     captured_name,
-                    MAX_TREE_OBJECT_BYTES,
+                    expected_size.max(64),
                 ) {
-                    Ok((bytes, _)) => {
-                        validate_bytes(&bytes)?;
+                    Ok((_, observation)) => {
+                        validate_observation(&observation)?;
                         (false, true)
                     }
                     Err(error) if is_io_not_found(&error) => (false, false),
                     Err(error) => return Err(error),
                 }
             }
-            Ok((bytes, _)) => {
-                validate_bytes(&bytes)?;
+            Ok((Some(_), observation)) => {
+                validate_observation(&observation)?;
                 (true, false)
             }
             Err(error) if is_io_not_found(&error) => (false, false),

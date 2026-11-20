@@ -5,6 +5,10 @@ use std::sync::Arc;
 use kio_core::Result;
 
 pub trait Interaction: Send + Sync {
+    #[cfg(debug_assertions)]
+    fn working_scan_started(&self) {}
+    #[cfg(debug_assertions)]
+    fn working_scan_published(&self) {}
     fn confirm(&self, summary: &str) -> Result<bool>;
     fn read_input(&self, max_bytes: usize) -> Result<Vec<u8>>;
     fn is_interactive(&self) -> bool;

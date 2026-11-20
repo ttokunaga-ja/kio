@@ -258,6 +258,53 @@ impl StageWriter {
             .map_err(|e| stage_io("cannot protect stage", e))
     }
 
+    /// Publish a previously synced stage after releasing its write handle.
+    /// The saved physical identity and nonce remain the authority, including
+    /// when an OS has reused a file ID while the handle was closed.
+    pub(crate) fn publish_saved(
+        directory: &StoreDirectory,
+        source: &Path,
+        identity: &StageIdentity,
+        target: &StoreDirectory,
+        leaf: &Path,
+    ) -> Result<()> {
+        Self::publish_saved_with(
+            directory,
+            source,
+            identity,
+            target,
+            leaf,
+            Publication::CreateOnly,
+        )
+    }
+
+    pub(crate) fn publish_saved_with(
+        directory: &StoreDirectory,
+        source: &Path,
+        identity: &StageIdentity,
+        target: &StoreDirectory,
+        leaf: &Path,
+        publication: Publication,
+    ) -> Result<()> {
+        if super::relative_components(source, false, directory.path())?.len() != 1
+            || super::relative_components(leaf, false, target.path())?.len() != 1
+        {
+            return Err(failure("saved stage publication requires direct leaves"));
+        }
+        let file = crate::platform::stage_operations::open_file(directory, source)?;
+        crate::private_fs::verify_private_regular_file_handle(&file)?;
+        identity.verify(&file)?;
+        crate::platform::stage_operations::publish(
+            directory,
+            source,
+            &file,
+            target,
+            leaf,
+            publication,
+            identity,
+        )
+    }
+
     /// Sync and publish only this file. The caller retires its durable journal
     /// after publication; an absent stage on recovery never authorizes deletion
     /// of the public destination.
@@ -299,9 +346,7 @@ impl StageWriter {
             leaf,
             publication,
             &identity,
-        )?;
-        directory.sync()?;
-        target.sync()
+        )
     }
 }
 
@@ -359,6 +404,76 @@ impl StoreDirectory {
                 crate::platform::stage_operations::discard_empty_directory(self, leaf, &handle),
             )),
         }
+    }
+
+    /// Publish an immutable, journaled file or adopt its verified destination.
+    /// In both cases the destination directory is synced before reclaiming the stage.
+    pub fn publish_or_adopt_stage(
+        &self,
+        target: &StoreDirectory,
+        leaf: &Path,
+        source: Option<(&Path, &StageIdentity)>,
+        verify: impl FnOnce(&mut File) -> Result<()>,
+    ) -> Result<bool> {
+        if super::relative_components(leaf, false, target.path())?.len() != 1 {
+            return Err(failure(
+                "stage publication destination must be a direct leaf",
+            ));
+        }
+        if target.contains_entry(leaf)? {
+            target.ensure_owner_private(leaf)?;
+            let mut file = target.open_regular_read(leaf, u64::MAX)?;
+            verify(&mut file)?;
+            target.sync_stage_destination()?;
+            if let Some((source, identity)) = source {
+                self.discard_stage(source, identity)?;
+            }
+        } else if let Some((source, identity)) = source {
+            self.publish_saved_stage(
+                source,
+                identity,
+                target,
+                leaf,
+                Publication::CreateOnly,
+                verify,
+            )?;
+        } else {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// Publish a synced stage recorded in a durable journal, including a file
+    /// captured during an interrupted publication. Verify the retained file
+    /// before moving it to the destination.
+    fn publish_saved_stage(
+        &self,
+        source: &Path,
+        identity: &StageIdentity,
+        target: &StoreDirectory,
+        leaf: &Path,
+        publication: Publication,
+        verify: impl FnOnce(&mut File) -> Result<()>,
+    ) -> Result<()> {
+        if super::relative_components(source, false, self.path())?.len() != 1
+            || super::relative_components(leaf, false, target.path())?.len() != 1
+        {
+            return Err(failure("stage publication requires direct leaves"));
+        }
+        crate::platform::stage_operations::recover_for_publication(self, source, identity)?;
+        self.ensure_owner_private(source)?;
+        let mut held = crate::platform::stage_operations::open_file(self, source)?;
+        identity.verify(&held)?;
+        verify(&mut held)?;
+        crate::platform::stage_operations::publish(
+            self,
+            source,
+            &held,
+            target,
+            leaf,
+            publication,
+            identity,
+        )
     }
 
     /// Discard a crash residue only when both components of its saved identity
@@ -435,6 +550,15 @@ pub struct StageInspectionEntry {
     pub state: StageEntryState,
 }
 impl StoreDirectory {
+    pub(crate) fn verify_named_file_stage(
+        &self,
+        leaf: &Path,
+        identity: &StageIdentity,
+    ) -> Result<()> {
+        self.ensure_owner_private(leaf)?;
+        identity.verify(&self.open_regular_read(leaf, u64::MAX)?)
+    }
+
     /// Inspect a dedicated large-stage directory against the caller's saved
     /// journal identities. Unknown, unsafe and mismatching entries are reported
     /// with a reason; missing expected entries are included as well. This API
@@ -480,7 +604,11 @@ impl StoreDirectory {
             let name = entry
                 .map_err(|e| io_failure("cannot inspect stage residue name", e))?
                 .file_name();
-            if let Some((source, identity)) = captures.get(&name) {
+            let capture_base = Path::new(&name).file_stem().unwrap_or(&name);
+            if let Some((source, identity)) = captures
+                .get(capture_base)
+                .filter(|_| super::capture_matches(Path::new(&name), Path::new(capture_base)))
+            {
                 let state = match crate::platform::stage_operations::inspect_capture(
                     self,
                     Path::new(&name),
@@ -504,10 +632,9 @@ impl StoreDirectory {
             }
             let verification = match expected.remove(&name) {
                 None => Err(failure("no saved stage identity; residue preserved")),
-                Some(Expected::File(identity)) => (|| {
-                    self.ensure_owner_private(Path::new(&name))?;
-                    identity.verify(&self.open_regular_read(Path::new(&name), u64::MAX)?)
-                })(),
+                Some(Expected::File(identity)) => {
+                    self.verify_named_file_stage(Path::new(&name), identity)
+                }
                 Some(Expected::Directory(identity)) => (|| {
                     let directory = StoreDirectory::from_retained_with_control(
                         self.open_directory(Path::new(&name))?,
@@ -965,6 +1092,40 @@ mod tests {
                 .is_symlink()
         );
         assert!(temp.path().join("owned").is_file());
+    }
+
+    #[test]
+    fn saved_stage_publication_reopens_only_the_recorded_identity() {
+        let (temp, directory) = directory();
+        let mut writer = StageWriter::create(&directory, Path::new("stage")).unwrap();
+        writer.write_chunk(b"complete").unwrap();
+        writer.sync().unwrap();
+        let identity = writer.identity().clone();
+        drop(writer);
+        StageWriter::publish_saved(
+            &directory,
+            Path::new("stage"),
+            &identity,
+            &directory,
+            Path::new("public"),
+        )
+        .unwrap();
+        assert_eq!(fs::read(temp.path().join("public")).unwrap(), b"complete");
+        let mut replacement = StageWriter::create(&directory, Path::new("stage")).unwrap();
+        replacement.write_chunk(b"foreign").unwrap();
+        drop(replacement);
+        assert!(
+            StageWriter::publish_saved(
+                &directory,
+                Path::new("stage"),
+                &identity,
+                &directory,
+                Path::new("other")
+            )
+            .is_err()
+        );
+        assert!(!temp.path().join("other").exists());
+        assert_eq!(fs::read(temp.path().join("stage")).unwrap(), b"foreign");
     }
 
     #[test]

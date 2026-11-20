@@ -25,7 +25,7 @@ use crate::scope::{acquire_bound_store_read_guard_with_control, canonical_tool_l
 
 const CAS_KINDS: [(&str, &str, u64, bool); 10] = [
     ("commit", "commits", MAX_COMMIT_OBJECT_BYTES, true),
-    ("tree", "trees", MAX_TREE_OBJECT_BYTES, true),
+    ("tree", "trees", u64::MAX, true),
     ("raw", "raw", u64::MAX, false),
     ("chunk", "chunks", MAX_CHUNK_OBJECT_BYTES, true),
     ("manifest", "manifests", MAX_MANIFEST_OBJECT_BYTES, true),
@@ -296,6 +296,7 @@ where
 }
 
 struct ScanState<'a> {
+    record_stages: &'a crate::disk_records::RecordStageRoot,
     limits: &'a UnreachableInventoryLimits,
     walker_limits: GcPlanLimits,
     walker_stats: GcPlanStats,
@@ -331,7 +332,10 @@ struct ScanState<'a> {
 }
 
 impl<'a> ScanState<'a> {
-    fn new(limits: &'a UnreachableInventoryLimits) -> Self {
+    fn new(
+        limits: &'a UnreachableInventoryLimits,
+        record_stages: &'a crate::disk_records::RecordStageRoot,
+    ) -> Self {
         let walker_limits = GcPlanLimits {
             max_refs: limits.max_refs,
             max_receipts: limits.max_receipts,
@@ -343,6 +347,7 @@ impl<'a> ScanState<'a> {
         };
         Self {
             limits,
+            record_stages,
             walker_limits,
             walker_stats: GcPlanStats::default(),
             stats: InventoryStats::default(),
@@ -501,11 +506,12 @@ impl UnreachableObjectInventory {
         let guard = acquire_bound_store_read_guard_with_control(&self.kio, &self.control)?;
         guard.recheck_idle()?;
         let invocation_time = self.control.now_utc_seconds();
-        let first = self.pass(&invocation_time)?;
+        let record_stages = crate::disk_records::RecordStageRoot::temporary()?;
+        let first = self.pass(&invocation_time, &record_stages)?;
         guard.recheck_idle()?;
         #[cfg(test)]
         self.wait_at_first_pass_test_barrier();
-        let second = self.pass(&invocation_time)?;
+        let second = self.pass(&invocation_time, &record_stages)?;
         guard.recheck_idle()?;
         self.assert_stable()?;
         if first != second {
@@ -578,8 +584,12 @@ impl UnreachableObjectInventory {
         }
     }
 
-    fn pass(&self, invocation_time: &str) -> Result<Pass> {
-        let mut state = ScanState::new(&self.limits);
+    fn pass(
+        &self,
+        invocation_time: &str,
+        record_stages: &crate::disk_records::RecordStageRoot,
+    ) -> Result<Pass> {
+        let mut state = ScanState::new(&self.limits, record_stages);
         state.observe_directory(&self.scope, "scope")?;
         state.observe_directory(&self.kio, ".kio")?;
         self.observe_scope_identity(&mut state)?;
@@ -954,7 +964,26 @@ impl UnreachableObjectInventory {
                     let observation_name =
                         format!("objects/{directory_name}/{first}/{second}/{leaf}");
                     let canonical_hash = format!("sha256:{leaf}");
-                    if materialize {
+                    if kind == "tree" {
+                        let remaining = state
+                            .limits
+                            .max_verified_bytes
+                            .saturating_sub(state.stats.verified_bytes);
+                        let (tree, observation) = read_cas_tree_observed(
+                            state.record_stages,
+                            &CasReadAccess::Unmetered,
+                            &second_dir,
+                            &leaf,
+                            remaining,
+                        )?;
+                        if observation.digest != canonical_hash {
+                            return Err(corrupt("tree hash mismatch"));
+                        }
+                        let size = observation.state.len;
+                        state.observe_file(&observation_name, observation, size)?;
+                        state.add_object(kind, canonical_hash.clone(), size)?;
+                        Self::record_tree(state, &canonical_hash, tree)?;
+                    } else if materialize {
                         let (bytes, observation) =
                             read_regular_observed(&second_dir, &leaf, max_bytes)?;
                         let size = bytes.len() as u64;
@@ -979,6 +1008,28 @@ impl UnreachableObjectInventory {
         Ok(())
     }
 
+    fn record_tree(state: &mut ScanState<'_>, hash: &str, tree: TreeObject) -> Result<()> {
+        for entry in &tree.entries {
+            let entry = entry?;
+            if let Some(normalize) = &entry.normalize {
+                state
+                    .tree_manifests
+                    .entry(normalize.manifest_hash.clone())
+                    .or_default()
+                    .insert(TreeManifestEdge {
+                        raw_hash: entry.raw_hash.clone(),
+                        tree_hash: hash.to_owned(),
+                        tool_profile_hash: normalize.tool_profile_hash.clone(),
+                        generation: normalize.r#gen,
+                    });
+            }
+        }
+        if state.trees.insert(hash.to_owned(), tree).is_some() {
+            return Err(corrupt("duplicate tree object"));
+        }
+        Ok(())
+    }
+
     fn validate_semantic_object(
         &self,
         state: &mut ScanState<'_>,
@@ -996,32 +1047,6 @@ impl UnreachableObjectInventory {
                 state.commit_toollocks.insert(commit.tool_lock_hash.clone());
                 if state.commits.insert(hash.to_owned(), commit).is_some() {
                     return Err(corrupt("duplicate commit object"));
-                }
-            }
-            "tree" => {
-                require_content_hash(bytes, hash, "tree")?;
-                let tree: TreeObject = strict_canonical_json(bytes, "tree")?;
-                if tree.entries.len() > MAX_TREE_ENTRIES {
-                    return Err(limit("tree entries"));
-                }
-                tree.validate()
-                    .map_err(|_| corrupt("invalid tree object"))?;
-                for entry in &tree.entries {
-                    if let Some(normalize) = &entry.normalize {
-                        state
-                            .tree_manifests
-                            .entry(normalize.manifest_hash.clone())
-                            .or_default()
-                            .insert(TreeManifestEdge {
-                                raw_hash: entry.raw_hash.clone(),
-                                tree_hash: hash.to_owned(),
-                                tool_profile_hash: normalize.tool_profile_hash.clone(),
-                                generation: normalize.r#gen,
-                            });
-                    }
-                }
-                if state.trees.insert(hash.to_owned(), tree).is_some() {
-                    return Err(corrupt("duplicate tree object"));
                 }
             }
             "chunk" => {
@@ -1252,7 +1277,7 @@ impl UnreachableObjectInventory {
                                     )
                                 })?;
                             if let Some(tree) = state.trees.get(&resurrection.tree)
-                                && !tree.entries.iter().any(|entry| entry.raw_hash == raw_hash)
+                                && !tree.entries.any(|entry| entry.raw_hash == raw_hash)?
                             {
                                 return Err(corrupt(
                                     "resurrection tree does not contain retired raw",
@@ -1285,6 +1310,7 @@ impl UnreachableObjectInventory {
         let mut history_steps = state.stats.history_steps;
         for (tree_hash, tree) in &state.trees {
             for entry in &tree.entries {
+                let entry = entry?;
                 let raw_present = state
                     .physical
                     .contains_key(&("raw".to_owned(), entry.raw_hash.clone()));

@@ -222,6 +222,7 @@ fn ct4_promotion_done_batch_updates_provenance_search_and_is_idempotent() {
     let mut promoted_profiles = tree
         .entries
         .iter()
+        .map(Result::unwrap)
         .filter_map(|entry| {
             entry
                 .normalize
@@ -237,7 +238,7 @@ fn ct4_promotion_done_batch_updates_provenance_search_and_is_idempotent() {
         "the mock batch uses one immutable profile"
     );
     let profile_hash = &promoted_profiles[0];
-    assert!(tree.entries.iter().all(|entry| {
+    assert!(tree.entries.iter().map(Result::unwrap).all(|entry| {
         entry
             .normalize
             .as_ref()

@@ -60,7 +60,51 @@ pub fn read_private_file_at_path(
     name: &Path,
     max_bytes: u64,
 ) -> Result<Vec<u8>> {
-    native::read_private_file_at_path(parent, name, max_bytes)
+    native::read_private_file_at_path(parent, name, max_bytes, None)
+}
+
+/// Read the retained private leaf with deadline checks between bounded reads.
+pub fn read_private_file_at_until(
+    parent: &StoreDirectory,
+    name: &str,
+    max_bytes: u64,
+    deadline: std::time::Instant,
+) -> Result<Vec<u8>> {
+    native::read_private_file_at_path(parent, Path::new(name), max_bytes, Some(deadline))
+}
+
+pub(crate) fn check_read_deadline(deadline: Option<std::time::Instant>) -> std::io::Result<()> {
+    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "file read deadline expired",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn read_to_end_checked(
+    mut read: impl std::io::Read,
+    bytes: &mut Vec<u8>,
+    deadline: Option<std::time::Instant>,
+) -> std::io::Result<()> {
+    if deadline.is_none() {
+        read.read_to_end(bytes)?;
+        return Ok(());
+    }
+    let mut chunk = [0; 16 * 1024];
+    loop {
+        check_read_deadline(deadline)?;
+        let count = match read.read(&mut chunk) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        check_read_deadline(deadline)?;
+        if count == 0 {
+            return Ok(());
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+    }
 }
 
 /// Resolve the sole supported inherited-directory spelling as a retained
@@ -324,4 +368,41 @@ pub(crate) fn raced_file(path: &Path) -> KioError {
         json!({ "path": path.display().to_string() }),
         ExitCode::PermanentFailure,
     )
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    use std::{
+        io,
+        time::{Duration, Instant},
+    };
+
+    #[test]
+    fn bounded_read_discards_a_chunk_that_arrives_after_the_deadline() {
+        struct DelayedSecondChunk {
+            reads: usize,
+            deadline: Instant,
+        }
+        impl io::Read for DelayedSecondChunk {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                self.reads += 1;
+                if self.reads == 2 {
+                    std::thread::sleep(
+                        self.deadline.saturating_duration_since(Instant::now())
+                            + Duration::from_millis(1),
+                    );
+                }
+                bytes[0] = b'x';
+                Ok(1)
+            }
+        }
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let mut reader = DelayedSecondChunk { reads: 0, deadline };
+        let mut bytes = Vec::new();
+        let error = read_to_end_checked(&mut reader, &mut bytes, Some(deadline)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(reader.reads, 2);
+        assert_eq!(bytes, b"x");
+    }
 }

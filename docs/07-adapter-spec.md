@@ -25,7 +25,7 @@ R23 の同梱 runtime が実行できる online target は `mistral_ocr_markdown
 `url` による実行先の差し替えを受理せず、宣言された model と built-in target の一致を
 その role を利用するコマンドの設定読取り時と実行直前に検証する。未使用 role は起動条件にしない
 ([操作別前提条件](14-v1-runtime-contracts.md#operation-specific-prerequisites))。
-上記の実行設定フィールドは現在の built-in role では受理しない。
+利用者管理のローカル endpoint の送信境界は §3.1、embedding endpoint の設定は §5.3 に従う。
 
 認証情報の保存規約:
 
@@ -82,7 +82,7 @@ Kio core
 
 ## 2.1 同梱 deterministic Adapter (ベースライン index)
 
-Kio は `deterministic_library` の Prepare / Markdownize Adapter を同梱する。対象: plain text / Markdown / コード、PDF text layer 抽出。OCR・レイアウト解析・画像理解は行わない。**出力は単純な passthrough ではなく、Normalized Markdown v1 (§5.2.1) への決定的正規化**である — 少なくとも Setext 見出し → ATX 変換・生 HTML block の fenced text 化・改行 / 空白 / fence の正規化を行う (§5.2.1 準拠が受け入れ検査 V5 の通過条件のため、passthrough では通常の Markdown (Setext 等) がオフライン基線 index で全滅する)。
+Kio は `deterministic_library` の Prepare / Markdownize Adapter を同梱する。対象: plain text / Markdown、PDF text layer 抽出。OCR・レイアウト解析・画像理解は行わない。**出力は単純な passthrough ではなく、Normalized Markdown v1 (§5.2.1) への決定的正規化**である — 少なくとも Setext 見出し → ATX 変換・生 HTML block の fenced text 化・改行 / 空白 / fence の正規化を行う (§5.2.1 準拠が受け入れ検査 V5 の通過条件のため、passthrough では通常の Markdown (Setext 等) がオフライン基線 index で全滅する)。
 
 > **PDF text layer 抽出の範囲 (実装フィードバック 2026-07-23)**: 実世界の text-layer PDF
 > (TeX / LibreOffice 出力) は FlateDecode 圧縮 content stream + subset font の glyph index +
@@ -296,7 +296,20 @@ renderer 版内で prepared_hash が安定し、renderer 更新による出力�
 renderer の検出は配布元名、固定 install prefix、最低 version の文字列だけで可否を決めない。
 実 executable identity と必要 runtime resource を特定・検証し、隔離内の bounded な実変換 probe で
 headless PDF 出力 capability を確認する。名称・version・配布物 digest は provenance と診断に残す。
-macOS の署名検証は有効性と実コードの binding を確認し、特定 vendor の署名だけを許可条件にしない。
+実変換 probe は Office 入力の索引・処理と、明示的な診断コマンド `kio status` で行う。
+`kio search` は renderer の解決や probe を行わず、`index_status.office_conversion_unavailable` に
+現在の公開済み HEAD に対応するファイル別の記録を返す。現在の renderer の利用可否と理由は
+`kio status` で確認する。利用不能時は同コマンドの `office_readiness` に理由を表示する。
+macOS は app bundle の Apple 発行コード署名と seal を全 architecture・nested code について検証し、
+署名された bundle の主実行ファイルを起動する。PATH に shell wrapper がある場合は
+`KIO_OFFICE_CONVERTER` に bundle 内の実行ファイルを指定できる。特定の Team ID や bundle ID の
+指定、追加の notarization ticket 照会は行わない。Windows は `program/soffice.exe` と同じ
+`program/` 内に `soffice.bin`・`fundamental.ini` があり、隣に `share/` がある配置を検証する。
+launcher・renderer 本体・配置内の PE image の Authenticode 署名を実ファイル上で確認する。
+Windows の trust 判定はローカル情報で行い、publisher 名やインストーラの署名は判定に使わない。
+両 OS とも検証した runtime の配置と実体を probe・変換に結び付ける。macOS の bundle 内のリンクは
+bundle の内側に閉じる。Windows の配置内では reparse point と複数の hard link を持つファイルを拒否する。
+Windows の AppContainer のアクセス制御は OS の ACL に従う。
 version 応答の形式差だけを「未導入」と扱わず、検出済みだが利用不能なら具体的な理由を表示する。
 CI の配布物 SHA pin は再現性のため維持し、製品の一般的な版許可リストにはしない。
 
@@ -305,6 +318,15 @@ Linux の distro / TDF / portable の配置は実際に必要な read-only runti
 固定 `/opt/libreoffice<major>.<minor>` と sibling 名だけで決めない。runtime 内の symlink は
 解決した対象を同じ許可済み runtime closure に固定できる場合だけ許可し、任意の host path へ
 読み取り権限を広げない。network / unrelated private files / write の隔離を弱めて probe を通さない。
+Debian・Ubuntu のパッケージと標準の `/opt/libreoffice<major>.<minor>` に配置された TDF の DEB は、
+構成済みの dpkg 台帳で所属と内容を照合する。この配置では `SHA256SUMS` があっても dpkg の照合を必須とする。
+portable では、信頼できる配布物のファイル一覧を展開先直下の `SHA256SUMS` として用意する。
+各行は SHA-256、空白 2 字、展開先からの相対パスとする。symlink は SHA-256 に `link:` を付け、
+リンク先のパス文字列（末尾改行なし）をハッシュする。空ディレクトリは `dir`、空白 2 字、相対パスで指定できる。
+対象は `program`、`share`、`presets` の中で、一覧にないファイルが混在する配置は拒否する。
+相対パスは最大 1,024 バイト・32 要素、暗黙の親を含めて最大 32,768 エントリとする。
+一覧は信頼できる配布物から作成し、現在の展開ツリーを自動的に承認するためには使わない。
+
 renderer scratch は [14 の storage 契約](14-v1-runtime-contracts.md#protection-of-kio-created-objects) に従う。
 
 **Office package preflight (DOCX / PPTX)**: LibreOffice に渡す前に raw ZIP を最大 100 MiB、central-directory を最大 4,096 entry、各 member を最大 32 MiB、全 member の declared aggregate を最大 256 MiB として検証する。必要な `[Content_Types].xml`、`_rels/.rels`、main XML の読取り合計は 6 MiB に制限し、CRC を検証して読む。encrypted / split ZIP、ZIP64、重複・非 UTF-8・unsafe part name、非 Stored/Deflated member は拒否する。XML は UTF-8、nesting 256、attribute 1,024 を上限とし、DTD/entity declaration を受けない。DOCX / PPTX ごとに genuine な MIME override、内部 root relationship、main part と namespace を検証する。preflight failure は renderer を起動せず contract violation とする。
@@ -615,9 +637,34 @@ local crash の再計算・0 USD 回復は [04-pipeline.md §5](04-pipeline.md) 
 | OpenAI 互換 input | text のみ（Ollama / LM Studio 等）。image capability は宣言せず、image は Skipped(image_capability_unavailable) |
 | vLLM chat-form messages | text と image。同 profile の text/query も messages を使う。image は data URI 付き user message、1 item/request |
 
-wire 形式・model・重み pin・chat template/instruction を意味的 profile に固定する。
-空 instruction も固定し、同一 profile で input/messages を混用しない。
-出力は768次元を要求し、形式が許す場合だけ余剰次元を切り詰めて正規化し、そうでなければ明示拒否する。
+端末の `tools.toml` で設定する。次は messages 形式の例である。二つの SHA-256 は利用する重みと、
+サーバーが使う chat template の値に置き換える。
+
+```toml
+[embedding.local_embedding]
+kind = "offline_api"
+url = "http://127.0.0.1:8000"
+wire_format = "messages"
+model = "my-embedding-model"
+model_version_pin = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+chat_template_hash = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+instruction = ""
+```
+
+`wire_format` は `input` または `messages` を明示する。model・重み pin・chat template の SHA-256・
+instruction（空文字列を含む）も必須で、wire 形式とともに意味的 profile に固定する。
+template を使わないサーバーでは空の template の SHA-256 を記録する。重みと template の pin は
+利用者が管理するサーバーの構成を宣言する値である。同一 profile で input/messages を混用しない。
+`messages` で空でない instruction は system message として送る。
+`input` では instruction の文字列を本文の直前に連結し、必要な区切りも設定値に含める。
+
+リクエストの `dimensions` は 768 とする。利用するモデルが先頭次元の切り詰めをサポートする場合に
+のみ `truncate_dimensions = true` を設定できる。この設定も profile に固定する。余剰次元は
+この設定時だけ切り詰めて L2 正規化する。寸法不足と、設定なしでの超過は契約違反として拒否する。
+`kio adapter approve local_embedding --preview` で送信内容を確認し、
+`kio adapter approve local_embedding --yes` で宛先を承認する。
+応答の `data` は 1 要素で、入力に対応する整数の `index: 0` を要求する。
+HTTP 4xx の要求拒否は `invalid_input` とする。408 と 429 には通信障害と rate limit の再試行規則を適用する。
 窓は同じ Task・無料 local execution state・member 受入・回復契約を使う。Kio は endpoint server を起動・管理しない。
 HTTP/HTTPS の送信境界は §3.1 に従い、別の実行 pipeline や管理 server 選択肢は設けない。
 
@@ -828,6 +875,7 @@ MVP における Adapter の脅威モデルを次のとおり確定する。
      適用する (**AdapterRun = 1 回の Adapter 呼出 = 1 request / job** — §4・§5.5 の課金報告と同一
      単位。task 全体の総量上限ではない — 総量は budget cap 側が律する) — 超過は送信前に当該 task を
      terminal failed (invalid_input・非再試行) とし、送信しない (課金なし)
+     Office の変換前に原本を読み込む処理は、ローカルの standard メモリ予算内で行う。
    - Kio は allowed_scope 外のファイルを Adapter に渡さない (入力制御)
    - Kio は永続 gate が不成立の Adapter にオンライン送信前提の task を発行しない
    - AdapterRun (task_id / input_hashes / output_hashes / status) を監査ログとして残す

@@ -1,10 +1,9 @@
 use crate::batch_recovery_key;
 use crate::cursor_key;
-use crate::embedding::admission::declared_embedding_profile;
 use crate::object_persistence::adapter_to_kio;
 use crate::search::query::toml_f64;
 use crate::search::query::toml_u64;
-use kio_adapter::catalog::EmbeddingExecution;
+use kio_adapter::catalog::declared_deterministic_embedding_profile;
 use kio_adapter::tool_lock::MAX_TOOLS_TOML_BYTES;
 use kio_adapter::tool_lock::load_tool_lock;
 use kio_adapter::tool_lock::parse_tools_toml_for_roles;
@@ -28,7 +27,7 @@ use std::sync::Arc;
 const DEFAULT_MAX_INPUT_BYTES: u64 = 104_857_600;
 
 /// R12-2: effective `adapter.policy.max_input_bytes` — scope config wins over user
-/// config, default 100 MB (07 §7). Enforced as an input gate in `run_index_pipeline`.
+/// config, default 100 MiB (07 §7). Applied to prepared input before an adapter send.
 pub(crate) fn effective_max_input_bytes(repo: &Repository) -> Result<u64> {
     if let Some(limit) = read_max_input_bytes_config(&repo.kio_dir().join("config.toml")) {
         return Ok(limit);
@@ -549,7 +548,7 @@ pub(crate) fn embedding_profile_summary(
 pub(crate) fn persisted_embedding_is_deterministic(
     entry: &kio_adapter::tool_lock::EmbeddingToolLockEntry,
 ) -> bool {
-    let builtin = declared_embedding_profile(EmbeddingExecution::DeterministicEvaluator);
+    let builtin = declared_deterministic_embedding_profile();
     entry.kind == Some(ExecutionMode::DeterministicLibrary)
         && entry.tool_id == builtin.tool_id
         && entry.profile_hash == builtin.profile_hash

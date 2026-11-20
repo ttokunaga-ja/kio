@@ -170,6 +170,8 @@ kio reindex [--regenerate] [--at <commit>] [--yes] [--online|--offline] [--realt
                                         # --regenerate は first-instance-wins の
                                         # 明示経路で gen+1 の新 instance を作る (07-adapter-spec.md §9。もう 1 つの合法経路 =
                                         # prepared_hash 変化起因の自動 gen+1 — 03-data-model.md §2.1)。
+                                        # HEAD が指す確定 manifest や unit が破損・欠落した文書は旧 gen の参照を保持し、
+                                        # skipped_units に報告する。残りの文書は再 normalize し、検証できた内容をテキスト検索に公開する。
                                         # 上書きチェーンは manifest の parent_gen (同一 raw 内) / parent_instance
                                         # (raw 跨ぎ incremental の三つ組 — full では null) で永続記録 — parent_run_id は
                                         # task cache の揮発情報 (03-data-model.md §8 / §6)。--regenerate は確認プロンプト必須 (--yes で省略可)
@@ -214,6 +216,9 @@ model/adapter status の typed fields は `selected_profile`、`profile_hash`、
 Task の Skipped は理由別件数、資源待ちは `resource_busy` として表示する。
 local HTTP peer には `peer_authenticated=false` を表示し、承認確認にも未認証と明示する。
 HTTPS の trust 状態は既存の managed CA status に従う。producer の認定状態は設けない。
+汎用 endpoint の設定は [07-adapter-spec.md §5.3](07-adapter-spec.md) に従う。
+`kio adapter status local_embedding` は現在の用途と送信内容を
+`device_endpoints[].configured_disclosures` に、承認時の確認内容を `grants` に表示する。
 
 ### Device-global ledger recovery
 

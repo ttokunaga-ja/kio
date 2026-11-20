@@ -1,5 +1,5 @@
 use crate::commands::PointerArgs;
-use crate::historical_reindex::pinned_done_units;
+use crate::historical_reindex::pinned_manifest;
 use crate::historical_reindex::retained_history_instances;
 use crate::image_authority;
 use crate::index::chunk_ledger::check_index_generation_current;
@@ -47,6 +47,7 @@ use kio_core::Result;
 use kio_core::cas::ChunkObject;
 use kio_core::cas::ContentObjectKind;
 use kio_core::cas::MAX_CONTENT_OBJECT_BYTES;
+use kio_core::cas::ObjectStore;
 use kio_core::cas::fanout_path;
 use kio_core::cas::is_hash;
 use kio_core::control::ControlHandle;
@@ -63,9 +64,11 @@ use kio_index::fts::ExistingSourceIndexOpenMode;
 use kio_index::fts::FtsSchemaConfig;
 use kio_index::fts::FtsTokenizer;
 use kio_index::fts::open_existing_source_index_connection;
-use kio_pipeline::markdownize::build_normalized_view_layout;
-use kio_pipeline::markdownize::load_validated_normalized_instance_with_control;
 use kio_pipeline::markdownize::normalized_view_path;
+use kio_pipeline::markdownize::{
+    normalized_manifest_hash, read_normalized_instance_manifest, verify_normalized_view_bytes,
+    visit_validated_normalized_units,
+};
 use kio_pipeline::policy::CurrentPolicyEvaluator;
 use kio_pipeline::prepare::hash_bytes;
 use kio_pipeline::scan::hash_verified_scan_input;
@@ -352,18 +355,17 @@ fn current_policy_raw_path_for_short_hash(
     };
     let commit = repo.read_commit(&head)?;
     let tree = repo.read_tree(&commit.tree)?;
-    let mut allowed = Vec::new();
-    for entry in tree
-        .entries
-        .iter()
-        .filter(|entry| entry.raw_hash == raw_hash)
-    {
+    for entry in &tree.entries {
+        let entry = entry?;
+        if entry.raw_hash != raw_hash {
+            continue;
+        }
         if policy.allows_path(&entry.path).map_err(pipeline_to_kio)? {
-            allowed.push(entry.path.clone());
+            // Validated trees are sorted by UTF-8 path bytes.
+            return Ok(Some(entry.path));
         }
     }
-    allowed.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
-    Ok(allowed.into_iter().next())
+    Ok(None)
 }
 
 /// True when a raw object with `raw_hash` is present in the working tree or the
@@ -575,11 +577,15 @@ pub(crate) fn verify_point_in_time_attribution(
     // it verifies the manifest CAS digest, canonical/schema/identity tuple,
     // and every Done entry's immutable normalized-unit CAS object. A mutable
     // normalized-unit cache therefore cannot make this pointer appear Alive.
-    let done_units = pinned_done_units(repo, &pointer.raw_hash, normalize)?;
-    if !done_units.iter().any(|unit| {
-        unit.unit_key == chunk.unit_key
-            && hash_bytes(unit.markdown.as_bytes()) == chunk.unit_content_hash
-    }) {
+    let manifest = pinned_manifest(repo, &pointer.raw_hash, normalize)?;
+    let mut found = false;
+    visit_validated_normalized_units(&repo.object_store(), &manifest, |unit| {
+        found |= unit.unit_key == chunk.unit_key
+            && hash_bytes(unit.markdown.as_bytes()) == chunk.unit_content_hash;
+        Ok(())
+    })
+    .map_err(pipeline_to_kio)?;
+    if !found {
         return Ok(PointInTimeAttribution::NotFound);
     }
     match check_publication_and_association_for_verifier(
@@ -848,41 +854,41 @@ fn resolve_chunk_view(
     chunk: &ChunkObject,
     control: &ControlHandle,
 ) -> Option<(PathBuf, u64, u64)> {
-    let instance = load_validated_normalized_instance_with_control(
+    let (manifest, _) = read_normalized_instance_manifest(
         kio_dir,
         &chunk.raw_hash,
         &chunk.tool_profile_hash,
         chunk.r#gen,
-        control,
     )
     .ok()?;
-    let unit = instance.units.iter().find(|unit| {
-        unit.unit_key == chunk.unit_key
-            && hash_bytes(unit.markdown.as_bytes()) == chunk.unit_content_hash
-    })?;
-    let layout = build_normalized_view_layout(&instance.manifest, &instance.units);
-    let unit_start = *layout.unit_starts.get(&unit.unit_key)? as u64;
-    let unit_len = *layout.unit_lens.get(&unit.unit_key)? as u64;
-    // The chunk's byte_end can run past the trimmed unit length: chunk spans
-    // are cut from the untrimmed `unit.markdown` (03 §8.1) and can include the
-    // trailing newlines the view assembly trims off (03 §2.1 rule 2) — clamp
-    // so the view span never reaches past the unit's actual content in `text`.
-    // Clamp BOTH ends, not just `byte_end`: a chunk indexed before the
-    // content-free-chunk guard can start inside the trailing newline run the
-    // view assembly trims away, and an unclamped `byte_start` would then
-    // report `start > end` — an out-of-order span a client would slice with.
-    let view_start = unit_start + chunk.byte_start.min(unit_len);
-    let view_end = unit_start + chunk.byte_end.min(unit_len);
+    let pin = normalized_manifest_hash(&manifest).ok()?;
     let view_path = normalized_view_path(
         kio_dir,
         &chunk.raw_hash,
         &chunk.tool_profile_hash,
         chunk.r#gen,
+        &pin,
     );
-    if fs::read(&view_path).ok()?.as_slice() != layout.text.as_bytes() {
-        return None;
-    }
-    Some((view_path, view_start, view_end))
+    let directory =
+        kio_core::store_dir::StoreDirectory::open_with_control(kio_dir, control.clone()).ok()?;
+    let mut view = directory
+        .open_regular_read(view_path.strip_prefix(kio_dir).ok()?, u64::MAX)
+        .ok()?;
+    let store =
+        ObjectStore::from_bound_kio_with_control(directory.root_handle().as_ref(), control.clone())
+            .ok()?;
+    let (start, length) = verify_normalized_view_bytes(
+        &mut view,
+        &store,
+        &manifest,
+        Some((&chunk.unit_key, &chunk.unit_content_hash)),
+    )
+    .ok()??;
+    Some((
+        view_path,
+        start + chunk.byte_start.min(length),
+        start + chunk.byte_end.min(length),
+    ))
 }
 
 fn resolve_pointer_for_cli(
@@ -950,11 +956,13 @@ fn resolve_pointer_for_cli(
     let (commit_shallow, entry_gen, mut entry_normalize, mut entry_path, entry_candidates) =
         match repo.read_tree(&commit.tree) {
             Ok(tree) => {
-                let raw_matches = tree
-                    .entries
-                    .iter()
-                    .filter(|entry| entry.raw_hash == pointer.raw_hash)
-                    .collect::<Vec<_>>();
+                let mut raw_matches = Vec::new();
+                for entry in &tree.entries {
+                    let entry = entry?;
+                    if entry.raw_hash == pointer.raw_hash {
+                        raw_matches.push(entry);
+                    }
+                }
                 if raw_matches.is_empty() {
                     // step 5 (tombstone) is checked before declaring not_found.
                     // This is a tree-membership failure (this pointer's commit
@@ -966,10 +974,7 @@ fn resolve_pointer_for_cli(
                     enforce_canonical_tombstone_only(&target, &pointer.raw_hash, ctx.control)?;
                     return Err(purge_not_found_error(&target, &pointer.raw_hash));
                 }
-                let entry_candidates = raw_matches
-                    .iter()
-                    .map(|entry| (*entry).clone())
-                    .collect::<Vec<_>>();
+                let entry_candidates = raw_matches.clone();
                 // M6/PB42/43 (§O, 08 §3.1 step 4): when the same raw_hash is
                 // placed at more than one path in this commit's tree (duplicate
                 // placement), select the entry whose normalize.tool_profile_hash
@@ -994,7 +999,7 @@ fn resolve_pointer_for_cli(
                     {
                         return Err(invalid_pointer_identity_error(pointer));
                     }
-                    *single
+                    single.clone()
                 } else {
                     raw_matches
                         .into_iter()

@@ -55,8 +55,8 @@ The full check that CI runs:
 cargo fmt --all -- --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --all-targets --locked
 ```
 
-The canonical evaluator, cross-scope supplement, offline rerank scorer, scale
-fixture lifecycle, and the entire persona lifecycle are Rust (`kio-eval`) and
+The canonical evaluator, cross-scope supplement, offline rerank scorer,
+and scale fixture lifecycle are Rust (`kio-eval`) and
 are covered by the workspace tests. Push and pull-request CI executes no
 Python. The Rust exception-ledger test requires every tracked `.py` file to be
 an explicit manual Python-native ML/SDK/render adapter:
@@ -64,12 +64,6 @@ an explicit manual Python-native ML/SDK/render adapter:
 ```bash
 cargo test -p kio-eval --all-targets --locked
 ```
-
-For a local persona-boundary smoke, use the nested Rust lifecycle: `kio-eval
-persona plan`, `schedule`, `render`, `materialize`, `scaffold`, `lease claim`,
-`lease scope claim`, `lease scope release`, `lease release`, then `attest`.
-All outputs are Rust-owned, create-only records; no Python persona runtime,
-schema, or CLI participates.
 
 High-cost Full/cold validation, Full scale acceptance, U7 GPU comparison, and
 manual OCR fixture/provider commands have one explicit entry point:

@@ -14,7 +14,7 @@ use kio_core::{KioError, Result};
 use kio_pipeline::policy::CurrentPolicyEvaluator;
 use kio_pipeline::scan::classify_secret;
 
-use crate::historical_reindex::{RetainedNormalizedInstance, pinned_done_units};
+use crate::historical_reindex::{RetainedNormalizedInstance, visit_pinned_done_units};
 use crate::object_persistence::pipeline_to_kio;
 
 /// Current authority for one typed, immutable image CAS object.
@@ -77,6 +77,22 @@ impl ImageAuthorityMap {
             .filter_map(|(hash, entry)| entry.policy_allowed.then_some(hash.as_str()))
     }
 
+    pub(crate) fn record_owned_hash(
+        &mut self,
+        image_hash: String,
+        owner: &ImageAuthorityEntry,
+    ) -> Result<()> {
+        if !is_hash(&image_hash) {
+            return Err(KioError::schema(
+                "retained image source unit has a non-canonical owned image hash",
+            ));
+        }
+        let entry = self.entries.entry(image_hash).or_default();
+        entry.policy_allowed |= owner.policy_allowed;
+        entry.requires_secret_approval |= owner.requires_secret_approval;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn test_map(entries: BTreeMap<String, ImageAuthorityEntry>) -> Self {
         Self {
@@ -86,7 +102,7 @@ impl ImageAuthorityMap {
     }
 }
 
-/// Build the image authority from the retained source graph. `pinned_done_units`
+/// Build the image authority from the retained source graph. The unit visitor
 /// verifies the exact tree-pinned manifest and immutable normalized-unit CAS
 /// object before exposing typed ownership, preventing a mutable cache or
 /// arbitrary Markdown from adding an owner.
@@ -95,19 +111,17 @@ pub(crate) fn retained_image_authority(
     retained_instances: &[RetainedNormalizedInstance],
     policy: &CurrentPolicyEvaluator,
 ) -> Result<ImageAuthorityMap> {
-    let mut authority = ImageAuthorityMap::default();
-    for instance in retained_instances {
-        // Evaluate every retained name. A current public name may make bytes
-        // available, but cannot erase a historical/current secret alias.
-        let mut policy_allowed = false;
-        let mut requires_secret_approval = false;
-        for path in &instance.policy_paths {
-            policy_allowed |= policy.allows_path(path).map_err(pipeline_to_kio)?;
-            requires_secret_approval |= classify_secret(path).is_some();
-        }
-
-        let units = match pinned_done_units(repo, &instance.raw_hash, &instance.normalize) {
-            Ok(units) => units,
+    retained_image_authority_with(retained_instances, policy, |instance| {
+        let mut owned_by_unit = Vec::new();
+        let verified =
+            visit_pinned_done_units(repo, &instance.raw_hash, &instance.normalize, |unit| {
+                if !unit.owned_image_hashes.is_empty() {
+                    owned_by_unit.push((unit.unit_key, unit.owned_image_hashes));
+                }
+                Ok(())
+            });
+        match verified {
+            Ok(()) => Ok(Some(owned_by_unit)),
             Err(error) => {
                 // Unit absence may be wrapped as a pipeline corruption error.
                 // The verifier independently proves actual CAS absence and
@@ -121,13 +135,29 @@ pub(crate) fn retained_image_authority(
                     // reference after re-ingest retires its marker. Omit that
                     // verified old closure entirely: absent bytes establish
                     // no image ownership, even when some bodies survived.
-                    continue;
+                    return Ok(None);
                 }
-                return Err(error);
+                Err(error)
             }
+        }
+    })
+}
+
+type OwnedUnitImages = Vec<(String, BTreeSet<String>)>;
+
+fn retained_image_authority_with(
+    retained_instances: &[RetainedNormalizedInstance],
+    policy: &CurrentPolicyEvaluator,
+    mut load: impl FnMut(&RetainedNormalizedInstance) -> Result<Option<OwnedUnitImages>>,
+) -> Result<ImageAuthorityMap> {
+    let mut authority = ImageAuthorityMap::default();
+    for instance in retained_instances {
+        let owner = image_owner_policy(instance, policy)?;
+        let Some(owned_by_unit) = load(instance)? else {
+            continue;
         };
-        for unit in units {
-            if policy_allowed && !unit.owned_image_hashes.is_empty() {
+        for (unit_key, hashes) in owned_by_unit {
+            if owner.policy_allowed {
                 authority
                     .unit_images
                     .entry((
@@ -135,24 +165,31 @@ pub(crate) fn retained_image_authority(
                         instance.normalize.tool_profile_hash.clone(),
                         instance.normalize.r#gen,
                         instance.normalize.manifest_hash.clone(),
-                        unit.unit_key.clone(),
+                        unit_key,
                     ))
                     .or_default()
-                    .extend(unit.owned_image_hashes.iter().cloned());
+                    .extend(hashes.iter().cloned());
             }
-            for image_hash in unit.owned_image_hashes {
-                if !is_hash(&image_hash) {
-                    return Err(KioError::schema(
-                        "retained image source unit has a non-canonical owned image hash",
-                    ));
-                }
-                let entry = authority.entries.entry(image_hash).or_default();
-                entry.policy_allowed |= policy_allowed;
-                entry.requires_secret_approval |= requires_secret_approval;
+            for hash in hashes {
+                authority.record_owned_hash(hash, &owner)?;
             }
         }
     }
     Ok(authority)
+}
+
+pub(crate) fn image_owner_policy(
+    instance: &RetainedNormalizedInstance,
+    policy: &CurrentPolicyEvaluator,
+) -> Result<ImageAuthorityEntry> {
+    // A current public name can make bytes available while a historical or
+    // current secret alias still requires approval.
+    let mut owner = ImageAuthorityEntry::default();
+    for path in &instance.policy_paths {
+        owner.policy_allowed |= policy.allows_path(path).map_err(pipeline_to_kio)?;
+        owner.requires_secret_approval |= classify_secret(path).is_some();
+    }
+    Ok(owner)
 }
 
 #[cfg(test)]

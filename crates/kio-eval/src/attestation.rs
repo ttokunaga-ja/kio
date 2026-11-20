@@ -10,9 +10,9 @@ use std::{collections::HashMap, fs, io::Read, path::Path};
 use cap_primitives::fs as cap_fs;
 use kio_core::{
     cas::{
-        MAX_CHUNK_OBJECT_BYTES, MAX_COMMIT_OBJECT_BYTES, MAX_TREE_OBJECT_BYTES,
-        canonical_json_bytes, hash_bytes, is_hash,
+        MAX_CHUNK_OBJECT_BYTES, MAX_COMMIT_OBJECT_BYTES, canonical_json_bytes, hash_bytes, is_hash,
     },
+    disk_records::{DiskRecords, RecordStageRoot},
     scope::KIO_FORMAT_VERSION,
 };
 use serde::{Deserialize, Deserializer, Serialize};
@@ -20,6 +20,9 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 
 use crate::boundary::BoundCorpus;
+
+#[path = "tree_stream.rs"]
+pub(crate) mod tree_stream;
 
 /// Maximum bytes verified across one evaluator invocation.
 pub const MAX_POINTER_ATTESTATION_BYTES: u64 = 512 * 1024 * 1024;
@@ -29,7 +32,6 @@ const MAX_SCOPE_RECORD_BYTES: u64 = 64 * 1024;
 /// Current rerank dumps have a stricter source-render budget than generic
 /// historical attestation, so reject a large chunk before JSON parsing.
 const MAX_CURRENT_CHUNK_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_TREE_ENTRIES: usize = 10_000;
 
 fn deserialize_present_heading_path<'de, D>(
     deserializer: D,
@@ -173,7 +175,7 @@ struct CommitStatsWire {
 #[serde(deny_unknown_fields)]
 struct TreeWire {
     chunking_config_hash: String,
-    entries: Vec<TreeEntryWire>,
+    entries: DiskRecords<TreeEntryWire>,
     object_type: String,
 }
 
@@ -241,7 +243,7 @@ impl AttestedObjectKind {
     const fn max_bytes(self) -> u64 {
         match self {
             Self::Commit => MAX_COMMIT_OBJECT_BYTES,
-            Self::Tree => MAX_TREE_OBJECT_BYTES,
+            Self::Tree => MAX_POINTER_ATTESTATION_BYTES,
             Self::Chunk => MAX_CHUNK_OBJECT_BYTES,
         }
     }
@@ -264,6 +266,7 @@ enum CachedObject {
 /// A fixed-map, byte-bounded attestor for the evaluator's historical hits.
 #[derive(Debug)]
 pub struct PointerAttestor {
+    record_stages: RecordStageRoot,
     /// Retained capability handles, indexed only after reading each bound
     /// scope's `scope.json` through its own `.kio` handle.
     scope_kio_dirs: HashMap<String, fs::File>,
@@ -298,6 +301,8 @@ impl PointerAttestor {
             }
         }
         Ok(Self {
+            record_stages: RecordStageRoot::temporary()
+                .map_err(|error| PointerAttestationError::new(error.to_string()))?,
             scope_kio_dirs,
             object_cache: HashMap::new(),
             verified_bytes: 0,
@@ -359,7 +364,12 @@ impl PointerAttestor {
         let entry = tree
             .entries
             .iter()
-            .find(|entry| entry.path == path)
+            .find_map(|entry| match entry {
+                Ok(entry) if entry.path == path => Some(Ok(entry)),
+                Ok(_) => None,
+                Err(error) => Some(Err(PointerAttestationError::new(error.to_string()))),
+            })
+            .transpose()?
             .ok_or_else(|| PointerAttestationError::new("tree does not contain pointer path"))?;
         if entry.raw_hash != pointer.raw_hash {
             return Err(PointerAttestationError::new(
@@ -559,6 +569,11 @@ impl PointerAttestor {
             })?
             .try_clone()
             .map_err(|_| PointerAttestationError::new("scope capability unavailable"))?;
+        if kind == AttestedObjectKind::Tree {
+            return self
+                .read_streamed_tree(&kio_dir, hash)
+                .map(CachedObject::Tree);
+        }
         // `ObjectStore` owns exact object-size enforcement but does not accept a
         // caller budget. Reserve the maximum before opening so a failed/corrupt
         // object can never push this global evaluator bound past its limit.
@@ -568,31 +583,69 @@ impl PointerAttestor {
             ));
         }
         match kind {
-            AttestedObjectKind::Commit | AttestedObjectKind::Tree => {
-                let kind_dir = match kind {
-                    AttestedObjectKind::Commit => "commits",
-                    AttestedObjectKind::Tree => "trees",
-                    AttestedObjectKind::Chunk => unreachable!(),
-                };
-                let bytes = self.read_cas_object(&kio_dir, kind_dir, hash, kind.max_bytes())?;
-                match kind {
-                    AttestedObjectKind::Commit => {
-                        let commit: CommitWire = exact_canonical_json(&bytes, "commit object")?;
-                        validate_commit_wire(&commit)?;
-                        Ok(CachedObject::Commit(commit))
-                    }
-                    AttestedObjectKind::Tree => {
-                        let tree: TreeWire = exact_canonical_json(&bytes, "tree object")?;
-                        validate_tree_wire(&tree)?;
-                        Ok(CachedObject::Tree(tree))
-                    }
-                    AttestedObjectKind::Chunk => unreachable!(),
-                }
+            AttestedObjectKind::Commit => {
+                let bytes = self.read_cas_object(&kio_dir, "commits", hash, kind.max_bytes())?;
+                let commit: CommitWire = exact_canonical_json(&bytes, "commit object")?;
+                validate_commit_wire(&commit)?;
+                Ok(CachedObject::Commit(commit))
             }
+            AttestedObjectKind::Tree => unreachable!("tree reads stream"),
             AttestedObjectKind::Chunk => Err(PointerAttestationError::new(
                 "chunk reads bypass the metadata cache",
             )),
         }
+    }
+
+    fn read_streamed_tree(
+        &mut self,
+        kio_dir: &fs::File,
+        hash: &str,
+    ) -> AttestationResult<TreeWire> {
+        let remaining = MAX_POINTER_ATTESTATION_BYTES
+            .checked_sub(self.verified_bytes)
+            .ok_or_else(|| {
+                PointerAttestationError::new("pointer attestation byte bound exhausted")
+            })?;
+        let (mut file, _) =
+            open_cap_cas_file(kio_dir, "trees", hash, remaining).map_err(|error| error.error)?;
+        let before = file
+            .metadata()
+            .map_err(|_| PointerAttestationError::new("tree unavailable"))?;
+        let outcome = tree_stream::decode::<TreeWire>(&self.record_stages, &mut file, remaining);
+        self.charge(outcome.consumed)?;
+        if outcome.token_limit_exceeded {
+            return Err(PointerAttestationError::new(
+                "tree JSON token exceeds streaming resource buffer",
+            ));
+        }
+        let after = file
+            .metadata()
+            .map_err(|_| PointerAttestationError::new("tree unavailable"))?;
+        if outcome.consumed != before.len()
+            || after.len() != before.len()
+            || after.modified().ok() != before.modified().ok()
+        {
+            return Err(PointerAttestationError::new("tree changed while reading"));
+        }
+        if outcome.hash != hash {
+            return Err(PointerAttestationError::new("CAS object hash mismatch"));
+        }
+        let tree = outcome
+            .decoded
+            .map_err(|error| PointerAttestationError::new(error.to_string()))?;
+        validate_tree_wire(&tree)?;
+        let canonical = tree_stream::canonical_hash(
+            &tree.chunking_config_hash,
+            &tree.entries,
+            &tree.object_type,
+        )
+        .map_err(PointerAttestationError::new)?;
+        if canonical != outcome.hash {
+            return Err(PointerAttestationError::new(
+                "tree object is not canonical JSON",
+            ));
+        }
+        Ok(tree)
     }
 
     fn read_cas_object(
@@ -712,17 +765,17 @@ fn validate_commit_wire(commit: &CommitWire) -> AttestationResult<()> {
 }
 
 fn validate_tree_wire(tree: &TreeWire) -> AttestationResult<()> {
-    if tree.object_type != "tree"
-        || !is_hash(&tree.chunking_config_hash)
-        || tree.entries.len() > MAX_TREE_ENTRIES
-    {
+    if tree.object_type != "tree" || !is_hash(&tree.chunking_config_hash) {
         return Err(PointerAttestationError::new(
             "tree object violates evaluator wire invariants",
         ));
     }
-    let mut previous: Option<&str> = None;
-    for entry in &tree.entries {
-        if previous.is_some_and(|path| path.as_bytes() >= entry.path.as_bytes())
+    let mut previous: Option<String> = None;
+    for entry in tree.entries.iter() {
+        let entry = entry.map_err(|error| PointerAttestationError::new(error.to_string()))?;
+        if previous
+            .as_ref()
+            .is_some_and(|path| path.as_bytes() >= entry.path.as_bytes())
             || !is_logical_direct_child(&entry.path)
             || entry.entry_type != "file"
             || !is_hash(&entry.raw_hash)
@@ -734,7 +787,7 @@ fn validate_tree_wire(tree: &TreeWire) -> AttestationResult<()> {
                 "tree entry violates evaluator wire invariants",
             ));
         }
-        previous = Some(&entry.path);
+        previous = Some(entry.path);
     }
     Ok(())
 }
@@ -890,6 +943,16 @@ fn read_cap_cas_file(
     hash: &str,
     max_bytes: u64,
 ) -> Result<(Vec<u8>, u64), CapReadError> {
+    let (file, size) = open_cap_cas_file(kio_dir, kind_dir, hash, max_bytes)?;
+    read_cap_open_file(file, size, max_bytes)
+}
+
+fn open_cap_cas_file(
+    kio_dir: &fs::File,
+    kind_dir: &str,
+    hash: &str,
+    max_bytes: u64,
+) -> Result<(fs::File, u64), CapReadError> {
     if !is_hash(hash) {
         return Err(CapReadError {
             error: PointerAttestationError::new("invalid CAS object hash"),
@@ -909,7 +972,7 @@ fn read_cap_cas_file(
             }
         })?;
     }
-    read_cap_regular_file_accounted(&directory, digest, max_bytes)
+    open_cap_regular_file(&directory, digest, max_bytes)
 }
 
 fn read_cap_regular_file(
@@ -927,15 +990,46 @@ fn read_cap_regular_file_accounted(
     name: &str,
     max_bytes: u64,
 ) -> Result<(Vec<u8>, u64), CapReadError> {
+    let (file, size) = open_cap_regular_file(directory, name, max_bytes)?;
+    read_cap_open_file(file, size, max_bytes)
+}
+
+fn read_cap_open_file(
+    mut file: fs::File,
+    size: u64,
+    max_bytes: u64,
+) -> Result<(Vec<u8>, u64), CapReadError> {
+    let mut bytes = Vec::with_capacity(size as usize);
+    let mut limited = file.by_ref().take(max_bytes.saturating_add(1));
+    match limited.read_to_end(&mut bytes) {
+        Ok(_) if bytes.len() as u64 <= max_bytes => {
+            let consumed = bytes.len() as u64;
+            Ok((bytes, consumed))
+        }
+        Ok(_) => Err(CapReadError {
+            error: PointerAttestationError::new("CAS object exceeds its byte limit"),
+            consumed: bytes.len() as u64,
+        }),
+        Err(_) => Err(CapReadError {
+            error: PointerAttestationError::new("CAS object unavailable"),
+            consumed: bytes.len() as u64,
+        }),
+    }
+}
+
+fn open_cap_regular_file(
+    directory: &fs::File,
+    name: &str,
+    max_bytes: u64,
+) -> Result<(fs::File, u64), CapReadError> {
     let mut options = cap_fs::OpenOptions::new();
     options
         .read(true)
         ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
-    let mut file =
-        cap_fs::open(directory, Path::new(name), &options).map_err(|_| CapReadError {
-            error: PointerAttestationError::new("CAS object unavailable"),
-            consumed: 0,
-        })?;
+    let file = cap_fs::open(directory, Path::new(name), &options).map_err(|_| CapReadError {
+        error: PointerAttestationError::new("CAS object unavailable"),
+        consumed: 0,
+    })?;
     let metadata = file.metadata().map_err(|_| CapReadError {
         error: PointerAttestationError::new("CAS object unavailable"),
         consumed: 0,
@@ -962,22 +1056,7 @@ fn read_cap_regular_file_accounted(
             consumed: 0,
         });
     }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    let mut limited = file.by_ref().take(max_bytes.saturating_add(1));
-    match limited.read_to_end(&mut bytes) {
-        Ok(_) if bytes.len() as u64 <= max_bytes => {
-            let consumed = bytes.len() as u64;
-            Ok((bytes, consumed))
-        }
-        Ok(_) => Err(CapReadError {
-            error: PointerAttestationError::new("CAS object exceeds its byte limit"),
-            consumed: bytes.len() as u64,
-        }),
-        Err(_) => Err(CapReadError {
-            error: PointerAttestationError::new("CAS object unavailable"),
-            consumed: bytes.len() as u64,
-        }),
-    }
+    Ok((file, metadata.len()))
 }
 
 fn is_ulid(value: &str) -> bool {
@@ -1002,7 +1081,10 @@ mod tests {
     #[cfg(unix)]
     use crate::boundary::BoundCorpus;
 
-    use super::{PointerAttestor, parse_pointer_wire, read_cap_regular_file};
+    use super::{
+        MAX_POINTER_ATTESTATION_BYTES, PointerAttestor, TreeWire, cap_fs, parse_pointer_wire,
+        read_cap_regular_file,
+    };
 
     const RAW_HASH: &str =
         "sha256:1111111111111111111111111111111111111111111111111111111111111111";
@@ -1029,6 +1111,121 @@ mod tests {
         scope: String,
         pointer: Value,
         chunk: ChunkObject,
+    }
+
+    #[test]
+    fn st05_evaluator_accepts_tree_above_directory_warning_threshold() {
+        let entries = (0..10_001).map(|i| serde_json::json!({
+            "path": format!("{i:05}.txt"), "type": "file",
+            "raw_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+        })).collect::<Vec<_>>();
+        let root = kio_core::disk_records::RecordStageRoot::temporary().unwrap();
+        let decode = |value: &Value| {
+            kio_core::disk_records::decode_json::<TreeWire>(
+                &root,
+                serde_json::to_vec(value).unwrap().as_slice(),
+            )
+            .unwrap()
+        };
+        let tree = decode(&serde_json::json!({
+            "object_type": "tree", "chunking_config_hash": RAW_HASH, "entries": entries
+        }));
+        super::validate_tree_wire(&tree).unwrap();
+        let mut value = serde_json::to_value(&tree).unwrap();
+        value["entries"].as_array_mut().unwrap().swap(0, 1);
+        let unsorted = decode(&value);
+        assert!(super::validate_tree_wire(&unsorted).is_err());
+    }
+
+    #[test]
+    fn st05_attests_a_pointer_in_a_tree_above_sixteen_mib() {
+        let mut fixture = fixture();
+        let store = ObjectStore::new(fixture.root.path().join(&fixture.scope).join(".kio"));
+        let (tree, _) = store
+            .read_tree(fixture.pointer["tree"].as_str().unwrap())
+            .unwrap();
+        let entries = tree
+            .entries
+            .iter()
+            .map(|entry| entry.unwrap())
+            .chain((0..60_000).map(|i| {
+                TreeEntry::raw_file(format!("extra-{i:05}-{}.txt", "x".repeat(210)), RAW_HASH)
+                    .unwrap()
+            }));
+        let mut builder = kio_core::dag::TreeBuilder::new(
+            &store.record_stages().unwrap(),
+            tree.chunking_config_hash.clone(),
+        );
+        for entry in entries {
+            builder.push(entry).unwrap();
+        }
+        let tree = builder.finish().unwrap();
+        let tree_hash = store.write_tree(&tree).unwrap();
+        assert!(store.read_tree(&tree_hash).unwrap().1 > 16 * 1024 * 1024);
+        let object = store
+            .read_object(
+                ObjectKind::Commit,
+                fixture.pointer["commit"].as_str().unwrap(),
+            )
+            .unwrap();
+        let mut commit: CommitObject = serde_json::from_slice(&object.bytes).unwrap();
+        commit.tree = tree_hash.clone();
+        let (commit_hash, _) = store
+            .write_json(ObjectKind::Commit, &serde_json::to_value(commit).unwrap())
+            .unwrap();
+        fixture.pointer["commit"] = json!(commit_hash);
+        fixture.pointer["tree"] = json!(tree_hash);
+        let mut attestor =
+            PointerAttestor::new(fixture.root.path(), std::slice::from_ref(&fixture.scope))
+                .unwrap();
+        attestor.attest(&fixture.pointer).unwrap();
+    }
+
+    #[test]
+    fn streamed_tree_rejects_noncanonical_and_unknown_wire_fields() {
+        let fixture = fixture();
+        let tree =
+            format!(r#"{{"chunking_config_hash":"{RAW_HASH}","entries":[],"object_type":"tree"}}"#);
+        let kio = cap_fs::open_ambient_dir(
+            &fixture.root.path().join(&fixture.scope).join(".kio"),
+            cap_primitives::ambient_authority(),
+        )
+        .unwrap();
+        for invalid in [
+            format!("{tree}\n"),
+            tree.replace("[]", "[ ]"),
+            tree.replace("\"object_type\"", "\"extra\":true,\"object_type\""),
+        ] {
+            let hash = hash_bytes(invalid.as_bytes());
+            let store = ObjectStore::new(fixture.root.path().join(&fixture.scope).join(".kio"));
+            // Test bytes intentionally bypass the typed canonical writer.
+            let path = store.object_path(ObjectKind::Tree, &hash).unwrap();
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, invalid).unwrap();
+            let mut attestor =
+                PointerAttestor::new(fixture.root.path(), std::slice::from_ref(&fixture.scope))
+                    .unwrap();
+            assert!(attestor.read_streamed_tree(&kio, &hash).is_err());
+            assert!(attestor.verified_bytes > 0);
+        }
+    }
+
+    #[test]
+    fn streamed_tree_preserves_remaining_aggregate_budget() {
+        let fixture = fixture();
+        let mut attestor =
+            PointerAttestor::new(fixture.root.path(), std::slice::from_ref(&fixture.scope))
+                .unwrap();
+        attestor.verified_bytes = MAX_POINTER_ATTESTATION_BYTES - 1;
+        assert!(
+            attestor
+                .read_tree(
+                    fixture.pointer["scope_id"].as_str().unwrap(),
+                    fixture.pointer["tree"].as_str().unwrap()
+                )
+                .is_err()
+        );
+        assert_eq!(attestor.verified_bytes, MAX_POINTER_ATTESTATION_BYTES - 1);
     }
 
     #[test]
@@ -1075,16 +1272,19 @@ mod tests {
             text: text.to_owned(),
         };
         let chunk_hash = store.write_chunk(&chunk).unwrap();
-        let tree = build_tree(vec![TreeEntry {
-            path: "old-name.md".to_owned(),
-            entry_type: "file".to_owned(),
-            raw_hash: RAW_HASH.to_owned(),
-            normalize: Some(NormalizeRef {
-                tool_profile_hash: PROFILE_HASH.to_owned(),
-                r#gen: 3,
-                manifest_hash: MANIFEST_HASH.to_owned(),
-            }),
-        }])
+        let tree = build_tree(
+            &store.record_stages().unwrap(),
+            vec![TreeEntry {
+                path: "old-name.md".to_owned(),
+                entry_type: "file".to_owned(),
+                raw_hash: RAW_HASH.to_owned(),
+                normalize: Some(NormalizeRef {
+                    tool_profile_hash: PROFILE_HASH.to_owned(),
+                    r#gen: 3,
+                    manifest_hash: MANIFEST_HASH.to_owned(),
+                }),
+            }],
+        )
         .unwrap();
         let (tree_hash, _) = store
             .write_json(ObjectKind::Tree, &serde_json::to_value(&tree).unwrap())
@@ -1152,12 +1352,15 @@ mod tests {
     fn current_chunk_text_accepts_only_the_explicit_missing_normalize_case() {
         let fixture = fixture();
         let store = ObjectStore::new(fixture.root.path().join(&fixture.scope).join(".kio"));
-        let tree = build_tree(vec![TreeEntry {
-            path: "old-name.md".to_owned(),
-            entry_type: "file".to_owned(),
-            raw_hash: RAW_HASH.to_owned(),
-            normalize: None,
-        }])
+        let tree = build_tree(
+            &store.record_stages().unwrap(),
+            vec![TreeEntry {
+                path: "old-name.md".to_owned(),
+                entry_type: "file".to_owned(),
+                raw_hash: RAW_HASH.to_owned(),
+                normalize: None,
+            }],
+        )
         .unwrap();
         let (tree_hash, _) = store
             .write_json(ObjectKind::Tree, &serde_json::to_value(&tree).unwrap())

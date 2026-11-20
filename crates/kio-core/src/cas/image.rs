@@ -131,7 +131,7 @@ impl ImageStore {
         }
         let hash = hash_bytes(bytes);
         let (parent, leaf) = self.fanout(&hash, true)?;
-        write_bound_content_at(&parent, &leaf, kind, &hash, bytes)?;
+        write_bound_content_at(&parent, &leaf, &hash, bytes)?;
         Ok(hash)
     }
 }
@@ -139,31 +139,24 @@ impl ImageStore {
 pub(super) fn write_bound_content_at(
     parent: &File,
     leaf: &str,
-    kind: ContentObjectKind,
     hash: &str,
     bytes: &[u8],
 ) -> Result<()> {
-    match bound_read_regular(&CasReadAccess::Unmetered, parent, leaf, kind.max_bytes()) {
-        Ok((_, existing)) => {
-            if hash_bytes(&existing) == hash && existing == bytes {
-                return Ok(());
-            }
-            return Err(corrupt_object_error(
-                Path::new(leaf),
-                "CAS content bytes do not match existing object",
-                hash,
-                Some(&hash_bytes(&existing)),
-            ));
-        }
+    match verify_bound_content(parent, leaf, hash, bytes) {
+        Ok(()) => return sync_bound_directory(parent, Path::new(leaf)),
         Err(error) if error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => {}
         Err(error) => return Err(error),
     }
     let (temp_name, mut temp) = bound_create_temp(parent)?;
     let result = (|| {
-        temp.write_all(bytes).kio_io(Path::new(&temp_name))?;
-        temp.sync_all().kio_io(Path::new(&temp_name))?;
+        temp.write_all(bytes).map_err(|error| {
+            crate::store_dir::stage::stage_io("cannot write staged CAS content", error)
+        })?;
+        temp.sync_all().map_err(|error| {
+            crate::store_dir::stage::stage_io("cannot sync staged CAS content", error)
+        })?;
         drop(temp);
-        bound_publish_content(parent, &temp_name, leaf, kind, hash, bytes)
+        bound_publish_content(parent, &temp_name, leaf, hash, bytes)
     })();
     if result.is_err() {
         let _ = bound_remove(parent, &temp_name);

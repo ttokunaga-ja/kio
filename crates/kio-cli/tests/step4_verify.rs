@@ -483,14 +483,14 @@ fn ct4_verify_and_fsck_accept_valid_tombstone_terminal() {
 }
 
 #[test]
-fn ct4_fsck_checks_failed_prepared_and_metadata_only_image_references() {
+fn ct4_fsck_checks_failed_prepared_and_owned_image_references() {
     let (dir, pointer, _) = fixture();
     let repo = kio_core::scope::Repository::open(dir.path()).unwrap();
     let parent_hash = pointer["commit"].as_str().unwrap().to_owned();
     let parent = repo.read_commit(&parent_hash).unwrap();
-    let mut tree = repo.read_tree(&parent.tree).unwrap();
-    let entry = tree
-        .entries
+    let tree = repo.read_tree(&parent.tree).unwrap();
+    let mut entries = tree.entries.to_vec().unwrap();
+    let entry = entries
         .iter_mut()
         .find(|entry| entry.raw_hash == pointer["raw_hash"].as_str().unwrap())
         .unwrap();
@@ -509,9 +509,11 @@ fn ct4_fsck_checks_failed_prepared_and_metadata_only_image_references() {
     let mut failed = template;
     failed["unit_key"] = Value::from(failed_key);
     failed["unit_ref"] = Value::from(kio_pipeline::prepare::unit_ref(failed_key));
+    failed["order"] = Value::from(manifest["units"][0]["order"].as_u64().unwrap() + 1);
     failed["status"] = Value::from("failed");
     failed["unit_object_hash"] = Value::Null;
-    failed["prepared_hash"] = Value::from(format!("sha256:{}", "e".repeat(64)));
+    let missing_prepared_hash = format!("sha256:{}", "e".repeat(64));
+    failed["prepared_hash"] = Value::from(missing_prepared_hash.clone());
     failed["error_kind"] = Value::from("contract_violation");
     manifest["units"].as_array_mut().unwrap().push(failed);
 
@@ -531,7 +533,7 @@ fn ct4_fsck_checks_failed_prepared_and_metadata_only_image_references() {
     }]);
     // Metadata alone is descriptive. Make this a typed local ownership edge
     // so fsck must verify the missing image CAS object.
-    unit["owned_image_hashes"] = serde_json::json!([missing_image_hash]);
+    unit["owned_image_hashes"] = serde_json::json!([missing_image_hash.clone()]);
     let unit_bytes = canonical_json_bytes(&unit).unwrap();
     let replacement_unit_hash = store
         .write_content_object(ContentObjectKind::NormalizedUnit, &unit_bytes)
@@ -542,7 +544,11 @@ fn ct4_fsck_checks_failed_prepared_and_metadata_only_image_references() {
         .write_content_object(ContentObjectKind::Manifest, &manifest_bytes)
         .unwrap();
 
-    let tree = build_tree(tree.entries).unwrap();
+    let tree = build_tree(
+        &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+        entries,
+    )
+    .unwrap();
     let (tree_hash, _) = store
         .write_json(ObjectKind::Tree, &serde_json::to_value(&tree).unwrap())
         .unwrap();
@@ -573,14 +579,20 @@ fn ct4_fsck_checks_failed_prepared_and_metadata_only_image_references() {
         .stdout
         .clone();
     let output: Value = serde_json::from_slice(&stdout).unwrap();
-    let kinds = output["remaining_findings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|finding| finding["kind"].as_str())
-        .collect::<std::collections::BTreeSet<_>>();
-    assert!(kinds.contains("prepared_corrupt"), "{output}");
-    assert!(kinds.contains("image_corrupt"), "{output}");
+    let findings = output["remaining_findings"].as_array().unwrap();
+    for (kind, hash) in [
+        ("prepared_corrupt", missing_prepared_hash),
+        ("image_corrupt", missing_image_hash),
+    ] {
+        assert!(
+            findings.iter().any(|finding| {
+                finding["kind"] == kind
+                    && finding["object_hash"] == hash
+                    && finding["affected_commits"] == serde_json::json!([commit_hash])
+            }),
+            "{output}"
+        );
+    }
 }
 
 #[test]
@@ -713,7 +725,7 @@ fn ct4_fsck_unindexed_scope_recovers_lifecycle_epoch_before_retired_backfill() {
         .commit
         .as_ref()
         .and_then(|commit| repo.read_tree(&commit.tree).ok())
-        .and_then(|tree| tree.entries.first().map(|entry| entry.raw_hash.clone()))
+        .and_then(|tree| tree.entries.first().unwrap().map(|entry| entry.raw_hash))
         .unwrap();
     assert!(!dir.path().join(".kio/index/sqlite.db").exists());
 

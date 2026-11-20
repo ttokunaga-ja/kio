@@ -8,7 +8,8 @@ use std::{fs::File, os::windows::io::AsRawHandle, path::Path};
 use windows_sys::Win32::{
     Foundation::GENERIC_READ,
     Storage::FileSystem::{
-        DELETE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, SYNCHRONIZE,
+        DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, SYNCHRONIZE,
     },
 };
 
@@ -38,7 +39,7 @@ pub(crate) fn open_file(directory: &StoreDirectory, leaf: &Path) -> Result<File>
 }
 
 pub(crate) fn publish(
-    _directory: &StoreDirectory,
+    directory: &StoreDirectory,
     _source: &Path,
     held: &File,
     target: &StoreDirectory,
@@ -58,7 +59,8 @@ pub(crate) fn publish(
         publication != Publication::CreateOnly,
         target.path(),
     )?;
-    target.sync()
+    target.sync_stage_destination()?;
+    directory.sync()
 }
 
 fn retire(held: &File) -> Result<()> {
@@ -97,11 +99,29 @@ pub(crate) fn discard_file(
     retire(held)
 }
 pub(crate) fn discard_empty_directory(
-    _directory: &StoreDirectory,
-    _source: &Path,
+    directory: &StoreDirectory,
+    source: &Path,
     held: &File,
 ) -> Result<()> {
-    retire(held)
+    // Persistent directory handles are read-only. Retain DELETE access to the
+    // named child, then compare its identity before retiring that handle.
+    let mut options = cap_fs::OpenOptions::new();
+    options
+        .access_mode(DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
+    let mutator = cap_fs::open(&directory.root_handle(), source, &options)
+        .map_err(|e| io_failure("cannot retain stage directory for retirement", e))?;
+    let Some(identity) = crate::platform::directory_handle_identity(held) else {
+        return Err(crate::KioError::schema("invalid retained stage directory"));
+    };
+    if crate::platform::directory_handle_identity(&mutator) != Some(identity) {
+        return Err(crate::KioError::schema(
+            "stage directory no longer matches the retained handle; preserved",
+        ));
+    }
+    retire(&mutator)
 }
 
 // Windows mutations use the retained handle directly and create no capture.
@@ -115,6 +135,14 @@ pub(crate) fn inspect_capture(
 ) -> Result<bool> {
     Ok(false)
 }
+pub(crate) fn recover_for_publication(
+    _: &StoreDirectory,
+    _: &Path,
+    _: &StageIdentity,
+) -> Result<()> {
+    Ok(())
+}
+
 pub(crate) fn recover_file(
     _parent: &StoreDirectory,
     _source: &Path,

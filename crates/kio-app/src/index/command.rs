@@ -22,13 +22,16 @@ use crate::historical_reindex;
 use crate::index::chunk_ledger::ensure_purge_epoch_initialized;
 use crate::index::chunk_ledger::recover_index_generation;
 use crate::index::pipeline::DeferredPaidPlaceholder;
-use crate::index::pipeline::explicitly_allowed_tier_a_paths;
 use crate::index::pipeline::index_preview_response;
 use crate::index::pipeline::optional_role_planning_ready;
+use crate::index::pipeline::record_reindex_unsupported_inputs;
 use crate::index::pipeline::run_index_pipeline;
-use crate::index::rebuild::is_rebuild_skippable_unit_error;
+use crate::index::pipeline::sorted_normalizes;
+use crate::index::rebuild::is_regeneration_skippable;
+use crate::index::rebuild::manifest_pin;
 use crate::index::rebuild::read_head_tree_for_rebuild;
 use crate::index::rebuild::rebuild_step3_index;
+use crate::index::rebuild::rebuild_step3_index_with_regeneration_skips;
 use crate::index::rebuild::skipped_disclosure;
 use crate::invocation::Invocation;
 use crate::invocation::merged_index_completion;
@@ -46,7 +49,6 @@ use crate::management::binding_for_repo;
 use crate::management::open_existing_managed_root;
 use crate::management::reconcile_planned_child;
 use crate::markdownize::batch::poll_batch_markdownize_jobs;
-use crate::object_persistence::compute_manifest_hash;
 use crate::object_persistence::copy_normalized_instance_gen;
 use crate::object_persistence::pipeline_to_kio;
 use crate::promotion::apply_online_promotion_to_index;
@@ -86,9 +88,10 @@ use kio_core::KioError;
 use kio_core::Result;
 use kio_core::control::ControlHandle;
 use kio_core::dag::CommitObject;
-use kio_core::dag::NormalizeRef;
-use kio_core::scope::PendingNormalizeRef;
+use kio_core::dag::{NormalizeRef, TreeObject};
+use kio_core::disk_records::{DiskRecords, RecordStageRoot, RecordWriter, SortedRecordCursor};
 use kio_core::scope::Repository;
+use kio_core::scope::{DeferredInput, DeferredInputReason, PendingNormalizeRef, ScannedInput};
 use kio_pipeline::budget::read_budget_policy;
 use kio_pipeline::budget::{BudgetEstimate, evaluate_budget_with_caps};
 use kio_pipeline::ledger::LedgerReadSnapshot;
@@ -100,14 +103,11 @@ use kio_pipeline::scan::ScanPreviewRequest;
 use kio_pipeline::scan::bind_planned_child;
 use kio_pipeline::scan::build_managed_scan_preview;
 use kio_pipeline::scan::build_planned_child_scan_preview;
-use kio_pipeline::scan::build_scan_preview;
 use kio_pipeline::scan::discover_managed_child_scopes_page;
 use kio_pipeline::scan::managed_scan_policy_allows_file;
-use kio_pipeline::scan::read_bound_verified_scan_input;
-use kio_pipeline::task::TaskStatus;
 use kio_pipeline::task::TaskStore;
 use kio_pipeline::task::TaskType;
-use kio_pipeline::unsupported::UNSUPPORTED_REASON_UNRECOGNIZED_BINARY;
+use kio_pipeline::task::{TaskDescriptor, TaskStatus};
 use kio_pipeline::unsupported::UnsupportedInputDisposition;
 use kio_pipeline::unsupported::UnsupportedInputStore;
 use serde_json::json;
@@ -182,8 +182,8 @@ struct IndexPublishedWork {
     paused_tasks: usize,
     failed_files: usize,
     normalized_files: usize,
+    deferred_inputs: DiskRecords<DeferredInput>,
     pending_files: usize,
-    skipped_oversized_files: usize,
     skipped_unrecognized_binary_files: usize,
     embedding_tasks_executed: usize,
     embedding_tasks_failed: usize,
@@ -209,8 +209,8 @@ impl IndexPublishedWork {
             paused_tasks: self.paused_tasks,
             failed_files: self.failed_files,
             normalized_files: self.normalized_files,
+            deferred_inputs: self.deferred_inputs,
             pending_files: self.pending_files,
-            skipped_oversized_files: self.skipped_oversized_files,
             skipped_unrecognized_binary_files: self.skipped_unrecognized_binary_files,
             embedding_tasks_executed: self.embedding_tasks_executed,
             embedding_tasks_failed: self.embedding_tasks_failed,
@@ -237,6 +237,15 @@ enum IndexWorkResponse {
 }
 
 impl IndexWorkResponse {
+    fn take_deferred_inputs(&mut self) -> DiskRecords<DeferredInput> {
+        match self {
+            Self::Published(work) => {
+                std::mem::replace(&mut work.deferred_inputs, DiskRecords::empty())
+            }
+            _ => DiskRecords::empty(),
+        }
+    }
+
     fn gc(&self) -> Option<&GcReport> {
         match self {
             Self::Published(work) => work.gc.as_ref(),
@@ -268,11 +277,15 @@ struct IndexInvocationState {
 struct DeferredScopeBudget {
     relative: String,
     scope_id: String,
-    tasks: Vec<DeferredPaidPlaceholder>,
+    tasks: DiskRecords<DeferredPaidPlaceholder>,
 }
 
 impl IndexInvocationState {
-    fn defer(&mut self, repo: &Repository, tasks: Vec<DeferredPaidPlaceholder>) -> Result<()> {
+    fn defer(
+        &mut self,
+        repo: &Repository,
+        tasks: DiskRecords<DeferredPaidPlaceholder>,
+    ) -> Result<()> {
         if tasks.is_empty() {
             return Ok(());
         }
@@ -364,20 +377,16 @@ fn finalize_deferred_budget(
         let (device, folder) =
             budget_remaining_from_totals(&caps, "markdownize", device, folder, adapter);
         let store = TaskStore::new_with_control(repo.kio_dir(), repo.control().clone());
-        let exact = scope
-            .tasks
-            .iter()
-            .map(|entry| (entry.expected.task_id.as_str(), entry))
-            .collect::<BTreeMap<_, _>>();
-        store
-            .update_matching(|task| {
-                let Some(deferred) = exact.get(task.task_id.as_str()) else {
-                    return false;
-                };
-                // Never clear somebody else's hold, attempt, deadline or paid stamp.
-                if *task != deferred.expected {
-                    return false;
-                }
+        let mut exact = SortedRecordCursor::new(scope.tasks.iter(), |row| &row.expected.task_id);
+        let mut tasks = store.all().map_err(pipeline_to_kio)?;
+        let mut paused = 0;
+        let mut pending = 0;
+        for task in &mut tasks {
+            let Some(deferred) = exact.at(&task.task_id)? else {
+                continue;
+            };
+            // Never clear somebody else's hold, attempt, deadline or paid stamp.
+            if *task == deferred.expected {
                 let estimate = BudgetEstimate {
                     scope_id: scope.scope_id.clone(),
                     task_type: TaskType::Markdownize,
@@ -388,29 +397,20 @@ fn finalize_deferred_budget(
                 let (status, reason) = if !decision.allowed && caps.hard_stop {
                     (TaskStatus::Paused, "budget_exceeded")
                 } else {
-                    (TaskStatus::Pending, deferred.ready_reason)
+                    (TaskStatus::Pending, deferred.ready_reason.as_str())
                 };
                 task.status = status;
                 task.fallback_reason = Some(reason.to_owned());
                 task.hold_reason = kio_pipeline::task::hold_reason_for_reason(reason);
-                true
-            })
-            .map_err(pipeline_to_kio)?;
-        if scope.relative.is_empty() {
-            let current = store.all().map_err(pipeline_to_kio)?;
-            let statuses = current
-                .iter()
-                .map(|task| (task.task_id.as_str(), task.status))
-                .collect::<BTreeMap<_, _>>();
-            let mut paused = 0;
-            let mut pending = 0;
-            for deferred in &scope.tasks {
-                match statuses.get(deferred.expected.task_id.as_str()) {
-                    Some(TaskStatus::Paused) => paused += 1,
-                    Some(TaskStatus::Pending) => pending += 1,
-                    _ => {}
-                }
             }
+            match task.status {
+                TaskStatus::Paused => paused += 1,
+                TaskStatus::Pending => pending += 1,
+                _ => {}
+            }
+        }
+        store.replace_all(&tasks).map_err(pipeline_to_kio)?;
+        if scope.relative.is_empty() {
             root_work.paused_tasks =
                 root_work.paused_tasks.saturating_sub(scope.tasks.len()) + paused;
             root_work.pending_online_tasks += pending;
@@ -491,6 +491,8 @@ fn run_index_for_repo_inner(
     discover_children: bool,
     invocation_state: &mut IndexInvocationState,
 ) -> Result<IndexExecution> {
+    #[cfg(debug_assertions)]
+    ctx.interaction.working_scan_started();
     let archive_repo =
         repo.clone()
             .with_archive_limits(kio_core::scope::ArchiveLimits::from_options(
@@ -512,14 +514,21 @@ fn run_index_for_repo_inner(
     // well as paid sends. Check an owned read-only registry snapshot before
     // GC recovery, grants or any index mutation can begin.
     if !args.preview {
-        let scope_id = repo.scope_identity()?.scope_id;
-        resolve_evidence_scope_target(
-            ctx.cwd(),
-            &EvidenceRegistry::default(),
-            &scope_id,
-            Some(&repo.canonical_root().display().to_string()),
-            ctx.control,
-        )?;
+        if super::extraction_retirement::has_journal(repo)? {
+            crate::scope_access::validate_extraction_recovery_registration(ctx.cwd(), repo)?;
+            let _lock = repo.lock_store_in_session(repo.lock_session())?;
+            admission_policy.revalidate().map_err(pipeline_to_kio)?;
+            super::extraction_retirement::recover_for_index(repo)?;
+        } else {
+            let scope_id = repo.scope_identity()?.scope_id;
+            resolve_evidence_scope_target(
+                ctx.cwd(),
+                &EvidenceRegistry::default(),
+                &scope_id,
+                Some(&repo.canonical_root().display().to_string()),
+                ctx.control,
+            )?;
+        }
     }
     let lane_override = LaneOverride::new(args.realtime, args.batch);
     let mut child_discovery = if discover_children && args.preview {
@@ -535,6 +544,9 @@ fn run_index_for_repo_inner(
         Some(&repo.kio_dir().join("config.toml")),
         ctx.control,
     )?;
+    // Validate the adapter input policy before planning. Its size limit is
+    // applied when the adapter input is prepared for a send.
+    crate::settings::effective_max_input_bytes(repo)?;
     // Preview and network-revoke are not successful index publications, so
     // they never activate automatic GC.  A real index first resumes any
     // after_index marker; if the bounded slice expires, return before taking
@@ -560,6 +572,7 @@ fn run_index_for_repo_inner(
         // writer is acquired.  This stays descriptor-bound for internal child
         // scopes through `build_repository_scan_preview`.
         validate_repo_tool_lock(repo)?;
+        let preview_stages = RecordStageRoot::temporary()?;
         let preview = build_repository_scan_preview(
             adapter_settings,
             repo,
@@ -568,23 +581,27 @@ fn run_index_for_repo_inner(
                 include_raw_hashes: false,
                 require_network_approval: !args.offline,
             },
-        )
-        .map_err(pipeline_to_kio)?;
-        let mut output = index_preview_response(repo.canonical_root(), &preview);
+            preview_stages.clone(),
+        )?;
+        let mut output = index_preview_response(repo.canonical_root(), &preview)?;
+        let root = repo
+            .bound_root_handle()
+            .ok_or_else(|| KioError::schema("preview lost retained scope root"))?;
+        let mut extraction_issues = RecordWriter::new(&preview_stages)?;
+        preview_extraction_issues(
+            &mut extraction_issues,
+            root,
+            repo.canonical_root(),
+            Path::new(""),
+            &preview,
+            args.resource_tier,
+            repo.control(),
+        )?;
         if let Some(discovery) = child_discovery.as_ref() {
             let plan = &discovery.slice.plan;
             let mut children = Vec::new();
-            let mut aggregate_files = preview
-                .candidates
-                .iter()
-                .filter(|candidate| !candidate.ignored)
-                .count();
-            let mut aggregate_bytes = preview
-                .candidates
-                .iter()
-                .filter(|candidate| !candidate.ignored)
-                .map(|candidate| candidate.size_bytes)
-                .sum::<u64>();
+            let (mut aggregate_files, mut aggregate_bytes) =
+                (output.estimated_file_count, output.estimated_size_bytes);
             let mut aggregate_cost = preview
                 .estimated_cost
                 .as_ref()
@@ -620,16 +637,16 @@ fn run_index_for_repo_inner(
                         parent_case,
                     )
                     .map_err(pipeline_to_kio)?;
-                    let included = child_preview
-                        .candidates
-                        .iter()
-                        .filter(|candidate| !candidate.ignored)
-                        .collect::<Vec<_>>();
-                    let count = included.len();
-                    let bytes = included
-                        .iter()
-                        .map(|candidate| candidate.size_bytes)
-                        .sum::<u64>();
+                    preview_extraction_issues(
+                        &mut extraction_issues,
+                        &bound.root,
+                        &bound.canonical_root,
+                        Path::new(&child.path),
+                        &child_preview,
+                        args.resource_tier,
+                        repo.control(),
+                    )?;
+                    let (count, bytes) = child_preview.included_totals()?;
                     let cost = child_preview
                         .estimated_cost
                         .as_ref()
@@ -654,6 +671,7 @@ fn run_index_for_repo_inner(
                 preview: true,
             });
         }
+        output.extraction_issues = extraction_issues.finish()?;
         admission_policy.revalidate().map_err(pipeline_to_kio)?;
         return Ok(IndexExecution {
             response: IndexWorkResponse::Preview(output),
@@ -675,8 +693,9 @@ fn run_index_for_repo_inner(
     // only then constructs a fresh preview, binding approvals and writes to the
     // current tree rather than a stale pre-lock observation. The lock is
     // reentrant, so the internal auto-snapshot re-acquisition does not deadlock.
-    let lock = repo.lock_store_in_session(repo.lock_session())?;
+    let lock = repo.lock_store_for_publication()?;
     admission_policy.revalidate().map_err(pipeline_to_kio)?;
+    super::extraction_retirement::recover(repo)?;
     management::reconcile_child_lifecycle(repo)?;
     // Lifecycle reconciliation may legitimately change management records.
     // Bind scanning and publication to the resulting live policy snapshot.
@@ -690,17 +709,12 @@ fn run_index_for_repo_inner(
             include_raw_hashes: true,
             require_network_approval: !args.offline,
         },
-    )
-    .map_err(pipeline_to_kio)?;
+        repo.object_store().record_stages()?,
+    )?;
 
-    let excluded = preview
-        .candidates
-        .iter()
-        .filter(|candidate| candidate.ignored)
-        .map(|candidate| candidate.input_path.clone())
-        .collect::<BTreeSet<_>>();
-    let explicitly_allowed_tier_a = explicitly_allowed_tier_a_paths(&preview);
-    repo.validate_archive_budget(&excluded, &explicitly_allowed_tier_a)?;
+    let stages = repo.object_store().record_stages()?;
+    let inputs = scanned_inputs(&stages, &preview)?;
+    repo.validate_scanned_archive_budget(&inputs)?;
 
     // Validated management membership is the continuing local scan grant.
     // External adapter consent is evaluated separately below; absence of a
@@ -797,22 +811,84 @@ fn run_index_for_repo_inner(
             crate::batch::command::recheck_resource_limit,
         )?;
     }
-    let mut index_result =
-        run_index_pipeline(adapter_settings, repo, &preview, &args, ledger.as_ref())?;
-    invocation_state.defer(repo, std::mem::take(&mut index_result.deferred_budget))?;
+    let (index_result, observations) = run_index_pipeline(
+        adapter_settings,
+        repo,
+        &preview,
+        &args,
+        ledger.as_ref(),
+        invocation_state.recheck_resources,
+    )?;
+    invocation_state.defer(repo, index_result.deferred_budget.finish()?)?;
+    let retired_extractions = index_result.retired_extractions.finish()?;
     // A prior batch may already have produced a complete accepted online
     // instance. Overlay it before the one normal index snapshot so an ordinary
     // index neither demotes the file to the deterministic baseline nor creates a
     // second promotion commit.
-    apply_online_promotion_to_index(adapter_settings, repo, &mut index_result)?;
-    let outcome = repo.auto_snapshot_with_bound_normalize(
-        Some("kio index auto snapshot"),
-        None,
-        &excluded,
-        &index_result.normalize_by_path,
-        &explicitly_allowed_tier_a,
-        Some(&|| publication_policy.revalidate().map_err(pipeline_to_kio)),
+    let normalizes = sorted_normalizes(&stages, index_result.normalizes.finish()?)?;
+    let promotion = apply_online_promotion_to_index(adapter_settings, repo, &normalizes)?;
+    let selected = if observations.is_empty() && promotion.is_none() {
+        normalizes
+    } else {
+        let mut observations_by_path =
+            SortedRecordCursor::new(observations.iter(), |row| &row.path);
+        let mut selected = RecordWriter::new(&stages)?;
+        let rows = kio_core::disk_records::merge_sorted_records(
+            normalizes.iter(),
+            promotion.iter().flat_map(|stage| stage.iter()),
+            |a, b| a.0.cmp(&b.0),
+        );
+        let mut rows = rows.peekable();
+        while let Some(row) = rows.next() {
+            let row = row?;
+            if rows
+                .peek()
+                .is_some_and(|next| next.as_ref().is_ok_and(|next| next.0 == row.0))
+            {
+                continue;
+            }
+            if !observations_by_path
+                .at(&row.0)?
+                .is_some_and(UnsupportedInputDisposition::is_unsupported)
+            {
+                selected.push(&row)?;
+            }
+        }
+        selected.finish()?
+    };
+    repo.control()
+        .checkpoint(kio_core::durability::DurabilityPoint::BeforeIndexSnapshot)?;
+    let deferred = record_scan_path_changes(
+        adapter_settings,
+        repo,
+        &stages,
+        &preview,
+        index_result.deferred_inputs.finish()?,
     )?;
+    let (outcome, deferred_inputs) = repo.auto_snapshot_scanned(
+        "kio index auto snapshot",
+        &inputs,
+        deferred,
+        &selected,
+        &|_| publication_policy.revalidate().map_err(pipeline_to_kio),
+        &|head, tree, deferred| {
+            if !retired_extractions.is_empty() || index_result.resource_limit.is_some() {
+                super::extraction_retirement::record(
+                    repo,
+                    head,
+                    tree,
+                    &retired_extractions,
+                    deferred,
+                )?;
+            }
+            ctx.control
+                .checkpoint(kio_core::durability::DurabilityPoint::ExtractionBeforeHead)
+        },
+    )?;
+    ctx.control
+        .checkpoint(kio_core::durability::DurabilityPoint::ExtractionAfterHead)?;
+    #[cfg(debug_assertions)]
+    ctx.interaction.working_scan_published();
     if let Some(commit_hash) = &outcome.commit_hash {
         maybe_inject_replica_after_head_fault("index_before_marker", ctx.control)?;
         // HEAD now names content the old source index and replica projection do
@@ -832,7 +908,8 @@ fn run_index_for_repo_inner(
             }),
         )?;
     }
-    let rebuild_report = rebuild_step3_index(ctx, repo)?;
+    super::extraction_retirement::recover(repo)?;
+    let mut rebuild_report = rebuild_step3_index(ctx, repo)?;
     // LC42-LC44: after the rebuild's temp-build-then-rename lands the final
     // `sqlite.db`, reconcile `index_metadata` (item 2).
     recover_index_generation(repo.kio_dir(), repo.control())?;
@@ -840,7 +917,8 @@ fn run_index_for_repo_inner(
     // guardrails (K4). No-op unless an embedding adapter is configured. R11-2: keep
     // the ExecOutcome (was discarded) so the embedding enrichment result is disclosed
     // and can raise the exit code (auth/budget) instead of a silent exit 0.
-    let enrichment = generate_scope_embeddings(ctx, repo, &args)?;
+    let enrichment =
+        generate_scope_embeddings(ctx, repo, &args, rebuild_report.enrichment_replay.as_mut())?;
     // The scope now has a search index; register it as indexed so it participates
     // in default multi-scope search (05 §1.8, K3). Cache write, never fatal.
     register_scope(ctx, repo, true);
@@ -855,7 +933,9 @@ fn run_index_for_repo_inner(
         .or(enrichment.resource_limit.clone())
         .or(persisted_limit)
     {
-        return Err(limit.into_error("index preserved completed units and is held for resources"));
+        return Err(limit
+            .into_error("index preserved completed units and is held for resources")
+            .with_context_field("published_with_resource_hold", json!(true)));
     }
     let mut output = IndexPublishedWork {
         status: if outcome.noop { "noop" } else { "indexed" }.to_owned(),
@@ -867,8 +947,8 @@ fn run_index_for_repo_inner(
         paused_tasks: index_result.paused_tasks + enrichment.paused,
         failed_files: index_result.failed_files,
         normalized_files: index_result.normalized_files,
+        deferred_inputs,
         pending_files: index_result.pending_files,
-        skipped_oversized_files: index_result.skipped_oversized_files,
         skipped_unrecognized_binary_files: index_result.skipped_unrecognized_binary_files,
         embedding_tasks_executed: enrichment.executed,
         embedding_tasks_failed: enrichment.failed,
@@ -907,6 +987,7 @@ fn run_index_for_repo_inner(
         let mut child_rows_total = 0_u64;
         let mut managed_parents = BTreeMap::<String, Repository>::new();
         let mut child_gc_reports = BTreeMap::<String, GcReport>::new();
+        let mut child_deferrals = BTreeMap::new();
         let parent_completion = completion;
         let mut child_completions = Vec::new();
         let mut incomplete_child_discovery = false;
@@ -1005,9 +1086,7 @@ fn run_index_for_repo_inner(
                         child.status = "skipped_ignored".to_owned();
                         child.reason = Some("current_parent_policy".to_owned());
                     }
-                    Ok(BoundChildIndex::Output(child_output, child_repo))
-                        if child_output.completion == Completion::Complete =>
-                    {
+                    Ok(BoundChildIndex::Output(mut child_output, child_repo)) => {
                         cache_managed_child_parent(
                             &mut managed_parents,
                             child.path.clone(),
@@ -1016,48 +1095,48 @@ fn run_index_for_repo_inner(
                         if let Some(gc) = child_output.response.gc() {
                             child_gc_reports.insert(child.path.clone(), gc.clone());
                         }
-                        child.status = "indexed".to_owned()
-                    }
-                    Ok(BoundChildIndex::Output(child_output, child_repo)) => {
-                        cache_managed_child_parent(
-                            &mut managed_parents,
-                            child.path.clone(),
-                            *child_repo,
-                        );
-                        if let Some(gc) = child_output.response.gc() {
-                            child_gc_reports.insert(child.path.clone(), gc.clone());
+                        if children.len() < CHILD_SCOPE_DISCOVERY_PAGE_SIZE {
+                            let deferred = child_output.response.take_deferred_inputs();
+                            if !deferred.is_empty() {
+                                child_deferrals.insert(child.path.clone(), deferred);
+                            }
                         }
                         let child_completion = child_output.completion;
-                        child_completions.push(child_completion);
-                        child.status = "indexed_partial".to_owned();
-                        child.error_code = child_output
-                            .response
-                            .error_code()
-                            .map(str::to_owned)
-                            .or_else(|| {
-                                Some(
-                                    match child_completion {
-                                        Completion::AuthRequired => "KIO-E-ADAPTER-AUTH-001",
-                                        Completion::BudgetBlocked => "KIO-E-BUDGET-EXCEEDED-001",
-                                        Completion::Partial => "KIO-E-SEARCH-PARTIAL-001",
-                                        Completion::Permanent => {
-                                            "KIO-E-SEARCH-SCOPE-ALL-FAILED-001"
+                        if child_completion == Completion::Complete {
+                            child.status = "indexed".to_owned();
+                        } else {
+                            child_completions.push(child_completion);
+                            child.status = "indexed_partial".to_owned();
+                            child.error_code = child_output
+                                .response
+                                .error_code()
+                                .map(str::to_owned)
+                                .or_else(|| {
+                                    Some(
+                                        match child_completion {
+                                            Completion::AuthRequired => "KIO-E-ADAPTER-AUTH-001",
+                                            Completion::BudgetBlocked => {
+                                                "KIO-E-BUDGET-EXCEEDED-001"
+                                            }
+                                            Completion::Partial => "KIO-E-SEARCH-PARTIAL-001",
+                                            Completion::Permanent => {
+                                                "KIO-E-SEARCH-SCOPE-ALL-FAILED-001"
+                                            }
+                                            Completion::Complete => {
+                                                unreachable!("guarded child must be noncomplete")
+                                            }
                                         }
-                                        Completion::Complete => {
-                                            unreachable!("guarded child must be noncomplete")
-                                        }
-                                    }
-                                    .to_owned(),
-                                )
-                            });
-                        child.message =
-                            child_output
+                                        .to_owned(),
+                                    )
+                                });
+                            child.message = child_output
                                 .response
                                 .message()
                                 .map(str::to_owned)
                                 .or_else(|| {
                                     Some("child index completed with a non-success exit".to_owned())
                                 });
+                        }
                     }
                     Err(error) => {
                         #[cfg(test)]
@@ -1135,7 +1214,14 @@ fn run_index_for_repo_inner(
                 .into_iter()
                 .map(|discovery| {
                     let gc = child_gc_reports.get(&discovery.path).cloned();
-                    ChildPublishedRow { discovery, gc }
+                    let deferred_inputs = child_deferrals
+                        .remove(&discovery.path)
+                        .unwrap_or_else(DiskRecords::empty);
+                    ChildPublishedRow {
+                        discovery,
+                        gc,
+                        deferred_inputs,
+                    }
                 })
                 .collect(),
         );
@@ -1200,19 +1286,102 @@ fn build_repository_scan_preview(
     adapter_settings: &Arc<AdapterRuntimeSettings>,
     repo: &Repository,
     request: ScanPreviewRequest,
-) -> kio_pipeline::Result<ScanPreview> {
+    stages: RecordStageRoot,
+) -> Result<ScanPreview> {
     let binding = binding_for_repo(repo).map_err(|error| {
-        kio_pipeline::PipelineError::contract("KIO-E-POLICY-MANAGEMENT-001", error.to_string())
+        pipeline_to_kio(kio_pipeline::PipelineError::contract(
+            "KIO-E-POLICY-MANAGEMENT-001",
+            error.to_string(),
+        ))
     })?;
     build_managed_scan_preview(
         &adapter_settings.declared_pricing("markdown"),
         &adapter_settings.declared_pricing("embedding"),
         &binding,
+        stages,
         request,
     )
+    .map_err(pipeline_to_kio)
 }
 
-pub(crate) fn read_repository_scan_input(
+fn preview_extraction_issues(
+    issues: &mut RecordWriter<crate::response::index::ExtractionIssue>,
+    root: &std::fs::File,
+    display_root: &Path,
+    prefix: &Path,
+    preview: &ScanPreview,
+    tier: kio_core::error::ResourceTier,
+    control: &kio_core::control::ControlHandle,
+) -> Result<()> {
+    use kio_pipeline::prepare::{
+        ExtractionBudget, PrepareStageBytesRequest, visit_prepared_units_with_budget,
+    };
+
+    let profile = kio_adapter::catalog::builtin_prepare_profile();
+    let budget = ExtractionBudget::new(tier);
+    for candidate in &preview.candidates {
+        let candidate = candidate?;
+        if candidate.ignored
+            || candidate.media_type == "inode/directory"
+            || kio_pipeline::unsupported::unsupported_reason_for_path(Path::new(
+                &candidate.input_path,
+            ))
+            .is_some()
+        {
+            continue;
+        }
+        let result =
+            kio_pipeline::scan::read_bound_extraction_input(root, &candidate.input_path, tier)
+                .and_then(|verified| {
+                    let path = display_root.join(&candidate.input_path);
+                    visit_prepared_units_with_budget(
+                        PrepareStageBytesRequest {
+                            raw_hash: &verified.raw_hash,
+                            media_type: &candidate.media_type,
+                            input_path: &path.to_string_lossy(),
+                            tool_profile_hash: &profile.tool_profile_hash,
+                            bytes: &verified.bytes,
+                        },
+                        control,
+                        budget,
+                        |prepared, bytes| {
+                            super::pipeline::check_preview_normalized_unit(
+                                &path,
+                                &verified.raw_hash,
+                                &candidate.media_type,
+                                prepared,
+                                bytes,
+                            )
+                        },
+                    )
+                });
+        if let Err(error) = result {
+            let error = pipeline_to_kio(error);
+            issues.push(&crate::response::index::ExtractionIssue {
+                path: prefix.join(&candidate.input_path),
+                error_code: error.error_code().to_owned(),
+                resource_limit: error.resource_limit().cloned(),
+            })?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn read_repository_extraction_input(
+    repo: &Repository,
+    input_path: &str,
+    tier: kio_core::error::ResourceTier,
+) -> kio_pipeline::Result<kio_pipeline::scan::VerifiedScanInput> {
+    let root = repo.bound_root_handle().ok_or_else(|| {
+        kio_pipeline::PipelineError::contract(
+            "KIO-E-SCOPE-BOUND-STATE-001",
+            "managed index is missing its retained scope handle",
+        )
+    })?;
+    kio_pipeline::scan::read_bound_extraction_input(root, input_path, tier)
+}
+
+pub(crate) fn read_verified_adapter_source(
     repo: &Repository,
     input_path: &str,
     max_bytes: u64,
@@ -1223,7 +1392,33 @@ pub(crate) fn read_repository_scan_input(
             "managed index is missing its retained scope handle",
         )
     })?;
-    read_bound_verified_scan_input(root, input_path, max_bytes)
+    kio_pipeline::scan::read_bound_extraction_input_at_most(
+        root,
+        input_path,
+        kio_core::error::ResourceTier::Standard,
+        max_bytes,
+    )
+    .map_err(|error| match error {
+        kio_pipeline::PipelineError::ResourceLimit(mut limit) => {
+            limit.stage = "read_adapter_source".to_owned();
+            limit.resource_tier = None;
+            kio_pipeline::PipelineError::ResourceLimit(limit)
+        }
+        error => error,
+    })
+}
+
+pub(crate) fn hash_repository_scan_input(
+    repo: &Repository,
+    input_path: &str,
+) -> kio_pipeline::Result<kio_pipeline::scan::VerifiedScanIdentity> {
+    let root = repo.bound_root_handle().ok_or_else(|| {
+        kio_pipeline::PipelineError::contract(
+            "KIO-E-SCOPE-BOUND-STATE-001",
+            "managed index is missing its retained scope handle",
+        )
+    })?;
+    kio_pipeline::scan::hash_bound_verified_scan_input(root, input_path, u64::MAX)
 }
 
 pub(crate) fn repository_scan_policy_allows_file(
@@ -1399,7 +1594,6 @@ pub(crate) fn compute_index_status(
     ledger_path: &Path,
     budget_month: &str,
     control: &ControlHandle,
-    locks: &kio_core::scope::LockSession,
 ) -> Result<IndexStatusResponse> {
     let mut total = 0u64;
     let mut total_enrichment_tasks = 0u64;
@@ -1450,73 +1644,11 @@ pub(crate) fn compute_index_status(
                 Vec::new()
             }
         };
-        for task in tasks {
-            if !matches!(task.task_type, TaskType::Markdownize | TaskType::Embedding) {
-                continue;
-            }
-            // R20-7: a `retired_non_live` task's chunk went non-live (deleted / re-chunked /
-            // superseded), so it is NOT an enrichment gap in the CURRENT corpus and must not
-            // deflate enriched_ratio. R11-8 deliberately keeps a LIVE permanent-gap Failed
-            // (invalid_input/contract) in the denominator; this excludes only the non-live
-            // subset, which R19-3's dedicated reason makes unambiguous. Without this, a
-            // deleted/reverted chunk left enriched_ratio < 1.0 with pending == 0 forever.
-            if task.fallback_reason.as_deref() == Some(RETIRED_NON_LIVE) {
-                continue;
-            }
-            total_enrichment_tasks += 1;
-            if task.status == TaskStatus::Skipped {
-                skipped_enrichment_tasks += 1;
-                *skipped_enrichment_reasons
-                    .entry(
-                        task.fallback_reason
-                            .clone()
-                            .expect("validated skipped reason"),
-                    )
-                    .or_insert(0) += 1;
-                continue;
-            }
-            total += 1;
-            match task.status {
-                TaskStatus::Done => done += 1,
-                // R9-4: a Partial task has Failed units still awaiting completion —
-                // count it as incomplete (pending), not done. Counting it as done
-                // made `index_status` report enriched_ratio = 1.0 with
-                // pending_enrichment_tasks = 0 while units were permanently missing
-                // (a silent data gap on text-layer-less scans). `batch retry` now
-                // drives it to Done (docs/04 §5.2).
-                TaskStatus::Partial | TaskStatus::Pending | TaskStatus::Running => pending += 1,
-                // R22-7: only a BUDGET pause may set `budget_paused`. docs/05-runtime.md:200
-                // has agents render this flag as "(budget により一時停止中)", so a Tier B
-                // `secrets_tier_b_hold` — which costs nothing and is cleared by
-                // `--send-secrets`, never by raising a cap — was steering them to
-                // `--override-budget` while `device_remaining_usd` sat untouched at its full
-                // cap. It is still outstanding work, so it stays in `pending`.
-                TaskStatus::Paused => {
-                    pending += 1;
-                    if task.fallback_reason.as_deref() == Some("budget_exceeded") {
-                        budget_paused = true;
-                    }
-                }
-                // R11-8: a RETRYABLE Failed enrichment task (network_error/
-                // quota_exceeded etc., holding next_retry_at, recoverable by
-                // `batch retry`) is outstanding work — count it as pending.
-                // (rate_limit no longer reaches this arm at all under QA3,
-                // 04 §5.3: it stays Pending — already counted by the
-                // `TaskStatus::Partial | TaskStatus::Pending | TaskStatus::Running`
-                // arm above — never Failed.) Otherwise the scope reads
-                // enriched_ratio<1.0 with pending_enrichment_tasks=0 and
-                // budget_paused=false, an impossible-looking dead end an Agent
-                // cannot act on (the dual of R9-4). A NON-retryable Failed task
-                // (permanent gap) stays excluded: it surfaces only as
-                // ratio<1.0, never as actionable pending work.
-                TaskStatus::Failed if task_retry_allowed(&task) => pending += 1,
-                TaskStatus::Failed | TaskStatus::Skipped => {}
-            }
-        }
-        // R23-20: `scope.scope_path` is the `.kio` directory; `Repository::open`
-        // wants the scope ROOT (it appends `.kio` itself), so this uses the
-        // separately-carried `repo_root` field.
-        match Repository::open_in_session(&scope.repo_root, control.clone(), locks) {
+        let first_unsupported = unsupported_inputs.len();
+        let mut current_inputs = BTreeMap::new();
+        // Status in a search response observes the current published HEAD.
+        // An interrupted publication is reported as incomplete status.
+        match Repository::open_for_search_with_control(&scope.repo_root, control.clone()) {
             Ok(repo) => {
                 // 07 §5.1: a single shared read (`current_dispositions`) feeds
                 // BOTH `unsupported_inputs` and the new `office_conversion_unavailable`
@@ -1525,17 +1657,16 @@ pub(crate) fn compute_index_status(
                 // unreadable scope must report exactly ONE error here, not one
                 // per output field (two independent re-reads of the identical
                 // failing store would double-count it).
-                match current_dispositions(&repo) {
-                    Ok(dispositions) => {
+                match current_dispositions(&repo, &tasks) {
+                    Ok((bindings, dispositions)) => {
+                        current_inputs = bindings;
                         let (office_unavailable, unsupported): (Vec<_>, Vec<_>) =
                             dispositions.into_iter().partition(|disposition| {
                                 disposition.reason == OFFICE_CONVERSION_UNAVAILABLE_REASON
                             });
                         let unsupported: Vec<_> = unsupported
                             .into_iter()
-                            .filter(|disposition| {
-                                disposition.reason == UNSUPPORTED_REASON_UNRECOGNIZED_BINARY
-                            })
+                            .filter(UnsupportedInputDisposition::is_unsupported)
                             .collect();
                         total = total.saturating_add(unsupported.len() as u64);
                         total = total.saturating_add(office_unavailable.len() as u64);
@@ -1628,6 +1759,85 @@ pub(crate) fn compute_index_status(
                 unsupported_input_errors.push(error);
             }
         }
+        let unsupported = &unsupported_inputs[first_unsupported..];
+        let unsupported_paths = unsupported
+            .iter()
+            .map(|row| row.path.as_str())
+            .collect::<BTreeSet<_>>();
+        let unsupported_raws = unsupported
+            .iter()
+            .map(|row| row.raw_hash.as_str())
+            .collect::<BTreeSet<_>>();
+        for task in tasks {
+            if !matches!(task.task_type, TaskType::Markdownize | TaskType::Embedding) {
+                continue;
+            }
+            // R20-7: a `retired_non_live` task's chunk went non-live (deleted / re-chunked /
+            // superseded), so it is NOT an enrichment gap in the CURRENT corpus and must not
+            // deflate enriched_ratio. R11-8 deliberately keeps a LIVE permanent-gap Failed
+            // (invalid_input/contract) in the denominator; this excludes only the non-live
+            // subset, which R19-3's dedicated reason makes unambiguous. Without this, a
+            // deleted/reverted chunk left enriched_ratio < 1.0 with pending == 0 forever.
+            if task.fallback_reason.as_deref() == Some(RETIRED_NON_LIVE) {
+                continue;
+            }
+            if task.task_type == TaskType::Markdownize
+                && (unsupported_paths.contains(task.input_path.as_str())
+                    || current_inputs.get(&task.input_path) != Some(&task.input_hash)
+                        && unsupported_raws.contains(task.input_hash.as_str()))
+            {
+                continue;
+            }
+            total_enrichment_tasks += 1;
+            if task.status == TaskStatus::Skipped {
+                skipped_enrichment_tasks += 1;
+                *skipped_enrichment_reasons
+                    .entry(
+                        task.fallback_reason
+                            .clone()
+                            .expect("validated skipped reason"),
+                    )
+                    .or_insert(0) += 1;
+                continue;
+            }
+            total += 1;
+            match task.status {
+                TaskStatus::Done => done += 1,
+                // R9-4: a Partial task has Failed units still awaiting completion —
+                // count it as incomplete (pending), not done. Counting it as done
+                // made `index_status` report enriched_ratio = 1.0 with
+                // pending_enrichment_tasks = 0 while units were permanently missing
+                // (a silent data gap on text-layer-less scans). `batch retry` now
+                // drives it to Done (docs/04 §5.2).
+                TaskStatus::Partial | TaskStatus::Pending | TaskStatus::Running => pending += 1,
+                // R22-7: only a BUDGET pause may set `budget_paused`. docs/05-runtime.md:200
+                // has agents render this flag as "(budget により一時停止中)", so a Tier B
+                // `secrets_tier_b_hold` — which costs nothing and is cleared by
+                // `--send-secrets`, never by raising a cap — was steering them to
+                // `--override-budget` while `device_remaining_usd` sat untouched at its full
+                // cap. It is still outstanding work, so it stays in `pending`.
+                TaskStatus::Paused => {
+                    pending += 1;
+                    if task.fallback_reason.as_deref() == Some("budget_exceeded") {
+                        budget_paused = true;
+                    }
+                }
+                // R11-8: a RETRYABLE Failed enrichment task (network_error/
+                // quota_exceeded etc., holding next_retry_at, recoverable by
+                // `batch retry`) is outstanding work — count it as pending.
+                // (rate_limit no longer reaches this arm at all under QA3,
+                // 04 §5.3: it stays Pending — already counted by the
+                // `TaskStatus::Partial | TaskStatus::Pending | TaskStatus::Running`
+                // arm above — never Failed.) Otherwise the scope reads
+                // enriched_ratio<1.0 with pending_enrichment_tasks=0 and
+                // budget_paused=false, an impossible-looking dead end an Agent
+                // cannot act on (the dual of R9-4). A NON-retryable Failed task
+                // (permanent gap) stays excluded: it surfaces only as
+                // ratio<1.0, never as actionable pending work.
+                TaskStatus::Failed if task_retry_allowed(&task) => pending += 1,
+                TaskStatus::Failed | TaskStatus::Skipped => {}
+            }
+        }
     }
 
     let enriched_ratio = if total == 0 {
@@ -1638,7 +1848,6 @@ pub(crate) fn compute_index_status(
     let unsupported_inputs_complete = unsupported_input_errors.is_empty();
     let tasks_complete = task_errors.is_empty();
     Ok(IndexStatusResponse {
-        office_readiness: crate::response::status::office_readiness(control),
         enriched_ratio,
         total_enrichment_tasks,
         skipped_enrichment_tasks,
@@ -1670,52 +1879,209 @@ pub(crate) fn compute_index_status(
     })
 }
 
-pub(crate) fn current_unsupported_inputs(
+pub(crate) fn unsupported_inputs_at_head(
     repo: &Repository,
-) -> Result<Vec<UnsupportedInputDisposition>> {
-    Ok(current_dispositions(repo)?
-        .into_iter()
-        .filter(|disposition| disposition.reason == UNSUPPORTED_REASON_UNRECOGNIZED_BINARY)
-        .collect())
-}
-
-/// Shared body for [`current_unsupported_inputs`] / `compute_index_status`'s
-/// own combined read (which partitions by `reason` itself — including 07
-/// §5.1's `OFFICE_CONVERSION_UNAVAILABLE_REASON` — in one pass, so a single
-/// corrupt/unreadable scope reports exactly one error rather than one per
-/// reason): every `UnsupportedInputStore` disposition (any reason) still LIVE
-/// at HEAD with the SAME `raw_hash` the disposition recorded (a reverted /
-/// deleted / re-hashed file's stale disposition must not keep surfacing).
-fn current_dispositions(repo: &Repository) -> Result<Vec<UnsupportedInputDisposition>> {
-    let store = UnsupportedInputStore::new(repo.kio_dir());
-    let dispositions = store.latest_by_path().map_err(pipeline_to_kio)?;
-    let Some(head) = repo.head_commit_hash()? else {
-        return Ok(Vec::new());
-    };
-    let commit = repo.read_commit(&head)?;
-    let tree = repo.read_tree(&commit.tree)?;
-    let live = tree
-        .entries
-        .into_iter()
-        .map(|entry| (entry.path, entry.raw_hash))
-        .collect::<BTreeMap<_, _>>();
-    Ok(dispositions
-        .into_iter()
-        .filter(|disposition| live.get(&disposition.path) == Some(&disposition.raw_hash))
-        .collect())
-}
-
-pub(crate) fn record_unsupported_if_changed(
-    store: &UnsupportedInputStore,
-    latest_by_path: &mut BTreeMap<String, UnsupportedInputDisposition>,
-    disposition: UnsupportedInputDisposition,
-) -> Result<bool> {
-    if latest_by_path.get(&disposition.path) == Some(&disposition) {
-        return Ok(false);
+    head: Option<&str>,
+) -> Result<DiskRecords<UnsupportedInputDisposition>> {
+    let (_, dispositions) = dispositions_at_head(repo, head)?;
+    let mut unsupported = RecordWriter::new(&repo.object_store().scratch_record_stages())?;
+    for row in dispositions {
+        let row = row?;
+        if row.is_unsupported() {
+            unsupported.push(&row)?;
+        }
     }
-    store.record(&disposition).map_err(pipeline_to_kio)?;
-    latest_by_path.insert(disposition.path.clone(), disposition);
-    Ok(true)
+    unsupported.finish()
+}
+
+/// Read against one observed HEAD. A writer may prune the previous HEAD's
+/// reasons as soon as it starts preparing another publication.
+pub(crate) fn read_stable_head<T>(
+    repo: &Repository,
+    mut read: impl FnMut(Option<&str>) -> Result<T>,
+) -> Result<T> {
+    let mut head = repo.head_commit_hash()?;
+    repo.control()
+        .checkpoint(kio_core::durability::DurabilityPoint::BeforeReadDispositions)?;
+    for _ in 0..3 {
+        let result = read(head.as_deref());
+        let next = repo.head_commit_hash()?;
+        if next == head {
+            return result;
+        }
+        head = next;
+    }
+    Err(KioError::new(
+        "KIO-E-PUBLICATION-CONFLICT-001",
+        "HEAD kept changing while reading index status; retry the command",
+        json!({}),
+        ExitCode::PartialFailure,
+    ))
+}
+
+fn current_dispositions(
+    repo: &Repository,
+    tasks: &[TaskDescriptor],
+) -> Result<(BTreeMap<String, String>, Vec<UnsupportedInputDisposition>)> {
+    read_stable_head(repo, |head| {
+        let (tree, dispositions) = dispositions_at_head(repo, head)?;
+        let dispositions = dispositions.to_vec()?;
+        let raw_hashes: BTreeSet<_> = dispositions
+            .iter()
+            .filter(|row| row.is_unsupported())
+            .map(|row| row.raw_hash.as_str())
+            .collect();
+        // Only tasks that share an unsupported raw can be mistaken for a
+        // rename. Keep the live bindings of those tasks, including OCR waits.
+        let task_paths: BTreeSet<_> = tasks
+            .iter()
+            .filter(|task| {
+                task.task_type == TaskType::Markdownize
+                    && raw_hashes.contains(task.input_hash.as_str())
+            })
+            .map(|task| task.input_path.as_str())
+            .collect();
+        let mut bindings = BTreeMap::new();
+        if let Some(tree) = tree.filter(|_| !task_paths.is_empty()) {
+            for entry in &tree.entries {
+                let entry = entry?;
+                if task_paths.contains(entry.path.as_str())
+                    && raw_hashes.contains(entry.raw_hash.as_str())
+                {
+                    bindings.insert(entry.path, entry.raw_hash);
+                }
+            }
+        }
+        Ok((bindings, dispositions))
+    })
+}
+
+/// Unsupported paths must be raw-only in the selected tree.
+type HeadDispositions = (Option<TreeObject>, DiskRecords<UnsupportedInputDisposition>);
+
+pub(super) fn dispositions_at_head(
+    repo: &Repository,
+    head: Option<&str>,
+) -> Result<HeadDispositions> {
+    let store = UnsupportedInputStore::new(repo.kio_dir())
+        .with_record_stages(repo.object_store().scratch_record_stages());
+    let Some(head) = head else {
+        store.latest_by_path().map_err(pipeline_to_kio)?;
+        return Ok((None, DiskRecords::empty()));
+    };
+    let commit = repo.read_commit(head)?;
+    let tree = repo.read_tree(&commit.tree)?;
+    let dispositions = store
+        .with_published_tree(Some(&tree))
+        .published_by_path()
+        .map_err(pipeline_to_kio)?;
+    Ok((Some(tree), dispositions))
+}
+
+pub(crate) fn stage_unsupported_if_changed(
+    observations: &mut RecordWriter<UnsupportedInputDisposition>,
+    latest: &mut Option<UnsupportedInputDisposition>,
+    disposition: UnsupportedInputDisposition,
+) -> Result<()> {
+    if latest.as_ref() != Some(&disposition) {
+        observations.push(&disposition)?;
+        *latest = Some(disposition);
+    }
+    Ok(())
+}
+
+fn scanned_inputs(
+    stages: &RecordStageRoot,
+    preview: &ScanPreview,
+) -> Result<DiskRecords<ScannedInput>> {
+    let mut inputs = RecordWriter::new(stages)?;
+    for candidate in &preview.candidates {
+        let candidate = candidate?;
+        if !candidate.ignored && candidate.media_type != "inode/directory" {
+            inputs.push(&ScannedInput {
+                path: candidate.input_path,
+                raw_hash: candidate.raw_hash,
+                size_bytes: candidate.size_bytes,
+            })?;
+        }
+    }
+    inputs.finish()
+}
+
+fn record_scan_path_changes(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
+    repo: &Repository,
+    stages: &RecordStageRoot,
+    preview: &ScanPreview,
+    deferred: DiskRecords<DeferredInput>,
+) -> Result<DiskRecords<DeferredInput>> {
+    let current = build_repository_scan_preview(
+        adapter_settings,
+        repo,
+        ScanPreviewRequest {
+            scope_path: repo.root().display().to_string(),
+            include_raw_hashes: false,
+            require_network_approval: false,
+        },
+        stages.clone(),
+    )?;
+    // Compare the enumerated spellings, including case-only renames on
+    // volumes where opening the old spelling would still work.
+    let mut prior = preview.candidates.iter();
+    let mut current = current.candidates.iter();
+    let mut before = prior.next().transpose()?;
+    let mut after = current.next().transpose()?;
+    let mut changes = RecordWriter::new(stages)?;
+    let mut existing = SortedRecordCursor::new(deferred.iter(), |row| &row.path);
+    while before.is_some() || after.is_some() {
+        let order = match (&before, &after) {
+            (Some(before), Some(after)) => before.input_path.cmp(&after.input_path),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            _ => std::cmp::Ordering::Greater,
+        };
+        match order {
+            std::cmp::Ordering::Less => {
+                let row = std::mem::replace(&mut before, prior.next().transpose()?)
+                    .expect("earlier scan candidate");
+                if row.raw_hash.is_some() && existing.at(&row.input_path)?.is_none() {
+                    changes.push(&DeferredInput {
+                        path: row.input_path,
+                        reason: DeferredInputReason::MissingAfterScan,
+                    })?;
+                }
+            }
+            std::cmp::Ordering::Greater => {
+                let row = std::mem::replace(&mut after, current.next().transpose()?)
+                    .expect("later scan candidate");
+                if !row.ignored {
+                    changes.push(&DeferredInput {
+                        path: row.input_path,
+                        reason: DeferredInputReason::AddedAfterScan,
+                    })?;
+                }
+            }
+            std::cmp::Ordering::Equal => {
+                before = prior.next().transpose()?;
+                after = current.next().transpose()?;
+            }
+        }
+    }
+    let changes = changes.finish()?;
+    if deferred.is_empty() {
+        return Ok(changes);
+    }
+    if changes.is_empty() {
+        return Ok(deferred);
+    }
+    let mut combined = RecordWriter::new(stages)?;
+    for row in
+        kio_core::disk_records::merge_sorted_records(deferred.iter(), changes.iter(), |a, b| {
+            a.path.cmp(&b.path)
+        })
+    {
+        combined.push(&row?)?;
+    }
+    combined.finish()
 }
 
 pub(crate) fn run_reindex(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<CommandResponse> {
@@ -1755,6 +2121,11 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
     let _lock = repo.lock_store_in_session(repo.lock_session())?;
     publication_policy.revalidate().map_err(pipeline_to_kio)?;
     validate_repo_tool_lock(&repo)?;
+    if parsed.force && parsed.yes && super::extraction_retirement::has_journal(&repo)? {
+        crate::scope_access::validate_extraction_recovery_registration(ctx.cwd(), &repo)?;
+        super::extraction_retirement::recover_for_index(&repo)?;
+    }
+    let _publication_lock = repo.lock_store_for_publication()?;
     // CL45/item 5: reconcile any stale `request_kind='sync'` cost-ledger.sqlite
     // rows left by a crashed prior run — applies uniformly to both the
     // historical (`--at`) and HEAD (`--force`) reindex modes below.
@@ -1816,6 +2187,7 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
             ExitCode::ConfirmationRejected,
         ));
     }
+    crate::index::pipeline::retry_local_extractions(ctx, &repo, &store, args.resource_tier)?;
     let head = repo
         .head_commit_hash()?
         .ok_or_else(|| KioError::not_found("HEAD"))?;
@@ -1835,10 +2207,28 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
     // generation. A post-barrier reindex must not partially republish derived
     // state for entries encountered before the purged target.
     for entry in &tree.entries {
+        let entry = entry?;
         ensure_raw_ingest_allowed(&repo, &entry.raw_hash)?;
     }
-    let mut normalize_by_path = BTreeMap::new();
+    let closing_preview = build_repository_scan_preview(
+        adapter_settings,
+        &repo,
+        ScanPreviewRequest {
+            scope_path: repo.root().display().to_string(),
+            include_raw_hashes: true,
+            require_network_approval: false,
+        },
+        repo.object_store().record_stages()?,
+    )?;
+    let stages = repo.object_store().record_stages()?;
+    let inputs = scanned_inputs(&stages, &closing_preview)?;
+    let classified =
+        record_reindex_unsupported_inputs(&repo, &closing_preview, &tree, args.resource_tier)?;
+    let mut unsupported_paths =
+        SortedRecordCursor::new(classified.unsupported.iter(), |row| &row.path);
+    let mut normalizes = RecordWriter::new(&stages)?;
     let mut reindexed = 0u64;
+    let mut regenerated_paths = RecordWriter::new(&stages)?;
     // R17-2: a single document's missing/corrupt normalized unit must not abort the
     // whole re-normalization — the same docs/10 §7.2 resilience R16-4 gave the shared
     // `rebuild_step3_index`, which this pre-rebuild copy loop never inherited (R16-4
@@ -1846,32 +2236,27 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
     // copy). A skippable failure keeps the document's PREVIOUS gen (so the snapshot
     // still points at its last-good normalized instance and search keeps serving that
     // gen's cached chunks) and is recorded; healthy documents still re-normalize.
-    let mut reindex_skipped = Vec::<SkippedUnit>::new();
+    let mut reindex_skipped = RecordWriter::new(&stages)?;
+    let mut regeneration_skips = BTreeSet::new();
+    let mut retire = RecordWriter::new(&stages)?;
     for entry in &tree.entries {
+        let entry = entry?;
+        if unsupported_paths.at(&entry.path)?.is_some() {
+            continue;
+        }
         let Some(normalize) = &entry.normalize else {
             continue;
         };
         let new_gen = normalize.r#gen + 1;
-        match copy_normalized_instance_gen(
-            repo.kio_dir(),
-            &entry.raw_hash,
-            &normalize.tool_profile_hash,
-            normalize.r#gen,
-            new_gen,
-            ctx.control,
-        ) {
-            Ok(()) => {
-                // PB04: the copied instance's manifest.json now declares
-                // `gen: new_gen` (different bytes than the source gen's
-                // manifest), so its manifest_hash must be recomputed, not
-                // carried forward.
-                let manifest_hash = compute_manifest_hash(
-                    &repo,
-                    &entry.raw_hash,
-                    &normalize.tool_profile_hash,
-                    new_gen,
-                )?;
-                normalize_by_path.insert(
+        match copy_normalized_instance_gen(&repo, &entry.raw_hash, normalize, new_gen) {
+            Ok(manifest_hash) => {
+                retire.push(&super::extraction_retirement::Retirement {
+                    raw: entry.raw_hash.clone(),
+                    path: entry.path.clone(),
+                    hold: None,
+                    normalize: None,
+                })?;
+                normalizes.push(&(
                     entry.path.clone(),
                     PendingNormalizeRef {
                         expected_raw_hash: entry.raw_hash.clone(),
@@ -1881,14 +2266,16 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
                             manifest_hash,
                         },
                     },
-                );
+                ))?;
+                regenerated_paths.push(&entry.path)?;
                 reindexed += 1;
             }
             // STORE-IO (missing unit) / STORE-CORRUPT (malformed manifest/unit) are
             // localized to one document; keep the previous gen and continue. Any other
             // class is not a localized unit fault and still aborts (mirrors R16-4).
-            Err(error) if is_rebuild_skippable_unit_error(&error) => {
-                normalize_by_path.insert(
+            Err(error) if is_regeneration_skippable(&error) => {
+                regeneration_skips.insert(manifest_pin(&entry.raw_hash, normalize));
+                normalizes.push(&(
                     entry.path.clone(),
                     PendingNormalizeRef {
                         expected_raw_hash: entry.raw_hash.clone(),
@@ -1901,42 +2288,50 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
                             manifest_hash: normalize.manifest_hash.clone(),
                         },
                     },
-                );
-                reindex_skipped.push(SkippedUnit {
+                ))?;
+                reindex_skipped.push(&SkippedUnit {
                     raw_hash: entry.raw_hash.clone(),
                     path: entry.path.clone(),
                     r#gen: normalize.r#gen,
                     reason: error.error_code().to_owned(),
-                });
+                })?;
             }
             Err(error) => return Err(error),
         }
     }
-    let closing_preview = build_scan_preview(
-        &adapter_settings.declared_pricing("markdown"),
-        &adapter_settings.declared_pricing("embedding"),
-        ScanPreviewRequest {
-            scope_path: repo.root().display().to_string(),
-            include_raw_hashes: false,
-            require_network_approval: false,
-        },
-    )
-    .map_err(pipeline_to_kio)?;
-    let excluded = closing_preview
-        .candidates
-        .iter()
-        .filter(|candidate| candidate.ignored)
-        .map(|candidate| candidate.input_path.clone())
-        .collect::<BTreeSet<_>>();
-    let explicitly_allowed_tier_a = explicitly_allowed_tier_a_paths(&closing_preview);
-    let outcome = repo.auto_snapshot_with_bound_normalize(
-        Some("kio reindex --force"),
-        None,
-        &excluded,
-        &normalize_by_path,
-        &explicitly_allowed_tier_a,
-        Some(&|| publication_policy.revalidate().map_err(pipeline_to_kio)),
+    let retire = retire.finish()?;
+    let reindex_skipped = reindex_skipped.finish()?;
+    let regenerated_paths = regenerated_paths.finish()?;
+    repo.control()
+        .checkpoint(kio_core::durability::DurabilityPoint::BeforeIndexSnapshot)?;
+    let deferred = record_scan_path_changes(
+        adapter_settings,
+        &repo,
+        &stages,
+        &closing_preview,
+        classified.deferred_inputs,
     )?;
+    let (outcome, deferred_inputs) = repo.auto_snapshot_scanned(
+        "kio reindex --force",
+        &inputs,
+        deferred,
+        &normalizes.finish()?,
+        &|_| publication_policy.revalidate().map_err(pipeline_to_kio),
+        &|head, tree, deferred| {
+            if !retire.is_empty() {
+                super::extraction_retirement::record(&repo, head, tree, &retire, deferred)?;
+            }
+            Ok(())
+        },
+    )?;
+    let mut regenerated = SortedRecordCursor::new(regenerated_paths.iter(), String::as_str);
+    for row in &deferred_inputs {
+        if regenerated.at(&row?.path)?.is_some() {
+            reindexed -= 1;
+        }
+    }
+    #[cfg(debug_assertions)]
+    ctx.interaction.working_scan_published();
     if let Some(commit_hash) = &outcome.commit_hash {
         maybe_inject_replica_after_head_fault("reindex_before_marker", ctx.control)?;
         // `--regenerate` has the same HEAD-before-rebuild window as `kio index`.
@@ -1945,7 +2340,8 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
         mark_replica_rebuilding_or_log(ctx, repo.kio_dir(), commit_hash);
         maybe_inject_replica_after_head_fault("reindex", ctx.control)?;
     }
-    let mut report = rebuild_step3_index(ctx, &repo)?;
+    super::extraction_retirement::recover(&repo)?;
+    let mut report = rebuild_step3_index_with_regeneration_skips(ctx, &repo, &regeneration_skips)?;
     // LC42-LC44 (item 2), same ordering rationale as `run_index`'s call.
     recover_index_generation(repo.kio_dir(), repo.control())?;
     // R17-2: fold the re-normalization loop's skips into the rebuild report so the one
@@ -1953,7 +2349,7 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
     // skipped document whose kept previous gen is ALSO unloadable is already reported by
     // the rebuild above; this appends only reindex-only skips (e.g. a corrupt non-`Done`
     // unit whose healthy `Done` units still let the rebuild serve the document).
-    historical_reindex::merge_reindex_skips(&mut report, reindex_skipped);
+    historical_reindex::merge_reindex_skips(&mut report, reindex_skipped)?;
     // L1: reindex = re-normalize + re-embedding (docs/06). The rebuild appends
     // fresh chunk rows; enrich them symmetrically with the `kio index` path so
     // the embedding index tracks the new generation. Online only under the
@@ -1972,10 +2368,18 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
     )?;
     // R11-2: keep the enrichment ExecOutcome (was discarded) so a new-generation
     // embedding auth/budget-pause is disclosed and raises the exit (result on stdout).
-    let enrichment = run_embedding_enrichment(ctx, &repo, embedding_online, false, false)?;
+    let enrichment = run_embedding_enrichment(
+        ctx,
+        &repo,
+        embedding_online,
+        false,
+        false,
+        report.enrichment_replay.as_mut(),
+    )?;
     let response = HeadReindexResponse {
         status: "reindexed".to_owned(),
         reindexed_files: reindexed,
+        deferred_inputs,
         commit_hash: outcome.commit_hash,
         rebuilt_chunks: report.rebuilt_chunks,
         embedding_tasks_executed: enrichment.executed,

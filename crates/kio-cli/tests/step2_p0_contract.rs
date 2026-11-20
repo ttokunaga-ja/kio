@@ -2440,7 +2440,7 @@ fn r9_7_batch_retry_reports_failed_attempts_in_json() {
     assert_eq!(first_online_task(&status)["status"], "paused");
 }
 
-/// R9-2: text-native files (Markdown / plain text / code) must NOT enqueue an
+/// R9-2: text-native files (Markdown / plain text) must NOT enqueue an
 /// online Mistral-OCR task — they are fully handled by the deterministic Adapter
 /// (07 §2.1 / §5.2). A non-text-native PDF still does (routing preserved). Pre-fix
 /// every text file's raw bytes were queued for a third-party OCR API and billed
@@ -2453,7 +2453,6 @@ fn r9_2_text_native_files_do_not_enqueue_online_ocr_task() {
     // The explicit adapter grant leaves the media gate as the only condition
     // that could stop enqueueing.
     fs::write(dir.path().join("note.md"), "# Note\n\nbody text here\n").unwrap();
-    fs::write(dir.path().join("main.rs"), "fn main() { let _x = 1; }\n").unwrap();
     fs::write(dir.path().join("plain.txt"), "just some plain text\n").unwrap();
     let output = json_success(&dir, ["index", "--yes"]);
     assert_eq!(

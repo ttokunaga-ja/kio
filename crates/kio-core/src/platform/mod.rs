@@ -33,7 +33,6 @@ pub(crate) use windows::{private_fs, profile::profile_dir, store};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) use unix::{
     cas_io,
-    durability::sync_directory,
     gc_io::{
         open_verified_receipt_durable_handle as gc_receipt_handle,
         sync_bound_directory as gc_sync_bound_directory,
@@ -52,7 +51,6 @@ pub(crate) use unix::{
 #[cfg(target_os = "windows")]
 pub(crate) use windows::{
     cas_io,
-    durability::sync_directory,
     gc_io::{
         open_verified_receipt_durable_handle as gc_receipt_handle,
         sync_bound_directory as gc_sync_bound_directory,
@@ -278,3 +276,8 @@ pub(crate) mod stage_operations;
 pub fn producer_platform() -> (&'static str, &'static str) {
     (std::env::consts::OS, std::env::consts::ARCH)
 }
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) use unix::durability_tests::sync_directory;
+#[cfg(all(test, target_os = "windows"))]
+pub(crate) use windows::durability_tests::sync_directory;

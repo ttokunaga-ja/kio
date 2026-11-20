@@ -1,6 +1,6 @@
 mod support;
 
-use support::canonical_tempdir;
+use support::{canonical_tempdir, view_slice};
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -41,6 +41,7 @@ const KIO_CHILD_ENV_DENYLIST: &[&str] = &[
     "KIO_TEST_EMBEDDING_PUBLICATION_FAULT",
     "KIO_TEST_DURABILITY_POINT",
     "KIO_TEST_DURABILITY_READY",
+    "KIO_TEST_DURABILITY_STORAGE_FAULT",
     "KIO_TEST_HOLD_LOCK_READY",
     "KIO_TEST_SCOPE_SEARCH_DELAY_SCOPE_ID",
     "KIO_TEST_SCOPE_SEARCH_DELAY_MS",
@@ -108,30 +109,6 @@ fn json_failure(dir: &TempDir, args: &[&str], code: i32) -> Value {
         .stderr
         .clone();
     serde_json::from_slice(&output).unwrap()
-}
-
-/// 05 §1.7.2 / §4.2 (2026-08-11): `kio view --json` stopped returning a
-/// `text` field -- it resolves to a full-text normalized view path plus a
-/// view-local byte span instead. This is the only way left to recover
-/// chunk-adjacent text from `view`'s JSON, and exercising it (read the file,
-/// slice by the reported offsets) is what actually proves the unit-local ->
-/// view-local offset translation is correct, unlike a plain field-content
-/// assertion on the old `text` field ever did.
-fn view_slice(viewed: &Value) -> String {
-    let view_path = viewed["view_path"]
-        .as_str()
-        .unwrap_or_else(|| panic!("view_path must be a resolvable path: {viewed}"));
-    let start = viewed["view_byte_start"]
-        .as_u64()
-        .unwrap_or_else(|| panic!("view_byte_start must be present: {viewed}"))
-        as usize;
-    let end = viewed["view_byte_end"]
-        .as_u64()
-        .unwrap_or_else(|| panic!("view_byte_end must be present: {viewed}"))
-        as usize;
-    let bytes = fs::read(view_path)
-        .unwrap_or_else(|err| panic!("failed to read view_path {view_path}: {err}"));
-    String::from_utf8(bytes[start..end].to_vec()).unwrap()
 }
 
 fn json_success_path(path: &Path, data_home: &Path, args: &[&str]) -> Value {
@@ -1771,6 +1748,7 @@ fn ct4_rebuild_uses_pinned_manifest_unit_status_not_current_working_manifest() {
     let entry = tree
         .entries
         .iter()
+        .map(Result::unwrap)
         .find(|entry| entry.path == "auth.md")
         .unwrap();
     let normalize = entry.normalize.as_ref().unwrap();
@@ -1801,6 +1779,7 @@ fn ct4_rebuild_uses_immutable_pinned_unit_body_not_mutable_cache_body() {
     let entry = tree
         .entries
         .iter()
+        .map(Result::unwrap)
         .find(|entry| entry.path == "auth.md")
         .unwrap();
     let normalize = entry.normalize.as_ref().unwrap();
@@ -1852,6 +1831,7 @@ fn ct4_rebuild_missing_pinned_unit_cas_skips_without_reading_mutable_cache() {
     let entry = tree
         .entries
         .iter()
+        .map(Result::unwrap)
         .find(|entry| entry.path == "auth.md")
         .unwrap();
     let normalize = entry.normalize.as_ref().unwrap();
@@ -1906,6 +1886,7 @@ fn ct4_reindex_at_does_not_publish_later_same_gen_unit_into_failed_snapshot() {
     let entry = tree
         .entries
         .iter()
+        .map(Result::unwrap)
         .find(|entry| entry.path == "auth.md")
         .unwrap();
     let normalize = entry.normalize.as_ref().unwrap();
@@ -1936,10 +1917,10 @@ fn ct4_rebuild_rejects_pinned_manifest_for_a_different_raw_identity() {
     let normalize = tree
         .entries
         .iter()
+        .map(Result::unwrap)
         .find(|entry| entry.path == "auth.md")
         .unwrap()
         .normalize
-        .as_ref()
         .unwrap();
     let store = ObjectStore::new(repo.kio_dir());
     let manifest_path = store
@@ -1964,10 +1945,10 @@ fn ct4_rebuild_rejects_pinned_done_unit_with_mismatched_prepared_hash() {
     let normalize = tree
         .entries
         .iter()
+        .map(Result::unwrap)
         .find(|entry| entry.path == "auth.md")
         .unwrap()
         .normalize
-        .as_ref()
         .unwrap();
     let store = ObjectStore::new(repo.kio_dir());
     let manifest_path = store
@@ -8707,10 +8688,9 @@ fn r12_2_user_config_redact_logs_false_records_path() {
     );
 }
 
-// max_input_bytes is a real input gate: a file larger than the cap is skipped for
-// adapter processing (never normalized) but the index still succeeds.
+// The external prepared-input cap does not constrain local extraction.
 #[test]
-fn r12_2_max_input_bytes_gates_oversized_input() {
+fn p0_external_input_cap_does_not_gate_local_extraction() {
     let dir = canonical_tempdir();
     kio(&dir, &["init"]).assert().success();
     // Cap at 50 bytes; write a markdown file well over that.
@@ -8725,8 +8705,7 @@ fn r12_2_max_input_bytes_gates_oversized_input() {
     )
     .unwrap();
     let index = json_success(&dir, &["index"]);
-    assert_eq!(index["skipped_oversized_files"], 1);
-    assert_eq!(index["normalized_files"], 0);
+    assert_eq!(index["normalized_files"], 1);
 }
 
 // ===========================================================================
@@ -9317,28 +9296,27 @@ fn assert_published_free_record(dir: &TempDir, target: &str, task_id: &str, atte
         .into_iter()
         .find(|(_, row)| row["key"] == record["key"])
         .unwrap();
-    let bytes = fs::read(
-        dir.path()
-            .join(".test-state/kio/local-execution")
-            .join(path.parent().unwrap())
-            .join("result.bin"),
-    )
-    .unwrap();
+    let record_path = dir
+        .path()
+        .join(".test-state/kio/local-execution")
+        .join(path);
+    let bytes = fs::read(record_path.with_file_name("result.bin")).unwrap();
     assert_eq!(record["phase"]["bytes"], bytes.len());
-    // Local result integrity binds the exact job identity and claim token,
-    // as well as the bytes (docs/04 §5.4); it is not a plain CAS digest.
+    // The result binds the full recorded identity (including the original
+    // members), the claim token and the bytes. Preserve the identity's serialized
+    // field order when hashing it. The document retry key has a different scope.
+    use kio_core::cas::lower_hex;
     use sha2::{Digest, Sha256};
+    let record_bytes = fs::read(record_path).unwrap();
+    let fields: std::collections::BTreeMap<&str, &serde_json::value::RawValue> =
+        serde_json::from_slice(&record_bytes).unwrap();
+    let identity_digest = lower_hex(&Sha256::digest(fields["identity"].get().as_bytes()));
     let mut digest = Sha256::new();
     digest.update(b"kio.local-execution.result/v1\0");
-    digest.update(record["key"].as_str().unwrap().as_bytes());
+    digest.update(identity_digest.as_bytes());
     digest.update(record["token"].as_str().unwrap().as_bytes());
     digest.update(&bytes);
-    let digest = digest
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    assert_eq!(record["phase"]["digest"], digest);
+    assert_eq!(record["phase"]["digest"], lower_hex(&digest.finalize()));
 }
 fn free_trace(dir: &TempDir) -> Vec<Value> {
     fs::read_to_string(dir.path().join(".test-data/free-task.trace"))
@@ -11780,7 +11758,7 @@ fn r17_5_shallow_commit_via_hash_tag_and_implicit_head_folds_to_commit_shallow()
     );
 }
 
-// R17-2: `reindex --force` must not let ONE document's corrupt normalized unit abort the
+// R17-2: `reindex --regenerate` must not let ONE document's corrupt normalized manifest abort the
 // whole scope's re-normalization (docs/10 §7.2). R16-4 gave `rebuild_step3_index` this
 // skip-continue resilience, but the pre-rebuild copy loop in `run_reindex` never inherited
 // it — a single STORE-CORRUPT unit killed the reindex (exit 4) and the healthy documents
@@ -11788,7 +11766,16 @@ fn r17_5_shallow_commit_via_hash_tag_and_implicit_head_folds_to_commit_shallow()
 // command. Now the corrupt document is skipped (its previous gen kept) and reported under
 // skipped_units; the healthy document is re-normalized and the scope stays searchable.
 #[test]
-fn r17_2_reindex_force_skips_corrupt_unit_and_renormalizes_healthy() {
+fn r17_2_reindex_regenerate_skips_corrupt_manifest_and_renormalizes_healthy() {
+    check_reindex_regenerate_skips_corrupt_manifest(false);
+}
+
+#[test]
+fn r17_2_reindex_regenerate_projects_healthy_text_after_enrichment() {
+    check_reindex_regenerate_skips_corrupt_manifest(true);
+}
+
+fn check_reindex_regenerate_skips_corrupt_manifest(embed: bool) {
     let dir = canonical_tempdir();
     fs::write(
         dir.path().join("healthy.md"),
@@ -11801,20 +11788,59 @@ fn r17_2_reindex_force_skips_corrupt_unit_and_renormalizes_healthy() {
     )
     .unwrap();
     kio(&dir, &["init"]).assert().success();
-    json_success(&dir, &["index", "--yes"]);
-
-    // Corrupt ONE document's normalized-instance manifest → copy_normalized_instance_gen
-    // raises KIO-E-STORE-CORRUPT-001 for that raw_hash during re-normalization.
-    let units_root = dir.path().join(".kio/objects/normalized_units");
-    let manifest = first_manifest_json(&units_root);
-    let corrupt_raw_hash = {
-        let value: Value = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
-        value["raw_hash"].as_str().unwrap().to_owned()
+    let run = if embed {
+        json_success_deterministic_embed
+    } else {
+        json_success
     };
+    run(&dir, &["index", "--yes"]);
+
+    let repo = kio_core::scope::Repository::open(dir.path()).unwrap();
+    let read_head_entries = || {
+        let head = repo.head_commit_hash().unwrap().unwrap();
+        let commit = repo.read_commit(&head).unwrap();
+        repo.read_tree(&commit.tree)
+            .unwrap()
+            .entries
+            .to_vec()
+            .unwrap()
+    };
+    let before = read_head_entries();
+    let corrupt = before
+        .iter()
+        .find(|entry| entry.path == "corrupt.md")
+        .unwrap();
+    let previous = corrupt.normalize.as_ref().unwrap();
+    // Regeneration reads the immutable manifest pinned by HEAD.
+    let manifest = object_path(repo.kio_dir(), "manifests", &previous.manifest_hash);
+    let old_head = head_commit(repo.kio_dir());
+    let corrupt_query = [
+        "search",
+        "corrupttoken",
+        "--mode",
+        "text",
+        "--scope",
+        dir.path().to_str().unwrap(),
+        "--at",
+        &old_head,
+    ];
+    let before_corruption = json_success(&dir, &corrupt_query);
+    assert!(!before_corruption["results"].as_array().unwrap().is_empty());
     fs::write(&manifest, r#"{"torn":"#).unwrap();
+    let repair = json_failure(&dir, &["repair", "rebuild-db"], 4);
+    assert_eq!(repair["error_code"], "KIO-E-STORE-CORRUPT-001");
+    if embed {
+        // Exercise a fresh write-through from enrichment after reindex.
+        let store = ObjectStore::new(repo.kio_dir());
+        let hashes = store.embedding_hashes().unwrap();
+        assert!(!hashes.is_empty());
+        for hash in hashes {
+            fs::remove_file(store.embedding_path(&hash).unwrap()).unwrap();
+        }
+    }
 
     // Before the fix: exit 4 (KIO-E-STORE-CORRUPT-001), no re-normalization at all.
-    let out = json_success(&dir, &["reindex", "--regenerate", "--yes"]);
+    let out = run(&dir, &["reindex", "--regenerate", "--yes"]);
     // The healthy document IS re-normalized (the loop no longer dies on the corrupt one).
     assert_eq!(
         out["reindexed_files"].as_u64().unwrap(),
@@ -11829,19 +11855,44 @@ fn r17_2_reindex_force_skips_corrupt_unit_and_renormalizes_healthy() {
     );
     assert_eq!(skipped[0]["reason"], "KIO-E-STORE-CORRUPT-001");
     assert_eq!(
-        skipped[0]["raw_hash"], corrupt_raw_hash,
+        skipped[0]["raw_hash"], corrupt.raw_hash,
         "the skip names the corrupted document: {out}"
     );
     assert!(
         out["skipped_units_guidance"].as_str().is_some(),
         "the skip is loudly disclosed: {out}"
     );
+    let after = read_head_entries();
+    let kept = after
+        .iter()
+        .find(|entry| entry.path == "corrupt.md")
+        .unwrap();
+    assert_eq!(kept.normalize, corrupt.normalize);
+    let healthy_before = before
+        .iter()
+        .find(|entry| entry.path == "healthy.md")
+        .unwrap();
+    let healthy_after = after
+        .iter()
+        .find(|entry| entry.path == "healthy.md")
+        .unwrap();
+    assert_eq!(
+        healthy_after.normalize.as_ref().unwrap().r#gen,
+        healthy_before.normalize.as_ref().unwrap().r#gen + 1
+    );
     // The scope is not bricked — the healthy document still searches after the reindex.
-    let search = json_success(&dir, &["search", "healthytoken"]);
+    let search = if embed {
+        assert!(out["embedding_tasks_executed"].as_u64().unwrap() > 0);
+        run(&dir, &["search", "healthytoken", "--mode", "text"])
+    } else {
+        json_success(&dir, &["search", "healthytoken"])
+    };
     assert!(
         !search["results"].as_array().unwrap().is_empty(),
         "healthy document searchable after reindex: {search}"
     );
+    let corrupt_history = json_success(&dir, &corrupt_query);
+    assert!(corrupt_history["results"].as_array().unwrap().is_empty());
 }
 
 // R17-4: when EVERY searched scope is excluded for a store-corruption class the search
@@ -14890,3 +14941,2198 @@ mod o3_image_failure_matrix;
 
 #[path = "step3_p0_contract/o3_image_publication_recovery.rs"]
 mod o3_image_publication_recovery;
+
+#[test]
+fn nc_source_code_is_unsupported_and_markdown_code_remains_searchable() {
+    let dir = canonical_tempdir();
+    for ext in ["rs", "py", "js", "ts", "go", "java", "c", "h", "cpp"] {
+        for (case, ext) in [
+            ("lower", ext.to_owned()),
+            ("upper", ext.to_ascii_uppercase()),
+        ] {
+            fs::write(
+                dir.path().join(format!("main.{case}.{ext}")),
+                "sourceonlyneedle readable text\n",
+            )
+            .unwrap();
+        }
+    }
+    fs::write(
+        dir.path().join("note.md"),
+        "# Note\n\n```rs\nmarkdowncodeneedle\n```\n\n`inlinecodeneedle`\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("settings.cfg"),
+        "unknowntextneedle readable text\n",
+    )
+    .unwrap();
+    kio(&dir, &["init"]).assert().success();
+    let index = json_success(&dir, &["index", "--yes"]);
+    assert_eq!(index["normalized_files"], 2, "{index}");
+    let status = json_success(&dir, &["status"]);
+    let unsupported = status["unsupported_inputs"].as_array().unwrap();
+    assert_eq!(unsupported.len(), 18, "{status}");
+    for row in unsupported {
+        assert_eq!(row["reason"], "source_code_is_not_supported");
+    }
+    assert!(
+        json_success(&dir, &["search", "sourceonlyneedle"])["results"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    for needle in [
+        "markdowncodeneedle",
+        "inlinecodeneedle",
+        "unknowntextneedle",
+    ] {
+        let search = json_success(&dir, &["search", needle]);
+        assert!(
+            !search["results"].as_array().unwrap().is_empty(),
+            "{needle}: {search}"
+        );
+    }
+    let store = dir.path().join(".kio/unsupported-inputs.jsonl");
+    let before = fs::read(&store).unwrap();
+    json_success(&dir, &["index", "--yes"]);
+    assert_eq!(before, fs::read(store).unwrap());
+    assert!(
+        json_success(&dir, &["status"])["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|task| !task["input_path"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("main."))
+    );
+}
+
+#[test]
+fn nc_source_code_remains_unsupported_above_adapter_input_limit() {
+    let dir = canonical_tempdir();
+    kio(&dir, &["init"]).assert().success();
+    let cfg = dir.path().join(".kio/config.toml");
+    let mut document = fs::read_to_string(&cfg)
+        .unwrap()
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap();
+    document["adapter"]["policy"]["max_input_bytes"] = toml_edit::value(1);
+    fs::write(&cfg, document.to_string()).unwrap();
+    fs::write(
+        dir.path().join("main.pY"),
+        "sourceonlyneedle readable text\n",
+    )
+    .unwrap();
+    let index = json_success(&dir, &["index", "--yes"]);
+    assert_eq!(index["normalized_files"], 0);
+    let status = json_success(&dir, &["status"]);
+    let unsupported = status["unsupported_inputs"].as_array().unwrap();
+    assert_eq!(unsupported.len(), 1, "{status}");
+    assert_eq!(unsupported[0]["path"], "main.pY");
+    assert_eq!(unsupported[0]["reason"], "source_code_is_not_supported");
+}
+
+#[test]
+fn p0_extraction_hold_survives_restart_and_requires_explicit_retry() {
+    let dir = canonical_tempdir();
+    let bytes = b"# Local\n\nRecovered extraction body.\n";
+    fs::write(dir.path().join("held.md"), bytes).unwrap();
+    kio(&dir, &["init"]).assert().success();
+    json_success(&dir, &["snapshot", "create"]);
+    let store = kio_pipeline::task::TaskStore::new(dir.path().join(".kio"));
+    let task: kio_pipeline::task::TaskDescriptor = serde_json::from_value(serde_json::json!({
+        "task_id": "task_held_local",
+        "type": "markdownize",
+        "mode": "full",
+        "input_path": "held.md",
+        "input_hash": kio_core::cas::hash_bytes(bytes),
+        "output_ref": kio_pipeline::task::EXTRACTION_HOLD_OUTPUT_REF,
+        "previous_raw_hash": null,
+        "parent_run_id": null,
+        "changed_unit_keys": [],
+        "unit_keys": null,
+        "next_retry_at": null,
+        "deadline": null,
+        "heartbeat_at": null,
+        "bbox_annotation_enabled": null,
+        "reserved_usd": null,
+        "reserved_month": null,
+        "reservation_id": null,
+        "status": "paused",
+        "attempts": 0,
+        "fallback_reason": "resource_limit",
+        "hold_reason": "resource_limit",
+        "resource_limit": {
+            "resource": "storage", "stage": "private_stage",
+            "limit": null, "observed": null, "resource_tier": null
+        },
+        "created_at": "2026-07-03T00:00:00Z"
+    }))
+    .unwrap();
+    store.append(&task).unwrap();
+
+    let status = json_success(&dir, &["status"]);
+    assert_eq!(
+        status["paused_by_hold_reason"]["resource_limit"], 1,
+        "{status}"
+    );
+    kio(&dir, &["batch", "resume"]).assert().code(3);
+    assert_eq!(
+        store
+            .all()
+            .unwrap()
+            .iter()
+            .find(|item| item.task_id == task.task_id)
+            .unwrap()
+            .attempts,
+        0
+    );
+    kio(&dir, &["batch", "retry"]).assert().success();
+    let status = json_success(&dir, &["status"]);
+    assert_eq!(
+        status["paused_by_hold_reason"]["resource_limit"], 0,
+        "{status}"
+    );
+    let repo = Repository::open(dir.path()).unwrap();
+    let head = repo.head_commit_hash().unwrap().unwrap();
+    let head = repo.read_commit(&head).unwrap();
+    assert!(
+        repo.read_tree(&head.tree)
+            .unwrap()
+            .entries
+            .iter()
+            .map(Result::unwrap)
+            .any(|entry| { entry.path == "held.md" && entry.normalize.is_some() })
+    );
+}
+
+#[test]
+fn nc2_current_index_drops_unsupported_bindings_and_preserves_evidence() {
+    for command in [
+        &["index", "--yes"][..],
+        &["reindex", "--regenerate", "--yes"][..],
+    ] {
+        let dir = canonical_tempdir();
+        fs::write(
+            dir.path().join("previous.txt"),
+            "historicalneedle readable text\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("binary.cfg"), "previousbinaryneedle\n").unwrap();
+        fs::write(dir.path().join("keep.txt"), "supported control text\n").unwrap();
+        kio(&dir, &["init"]).assert().success();
+        json_success_deterministic_embed(&dir, &["index", "--yes"]);
+        let search = json_success_deterministic_embed(
+            &dir,
+            &["search", "historicalneedle", "--mode", "text"],
+        );
+        let evidence = first_result(&search)["evidence_pointer"].clone();
+        let vectors = json_success_deterministic_embed(
+            &dir,
+            &["search", "historicalneedle", "--mode", "vector"],
+        );
+        assert_eq!(vectors["resolved_mode"], "vector");
+        pointer_for_path(&vectors, "previous.txt");
+
+        let repo = Repository::open(dir.path()).unwrap();
+        let previous_head = repo
+            .read_commit(evidence["commit"].as_str().unwrap())
+            .unwrap();
+        let previous_tree = repo.read_tree(&previous_head.tree).unwrap();
+        let previous = previous_tree.find_entry("previous.txt").unwrap().unwrap();
+
+        support::bind_renamed_normalize(dir.path(), "previous.txt", "previous.rs");
+        fs::write(dir.path().join("binary.cfg"), b"\0\xff").unwrap();
+
+        let result = json_success_deterministic_embed(&dir, command);
+        if command[0] == "reindex" {
+            assert_eq!(result["reindexed_files"], 1, "{result}");
+        }
+        let current_head = repo
+            .read_commit(&repo.head_commit_hash().unwrap().unwrap())
+            .unwrap();
+        let current_tree = repo.read_tree(&current_head.tree).unwrap();
+        let current = current_tree.find_entry("previous.rs").unwrap().unwrap();
+        assert_eq!(current.raw_hash, previous.raw_hash);
+        assert!(current.normalize.is_none(), "{command:?}: {current:?}");
+
+        let status = json_success(&dir, &["status"]);
+        let text_search = json_success_deterministic_embed(
+            &dir,
+            &["search", "historicalneedle", "--mode", "text"],
+        );
+        for unsupported in [
+            &status["unsupported_inputs"],
+            &text_search["index_status"]["unsupported_inputs"],
+        ] {
+            for (path, reason) in [
+                ("previous.rs", "source_code_is_not_supported"),
+                ("binary.cfg", "unrecognized_binary_without_local_text"),
+            ] {
+                assert!(
+                    unsupported
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|row| row["path"] == path && row["reason"] == reason),
+                    "{command:?}: {unsupported}"
+                );
+            }
+        }
+        assert!(
+            text_search["results"].as_array().unwrap().is_empty(),
+            "{text_search}"
+        );
+        let vector_search = json_success_deterministic_embed(
+            &dir,
+            &["search", "historicalneedle", "--mode", "vector"],
+        );
+        assert_eq!(vector_search["resolved_mode"], "vector");
+        let results = vector_search["results"].as_array().unwrap();
+        assert!(!results.is_empty(), "{vector_search}");
+        assert!(
+            results.iter().all(|row| {
+                let pointer = &row["evidence_pointer"];
+                pointer["raw_hash"] != previous.raw_hash && pointer["path_at_commit"] == "keep.txt"
+            }),
+            "{vector_search}"
+        );
+        let viewed = json_success(&dir, &["view", &evidence.to_string()]);
+        assert!(view_slice(&viewed).contains("historicalneedle"), "{viewed}");
+    }
+}
+
+#[test]
+fn nc2_binary_with_unavailable_markdown_drops_matching_head_generation() {
+    let dir = canonical_tempdir();
+    fs::write(
+        dir.path().join("old.txt"),
+        b"binaryneedle searchable text\n\xff",
+    )
+    .unwrap();
+    kio(&dir, &["init"]).assert().success();
+    json_success(&dir, &["index", "--yes", "--offline"]);
+    let search = json_success(&dir, &["search", "binaryneedle", "--mode", "text"]);
+    pointer_for_path(&search, "old.txt");
+    support::bind_renamed_normalize(dir.path(), "old.txt", "old.cfg");
+    write_tools_toml(
+        &dir,
+        "[markdown.mistral_ocr_markdownize]\nurl = 'http://127.0.0.1:1'\n",
+    );
+
+    let index = json_success(&dir, &["index", "--yes", "--offline"]);
+    assert_eq!(index["skipped_unrecognized_binary_files"], 1, "{index}");
+    let search = json_success(&dir, &["search", "binaryneedle", "--mode", "text"]);
+    assert!(search["results"].as_array().unwrap().is_empty(), "{search}");
+    let status = json_success(&dir, &["status"]);
+    assert_eq!(status["unsupported_inputs"][0]["path"], "old.cfg");
+    assert_eq!(
+        status["unsupported_inputs"][0]["reason"],
+        "unrecognized_binary_without_local_text"
+    );
+}
+
+#[test]
+fn nc2_index_status_does_not_count_old_markdownize_tasks_for_unsupported_path() {
+    let dir = canonical_tempdir();
+    let path = dir.path().join("document.cfg");
+    fs::write(&path, "taskneedle searchable text\n").unwrap();
+    kio(&dir, &["init"]).assert().success();
+    json_success(&dir, &["index", "--yes", "--offline"]);
+    let status = json_success(&dir, &["status"]);
+    assert_eq!(status["tasks"][0]["status"], "done");
+    let task_id = &status["tasks"][0]["task_id"];
+
+    fs::write(path, b"\xff").unwrap();
+    json_success(&dir, &["index", "--yes", "--offline"]);
+    let search = json_success(&dir, &["search", "taskneedle", "--mode", "text"]);
+    assert_eq!(search["index_status"]["enriched_ratio"], 0.0, "{search}");
+    let status = json_success(&dir, &["status"]);
+    assert!(
+        status["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| { task["task_id"] == *task_id && task["status"] == "done" }),
+        "{status}"
+    );
+}
+
+#[test]
+fn p0_small_extraction_publishes_without_identified_workspaces() {
+    let dir = canonical_tempdir();
+    fs::write(
+        dir.path().join("small.md"),
+        "# Small\n\natomicpublicationneedle\n",
+    )
+    .unwrap();
+    json_success(&dir, &["init"]);
+    json_success(&dir, &["index", "--offline"]);
+    let stages = dir.path().join(".kio/extraction-stages");
+    assert!(!stages.join("prepared").exists());
+    assert!(!stages.join("views").exists());
+    let found = json_success(
+        &dir,
+        &["search", "atomicpublicationneedle", "--mode", "text"],
+    );
+    assert!(!found["results"].as_array().unwrap().is_empty());
+}
+
+#[cfg(debug_assertions)]
+fn large_extraction_markdown(text: &str) -> String {
+    format!(
+        "{text}\n\n{}\n",
+        "x".repeat(kio_core::cas::CAS_STREAM_BUFFER_BYTES)
+    )
+}
+
+#[cfg(debug_assertions)]
+fn large_extraction_png() -> Vec<u8> {
+    use base64::Engine as _;
+    let mut png = base64::engine::general_purpose::STANDARD
+        .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGP4DwQACfsD/fteaysAAAAASUVORK5CYII=")
+        .unwrap();
+    // Insert a valid ancillary chunk before IEND. Pixel decoding stays small.
+    let mut chunk = b"tEXtComment\0".to_vec();
+    chunk.extend(std::iter::repeat_n(
+        b'x',
+        kio_core::cas::CAS_STREAM_BUFFER_BYTES,
+    ));
+    let crc = chunk.iter().fold(u32::MAX, |crc, byte| {
+        (0..8).fold(crc ^ u32::from(*byte), |crc, _| {
+            (crc >> 1) ^ if crc & 1 == 0 { 0 } else { 0xedb8_8320 }
+        })
+    }) ^ u32::MAX;
+    let length = (chunk.len() as u32 - 4).to_be_bytes();
+    let iend = png.len() - 12;
+    png.splice(
+        iend..iend,
+        length.into_iter().chain(chunk).chain(crc.to_be_bytes()),
+    );
+    png
+}
+
+#[cfg(debug_assertions)]
+fn extraction_process(dir: &TempDir, args: &[&str]) -> std::process::Command {
+    let mut command = hermetic_process_command(&assert_cmd::cargo::cargo_bin("kio"));
+    command
+        .current_dir(dir.path())
+        .envs(support::home_env(dir.path()))
+        .env("XDG_CONFIG_HOME", dir.path().join(".test-config"))
+        .env("XDG_DATA_HOME", dir.path().join(".test-data"))
+        .env("XDG_STATE_HOME", dir.path().join(".test-state"))
+        .env("XDG_CACHE_HOME", dir.path().join(".test-cache"))
+        .args(args);
+    command
+}
+
+#[cfg(debug_assertions)]
+fn interrupt_extraction(dir: &TempDir, point: &str) {
+    interrupt_extraction_command(
+        dir,
+        &mut extraction_process(dir, &["index", "--offline"]),
+        point,
+    );
+}
+
+#[cfg(debug_assertions)]
+fn interrupt_extraction_command(dir: &TempDir, command: &mut std::process::Command, point: &str) {
+    let markers = dir.path().join(".test-data");
+    fs::create_dir_all(&markers).unwrap();
+    let ready = markers.join("extraction.ready");
+    let mut child = command
+        .env("KIO_TEST_DURABILITY_POINT", point)
+        .env("KIO_TEST_DURABILITY_READY", &ready)
+        .spawn()
+        .unwrap();
+    let expected = format!("point={point}\npid={}\n", child.id());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while fs::read_to_string(&ready).ok().as_deref() != Some(&expected) {
+        if child.try_wait().unwrap().is_some() || Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("extraction did not reach {point}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    child.kill().unwrap();
+    assert!(!child.wait().unwrap().success());
+}
+
+#[cfg(debug_assertions)]
+fn check_extraction_publication_crash(points: &[&str]) {
+    for point in points {
+        let dir = canonical_tempdir();
+        fs::write(
+            dir.path().join("stage.md"),
+            large_extraction_markdown("# Saved\n\nextractioncheckpointneedle\n"),
+        )
+        .unwrap();
+        json_success(&dir, &["init"]);
+        interrupt_extraction(&dir, point);
+        let unverified = if *point == "stage_capture_record_writing" {
+            let prepared = dir.path().join(".kio/extraction-stages/prepared");
+            let raw = fs::read_dir(prepared)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            let workspace = fs::read_dir(raw).unwrap().next().unwrap().unwrap().path();
+            let capture = fs::read_dir(workspace)
+                .unwrap()
+                .flatten()
+                .find(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".kio-stage-operation-")
+                })
+                .unwrap()
+                .path()
+                .join("capture.json");
+            assert!(fs::read(&capture).unwrap().is_empty());
+            Some(capture)
+        } else {
+            None
+        };
+
+        let occupied = dir.path().join(".test-data/extraction.ready");
+        if unverified.is_some() {
+            fs::remove_file(&occupied).unwrap();
+            interrupt_extraction(&dir, "stage_captured");
+        }
+
+        // The occupied marker fails a repeat of the checkpoint. Other
+        // interruptions must reuse the already generated prepared unit.
+        let checkpoint = if *point == "extraction_view_ready" {
+            *point
+        } else {
+            "extraction_unit_ready"
+        };
+        kio(&dir, &["index", "--offline"])
+            .env("KIO_TEST_DURABILITY_POINT", checkpoint)
+            .env("KIO_TEST_DURABILITY_READY", occupied)
+            .assert()
+            .success();
+        if let Some(unverified) = unverified {
+            assert!(fs::read(unverified).unwrap().is_empty());
+        }
+        let result = json_success(
+            &dir,
+            &["search", "extractioncheckpointneedle", "--mode", "text"],
+        );
+        assert!(
+            !result["results"].as_array().unwrap().is_empty(),
+            "{point}: {result}"
+        );
+    }
+}
+
+#[cfg(all(debug_assertions, unix))]
+#[test]
+fn p0_unix_recovers_extraction_capture_and_rename() {
+    check_extraction_publication_crash(&[
+        "extraction_unit_ready",
+        "stage_captured",
+        "extraction_cas_published",
+        "extraction_view_ready",
+        "extraction_before_head",
+    ]);
+}
+
+#[cfg(all(debug_assertions, windows))]
+#[test]
+fn p0_windows_recovers_extraction_handle_rename() {
+    check_extraction_publication_crash(&[
+        "extraction_unit_ready",
+        "extraction_manifest_renamed",
+        "extraction_before_destination_sync",
+        "extraction_cas_published",
+        "extraction_view_ready",
+        "extraction_before_head",
+    ]);
+}
+
+#[cfg(debug_assertions)]
+fn pause_nc2_command(
+    dir: &TempDir,
+    ready: &Path,
+    point: &str,
+    args: &[&str],
+) -> std::process::Child {
+    let mut command = hermetic_process_command(&assert_cmd::cargo::cargo_bin("kio"));
+    let mut child = command
+        .current_dir(dir.path())
+        .envs(support::home_env(dir.path()))
+        .env("KIO_TEST_DURABILITY_POINT", point)
+        .env("KIO_TEST_DURABILITY_READY", ready)
+        .args(args)
+        .arg("--json")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let expected = format!("point={point}\npid={}\n", child.id());
+    let deadline = Instant::now() + Duration::from_secs(25);
+    while fs::read_to_string(ready).ok().as_deref() != Some(&expected) {
+        if child.try_wait().unwrap().is_some() || Instant::now() >= deadline {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!("{args:?} did not reach checkpoint {point}: {output:?}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    child
+}
+
+#[cfg(debug_assertions)]
+const NC2_REINDEX: &[&str] = &["reindex", "--regenerate", "--yes", "--offline"];
+
+#[cfg(debug_assertions)]
+fn pause_nc2_reindex(dir: &TempDir, ready: &Path) -> std::process::Child {
+    pause_nc2_command(dir, ready, "before_index_snapshot", NC2_REINDEX)
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn p0_stage_write_storage_failure_is_held_until_explicit_retry() {
+    let dir = canonical_tempdir();
+    fs::write(
+        dir.path().join("held.md"),
+        large_extraction_markdown("# Held\n\nstoragefaultneedle\n"),
+    )
+    .unwrap();
+    json_success(&dir, &["init"]);
+    kio(&dir, &["index", "--offline"])
+        .env("KIO_TEST_DURABILITY_POINT", "extraction_stage_writing")
+        .env("KIO_TEST_DURABILITY_STORAGE_FAULT", "1")
+        .assert()
+        .code(3);
+    let status = json_success(&dir, &["status"]);
+    assert_eq!(status["paused_by_hold_reason"]["resource_limit"], 1);
+    kio(&dir, &["batch", "resume", "--offline"])
+        .assert()
+        .code(3);
+    let watch_home = canonical_tempdir();
+    let watch_command = |args: &[&str]| {
+        let mut command = extraction_process(&dir, args);
+        command
+            .envs(support::home_env(watch_home.path()))
+            .env("XDG_CONFIG_HOME", watch_home.path().join("config"))
+            .env("XDG_DATA_HOME", watch_home.path().join("data"))
+            .env("XDG_STATE_HOME", watch_home.path().join("state"))
+            .env("XDG_CACHE_HOME", watch_home.path().join("cache"));
+        command
+    };
+    let mut watcher = watch_command(&["watch", "run", "--reconcile-interval-seconds", "1"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(25);
+    loop {
+        let output = watch_command(&["watch", "status", "--json"])
+            .output()
+            .unwrap();
+        let watch: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
+        if watch["last_observation"]["last_success_ms"].is_number() {
+            break;
+        }
+        if !output.status.success()
+            || watcher.try_wait().unwrap().is_some()
+            || Instant::now() >= deadline
+        {
+            let _ = watcher.kill();
+            let _ = watcher.wait();
+            panic!(
+                "watch did not reconcile the resource-held scope: {watch} {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let stop = watch_command(&["watch", "stop"]).status();
+    let deadline = Instant::now() + Duration::from_secs(25);
+    while watcher.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if watcher.try_wait().unwrap().is_none() {
+        let _ = watcher.kill();
+    }
+    let stopped = watcher.wait().unwrap();
+    assert!(stop.unwrap().success() && stopped.success());
+    assert_eq!(
+        json_success(&dir, &["status"])["paused_by_hold_reason"]["resource_limit"],
+        1,
+        "watch retried a resource-held extraction"
+    );
+    kio(&dir, &["batch", "retry", "--offline"])
+        .assert()
+        .success();
+    let status = json_success(&dir, &["status"]);
+    assert_eq!(status["paused_by_hold_reason"]["resource_limit"], 0);
+    assert!(
+        !json_success(&dir, &["search", "storagefaultneedle", "--mode", "text"])["results"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn p0_preview_checks_the_selected_extraction_budget() {
+    let dir = canonical_tempdir();
+    json_success(&dir, &["init"]);
+    let file = fs::File::create(dir.path().join("large.txt")).unwrap();
+    file.set_len(256 * 1024 * 1024 + 1).unwrap();
+    let report = json_success(&dir, &["index", "--preview", "--resource-tier", "standard"]);
+    let issues = report["extraction_issues"].as_array().unwrap();
+    assert!(
+        issues.iter().any(|issue| {
+            issue["path"] == "large.txt"
+                && issue["resource_limit"]["resource_tier"] == "standard"
+                && issue["resource_limit"]["observed"] == 256 * 1024 * 1024 + 1
+        }),
+        "{report}"
+    );
+    assert!(!dir.path().join(".kio/extraction-stages").exists());
+}
+
+#[test]
+#[ignore = "streams more than 256 MiB through the ordinary index and source rebuild"]
+fn p0_index_rebuilds_large_streamed_extraction() {
+    use kio_pipeline::prepare::{
+        PrepareStageBytesRequest, PrepareStageOutput, PreparedUnit, UnitType,
+        fingerprint_for_bytes, prepare_staged_with,
+    };
+    let dir = canonical_tempdir();
+    json_success(&dir, &["init"]);
+    let raw = b"%PDF-1.4\n";
+    let path = dir.path().join("stream.pdf");
+    fs::write(&path, raw).unwrap();
+    let raw_hash = kio_core::cas::hash_bytes(raw);
+    let profile = kio_adapter::catalog::builtin_prepare_profile().tool_profile_hash;
+    let store = kio_core::store_dir::StoreDirectory::open(&dir.path().join(".kio")).unwrap();
+    prepare_staged_with(
+        &store,
+        PrepareStageBytesRequest {
+            raw_hash: &raw_hash,
+            media_type: "application/pdf",
+            input_path: &path.to_string_lossy(),
+            tool_profile_hash: &profile,
+            bytes: raw,
+        },
+        &profile,
+        |completed, emit| {
+            assert!(completed.is_empty());
+            emit.declare(17)?;
+            let mut prepared_units = Vec::new();
+            for order in 0..17 {
+                let text = format!(
+                    "streamedrebuildneedle {} tail {order}",
+                    "\u{2003}".repeat(16 * 1024 * 1024 / 3)
+                );
+                let bytes = text.as_bytes();
+                let hash = kio_core::cas::hash_bytes(bytes);
+                let unit = PreparedUnit {
+                    renderer: None,
+                    unit_key: format!("page:{}", order + 1),
+                    unit_type: UnitType::Page,
+                    order,
+                    prepared_hash: hash,
+                    preparation_profile_hash: profile.clone(),
+                    fingerprint: fingerprint_for_bytes(bytes, bytes),
+                    mime: Some("application/pdf".to_owned()),
+                    page_number: Some(order + 1),
+                };
+                emit.write(&unit, bytes)?;
+                prepared_units.push(unit);
+            }
+            Ok(PrepareStageOutput {
+                prepared_object_hashes: prepared_units
+                    .iter()
+                    .map(|unit| unit.prepared_hash.clone())
+                    .collect(),
+                prepared_units,
+                image_object_hashes: Vec::new(),
+            })
+        },
+    )
+    .unwrap();
+    let index = json_success(&dir, &["index", "--offline"]);
+    assert_eq!(index["normalized_files"], 1, "{index}");
+    let search = json_success(
+        &dir,
+        &[
+            "search",
+            "streamedrebuildneedle",
+            "--mode",
+            "text",
+            "--limit",
+            "1",
+        ],
+    );
+    assert!(!search["results"].as_array().unwrap().is_empty());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn p0_native_image_resumes_after_prepared_and_normalized_stage_failures() {
+    for (point, kind) in [
+        ("extraction_stage_writing", "prepared"),
+        ("extraction_before_manifest", "views"),
+    ] {
+        assert_native_image_retry(point, kind);
+    }
+}
+
+#[cfg(debug_assertions)]
+fn assert_native_image_retry(point: &str, kind: &str) {
+    let dir = canonical_tempdir();
+    let image = large_extraction_png();
+    let raw = kio_core::cas::hash_bytes(&image);
+    fs::write(dir.path().join("held.png"), image).unwrap();
+    json_success(&dir, &["init"]);
+    kio(&dir, &["index", "--offline"])
+        .env("KIO_TEST_DURABILITY_POINT", point)
+        .env("KIO_TEST_DURABILITY_STORAGE_FAULT", "1")
+        .assert()
+        .code(3);
+    assert_eq!(
+        json_success(&dir, &["status"])["paused_by_hold_reason"]["resource_limit"],
+        1
+    );
+    let staged = dir
+        .path()
+        .join(".kio/extraction-stages")
+        .join(kind)
+        .join(raw.trim_start_matches("sha256:"));
+    assert!(
+        fs::read_dir(staged).unwrap().any(|workspace| {
+            fs::read_dir(workspace.unwrap().path())
+                .unwrap()
+                .any(|entry| {
+                    entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("unit-")
+                })
+        }),
+        "no durable unit journal in {kind}"
+    );
+    kio(&dir, &["batch", "retry", "--offline"])
+        .assert()
+        .success();
+    let repo = Repository::open(dir.path()).unwrap();
+    let head = repo
+        .read_commit(&repo.head_commit_hash().unwrap().unwrap())
+        .unwrap();
+    assert!(
+        repo.read_tree(&head.tree)
+            .unwrap()
+            .entries
+            .iter()
+            .map(Result::unwrap)
+            .any(|entry| entry.path == "held.png" && entry.normalize.is_some())
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn nc2_defers_when_classified_bytes_change_before_snapshot() {
+    let dir = canonical_tempdir();
+    let path = dir.path().join("document.cfg");
+    let original = b"racedneedle searchable text\n";
+    let binary = vec![0xff; original.len()];
+    // Put the raced path after more than one run of classified inputs.
+    for n in 0..=kio_core::disk_records::SORT_BUFFER_RECORDS {
+        fs::write(dir.path().join(format!("{n:05}.rs")), "source fixture").unwrap();
+    }
+    fs::write(&path, original).unwrap();
+    kio(&dir, &["init"]).assert().success();
+    json_success(&dir, &["index", "--yes", "--offline"]);
+    let kio_dir = dir.path().join(".kio");
+    let head = head_commit(&kio_dir);
+    let published = json_success(&dir, &["status"])["unsupported_inputs"].clone();
+    let replacements = canonical_tempdir();
+
+    for command in [NC2_REINDEX, &["index", "--yes", "--offline"][..]] {
+        // Cover both directions, including a recognized text file whose
+        // classification can become stale when binary content replaces it.
+        for (before, after) in [
+            (binary.as_slice(), original.as_slice()),
+            (original.as_slice(), binary.as_slice()),
+        ] {
+            fs::write(&path, before).unwrap();
+            let replacement = replacements.path().join("replacement.cfg");
+            fs::write(&replacement, after).unwrap();
+            let output = nc2_change_before_snapshot(&dir, command, || {
+                fs::remove_file(&path).unwrap();
+                fs::rename(replacement, &path).unwrap();
+            });
+            assert_nc2_deferred(&dir, &output, "document.cfg", "changed_after_scan");
+            assert_eq!(head_commit(&kio_dir), head);
+            assert_eq!(
+                json_success(&dir, &["status"])["unsupported_inputs"],
+                published
+            );
+        }
+    }
+    let search = json_success(&dir, &["search", "racedneedle", "--mode", "text"]);
+    pointer_for_path(&search, "document.cfg");
+    json_success(&dir, &["index", "--yes", "--offline"]);
+    let status = json_success(&dir, &["status"]);
+    assert!(status.get("deferred_inputs").is_none());
+    assert_eq!(
+        status["unsupported_inputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["path"] == "document.cfg")
+            .unwrap()["raw_hash"],
+        kio_core::cas::hash_bytes(&binary)
+    );
+    let search = json_success(&dir, &["search", "racedneedle", "--mode", "text"]);
+    assert_eq!(search["results"], serde_json::json!([]));
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn nc2_aborted_reindex_preserves_published_unsupported_reason() {
+    let dir = canonical_tempdir();
+    let path = dir.path().join("document.cfg");
+    fs::write(&path, b"\xff").unwrap();
+    kio(&dir, &["init"]).assert().success();
+    json_success(&dir, &["index", "--yes", "--offline"]);
+    let published = json_success(&dir, &["status"])["unsupported_inputs"].clone();
+    assert_eq!(published.as_array().unwrap().len(), 1);
+
+    // Force the replacement path: compaction must preserve the published
+    // record even when it is about to write a different raw for the same path.
+    let journal = dir.path().join(".kio/unsupported-inputs.jsonl");
+    let record = fs::read(&journal).unwrap();
+    fs::write(
+        &journal,
+        record.repeat((16 * 1024 * 1024) / record.len() + 1),
+    )
+    .unwrap();
+    fs::write(&path, b"\xfe").unwrap();
+    let markers = canonical_tempdir();
+    let mut child = pause_nc2_reindex(&dir, &markers.path().join("ready"));
+    child.kill().unwrap();
+    assert!(!child.wait().unwrap().success());
+    assert_eq!(
+        json_success(&dir, &["status"])["unsupported_inputs"],
+        published
+    );
+
+    json_success(&dir, &["reindex", "--regenerate", "--yes", "--offline"]);
+    let current = json_success(&dir, &["status"])["unsupported_inputs"].clone();
+    assert_eq!(current[0]["reason"], published[0]["reason"]);
+    assert_ne!(current[0]["raw_hash"], published[0]["raw_hash"]);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn p0_edit_reclaims_the_obsolete_extraction_stage() {
+    let dir = canonical_tempdir();
+    let old = large_extraction_markdown("# Old\n\nfirst extraction body\n");
+    let path = dir.path().join("held.md");
+    fs::write(&path, &old).unwrap();
+    json_success(&dir, &["init"]);
+    let old_hash = kio_core::cas::hash_bytes(old.as_bytes());
+    let old_workspace = dir
+        .path()
+        .join(".kio/extraction-stages/prepared")
+        .join(old_hash.trim_start_matches("sha256:"));
+    kio(&dir, &["index", "--offline"])
+        .env("KIO_TEST_DURABILITY_POINT", "extraction_stage_writing")
+        .env("KIO_TEST_DURABILITY_STORAGE_FAULT", "1")
+        .assert()
+        .code(3);
+    let work = fs::read_dir(old_workspace)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert!(work.join("unit-0.json").is_file());
+    fs::write(&path, "# Edited\n\nreplacementstagebody\n").unwrap();
+    json_success(&dir, &["index", "--offline"]);
+    assert!(!work.join("unit-0.json").exists());
+    assert!(
+        !fs::read_dir(work)
+            .unwrap()
+            .flatten()
+            .any(|entry| { entry.file_name().to_string_lossy().starts_with("payload-") })
+    );
+    assert_eq!(
+        json_success(&dir, &["status"])["paused_by_hold_reason"]["resource_limit"],
+        0
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn p0_recheck_retries_holds_before_head_even_for_new_or_edited_inputs() {
+    for (args, edited, stop) in [
+        (
+            &["batch", "retry", "--offline"][..],
+            false,
+            "extraction_before_head",
+        ),
+        (
+            &["batch", "retry", "--offline"][..],
+            true,
+            "publication_journal",
+        ),
+        (
+            &["repair", "rebuild-db", "--offline"][..],
+            false,
+            "extraction_before_head",
+        ),
+        (
+            &["reindex", "--regenerate", "--yes", "--offline"][..],
+            true,
+            "extraction_before_head",
+        ),
+    ] {
+        let dir = canonical_tempdir();
+        json_success(&dir, &["init"]);
+        let path = dir.path().join("held.md");
+        let unrelated_paths = ["a-existing.rs", "z-existing.rs"];
+        let unrelated_original = b"# Before retry\n";
+        if edited {
+            if args[0] == "batch" {
+                for path in unrelated_paths {
+                    fs::write(dir.path().join(path), unrelated_original).unwrap();
+                }
+            }
+            fs::write(&path, "# Previous version\n").unwrap();
+            json_success(&dir, &["index", "--offline"]);
+        }
+        let contents = large_extraction_markdown("# publishheldneedle\n");
+        fs::write(&path, &contents).unwrap();
+        interrupt_extraction_command(
+            &dir,
+            extraction_process(&dir, &["index", "--offline"])
+                .env("KIO_TEST_EXTRACTION_WRITE_FAULT_BEFORE_HEAD", "1"),
+            stop,
+        );
+        let status = json_success(&dir, &["status"]);
+        assert_eq!(
+            status["paused_by_hold_reason"]["resource_limit"], 1,
+            "{status}"
+        );
+        if args[0] == "batch" {
+            fs::write(dir.path().join("unrelated.md"), "unrelated").unwrap();
+            if edited {
+                for path in unrelated_paths {
+                    fs::write(dir.path().join(path), b"# Unpublished edit\n").unwrap();
+                }
+            }
+        }
+        kio(&dir, args).assert().success();
+        let repo = Repository::open(dir.path()).unwrap();
+        let head = repo
+            .read_commit(&repo.head_commit_hash().unwrap().unwrap())
+            .unwrap();
+        let tree = repo.read_tree(&head.tree).unwrap();
+        assert!(
+            tree.entries
+                .iter()
+                .map(Result::unwrap)
+                .any(|entry| entry.path == "held.md"
+                    && entry.raw_hash == kio_core::cas::hash_bytes(contents.as_bytes())
+                    && entry.normalize.is_some())
+        );
+        if args[0] == "batch" {
+            assert!(
+                tree.entries
+                    .iter()
+                    .map(Result::unwrap)
+                    .all(|entry| entry.path != "unrelated.md")
+            );
+            if edited {
+                let previous_raw = kio_core::cas::hash_bytes(unrelated_original);
+                for path in unrelated_paths {
+                    assert!(tree.entries.iter().map(Result::unwrap).any(|entry| {
+                        entry.path == path
+                            && entry.raw_hash == previous_raw
+                            && entry.normalize.is_none()
+                    }));
+                }
+            }
+            let result = json_success(&dir, &["search", "publishheldneedle", "--mode", "text"]);
+            assert!(
+                !result["results"].as_array().unwrap().is_empty(),
+                "{result}"
+            );
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn nc2_retry_keeps_reason_for_pending_publication() {
+    for (command, extraction) in [
+        (&["index", "--yes", "--offline"][..], false),
+        (&["index", "--yes", "--offline"][..], true),
+        (NC2_REINDEX, false),
+        (NC2_REINDEX, true),
+    ] {
+        let dir = canonical_tempdir();
+        let path = dir.path().join("document.cfg");
+        fs::write(&path, b"\xff").unwrap();
+        json_success(&dir, &["init"]);
+        if extraction {
+            fs::write(
+                dir.path().join("note.md"),
+                large_extraction_markdown("# A staged extraction"),
+            )
+            .unwrap();
+        }
+        json_success(&dir, &["index", "--yes", "--offline"]);
+        fs::write(&path, b"\xfe").unwrap();
+        let markers = canonical_tempdir();
+        let mut child = pause_nc2_command(
+            &dir,
+            &markers.path().join("ready"),
+            "publication_journal",
+            command,
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        if extraction {
+            assert!(
+                dir.path()
+                    .join(".kio/extraction-stages/retirement.json")
+                    .is_file()
+            );
+        }
+
+        fs::write(&path, b"\xfd").unwrap();
+        if extraction {
+            let error = json_failure(&dir, command, 3);
+            assert_eq!(
+                error["error_code"],
+                "KIO-E-PUBLICATION-RECOVERY-REQUIRED-001"
+            );
+        } else {
+            kio(&dir, command).assert().failure();
+        }
+        json_success(&dir, &["init"]);
+        let status = json_success(&dir, &["status"]);
+        assert_eq!(
+            status["unsupported_inputs"][0]["raw_hash"],
+            kio_pipeline::prepare::hash_bytes(b"\xfe"),
+            "{command:?}: {status}"
+        );
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn p0_recheck_retires_a_published_stage_after_restart_and_edit() {
+    for point in [
+        "publication_journal",
+        "publication_head",
+        "extraction_after_head",
+    ] {
+        assert_recheck_stage_retirement(point);
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn p0_recovers_retirement_journal_above_the_former_tree_limit() {
+    let dir = canonical_tempdir();
+    json_success(&dir, &["init"]);
+    let path = dir.path().join("held.md");
+    fs::write(&path, large_extraction_markdown("# Already published\n")).unwrap();
+    interrupt_extraction(&dir, "extraction_after_head");
+
+    let journal = dir.path().join(".kio/extraction-stages/retirement.json");
+    {
+        use std::io::Write;
+
+        let mut file = fs::OpenOptions::new().append(true).open(&journal).unwrap();
+        let whitespace = [b' '; 4096];
+        for _ in 0..8192 {
+            file.write_all(&whitespace).unwrap();
+        }
+        file.sync_all().unwrap();
+    }
+    fs::write(&path, b"# Changed after the interruption\n").unwrap();
+    json_success(&dir, &["index", "--offline"]);
+    assert!(!journal.exists());
+}
+
+#[cfg(debug_assertions)]
+fn assert_recheck_stage_retirement(point: &str) {
+    let dir = canonical_tempdir();
+    json_success(&dir, &["init"]);
+    let path = dir.path().join("held.md");
+    let old = large_extraction_markdown("# stagedretirementneedle\n");
+    fs::write(&path, &old).unwrap();
+    interrupt_extraction(&dir, point);
+    let hash = kio_core::cas::hash_bytes(old.as_bytes());
+    let work = dir
+        .path()
+        .join(".kio/extraction-stages/prepared")
+        .join(hash.trim_start_matches("sha256:"));
+    let journal = fs::read_dir(work)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path()
+        .join("unit-0.json");
+    assert!(journal.is_file());
+    fs::write(&path, "# Changed\n").unwrap();
+    json_success(&dir, &["index", "--offline"]);
+    assert!(!journal.exists());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn p0_recheck_regenerate_reuses_units_after_synced_view() {
+    let dir = canonical_tempdir();
+    json_success(&dir, &["init"]);
+    fs::write(
+        dir.path().join("doc.md"),
+        large_extraction_markdown("# copiedneedle\n"),
+    )
+    .unwrap();
+    json_success(&dir, &["index", "--offline"]);
+    let args = ["reindex", "--regenerate", "--yes", "--offline"];
+    interrupt_extraction_command(
+        &dir,
+        &mut extraction_process(&dir, &args),
+        "extraction_view_ready",
+    );
+    kio(&dir, &args)
+        .env("KIO_TEST_DURABILITY_POINT", "extraction_view_ready")
+        .env(
+            "KIO_TEST_DURABILITY_READY",
+            dir.path().join(".test-data/extraction.ready"),
+        )
+        .assert()
+        .success();
+    let repo = Repository::open(dir.path()).unwrap();
+    let head = repo
+        .read_commit(&repo.head_commit_hash().unwrap().unwrap())
+        .unwrap();
+    assert_eq!(
+        repo.read_tree(&head.tree)
+            .unwrap()
+            .entries
+            .iter()
+            .next()
+            .unwrap()
+            .unwrap()
+            .normalize
+            .as_ref()
+            .unwrap()
+            .r#gen,
+        1
+    );
+}
+
+#[cfg(all(debug_assertions, unix))]
+#[test]
+fn p0_recheck_publication_recovers_before_capture_record_and_destination_sync() {
+    check_extraction_publication_crash(&[
+        "stage_capture_record_writing",
+        "extraction_manifest_renamed",
+        "extraction_before_destination_sync",
+    ]);
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn p0_recheck_index_keeps_retirement_handles_bounded() {
+    let dir = canonical_tempdir();
+    json_success(&dir, &["init"]);
+    for i in 0..42 {
+        fs::write(
+            dir.path().join(format!("file-{i}.txt")),
+            large_extraction_markdown(&format!("document number {i}")),
+        )
+        .unwrap();
+    }
+    let kio = extraction_process(&dir, &["index", "--offline"]);
+    let mut limited = std::process::Command::new("sh");
+    limited
+        .arg("-c")
+        .arg("ulimit -n 160 && exec \"$@\"")
+        .arg("sh")
+        .arg(kio.get_program())
+        .args(kio.get_args())
+        .current_dir(kio.get_current_dir().unwrap());
+    for (key, value) in kio.get_envs() {
+        if let Some(value) = value {
+            limited.env(key, value);
+        } else {
+            limited.env_remove(key);
+        }
+    }
+    let output = limited.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn p0_recheck_adoption_retries_destination_sync_before_retiring() {
+    let dir = canonical_tempdir();
+    json_success(&dir, &["init"]);
+    fs::write(
+        dir.path().join("sync.md"),
+        large_extraction_markdown("# syncdurabilityneedle\n"),
+    )
+    .unwrap();
+    interrupt_extraction(&dir, "extraction_before_destination_sync");
+    // The second attempt sees the public name produced by the interrupted
+    // rename. Inject failure at its directory sync as well.
+    kio(&dir, &["index", "--offline"])
+        .env(
+            "KIO_TEST_DURABILITY_POINT",
+            "extraction_before_destination_sync",
+        )
+        .env("KIO_TEST_DURABILITY_STORAGE_FAULT", "1")
+        .assert()
+        .code(3);
+    assert_eq!(
+        json_success(&dir, &["status"])["paused_by_hold_reason"]["resource_limit"],
+        1
+    );
+    kio(&dir, &["batch", "retry", "--offline"])
+        .assert()
+        .success();
+    let search = json_success(&dir, &["search", "syncdurabilityneedle", "--mode", "text"]);
+    assert!(!search["results"].as_array().unwrap().is_empty());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn p0_recheck_retirement_survives_after_clearing_the_hold() {
+    let dir = canonical_tempdir();
+    json_success(&dir, &["init"]);
+    let source = dir.path().join("held.md");
+    let input = large_extraction_markdown("# retirement hold needle\n");
+    fs::write(&source, &input).unwrap();
+    kio(&dir, &["index", "--offline"])
+        .env("KIO_TEST_DURABILITY_POINT", "extraction_stage_writing")
+        .env("KIO_TEST_DURABILITY_STORAGE_FAULT", "1")
+        .assert()
+        .code(3);
+    interrupt_extraction_command(
+        &dir,
+        &mut extraction_process(&dir, &["batch", "retry", "--offline"]),
+        "extraction_before_retirement_cleanup",
+    );
+    assert_eq!(
+        json_success(&dir, &["status"])["paused_by_hold_reason"]["resource_limit"],
+        0
+    );
+    let hash = kio_core::cas::hash_bytes(input.as_bytes());
+    let work = dir
+        .path()
+        .join(".kio/extraction-stages/prepared")
+        .join(hash.trim_start_matches("sha256:"));
+    let record = fs::read_dir(work)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path()
+        .join("unit-0.json");
+    assert!(record.is_file());
+    fs::write(&source, "# Edited after retirement\n").unwrap();
+    json_success(&dir, &["index", "--offline"]);
+    assert!(!record.exists());
+    assert!(
+        !dir.path()
+            .join(".kio/extraction-stages/retirement.json")
+            .exists()
+    );
+}
+
+#[test]
+#[ignore = "serializes a normalized unit above the 128 MiB object limit"]
+fn p0_recheck_preview_and_index_agree_on_normalized_unit_size() {
+    use std::io::Write as _;
+    let dir = canonical_tempdir();
+    json_success(&dir, &["init"]);
+    let mut source = fs::File::create(dir.path().join("large.txt")).unwrap();
+    let block = vec![b'\\'; 1024 * 1024];
+    // JSON string escapes double this body. Prepared bytes and raw input are
+    // both below the normalized object's serialization limit.
+    for _ in 0..65 {
+        source.write_all(&block).unwrap();
+    }
+    drop(source);
+    let preview = json_success(&dir, &["index", "--preview", "--resource-tier", "large"]);
+    let issue = &preview["extraction_issues"][0];
+    assert_eq!(
+        issue["resource_limit"]["stage"], "normalized_unit",
+        "{preview}"
+    );
+    assert!(!dir.path().join(".kio/extraction-stages").exists());
+
+    let output = kio(&dir, &["index", "--offline", "--resource-tier", "large"])
+        .arg("--json")
+        .assert()
+        .code(3)
+        .get_output()
+        .stderr
+        .clone();
+    let error: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(error["context"]["stage"], "normalized_unit", "{error}");
+    let status = json_success(&dir, &["status"]);
+    assert_eq!(status["paused_by_hold_reason"]["resource_limit"], 1);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn nc2_purge_cannot_delete_raw_from_pending_publication() {
+    let dir = canonical_tempdir();
+    let path = dir.path().join("document.txt");
+    fs::write(&path, b"previous snapshot\n").unwrap();
+    json_success(&dir, &["init"]);
+    json_success(&dir, &["snapshot", "create"]);
+    let pending = b"pending snapshot\n";
+    fs::write(&path, pending).unwrap();
+    let markers = canonical_tempdir();
+    let mut child = pause_nc2_command(
+        &dir,
+        &markers.path().join("ready"),
+        "publication_journal",
+        &["snapshot", "create"],
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let raw = kio_pipeline::prepare::hash_bytes(pending);
+    fs::remove_file(path).unwrap();
+    kio(
+        &dir,
+        &["purge", "--raw-hash", &raw, "--reason", "privacy", "--yes"],
+    )
+    .assert()
+    .failure();
+
+    json_success(&dir, &["init"]);
+    let repo = Repository::open(dir.path()).unwrap();
+    let commit = repo
+        .read_commit(&repo.head_commit_hash().unwrap().unwrap())
+        .unwrap();
+    let tree = repo.read_tree(&commit.tree).unwrap();
+    assert_eq!(
+        tree.find_entry("document.txt").unwrap().unwrap().raw_hash,
+        raw
+    );
+    assert!(
+        repo.object_store()
+            .inspect_object(ObjectKind::Raw, &raw)
+            .is_ok(),
+        "recovered HEAD points to deleted raw {raw}"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn nc2_defers_renamed_or_deleted_inputs_before_snapshot() {
+    for command in [NC2_REINDEX, &["index", "--yes", "--offline"][..]] {
+        for renamed in [Some("b.cfg"), Some("A.cfg"), None] {
+            let dir = canonical_tempdir();
+            let original = dir.path().join("a.cfg");
+            fs::write(&original, b"\xff").unwrap();
+            json_success(&dir, &["init"]);
+            json_success(&dir, &["index", "--yes", "--offline"]);
+            let published = json_success(&dir, &["status"])["unsupported_inputs"].clone();
+            fs::write(dir.path().join("other.md"), "otherneedle text\n").unwrap();
+            let output = nc2_change_before_snapshot(&dir, command, || {
+                if let Some(renamed) = renamed {
+                    fs::rename(original, dir.path().join(renamed)).unwrap();
+                } else {
+                    fs::remove_file(original).unwrap();
+                }
+            });
+            let report = assert_nc2_deferred(&dir, &output, "a.cfg", "missing_after_scan");
+            if let Some(renamed) = renamed {
+                assert!(
+                    report["deferred_inputs"].as_array().unwrap().contains(
+                        &serde_json::json!({"path": renamed, "reason": "added_after_scan"})
+                    )
+                );
+            }
+            let search = json_success(&dir, &["search", "otherneedle", "--mode", "text"]);
+            if command[0] == "index" {
+                pointer_for_path(&search, "other.md");
+            }
+            assert_eq!(
+                json_success(&dir, &["status"])["unsupported_inputs"],
+                published
+            );
+            json_success(&dir, &["index", "--yes", "--offline"]);
+            let status = json_success(&dir, &["status"]);
+            assert!(status.get("deferred_inputs").is_none());
+            if let Some(renamed) = renamed {
+                assert_eq!(status["unsupported_inputs"][0]["path"], renamed);
+                assert_eq!(
+                    status["unsupported_inputs"][0]["reason"],
+                    published[0]["reason"]
+                );
+            } else {
+                assert_eq!(status["unsupported_inputs"], serde_json::json!([]));
+            }
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn nc2_defers_an_appended_file_while_publishing_other_files() {
+    use std::io::Write;
+    let dir = canonical_tempdir();
+    let path = dir.path().join("log.txt");
+    fs::write(&path, "previousneedle text\n").unwrap();
+    json_success(&dir, &["init"]);
+    json_success(&dir, &["index", "--yes", "--offline"]);
+    fs::write(dir.path().join("other.md"), "otherneedle text\n").unwrap();
+
+    for _ in 0..2 {
+        let output = nc2_change_before_snapshot(&dir, &["index", "--yes", "--offline"], || {
+            let mut log = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            writeln!(log, "appendedneedle").unwrap();
+        });
+        assert_nc2_deferred(&dir, &output, "log.txt", "changed_after_scan");
+        let status = kio(&dir, &["status"]).assert().success();
+        assert!(
+            String::from_utf8_lossy(&status.get_output().stdout)
+                .contains("deferred log.txt (changed_after_scan)")
+        );
+        let search = json_success(&dir, &["search", "previousneedle", "--mode", "text"]);
+        pointer_for_path(&search, "log.txt");
+        let search = json_success(&dir, &["search", "otherneedle", "--mode", "text"]);
+        pointer_for_path(&search, "other.md");
+        let search = json_success(&dir, &["search", "appendedneedle", "--mode", "text"]);
+        assert_eq!(search["results"], serde_json::json!([]));
+    }
+
+    json_success(&dir, &["index", "--yes", "--offline"]);
+    let search = json_success(&dir, &["search", "appendedneedle", "--mode", "text"]);
+    pointer_for_path(&search, "log.txt");
+    assert!(
+        json_success(&dir, &["status"])
+            .get("deferred_inputs")
+            .is_none()
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn p0_keeps_extraction_on_mf3_deferral_until_publication() {
+    let dir = canonical_tempdir();
+    let path = dir.path().join("held.md");
+    let original = large_extraction_markdown("# helddeferralneedle");
+    fs::write(&path, &original).unwrap();
+    json_success(&dir, &["init"]);
+    json_success(&dir, &["snapshot", "create"]);
+    kio(&dir, &["index", "--offline"])
+        .env("KIO_TEST_EXTRACTION_WRITE_FAULT_BEFORE_HEAD", "1")
+        .assert()
+        .code(3);
+    let status = json_success(&dir, &["status"]);
+    assert_eq!(status["paused_by_hold_reason"]["resource_limit"], 1);
+
+    let args = &["index", "--offline"];
+    let output = nc2_change_before_snapshot(&dir, args, || {
+        fs::write(&path, b"# changed after scan").unwrap();
+    });
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    let status = json_success(&dir, &["status"]);
+    assert_eq!(status["deferred_inputs"][0]["path"], "held.md");
+    assert_eq!(status["deferred_inputs"][0]["reason"], "changed_after_scan");
+    assert_eq!(status["paused_by_hold_reason"]["resource_limit"], 1);
+
+    fs::write(&path, &original).unwrap();
+    json_success(&dir, args);
+    let status = json_success(&dir, &["status"]);
+    assert_eq!(status["paused_by_hold_reason"]["resource_limit"], 0);
+    let search = json_success(&dir, &["search", "helddeferralneedle", "--mode", "text"]);
+    pointer_for_path(&search, "held.md");
+}
+
+#[cfg(debug_assertions)]
+fn nc2_change_before_snapshot(
+    dir: &TempDir,
+    command: &[&str],
+    change: impl FnOnce(),
+) -> std::process::Output {
+    let markers = canonical_tempdir();
+    let ready = markers.path().join("ready");
+    let child = pause_nc2_command(dir, &ready, "before_index_snapshot", command);
+    change();
+    fs::write(ready.with_extension("release"), b"release").unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[cfg(debug_assertions)]
+fn assert_nc2_deferred(
+    dir: &TempDir,
+    output: &std::process::Output,
+    path: &str,
+    reason: &str,
+) -> Value {
+    assert!(output.status.success(), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let expected = serde_json::json!({ "path": path, "reason": reason });
+    let deferred = report["deferred_inputs"]
+        .as_array()
+        .expect("missing file deferrals");
+    assert!(deferred.contains(&expected), "{report}");
+    assert_eq!(
+        json_success(dir, &["status"])["deferred_inputs"],
+        report["deferred_inputs"]
+    );
+    report
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn nc2_defers_files_added_after_scanning() {
+    let index = &["index", "--yes", "--offline"][..];
+    for (command, additional_inputs) in [
+        (NC2_REINDEX, 0),
+        (index, kio_core::disk_records::SORT_BUFFER_RECORDS + 1),
+    ] {
+        let dir = canonical_tempdir();
+        fs::write(dir.path().join("a.md"), "# Original\n\noriginal text\n").unwrap();
+        for n in 0..additional_inputs {
+            fs::write(dir.path().join(format!("z{n:05}.rs")), "source fixture").unwrap();
+        }
+        json_success(&dir, &["init"]);
+        json_success(&dir, &["index", "--yes", "--offline"]);
+        let added_raw = kio_core::cas::hash_bytes(b"\xff");
+        let output = nc2_change_before_snapshot(&dir, command, || {
+            fs::write(dir.path().join("b.cfg"), b"\xff").unwrap();
+        });
+        assert_nc2_deferred(&dir, &output, "b.cfg", "added_after_scan");
+        let repo = Repository::open_read_only(dir.path()).unwrap();
+        let head = repo
+            .read_commit(&repo.head_commit_hash().unwrap().unwrap())
+            .unwrap();
+        let tree = repo.read_tree(&head.tree).unwrap();
+        assert!(tree.find_entry("a.md").unwrap().is_some());
+        assert!(tree.find_entry("b.cfg").unwrap().is_none());
+        let error = repo
+            .object_store()
+            .inspect_object(ObjectKind::Raw, &added_raw)
+            .unwrap_err();
+        assert_eq!(error.error_code(), "KIO-E-STORE-NOT-FOUND-001");
+
+        json_success(&dir, &["index", "--yes", "--offline"]);
+        let status = json_success(&dir, &["status"]);
+        assert_eq!(status["unsupported_inputs"][0]["path"], "b.cfg");
+        assert_eq!(status["unsupported_inputs"][0]["raw_hash"], added_raw);
+        assert_eq!(
+            status["unsupported_inputs"][0]["reason"],
+            "unrecognized_binary_without_local_text"
+        );
+    }
+}
+
+#[test]
+fn nc2_search_counts_raw_only_ocr_task_with_unsupported_alias() {
+    let dir = canonical_tempdir();
+    let mut scan = b"%PDF-1.4\n".to_vec();
+    scan.extend([0xff; 64]);
+    for name in ["scan.pdf", "copy.cfg"] {
+        fs::write(dir.path().join(name), &scan).unwrap();
+    }
+    json_success(&dir, &["init"]);
+    json_both_mock(&dir, &["index", "--yes", "--offline"]);
+    let status = json_success(&dir, &["status"]);
+    let task = &status["tasks"][0];
+    assert_eq!(task["input_path"], "scan.pdf", "{status}");
+    assert_eq!(task["status"], "paused", "{status}");
+    assert_eq!(status["unsupported_inputs"][0]["path"], "copy.cfg");
+    assert_eq!(
+        task["input_hash"],
+        status["unsupported_inputs"][0]["raw_hash"]
+    );
+
+    let search = json_success(&dir, &["search", "ocrneedle", "--mode", "text"]);
+    assert_eq!(
+        search["index_status"]["pending_enrichment_tasks"], 1,
+        "{search}"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn nc2_status_retries_if_head_changes_after_observation() {
+    let dir = canonical_tempdir();
+    let path = dir.path().join("document.cfg");
+    fs::write(&path, b"\xff").unwrap();
+    json_success(&dir, &["init"]);
+    json_success(&dir, &["index", "--yes", "--offline"]);
+
+    let markers = canonical_tempdir();
+    let ready = markers.path().join("ready");
+    let child = pause_nc2_command(&dir, &ready, "before_read_dispositions", &["status"]);
+    for contents in [b"\xfe", b"\xfd"] {
+        fs::write(&path, contents).unwrap();
+        json_success(&dir, NC2_REINDEX);
+    }
+    fs::write(ready.with_extension("release"), b"release").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["unsupported_inputs_complete"], true);
+    assert_eq!(
+        status["unsupported_inputs"][0]["raw_hash"],
+        kio_pipeline::prepare::hash_bytes(b"\xfd"),
+        "{status}"
+    );
+    assert_eq!(
+        status["files"][0]["raw_hash"],
+        status["unsupported_inputs"][0]["raw_hash"]
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn p0_third_batch_rebuilds_after_retirement_and_restart() {
+    assert_batch_reconciles_extraction_index("extraction_before_index_rebuild");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn p0_third_batch_completes_projection_after_sqlite_rename() {
+    assert_batch_reconciles_extraction_index("extraction_index_renamed");
+}
+
+#[cfg(debug_assertions)]
+fn assert_batch_reconciles_extraction_index(point: &str) {
+    let dir = canonical_tempdir();
+    json_success(&dir, &["init"]);
+    fs::write(
+        dir.path().join("held.md"),
+        large_extraction_markdown("# recoveredbatchneedle\n"),
+    )
+    .unwrap();
+    kio(&dir, &["index", "--offline"])
+        .env("KIO_TEST_EXTRACTION_WRITE_FAULT_BEFORE_HEAD", "1")
+        .assert()
+        .code(3);
+    interrupt_extraction_command(
+        &dir,
+        &mut extraction_process(&dir, &["batch", "retry", "--offline"]),
+        point,
+    );
+    json_success(&dir, &["batch", "retry", "--offline"]);
+    let found = json_success(&dir, &["search", "recoveredbatchneedle", "--mode", "text"]);
+    assert!(!found["results"].as_array().unwrap().is_empty(), "{found}");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn p0_third_image_adoption_rechecks_directory_sync() {
+    let dir = canonical_tempdir();
+    let image = large_extraction_png();
+    fs::write(dir.path().join("held.png"), image).unwrap();
+    json_success(&dir, &["init"]);
+    for command in [
+        &["index", "--offline"][..],
+        &["batch", "retry", "--offline"][..],
+    ] {
+        let _ = kio(&dir, command)
+            .env(
+                "KIO_TEST_DURABILITY_POINT",
+                "extraction_directory_before_sync",
+            )
+            .env("KIO_TEST_DURABILITY_STORAGE_FAULT", "1")
+            .assert();
+        assert_eq!(
+            json_success(&dir, &["status"])["paused_by_hold_reason"]["resource_limit"],
+            1
+        );
+    }
+    json_success(&dir, &["batch", "retry", "--offline"]);
+    assert_eq!(
+        json_success(&dir, &["status"])["paused_by_hold_reason"]["resource_limit"],
+        0
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn p0_third_large_binary_retry_records_unsupported_reason() {
+    let dir = canonical_tempdir();
+    let path = dir.path().join("note.cfg");
+    fs::write(&path, b"previouslysearchable text").unwrap();
+    json_success(&dir, &["init"]);
+    json_success(&dir, &["index", "--offline"]);
+    fs::File::create(&path)
+        .unwrap()
+        .set_len(256 * 1024 * 1024 + 1)
+        .unwrap();
+    kio(&dir, &["index", "--offline"]).assert().code(3);
+    json_success(
+        &dir,
+        &[
+            "repair",
+            "rebuild-db",
+            "--offline",
+            "--resource-tier",
+            "large",
+        ],
+    );
+    let status = json_success(&dir, &["status"]);
+    assert_eq!(
+        status["unsupported_inputs"][0]["reason"], "unrecognized_binary_without_local_text",
+        "{status}"
+    );
+    assert_eq!(status["paused_by_hold_reason"]["resource_limit"], 0);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn p0_third_rebuild_discards_document_when_a_later_unit_disappears() {
+    let dir = canonical_tempdir();
+    json_success(&dir, &["init"]);
+    fs::write(
+        dir.path().join("a.pdf"),
+        fake_pdf(&["discardfirstneedle", "discardsecondneedle"]),
+    )
+    .unwrap();
+    fs::write(dir.path().join("z.md"), "# healthydocumentneedle").unwrap();
+    let marker = canonical_tempdir();
+    let ready = marker.path().join("ready");
+    let child = pause_nc2_command(
+        &dir,
+        &ready,
+        "before_chunk_unit_read",
+        &["index", "--offline"],
+    );
+    let repo = Repository::open(dir.path()).unwrap();
+    let head = repo
+        .read_commit(&repo.head_commit_hash().unwrap().unwrap())
+        .unwrap();
+    let tree = repo.read_tree(&head.tree).unwrap();
+    let entry = tree
+        .entries
+        .iter()
+        .map(Result::unwrap)
+        .find(|entry| entry.path == "a.pdf")
+        .unwrap();
+    let normalize = entry.normalize.unwrap();
+    let (manifest, _) = kio_pipeline::markdownize::read_normalized_instance_manifest(
+        repo.kio_dir(),
+        &entry.raw_hash,
+        &normalize.tool_profile_hash,
+        normalize.r#gen,
+    )
+    .unwrap();
+    let key = manifest.units[1].unit_object_hash.as_deref().unwrap();
+    let unit =
+        kio_core::cas::fanout_path(repo.kio_dir().join("objects/normalized_unit_objects"), key)
+            .unwrap();
+    fs::remove_file(unit).unwrap();
+    fs::write(ready.with_extension("release"), b"release").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let index: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        index["skipped_units"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["path"] == "a.pdf")
+    );
+    // The source rebuild may recover other documents while strict replica
+    // projection still rejects the missing immutable historical object.
+    let sqlite = rusqlite::Connection::open_with_flags(
+        repo.kio_dir().join("index/sqlite.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    for (needle, expected) in [("discardfirstneedle", 0), ("healthydocumentneedle", 1)] {
+        let count: i64 = sqlite
+            .query_row(
+                "SELECT COUNT(*) FROM chunks WHERE instr(text, ?1) > 0",
+                [needle],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, expected, "{needle}");
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn p0_third_retirement_preserves_journal_when_record_stages_are_unavailable() {
+    let dir = canonical_tempdir();
+    json_success(&dir, &["init"]);
+    fs::write(
+        dir.path().join("held.md"),
+        large_extraction_markdown("# Held until rebuild"),
+    )
+    .unwrap();
+    kio(&dir, &["index", "--offline"])
+        .env("KIO_TEST_EXTRACTION_WRITE_FAULT_BEFORE_HEAD", "1")
+        .assert()
+        .code(3);
+    interrupt_extraction_command(
+        &dir,
+        &mut extraction_process(&dir, &["batch", "retry", "--offline"]),
+        "extraction_before_retirement_cleanup",
+    );
+    let kio_dir = dir.path().join(".kio");
+    let stages = kio_dir.join("internal/record-stages");
+    // With small record runs in memory this scope starts without a registry.
+    // An invalid registry slot must still block recovery and retain the journal.
+    fs::create_dir_all(stages.parent().unwrap()).unwrap();
+    fs::write(&stages, b"not a directory").unwrap();
+    let journal = kio_dir.join("extraction-stages/retirement.json");
+    kio(&dir, &["batch", "retry", "--offline"])
+        .assert()
+        .failure();
+    assert!(journal.exists());
+    fs::remove_file(&stages).unwrap();
+    json_success(&dir, &["batch", "retry", "--offline"]);
+    assert!(!journal.exists());
+}
+
+#[test]
+fn p0_fourth_index_rebuild_preserves_large_chunk() {
+    let dir = canonical_tempdir();
+    json_success(&dir, &["init"]);
+    fs::write(
+        dir.path().join(".kio/config.toml"),
+        "[chunking]\nstrategy = \"heading\"\nmax_chars = 100000\n",
+    )
+    .unwrap();
+    let body = "largechunkneedle ".repeat(5000);
+    fs::write(dir.path().join("large.txt"), &body).unwrap();
+    json_success(&dir, &["index", "--offline"]);
+    let conn = Connection::open(dir.path().join(".kio/index/sqlite.db")).unwrap();
+    let largest: i64 = conn
+        .query_row("SELECT max(length(text)) FROM chunks", [], |row| row.get(0))
+        .unwrap();
+    assert!(largest > 64 * 1024, "{largest}");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn p0_fourth_rebuild_uses_verified_units_after_document_staging() {
+    let dir = canonical_tempdir();
+    json_success(&dir, &["init"]);
+    fs::write(dir.path().join("a.md"), "# stagedbodyneedle").unwrap();
+    fs::write(dir.path().join("z.md"), "# nextbodyneedle").unwrap();
+    let marker = canonical_tempdir();
+    let ready = marker.path().join("ready");
+    let child = pause_nc2_command(
+        &dir,
+        &ready,
+        "after_chunk_document_staging",
+        &["index", "--offline"],
+    );
+    let repo = Repository::open(dir.path()).unwrap();
+    let commit = repo
+        .read_commit(&repo.head_commit_hash().unwrap().unwrap())
+        .unwrap();
+    let tree = repo.read_tree(&commit.tree).unwrap();
+    let entry = tree.entries.iter().next().unwrap().unwrap();
+    let normalize = entry.normalize.unwrap();
+    let (manifest, _) = kio_pipeline::markdownize::read_normalized_instance_manifest(
+        repo.kio_dir(),
+        &entry.raw_hash,
+        &normalize.tool_profile_hash,
+        normalize.r#gen,
+    )
+    .unwrap();
+    let hash = manifest.units[0].unit_object_hash.as_ref().unwrap();
+    fs::remove_file(
+        kio_core::cas::fanout_path(repo.kio_dir().join("objects/normalized_unit_objects"), hash)
+            .unwrap(),
+    )
+    .unwrap();
+    fs::write(ready.with_extension("release"), b"release").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let conn = Connection::open(repo.kio_dir().join("index/sqlite.db")).unwrap();
+    for needle in ["stagedbodyneedle", "nextbodyneedle"] {
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM chunks WHERE instr(text, ?1) > 0",
+                [needle],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "{needle}");
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn p0_fourth_retry_rejects_changed_raw_before_cas_publication() {
+    let dir = canonical_tempdir();
+    json_success(&dir, &["init"]);
+    let source = dir.path().join("held.md");
+    fs::write(&source, large_extraction_markdown("# pausedretryneedle")).unwrap();
+    kio(&dir, &["index", "--offline"])
+        .env("KIO_TEST_EXTRACTION_WRITE_FAULT_BEFORE_HEAD", "1")
+        .assert()
+        .code(3);
+    let marker = canonical_tempdir();
+    let ready = marker.path().join("ready");
+    let child = pause_nc2_command(
+        &dir,
+        &ready,
+        "before_index_snapshot",
+        &["batch", "retry", "--offline"],
+    );
+    let changed = b"# changed after classification";
+    fs::write(&source, changed).unwrap();
+    fs::write(ready.with_extension("release"), b"release").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    let hash = kio_core::cas::hash_bytes(changed);
+    assert!(
+        !kio_core::cas::fanout_path(dir.path().join(".kio/objects/raw"), &hash)
+            .unwrap()
+            .exists()
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn p0_fourth_discarded_stage_does_not_claim_another_images_generation() {
+    let dir = canonical_tempdir();
+    json_success(&dir, &["init"]);
+    let image = large_extraction_png();
+    let old = dir.path().join("old.png");
+    fs::write(&old, image).unwrap();
+    interrupt_extraction(&dir, "extraction_before_manifest");
+    fs::remove_file(dir.path().join(".test-data/extraction.ready")).unwrap();
+    let new = dir.path().join("new.png");
+    fs::rename(old, &new).unwrap();
+    interrupt_extraction(&dir, "after_normalized_stage_removal");
+    json_success(&dir, &["index", "--offline"]);
+    assert!(new.is_file());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn p0_fourth_failed_manifest_keeps_same_generation_history() {
+    check_failed_manifest_keeps_same_generation_history(None, false);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn p0_fifth_missing_second_page_preserves_healthy_history_from_rebuild_start() {
+    check_failed_manifest_keeps_same_generation_history(Some(false), false);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn p0_fifth_existing_publication_cannot_retain_an_unreadable_manifest() {
+    check_failed_manifest_keeps_same_generation_history(Some(true), false);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn p0_sixth_repair_enrichment_uses_the_rebuild_manifest_exclusions() {
+    check_failed_manifest_keeps_same_generation_history(Some(true), true);
+}
+
+#[cfg(debug_assertions)]
+fn check_failed_manifest_keeps_same_generation_history(
+    missing_at_start: Option<bool>,
+    embedding_enabled: bool,
+) {
+    use kio_core::dag::{CommitStats, CommitType, build_tree};
+    use kio_pipeline::markdownize::{NormalizedInstanceManifest, NormalizedUnitObject};
+    let dir = canonical_tempdir();
+    json_success(&dir, &["init"]);
+    fs::write(
+        dir.path().join("a.pdf"),
+        fake_pdf(&["historicalfirstneedle"]),
+    )
+    .unwrap();
+    let run = if embedding_enabled {
+        json_success_deterministic_embed
+    } else {
+        json_success
+    };
+    let old = run(&dir, &["index", "--offline"]);
+    if embedding_enabled {
+        assert!(count(&index_db(&dir), "SELECT count(*) FROM chunk_vec") > 0);
+    }
+    let old_head = old["commit_hash"].as_str().unwrap();
+    let repo = Repository::open(dir.path()).unwrap();
+    let old_commit = repo.read_commit(old_head).unwrap();
+    let old_tree = repo.read_tree(&old_commit.tree).unwrap();
+    let mut entries = old_tree.entries.to_vec().unwrap();
+    let normalize = entries[0].normalize.as_mut().unwrap();
+    let store = ObjectStore::new(repo.kio_dir());
+    let mut manifest: NormalizedInstanceManifest = serde_json::from_slice(
+        &store
+            .read_content_object_bytes(
+                ContentObjectKind::Manifest,
+                &normalize.manifest_hash,
+                1024 * 1024,
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    let mut entry = manifest.units[0].clone();
+    let mut unit: NormalizedUnitObject = serde_json::from_slice(
+        &store
+            .read_content_object_bytes(
+                ContentObjectKind::NormalizedUnit,
+                entry.unit_object_hash.as_ref().unwrap(),
+                1024 * 1024,
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    unit.unit_key = "page:2".into();
+    unit.markdown = "unavailable second page".into();
+    let hash = store
+        .write_content_object(
+            ContentObjectKind::NormalizedUnit,
+            &serde_jcs::to_vec(&unit).unwrap(),
+        )
+        .unwrap();
+    entry.order += 1;
+    entry.unit_key = unit.unit_key;
+    entry.unit_ref = kio_pipeline::prepare::unit_ref(&entry.unit_key);
+    entry.unit_object_hash = Some(hash.clone());
+    manifest.units.push(entry);
+    normalize.manifest_hash = store
+        .write_content_object(
+            ContentObjectKind::Manifest,
+            &serde_jcs::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+    let tree = build_tree(
+        &kio_core::disk_records::RecordStageRoot::temporary().unwrap(),
+        entries,
+    )
+    .unwrap();
+    let (tree_hash, _) = store
+        .write_json(ObjectKind::Tree, &serde_json::to_value(tree).unwrap())
+        .unwrap();
+    let commit = CommitObject::new(
+        tree_hash,
+        Some(old_head.to_owned()),
+        "2026-11-20T00:00:00Z".into(),
+        "same-generation retry".into(),
+        old_commit.tool_lock_hash,
+        CommitStats {
+            files_added: 0,
+            files_deleted: 0,
+            files_modified: 1,
+        },
+        CommitType::Manual,
+    )
+    .unwrap();
+    let (head, _) = store
+        .write_json(ObjectKind::Commit, &serde_json::to_value(commit).unwrap())
+        .unwrap();
+    fs::write(
+        repo.kio_dir().join("HEAD"),
+        format!(
+            "{head}
+"
+        ),
+    )
+    .unwrap();
+
+    let second_page = store
+        .content_path(ContentObjectKind::NormalizedUnit, &hash)
+        .unwrap();
+    if let Some(has_publication) = missing_at_start {
+        if has_publication {
+            run(&dir, &["repair", "rebuild-db", "--offline"]);
+            let conn = Connection::open(repo.kio_dir().join("index/sqlite.db")).unwrap();
+            let count: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM chunk_publications WHERE introduction_commit = ?1",
+                    [&head],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(count > 0);
+        }
+        fs::remove_file(second_page).unwrap();
+        let out = run(&dir, &["repair", "rebuild-db", "--offline"]);
+        assert_eq!(out["skipped_units"].as_array().unwrap().len(), 1, "{out}");
+    } else {
+        let marker = canonical_tempdir();
+        let ready = marker.path().join("ready");
+        let child = pause_nc2_command(
+            &dir,
+            &ready,
+            "before_chunk_unit_read",
+            &["repair", "rebuild-db", "--offline"],
+        );
+        fs::remove_file(second_page).unwrap();
+        fs::write(ready.with_extension("release"), b"release").unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+    let conn = Connection::open(repo.kio_dir().join("index/sqlite.db")).unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM chunks JOIN chunk_publications USING (chunk_id)
+         WHERE instr(text, 'historicalfirstneedle') > 0 AND introduction_commit = ?1",
+            [old_head],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+    let unavailable: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM chunk_publications WHERE introduction_commit = ?1",
+            [&head],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(unavailable, 0);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn p0_sixth_image_replay_recovers_after_candidate_read_failure() {
+    let dir = indexed_scope_deterministic_embed_with_images();
+    let before = count(&index_db(&dir), "SELECT count(*) FROM image_vec");
+    assert!(before > 0);
+    fs::remove_file(dir.path().join(".kio/index/sqlite.db")).unwrap();
+
+    kio(&dir, &["repair", "rebuild-db", "--offline"])
+        .env(
+            "KIO_TEST_DURABILITY_POINT",
+            "before_image_replay_candidate_read",
+        )
+        .env("KIO_TEST_DURABILITY_STORAGE_FAULT", "1")
+        .assert()
+        .success();
+    assert_eq!(
+        count(&index_db(&dir), "SELECT count(*) FROM image_vec"),
+        before
+    );
+}

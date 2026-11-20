@@ -29,7 +29,6 @@ use crate::embedding::plan::hold_secret_embedding_tasks;
 use crate::embedding::plan::plan_embed_batch;
 use crate::embedding::plan::reconcile_committed_embedding_tasks;
 use crate::embedding::plan::retained_chunks_without_embedding;
-use crate::embedding::plan::retained_history_chunks;
 use crate::embedding::plan::selected_embedding_contexts;
 use crate::embedding::plan::validate_embedding_task_bindings;
 use crate::embedding::transport::{EmbeddingRunFailure, run_embedding_adapter};
@@ -38,6 +37,7 @@ use crate::historical_reindex::RetainedNormalizedInstance;
 use crate::historical_reindex::retained_history_instances;
 use crate::index::chunk_ledger::rotate_index_generation_unconditionally;
 use crate::index::chunk_ledger::sqlite_path;
+use crate::index::rebuild::RebuildAuthorities;
 use crate::index::rebuild::held_secret_embedding_chunk_ids;
 use crate::invocation::Invocation;
 use crate::ledger_access::RETIRED_NON_LIVE;
@@ -54,7 +54,7 @@ use crate::object_persistence::pipeline_to_kio;
 use crate::search::projection::publish_in_place_delta;
 use crate::search::projection::replica_now_ms;
 use crate::search::projection::replica_scope_stamp;
-use crate::search::projection::write_through_projection_or_log_for_repo;
+use crate::search::projection::write_through_repository_projection;
 use crate::search::query::ensure_snapshot_tree_entries;
 use crate::search::query::snapshot_chunking_config_hash;
 use crate::search::scope::aggregator_path;
@@ -129,6 +129,7 @@ pub(crate) fn generate_scope_embeddings(
     ctx: &Invocation<'_>,
     repo: &Repository,
     args: &IndexArgs,
+    replay: Option<&mut RebuildAuthorities>,
 ) -> Result<ExecOutcome> {
     let adapter_settings = ctx.settings;
 
@@ -139,7 +140,7 @@ pub(crate) fn generate_scope_embeddings(
         embedding_online_allowed(adapter_settings, repo, args.offline, args.online, args.yes)?;
     // R11-2: return the enrichment outcome (was discarded) so `run_index` can disclose
     // it and raise the exit code on auth/budget-pause.
-    run_embedding_enrichment(ctx, repo, online, false, false)
+    run_embedding_enrichment(ctx, repo, online, false, false, replay)
 }
 
 /// Core enrichment pass shared by `kio index` (inline) and `kio batch
@@ -152,6 +153,7 @@ pub(crate) fn run_embedding_enrichment(
     online: bool,
     override_budget: bool,
     allow_auth_revive: bool,
+    replay: Option<&mut RebuildAuthorities>,
 ) -> Result<ExecOutcome> {
     let adapter_settings = ctx.settings;
 
@@ -167,7 +169,7 @@ pub(crate) fn run_embedding_enrichment(
         override_budget,
         allow_auth_revive,
         None,
-        None,
+        replay,
     )
 }
 
@@ -194,8 +196,8 @@ pub(crate) fn run_historical_embedding_enrichment(
         online,
         false,
         false,
-        Some(selected_instances),
-        Some(selected_tree_config_hash),
+        Some((selected_instances, selected_tree_config_hash)),
+        None,
     )
 }
 
@@ -205,9 +207,10 @@ fn run_embedding_enrichment_for_instances(
     online: bool,
     override_budget: bool,
     allow_auth_revive: bool,
-    selected_instances: Option<&[RetainedNormalizedInstance]>,
-    selected_tree_config_hash: Option<&str>,
+    selected: Option<(&[RetainedNormalizedInstance], &str)>,
+    mut replay: Option<&mut RebuildAuthorities>,
 ) -> Result<ExecOutcome> {
+    let (selected_instances, selected_tree_config_hash) = selected.unzip();
     let ctx = &invocation;
     let adapter_settings = invocation.settings;
 
@@ -215,7 +218,7 @@ fn run_embedding_enrichment_for_instances(
     let Some(execution) = embedding_execution(adapter_settings, invocation.control) else {
         return Ok(ExecOutcome::default());
     };
-    let profile = declared_embedding_profile(execution);
+    let profile = declared_embedding_profile(adapter_settings, execution)?;
     // Non-multimodal is rejected at materialize_tool_lock; never reach embed here.
     if profile.modality != "multimodal" {
         return Ok(ExecOutcome::default());
@@ -255,7 +258,7 @@ fn run_embedding_enrichment_for_instances(
         Some(hash) => hash.to_owned(),
         None => snapshot_chunking_config_hash(repo, &head)?,
     };
-    let retained_instances_owned;
+    let mut retained_instances_owned;
     let retained_instances = if let Some(selected) = selected_instances {
         selected
     } else {
@@ -264,15 +267,19 @@ fn run_embedding_enrichment_for_instances(
         // cache relation here before its live-chunk JOIN.
         ensure_snapshot_tree_entries(repo, &conn, &head)?;
         retained_instances_owned = retained_history_instances(repo, &head)?;
+        if let Some(replay) = &replay {
+            retained_instances_owned.retain(|instance| !replay.excludes(instance));
+        }
         &retained_instances_owned
     };
     let current_policy = current_embedding_policy(repo)?;
-    let retained_chunks = retained_history_chunks(
-        &conn,
+    let retained_chunks = embedding_owners::collect_retained_embedding_chunks_with_replay(
         repo,
+        &conn,
         retained_instances,
-        &chunking_config_hash,
+        Some(&chunking_config_hash),
         Some(&current_policy),
+        replay.as_deref_mut(),
     )?;
     let projection_instances_owned;
     let projection_instances = if selected_instances.is_some() {
@@ -281,12 +288,13 @@ fn run_embedding_enrichment_for_instances(
     } else {
         retained_instances
     };
-    let projection_chunks = embedding_owners::collect_retained_embedding_chunks(
+    let projection_chunks = embedding_owners::collect_retained_embedding_chunks_with_replay(
         repo,
         &conn,
         projection_instances,
         None,
         Some(&current_policy),
+        replay.as_deref_mut(),
     )?;
     let selected_contexts = selected_embedding_contexts(&projection_chunks, &current_policy)?;
     let projection_chunks = bind_embedding_work(projection_chunks, &profile)?;
@@ -399,6 +407,7 @@ fn run_embedding_enrichment_for_instances(
             execution,
             policy: &current_policy,
             selected_contexts: &selected_contexts,
+            rebuild: replay.as_deref(),
             invalidated: std::cell::Cell::new(false),
         },
     };
@@ -588,7 +597,13 @@ fn run_embedding_enrichment_for_instances(
             // `chunk_vec` with no adapter call and no rebuild, and a vector
             // appearing is exactly the kind of change LC25 retires cursors for.
             current_policy.revalidate().map_err(pipeline_to_kio)?;
-            publish_in_place_delta(ctx, repo.kio_dir(), replica_before.as_deref(), &replica)?;
+            publish_in_place_delta(
+                ctx,
+                repo,
+                replica_before.as_deref(),
+                &replica,
+                embedding_context.projection.rebuild,
+            )?;
             outcome.add(submitted);
             return Ok(outcome);
         }
@@ -799,10 +814,12 @@ fn run_embedding_enrichment_for_instances(
                 let refs = tasks.iter().map(|task| task.output_ref.clone()).collect();
                 mirror_local_embedding_start(&task_store, &refs, claim.attempts(), &now)?;
                 let completed = if let Some(bytes) = recovered_bytes {
+                    // Verify the staged member list before linking the input's
+                    // vector to the currently authorized aliases below.
                     crate::embedding::transport::decode_local_embedding_result(
                         &bytes,
                         &profile,
-                        members.iter().map(|member| member.id.clone()).collect(),
+                        claim.embedding_member_ids()?,
                     )?
                 } else {
                     match send_local_embed_group(
@@ -849,7 +866,12 @@ fn run_embedding_enrichment_for_instances(
                         Err(crate::embedding::transport::LocalEmbeddingRunFailure::Classified(
                             failure,
                         )) => {
-                            let next = fail_local_embedding_claim(&mut claim, &failure, &now)?;
+                            let next = fail_local_embedding_claim(
+                                &mut claim,
+                                &failure,
+                                &now,
+                                crate::embedding::transport::local_max_attempts(execution),
+                            )?;
                             let refs = tasks.iter().map(|task| task.output_ref.clone()).collect();
                             mirror_local_embedding_failure(
                                 &task_store,
@@ -1192,9 +1214,15 @@ fn run_embedding_enrichment_for_instances(
     // there nothing else rotates at all — leaving both the cursor contract and
     // the replica's only staleness signal on a stamp that never moves.
     current_policy.revalidate().map_err(pipeline_to_kio)?;
-    publish_in_place_delta(ctx, repo.kio_dir(), replica_before.as_deref(), &replica)?;
+    publish_in_place_delta(
+        ctx,
+        repo,
+        replica_before.as_deref(),
+        &replica,
+        embedding_context.projection.rebuild,
+    )?;
     if outcome.executed > 0 && replica.is_empty() {
-        write_through_projection_or_log_for_repo(ctx, repo);
+        write_through_repository_projection(ctx, repo, embedding_context.projection.rebuild);
     }
     for mut claim in local_publications {
         claim.publish()?;
@@ -1438,6 +1466,7 @@ pub(crate) struct EmbeddingProjection<'a> {
     pub(crate) execution: EmbeddingExecution,
     pub(crate) policy: &'a CurrentPolicyEvaluator,
     pub(crate) selected_contexts: &'a BTreeMap<String, Option<String>>,
+    pub(crate) rebuild: Option<&'a RebuildAuthorities>,
     pub(crate) invalidated: std::cell::Cell<bool>,
 }
 
@@ -1536,7 +1565,7 @@ pub(crate) fn refresh_embedding_projection(
     if expected == existing {
         if !embedding_replica_projection_is_current(repo) {
             projection.policy.revalidate().map_err(pipeline_to_kio)?;
-            write_through_projection_or_log_for_repo(ctx, repo);
+            write_through_repository_projection(ctx, repo, projection.rebuild);
         }
         return Ok(());
     }
@@ -1556,7 +1585,7 @@ pub(crate) fn refresh_embedding_projection(
     )
     .map_err(index_to_kio)?;
     projection.policy.revalidate().map_err(pipeline_to_kio)?;
-    write_through_projection_or_log_for_repo(ctx, repo);
+    write_through_repository_projection(ctx, repo, projection.rebuild);
     Ok(())
 }
 
@@ -2098,11 +2127,20 @@ pub(crate) fn fail_local_embedding_claim(
     claim: &mut crate::local_execution::LocalGuard,
     failure: &TaskExecutionFailure,
     now: &str,
+    max_attempts: u32,
 ) -> Result<Option<i64>> {
     let policy = retry_policy(failure.retry_kind);
+    let retry_budget_remaining = if failure.retry_kind == RetryErrorKind::ContractViolation {
+        claim.attempts() < max_attempts
+            && policy
+                .max_attempts
+                .is_none_or(|max| claim.contract_violation_count() < max)
+    } else {
+        policy.max_attempts.is_none_or(|max| claim.attempts() < max)
+    };
     let next = if failure.retry_kind == RetryErrorKind::RateLimit {
         Some(rate_limit_retry_at(now, failure.retry_after_ms))
-    } else if policy.retryable && policy.max_attempts.is_none_or(|max| claim.attempts() < max) {
+    } else if policy.retryable && retry_budget_remaining {
         Some(scheduled_retry_at(now, &policy.backoff, claim.attempts()))
     } else {
         None
