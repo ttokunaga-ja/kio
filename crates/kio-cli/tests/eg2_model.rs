@@ -239,7 +239,8 @@ fn wrong_sizes_preserve_existing_model() {
     }
 }
 
-#[cfg(unix)]
+// The fixture requires a filesystem that accepts non-UTF-8 names, unlike APFS.
+#[cfg(target_os = "linux")]
 #[test]
 fn non_utf8_data_path_is_displayed_after_import_and_in_status() {
     use std::os::unix::ffi::OsStrExt;
