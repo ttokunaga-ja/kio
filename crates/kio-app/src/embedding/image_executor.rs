@@ -157,6 +157,14 @@ pub(crate) fn run_image_embedding_enrichment(
         model_missing,
         override_budget,
     } = request;
+    // A text-only rebuild already authenticated its staged units. There is
+    // no image authority to resolve until a chunk actually cites an image.
+    if !eligible_chunks
+        .iter()
+        .any(|chunk| !kio_search::extract_related_images(&chunk.text).is_empty())
+    {
+        return Ok(ExecOutcome::default());
+    }
     let ctx = &invocation;
     let adapter_settings = invocation.settings;
 

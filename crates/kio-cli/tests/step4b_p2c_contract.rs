@@ -368,9 +368,8 @@ fn init(dir: &TempDir) {
     success(dir, &["init"]);
 }
 
-/// A single indexed scope with two documents, offline (no embedding adapter
-/// configured — every `--at`/basic-search PC test uses this so `auto` mode is
-/// unambiguously text with `fallback_reason = embedding_endpoint_not_configured`).
+/// A single indexed scope with two documents and an uninstalled EG2 model.
+/// The offline egress tests explicitly select an external embedding adapter.
 fn indexed_scope() -> TempDir {
     let dir = canonical_tempdir();
     fs::write(
@@ -407,15 +406,38 @@ fn decode_cursor_payload(token: &str) -> Value {
 // §A / §B — mode resolution order, consent gate, warnings[] (PC1-7)
 // ---------------------------------------------------------------------------
 
+// Use a selected external adapter: --offline still permits EG2.
+fn run_with_external_embedding(dir: &TempDir, args: &[&str]) -> (i32, Value) {
+    let output = kio(dir, args)
+        .env(TEST_ADOPTED_EMBEDDING_ENV, "mock")
+        .arg("--json")
+        .output()
+        .unwrap();
+    let stream = if output.stdout.is_empty() {
+        &output.stderr
+    } else {
+        &output.stdout
+    };
+    (
+        output.status.code().unwrap(),
+        serde_json::from_slice(stream).unwrap(),
+    )
+}
+
+fn success_with_external_embedding(dir: &TempDir, args: &[&str]) -> Value {
+    let (code, result) = run_with_external_embedding(dir, args);
+    assert_eq!(code, 0, "{result}");
+    result
+}
+
 /// PC1(a)/PC5 (05 §1.1 L25-28): `--offline` resolves auto to text with
 /// `fallback_reason="offline"` and no `error_code` — distinct from a
-/// technical `Unavailable` cause, and checked first in the resolution order
-/// (ahead of "no embedding endpoint configured", which would otherwise also
-/// apply here).
+/// technical `Unavailable` cause, and checked before vector readiness for
+/// the selected external adapter.
 #[test]
 fn pc1_pc5_offline_flag_forces_text_fallback_with_no_error_code() {
     let dir = indexed_scope();
-    let search = success(
+    let search = success_with_external_embedding(
         &dir,
         &["search", "tokentestterm", "--offline", "--scope", "."],
     );
@@ -431,7 +453,7 @@ fn pc1_pc5_offline_flag_forces_text_fallback_with_no_error_code() {
 #[test]
 fn pc1_pc5_offline_with_explicit_vector_is_a_hard_error() {
     let dir = indexed_scope();
-    let (code, err) = run(
+    let (code, err) = run_with_external_embedding(
         &dir,
         &[
             "search",
@@ -458,7 +480,7 @@ fn pc2_fail_behavior_error_does_not_escalate_offline() {
         "[search]\nfail_behavior = \"error\"\n",
     )
     .unwrap();
-    let search = success(
+    let search = success_with_external_embedding(
         &dir,
         &[
             "search",

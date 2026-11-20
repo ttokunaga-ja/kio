@@ -2084,7 +2084,11 @@ fn r9_4_partial_task_recovers_via_retry_and_status_counts_it() {
         fake_pdf(&["page one alpha", "page two beta"]),
     )
     .unwrap();
-    json_success(&dir, ["index", "--yes"]);
+    let free_embedding = (
+        kio_adapter::catalog::DETERMINISTIC_EVAL_EMBEDDING_ENV,
+        "scale-v3",
+    );
+    json_success_with_env(&dir, ["index", "--yes"], &[free_embedding]);
     // `partial_network` keeps one accepted unit and explicitly declares the other
     // as retryable. A dropped output without that declaration is a contract violation.
     let first = json_code_stdout_with_env(
@@ -2092,6 +2096,7 @@ fn r9_4_partial_task_recovers_via_retry_and_status_counts_it() {
         ["batch", "resume"],
         3,
         &[
+            free_embedding,
             (TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "partial_network"),
             ("KIO_FIXED_NOW", "2026-07-03T00:00:00Z"),
         ],
@@ -2107,7 +2112,7 @@ fn r9_4_partial_task_recovers_via_retry_and_status_counts_it() {
     assert!(has_partial(&json_success(&dir, ["status"])));
     // index_status (surfaced by search) must NOT claim full enrichment while a unit
     // is still missing.
-    let search = json_success(&dir, ["search", "alpha"]);
+    let search = json_success_with_env(&dir, ["search", "alpha"], &[free_embedding]);
     assert!(
         search["index_status"]["enriched_ratio"].as_f64().unwrap() < 1.0,
         "a Partial task must lower enriched_ratio: {search}"
@@ -2125,6 +2130,7 @@ fn r9_4_partial_task_recovers_via_retry_and_status_counts_it() {
         &dir,
         ["batch", "retry"],
         &[
+            free_embedding,
             (TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "mock"),
             ("KIO_FIXED_NOW", "2026-07-03T01:00:00Z"),
         ],
@@ -2142,7 +2148,7 @@ fn r9_4_partial_task_recovers_via_retry_and_status_counts_it() {
         !has_partial(&status),
         "no Partial task may remain: {status}"
     );
-    let search = json_success(&dir, ["search", "alpha"]);
+    let search = json_success_with_env(&dir, ["search", "alpha"], &[free_embedding]);
     assert_eq!(
         search["index_status"]["enriched_ratio"].as_f64().unwrap(),
         1.0,
@@ -4179,13 +4185,21 @@ fn resource_limit_explicit_commands_recheck_but_resume_keeps_hold() {
             "bbox_annotation_enabled":false,"hold_reason":"resource_limit","reserved_usd":null,"reserved_month":null,"reservation_id":null
         })).unwrap();
         let store = TaskStore::new(dir.path().join(".kio"));
-        store.replace_all(std::slice::from_ref(&held)).unwrap();
+        let mut before = store
+            .all()
+            .unwrap()
+            .into_iter()
+            .filter(|task| task.task_type == TaskType::Embedding)
+            .collect::<Vec<_>>();
+        before.push(held.clone());
+        store.replace_all(&before).unwrap();
+        let before = store.all().unwrap();
         let error = json_failure(&dir, ["batch", "resume", "--offline"], 3);
         assert_eq!(error["error_code"], "KIO-E-RESOURCE-LIMIT-001");
         let mut expected = descriptor.clone();
         expected["retry_disposition"] = json!("explicit_after_resource_change");
         assert_eq!(error["context"], expected);
-        assert_eq!(store.all().unwrap(), vec![held.clone()]);
+        assert_eq!(store.all().unwrap(), before);
         kio(&dir, ["--json"]).args(&command).assert().success();
         let resumed = store
             .all()
@@ -4422,7 +4436,12 @@ fn exercise_resource_mixed_retry(resource_sibling: bool, initial_attempts: u32) 
         store.replace_all(std::slice::from_ref(&task)).unwrap();
         let error = json_failure(&dir, ["batch", "retry", "--offline"], 3);
         assert_eq!(error["error_code"], "KIO-E-RESOURCE-LIMIT-001");
-        let held = store.all().unwrap().remove(0);
+        let held = store
+            .all()
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.task_id == task.task_id)
+            .unwrap();
         assert_eq!(held.status, TaskStatus::Partial);
         assert_eq!(held.hold_reason, task.hold_reason);
         assert_eq!(held.resource_limit, task.resource_limit);

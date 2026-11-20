@@ -316,8 +316,8 @@ fn assert_no_budget_paused_task(dir: &TempDir) {
     for line in tasks.lines().filter(|line| !line.is_empty()) {
         let task: Value = serde_json::from_str(line).unwrap();
         assert_ne!(
-            task["status"], "paused",
-            "fixture must not pre-pause task: {task}"
+            task["hold_reason"], "budget",
+            "fixture must not pre-pause a task for budget: {task}"
         );
     }
 }
@@ -384,6 +384,8 @@ fn write_budget_caps(dir: &TempDir, device_cap: f64, folder_cap: Option<f64>) {
 
 fn assert_text_budget_pause_preserves_ledger(dir: &TempDir, query: &str, cap_kind: &str) {
     let before = observe_ledger_leaves(dir);
+    let task_path = dir.path().join(".kio/tasks.jsonl");
+    let tasks_before = fs::read(&task_path).unwrap();
     for (label, args) in [
         ("explicit text", vec!["search", query, "--mode", "text"]),
         ("auto resolved to text", vec!["search", query]),
@@ -411,6 +413,7 @@ fn assert_text_budget_pause_preserves_ledger(dir: &TempDir, query: &str, cap_kin
             response["index_status"]["budget_paused"], true,
             "{label} must preserve exhausted {cap_kind} budget truth: {response}"
         );
+        assert_eq!(fs::read(&task_path).unwrap(), tasks_before, "{label}");
         assert_no_budget_paused_task(dir);
         assert_ledger_leaves_unchanged(dir, &before, label);
     }
@@ -698,6 +701,8 @@ fn pb_text_search_retries_absent_to_present_ledger_before_budget_status() {
     private_success(&dir, &["index", "--offline"]);
     write_budget_caps(&dir, 1.0, None);
     assert_no_budget_paused_task(&dir);
+    let task_path = dir.path().join(".kio/tasks.jsonl");
+    let tasks_before = fs::read(&task_path).unwrap();
     for path in ledger_leaf_paths(&dir) {
         if path.exists() {
             fs::remove_file(path).unwrap();
@@ -750,6 +755,7 @@ fn pb_text_search_retries_absent_to_present_ledger_before_budget_status() {
         !response["results"].as_array().unwrap().is_empty(),
         "{response}"
     );
+    assert_eq!(fs::read(task_path).unwrap(), tasks_before);
     assert_no_budget_paused_task(&dir);
     assert_ledger_leaves_unchanged(
         &dir,
@@ -836,7 +842,28 @@ fn pb_text_and_auto_preserve_folder_reservation_exhaustion_without_ledger_mutati
 }
 
 /// init + index + search, returning (dir, evidence_pointer, evidence_uri).
+// Prune blocks on every non-terminal task, including EG2 awaiting a model.
+fn index_with_settled_embeddings(dir: &TempDir) {
+    kio(dir, &["index", "--offline"])
+        .env(
+            kio_adapter::catalog::DETERMINISTIC_EVAL_EMBEDDING_ENV,
+            "scale-v3",
+        )
+        .assert()
+        .success();
+}
+
+fn prunable_evidence_fixture() -> (TempDir, Value, String) {
+    evidence_fixture(index_with_settled_embeddings)
+}
+
 fn fixture() -> (TempDir, Value, String) {
+    evidence_fixture(|dir| {
+        success(dir, &["index", "--offline"]);
+    })
+}
+
+fn evidence_fixture(index: impl FnOnce(&TempDir)) -> (TempDir, Value, String) {
     let dir = canonical_tempdir();
     fs::write(
         dir.path().join("evidence.md"),
@@ -844,7 +871,7 @@ fn fixture() -> (TempDir, Value, String) {
     )
     .unwrap();
     success(&dir, &["init"]);
-    success(&dir, &["index", "--offline"]);
+    index(&dir);
     let search = success(&dir, &["search", "3600", "--mode", "text"]);
     let pointer = search["results"][0]["evidence_pointer"].clone();
     let uri = search["results"][0]["evidence_uri"]
@@ -855,6 +882,16 @@ fn fixture() -> (TempDir, Value, String) {
 }
 
 fn make_pointer_commit_final_shallow(dir: &TempDir, pointer: &Value) {
+    make_pointer_commit_final_shallow_with_index(dir, pointer, |dir| {
+        success(dir, &["index", "--offline"]);
+    });
+}
+
+fn make_pointer_commit_final_shallow_with_index(
+    dir: &TempDir,
+    pointer: &Value,
+    index: impl FnOnce(&TempDir),
+) {
     let commit_hash = pointer["commit"].as_str().unwrap();
     let repo = Repository::open(dir.path()).unwrap();
     let commit = repo.read_commit(commit_hash).unwrap();
@@ -867,7 +904,7 @@ fn make_pointer_commit_final_shallow(dir: &TempDir, pointer: &Value) {
         "# Advance\n\nadvance the shallow fixture head\n",
     )
     .unwrap();
-    success(dir, &["index", "--offline"]);
+    index(dir);
 
     let receipt_path = kio_dir(dir)
         .join("gc/shallowed")
@@ -1541,7 +1578,7 @@ fn pb09_canonical_ref_names_correspondence_is_asymmetric() {
 /// modifier.
 #[test]
 fn pb12_prune_orphans_flag_parsing() {
-    let (dir, ..) = fixture();
+    let (dir, ..) = prunable_evidence_fixture();
     let accepted = success(
         &dir,
         &["repair", "verify-objects", "--prune-orphans", "--yes"],
@@ -1567,7 +1604,7 @@ fn pb12_prune_orphans_flag_parsing() {
 /// orphans are still there to be pruned.
 #[test]
 fn repair_prune_requires_confirmation_and_refuses_without_deleting() {
-    let (dir, ..) = fixture();
+    let (dir, ..) = prunable_evidence_fixture();
     let prepared_hash = write_content_bytes(
         &kio_dir(&dir),
         ContentObjectKind::Prepared.directory(),
@@ -1610,7 +1647,7 @@ fn repair_prune_requires_confirmation_and_refuses_without_deleting() {
 /// deleted by `--prune-orphans`.
 #[test]
 fn pb13_prune_orphans_deletes_unreferenced_prepared_and_image() {
-    let (dir, ..) = fixture();
+    let (dir, ..) = prunable_evidence_fixture();
     let prepared_hash = write_content_bytes(
         &kio_dir(&dir),
         ContentObjectKind::Prepared.directory(),
@@ -1697,7 +1734,7 @@ fn pb15_prune_orphans_blocked_by_active_purge_journal() {
 }
 
 fn prune_fixture() -> (TempDir, PathBuf, Vec<u8>) {
-    let (dir, ..) = fixture();
+    let (dir, ..) = prunable_evidence_fixture();
     let bytes = b"PB15 orphan must survive every unresolved authority".to_vec();
     let hash = write_content_bytes(
         &kio_dir(&dir),
@@ -2252,7 +2289,7 @@ fn pb15_finalized_partial_blocks_below_retry_limit_and_settles_at_limit() {
 
 #[test]
 fn pb13_cli_purge_resurrection_then_prune_preserves_live_closure() {
-    let (dir, pointer, _) = fixture();
+    let (dir, pointer, _) = prunable_evidence_fixture();
     let raw = pointer["raw_hash"].as_str().unwrap();
     let (_, before_normalize) = prune_normalize(&dir);
     let store = ObjectStore::new(kio_dir(&dir));
@@ -2264,7 +2301,7 @@ fn pb13_cli_purge_resurrection_then_prune_preserves_live_closure() {
         &["purge", "--raw-hash", raw, "--reason", "legal", "--yes"],
     );
     assert!(!old_manifest.exists());
-    success(&dir, &["index", "--offline"]);
+    index_with_settled_embeddings(&dir);
     assert!(
         !old_manifest.exists(),
         "fixture must exercise the lifecycle-explained missing historical closure"
@@ -2334,7 +2371,7 @@ fn pb13_cli_purge_resurrection_then_prune_preserves_live_closure() {
 }
 
 fn historical_partial_closure_fixture(unrelated_shallow: bool) {
-    let (dir, pointer, _) = fixture();
+    let (dir, pointer, _) = prunable_evidence_fixture();
     let raw = pointer["raw_hash"].as_str().unwrap();
     let repo = Repository::open(dir.path()).unwrap();
     let store = ObjectStore::new(kio_dir(&dir));
@@ -2429,7 +2466,7 @@ fn historical_partial_closure_fixture(unrelated_shallow: bool) {
         &dir,
         &["purge", "--raw-hash", raw, "--reason", "legal", "--yes"],
     );
-    success(&dir, &["index", "--offline"]);
+    index_with_settled_embeddings(&dir);
     let first = store
         .content_path(ContentObjectKind::NormalizedUnit, &unit_hashes[0])
         .unwrap();
@@ -2453,7 +2490,11 @@ fn historical_partial_closure_fixture(unrelated_shallow: bool) {
         // This receipt covers a post-resurrection Auto commit, not the older
         // partial historical closure whose surviving unit must still validate.
         let current = repo.head_commit_hash().unwrap().unwrap();
-        make_pointer_commit_final_shallow(&dir, &serde_json::json!({"commit": current}));
+        make_pointer_commit_final_shallow_with_index(
+            &dir,
+            &serde_json::json!({"commit": current}),
+            index_with_settled_embeddings,
+        );
         assert_eq!(
             store
                 .write_content_object(ContentObjectKind::NormalizedUnit, &unit_bytes[1])

@@ -1229,11 +1229,7 @@ pub(super) fn rebuild_step3_index_with_regeneration_skips(
         rebuilt_chunks: appended_count,
         rebuilt_tree_entries: tree_entries.len() as u64,
         skipped_units,
-        enrichment_replay: if authorities.publication.unavailable_pins.is_empty() {
-            None
-        } else {
-            Some(authorities)
-        },
+        enrichment_replay: Some(authorities),
     })
 }
 

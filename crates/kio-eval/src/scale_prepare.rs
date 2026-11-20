@@ -345,6 +345,7 @@ struct IndexOutput {
     skipped_unrecognized_binary_files: u64,
     embedding_tasks_executed: u64,
     embedding_tasks_failed: u64,
+    embedding_unavailable_reason: Option<String>,
     tree_hash: Option<String>,
     #[serde(deserialize_with = "required_nullable")]
     commit_hash: Option<String>,
@@ -1027,6 +1028,7 @@ fn validate_index_output(
         || output.paused_tasks != 0
         || output.failed_files != 0
         || output.embedding_tasks_failed != 0
+        || output.embedding_unavailable_reason.is_some()
         || output.skipped_unrecognized_binary_files != 0
         || !output.skipped_units.is_empty()
         || !output.child_scopes.is_empty()
@@ -1854,6 +1856,25 @@ esac
         std::fs::hard_link(&report, temp.path().join("alias")).unwrap();
         let root = std::fs::File::open(temp.path()).unwrap();
         assert!(read_existing_report(&root).is_err());
+    }
+
+    #[test]
+    fn index_parser_recognizes_eg2_readiness_and_rejects_unfinished_enrichment() {
+        let mut output = indexed_output();
+        output["embedding_unavailable_reason"] = serde_json::json!("model_missing");
+        output["paused_tasks"] = serde_json::json!(1);
+        let error = validate_index_output(
+            &output,
+            IndexExpectation::Repair {
+                files: 1,
+                embeddings: 0,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("reports a pending, skipped"),
+            "{error}"
+        );
     }
 
     #[test]

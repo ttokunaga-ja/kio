@@ -524,6 +524,14 @@ pub(super) fn run(
             })?;
     }
 
+    // A publication attests an association within already published history.
+    // Reject new roots before writing chunk CAS or ledger entries.
+    let publication_roots = selected
+        .values()
+        .flat_map(|instance| instance.introductions.iter().cloned())
+        .collect();
+    repo.validate_published_history_roots(&publication_roots)?;
+
     let existing = read_stored_chunks(repo.kio_dir())?;
     truncate_torn_chunk_tail(repo.kio_dir())?;
     // A chunk identity may already exist under an older config association. Its

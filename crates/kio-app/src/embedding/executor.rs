@@ -38,7 +38,7 @@ use crate::embedding::transport::{
 };
 use crate::embedding_owners;
 use crate::historical_reindex::RetainedNormalizedInstance;
-use crate::historical_reindex::retained_history_instances;
+use crate::historical_reindex::retained_history_instances_for_roots;
 use crate::index::chunk_ledger::rotate_index_generation_unconditionally;
 use crate::index::chunk_ledger::sqlite_path;
 use crate::index::rebuild::RebuildAuthorities;
@@ -262,6 +262,10 @@ fn run_embedding_enrichment_for_instances(
         Some(hash) => hash.to_owned(),
         None => snapshot_chunking_config_hash(repo, &head)?,
     };
+    // Keep enrichment on the same verified history as the source rebuild.
+    // A finalized shallow ancestor has no tree to contribute.
+    let head_root = BTreeSet::from([head.clone()]);
+    let retained_roots = replay.as_deref().map_or(&head_root, |replay| &replay.roots);
     let mut retained_instances_owned;
     let retained_instances = if let Some(selected) = selected_instances {
         selected
@@ -270,11 +274,18 @@ fn run_embedding_enrichment_for_instances(
         // `tree_entries`. Enrichment is writer work, so materialize that source
         // cache relation here before its live-chunk JOIN.
         ensure_snapshot_tree_entries(repo, &conn, &head)?;
-        retained_instances_owned = retained_history_instances(repo, &head)?;
+        retained_instances_owned = retained_history_instances_for_roots(repo, retained_roots)?;
         if let Some(replay) = &replay {
             retained_instances_owned.retain(|instance| !replay.excludes(instance));
         }
         &retained_instances_owned
+    };
+    let projection_instances_owned;
+    let projection_instances = if selected_instances.is_some() {
+        projection_instances_owned = retained_history_instances_for_roots(repo, retained_roots)?;
+        &projection_instances_owned
+    } else {
+        retained_instances
     };
     let current_policy = current_embedding_policy(repo)?;
     let retained_chunks = embedding_owners::collect_retained_embedding_chunks_with_replay(
@@ -285,13 +296,6 @@ fn run_embedding_enrichment_for_instances(
         Some(&current_policy),
         replay.as_deref_mut(),
     )?;
-    let projection_instances_owned;
-    let projection_instances = if selected_instances.is_some() {
-        projection_instances_owned = retained_history_instances(repo, &head)?;
-        &projection_instances_owned
-    } else {
-        retained_instances
-    };
     let projection_chunks = embedding_owners::collect_retained_embedding_chunks_with_replay(
         repo,
         &conn,
