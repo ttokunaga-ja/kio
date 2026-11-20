@@ -2,6 +2,8 @@
 //! prepared input at a time and can publish only a validated complete vector.
 
 mod input;
+mod interrupt;
+pub use interrupt::cancellation;
 mod native;
 mod platform;
 mod runtime;
@@ -138,6 +140,20 @@ impl WorkerError {
             Self::Cancelled => ("KIO-E-INTERRUPTED-001", ExitCode::Interrupted),
             _ => ("KIO-E-EMBED-RUNTIME-001", ExitCode::PermanentFailure),
         }
+    }
+
+    pub(crate) fn interruption_error(self) -> kio_core::KioError {
+        let (code, exit) = self.public_error();
+        kio_core::KioError::new(
+            code,
+            "embedding interrupted",
+            serde_json::json!({"reason": self.reason()}),
+            exit,
+        )
+    }
+
+    pub(crate) fn is_hash_mismatch(self) -> bool {
+        matches!(self, Self::ModelHashMismatch | Self::RuntimeHashMismatch)
     }
 
     pub(crate) fn is_resource_busy(self) -> bool {

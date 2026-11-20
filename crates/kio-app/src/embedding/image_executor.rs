@@ -729,6 +729,7 @@ pub(crate) fn run_image_embedding_enrichment(
                                 unreachable!("image item")
                             };
                             return run_native_embedding(
+                                invocation.context.interaction.as_ref(),
                                 &mut embedding.native_session.borrow_mut(),
                                 EmbeddingInput::Image(bytes),
                                 image_hash.clone(),

@@ -964,7 +964,7 @@ fn new_token() -> Result<String> {
 mod tests {
     use super::*;
 
-    fn query_identity() -> LocalIdentity {
+    pub(super) fn query_identity() -> LocalIdentity {
         let digest = hex_digest(b"private query canary");
         LocalIdentity {
             target: LocalTarget::Query {
@@ -1088,6 +1088,54 @@ mod tests {
 
     #[test]
     fn document_group_changes_recover_the_saved_result_with_its_original_members() {
+        let original = document_identity();
+        let profile = kio_adapter::catalog::DeclaredEmbeddingProfile {
+            tool_id: "test".to_owned(),
+            dimensions: 3,
+            distance: "cosine".to_owned(),
+            modality: "text".to_owned(),
+            profile_hash: original.profile.clone(),
+        };
+        check_regrouped_embedding_result(original, profile, None);
+    }
+
+    #[test]
+    fn eg2_document_group_changes_preserve_the_original_members_and_native_producer() {
+        use kio_core::cas::{ProducerExecutionMode, ProducerProvenance};
+
+        let profile = kio_adapter::catalog::declared_native_embedding_profile();
+        let bundle = kio_core::litert::Bundle::for_target("x86_64-unknown-linux-gnu").unwrap();
+        let mut original = document_identity();
+        original.execution = LocalExecutionKind::NativeWorker;
+        original.profile.clone_from(&profile.profile_hash);
+        original.contract = LocalContract::Embedding {
+            dimensions: u32::try_from(profile.dimensions).unwrap(),
+            distance: profile.distance.clone(),
+            modality: profile.modality.clone(),
+            members: vec![document_member(
+                &original.profile,
+                &original.input_sha256,
+                b"chunk",
+            )],
+        };
+        let producer = ProducerProvenance {
+            execution_mode: ProducerExecutionMode::NativeLibrary,
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            runtime_version: Some("0.19.1".into()),
+            runtime_library_sha256: Some(format!("sha256:{}", bundle.library.sha256)),
+            profile_hash: profile.profile_hash.clone(),
+            cpu_backend: Some("cpu".into()),
+            threads: Some(2),
+        };
+        check_regrouped_embedding_result(original, profile, Some(producer));
+    }
+
+    fn check_regrouped_embedding_result(
+        original: LocalIdentity,
+        profile: kio_adapter::catalog::DeclaredEmbeddingProfile,
+        producer: Option<kio_core::cas::ProducerProvenance>,
+    ) {
         use crate::embedding::transport::decode_local_embedding_result;
 
         let temp = tempfile::tempdir().unwrap();
@@ -1097,30 +1145,22 @@ mod tests {
             ControlHandle::default(),
         )
         .unwrap();
-        let original = document_identity();
         let expanded = expanded_document_identity(&original);
         let LocalContract::Embedding { members, .. } = &original.contract else {
             unreachable!()
         };
         let original_ids = vec![members[0].id.clone()];
-        let profile = kio_adapter::catalog::DeclaredEmbeddingProfile {
-            tool_id: "test".to_owned(),
-            dimensions: 3,
-            distance: "cosine".to_owned(),
-            modality: "text".to_owned(),
-            profile_hash: original.profile.clone(),
-        };
+        let mut vector = vec![0.0; profile.dimensions as usize];
+        vector[0] = 1.0;
         let completed = kio_adapter::types::EmbeddingCompleted {
-            dimensions: 3,
+            dimensions: u32::try_from(profile.dimensions).unwrap(),
             distance: profile.distance.clone(),
             modality: profile.modality.clone(),
             embedding_profile_hash: profile.profile_hash.clone(),
             usage: kio_adapter::types::EmbeddingUsage::Unmetered,
             members: vec![kio_adapter::types::EmbeddingMemberOutcome {
                 id: original_ids[0].clone(),
-                result: kio_adapter::types::EmbeddingMemberResult::Vector {
-                    vector: vec![1.0, 0.0, 0.0],
-                },
+                result: kio_adapter::types::EmbeddingMemberResult::Vector { vector },
             }],
         };
         let Claim::Claimed(mut first) = store.claim(&original, 0, None, 5, 0).unwrap() else {
@@ -1128,7 +1168,7 @@ mod tests {
         };
         crate::embedding::transport::LocalEmbeddingResult {
             completed: completed.clone(),
-            native_producer: None,
+            native_producer: producer.clone(),
         }
         .stage(&mut first)
         .unwrap();
@@ -1144,16 +1184,14 @@ mod tests {
         assert_eq!(recovered.attempts(), 1);
         assert_eq!(recovered.record.identity, original);
         assert_eq!(recovered.embedding_member_ids().unwrap(), original_ids);
-        assert_eq!(
-            decode_local_embedding_result(
-                &bytes,
-                &profile,
-                recovered.embedding_member_ids().unwrap()
-            )
-            .unwrap()
-            .completed,
-            completed
-        );
+        let decoded = decode_local_embedding_result(
+            &bytes,
+            &profile,
+            recovered.embedding_member_ids().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(decoded.completed, completed);
+        assert_eq!(decoded.native_producer, producer);
         let LocalContract::Embedding { members, .. } = &expanded.contract else {
             unreachable!()
         };
@@ -1932,4 +1970,62 @@ mod tests {
             }
         ));
     }
+}
+
+#[cfg(test)]
+#[test]
+fn eg2_query_memory_limit_refunds_each_attempt() {
+    use crate::eg2::WorkerError;
+    use crate::embedding::transport::{QueryEmbeddingOutcome, finish_native_query_failure};
+
+    let temp = tempfile::tempdir().unwrap();
+    let store = LocalExecution::new(
+        temp.path().join("state"),
+        temp.path().to_path_buf(),
+        ControlHandle::default(),
+    )
+    .unwrap();
+    let mut identity = tests::query_identity();
+    identity.execution = LocalExecutionKind::NativeWorker;
+    for now in 0..4 {
+        let Claim::Claimed(mut claim) = store.claim(&identity, 0, None, 3, now).unwrap() else {
+            panic!("resource pressure prevented a later attempt");
+        };
+        assert!(matches!(
+            finish_native_query_failure(&mut claim, WorkerError::MemoryLimit).unwrap(),
+            Some(QueryEmbeddingOutcome::Unavailable(WorkerError::MemoryLimit))
+        ));
+        assert_eq!(claim.attempts(), 0);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn eg2_query_cancel_is_interrupted_and_can_be_claimed_again() {
+    use crate::eg2::WorkerError;
+    use crate::embedding::transport::finish_native_query_failure;
+
+    let temp = tempfile::tempdir().unwrap();
+    let store = LocalExecution::new(
+        temp.path().join("state"),
+        temp.path().to_path_buf(),
+        ControlHandle::default(),
+    )
+    .unwrap();
+    let mut identity = tests::query_identity();
+    identity.execution = LocalExecutionKind::NativeWorker;
+    let Claim::Claimed(mut claim) = store.claim(&identity, 0, None, 3, 0).unwrap() else {
+        panic!("initial claim");
+    };
+    let Err(error) = finish_native_query_failure(&mut claim, WorkerError::Cancelled) else {
+        panic!("cancel did not end the command");
+    };
+    assert_eq!(error.exit_code(), kio_core::ExitCode::Interrupted);
+    assert_eq!(error.error_code(), "KIO-E-INTERRUPTED-001");
+    assert!(matches!(claim.record.phase, Phase::Interrupted));
+    drop(claim);
+    let Claim::Claimed(recovered) = store.claim(&identity, 0, None, 3, 1).unwrap() else {
+        panic!("cancelled work could not be retried");
+    };
+    assert!(recovered.result().unwrap().is_none());
 }

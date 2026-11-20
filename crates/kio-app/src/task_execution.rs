@@ -193,6 +193,27 @@ pub(crate) struct ExecOutcome {
 }
 
 impl ExecOutcome {
+    fn native_rejection(&self) -> Option<(crate::response::Completion, &'static str)> {
+        use crate::{eg2::WorkerError, response::Completion};
+        if let Some(error) = self.native_failure.filter(|error| error.is_hash_mismatch()) {
+            Some((Completion::Permanent, error.public_error().0))
+        } else if self.resource_busy > 0 {
+            Some((
+                Completion::Partial,
+                WorkerError::ResourceBusy.public_error().0,
+            ))
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn native_error_code(&self) -> Option<String> {
+        self.native_rejection()
+            .map(|(_, code)| code)
+            .or_else(|| self.native_failure.map(|error| error.public_error().0))
+            .map(str::to_owned)
+    }
+
     pub(crate) fn attempted(&self) -> usize {
         self.executed + self.failed
     }
@@ -203,7 +224,13 @@ impl ExecOutcome {
         }
         self.resource_busy += other.resource_busy;
         self.model_not_ready += other.model_not_ready;
-        self.native_failure = self.native_failure.or(other.native_failure);
+        if self.native_failure.is_none()
+            || other
+                .native_failure
+                .is_some_and(crate::eg2::WorkerError::is_hash_mismatch)
+        {
+            self.native_failure = other.native_failure;
+        }
         self.embedding_unavailable_reason = self
             .embedding_unavailable_reason
             .or(other.embedding_unavailable_reason);
@@ -221,11 +248,13 @@ pub(crate) fn batch_completion(outcome: &ExecOutcome) -> crate::response::Comple
     use crate::response::Completion;
     if outcome.resource_limit.is_some() {
         Completion::Partial
+    } else if let Some((completion, _)) = outcome.native_rejection() {
+        completion
     } else if outcome.auth_failed > 0 {
         Completion::AuthRequired
     } else if outcome.paused > outcome.resource_busy + outcome.model_not_ready {
         Completion::BudgetBlocked
-    } else if outcome.resource_busy > 0 || outcome.failed_retryable > 0 || outcome.inflight > 0 {
+    } else if outcome.failed_retryable > 0 || outcome.inflight > 0 {
         Completion::Partial
     } else if outcome.failed > 0 {
         Completion::Permanent
@@ -245,12 +274,12 @@ pub(crate) fn enrichment_completion(outcome: &ExecOutcome) -> crate::response::C
     use crate::response::Completion;
     if outcome.resource_limit.is_some() {
         Completion::Partial
+    } else if let Some((completion, _)) = outcome.native_rejection() {
+        completion
     } else if outcome.auth_failed > 0 {
         Completion::AuthRequired
     } else if outcome.paused > outcome.resource_busy + outcome.model_not_ready {
         Completion::BudgetBlocked
-    } else if outcome.resource_busy > 0 {
-        Completion::Partial
     } else if outcome.native_failure.is_some() {
         if outcome.failed_retryable > 0 {
             Completion::Partial

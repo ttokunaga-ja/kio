@@ -93,7 +93,7 @@ fn main() {
             }
             ResponseBody::Reindex(ReindexResponse::Head(report)) => {
                 if code != ExitCode::Success {
-                    append_completion_error(&Value::Null, code);
+                    append_completion_error(&json!({"error_code": report.error_code}), code);
                 }
                 if json_mode {
                     write_output_json(|writer| serde_json::to_writer(writer, &report))?;
@@ -266,6 +266,10 @@ struct TerminalInteraction {
 }
 
 impl Interaction for TerminalInteraction {
+    fn embedding_cancellation(&self) -> Result<Box<dyn Fn() -> bool>> {
+        kio_app::eg2::cancellation()
+    }
+
     #[cfg(debug_assertions)]
     fn working_scan_started(&self) {
         scan_heap::scan_started();

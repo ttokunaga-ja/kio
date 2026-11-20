@@ -213,6 +213,11 @@ model install/import は課金台帳を検査・初期化・修復せず、model
 model/adapter status の typed fields は `selected_profile`、`profile_hash`、`model_revision`、`model_hash`、
 `runtime_version`、`readiness`（ready / missing / license-required / hash-mismatch）、
 `reembedding_count`、`producers`（OS/arch、library SHA、runtime version、件数）、`mixed_producers`。
+`model status` は端末設定が選ぶ embedding の ID と profile hash を表示する。
+現在の scope があれば、保存済み CAS から同 profile の native producer を集計する。
+`reembedding_count` は、別 profile で保存済みの入力のうち、選択中の profile の
+結果がまだない入力数。本文は text hash とファイル名 context、画像は画像 hash で数える。
+scope の外では `reembedding_count` は null とする。
 Task の Skipped は理由別件数、資源待ちは `resource_busy` として表示する。
 `index` と HEAD の `reindex` は、モデルまたは runtime の準備不足で EG2 を実行できないとき、
 `embedding_unavailable_reason` に理由を記録する。例は `model_missing` と `runtime_hash_mismatch`。

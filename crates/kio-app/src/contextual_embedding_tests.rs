@@ -1828,6 +1828,15 @@ fn eg2_slot_contention_pauses_without_consuming_a_local_attempt() {
         crate::response::Completion::Partial
     ));
 
+    assert_eq!(
+        outcome.native_error_code().as_deref(),
+        Some("KIO-E-EMBED-RESOURCE-001")
+    );
+    assert_eq!(
+        crate::task_execution::batch_completion(&outcome),
+        crate::response::Completion::Partial
+    );
+
     let Claim::Claimed(claim) = store.claim(&identity, paused.attempts, None, 3, 1).unwrap() else {
         panic!("expected resumed free claim");
     };
@@ -1836,4 +1845,31 @@ fn eg2_slot_contention_pauses_without_consuming_a_local_attempt() {
     let resumed = &tasks.all().unwrap()[0];
     assert_eq!(resumed.status, TaskStatus::Running);
     assert_eq!(resumed.hold_reason, None);
+    let mut claim = claim;
+    for error in [
+        WorkerError::ModelHashMismatch,
+        WorkerError::RuntimeHashMismatch,
+    ] {
+        let mut outcome = ExecOutcome::default();
+        finish_native_embedding_failure(&tasks, &refs, &mut claim, error, &mut outcome).unwrap();
+        assert_eq!(claim.attempts(), 0);
+        assert_eq!(
+            outcome.native_error_code().as_deref(),
+            Some("KIO-E-MODEL-HASH-001")
+        );
+        assert!(matches!(
+            enrichment_completion(&outcome),
+            crate::response::Completion::Permanent
+        ));
+        assert!(matches!(
+            crate::task_execution::batch_completion(&outcome),
+            crate::response::Completion::Permanent
+        ));
+        drop(claim);
+        let Claim::Claimed(next) = store.claim(&identity, 0, None, 3, 2).unwrap() else {
+            panic!("hash rejection must leave an unsent record");
+        };
+        claim = next;
+        mirror_local_embedding_start(&tasks, &refs, claim.attempts(), now).unwrap();
+    }
 }

@@ -854,7 +854,7 @@ fn run_embedding_enrichment_for_instances(
                         &embedding_context,
                         group,
                         claim.token().to_owned(),
-                        invocation.control,
+                        &invocation,
                     ) {
                         Ok(mut result) => {
                             let vector = result
@@ -2200,25 +2200,27 @@ pub(crate) fn finish_native_embedding_failure(
     error: WorkerError,
     outcome: &mut ExecOutcome,
 ) -> Result<()> {
+    crate::embedding::transport::record_native_failure(claim, error)?;
     let (status, reason) = if error.is_resource_busy() {
-        if error.is_unsent() {
-            claim.cancel_unsent()?;
-        } else {
-            claim.fail(RetryErrorKind::ResourceLimit, None, false, false)?;
-        }
         outcome.paused += refs.len();
         outcome.resource_busy += refs.len();
         (TaskStatus::Paused, "resource_busy")
     } else if error.is_unsent() {
-        claim.cancel_unsent()?;
         outcome.paused += refs.len();
         outcome.model_not_ready += refs.len();
         outcome.embedding_unavailable_reason = Some(error.reason());
+        if error.is_hash_mismatch() {
+            outcome.native_failure = Some(error);
+        }
         (TaskStatus::Paused, "model_not_ready")
     } else {
-        claim.interrupt()?;
         outcome.failed += refs.len();
-        outcome.native_failure = Some(error);
+        if !outcome
+            .native_failure
+            .is_some_and(WorkerError::is_hash_mismatch)
+        {
+            outcome.native_failure = Some(error);
+        }
         if error.retryable() && claim.attempts() < 3 {
             outcome.failed_retryable += refs.len();
         }
@@ -2240,8 +2242,11 @@ pub(crate) fn finish_native_embedding_failure(
             task.heartbeat_at = None;
             true
         })
-        .map(|_| ())
-        .map_err(pipeline_to_kio)
+        .map_err(pipeline_to_kio)?;
+    if error == WorkerError::Cancelled {
+        return Err(error.interruption_error());
+    }
+    Ok(())
 }
 
 pub(crate) fn fail_local_embedding_claim(
@@ -2446,7 +2451,7 @@ fn send_local_embed_group(
     embedding: &EmbeddingExecutionContext<'_>,
     group: &EmbeddingSendGroup<'_>,
     token: String,
-    control: &ControlHandle,
+    invocation: &Invocation<'_>,
 ) -> std::result::Result<LocalEmbeddingResult, LocalEmbeddingRunFailure> {
     validate_embedding_aliases(
         embedding.current_policy,
@@ -2470,6 +2475,7 @@ fn send_local_embed_group(
     if embedding.execution == EmbeddingExecution::Native {
         let context = embedding_store::chunk_embedding_context(&group.representative.raw_path);
         return run_native_embedding(
+            invocation.context.interaction.as_ref(),
             &mut embedding.native_session.borrow_mut(),
             EmbeddingInput::Document {
                 body: &group.representative.text,
@@ -2489,7 +2495,7 @@ fn send_local_embed_group(
         group_embedding_items(group),
         EmbeddingInputType::MarkdownChunk,
         Some(token),
-        control,
+        invocation.control,
     )
 }
 

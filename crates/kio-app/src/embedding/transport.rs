@@ -696,13 +696,17 @@ pub(crate) fn decode_local_embedding_result(
 }
 
 pub(crate) fn run_native_embedding(
+    interaction: &dyn crate::context::Interaction,
     session: &mut EmbeddingSession,
     input: EmbeddingInput<'_>,
     member_id: String,
     profile: &kio_adapter::catalog::DeclaredEmbeddingProfile,
 ) -> std::result::Result<LocalEmbeddingResult, LocalEmbeddingRunFailure> {
+    let cancelled = interaction
+        .embedding_cancellation()
+        .map_err(LocalEmbeddingRunFailure::Admission)?;
     let output = session
-        .embed(input, &|| false)
+        .embed(input, &cancelled)
         .map_err(LocalEmbeddingRunFailure::Native)?;
     let result = LocalEmbeddingResult {
         completed: EmbeddingCompleted {
@@ -733,6 +737,30 @@ pub(crate) fn run_native_embedding(
         .validate(profile, vec![member_id])
         .map_err(|_| LocalEmbeddingRunFailure::Native(WorkerError::Protocol))?;
     Ok(result)
+}
+
+pub(crate) fn record_native_failure(
+    claim: &mut crate::local_execution::LocalGuard,
+    error: WorkerError,
+) -> Result<()> {
+    if error.is_unsent() {
+        claim.cancel_unsent()
+    } else if error.is_resource_busy() {
+        claim.fail(RetryErrorKind::ResourceLimit, None, false, false)
+    } else {
+        claim.interrupt()
+    }
+}
+
+pub(crate) fn finish_native_query_failure(
+    claim: &mut crate::local_execution::LocalGuard,
+    error: WorkerError,
+) -> Result<Option<QueryEmbeddingOutcome>> {
+    record_native_failure(claim, error)?;
+    if error == WorkerError::Cancelled {
+        return Err(error.interruption_error());
+    }
+    Ok(Some(QueryEmbeddingOutcome::Unavailable(error)))
 }
 
 fn run_free_query_embedding_job(
@@ -787,6 +815,7 @@ fn run_free_query_embedding_job(
         record_query_embed_trace(query, invocation.control);
         let result = if execution == EmbeddingExecution::Native {
             run_native_embedding(
+                invocation.context.interaction.as_ref(),
                 &mut EmbeddingSession::new(EngineSlot::Query),
                 EmbeddingInput::Query(query),
                 "query".to_owned(),
@@ -812,12 +841,7 @@ fn run_free_query_embedding_job(
                 result
             }
             Err(LocalEmbeddingRunFailure::Native(error)) => {
-                if error.is_unsent() {
-                    claim.cancel_unsent()?;
-                } else {
-                    claim.interrupt()?;
-                }
-                return Ok(Some(QueryEmbeddingOutcome::Unavailable(error)));
+                return finish_native_query_failure(&mut claim, error);
             }
             Err(LocalEmbeddingRunFailure::Classified(failure)) => {
                 crate::embedding::executor::fail_local_embedding_claim(

@@ -1,5 +1,6 @@
 //! The pinned device model is installed only through the explicit model command.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{self, Read, Seek};
 use std::path::{Path, PathBuf};
@@ -11,7 +12,7 @@ use kio_core::{ExitCode, KioError, Result};
 
 use crate::commands::ModelCommand;
 use crate::context::AppContext;
-use crate::response::model::{ModelReadiness, ModelResponse};
+use crate::response::model::{ModelProducer, ModelReadiness, ModelResponse};
 use crate::response::{CommandResponse, Completion, ResponseBody};
 
 use kio_core::eg2::{MODEL, MODEL_SHA256, REVISION};
@@ -118,36 +119,11 @@ pub(crate) fn run(
     let path = directory.join(ARTIFACT);
     match command {
         ModelCommand::Status => {
-            use crate::eg2::WorkerError;
-            let Some((_, mismatch)) = pin.open_installed(&base, control)? else {
-                return Ok(missing(&pin, &path));
-            };
-            if let Some(mismatch) = mismatch {
-                return Ok(pin.response(
-                    &path,
-                    ModelReadiness::HashMismatch,
-                    mismatch.message(),
-                    None,
-                ));
+            let mut response = model_status(&pin, &base, &path, control)?;
+            if let ResponseBody::Model(model) = &mut response.body {
+                describe_selected_profile(ctx.cwd(), control, model)?;
             }
-            let (readiness, reason, version) = match crate::eg2::verify_runtime() {
-                Ok(()) => (
-                    ModelReadiness::Ready,
-                    "model and runtime SHA-256 verified",
-                    Some(kio_core::litert::VERSION.to_owned()),
-                ),
-                Err(WorkerError::RuntimeMissing) => {
-                    (ModelReadiness::Missing, "runtime_missing", None)
-                }
-                Err(WorkerError::RuntimeHashMismatch) => {
-                    (ModelReadiness::HashMismatch, "runtime_hash_mismatch", None)
-                }
-                Err(WorkerError::RuntimeUnsupported) => {
-                    (ModelReadiness::Missing, "runtime_unsupported_target", None)
-                }
-                Err(_) => (ModelReadiness::Missing, "runtime_unavailable", None),
-            };
-            return Ok(pin.response(&path, readiness, reason, version));
+            return Ok(response);
         }
         ModelCommand::Install { from, yes, offline } => {
             if offline && from.is_none() {
@@ -191,6 +167,109 @@ pub(crate) fn run(
         "model size and SHA-256 verified",
         None,
     ))
+}
+
+fn model_status(
+    pin: &Pin,
+    base: &Path,
+    path: &Path,
+    control: &ControlHandle,
+) -> Result<CommandResponse> {
+    use crate::eg2::WorkerError;
+    let Some((_, mismatch)) = pin.open_installed(base, control)? else {
+        return Ok(pin.response(
+            path,
+            ModelReadiness::Missing,
+            "model is not installed; run kio model install embeddinggemma-2",
+            None,
+        ));
+    };
+    if let Some(mismatch) = mismatch {
+        return Ok(pin.response(path, ModelReadiness::HashMismatch, mismatch.message(), None));
+    }
+    let (readiness, reason, version) = match crate::eg2::verify_runtime() {
+        Ok(()) => (
+            ModelReadiness::Ready,
+            "model and runtime SHA-256 verified",
+            Some(kio_core::litert::VERSION.to_owned()),
+        ),
+        Err(WorkerError::RuntimeHashMismatch) => {
+            (ModelReadiness::HashMismatch, "runtime_hash_mismatch", None)
+        }
+        Err(error) => (ModelReadiness::Missing, error.reason(), None),
+    };
+    Ok(pin.response(path, readiness, reason, version))
+}
+
+fn describe_selected_profile(
+    cwd: &Path,
+    control: &ControlHandle,
+    model: &mut ModelResponse,
+) -> Result<()> {
+    use kio_core::cas::EmbeddingContext;
+    use kio_core::scope::Repository;
+
+    let settings = crate::settings::adapter_runtime_settings_for_roles(control, &["embedding"])?;
+    let Some(execution) =
+        kio_adapter::catalog::active_embedding_execution_with_control(&settings, control)
+    else {
+        return Ok(());
+    };
+    let profile = crate::embedding::admission::declared_embedding_profile(&settings, execution)?;
+    let cwd = cwd
+        .canonicalize()
+        .map_err(|error| KioError::io(error.to_string(), cwd.display().to_string()))?;
+    for root in cwd.ancestors() {
+        match std::fs::symlink_metadata(root.join(".kio")) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(KioError::io(error.to_string(), root.display().to_string())),
+            Ok(_) => {}
+        }
+        let repo = Repository::open_read_only_with_control(root, control.clone())?;
+        let store = repo.object_store();
+        let mut current = BTreeSet::new();
+        let mut previous = BTreeSet::new();
+        let mut producers = BTreeMap::new();
+        for hash in store.embedding_hashes()? {
+            let object = store.read_embedding(&hash)?;
+            let filename = match object.context {
+                Some(EmbeddingContext::Text(filename)) => Some(filename),
+                _ => None,
+            };
+            let input = (object.target_type, object.target_hash, filename);
+            if object.profile_hash != profile.profile_hash {
+                previous.insert(input);
+                continue;
+            }
+            current.insert(input);
+            let producer = object.metadata.producer;
+            if let (Some(library), Some(version)) =
+                (producer.runtime_library_sha256, producer.runtime_version)
+            {
+                *producers
+                    .entry((producer.os, producer.arch, library, version))
+                    .or_insert(0) += 1;
+            }
+        }
+        model.reembedding_count = Some(previous.difference(&current).count() as u64);
+        model.producers = producers
+            .into_iter()
+            .map(
+                |((os, arch, library_sha256, runtime_version), count)| ModelProducer {
+                    os,
+                    arch,
+                    library_sha256,
+                    runtime_version,
+                    count,
+                },
+            )
+            .collect();
+        model.mixed_producers = model.producers.len() > 1;
+        break;
+    }
+    model.selected_profile = Some(profile.tool_id);
+    model.profile_hash = Some(profile.profile_hash);
+    Ok(())
 }
 
 /// Report an absent artifact without loading weights or opening a worker.
@@ -257,15 +336,6 @@ fn confirm(
     } else {
         Err(consent_error("model installation declined"))
     }
-}
-
-fn missing(pin: &Pin, path: &Path) -> CommandResponse {
-    pin.response(
-        path,
-        ModelReadiness::Missing,
-        "model is not installed; run kio model install embeddinggemma-2",
-        None,
-    )
 }
 
 fn verified_model_file(directory: &StoreDirectory) -> Result<File> {

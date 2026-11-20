@@ -753,6 +753,7 @@ pub(super) fn run(
         rebuilt_chunks: report.rebuilt_chunks,
         embedding_tasks_executed: enrichment.executed,
         embedding_tasks_failed: enrichment.failed,
+        error_code: enrichment.native_error_code(),
         paused_tasks: enrichment.paused,
         blocked_raw_hashes: blocked_raw_hashes.len(),
         skipped: skipped_disclosure(&report, repo.kio_dir()),

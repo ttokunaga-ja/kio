@@ -661,3 +661,55 @@ fn profile_binds_exact_prompts_and_semantics_across_platforms() {
     profile["embedding_semantics"]["query_prompt"] = "task: search result | query:".into();
     assert_ne!(tool_profile_hash(&profile).unwrap(), profile_hash());
 }
+
+#[test]
+fn product_embedding_passes_cancellation_to_worker() {
+    use crate::context::Interaction;
+    use crate::embedding::transport::{LocalEmbeddingRunFailure, run_native_embedding};
+    struct Cancelled;
+    impl Interaction for Cancelled {
+        fn embedding_cancellation(&self) -> kio_core::Result<Box<dyn Fn() -> bool>> {
+            let started = std::time::Instant::now();
+            Ok(Box::new(move || {
+                started.elapsed() >= Duration::from_millis(50)
+            }))
+        }
+        fn confirm(&self, _: &str) -> kio_core::Result<bool> {
+            unreachable!()
+        }
+        fn is_interactive(&self) -> bool {
+            false
+        }
+        fn read_input(&self, _: usize) -> kio_core::Result<Vec<u8>> {
+            unreachable!()
+        }
+        fn diagnostic(&self, _: &str) {
+            unreachable!()
+        }
+        fn write_diagnostic(&self, _: &str) -> kio_core::Result<()> {
+            unreachable!()
+        }
+        fn flush_diagnostics(&self) -> kio_core::Result<()> {
+            unreachable!()
+        }
+    }
+
+    let mut session = EmbeddingSession {
+        slot: EngineSlot::Query,
+        worker: Some(fake("timeout")),
+        unavailable: None,
+    };
+    let profile = kio_adapter::catalog::declared_native_embedding_profile();
+    let result = run_native_embedding(
+        &Cancelled,
+        &mut session,
+        EmbeddingInput::Query("hello"),
+        "query".into(),
+        &profile,
+    );
+    assert!(matches!(
+        result,
+        Err(LocalEmbeddingRunFailure::Native(WorkerError::Cancelled))
+    ));
+    assert!(session.worker.is_none());
+}
