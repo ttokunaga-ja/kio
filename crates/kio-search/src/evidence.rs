@@ -184,6 +184,16 @@ impl EvidencePointer {
             ));
         }
 
+        if self
+            .path_at_commit
+            .as_deref()
+            .is_some_and(|path| !kio_core::dag::is_logical_direct_child(path))
+        {
+            return Err(SearchError::Evidence(
+                "path_at_commit must be a logical direct child name".to_owned(),
+            ));
+        }
+
         if let Some(heading_path) = &self.heading_path {
             if heading_path.is_empty() {
                 return Err(SearchError::Evidence(
@@ -363,6 +373,26 @@ mod tests {
             section_id: pointer.section_id,
             byte_start: pointer.byte_start,
             byte_end: pointer.byte_end,
+        }
+    }
+
+    #[test]
+    fn path_at_commit_obeys_logical_name_schema() {
+        for name in ["", ".", "..", "a/b", "a\0b"] {
+            let mut value = serde_json::to_value(pointer()).unwrap();
+            value["path_at_commit"] = serde_json::json!(name);
+            assert!(
+                serde_json::from_value::<EvidencePointer>(value).is_err(),
+                "{name:?}"
+            );
+        }
+        for name in ["a\\b", "CON", "a\nb"] {
+            let mut value = serde_json::to_value(pointer()).unwrap();
+            value["path_at_commit"] = serde_json::json!(name);
+            assert!(
+                serde_json::from_value::<EvidencePointer>(value).is_ok(),
+                "{name:?}"
+            );
         }
     }
 

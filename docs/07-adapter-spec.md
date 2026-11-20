@@ -92,7 +92,7 @@ PDF はページ単位で有界に扱い、256 pages / 8,192 objects を文書�
 malformed object stream、循環参照、不正 offset/length は `contract_violation` とし、資源予算超過と区別する。
 これらの失敗で弱い parser や有料 OCR への無断切替を行わない。資源 tier は §5.1 に従う。
 
-- online Adapter が未設定または network 未承認のとき、Markdownize タスクは同梱 deterministic Adapter で実行する (タスクを止めない)。Embedding はモデル準備済みなら既定の EG2 を使い、未準備なら理由を表示して text fallback する ([05-runtime.md §1](05-runtime.md))
+- online Adapter が未設定または network 未承認のとき、Markdownize タスクは同梱 deterministic Adapter で実行する (タスクを止めない)。embedding の宣言がない場合は EG2 が既定であり、未準備なら理由を表示して text fallback する。明示選択した HTTP embedding が未承認の場合は EG2 に切り替えず、auto / hybrid は全文検索に縮退し、明示 vector / image / online はエラーとする ([05-runtime.md §1](05-runtime.md))
 - この状態を **ベースライン index** と呼ぶ。`init → index --yes → search → open <pointer>` の最低体験ライン ([01-positioning.md §3](01-positioning.md)) はベースライン index のみで成立しなければならない
 - online Adapter を承認した後の AI 強化は、別 `tool_profile_hash` の artifact として通常の Markdownize / Embedding タスクで生成する (identity 規約 [03-data-model.md §5](03-data-model.md) のとおり。ベースライン artifact とその Evidence Pointer は不変のまま残る)
 

@@ -131,11 +131,9 @@ impl TreeEntry {
     }
 }
 
-/// Preserve names valid on the current scope filesystem while rejecting every
-/// component that can escape a direct child on that platform. In particular,
-/// `:` and `\` remain legitimate Unix filename bytes, but are path/ADS syntax on
-/// Windows and are rejected there.
-fn is_logical_direct_child(path: &str) -> bool {
+/// Validate a persisted logical direct-child name independently of the host OS.
+#[must_use]
+pub fn is_logical_direct_child(path: &str) -> bool {
     if path.is_empty() || path == "." || path == ".." || path.contains('/') || path.contains('\0') {
         return false;
     }
