@@ -257,6 +257,6 @@
 
 ### D-20261120-04 F2 で見つかった仕様と実装の食い違いの扱い
 
-- **内容**：(1) `kio diff` の派生物だけの変化の表示（`tasks/step4b-contract-tests-p3b.md` の QB39）を v1 で実装する。(2) tree と Evidence Pointer の名前は、論理名と物理名を分けて判定する。論理名は `/`・NUL・空・単独の `.`／`..` を拒否し、それ以外は履歴に保存できる。宛先 OS で安全に作れない名前は、ファイルとして書き出すときに拒否する。Evidence Pointer の `path_at_commit` も同じ論理名の規則で検証する。(3) 明示的に選んだ HTTP embedding が未承認のときは、`docs/05-runtime.md` §1.1 のとおり auto／hybrid を全文検索に縮退させ、EG2 に切り替えない。(4) 有料 OCR の Batch の `fallback_to_full` は、sync と同じく元の要求を精算し、task を終端にせず Full を新しい相 1 から投入する。これを v1 で実装する。
-- **理由**：利用者の決定。(1) と (4) は承認済みの契約で、実装が欠けていた。(2) は Unix で正当なファイル名を保存できるようにするため、(3) は利用者が選んだ送信先を黙って別のモデルに替えないため、仕様を揃える。
-- **関係する資料**：`docs/06-cli-spec.md` §1、`docs/03-data-model.md` §2・§3、`docs/08-evidence-pointer-spec.md` §2、`docs/05-runtime.md` §1.1、`docs/07-adapter-spec.md` §2.1、`docs/04-pipeline.md` §5.8、`tasks/v1-plan.md` §3.2b の H1〜H3。
+- **内容**：(1) `kio diff` の派生物だけの変化の表示（`tasks/step4b-contract-tests-p3b.md` の QB39）を v1 で実装する。(2) tree と Evidence Pointer の名前は、論理名と物理名を分けて判定する。論理名は `/`・NUL・空・単独の `.`／`..` を拒否し、それ以外は履歴に保存できる。宛先 OS で安全に作れない名前は、ファイルとして書き出すときに拒否する。Evidence Pointer の `path_at_commit` も同じ論理名の規則で検証する。(3) 明示的に選んだ HTTP embedding が未承認のときは、`docs/05-runtime.md` §1.1 のとおり auto／hybrid を全文検索に縮退させ、EG2 に切り替えない。(4) 有料 OCR の Batch の提供元（Mistral OCR）は incremental の不適用を示す制御応答（`fallback_to_full`）を返さない。Batch の制御応答の記帳と Full の開始の規定を仕様から削除し、実装しない。
+- **理由**：利用者の決定。(1) は承認済みの契約で、実装が欠けていた。(4) は当初 v1 で実装すると決めたが、Mistral は送られたページを常に OCR し、この応答を返す仕組みがないため、製品で到達しない経路になると分かり、利用者が仕様を変えると決め直した。(2) は Unix で正当なファイル名を保存できるようにするため、(3) は利用者が選んだ送信先を黙って別のモデルに替えないため、仕様を揃える。
+- **関係する資料**：`docs/06-cli-spec.md` §1、`docs/03-data-model.md` §2・§3、`docs/08-evidence-pointer-spec.md` §2、`docs/05-runtime.md` §1.1、`docs/07-adapter-spec.md` §2.1、`docs/04-pipeline.md` §5.8、`tasks/v1-plan.md` §3.2b の H1・H2。

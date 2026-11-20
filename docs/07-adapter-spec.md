@@ -224,8 +224,8 @@ AdapterRun:
                         (partial = unit 単位の部分失敗, 04-pipeline.md §5.2。`full_required`
                          (= fallback_to_full) は request の制御結果であり、AdapterRun は "done" でも
                          normalized task の完了を意味しない。同期の有料 incremental を送信した後は
-                         自動 Full 再送を行わず result_unknown として明示承認を待つ。有効な Batch 制御応答
-                         からの Full 開始は 04 §5.8 に従う。request outcome の区別は cost_ledger 側
+                         自動 Full 再送を行わず result_unknown として明示承認を待つ。Batch の提供元は
+                         制御応答を返さない (04 §5.8)。request outcome の区別は cost_ledger 側
                          ([04-pipeline.md §3.2](04-pipeline.md)))
   error_code            機械判定用 (06-cli-spec.md §8)
   error_category        transient | permanent | rate_limit — 04 §5.3 の retry 分類の入力

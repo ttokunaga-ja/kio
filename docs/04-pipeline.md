@@ -369,7 +369,7 @@ full / incremental / retry 合成のいずれも、合成後の集合に対し�
 検査する)。衝突があれば persist 先 `<unit_ref>.json` が競合するため当該応答を whole-response
 reject とする (実用上は起こらない 64bit 衝突の防衛線 — 検査は persist 前の V 検査と同時に行う)。
 
-**制御応答 (fallback_to_full=true)**: validatorはV1〜V6より先に制御応答を識別する。unit配列・unchanged・removedは空であり、Full要求に対する同制御応答は契約違反とする。制御応答は正規化本文として保存しない。外部送信前の適用可否判定や、送信を行わない再利用の判定ではFullへ切り替えられる。同期の有料incremental要求を送信した後は、同じ予約でFullを再送しない。現行の同期Adapterは受信結果の耐久再取得を提供しないため、受理・保存できない応答は§5.4の`result_unknown`として停止する。`batch retry --resend-unknown <selector> --yes`で追加試行を承認すると、次のonline実行は新しい予約でFull要求を行う（既存の失敗unit subsetがある場合はそのsubsetを維持）。この承認も現在のpolicy、Adapter grant、予算判定を省略しない。Batch の有効な制御応答は §5.8 の記帳・Full 開始の規則に従う。
+**制御応答 (fallback_to_full=true)**: validatorはV1〜V6より先に制御応答を識別する。unit配列・unchanged・removedは空であり、Full要求に対する同制御応答は契約違反とする。制御応答は正規化本文として保存しない。外部送信前の適用可否判定や、送信を行わない再利用の判定ではFullへ切り替えられる。同期の有料incremental要求を送信した後は、同じ予約でFullを再送しない。現行の同期Adapterは受信結果の耐久再取得を提供しないため、受理・保存できない応答は§5.4の`result_unknown`として停止する。`batch retry --resend-unknown <selector> --yes`で追加試行を承認すると、次のonline実行は新しい予約でFull要求を行う（既存の失敗unit subsetがある場合はそのsubsetを維持）。この承認も現在のpolicy、Adapter grant、予算判定を省略しない。Batch の提供元は制御応答を返さない (§5.8)。
 
 違反時の挙動:
 
@@ -925,8 +925,7 @@ resource_limit がない受理応答で要求した全 unit が `failed_units` �
     再投入 — **この full 再投入は下記「持たない場合」の分岐と同一規範に従う**: `mode=full` でも
     request の prepared input は失敗 unit subset のみとし、V6 の母集合もその request に渡した subset とする。
     既 done unit を全 manifest の出力として再要求・再検査しない。既 done の unit は first-instance-wins で
-    保持して、失敗 unit の成功出力だけを immutable manifest へ併合する。この Full 再試行には §5.3 の通常の retry budget を適用する。Batch の有効な
-    `fallback_to_full` 制御応答を受けて開始する Full は、この task retry の attempts に算入しない)。
+    保持して、失敗 unit の成功出力だけを immutable manifest へ併合する。この Full 再試行には §5.3 の通常の retry budget を適用する)。
     **合成 hints の残余 field は `added_unit_keys = []`・`removed_unit_keys = []` と定める** — 元 run で
     added だった失敗 unit も retry では changed として再投入し、成功出力は `updated_units` 側で返る。
     §3.2 の V1〜V6 (V2 の removed 完全一致・V4 の added 集合式を含む) はこの合成値に対して評価する。
@@ -1363,9 +1362,8 @@ UNIQUE 衝突し、実課金が DO NOTHING に黙って吸収される)。この
 正常完了 = `succeeded` / §3.2 reject 終端 = `contract_violation` / expired 終端 = `expired` /
 abandon = `abandoned` / 拒否課金 provider の submit 拒否 = `submit_rejected` / purge 起因の
 terminal 化 (error='purged') = `purged` / 回復期限超過・照会不能の estimated 確定 = `unknown_settled` /
-有効な Batch 制御応答 (`fallback_to_full=true`、§3.2) は request の終端を `outcome='fallback_to_full'` とし、
-task は非終端に保つ。終端 transaction の完了後に `mode=full` の新 request を相 1 から開始する。
-同期の有料要求を送信済みの場合の制御応答は [同期結果不明の回復](10-operations.md#同期結果不明の回復) に従う。
+Batch の提供元 (Mistral OCR — [07-adapter-spec.md](07-adapter-spec.md)) は制御応答 (§3.2) を返さないため、
+Batch の request に `fallback_to_full` の終端はない。同期の有料要求を送信済みの場合の制御応答は [同期結果不明の回復](10-operations.md#同期結果不明の回復) に従う。
 
 **記帳値の事前検証**: Adapter 報告値は INSERT 前に検証する — `usd` は有限・非負の数値。
 `billable_units` は **1 要素以上の配列で、各要素の `count` が有限・非負の整数、`kind` が閉 enum・
@@ -1381,7 +1379,7 @@ provider の reject 等) の usage 欠落は正当であり、確定額 0 (`usd=
 表の欠落) も「欠落」と同じ estimated 縮退 + warning とする** (終端 Tx を止めない。0 円確定にはしない —
 billable Adapter の pricing 被覆は送信前に検査される ([10-operations.md §11.3](10-operations.md))
 ため、この経路は途中で表が壊れた場合の防衛線)。**課金 field 単独の不良は応答の受否・outcome・`contract_violation_count` を
-変えない** — 成功は成功のまま、有効な Batch 制御応答は `outcome='fallback_to_full'` のまま (構造違反 (§3.2、
+変えない** — 成功は成功のまま (構造違反 (§3.2、
 Embedding は §5.1 の受入検査) だけが contract violation。
 課金 field の不良は warning log で可視化する —
 [07-adapter-spec.md §7](07-adapter-spec.md) の `usage_validation` / `billing_source` field と
