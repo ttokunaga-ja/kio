@@ -1,4 +1,4 @@
-use crate::platform::{runner_argv, xml_escape};
+use crate::platform::{runner_argv, watch_task_definition::xml_escape};
 use crate::response::watch::NativeServiceState;
 use crate::watch_service::{
     ServiceEnvironment, ServiceManifest, invalid, service_error, validate_argument_path,
@@ -26,7 +26,7 @@ pub(crate) fn native_prepare_replacement(_manifest: &ServiceManifest) -> Result<
 }
 
 pub(crate) fn native_manifest_anchor(manifest: &ServiceManifest) -> Result<Option<PathBuf>> {
-    super::watch_service_model::manifest_anchor_from_cache(&manifest.id, &manifest.native_path)
+    super::watch_task_definition::manifest_anchor_from_cache(&manifest.id, &manifest.native_path)
         .map(Some)
 }
 
@@ -38,7 +38,7 @@ pub(crate) fn native_manifest_locator(id: &str) -> Result<Option<PathBuf>> {
     let args = task
         .arguments
         .ok_or_else(|| service_error("foreign native task actions"))?;
-    super::watch_service_model::manifest_from_arguments(&args).map(Some)
+    super::watch_task_definition::manifest_from_arguments(&args).map(Some)
 }
 
 pub(crate) fn native_definition_path(
