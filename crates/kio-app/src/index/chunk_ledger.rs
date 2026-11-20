@@ -491,11 +491,12 @@ pub(crate) fn check_index_generation_current(
 /// an earlier record.
 #[cfg(test)]
 pub(crate) fn parse_chunk_ledger(kio_dir: &Path) -> Result<()> {
-    parse_chunk_ledger_with(kio_dir, |_, _| Ok(())).map(|_| ())
+    parse_chunk_ledger_with(kio_dir, false, |_, _| Ok(())).map(|_| ())
 }
 
 fn parse_chunk_ledger_with(
     kio_dir: &Path,
+    strict_bounded: bool,
     mut visit: impl FnMut(usize, StoredChunk) -> Result<()>,
 ) -> Result<Vec<ChunkPublicationEvent>> {
     use std::io::BufRead;
@@ -524,11 +525,27 @@ fn parse_chunk_ledger_with(
     let mut events = Vec::new();
     let mut event_keys = BTreeSet::new();
     let mut created_pairs = BTreeSet::new();
+    let mut remaining = if strict_bounded {
+        kio_core::history::DEFAULT_MAX_HISTORY_VERIFIED_BYTES
+    } else {
+        u64::MAX
+    };
     for line_no in 0.. {
         frame.clear();
-        reader
+        let limit = if strict_bounded {
+            remaining.min(kio_core::cas::MAX_CHUNK_OBJECT_BYTES)
+        } else {
+            u64::MAX
+        };
+        let count = reader
+            .by_ref()
+            .take(limit.saturating_add(1))
             .read_until(b'\n', &mut frame)
             .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?;
+        if count as u64 > limit {
+            return Err(KioError::schema("chunk ledger read limit exceeded"));
+        }
+        remaining -= count as u64;
         if frame.last() != Some(&b'\n') {
             break;
         }
@@ -636,14 +653,22 @@ pub(crate) fn read_stored_chunks(kio_dir: &Path) -> Result<Vec<StoredChunk>> {
 
 pub(crate) fn visit_stored_chunks(
     kio_dir: &Path,
-    mut visit: impl FnMut(StoredChunk) -> Result<()>,
+    visit: impl FnMut(StoredChunk) -> Result<()>,
 ) -> Result<()> {
+    visit_chunk_ledger(kio_dir, false, visit).map(|_| ())
+}
+
+pub(crate) fn visit_chunk_ledger(
+    kio_dir: &Path,
+    strict_bounded: bool,
+    mut visit: impl FnMut(StoredChunk) -> Result<()>,
+) -> Result<Vec<ChunkPublicationEvent>> {
     let path = chunks_jsonl_path(kio_dir);
     let mut association_owners = BTreeMap::<u64, (String, String)>::new();
     let mut known_associations = BTreeSet::<(String, String)>::new();
     let mut chunk_rowid_owners = BTreeMap::<u64, String>::new();
     let mut rowid_for_chunk = BTreeMap::<String, u64>::new();
-    parse_chunk_ledger_with(kio_dir, |line, chunk| {
+    parse_chunk_ledger_with(kio_dir, strict_bounded, |line, chunk| {
         if chunk.rowid == 0 || chunk.association_rowid == 0 {
             return Err(corrupt_chunk_ledger_error(
                 &path,
@@ -694,15 +719,14 @@ pub(crate) fn visit_stored_chunks(
             ));
         }
         visit(chunk)
-    })?;
-    Ok(())
+    })
 }
 
 /// Read durable publication event rows from the chunk ledger. Creation rows
 /// remain parsed by `read_stored_chunks`; publication rows are additive and do
 /// not create another chunk/config association.
 pub(crate) fn read_chunk_publication_events(kio_dir: &Path) -> Result<Vec<ChunkPublicationEvent>> {
-    parse_chunk_ledger_with(kio_dir, |_, _| Ok(()))
+    parse_chunk_ledger_with(kio_dir, false, |_, _| Ok(()))
 }
 
 fn corrupt_chunk_ledger_error(path: &Path, line: usize, message: &str) -> KioError {

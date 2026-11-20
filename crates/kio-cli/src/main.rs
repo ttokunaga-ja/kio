@@ -517,11 +517,22 @@ fn print_output(value: Value, json_mode: bool) {
         }
     } else if let Some(changes) = value.get("changes").and_then(Value::as_array) {
         for change in changes {
-            println!(
-                "{} {}",
-                terminal_safe_text(change["change"].as_str().unwrap_or_default(), false),
-                terminal_safe_text(change["relative_path"].as_str().unwrap_or_default(), false)
-            );
+            let kind = terminal_safe_text(change["change"].as_str().unwrap_or_default(), false);
+            if let Some(path) = change["relative_path"].as_str() {
+                println!("{kind} {}", terminal_safe_text(path, false));
+            } else if let Some(roles) = change["changed_roles"].as_array() {
+                let old = change["old_tool_lock_hash"].as_str().unwrap_or_default();
+                let new = change["new_tool_lock_hash"].as_str().unwrap_or_default();
+                let roles: Vec<_> = roles.iter().filter_map(Value::as_str).collect();
+                println!(
+                    "{kind} {} -> {} ({})",
+                    terminal_safe_text(old, false),
+                    terminal_safe_text(new, false),
+                    terminal_safe_text(&roles.join(", "), false)
+                );
+            } else {
+                println!("{kind}");
+            }
         }
     } else if let Some(files) = value.get("files").and_then(Value::as_array) {
         for file in files {

@@ -1,5 +1,12 @@
 use super::*;
 
+fn manifest_pin(entry: &TreeEntry) -> Option<&str> {
+    entry
+        .normalize
+        .as_ref()
+        .map(|value| value.manifest_hash.as_str())
+}
+
 impl Repository {
     pub fn log(&self) -> Result<LogReport> {
         self.log_from(None)
@@ -82,7 +89,7 @@ impl Repository {
         Ok(LogReport { entries, truncated })
     }
 
-    pub fn diff(&self, a: &str, b: &str) -> Result<Vec<DiffEntry>> {
+    pub fn diff(&self, a: &str, b: &str) -> Result<DiffReport> {
         self.validate()?;
         let a_hash = self.resolve_commit(a)?;
         let b_hash = self.resolve_commit(b)?;
@@ -91,32 +98,94 @@ impl Repository {
         // that names WHICH side (a/b) is shallow, not a raw opaque
         // KIO-E-STORE-NOT-FOUND-001 whose hash the user cannot map to an operand
         // (docs/05 §3.4.1: "片方が shallow なら全ファイル差分は不能と明示").
-        let a_tree = self.diff_side_tree("a", &a_hash)?;
-        let b_tree = self.diff_side_tree("b", &b_hash)?;
-        let a_map = tree_map(&a_tree)?;
-        let b_map = tree_map(&b_tree)?;
-
-        let mut paths = BTreeSet::new();
-        paths.extend(a_map.keys().cloned());
-        paths.extend(b_map.keys().cloned());
-
+        let (a_commit, a_tree) = self.diff_side("a", &a_hash)?;
+        let (b_commit, b_tree) = self.diff_side("b", &b_hash)?;
+        let mut old = a_tree.entries.iter();
+        let mut new = b_tree.entries.iter();
+        let mut a = old.next().transpose()?;
+        let mut b = new.next().transpose()?;
         let mut changes = Vec::new();
-        for path in paths {
-            let change = match (a_map.get(&path), b_map.get(&path)) {
-                (None, Some(_)) => "added",
-                (Some(_), None) => "deleted",
-                (Some(old), Some(new)) if old != new => "modified",
+        loop {
+            let (left, right) = match (&a, &b) {
+                (Some(x), Some(y)) if x.path == y.path => (a.take(), b.take()),
+                (Some(x), Some(y)) if x.path < y.path => (a.take(), None),
+                (_, Some(_)) => (None, b.take()),
+                (Some(_), None) => (a.take(), None),
+                (None, None) => break,
+            };
+            if left.is_some() {
+                a = old.next().transpose()?;
+            }
+            if right.is_some() {
+                b = new.next().transpose()?;
+            }
+            let change = match (&left, &right) {
+                (None, Some(_)) => DiffChange::Added,
+                (Some(_), None) => DiffChange::Deleted,
+                (Some(x), Some(y)) if x.raw_hash != y.raw_hash => DiffChange::Modified,
+                (Some(x), Some(y)) if manifest_pin(x) != manifest_pin(y) => {
+                    DiffChange::NormalizeManifestChanged
+                }
                 _ => continue,
             };
+            let path = &left.as_ref().or(right.as_ref()).expect("one entry").path;
             changes.push(DiffEntry {
-                path: is_materializable_direct_child(&path).then(|| self.root.join(&path)),
-                relative_path: path.clone(),
-                change: change.to_owned(),
-                old_raw_hash: a_map.get(&path).cloned(),
-                new_raw_hash: b_map.get(&path).cloned(),
+                path: is_materializable_direct_child(path).then(|| self.root.join(path)),
+                relative_path: Some(path.clone()),
+                change,
+                old_raw_hash: left.map(|entry| entry.raw_hash),
+                new_raw_hash: right.map(|entry| entry.raw_hash),
             });
         }
-        Ok(changes)
+        if a_tree.chunking_config_hash != b_tree.chunking_config_hash {
+            changes.push(DiffEntry::scope(DiffChange::ChunkingConfigChanged));
+        }
+        if a_commit.tool_lock_hash != b_commit.tool_lock_hash {
+            let old = self.diff_tool_lock(&a_commit.tool_lock_hash)?;
+            let new = self.diff_tool_lock(&b_commit.tool_lock_hash)?;
+            let changed_roles = ["prepare", "markdown", "embedding"]
+                .into_iter()
+                .filter(|role| old.get(role) != new.get(role))
+                .collect();
+            changes.push(DiffEntry::scope(DiffChange::ToolLockChanged {
+                old_tool_lock_hash: a_commit.tool_lock_hash,
+                new_tool_lock_hash: b_commit.tool_lock_hash,
+                changed_roles,
+            }));
+        }
+        Ok(DiffReport {
+            before: DiffSnapshot {
+                commit_hash: a_hash,
+                tree: a_tree,
+            },
+            after: DiffSnapshot {
+                commit_hash: b_hash,
+                tree: b_tree,
+            },
+            changes,
+        })
+    }
+
+    fn diff_tool_lock(&self, hash: &str) -> Result<Value> {
+        let (lock, _) = self
+            .store
+            .decode_content_accounted(
+                ContentObjectKind::Toollock,
+                hash,
+                MAX_BOUND_CONFIG_BYTES,
+                |input| {
+                    serde_json::from_reader(input)
+                        .map_err(|error| KioError::schema(error.to_string()))
+                },
+            )
+            .map_err(|failure| failure.error)?;
+        let canonical = canonical_tool_lock_value(&lock)?;
+        if crate::cas::hash_bytes(&canonical_json_bytes(&canonical)?) != hash {
+            return Err(KioError::schema(
+                "historical tool-lock object is not canonical",
+            ));
+        }
+        Ok(canonical)
     }
 
     /// R16-5: read one `diff` side's tree, folding a missing commit OR tree object
@@ -127,7 +196,7 @@ impl Repository {
     /// to every other shallow-commit site (R16-1). `resolve_commit` already ran, so
     /// a genuinely absent operand is a distinct not_found — only a resolved commit
     /// whose backing objects are gone reaches here.
-    fn diff_side_tree(&self, side: &str, commit_hash: &str) -> Result<TreeObject> {
+    fn diff_side(&self, side: &str, commit_hash: &str) -> Result<(CommitObject, TreeObject)> {
         let commit = match self.read_commit(commit_hash) {
             Ok(commit) => commit,
             Err(error) if is_store_not_found(&error) => {
@@ -136,7 +205,7 @@ impl Repository {
             Err(error) => return Err(error),
         };
         match self.read_tree(&commit.tree) {
-            Ok(tree) => Ok(tree),
+            Ok(tree) => Ok((commit, tree)),
             Err(error) if is_store_not_found(&error) => {
                 crate::gc::GcSweepSession::bind_repository(self)?
                     .validate_final_shallow_tree(commit_hash, &commit.tree)?;

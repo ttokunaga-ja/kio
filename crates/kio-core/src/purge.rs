@@ -1088,6 +1088,29 @@ impl PurgeState {
         Ok(Some(parse_erase_receipt_bytes(&bytes, raw_hash)?))
     }
 
+    /// Read both marker histories against the caller's aggregate byte budget.
+    pub fn read_lifecycle_records(
+        &self,
+        raw_hash: &str,
+        remaining: &mut u64,
+    ) -> Result<(Option<TombstoneRecord>, Option<EraseReceipt>)> {
+        validate_hash("lifecycle lookup", raw_hash)?;
+        let mut read = |relative: PathBuf| {
+            let bytes = self.read_relative(&relative, MAX_PURGE_RECORD_BYTES.min(*remaining))?;
+            if let Some(bytes) = &bytes {
+                *remaining -= bytes.len() as u64;
+            }
+            Ok::<_, KioError>(bytes)
+        };
+        let tombstone = read(Self::tombstone_relative(raw_hash)?)?
+            .map(|bytes| parse_tombstone_bytes(&bytes, raw_hash))
+            .transpose()?;
+        let receipt = read(Self::erase_receipt_relative(raw_hash)?)?
+            .map(|bytes| parse_erase_receipt_bytes(&bytes, raw_hash))
+            .transpose()?;
+        Ok((tombstone, receipt))
+    }
+
     /// Append one lifecycle event to `raw_hash`'s tombstone, creating the
     /// record if absent (the initial `purged` case) or appending to it
     /// (retire, re-purge — LC58). Idempotent for a retried
