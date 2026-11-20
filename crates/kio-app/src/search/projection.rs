@@ -15,6 +15,7 @@ use crate::search::query::ensure_snapshot_tree_entries;
 use crate::search::query::snapshot_chunking_config_hash;
 use crate::search::query::source_tree_entry_snapshot_commits;
 use crate::search::query::token_equivalence_forms;
+use crate::search::query::tree_entry_projections;
 use crate::search::scope::ChunkMeta;
 use crate::search::scope::GlobalRanks;
 use crate::search::scope::ReplicaCandidateRequest;
@@ -1526,27 +1527,6 @@ fn source_tree_entry_projections(
     Ok(projections)
 }
 
-/// The part of a tree whose normalization identity is immutable in CAS.  A
-/// Ready predecessor is reusable only when its source cache says exactly this
-/// relation; a fallback row inferred from mutable latest-normalize state
-/// is deliberately not promoted through a new snapshot.
-fn normalized_tree_entry_projections(tree: &TreeObject) -> Result<Vec<TreeEntryProjection>> {
-    let mut rows = Vec::new();
-    for entry in &tree.entries {
-        let entry = entry?;
-        if let Some(normalize) = entry.normalize {
-            rows.push(TreeEntryProjection {
-                path: entry.path,
-                raw_hash: entry.raw_hash,
-                tool_profile_hash: Some(normalize.tool_profile_hash),
-                r#gen: Some(normalize.r#gen),
-                manifest_hash: Some(normalize.manifest_hash),
-            });
-        }
-    }
-    Ok(rows)
-}
-
 /// Reuse a just-prior Ready projection after a semantically unchanged manual
 /// snapshot.  This is a writer-side materialization of `tree_entries`, followed
 /// by the normal full replica write-through; it never creates a reader-side
@@ -1644,8 +1624,9 @@ pub(crate) fn republish_equivalent_manual_snapshot(
         return Ok(false);
     }
 
-    let expected =
-        normalized_tree_entry_projections(&prior_tree).map_err(|error| error.to_string())?;
+    // Compare the complete CAS relation, including the NULL normalization
+    // columns for raw-only entries.
+    let expected = tree_entry_projections(&prior_tree).map_err(|error| error.to_string())?;
     let source_rows = source_tree_entry_projections(&conn, &before.snapshot_commit)
         .map_err(|error| format!("read prior source tree entries: {error}"))?;
     if source_rows != expected {

@@ -30,7 +30,7 @@ use kio_core::ExitCode;
 use kio_core::KioError;
 use kio_core::Result;
 use kio_core::control::ControlHandle;
-use kio_core::dag::NormalizeRef;
+use kio_core::dag::{NormalizeRef, TreeObject};
 use kio_core::history::HistoryReader;
 use kio_core::scope::Repository;
 use kio_index::embedding_store::f32_from_le_bytes;
@@ -376,30 +376,32 @@ pub(crate) fn ensure_snapshot_tree_entries(
     if existing {
         return Ok(SnapshotTreeEntries::Projected);
     }
-    let mut rows: Vec<TreeEntryProjection> = Vec::new();
-    for entry in &tree.entries {
-        let entry = entry?;
-        let (tool_profile_hash, r#gen, manifest_hash) =
-            entry
-                .normalize
-                .as_ref()
-                .map_or((None, None, None), |normalize| {
+    insert_snapshot_tree_entries(conn, commit_hash, &tree_entry_projections(&tree)?)?;
+    Ok(SnapshotTreeEntries::Projected)
+}
+
+pub(crate) fn tree_entry_projections(tree: &TreeObject) -> Result<Vec<TreeEntryProjection>> {
+    tree.entries
+        .iter()
+        .map(|entry| {
+            let entry = entry?;
+            let (tool_profile_hash, r#gen, manifest_hash) =
+                entry.normalize.map_or((None, None, None), |normalize| {
                     (
-                        Some(normalize.tool_profile_hash.clone()),
+                        Some(normalize.tool_profile_hash),
                         Some(normalize.r#gen),
-                        Some(normalize.manifest_hash.clone()),
+                        Some(normalize.manifest_hash),
                     )
                 });
-        rows.push(TreeEntryProjection {
-            path: entry.path.clone(),
-            raw_hash: entry.raw_hash.clone(),
-            tool_profile_hash,
-            r#gen,
-            manifest_hash,
-        });
-    }
-    insert_snapshot_tree_entries(conn, commit_hash, &rows)?;
-    Ok(SnapshotTreeEntries::Projected)
+            Ok(TreeEntryProjection {
+                path: entry.path,
+                raw_hash: entry.raw_hash,
+                tool_profile_hash,
+                r#gen,
+                manifest_hash,
+            })
+        })
+        .collect()
 }
 
 /// One projected `tree_entries` row for [`insert_snapshot_tree_entries`].

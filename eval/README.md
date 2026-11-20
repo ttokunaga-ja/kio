@@ -388,8 +388,9 @@ reference tokenだけをdomain-separated anchorとして扱う。query自体も�
 prepare reportはscopeごとのbase/final commit・treeを束縛する。`scale-attestation.json`は次を証明する。
 
 - lane/profile/manifestとsource bytesの完全一致、isolated registryのindexed 20 scopes完全一致
-- 生CASからbase→final commit/tree関係、凍結adapter setのtool-lock preimage、chunk canonical bytes/hash、
-  publication/index projectionを再計算
+- 生CASからbase→final commit/tree関係、tool-lock preimage、chunk canonical bytes/hash、
+  publication/index projectionを再計算。期待するtool-lock identityは、評価器に組み込まれた
+  Prepare/Markdownizeのprofileとscale-v3専用embeddingの固定profileから導出する
 - current、historical-only、deleted、physical CAS、embedding/vector rowを別々に数え、凍結母集団と完全一致
 - history laneの`edit_operations` / `rename_operations` / `delete_operations`が各20件であり、
   current-text laneでは各0件、かつ両laneの母集団とdestinationが独立していること
