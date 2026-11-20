@@ -76,9 +76,9 @@ use kio_core::dag::{NormalizeRef, TreeObject};
 use kio_core::disk_records::{
     DiskRecords, RecordSorter, RecordStageRoot, RecordWriter, SortedRecordCursor,
 };
-use kio_core::scope::PendingNormalizeRef;
 use kio_core::scope::Repository;
 use kio_core::scope::new_ulid;
+use kio_core::scope::{DeferredInput, DeferredInputReason, PendingNormalizeRef};
 #[cfg(debug_assertions)]
 use kio_core::test_control::MarkdownizeAdapterMode;
 use kio_pipeline::budget::read_budget_policy;
@@ -182,7 +182,7 @@ pub(crate) fn index_preview_response(
 pub(crate) struct IndexPipelineResult {
     pub(crate) resource_limit: Option<kio_core::error::ResourceLimit>,
     pub(crate) normalizes: RecordWriter<(String, PendingNormalizeRef)>,
-
+    pub(crate) deferred_inputs: RecordWriter<DeferredInput>,
     pub(crate) network_allowed: bool,
     pub(crate) pending_online_tasks: usize,
     pub(crate) paused_tasks: usize,
@@ -575,96 +575,108 @@ pub(crate) fn test_markdown_unit(hint: &PreparedUnitHint, prefix: &str) -> Markd
     }
 }
 
-fn hash_unsupported_input(
-    repo: &Repository,
+fn unsupported_input(
     candidate: &ScanCandidate,
+    raw_hash: &str,
     reason: &str,
-) -> Result<UnsupportedInputDisposition> {
-    let root = repo.bound_root_handle().ok_or_else(|| {
-        pipeline_to_kio(kio_pipeline::PipelineError::contract(
-            "KIO-E-SCOPE-BOUND-STATE-001",
-            "managed index is missing its retained scope handle",
-        ))
-    })?;
-    let identity = kio_pipeline::scan::hash_bound_verified_scan_input(
-        root,
-        &candidate.input_path,
-        candidate.size_bytes,
-    )
-    .map_err(pipeline_to_kio)?;
-    Ok(UnsupportedInputDisposition {
+) -> UnsupportedInputDisposition {
+    UnsupportedInputDisposition {
         path: candidate.input_path.clone(),
-        raw_hash: identity.raw_hash,
+        raw_hash: raw_hash.to_owned(),
         media_type: candidate.media_type.clone(),
-        size_bytes: identity.size_bytes,
+        size_bytes: candidate.size_bytes,
         reason: reason.to_owned(),
-    })
+    }
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
-pub(super) struct ClassifiedInput {
-    pub(super) path: String,
-    pub(super) raw_hash: String,
-    pub(super) unsupported: bool,
+pub(super) struct ReindexInputClassifications {
+    pub(super) deferred_inputs: DiskRecords<DeferredInput>,
+    pub(super) unsupported: DiskRecords<UnsupportedInputDisposition>,
+}
+
+fn changed_scan_read(error: &kio_pipeline::PipelineError) -> Option<DeferredInputReason> {
+    match error {
+        kio_pipeline::PipelineError::Contract {
+            code: "KIO-E-SCAN-FILE-MISSING-001",
+            ..
+        } => Some(DeferredInputReason::MissingAfterScan),
+        kio_pipeline::PipelineError::Contract {
+            code:
+                "KIO-E-SCAN-FILE-IDENTITY-001"
+                | "KIO-E-SCAN-INPUT-CHANGED-001"
+                | "KIO-E-SCAN-INPUT-OVERSIZED-001",
+            ..
+        } => Some(DeferredInputReason::ChangedAfterScan),
+        _ => None,
+    }
 }
 
 pub(super) fn record_reindex_unsupported_inputs(
     repo: &Repository,
     preview: &ScanPreview,
     head_tree: &TreeObject,
-) -> Result<DiskRecords<ClassifiedInput>> {
+) -> Result<ReindexInputClassifications> {
     let max_input_bytes = effective_max_input_bytes(repo)?;
     let stages = repo.object_store().record_stages()?;
     let store = UnsupportedInputStore::new(repo.kio_dir())
         .with_published_tree(Some(head_tree))
         .with_record_stages(stages.clone());
     let mut observations = RecordWriter::new(&stages)?;
-    let mut classified = RecordWriter::new(&stages)?;
+    let mut deferred = RecordWriter::new(&stages)?;
     for candidate in &preview.candidates {
         let candidate = &candidate?;
         if candidate.ignored {
             continue;
         }
+        let Some(scan_hash) = candidate.raw_hash.as_deref() else {
+            continue;
+        };
         let disposition = if let Some(reason) =
             unsupported_reason_for_path(Path::new(&candidate.input_path))
         {
-            hash_unsupported_input(repo, candidate, reason)?
+            unsupported_input(candidate, scan_hash, reason)
         } else if candidate.media_type == "application/octet-stream"
             && candidate.size_bytes <= max_input_bytes
         {
-            let verified = read_repository_scan_input(repo, &candidate.input_path, max_input_bytes)
-                .map_err(pipeline_to_kio)?;
+            let verified =
+                match read_repository_scan_input(repo, &candidate.input_path, max_input_bytes) {
+                    Ok(verified) if verified.raw_hash == scan_hash => verified,
+                    Ok(_) => {
+                        deferred.push(&DeferredInput {
+                            path: candidate.input_path.clone(),
+                            reason: DeferredInputReason::ChangedAfterScan,
+                        })?;
+                        continue;
+                    }
+                    Err(error) => {
+                        let reason =
+                            changed_scan_read(&error).ok_or_else(|| pipeline_to_kio(error))?;
+                        deferred.push(&DeferredInput {
+                            path: candidate.input_path.clone(),
+                            reason,
+                        })?;
+                        continue;
+                    }
+                };
             let Some(reason) =
                 unsupported_reason_for_content(&candidate.media_type, &verified.bytes)
             else {
-                classified.push(&ClassifiedInput {
-                    path: candidate.input_path.clone(),
-                    raw_hash: verified.raw_hash,
-                    unsupported: false,
-                })?;
                 continue;
             };
-            UnsupportedInputDisposition {
-                path: candidate.input_path.clone(),
-                raw_hash: verified.raw_hash,
-                media_type: candidate.media_type.clone(),
-                size_bytes: verified.size_bytes,
-                reason: reason.to_owned(),
-            }
+            unsupported_input(candidate, scan_hash, reason)
         } else {
             continue;
         };
-        classified.push(&ClassifiedInput {
-            path: disposition.path.clone(),
-            raw_hash: disposition.raw_hash.clone(),
-            unsupported: true,
-        })?;
         observations.push(&disposition)?;
     }
+    let unsupported = observations.finish()?;
     store
-        .record_observations(observations.finish()?)
+        .record_observations(unsupported.iter())
         .map_err(pipeline_to_kio)?;
-    classified.finish()
+    Ok(ReindexInputClassifications {
+        deferred_inputs: deferred.finish()?,
+        unsupported,
+    })
 }
 
 pub(crate) fn run_index_pipeline(
@@ -768,6 +780,7 @@ pub(crate) fn run_index_pipeline(
     let stages = repo.object_store().record_stages()?;
     let mut result = IndexPipelineResult {
         normalizes: RecordWriter::new(&stages)?,
+        deferred_inputs: RecordWriter::new(&stages)?,
         network_allowed,
         resource_limit: None,
         pending_online_tasks: 0,
@@ -811,6 +824,9 @@ pub(crate) fn run_index_pipeline(
         if candidate.ignored || candidate.media_type == "inode/directory" {
             continue;
         }
+        let Some(scan_hash) = candidate.raw_hash.as_deref() else {
+            continue;
+        };
         let mut latest_unsupported = unsupported_by_path.at(&candidate.input_path)?.cloned();
         let unsupported_reason = unsupported_reason_for_path(Path::new(&candidate.input_path));
         if candidate.size_bytes > max_input_bytes && unsupported_reason.is_none() {
@@ -840,7 +856,7 @@ pub(crate) fn run_index_pipeline(
             continue;
         }
         if let Some(reason) = unsupported_reason {
-            let disposition = hash_unsupported_input(repo, candidate, reason)?;
+            let disposition = unsupported_input(candidate, scan_hash, reason);
             unsupported_observations.push(&disposition)?;
             continue;
         }
@@ -848,6 +864,13 @@ pub(crate) fn run_index_pipeline(
             match read_repository_scan_input(repo, &candidate.input_path, max_input_bytes) {
                 Ok(verified) => verified,
                 Err(error) => {
+                    if let Some(reason) = changed_scan_read(&error) {
+                        result.deferred_inputs.push(&DeferredInput {
+                            path: candidate.input_path.clone(),
+                            reason,
+                        })?;
+                        continue;
+                    }
                     repo.control().append_event_log_in_session(
                         repo.lock_session(),
                         "KIO-I-INDEX-INPUT-CHANGED-001",
@@ -859,28 +882,13 @@ pub(crate) fn run_index_pipeline(
                     continue;
                 }
             };
-        // R15-8: `candidate.raw_hash` was computed at SCAN time; `bytes` is read HERE. If
-        // the file was externally edited in that window, persisting the normalized
-        // instance under the stale SCAN hash while the closing snapshot hashes the CURRENT
-        // bytes for the tree entry would diverge their identities (the offline twin of
-        // R14-2). Re-hash what we actually read and, on a mismatch, SKIP this candidate —
-        // the next clean index re-scans and normalizes it under its correct identity. The
-        // window is one store-lock-held `kio index` plus an external write, so this is a
-        // rare defensive guard. (No deterministic test: reproducing it needs an external
-        // edit landing inside the lock-held critical section between the scan and this
-        // read, which no public seam exposes.)
+        // Only prepare bytes that still match the admitted scan identity.
         let current_hash = verified.raw_hash.clone();
-        if let Some(scan_hash) = &candidate.raw_hash
-            && scan_hash != &current_hash
-        {
-            repo.control().append_event_log_in_session(
-                repo.lock_session(),
-                "KIO-I-INDEX-INPUT-CHANGED-001",
-                "input file changed between scan and normalize; skipped to preserve \
-                     content-addressing (re-run index)",
-                json!({ "input_path": candidate.input_path }),
-            )?;
-            result.failed_files += 1;
+        if scan_hash != current_hash {
+            result.deferred_inputs.push(&DeferredInput {
+                path: candidate.input_path.clone(),
+                reason: DeferredInputReason::ChangedAfterScan,
+            })?;
             continue;
         }
         let raw_hash = current_hash;

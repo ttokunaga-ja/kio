@@ -55,6 +55,7 @@ fn records<T: serde::Serialize + serde::de::DeserializeOwned>(
 
 fn empty_status(quarantine: Vec<Value>) -> StatusResponse {
     StatusResponse {
+        deferred_inputs: kio_core::disk_records::DiskRecords::empty(),
         stage_residues: kio_core::disk_records::DiskRecords::empty(),
         office_readiness: None,
         scope_path: PathBuf::from("scope/日本語/.kio"),
@@ -215,6 +216,11 @@ fn status_projection_preserves_domain_file_omission_and_unsupported_input_record
         reason: "unsupported".to_owned(),
     }]);
     legacy["unsupported_inputs"] = json!([{"path":"clip.bin","raw_hash":"hash","media_type":"application/octet-stream","size_bytes":7,"reason":"unsupported"}]);
+    dto.deferred_inputs = records([kio_core::scope::DeferredInput {
+        path: "moving.txt".to_owned(),
+        reason: kio_core::scope::DeferredInputReason::UnstableDuringScan,
+    }]);
+    legacy["deferred_inputs"] = json!([{"path":"moving.txt","reason":"unstable_during_scan"}]);
     assert_projection(dto, legacy);
 }
 

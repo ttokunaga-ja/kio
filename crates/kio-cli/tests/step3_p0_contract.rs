@@ -15156,45 +15156,61 @@ fn pause_nc2_reindex(dir: &TempDir, ready: &Path) -> std::process::Child {
 
 #[cfg(debug_assertions)]
 #[test]
-fn nc2_aborts_when_classified_bytes_change_before_snapshot() {
+fn nc2_defers_when_classified_bytes_change_before_snapshot() {
     let dir = canonical_tempdir();
     let path = dir.path().join("document.cfg");
     let original = b"racedneedle searchable text\n";
+    let binary = vec![0xff; original.len()];
+    // Put the raced path after more than one run of classified inputs.
+    for n in 0..=kio_core::disk_records::SORT_BUFFER_RECORDS {
+        fs::write(dir.path().join(format!("{n:05}.rs")), "source fixture").unwrap();
+    }
     fs::write(&path, original).unwrap();
     kio(&dir, &["init"]).assert().success();
     json_success(&dir, &["index", "--yes", "--offline"]);
     let kio_dir = dir.path().join(".kio");
     let head = head_commit(&kio_dir);
+    let published = json_success(&dir, &["status"])["unsupported_inputs"].clone();
+    let replacements = canonical_tempdir();
 
-    // Put the raced path after more than one run of classified inputs.
-    for n in 0..=kio_core::disk_records::SORT_BUFFER_RECORDS {
-        fs::write(dir.path().join(format!("{n:05}.rs")), "source fixture").unwrap();
-    }
     for command in [NC2_REINDEX, &["index", "--yes", "--offline"][..]] {
         // Cover both directions, including a recognized text file whose
         // classification can become stale when binary content replaces it.
         for (before, after) in [
-            (b"\xff".as_slice(), original.as_slice()),
-            (original, b"\xff"),
+            (binary.as_slice(), original.as_slice()),
+            (original.as_slice(), binary.as_slice()),
         ] {
             fs::write(&path, before).unwrap();
+            let replacement = replacements.path().join("replacement.cfg");
+            fs::write(&replacement, after).unwrap();
             let output = nc2_change_before_snapshot(&dir, command, || {
-                fs::write(&path, after).unwrap();
+                fs::remove_file(&path).unwrap();
+                fs::rename(replacement, &path).unwrap();
             });
-            let error = assert_nc2_input_changed(command, &output);
-            assert!(
-                error["message"].as_str().unwrap().contains("document.cfg"),
-                "{command:?}: {error}"
-            );
+            assert_nc2_deferred(&dir, &output, "document.cfg", "changed_after_scan");
             assert_eq!(head_commit(&kio_dir), head);
+            assert_eq!(
+                json_success(&dir, &["status"])["unsupported_inputs"],
+                published
+            );
         }
     }
-    fs::write(&path, original).unwrap();
     let search = json_success(&dir, &["search", "racedneedle", "--mode", "text"]);
     pointer_for_path(&search, "document.cfg");
-    json_success(&dir, &["reindex", "--regenerate", "--yes", "--offline"]);
+    json_success(&dir, &["index", "--yes", "--offline"]);
+    let status = json_success(&dir, &["status"]);
+    assert!(status.get("deferred_inputs").is_none());
+    assert_eq!(
+        status["unsupported_inputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["path"] == "document.cfg")
+            .unwrap()["raw_hash"],
+        kio_core::cas::hash_bytes(&binary)
+    );
     let search = json_success(&dir, &["search", "racedneedle", "--mode", "text"]);
-    pointer_for_path(&search, "document.cfg");
+    assert_eq!(search["results"], serde_json::json!([]));
 }
 
 #[cfg(debug_assertions)]
@@ -15313,29 +15329,93 @@ fn nc2_purge_cannot_delete_raw_from_pending_publication() {
 
 #[cfg(debug_assertions)]
 #[test]
-fn nc2_rejects_renamed_inputs_before_snapshot() {
+fn nc2_defers_renamed_or_deleted_inputs_before_snapshot() {
     for command in [NC2_REINDEX, &["index", "--yes", "--offline"][..]] {
-        let dir = canonical_tempdir();
-        let original = dir.path().join("a.cfg");
-        let renamed = dir.path().join("b.cfg");
-        fs::write(&original, b"\xff").unwrap();
-        json_success(&dir, &["init"]);
-        json_success(&dir, &["index", "--yes", "--offline"]);
-        let kio_dir = dir.path().join(".kio");
-        let head = head_commit(&kio_dir);
-        let output = nc2_change_before_snapshot(&dir, command, || {
-            fs::rename(original, &renamed).unwrap();
-        });
-        assert_nc2_input_changed(command, &output);
-        assert_eq!(head_commit(&kio_dir), head);
-        json_success(&dir, command);
-        let status = json_success(&dir, &["status"]);
-        assert_eq!(status["unsupported_inputs"][0]["path"], "b.cfg");
-        assert_eq!(
-            status["unsupported_inputs"][0]["reason"],
-            "unrecognized_binary_without_local_text"
-        );
+        for renamed in [Some("b.cfg"), Some("A.cfg"), None] {
+            let dir = canonical_tempdir();
+            let original = dir.path().join("a.cfg");
+            fs::write(&original, b"\xff").unwrap();
+            json_success(&dir, &["init"]);
+            json_success(&dir, &["index", "--yes", "--offline"]);
+            let published = json_success(&dir, &["status"])["unsupported_inputs"].clone();
+            fs::write(dir.path().join("other.md"), "otherneedle text\n").unwrap();
+            let output = nc2_change_before_snapshot(&dir, command, || {
+                if let Some(renamed) = renamed {
+                    fs::rename(original, dir.path().join(renamed)).unwrap();
+                } else {
+                    fs::remove_file(original).unwrap();
+                }
+            });
+            let report = assert_nc2_deferred(&dir, &output, "a.cfg", "missing_after_scan");
+            if let Some(renamed) = renamed {
+                assert!(
+                    report["deferred_inputs"].as_array().unwrap().contains(
+                        &serde_json::json!({"path": renamed, "reason": "added_after_scan"})
+                    )
+                );
+            }
+            let search = json_success(&dir, &["search", "otherneedle", "--mode", "text"]);
+            if command[0] == "index" {
+                pointer_for_path(&search, "other.md");
+            }
+            assert_eq!(
+                json_success(&dir, &["status"])["unsupported_inputs"],
+                published
+            );
+            json_success(&dir, &["index", "--yes", "--offline"]);
+            let status = json_success(&dir, &["status"]);
+            assert!(status.get("deferred_inputs").is_none());
+            if let Some(renamed) = renamed {
+                assert_eq!(status["unsupported_inputs"][0]["path"], renamed);
+                assert_eq!(
+                    status["unsupported_inputs"][0]["reason"],
+                    published[0]["reason"]
+                );
+            } else {
+                assert_eq!(status["unsupported_inputs"], serde_json::json!([]));
+            }
+        }
     }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn nc2_defers_an_appended_file_while_publishing_other_files() {
+    use std::io::Write;
+    let dir = canonical_tempdir();
+    let path = dir.path().join("log.txt");
+    fs::write(&path, "previousneedle text\n").unwrap();
+    json_success(&dir, &["init"]);
+    json_success(&dir, &["index", "--yes", "--offline"]);
+    fs::write(dir.path().join("other.md"), "otherneedle text\n").unwrap();
+
+    for _ in 0..2 {
+        let output = nc2_change_before_snapshot(&dir, &["index", "--yes", "--offline"], || {
+            let mut log = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            writeln!(log, "appendedneedle").unwrap();
+        });
+        assert_nc2_deferred(&dir, &output, "log.txt", "changed_after_scan");
+        let status = kio(&dir, &["status"]).assert().success();
+        assert!(
+            String::from_utf8_lossy(&status.get_output().stdout)
+                .contains("deferred log.txt (changed_after_scan)")
+        );
+        let search = json_success(&dir, &["search", "previousneedle", "--mode", "text"]);
+        pointer_for_path(&search, "log.txt");
+        let search = json_success(&dir, &["search", "otherneedle", "--mode", "text"]);
+        pointer_for_path(&search, "other.md");
+        let search = json_success(&dir, &["search", "appendedneedle", "--mode", "text"]);
+        assert_eq!(search["results"], serde_json::json!([]));
+    }
+
+    json_success(&dir, &["index", "--yes", "--offline"]);
+    let search = json_success(&dir, &["search", "appendedneedle", "--mode", "text"]);
+    pointer_for_path(&search, "log.txt");
+    assert!(
+        json_success(&dir, &["status"])
+            .get("deferred_inputs")
+            .is_none()
+    );
 }
 
 #[cfg(debug_assertions)]
@@ -15353,16 +15433,24 @@ fn nc2_change_before_snapshot(
 }
 
 #[cfg(debug_assertions)]
-fn assert_nc2_input_changed(command: &[&str], output: &std::process::Output) -> Value {
-    assert!(!output.status.success(), "{command:?}: {output:?}");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let error: Value = serde_json::from_str(stderr.lines().last().unwrap_or_default())
-        .unwrap_or_else(|err| panic!("{command:?}: invalid error response ({err}): {stderr}"));
+fn assert_nc2_deferred(
+    dir: &TempDir,
+    output: &std::process::Output,
+    path: &str,
+    reason: &str,
+) -> Value {
+    assert!(output.status.success(), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let expected = serde_json::json!({ "path": path, "reason": reason });
+    let deferred = report["deferred_inputs"]
+        .as_array()
+        .expect("missing file deferrals");
+    assert!(deferred.contains(&expected), "{report}");
     assert_eq!(
-        error["error_code"], "KIO-E-SCAN-INPUT-CHANGED-001",
-        "{command:?}: {stderr}"
+        json_success(dir, &["status"])["deferred_inputs"],
+        report["deferred_inputs"]
     );
-    error
+    report
 }
 
 #[cfg(debug_assertions)]
@@ -15384,7 +15472,7 @@ fn nc2_defers_files_added_after_scanning() {
         let output = nc2_change_before_snapshot(&dir, command, || {
             fs::write(dir.path().join("b.cfg"), b"\xff").unwrap();
         });
-        assert!(output.status.success(), "{command:?}: {output:?}");
+        assert_nc2_deferred(&dir, &output, "b.cfg", "added_after_scan");
         let repo = Repository::open_read_only(dir.path()).unwrap();
         let head = repo
             .read_commit(&repo.head_commit_hash().unwrap().unwrap())

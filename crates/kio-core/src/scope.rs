@@ -165,13 +165,6 @@ pub struct PendingNormalizeRef {
     pub normalize: NormalizeRef,
 }
 
-/// An admitted path and its local Tier-A permission from index's sorted scan.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ScannedPathPolicy {
-    pub path: String,
-    pub allow_tier_a: bool,
-}
-
 #[derive(Debug)]
 struct WorkingFileCandidate {
     path: PathBuf,
@@ -222,6 +215,41 @@ impl Repository {
     pub fn object_store(&self) -> ObjectStore {
         self.store.clone()
     }
+}
+
+/// Input admitted by the managed index scan. No hash means the scan
+/// observed this path but could not read a stable version.
+#[derive(Serialize, Deserialize)]
+pub struct ScannedInput {
+    pub path: String,
+    pub raw_hash: Option<String>,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeferredInputReason {
+    AddedAfterScan,
+    MissingAfterScan,
+    ChangedAfterScan,
+    UnstableDuringScan,
+}
+
+impl DeferredInputReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AddedAfterScan => "added_after_scan",
+            Self::MissingAfterScan => "missing_after_scan",
+            Self::ChangedAfterScan => "changed_after_scan",
+            Self::UnstableDuringScan => "unstable_during_scan",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeferredInput {
+    pub path: String,
+    pub reason: DeferredInputReason,
 }
 
 #[derive(Debug, Clone)]

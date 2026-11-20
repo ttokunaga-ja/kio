@@ -275,6 +275,15 @@ impl StoreDirectory {
         atomic::write(self, self, relative, bytes, publication)
     }
 
+    pub(crate) fn write_atomic_stream(
+        &self,
+        relative: &Path,
+        publication: Publication,
+        write: impl FnOnce(&mut File) -> Result<()>,
+    ) -> Result<()> {
+        atomic::write_stream(self, relative, publication, write)
+    }
+
     /// Publish private bytes only after a caller's final target check succeeds.
     /// The check runs after staging and syncing, immediately before publication,
     /// with the actual retained destination parent and direct leaf name.

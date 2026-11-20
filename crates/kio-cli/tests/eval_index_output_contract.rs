@@ -8,7 +8,14 @@ fn run(root: &Path, device: &Path, args: &[&str]) -> Vec<u8> {
 }
 
 fn invoke(root: &Path, device: &Path, args: &[&str], scan_heap: bool) -> std::process::Output {
-    let output = Command::new(env!("CARGO_BIN_EXE_kio"))
+    let output = command(root, device, args, scan_heap).output().unwrap();
+    assert!(output.status.success(), "args={args:?}; {output:?}");
+    output
+}
+
+fn command(root: &Path, device: &Path, args: &[&str], scan_heap: bool) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kio"));
+    command
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env(
@@ -30,11 +37,8 @@ fn invoke(root: &Path, device: &Path, args: &[&str], scan_heap: bool) -> std::pr
         .env("TEMP", device.join("tmp"))
         .env("KIO_TEST_SCAN_HEAP", if scan_heap { "1" } else { "0" })
         .current_dir(root)
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "args={args:?}; {output:?}");
-    output
+        .args(args);
+    command
 }
 
 #[test]
@@ -216,6 +220,119 @@ fn working_scan_heap_is_bounded_through_cli_publication_and_output() {
             "{label}: output heap grew from {} to {}",
             small.1,
             large.1
+        );
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn mf3_deferrals_are_bounded_through_publication_and_status_output() {
+    use kio_core::disk_records::SORT_BUFFER_RECORDS;
+    use serde_json::Value;
+    use std::{
+        process::Stdio,
+        time::{Duration, Instant},
+    };
+
+    let mut measurements = Vec::new();
+    for count in [SORT_BUFFER_RECORDS + 1, SORT_BUFFER_RECORDS * 16 + 1] {
+        let fixture = support::canonical_tempdir();
+        let root = fixture.path().join("scope");
+        let device = fixture.path().join("device");
+        fs::create_dir(&root).unwrap();
+        for name in ["home", "config", "data", "cache", "state", "runtime", "tmp"] {
+            fs::create_dir_all(device.join(name)).unwrap();
+        }
+        fs::write(root.join("published.md"), "ordinary searchable text\n").unwrap();
+        run(&root, &device, &["--json", "init", "."]);
+        let incoming = fixture.path().join("incoming");
+        fs::create_dir(&incoming).unwrap();
+        let name = |index| format!("{index:05}-{}.rs", "late".repeat(30));
+        for index in 0..count {
+            fs::write(incoming.join(name(index)), "late source fixture\n").unwrap();
+        }
+        let ready = fixture.path().join("ready");
+        let mut child = command(&root, &device, &["--json", "index", "--offline"], true)
+            .env("KIO_TEST_DURABILITY_POINT", "before_index_snapshot")
+            .env("KIO_TEST_DURABILITY_READY", &ready)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let marker = format!("point=before_index_snapshot\npid={}\n", child.id());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while fs::read_to_string(&ready).ok().as_deref() != Some(&marker) {
+            if child.try_wait().unwrap().is_some() || Instant::now() >= deadline {
+                let _ = child.kill();
+                panic!(
+                    "index never reached publication: {:?}",
+                    child.wait_with_output().unwrap()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        for index in (0..count).rev() {
+            let leaf = name(index);
+            fs::rename(incoming.join(&leaf), root.join(leaf)).unwrap();
+        }
+        fs::write(ready.with_extension("release"), b"release").unwrap();
+
+        let indexed = child.wait_with_output().unwrap();
+        assert!(indexed.status.success(), "{indexed:?}");
+        let status = invoke(&root, &device, &["--json", "status"], true);
+        let human = invoke(&root, &device, &["status"], true);
+        let mut peaks = Vec::new();
+        for output in [&indexed, &status, &human] {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let fields = stderr
+                .lines()
+                .find_map(|line| line.strip_prefix("kio_scan_heap "))
+                .unwrap_or_else(|| panic!("missing scan heap: {stderr}"))
+                .split_ascii_whitespace()
+                .collect::<Vec<_>>();
+            peaks.push((
+                fields[0].parse::<usize>().unwrap(),
+                fields[1].parse::<usize>().unwrap(),
+            ));
+        }
+        measurements.push(peaks);
+
+        let indexed: Value = serde_json::from_slice(&indexed.stdout).unwrap();
+        let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+        assert_eq!(indexed["commit"]["stats"]["files_added"], 1);
+        assert_eq!(status["files"].as_array().unwrap().len(), 1);
+        assert_eq!(indexed["deferred_inputs"], status["deferred_inputs"]);
+        let deferred = status["deferred_inputs"].as_array().unwrap();
+        assert_eq!(deferred.len(), count);
+        for (index, row) in deferred.iter().enumerate() {
+            assert_eq!(row["path"], name(index));
+            assert_eq!(row["reason"], "added_after_scan");
+        }
+        let human = String::from_utf8(human.stdout).unwrap();
+        assert_eq!(
+            human
+                .lines()
+                .filter(|line| line.starts_with("deferred "))
+                .count(),
+            count
+        );
+        assert!(human.contains(&format!("deferred {} (added_after_scan)", name(count - 1))));
+    }
+    for (label, (small, large)) in ["index", "status JSON", "status text"]
+        .into_iter()
+        .zip(measurements[0].iter().zip(&measurements[1]))
+    {
+        eprintln!(
+            "{label} deferrals: scan {} -> {}, output {} -> {}",
+            small.0, large.0, small.1, large.1
+        );
+        assert!(
+            large.0 <= small.0 + 192 * 1024,
+            "{label}: working heap grew from {small:?} to {large:?}"
+        );
+        assert!(
+            large.1 <= small.1 + 64 * 1024,
+            "{label}: output heap grew from {small:?} to {large:?}"
         );
     }
 }

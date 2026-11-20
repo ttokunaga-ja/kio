@@ -963,7 +963,8 @@ tree は entries を単一の flat 配列で持つ。スコープ境界規則 (�
   canonical publication は有界 buffer と必要な private disk stage で行い、件数に比例する本文 bytes を
   常駐させない。実資源不足は件数超過／破損と区別して理由を表示し、entry を黙って捨てない。
 - `index`（preview を含む）、`reindex`、watch、`status` の working tree 走査も、候補の列挙・照合と
-  ファイルごとの結果を有界 buffer と逐次 reader で処理し、ファイル数に比例する走査メモリを確保しない。
+  ファイルごとの結果（見送ったパスと理由を含む）を有界 buffer と逐次 reader で処理し、
+  ファイル数に比例する走査メモリを確保しない。
   書き出しには tree と同じ private disk stage を使う。store を変更しない preview は private な作業ディレクトリに書き出す。
 - snapshot 時に tree_hash が現在の HEAD の tree と一致する場合、auto snapshot は commit を作らない (no-op。**例外 = resurrection finalize と tool_lock_hash の変化** — no-op 判定は tree_hash と commit の tool_lock_hash の両方を比較する。正本 [05-runtime.md §8.1](05-runtime.md))。tree は CAS object なので、内容不変なら新規 object も生成されない (tree_hash は保存バイト列の content hash、§8.1)
 - 1 ファイルの変更で tree 全体 (上表のサイズ) が新 object として書かれるのは仕様どおりの挙動である。
