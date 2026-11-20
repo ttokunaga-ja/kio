@@ -103,6 +103,7 @@ pub(crate) fn execute_lifecycle(
         Command::Watch(args) => watch_command::run(ctx, args, control),
         Command::Adapter(args) => run_adapter_lifecycle(ctx, args.command, control),
         Command::Ledger(args) => run_ledger_lifecycle(args, control),
+        Command::Model(command) => crate::model::run(ctx, command, control),
         _ => unreachable!("only lifecycle commands bypass adapter composition"),
     }
 }

@@ -21,7 +21,7 @@ pub use stage::{
     DirectoryStageIdentity, StageEntryState, StageIdentity, StageInspectionEntry, StageWriter,
 };
 pub(crate) mod planned_removal;
-pub use atomic::{ATOMIC_WORKSPACE_DIR, AtomicWorkspaceState};
+pub use atomic::{ATOMIC_WORKSPACE_DIR, AtomicWorkspaceState, hash_file as hash_regular_file};
 pub(crate) use planned_removal::require_same_filesystem;
 pub use planned_removal::{
     CAS_REMOVAL_QUARANTINE_PREFIX, PRUNE_DIRECTORY_QUARANTINE_PREFIX, PlannedDirectoryRemoval,
@@ -296,7 +296,8 @@ impl StoreDirectory {
         atomic::write(self, self, relative, bytes, publication)
     }
 
-    pub(crate) fn write_atomic_stream(
+    /// The callback writes and validates a retained private staging file before publication.
+    pub fn write_atomic_stream(
         &self,
         relative: &Path,
         publication: Publication,

@@ -28,6 +28,7 @@ pub enum CommandRequest {
     Batch(BatchArgs),
     Adapter(AdapterArgs),
     Ledger(LedgerArgs),
+    Model(ModelCommand),
     Repair(RepairArgs),
     Gc(GcArgs),
     /// Search indexed content.
@@ -42,6 +43,16 @@ pub enum CommandRequest {
     Purge(PurgeArgs),
     Reindex(ReindexArgs),
     Evidence(EvidenceArgs),
+}
+
+#[derive(Debug, Clone)]
+pub enum ModelCommand {
+    Status,
+    Install {
+        from: Option<PathBuf>,
+        yes: bool,
+        offline: bool,
+    },
 }
 
 #[derive(Debug, Clone)]

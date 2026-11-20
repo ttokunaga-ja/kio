@@ -198,7 +198,7 @@ kio evidence retarget <pointer> --at <commit> # exact-only read-only retarget。
 ```bash
 kio model status
 kio model install embeddinggemma-2 [--yes]
-kio model install embeddinggemma-2 --from <file> [--yes]
+kio model install embeddinggemma-2 --from <file> [--offline] [--yes]
 ```
 
 status は read-only で、取得・修復・同意・処理再開を起こさない。install は download または

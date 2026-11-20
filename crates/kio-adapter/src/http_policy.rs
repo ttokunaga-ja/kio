@@ -91,6 +91,10 @@ impl AuthenticatedHttpClient {
     /// Authenticated provider requests use HTTPS without proxies or redirects,
     /// matching the online runtime trust identity.
     pub(crate) fn agent(&self) -> ureq::Agent {
+        self.agent_with_redirect_limit(0)
+    }
+
+    pub(crate) fn agent_with_redirect_limit(&self, max_redirects: u32) -> ureq::Agent {
         // ureq 3's global timeout covers DNS through response-body completion.
         // Keep the strictest cap as the global deadline and explicitly return
         // status responses: callers retain their authenticated 401/403, 402, and
@@ -101,7 +105,7 @@ impl AuthenticatedHttpClient {
         let config = ureq::Agent::config_builder()
             .https_only(true)
             .proxy(None)
-            .max_redirects(0)
+            .max_redirects(max_redirects)
             .http_status_as_error(false)
             .timeout_connect(Some(policy.connect_timeout))
             .timeout_global(Some(effective_overall_timeout));
@@ -150,16 +154,7 @@ fn effective_overall_timeout(policy: HttpPolicy) -> Duration {
         .min(policy.write_timeout)
 }
 
-/// Read a response body under `max_bytes` with the shared identity-encoding
-/// posture (reject any transparent decompression, precheck `Content-Length`,
-/// hard-stop the wire read at the ceiling). Returns the raw bytes for
-/// non-JSON payloads (e.g. the Batch output-file JSONL, 07 §5.5);
-/// [`read_json_bounded`] layers JSON parsing on top for everything else.
-pub(crate) fn read_bytes_bounded(
-    mut response: HttpResponse,
-    max_bytes: usize,
-    context: &str,
-) -> Result<Vec<u8>> {
+pub(crate) fn require_identity_encoding(response: &HttpResponse, context: &str) -> Result<()> {
     if response
         .headers()
         .get("Content-Encoding")
@@ -170,6 +165,20 @@ pub(crate) fn read_bytes_bounded(
             "{context} uses unsupported content encoding"
         )));
     }
+    Ok(())
+}
+
+/// Read a response body under `max_bytes` with the shared identity-encoding
+/// posture (reject any transparent decompression, precheck `Content-Length`,
+/// hard-stop the wire read at the ceiling). Returns the raw bytes for
+/// non-JSON payloads (e.g. the Batch output-file JSONL, 07 §5.5);
+/// [`read_json_bounded`] layers JSON parsing on top for everything else.
+pub(crate) fn read_bytes_bounded(
+    mut response: HttpResponse,
+    max_bytes: usize,
+    context: &str,
+) -> Result<Vec<u8>> {
+    require_identity_encoding(&response, context)?;
     if let Some(content_length) = response
         .headers()
         .get("Content-Length")

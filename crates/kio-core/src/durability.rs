@@ -257,6 +257,7 @@ fn checkpoint_debug(owner: &crate::control::ControlHandle, point: DurabilityPoin
                     | DurabilityPoint::ExtractionDirectoryBeforeSync
                     | DurabilityPoint::BeforeAdapterSourceRead
                     | DurabilityPoint::BeforeImageReplayCandidateRead
+                    | DurabilityPoint::AtomicWriteStaged
                     | DurabilityPoint::AtomicWriteBeforeDirectorySync
             ))
     {

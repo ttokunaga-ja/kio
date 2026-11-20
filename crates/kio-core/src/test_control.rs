@@ -158,6 +158,7 @@ fn u64_selector(name: &str) -> Selector<u64> {
 /// Adapter seams. Fixture values that name files retain OS-path semantics.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct AdapterTestControl {
+    pub model_source: Selector<String>,
     pub mistral_ocr: Selector<MistralOcrMode>,
     pub gemini_embed: Selector<GeminiEmbedMode>,
     pub local_ocr: Selector<LocalOcrMode>,
@@ -290,6 +291,7 @@ impl DebugTestControl {
         Self {
             fixed_now: text("KIO_FIXED_NOW"),
             adapters: AdapterTestControl {
+                model_source: text("KIO_TEST_MODEL_SOURCE"),
                 mistral_ocr: selector("KIO_TEST_MISTRAL_OCR", MistralOcrMode::parse),
                 gemini_embed: selector("KIO_TEST_GEMINI_EMBED", GeminiEmbedMode::parse),
                 local_ocr: selector("KIO_TEST_LOCAL_OCR", LocalOcrMode::parse),

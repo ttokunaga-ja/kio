@@ -242,7 +242,8 @@ pub(crate) fn file_id(file: &File) -> Result<FileSystemIdentity> {
     crate::platform::atomic_semantics::atomic_file_identity(file)
 }
 
-pub(crate) fn hash_file(file: &mut File, max_bytes: u64) -> Result<(String, u64)> {
+/// Hash a retained file from its current position, checking length and identity.
+pub fn hash_file(file: &mut File, max_bytes: u64) -> Result<(String, u64)> {
     let before_id = file_id(file)?;
     let before = file
         .metadata()

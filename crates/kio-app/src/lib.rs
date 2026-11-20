@@ -73,6 +73,7 @@ mod image_authority;
 mod image_ingest;
 mod managed_restore;
 mod management;
+mod model;
 mod multi_scope;
 mod ocr_discovery;
 mod online_task;
@@ -141,15 +142,16 @@ fn execute_with_index_origin(
             ..
         }) | Command::Adapter(AdapterArgs {
             command: Some(AdapterCommand::Revoke(_) | AdapterCommand::Trust(_)),
-        }) | Command::Ledger(LedgerArgs {
-            command: Some(
-                LedgerCommand::Init { .. }
-                    | LedgerCommand::Status
-                    | LedgerCommand::Backup(_)
-                    | LedgerCommand::Restore(_)
-                    | LedgerCommand::Recover,
-            ),
-        })
+        }) | Command::Model(_)
+            | Command::Ledger(LedgerArgs {
+                command: Some(
+                    LedgerCommand::Init { .. }
+                        | LedgerCommand::Status
+                        | LedgerCommand::Backup(_)
+                        | LedgerCommand::Restore(_)
+                        | LedgerCommand::Recover,
+                ),
+            })
     ) {
         return execute_lifecycle(ctx, &control, command);
     }
@@ -220,6 +222,7 @@ fn adapter_roles_for_command(command: &Command) -> &'static [&'static str] {
         | Command::Inspect(_)
         | Command::Tag(_)
         | Command::Ledger(_)
+        | Command::Model(_)
         | Command::Repair(_)
         | Command::Gc(_)
         | Command::Open(_)
@@ -253,6 +256,7 @@ fn execute_dispatch(ctx: &Invocation<'_>, command: Command) -> Result<CommandRes
         Command::Batch(args) => run_batch(ctx, args),
         Command::Adapter(args) => run_adapter(ctx, args),
         Command::Ledger(args) => run_ledger(adapter_settings, args, ctx.control),
+        Command::Model(_) => unreachable!("model commands bypass adapter composition"),
         Command::Repair(args) => run_repair(ctx, args),
         Command::Gc(args) => gc::run(ctx, args.dry_run, args.yes, args.prune_unreachable, false),
         Command::Search(args) => run_search(ctx, args),

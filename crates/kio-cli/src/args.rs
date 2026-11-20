@@ -41,6 +41,11 @@ pub(crate) enum Command {
     Batch(BatchArgs),
     Adapter(AdapterArgs),
     Ledger(LedgerArgs),
+    /// Inspect or explicitly install the device-local embedding model.
+    Model {
+        #[command(subcommand)]
+        command: ModelCommand,
+    },
     Repair(RepairArgs),
     /// Plan retention-based shallow GC without changing the store.
     Gc(GcArgs),
@@ -425,6 +430,29 @@ pub(crate) struct TrustRotateArgs {
     #[arg(long)]
     pub(crate) yes: bool,
 }
+#[derive(Debug, Subcommand)]
+pub(crate) enum ModelCommand {
+    /// Verify the installed model without changing device state.
+    Status,
+    /// Download the pinned model or import it from a file.
+    Install {
+        #[arg(value_enum)]
+        model: ModelName,
+        #[arg(long, value_name = "FILE")]
+        from: Option<PathBuf>,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        offline: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum ModelName {
+    #[value(name = "embeddinggemma-2")]
+    EmbeddingGemma2,
+}
+
 #[derive(Debug, Args)]
 pub(crate) struct LedgerArgs {
     #[command(subcommand)]
@@ -937,6 +965,15 @@ impl From<Command> for app::CommandRequest {
             Command::Batch(args) => Self::Batch(args.into()),
             Command::Adapter(args) => Self::Adapter(args.into()),
             Command::Ledger(args) => Self::Ledger(args.into()),
+            Command::Model { command } => Self::Model(match command {
+                ModelCommand::Status => app::ModelCommand::Status,
+                ModelCommand::Install {
+                    model: ModelName::EmbeddingGemma2,
+                    from,
+                    yes,
+                    offline,
+                } => app::ModelCommand::Install { from, yes, offline },
+            }),
             Command::Repair(args) => Self::Repair(args.into()),
             Command::Gc(args) => Self::Gc(args.into()),
             Command::Search(args) => Self::Search(args.into()),

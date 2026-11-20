@@ -8,6 +8,7 @@ pub mod gc;
 pub mod history;
 pub mod index;
 pub mod ledger;
+pub mod model;
 pub mod mutation;
 pub mod pointer;
 pub mod reindex;
@@ -44,6 +45,7 @@ pub enum ResponseBody {
     Batch(batch::BatchResponse),
     Adapter(adapter::AdapterResponse),
     Ledger(ledger::LedgerResponse),
+    Model(model::ModelResponse),
     Repair(repair::RepairResponse),
     Index(index::IndexResponse),
     Reindex(reindex::ReindexResponse),
