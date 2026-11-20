@@ -317,7 +317,7 @@ mod tests {
                 && loaded.as_deref().is_none_or(|actual| {
                     let expected = self.native_definition(m);
                     if self.kind == SchedulerKind::TaskScheduler {
-                        crate::platform::watch_service_model::task_definition_matches(
+                        crate::platform::watch_task_definition::task_definition_matches(
                             actual, &expected,
                         )
                     } else {
@@ -325,7 +325,7 @@ mod tests {
                     }
                 })
                 && (self.kind != SchedulerKind::Systemd
-                    || crate::platform::watch_unit_model::unit_definition_matches(
+                    || crate::platform::watch_systemd_unit::unit_definition_matches(
                         &format!(
                             "# {}\n{}{}",
                             m.native_path.display(),

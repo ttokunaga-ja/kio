@@ -1,7 +1,7 @@
+use super::watch_runner::{run_native, run_native_output};
 use crate::response::watch::NativeServiceState;
 use crate::watch_service::{
-    ServiceEnvironment, ServiceManifest, invalid, run_native, run_native_output,
-    service_environment_pairs, service_error,
+    ServiceEnvironment, ServiceManifest, invalid, service_environment_pairs, service_error,
 };
 use kio_core::Result;
 use kio_process::BoundedProcessOutput;
@@ -78,7 +78,7 @@ fn loaded_definition_matches_with_query(
     manifest: &ServiceManifest,
     mut query: impl FnMut(&str) -> Result<String>,
 ) -> Result<bool> {
-    if !super::watch_unit_model::unit_definition_matches(
+    if !super::watch_systemd_unit::unit_definition_matches(
         &query("cat")?,
         &manifest.native_path,
         &manifest.definition,
@@ -95,7 +95,7 @@ pub(crate) fn native_prepare_replacement(manifest: &ServiceManifest) -> Result<(
     }
     // Called only for a durable, approved replacement whose private target
     // file has already been published. Do not execute any cached stop action.
-    if !super::watch_unit_model::unit_definition_matches(
+    if !super::watch_systemd_unit::unit_definition_matches(
         &complete_source(manifest)?,
         &manifest.native_path,
         &manifest.definition,
