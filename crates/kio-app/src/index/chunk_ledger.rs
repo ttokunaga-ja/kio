@@ -547,13 +547,6 @@ fn parse_chunk_ledger_with(
         }
         remaining -= count as u64;
         if frame.last() != Some(&b'\n') {
-            if strict_bounded && count != 0 {
-                return Err(corrupt_chunk_ledger_error(
-                    &path,
-                    line_no + 1,
-                    "unterminated record",
-                ));
-            }
             break;
         }
         let line = std::str::from_utf8(&frame).map_err(|_| {

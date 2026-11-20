@@ -2125,6 +2125,73 @@ fn r9_4_partial_task_recovers_via_retry_and_status_counts_it() {
         "a Partial task must count as pending enrichment: {search}"
     );
 
+    use kio_core::cas::{ContentObjectKind, canonical_json_bytes};
+    use kio_core::dag::NormalizeRef;
+    use kio_core::scope::{PendingNormalizeRef, Repository};
+    let repo = Repository::open(dir.path()).unwrap();
+    let task = TaskStore::new(repo.kio_dir())
+        .all()
+        .unwrap()
+        .into_iter()
+        .find(|task| task.input_path == "report.pdf" && task.status == TaskStatus::Partial)
+        .unwrap();
+    let TaskOutputRef::NormalizedInstance {
+        raw_hash,
+        tool_profile_hash,
+        r#gen,
+        ..
+    } = validate_task_output_ref(repo.kio_dir(), &task).unwrap()
+    else {
+        panic!("normalized instance")
+    };
+    let manifest = kio_pipeline::markdownize::load_validated_normalized_instance(
+        repo.kio_dir(),
+        &raw_hash,
+        &tool_profile_hash,
+        r#gen,
+    )
+    .unwrap()
+    .manifest;
+    let failed_unit = manifest
+        .units
+        .iter()
+        .find(|unit| unit.status == UnitStatus::Failed)
+        .unwrap()
+        .unit_key
+        .clone();
+    let manifest_hash = repo
+        .object_store()
+        .write_content_object(
+            ContentObjectKind::Manifest,
+            &canonical_json_bytes(&serde_json::to_value(&manifest).unwrap()).unwrap(),
+        )
+        .unwrap();
+    // Persist the actual partial response as a historical pin before exercising
+    // the production retry/finalize path on that same generation.
+    let partial_head = repo
+        .auto_snapshot_with_bound_normalize(
+            Some("retain partial result"),
+            Some("2026-07-03T00:00:01Z"),
+            &|_| true,
+            &BTreeMap::from([(
+                "report.pdf".to_owned(),
+                PendingNormalizeRef {
+                    expected_raw_hash: raw_hash.clone(),
+                    normalize: NormalizeRef {
+                        tool_profile_hash: tool_profile_hash.clone(),
+                        r#gen,
+                        manifest_hash: manifest_hash.clone(),
+                    },
+                },
+            )]),
+            &BTreeSet::new(),
+            None,
+        )
+        .unwrap()
+        .commit_hash
+        .unwrap();
+    json_success(&dir, ["repair", "rebuild-db", "--offline"]);
+
     // Retry with the full mock: the failed unit completes → the task reaches Done.
     let retry = json_success_with_env(
         &dir,
@@ -2147,6 +2214,44 @@ fn r9_4_partial_task_recovers_via_retry_and_status_counts_it() {
     assert!(
         !has_partial(&status),
         "no Partial task may remain: {status}"
+    );
+    let complete_head = repo.head_commit_hash().unwrap().unwrap();
+    let completed_tree = repo
+        .read_tree(&repo.read_commit(&complete_head).unwrap().tree)
+        .unwrap();
+    let completed_entry = completed_tree.find_entry("report.pdf").unwrap().unwrap();
+    let completed_pin = completed_entry.normalize.unwrap();
+    assert_eq!(completed_entry.raw_hash, raw_hash);
+    assert_eq!(completed_pin.r#gen, r#gen);
+    assert_eq!(completed_pin.tool_profile_hash, tool_profile_hash);
+    assert_ne!(completed_pin.manifest_hash, manifest_hash);
+    let completed = kio_pipeline::markdownize::read_canonical_manifest(
+        &repo.object_store(),
+        &completed_pin.manifest_hash,
+        kio_core::cas::MAX_MANIFEST_OBJECT_BYTES,
+    )
+    .unwrap()
+    .0;
+    assert!(
+        completed
+            .units
+            .iter()
+            .any(|unit| unit.unit_key == failed_unit && unit.status == UnitStatus::Done)
+    );
+    let diff = json_success(&dir, ["diff", &partial_head, &complete_head]);
+    let changes = diff["changes"].as_array().unwrap();
+    assert!(
+        changes
+            .iter()
+            .any(|change| change["change"] == "normalize_manifest_changed"),
+        "{diff}"
+    );
+    assert!(
+        !changes.iter().any(|change| matches!(
+            change["change"].as_str(),
+            Some("added" | "deleted" | "modified")
+        )),
+        "{diff}"
     );
     let search = json_success_with_env(&dir, ["search", "alpha"], &[free_embedding]);
     assert_eq!(

@@ -1344,15 +1344,37 @@ fn qb39_change(dir: &TempDir, a: &str, b: &str, kind: &str) -> (Value, String) {
 fn qb39_diff_detects_a_same_gen_manifest_change() {
     let (dir, base, commit, mut tree) = qb39_snapshot();
     let store = ObjectStore::new(kio_dir(&dir));
-    // Diff compares the pins in the tree. Manifest bodies are outside this fixture.
+    let profile = hash_bytes(b"same profile");
+    let archive_manifest = |run_id: &str| {
+        let manifest = serde_json::json!({
+            "preparation_provenance": kio_pipeline::markdownize::PreparationProvenance::local(),
+            "raw_hash": tree["entries"][0]["raw_hash"],
+            "tool_profile_hash": profile,
+            "gen": 0, "parent_gen": null, "run_id": run_id,
+            "generated_at": "2026-07-12T00:00:00Z",
+            "units": [{
+                "order": 0, "unit_key": "file", "unit_ref": kio_pipeline::prepare::unit_ref("file"),
+                "unit_type": "file", "status": "failed", "prepared_hash": profile,
+                "preparation_profile_hash": profile, "unit_object_hash": null,
+                "error_kind": "network_error",
+            }]
+        });
+        store
+            .write_content_object(
+                ContentObjectKind::Manifest,
+                &canonical_json_bytes(&manifest).unwrap(),
+            )
+            .unwrap()
+    };
+    let a_manifest = archive_manifest("run_first");
+    let b_manifest = archive_manifest("run_second");
     tree["entries"][0]["normalize"] = serde_json::json!({
-        "tool_profile_hash": hash_bytes(b"same profile"),
+        "tool_profile_hash": profile,
         "gen": 0,
-        "manifest_hash": hash_bytes(b"partial manifest")
+        "manifest_hash": a_manifest,
     });
     let a = qb39_child(&store, &base, commit.clone(), &tree);
-    tree["entries"][0]["normalize"]["manifest_hash"] =
-        serde_json::json!(hash_bytes(b"completed manifest"));
+    tree["entries"][0]["normalize"]["manifest_hash"] = serde_json::json!(b_manifest);
     let b = qb39_child(&store, &a, commit, &tree);
 
     let (change, text) = qb39_change(&dir, &a, &b, "normalize_manifest_changed");
@@ -1445,7 +1467,11 @@ fn qb39_diff_rejects_missing_required_derived_fields() {
 fn qb39_chunk_history() -> (TempDir, String, String, String) {
     let dir = canonical_tempdir();
     success(&dir, &["init"]);
-    let a = index_at(&dir, "2026-07-12T00:00:00Z", "# Publication\n\nA chunk.\n");
+    let a = index_at(
+        &dir,
+        "2026-07-12T00:00:00Z",
+        "# Publication\n\nA chunk.\n\n## More\n\nAnother chunk.\n",
+    );
     let commit = success(&dir, &["inspect", &a]);
     let tree = success(&dir, &["inspect", commit["tree"].as_str().unwrap()]);
     let store = ObjectStore::new(kio_dir(&dir));
@@ -1488,11 +1514,7 @@ fn qb39_diff_rejects_missing_or_malformed_chunk_publication() {
     let (dir, a, b, _) = qb39_chunk_history();
     let ledger = kio_dir(&dir).join("index/chunks.jsonl");
     let records = fs::read_to_string(&ledger).unwrap();
-    for replacement in [
-        "",
-        "{\"event\":\"publication\"}\n",
-        "{\"event\":\"publication\"",
-    ] {
+    for replacement in ["", "{\"event\":\"publication\"}\n"] {
         let mut contents = records
             .lines()
             .filter(|line| !line.contains("\"event\":\"publication\""))
@@ -1505,6 +1527,111 @@ fn qb39_diff_rejects_missing_or_malformed_chunk_publication() {
         assert_ne!(code, 0, "{error}");
         assert_eq!(error["error_code"], "KIO-E-STORE-CORRUPT-001", "{error}");
     }
+}
+
+#[test]
+fn qb39_diff_ignores_a_torn_uncommitted_ledger_tail() {
+    let (dir, a, b, _) = qb39_chunk_history();
+    let ledger = kio_dir(&dir).join("index/chunks.jsonl");
+    let mut bytes = fs::read(&ledger).unwrap();
+    bytes.extend_from_slice(b"{\"event\":\"publication\"");
+    fs::write(ledger, bytes).unwrap();
+    qb39_change(&dir, &a, &b, "chunk_set_changed");
+}
+
+#[test]
+fn qb39_diff_rejects_a_lost_chunk_event_without_the_projection() {
+    let (dir, a, b, _) = qb39_chunk_history();
+    let ledger = kio_dir(&dir).join("index/chunks.jsonl");
+    let records = fs::read_to_string(&ledger).unwrap();
+    let creations: String = records
+        .split_inclusive('\n')
+        .filter(|line| !line.contains("\"event\":\"publication\""))
+        .collect();
+    let sqlite = kio_dir(&dir).join("index/sqlite.db");
+    fs::remove_file(&sqlite).unwrap();
+    fs::write(&ledger, &creations).unwrap();
+    for remove_ledger in [false, true] {
+        if remove_ledger {
+            fs::remove_file(&ledger).unwrap();
+        }
+        let (code, error) = run(&dir, &["diff", &a, &b]);
+        assert_ne!(code, 0, "{error}");
+        assert_eq!(error["error_code"], "KIO-E-STORE-CORRUPT-001", "{error}");
+    }
+    kio_core::store_dir::StoreDirectory::open(&kio_dir(&dir))
+        .unwrap()
+        .write_atomic(
+            std::path::Path::new("index/chunks.jsonl"),
+            creations.as_bytes(),
+            kio_core::store_dir::Publication::CreateOnly,
+        )
+        .unwrap();
+    success(&dir, &["repair", "rebuild-db"]);
+    // Repair can backfill the ledger. Reproduce a lost association (creation
+    // and event) with a rebuilt projection that contains no publication rows.
+    let first: Value = serde_json::from_str(records.lines().next().unwrap()).unwrap();
+    let lost_id = first["chunk_id"].as_str().unwrap();
+    let damaged: String = records
+        .split_inclusive('\n')
+        .filter(|line| !line.contains(lost_id))
+        .collect();
+    assert!(damaged.contains("\"event\":\"publication\""));
+    fs::write(&ledger, damaged).unwrap();
+    support::prepare_private_sqlite_sidecars(&sqlite).unwrap();
+    rusqlite::Connection::open(sqlite)
+        .unwrap()
+        .execute("DELETE FROM chunk_publications", [])
+        .unwrap();
+    let (code, error) = run(&dir, &["diff", &a, &b]);
+    assert_ne!(code, 0, "{error}");
+    assert_eq!(error["error_code"], "KIO-E-STORE-CORRUPT-001", "{error}");
+}
+
+#[test]
+fn qb39_diff_rejects_a_shallow_chunk_introduction_with_readable_endpoints() {
+    use kio_core::gc::ShallowReceipt;
+    use kio_core::store_dir::{Publication, StoreDirectory};
+    use std::path::Path;
+
+    let (dir, a, b, c) = qb39_chunk_history();
+    let repo = Repository::open(dir.path()).unwrap();
+    let intro = repo.read_commit(&b).unwrap();
+    let mut tree = serde_json::to_value(repo.read_tree(&intro.tree).unwrap()).unwrap();
+    let raw = tree["entries"][0]["raw_hash"].clone();
+    tree["entries"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "path": "other.txt", "type": "file", "raw_hash": raw
+        }));
+    let store = ObjectStore::new(kio_dir(&dir));
+    let commit = serde_json::to_value(&intro).unwrap();
+    let left = qb39_child(&store, &a, commit.clone(), &tree);
+    let right = qb39_child(&store, &b, commit, &tree);
+    qb39_change(&dir, &left, &right, "chunk_set_changed");
+
+    fs::write(kio_dir(&dir).join("HEAD"), format!("{right}\n")).unwrap();
+    let kio = StoreDirectory::open(&kio_dir(&dir)).unwrap();
+    kio.create_directory_all(Path::new("gc/shallowed")).unwrap();
+    for hash in [a, b, c] {
+        let receipt = ShallowReceipt::new(
+            hash.clone(),
+            intro.tree.clone(),
+            "2026-08-14T00:00:00Z".into(),
+        )
+        .unwrap();
+        kio.write_atomic(
+            &Path::new("gc/shallowed").join(hash.strip_prefix("sha256:").unwrap()),
+            &receipt.canonical_bytes().unwrap(),
+            Publication::CreateOnly,
+        )
+        .unwrap();
+    }
+    fs::remove_file(store.object_path(ObjectKind::Tree, &intro.tree).unwrap()).unwrap();
+    let (code, error) = run(&dir, &["diff", &left, &right]);
+    assert_ne!(code, 0, "{error}");
+    assert_eq!(error["error_code"], "KIO-E-COMMIT-SHALLOW-001", "{error}");
 }
 
 fn qb39_resurrection_history() -> (TempDir, String, String, String) {
@@ -1578,6 +1705,24 @@ fn qb39_diff_rejects_missing_or_malformed_resurrection_events() {
         assert_ne!(code, 0, "{error}");
         assert_eq!(error["error_code"], "KIO-E-STORE-CORRUPT-001", "{error}");
     }
+}
+
+#[test]
+fn qb39_diff_rejects_a_lost_retirement_between_empty_endpoints() {
+    let (dir, _, purged, _) = qb39_resurrection_history();
+    fs::remove_file(dir.path().join("notes.txt")).unwrap();
+    let deleted = success(&dir, &["snapshot", "create", "-m", "removed again"]);
+    let deleted = deleted["commit_hash"].as_str().unwrap();
+    qb39_change(&dir, &purged, deleted, "resurrection_published");
+
+    let purge = PurgeState::open(kio_dir(&dir)).unwrap();
+    let marker = purge.tombstone_path(&hash_bytes(b"original raw")).unwrap();
+    let mut record: Value = serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
+    record["events"].as_array_mut().unwrap().pop().unwrap();
+    fs::write(marker, serde_json::to_vec(&record).unwrap()).unwrap();
+    let (code, error) = run(&dir, &["diff", &purged, deleted]);
+    assert_ne!(code, 0, "{error}");
+    assert_eq!(error["error_code"], "KIO-E-STORE-CORRUPT-001", "{error}");
 }
 
 fn log_commit_hashes(response: &Value) -> Vec<String> {

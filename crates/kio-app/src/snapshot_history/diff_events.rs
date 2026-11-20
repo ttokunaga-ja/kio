@@ -9,24 +9,37 @@ use crate::object_persistence::index_to_kio;
 use kio_core::cas::{VerifiedCasReadBudget, hash_bytes, is_hash};
 use kio_core::dag::{CommitObject, CommitType, TreeObject};
 use kio_core::history::{DEFAULT_MAX_HISTORY_TREE_ENTRIES, DEFAULT_MAX_HISTORY_VERIFIED_BYTES};
-use kio_core::purge::{EventKind, PurgeState, canonical_final_event, verify_marker_binding};
+use kio_core::purge::{EventKind, PurgeState, verify_marker_binding};
 use kio_core::scope::{DiffChange, DiffEntry, LogReport, Repository};
-use kio_core::{KioError, Result};
+use kio_core::{ExitCode, KioError, Result};
 use kio_index::fts::{
     ExistingSourceIndexOpenMode, FtsSchemaConfig, FtsTokenizer,
     open_existing_source_index_connection,
 };
+use kio_pipeline::PipelineError;
 use std::collections::{BTreeMap, BTreeSet};
 
 type Ancestry<'a> = BTreeMap<&'a str, (usize, &'a CommitObject)>;
 type Publications = Vec<(String, String, String)>;
 type Creations = BTreeMap<(String, String), StoredChunk>;
+type Associations<'a> = BTreeMap<(&'a str, &'a str), BTreeSet<&'a str>>;
+type UnitGroup<'a> = (&'a str, &'a str, u64, &'a str, &'a str);
+type LifecycleUpdates<'a> = BTreeMap<String, Vec<(&'a str, (u64, bool), EventKind)>>;
 
 pub(super) fn diff(repo: &Repository, before: &str, after: &str) -> Result<Vec<DiffEntry>> {
-    let mut report = repo.diff(before, after)?;
+    diff_with_limit(repo, before, after, DEFAULT_MAX_HISTORY_VERIFIED_BYTES)
+}
+
+fn diff_with_limit(
+    repo: &Repository,
+    before: &str,
+    after: &str,
+    max_bytes: u64,
+) -> Result<Vec<DiffEntry>> {
     VerifiedCasReadBudget::new()
-        .run(DEFAULT_MAX_HISTORY_VERIFIED_BYTES, |reads| {
+        .run(max_bytes, |reads| {
             let repo = repo.with_verified_reads(reads)?;
+            let mut report = repo.diff(before, after)?;
             // Writers append the ledger before updating SQLite. Capture the
             // projection first, so a concurrent append cannot make it look ahead
             // of the authoritative ledger read below.
@@ -48,33 +61,17 @@ pub(super) fn diff(repo: &Repository, before: &str, after: &str) -> Result<Vec<D
             let old = ancestry(&repo, &old_log)?;
             let new = ancestry(&repo, &new_log)?;
             check_projection(&repo, &projected, &events, [&old, &new])?;
-            let mut cache = PublicationAuthenticationCache::default();
-            let old_chunks = published_set(
-                &repo,
-                &report.before.tree,
-                &old,
-                &events,
-                &creations,
-                &mut cache,
-            )?;
-            let new_chunks = published_set(
-                &repo,
-                &report.after.tree,
-                &new,
-                &events,
-                &creations,
-                &mut cache,
-            )?;
+            let trees = [&report.before.tree, &report.after.tree];
+            let associations =
+                verified_associations(&repo, trees, [&old, &new], &events, &creations)?;
+            let old_chunks = published_set(&repo, trees[0], &old, &creations, &associations)?;
+            let new_chunks = published_set(&repo, trees[1], &new, &creations, &associations)?;
             if old_chunks != new_chunks {
                 report
                     .changes
                     .push(DiffEntry::scope(DiffChange::ChunkSetChanged));
             }
-            if resurrection_published(
-                &repo,
-                [&old, &new],
-                [&report.before.tree, &report.after.tree],
-            )? {
+            if resurrection_published(&repo, [&old, &new], [&old_log, &new_log])? {
                 report
                     .changes
                     .push(DiffEntry::scope(DiffChange::ResurrectionPublished));
@@ -172,82 +169,157 @@ fn check_projection(
     Ok(())
 }
 
-fn published_set<'a>(
+// A selected pin can be covered by an introduction outside its ancestry.
+// Authenticate it for completeness without adding it to that snapshot.
+fn verified_associations<'a>(
     repo: &Repository,
-    tree: &TreeObject,
-    ancestry: &Ancestry<'_>,
-    events: &[ChunkPublicationEvent],
-    creations: &'a Creations,
-    cache: &mut PublicationAuthenticationCache,
-) -> Result<BTreeSet<&'a str>> {
-    let mut candidates = BTreeMap::<_, Vec<_>>::new();
+    trees: [&TreeObject; 2],
+    sides: [&Ancestry<'_>; 2],
+    events: &'a [ChunkPublicationEvent],
+    creations: &Creations,
+) -> Result<Associations<'a>> {
+    let mut selected = BTreeSet::new();
+    for tree in trees {
+        for entry in &tree.entries {
+            let entry = entry?;
+            if let Some(pin) = entry.normalize {
+                selected.insert((
+                    tree.chunking_config_hash.as_str(),
+                    entry.raw_hash,
+                    pin.tool_profile_hash,
+                    pin.r#gen,
+                ));
+            }
+        }
+    }
+    let mut cache = PublicationAuthenticationCache::default();
+    let mut associations = Associations::new();
     for event in events {
-        let Some((_, intro)) = ancestry.get(event.introduction_commit.as_str()) else {
-            continue;
-        };
         let creation = &creations[&(event.chunk_id.clone(), event.chunking_config_hash.clone())];
-        match authenticate_publication_event_cached(repo, repo.kio_dir(), event, creation, cache) {
+        let row = &creation.row;
+        let selected_commit = sides
+            .iter()
+            .find_map(|side| side.get(event.introduction_commit.as_str()));
+        if !selected.contains(&(
+            event.chunking_config_hash.as_str(),
+            row.raw_hash.clone(),
+            row.tool_profile_hash.clone(),
+            row.r#gen,
+        )) {
+            continue;
+        }
+        match authenticate_publication_event_cached(
+            repo,
+            repo.kio_dir(),
+            event,
+            creation,
+            &mut cache,
+        ) {
+            Ok(true) => {
+                associations
+                    .entry((&event.chunk_id, &event.chunking_config_hash))
+                    .or_default()
+                    .insert(&event.introduction_commit);
+            }
+            Ok(false) if selected_commit.is_none() => {} // Uncommitted append residue.
             Ok(false) => {
                 return Err(store_corrupt_error(
                     &chunks_jsonl_path(repo.kio_dir()),
                     "committed chunk publication could not be authenticated",
                 ));
             }
-            // Shallow receipts exclude introductions as in historical search.
-            Err(error)
-                if error.error_code() == "KIO-E-STORE-NOT-FOUND-001"
-                    && matches!(repo.read_tree(&intro.tree), Err(e) if e.error_code() == "KIO-E-STORE-NOT-FOUND-001") =>
-            {
-                kio_core::gc::GcSweepSession::bind_repository(repo)?
-                    .validate_final_shallow_tree(&event.introduction_commit, &intro.tree)?;
-                continue;
+            Err(error) if error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => {
+                let intro = repo.read_commit(&event.introduction_commit)?;
+                read_history_tree(repo, &event.introduction_commit, &intro.tree)?;
+                return Err(error);
             }
             Err(error) => return Err(error),
-            Ok(true) => {}
         }
-        if event.chunking_config_hash == tree.chunking_config_hash {
-            let row = &creation.row;
-            candidates
+    }
+    Ok(associations)
+}
+
+fn published_set<'a>(
+    repo: &Repository,
+    tree: &TreeObject,
+    ancestry: &Ancestry<'_>,
+    creations: &'a Creations,
+    associations: &Associations<'_>,
+) -> Result<BTreeSet<&'a str>> {
+    let mut rows_by_unit = BTreeMap::<UnitGroup<'_>, Vec<_>>::new();
+    for creation in creations.values() {
+        let row = &creation.row;
+        if row.chunking_config_hash == tree.chunking_config_hash {
+            rows_by_unit
                 .entry((
-                    row.raw_hash.as_str(),
-                    row.tool_profile_hash.as_str(),
+                    &row.raw_hash,
+                    &row.tool_profile_hash,
                     row.r#gen,
+                    &row.unit_key,
+                    &row.unit_content_hash,
                 ))
                 .or_default()
                 .push(row);
         }
     }
-    let mut published = BTreeSet::new();
-    if candidates.is_empty() {
-        return Ok(published);
+    for rows in rows_by_unit.values_mut() {
+        rows.sort_unstable_by_key(|row| (row.byte_start, row.byte_end));
     }
+    let path = chunks_jsonl_path(repo.kio_dir());
+    let mut published = BTreeSet::new();
     let mut checked = BTreeSet::new();
     for entry in &tree.entries {
         let entry = entry?;
         let Some(pin) = entry.normalize else { continue };
-        let key = (
-            entry.raw_hash.as_str(),
-            pin.tool_profile_hash.as_str(),
-            pin.r#gen,
-        );
-        let Some(rows) = candidates.get(&key) else {
-            continue;
-        };
         if !checked.insert((entry.raw_hash.clone(), pin.clone())) {
             continue;
         }
-        let mut units = BTreeSet::new();
         visit_pinned_done_units(repo, &entry.raw_hash, &pin, |unit| {
-            units.insert((unit.unit_key, hash_bytes(unit.markdown.as_bytes())));
+            let hash = hash_bytes(unit.markdown.as_bytes());
+            let key = (
+                entry.raw_hash.as_str(),
+                pin.tool_profile_hash.as_str(),
+                pin.r#gen,
+                unit.unit_key.as_str(),
+                hash.as_str(),
+            );
+            let mut covered = 0;
+            let incomplete = || {
+                PipelineError::corrupt(
+                    path.display().to_string(),
+                    "cannot establish complete publications for a pinned normalized unit",
+                )
+            };
+            // Heading chunking covers the whole unit except whitespace-only spans.
+            // Check completeness independently of SQLite, then apply ancestry to
+            // the verified publications. A later introduction proves the chunk
+            // exists without publishing it retroactively.
+            for row in rows_by_unit.get(&key).into_iter().flatten() {
+                let introductions = associations
+                    .get(&(row.chunk_id.as_str(), row.chunking_config_hash.as_str()))
+                    .ok_or_else(incomplete)?;
+                let start = usize::try_from(row.byte_start).map_err(|_| incomplete())?;
+                let end = usize::try_from(row.byte_end).map_err(|_| incomplete())?;
+                if !unit
+                    .markdown
+                    .get(covered..start)
+                    .is_some_and(|gap| gap.trim().is_empty())
+                    || !unit.markdown.get(start..end).is_some_and(|span| {
+                        !span.trim().is_empty() && hash_bytes(span.as_bytes()) == row.text_hash
+                    })
+                {
+                    return Err(incomplete());
+                }
+                covered = end;
+                if introductions.iter().any(|hash| ancestry.contains_key(hash)) {
+                    published.insert(row.chunk_id.as_str());
+                }
+            }
+            if !unit.markdown[covered..].trim().is_empty() {
+                return Err(incomplete());
+            }
             Ok(())
         })?;
-        published.extend(
-            rows.iter()
-                .filter(|row| {
-                    units.contains(&(row.unit_key.clone(), row.unit_content_hash.clone()))
-                })
-                .map(|row| row.chunk_id.as_str()),
-        );
     }
     Ok(published)
 }
@@ -255,7 +327,7 @@ fn published_set<'a>(
 fn resurrection_published(
     repo: &Repository,
     sides: [&Ancestry<'_>; 2],
-    trees: [&TreeObject; 2],
+    logs: [&LogReport; 2],
 ) -> Result<bool> {
     let path = repo.kio_dir();
     let mut purged = BTreeMap::<_, BTreeSet<_>>::new();
@@ -270,20 +342,10 @@ fn resurrection_published(
     if purged.len() as u64 > DEFAULT_MAX_HISTORY_TREE_ENTRIES {
         return Err(KioError::schema("lifecycle diff read limit exceeded"));
     }
-    let [old_raws, new_raws] = trees.map(|tree| {
-        let mut raws = BTreeSet::new();
-        for entry in &tree.entries {
-            let entry = entry?;
-            if purged.contains_key(entry.raw_hash.as_str()) {
-                raws.insert(entry.raw_hash);
-            }
-        }
-        Ok::<_, KioError>(raws)
-    });
-    let present = [old_raws?, new_raws?];
     let now = repo.control().now_utc_seconds();
     let purge = PurgeState::open_with_control(path, repo.control().clone())?;
     let mut remaining = DEFAULT_MAX_HISTORY_VERIFIED_BYTES;
+    let mut updates = LifecycleUpdates::new();
     let mut published = false;
     for (raw, mut required) in purged {
         let (tombstone, receipt) = purge.read_lifecycle_records(raw, &mut remaining)?;
@@ -295,7 +357,22 @@ fn resurrection_published(
                 .as_ref()
                 .map_or(&[][..], |record| record.events.as_slice()),
         ];
-        for events in records {
+        for (source, events) in records.into_iter().enumerate() {
+            for event in events {
+                if sides
+                    .iter()
+                    .any(|side| side.contains_key(event.in_commit.as_str()))
+                {
+                    let order = (
+                        event.lifecycle_epoch.expect("validated lifecycle event"),
+                        source == 0,
+                    );
+                    updates
+                        .entry(event.in_commit.clone())
+                        .or_default()
+                        .push((raw, order, event.kind));
+                }
+            }
             for pair in events.chunks(2) {
                 let opening = &pair[0];
                 if let Some((_, commit)) = sides
@@ -335,26 +412,48 @@ fn resurrection_published(
                 "purge commit is missing its lifecycle event",
             ));
         }
-        for (side, raws) in sides.iter().zip(&present) {
-            if raws.contains(raw) {
-                let [tombstone_tail, receipt_tail] = records.map(|events| {
-                    events
-                        .iter()
-                        .rev()
-                        .find(|event| side.contains_key(event.in_commit.as_str()))
-                });
-                if canonical_final_event(tombstone_tail, receipt_tail)?
-                    .is_some_and(|tail| tail.event.kind != EventKind::Retired)
-                {
-                    return Err(store_corrupt_error(
-                        path,
-                        "republished raw is missing its retired event",
-                    ));
+    }
+    for (log, other) in logs.into_iter().zip([sides[1], sides[0]]) {
+        verify_retirement_coverage(repo, log, other, &updates)?;
+    }
+    Ok(published)
+}
+
+fn verify_retirement_coverage(
+    repo: &Repository,
+    history: &LogReport,
+    other: &Ancestry<'_>,
+    updates: &LifecycleUpdates<'_>,
+) -> Result<()> {
+    let mut latest = BTreeMap::new();
+    let mut active = BTreeSet::new();
+    for (rank, entry) in history.entries.iter().enumerate().rev() {
+        for &(raw, order, kind) in updates.get(&entry.commit_hash).into_iter().flatten() {
+            let prior = latest.entry(raw).or_default();
+            if order > *prior {
+                *prior = order;
+                if kind == EventKind::Retired {
+                    active.remove(raw);
+                } else {
+                    active.insert(raw);
                 }
             }
         }
+        // Establish the lifecycle state from the shared history, then check
+        // raw presence at the endpoints and within the comparison interval.
+        if (rank == 0 || !other.contains_key(entry.commit_hash.as_str()))
+            && !active.is_empty()
+            && read_history_tree(repo, &entry.commit_hash, &entry.commit.tree)?
+                .entries
+                .any(|item| active.contains(item.raw_hash.as_str()))?
+        {
+            return Err(store_corrupt_error(
+                repo.kio_dir(),
+                "republished raw is missing its retired event",
+            ));
+        }
     }
-    Ok(published)
+    Ok(())
 }
 
 fn verify_resurrected_raw(
@@ -363,16 +462,64 @@ fn verify_resurrected_raw(
     commit: &CommitObject,
     raw: &str,
 ) -> Result<()> {
-    match repo.read_tree(&commit.tree) {
-        Ok(tree) if tree.entries.any(|entry| entry.raw_hash == raw)? => Ok(()),
-        Ok(_) => Err(store_corrupt_error(
+    if !read_history_tree(repo, hash, &commit.tree)?
+        .entries
+        .any(|entry| entry.raw_hash == raw)?
+    {
+        return Err(store_corrupt_error(
             repo.kio_dir(),
             "resurrection commit does not contain the republished raw",
-        )),
+        ));
+    }
+    Ok(())
+}
+
+fn read_history_tree(repo: &Repository, commit: &str, tree: &str) -> Result<TreeObject> {
+    match repo.read_tree(tree) {
         Err(error) if error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => {
             kio_core::gc::GcSweepSession::bind_repository(repo)?
-                .validate_final_shallow_tree(hash, &commit.tree)
+                .validate_final_shallow_tree(commit, tree)?;
+            Err(KioError::new(
+                "KIO-E-COMMIT-SHALLOW-001",
+                "cannot verify diff events through a shallow commit",
+                serde_json::json!({"commit_hash": commit, "tree_hash": tree}),
+                ExitCode::Failure,
+            ))
         }
-        Err(error) => Err(error),
+        result => result,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kio_core::cas::ObjectKind;
+    use serde_json::json;
+
+    #[test]
+    fn diff_read_limit_includes_both_endpoint_trees() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        std::fs::write(dir.path().join("file.txt"), b"original").unwrap();
+        let base = repo.snapshot(None, None).unwrap().commit_hash.unwrap();
+        let mut commit = repo.read_commit(&base).unwrap();
+        let mut tree = serde_json::to_value(repo.read_tree(&commit.tree).unwrap()).unwrap();
+        let raw = tree["entries"][0]["raw_hash"].clone();
+        let entries = tree["entries"].as_array_mut().unwrap();
+        for index in 0..100 {
+            entries.push(
+                json!({"path": format!("name{index:03}.txt"), "type": "file", "raw_hash": raw}),
+            );
+        }
+        let store = repo.object_store();
+        (commit.tree, _) = store.write_json(ObjectKind::Tree, &tree).unwrap();
+        commit.parent = Some(base.clone());
+        let (large, _) = store
+            .write_json(ObjectKind::Commit, &serde_json::to_value(commit).unwrap())
+            .unwrap();
+        for (before, after) in [(&base, &large), (&large, &base)] {
+            let error = diff_with_limit(&repo, before, after, 8192).unwrap_err();
+            assert_eq!(error.error_code(), "KIO-E-STORE-VERIFIED-BYTES-LIMIT-001");
+        }
     }
 }
