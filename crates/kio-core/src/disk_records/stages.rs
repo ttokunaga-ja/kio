@@ -433,7 +433,7 @@ mod tests {
         let fixture = tempfile::tempdir().unwrap();
         let root = test_store_root(&fixture);
         assert!(inspect_root(&root, false).unwrap().is_empty());
-        assert!(!fixture.path().join("internal").exists());
+        assert!(!root.directory.path().join("internal").exists());
         let (run, writer) = RunDirectory::create(&root).unwrap();
         drop(writer);
         let gate = run.identities.lock_private_gate(Path::new(GATE)).unwrap();

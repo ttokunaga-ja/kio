@@ -13,7 +13,7 @@ use std::{
     fs::File,
     io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     marker::PhantomData,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering::Relaxed},
@@ -28,6 +28,7 @@ const MEMORY_RUN_BYTES: usize = RECORD_BYTES + 1;
 // Even callers retaining many small runs (e.g. a history walk) only keep
 // one sort chunk's worth of serialized run data in memory.
 const LIVE_MEMORY_BYTES: usize = SORT_BUFFER_RECORDS * RECORD_BYTES;
+const RECORD_STAGES: &str = "record-stages";
 
 mod stages;
 use stages::RunDirectory;
@@ -91,16 +92,46 @@ impl Drop for MemoryRun {
 
 #[derive(Debug)]
 struct ScratchDirectory {
-    directory: tempfile::TempDir,
+    parent: StoreDirectory,
+    leaf: PathBuf,
+    directory: StoreDirectory,
     preserve: std::sync::atomic::AtomicBool,
 }
 
 impl Drop for ScratchDirectory {
     fn drop(&mut self) {
         if *self.preserve.get_mut() {
-            self.directory.disable_cleanup(true);
+            return;
         }
+        // Traverse only within the retained private directory. Retiring its
+        // name separately prevents cleanup from descending into a replacement.
+        let registry = Path::new(RECORD_STAGES);
+        if matches!(self.directory.contains_entry(registry), Ok(true))
+            && self.directory.remove_directory_all(registry).is_err()
+        {
+            return;
+        }
+        let _ = crate::platform::stage_operations::discard_empty_directory(
+            &self.parent,
+            &self.leaf,
+            &self.directory.root_handle(),
+        );
     }
+}
+
+fn scratch_name() -> Result<PathBuf> {
+    let mut nonce = [0; 32];
+    getrandom::fill(&mut nonce)
+        .map_err(|error| KioError::io(error.to_string(), "record scratch"))?;
+    Ok(PathBuf::from(format!(
+        "kio-records-{}",
+        crate::cas::lower_hex(&nonce)
+    )))
+}
+
+fn scratch_parent() -> Result<StoreDirectory> {
+    let path = std::path::absolute(std::env::temp_dir()).map_err(scratch_io)?;
+    crate::private_fs::retain_external_directory(&path)
 }
 
 impl RecordStageRoot {
@@ -115,18 +146,20 @@ impl RecordStageRoot {
     /// Allocate a private workspace for callers without a writable store.
     /// DiskRecords retain it until the last record reader has finished.
     pub fn temporary() -> Result<Self> {
-        let temp = tempfile::Builder::new()
-            .prefix("kio-records-")
-            .tempdir()
-            .map_err(|error| crate::store_dir::ioerr(Path::new("record scratch"), error))?;
-        let directory = StoreDirectory::open(temp.path())?;
-        crate::store_dir::restrict_new_private_directory(&directory.root_handle())?;
+        let parent = scratch_parent()?;
+        let leaf = scratch_name()?;
+        let file = parent.create_directory(&leaf)?;
+        let directory = StoreDirectory::from_retained(file, parent.path().join(&leaf))?;
+        let scratch = Arc::new(ScratchDirectory {
+            parent,
+            leaf,
+            directory: directory.clone(),
+            preserve: false.into(),
+        });
+        crate::private_fs::verify_private_directory_handle(&directory)?;
         Ok(Self {
             directory,
-            scratch: Some(Arc::new(ScratchDirectory {
-                directory: temp,
-                preserve: false.into(),
-            })),
+            scratch: Some(scratch),
             memory: Arc::default(),
         })
     }
@@ -141,7 +174,7 @@ impl RecordStageRoot {
         } else {
             self.directory.clone()
         };
-        stages::container(&parent, "record-stages", create)
+        stages::container(&parent, RECORD_STAGES, create)
     }
 
     pub(crate) fn inspect(&self) -> Result<Vec<crate::cas::RawStageResidue>> {
@@ -408,7 +441,7 @@ impl RecordOutput {
                 Ok(WriterStorage::Disk(Box::new(writer)))
             }
             Self::Scratch(_) => {
-                let file = tempfile::tempfile().map_err(scratch_io)?;
+                let file = scratch_file()?;
                 let mut writer = BufWriter::with_capacity(RECORD_BYTES, file);
                 writer.write_all(bytes).map_err(scratch_io)?;
                 Ok(WriterStorage::Scratch(writer))
@@ -419,6 +452,22 @@ impl RecordOutput {
 
 fn scratch_io(error: std::io::Error) -> KioError {
     crate::store_dir::ioerr(Path::new("record scratch"), error)
+}
+
+#[cfg(unix)]
+fn scratch_file() -> Result<File> {
+    tempfile::tempfile().map_err(scratch_io)
+}
+
+#[cfg(windows)]
+fn scratch_file() -> Result<File> {
+    use crate::platform::private_fs::{NewPrivateObjectKind, create_new_private_at};
+    create_new_private_at(
+        &scratch_parent()?.root_handle(),
+        scratch_name()?.as_os_str(),
+        NewPrivateObjectKind::ScratchFile,
+    )
+    .map_err(scratch_io)
 }
 
 impl WriterStorage {
@@ -1003,14 +1052,42 @@ fn decode_bounded_json_to<T: DeserializeOwned>(
 
 #[cfg(test)]
 fn test_store_root(fixture: &tempfile::TempDir) -> RecordStageRoot {
-    let directory = StoreDirectory::open(fixture.path()).unwrap();
-    crate::store_dir::restrict_new_private_directory(&directory.root_handle()).unwrap();
+    let parent = crate::private_fs::retain_external_directory(fixture.path()).unwrap();
+    let directory = StoreDirectory::from_retained(
+        parent.create_directory(Path::new("store")).unwrap(),
+        parent.path().join("store"),
+    )
+    .unwrap();
     RecordStageRoot::in_store(directory, Arc::default())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn temporary_record_root_is_private_and_removed_after_last_reader() {
+        let root = RecordStageRoot::temporary().unwrap();
+        crate::private_fs::verify_private_directory_handle(&root.directory).unwrap();
+        let path = root.directory.path().to_owned();
+        let records = spilled_records(&root);
+        drop(root);
+        assert!(path.is_dir());
+        assert_eq!(records.first().unwrap(), Some(11));
+        drop(records);
+        assert!(!path.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn scratch_record_spill_has_a_protected_owner_only_dacl() {
+        let output = RecordOutput::Scratch(Arc::default());
+        let storage = output.spill(b"42\n").unwrap();
+        let RecordStorage::Scratch(file) = storage.finish().unwrap() else {
+            panic!("expected read-only scratch storage");
+        };
+        crate::platform::verify_owner_private_handle(&file.lock().unwrap()).unwrap();
+    }
 
     fn spilled_records(root: &RecordStageRoot) -> DiskRecords<usize> {
         DiskRecords::from_records(root, 11..=11 + SORT_BUFFER_RECORDS).unwrap()
@@ -1029,7 +1106,7 @@ mod tests {
     fn small_records_stay_in_memory_and_larger_inputs_spill() {
         let fixture = tempfile::tempdir().unwrap();
         let root = test_store_root(&fixture);
-        let stage_dir = fixture.path().join("internal/record-stages/stages");
+        let stage_dir = root.directory.path().join("internal/record-stages/stages");
         let mut writer = RecordWriter::new(&root).unwrap();
         for value in 0..SORT_BUFFER_RECORDS {
             writer.push(&value).unwrap();
@@ -1050,7 +1127,7 @@ mod tests {
     fn record_byte_limit_spills_even_below_the_count_limit() {
         let fixture = tempfile::tempdir().unwrap();
         let root = test_store_root(&fixture);
-        let stage_dir = fixture.path().join("internal/record-stages/stages");
+        let stage_dir = root.directory.path().join("internal/record-stages/stages");
         let value = "x".repeat(RECORD_BYTES - 2);
         let mut writer = RecordWriter::new(&root).unwrap();
         writer.push(&value).unwrap();
@@ -1065,7 +1142,7 @@ mod tests {
     fn small_sort_stays_in_memory_and_multiple_runs_spill() {
         let fixture = tempfile::tempdir().unwrap();
         let root = test_store_root(&fixture);
-        let stage_dir = fixture.path().join("internal/record-stages/stages");
+        let stage_dir = root.directory.path().join("internal/record-stages/stages");
         for count in [SORT_BUFFER_RECORDS, SORT_BUFFER_RECORDS + 1] {
             let mut sorter = RecordSorter::new(&root, usize::cmp);
             for value in (0..count).rev() {
@@ -1084,11 +1161,8 @@ mod tests {
     #[test]
     fn live_small_runs_share_a_budget_until_the_last_reader_drops() {
         let fixture = tempfile::tempdir().unwrap();
-        crate::store_dir::restrict_new_private_directory(
-            &StoreDirectory::open(fixture.path()).unwrap().root_handle(),
-        )
-        .unwrap();
-        let store = crate::cas::ObjectStore::new(fixture.path());
+        let root = test_store_root(&fixture);
+        let store = crate::cas::ObjectStore::new(root.directory.path());
         let value = "x".repeat(RECORD_BYTES - 3);
         let mut readers = Vec::new();
         for _ in 0..LIVE_MEMORY_BYTES / RECORD_BYTES {

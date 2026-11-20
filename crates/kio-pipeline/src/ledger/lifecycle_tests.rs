@@ -527,8 +527,16 @@ fn owner_control_default_ledger_and_public_clock_ignore_fixed_environment() {
 fn backup_preserves_live_main_wal_and_shm_bytes_and_permissions() {
     let (_dir, path) = fixture();
     let ledger = LedgerDb::initialize(&path).unwrap();
-    let raw = Connection::open(&path).unwrap();
-    raw.execute_batch("PRAGMA wal_autocheckpoint=0; UPDATE ledger_metadata SET sequence=sequence;")
+    // Let the ledger create its private sidecars before opening a second
+    // connection to keep them live across the write and backup.
+    let _live = ledger
+        .read(|_| {
+            let raw = Connection::open_with_flags(&path, READ_WRITE)?;
+            raw.execute_batch(
+                "PRAGMA wal_autocheckpoint=0; SELECT sequence FROM ledger_metadata;",
+            )?;
+            Ok(raw)
+        })
         .unwrap();
     ledger.write(|_| Ok(())).unwrap();
     assert!(fs::metadata(companion(&path, "-wal")).unwrap().len() > 32);
