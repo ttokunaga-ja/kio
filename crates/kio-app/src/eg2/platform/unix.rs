@@ -59,25 +59,33 @@ pub(in crate::eg2) fn configure_worker(slot: EngineSlot) -> Result<(), WorkerErr
     Ok(())
 }
 
-pub(in crate::eg2) fn private_stdout() -> Result<File, WorkerError> {
+pub(in crate::eg2) fn private_output(
+    capture_diagnostics: bool,
+) -> Result<(File, Option<File>), WorkerError> {
     let null = File::options()
         .write(true)
         .open("/dev/null")
         .map_err(|_| WorkerError::Startup)?;
-    // SAFETY: the duplicated descriptor is ours, and redirection is complete
-    // before loading LiteRT-LM or starting any of its threads.
+    // SAFETY: the duplicated descriptors are ours, and redirection is
+    // complete before loading LiteRT-LM or starting any of its threads.
     unsafe {
-        let fd = libc::fcntl(libc::STDOUT_FILENO, libc::F_DUPFD_CLOEXEC, 3);
-        if fd < 0 {
-            return Err(WorkerError::Startup);
-        }
-        let output = File::from_raw_fd(fd);
+        let duplicate = |source| {
+            let fd = libc::fcntl(source, libc::F_DUPFD_CLOEXEC, 3);
+            if fd < 0 {
+                return Err(WorkerError::Startup);
+            }
+            Ok(File::from_raw_fd(fd))
+        };
+        let output = duplicate(libc::STDOUT_FILENO)?;
+        let diagnostics = capture_diagnostics
+            .then(|| duplicate(libc::STDERR_FILENO))
+            .transpose()?;
         if libc::dup2(null.as_raw_fd(), libc::STDOUT_FILENO) < 0
             || libc::dup2(null.as_raw_fd(), libc::STDERR_FILENO) < 0
         {
             return Err(WorkerError::Startup);
         }
-        Ok(output)
+        Ok((output, diagnostics))
     }
 }
 

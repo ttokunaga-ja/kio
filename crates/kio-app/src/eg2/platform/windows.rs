@@ -47,13 +47,15 @@ pub(in crate::eg2) fn configure_worker(slot: EngineSlot) -> Result<(), WorkerErr
     Ok(())
 }
 
-pub(in crate::eg2) fn private_stdout() -> Result<File, WorkerError> {
+pub(in crate::eg2) fn private_output(
+    capture_diagnostics: bool,
+) -> Result<(File, Option<File>), WorkerError> {
     let null_output = File::options()
         .write(true)
         .open("NUL")
         .map_err(|_| WorkerError::Startup)?;
-    // SAFETY: duplicate the protocol pipe before replacing both standard
-    // handles. The duplicate is owned by the returned File.
+    // SAFETY: duplicate the protocol pipe and optional test diagnostic sink
+    // before replacing both standard handles.
     unsafe {
         let stdout = GetStdHandle(STD_OUTPUT_HANDLE);
         let stderr = GetStdHandle(STD_ERROR_HANDLE);
@@ -65,20 +67,24 @@ pub(in crate::eg2) fn private_stdout() -> Result<File, WorkerError> {
             return Err(WorkerError::Startup);
         }
         let process = GetCurrentProcess();
-        let mut output = null_mut();
-        if DuplicateHandle(
-            process,
-            stdout,
-            process,
-            &mut output,
-            0,
-            0,
-            DUPLICATE_SAME_ACCESS,
-        ) == 0
-        {
-            return Err(WorkerError::Startup);
-        }
-        let output = File::from_raw_handle(output);
+        let duplicate = |source| {
+            let mut handle = null_mut();
+            if DuplicateHandle(
+                process,
+                source,
+                process,
+                &mut handle,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            ) == 0
+            {
+                return Err(WorkerError::Startup);
+            }
+            Ok(File::from_raw_handle(handle))
+        };
+        let output = duplicate(stdout)?;
+        let diagnostics = capture_diagnostics.then(|| duplicate(stderr)).transpose()?;
         if SetStdHandle(STD_OUTPUT_HANDLE, null_output.as_raw_handle()) == 0 {
             return Err(WorkerError::Startup);
         }
@@ -91,7 +97,7 @@ pub(in crate::eg2) fn private_stdout() -> Result<File, WorkerError> {
         if stderr != stdout {
             windows_sys::Win32::Foundation::CloseHandle(stderr);
         }
-        Ok(output)
+        Ok((output, diagnostics))
     }
 }
 

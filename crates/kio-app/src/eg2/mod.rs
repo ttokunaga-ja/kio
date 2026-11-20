@@ -25,6 +25,7 @@ pub use profile::{profile_hash, profile_value};
 use supervisor::Worker;
 
 pub const WORKER_ARGUMENT: &str = "--internal-eg2-worker";
+const TEST_NATIVE_DIAGNOSTICS: &str = "KIO_EG2_TEST_NATIVE_DIAGNOSTICS";
 pub const DIMENSIONS: usize = 768;
 const TOKEN_CAP: u32 = 2048;
 const MAX_TEXT_BYTES: usize = 32 * 1024;
@@ -189,6 +190,7 @@ impl EmbeddingSession {
             let executable = std::env::current_exe().map_err(|_| WorkerError::Startup)?;
             let mut command = Command::new(executable);
             command.args([WORKER_ARGUMENT, self.slot.name()]);
+            command.env_remove(TEST_NATIVE_DIAGNOSTICS);
             self.worker = Some(Worker::spawn(command, STARTUP_TIMEOUT, cancelled, false)?);
         }
         let worker = self.worker.as_mut().expect("worker started");
@@ -325,7 +327,9 @@ pub fn run_worker(slot: &str) -> Result<(), WorkerError> {
         return Err(WorkerError::Protocol);
     }
 
-    let mut output = platform::private_stdout()?;
+    let capture_diagnostics = cfg!(debug_assertions)
+        && matches!(std::env::var(TEST_NATIVE_DIAGNOSTICS).as_deref(), Ok("1"));
+    let (mut output, diagnostics) = platform::private_output(capture_diagnostics)?;
     let (sender, requests) = mpsc::sync_channel(0);
     std::thread::spawn(move || {
         let mut input = io::stdin().lock();
@@ -345,7 +349,7 @@ pub fn run_worker(slot: &str) -> Result<(), WorkerError> {
     });
 
     let threads = slot.threads();
-    let result = initialize(slot, threads);
+    let result = initialize(slot, threads, diagnostics);
     let ready = [1, threads];
     let failure = [result.as_ref().err().map_or(0, |error| error.wire())];
     output
@@ -377,10 +381,11 @@ pub fn run_worker(slot: &str) -> Result<(), WorkerError> {
 fn initialize(
     slot: EngineSlot,
     threads: u8,
+    diagnostics: Option<File>,
 ) -> Result<(platform::SlotGate, native::Engine, File), WorkerError> {
     platform::configure_worker(slot)?;
     let executable = std::env::current_exe().map_err(|_| WorkerError::Startup)?;
-    let runtime = native::Api::open(runtime::verify(&executable)?)?;
+    let runtime = native::Api::open(runtime::verify(&executable)?, diagnostics)?;
     let control = ControlHandle::default();
     let model = crate::model::open_engine_model(&control)?;
     let cache = crate::settings::cache_home(&control);

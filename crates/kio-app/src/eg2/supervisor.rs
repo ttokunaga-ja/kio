@@ -39,10 +39,18 @@ impl Worker {
             return Err(WorkerError::Cancelled);
         }
         platform::configure_command(&mut command, memory_bytes);
+        let stderr = if cfg!(test)
+            && command.get_envs().any(|(key, value)| {
+                key == TEST_NATIVE_DIAGNOSTICS && value.is_some_and(|value| value == "1")
+            }) {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        };
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(stderr)
             .spawn()
             .map_err(|_| WorkerError::Startup)?;
         let limits = match platform::ProcessLimits::attach(&child, memory_bytes) {

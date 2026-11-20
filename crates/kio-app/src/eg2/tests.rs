@@ -10,7 +10,7 @@ fn fake_worker_entry() {
     };
     let mut input = std::io::stdin().lock();
     let mut output: Box<dyn Write> = if mode == "diagnostics" {
-        Box::new(platform::private_stdout().unwrap())
+        Box::new(platform::private_output(false).unwrap().0)
     } else {
         Box::new(std::io::stdout().lock())
     };
@@ -239,26 +239,44 @@ fn initialization_checks_the_pinned_location_only() {
 const TEST_TIMEOUT: Duration = Duration::from_millis(350);
 
 #[test]
-fn overflow_requires_the_exact_2048_token_diagnostic() {
+fn overflow_requires_the_pinned_runtime_diagnostic() {
+    const HEADER: &str = "INVALID_ARGUMENT: ERROR: [third_party/odml/litert_lm/runtime/core/embedding_engine_impl.cc:1619]\n└ ";
     const OVERFLOW: &str =
-        "Input sequence length (2049) exceeds maximum supported signature length (2048).";
+        "Input sequence length (2810) exceeds maximum supported signature length (2048).";
+    let observed = format!("{HEADER}{OVERFLOW}");
+    assert_eq!(
+        native::classify_error(3, observed.as_bytes()),
+        WorkerError::InputOverflow
+    );
+
     for (code, message, expected) in [
-        (3, OVERFLOW, WorkerError::InputOverflow),
-        (13, OVERFLOW, WorkerError::Inference),
-        (8, OVERFLOW, WorkerError::MemoryLimit),
+        (13, observed.clone(), WorkerError::Inference),
+        (8, observed.clone(), WorkerError::MemoryLimit),
+        (3, OVERFLOW.to_owned(), WorkerError::Inference),
         (
             3,
-            "Input sequence length (2048) exceeds maximum supported signature length (2048).",
+            observed.replace("(2810)", "(2048)"),
             WorkerError::Inference,
         ),
         (
             3,
-            "Input sequence length (2049) exceeds maximum supported signature length (512).",
+            observed.replace("(2048)", "(512)"),
+            WorkerError::Inference,
+        ),
+        (3, observed.replace(":1619", ":bad"), WorkerError::Inference),
+        (
+            3,
+            observed.replace("embedding_engine_impl.cc", "other.cc"),
             WorkerError::Inference,
         ),
         (
             3,
-            "Other failure: Input sequence length (2049) exceeds maximum supported signature length (2048).",
+            format!("{HEADER}Another failure: {OVERFLOW}"),
+            WorkerError::Inference,
+        ),
+        (
+            3,
+            format!("{observed}\nAnother failure"),
             WorkerError::Inference,
         ),
     ] {
@@ -273,6 +291,9 @@ fn native_worker_embeds_on_cpu() {
         .expect("set KIO_EG2_TEST_KIO to the built Kio executable");
     let mut command = Command::new(executable);
     command.args([WORKER_ARGUMENT, EngineSlot::Query.name()]);
+    if matches!(std::env::var(TEST_NATIVE_DIAGNOSTICS).as_deref(), Ok("1")) {
+        command.env(TEST_NATIVE_DIAGNOSTICS, "1");
+    }
     let mut worker = Worker::spawn(command, STARTUP_TIMEOUT, &|| false, false).unwrap();
 
     // Prove the real tokenizer rejects the whole query before verifying that

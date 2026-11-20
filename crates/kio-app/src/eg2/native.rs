@@ -4,6 +4,8 @@
 use super::runtime::VerifiedLibrary;
 use super::{DIMENSIONS, TOKEN_CAP, WireInput, WorkerError, valid_vector};
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::fs::File;
+use std::io::Write;
 use std::path::Path;
 use std::ptr::{null, null_mut};
 
@@ -20,10 +22,11 @@ macro_rules! api {
         pub(super) struct Api {
             $($name: $signature,)+
             _library: Library,
+            diagnostics: Option<File>,
         }
 
         impl Api {
-            fn load(library: Library) -> Result<Self, WorkerError> {
+            fn load(library: Library, diagnostics: Option<File>) -> Result<Self, WorkerError> {
                 Ok(Self {
                     $($name: {
                         let name = CStr::from_bytes_with_nul(
@@ -35,6 +38,7 @@ macro_rules! api {
                         unsafe { std::mem::transmute::<*mut c_void, $signature>(symbol) }
                     },)+
                     _library: library,
+                    diagnostics,
                 })
             }
         }
@@ -78,6 +82,10 @@ impl Object {
     ) -> Result<Self, WorkerError> {
         let mut ptr = null_mut();
         api.check(create(&mut ptr))?;
+        Self::from_raw(ptr, delete)
+    }
+
+    fn from_raw(ptr: Handle, delete: Delete) -> Result<Self, WorkerError> {
         if ptr.is_null() {
             return Err(WorkerError::Inference);
         }
@@ -182,15 +190,18 @@ impl Engine {
                 (api.input_data_create)(kind, bytes.as_ptr().cast(), bytes.len(), out)
             })?;
             let inputs = [data.ptr.cast_const()];
-            let response = Object::create(api, api.embedding_response_delete, |out| {
+            let mut response = null_mut();
+            api.check_status(
                 (api.embedding_engine_compute_embedding)(
                     self.engine.ptr,
                     inputs.as_ptr(),
                     inputs.len(),
                     self.options.ptr,
-                    out,
-                )
-            })?;
+                    &mut response,
+                ),
+                true,
+            )?;
+            let response = Object::from_raw(response, api.embedding_response_delete)?;
             let mut len = 0;
             api.check((api.embedding_response_get_size)(response.ptr, &mut len))?;
             if len != DIMENSIONS {
@@ -214,34 +225,60 @@ impl Engine {
 }
 
 impl Api {
-    pub(super) fn open(library: VerifiedLibrary) -> Result<Self, WorkerError> {
-        Self::load(Library::open(library)?)
+    pub(super) fn open(
+        library: VerifiedLibrary,
+        diagnostics: Option<File>,
+    ) -> Result<Self, WorkerError> {
+        Self::load(Library::open(library)?, diagnostics)
     }
 
     fn check(&self, status: Status) -> Result<(), WorkerError> {
+        self.check_status(status, false)
+    }
+
+    fn check_status(&self, status: Status, allow_overflow: bool) -> Result<(), WorkerError> {
         if status == 0 {
             return Ok(());
         }
-        // SAFETY: the API returns a thread-local NUL-terminated diagnostic.
-        // Only inspect a small prefix; raw diagnostics never leave this process.
-        let mut bytes = [0; 128];
+        // SAFETY: on failure the API returns a thread-local NUL-terminated
+        // diagnostic. Copy at most this buffer before clearing the native state.
+        let mut bytes = [0; 512];
         let mut len = 0;
         unsafe {
-            if status == 3 {
+            if (allow_overflow && status == 3) || self.diagnostics.is_some() {
                 let message = (self.get_last_error_message)();
                 if !message.is_null() {
-                    for (index, byte) in bytes.iter_mut().enumerate() {
-                        *byte = *message.add(index) as u8;
+                    for byte in &mut bytes {
+                        *byte = *message.add(len) as u8;
                         if *byte == 0 {
-                            len = index;
                             break;
                         }
+                        len += 1;
                     }
                 }
             }
             (self.clear_last_error)();
         }
-        Err(classify_error(status, &bytes[..len]))
+        let diagnostic = &bytes[..len];
+        if let Some(mut output) = self.diagnostics.as_ref() {
+            let message = String::from_utf8_lossy(diagnostic);
+            let suffix = if len == bytes.len() {
+                " (truncated)"
+            } else {
+                ""
+            };
+            let _ = writeln!(
+                output,
+                "LiteRT-LM status={status} message={message:?}{suffix}"
+            );
+        }
+        // A truncated diagnostic cannot qualify as the exact overflow message.
+        let overflow_diagnostic = if allow_overflow && len < bytes.len() {
+            diagnostic
+        } else {
+            &[]
+        };
+        Err(classify_error(status, overflow_diagnostic))
     }
 }
 
@@ -254,11 +291,22 @@ pub(super) fn classify_error(status: Status, diagnostic: &[u8]) -> WorkerError {
 }
 
 fn is_input_overflow(bytes: &[u8]) -> bool {
+    const SOURCE: &str = "INVALID_ARGUMENT: ERROR: [third_party/odml/litert_lm/runtime/core/embedding_engine_impl.cc:";
     const PREFIX: &str = "Input sequence length (";
     const SUFFIX: &str = ") exceeds maximum supported signature length (2048).";
-    std::str::from_utf8(bytes)
+
+    let Some((line, message)) = std::str::from_utf8(bytes)
         .ok()
-        .and_then(|message| message.strip_prefix(PREFIX)?.strip_suffix(SUFFIX))
+        .and_then(|message| message.strip_prefix(SOURCE)?.split_once("]\n└ "))
+    else {
+        return false;
+    };
+    if line.is_empty() || !line.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    message
+        .strip_prefix(PREFIX)
+        .and_then(|message| message.strip_suffix(SUFFIX))
         .filter(|digits| digits.bytes().all(|byte| byte.is_ascii_digit()))
         .and_then(|digits| digits.parse::<u64>().ok())
         .is_some_and(|length| length > u64::from(TOKEN_CAP))
