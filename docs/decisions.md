@@ -254,3 +254,9 @@
 - **内容**：F1 で Linux 固有コードの上限を 4,000 行から 4,500 行に一度だけ引き上げる。
 - **理由**：EG2 完了時の実測が 4,372 行だったため。利用者が 2026-11-20 に決定した。
 - **関係する資料**：`docs/09-mvp-scope.md` §3、`crates/kio-ci/src/code_limits.rs`、`tasks/v1-plan.md` §3.5 の F1。
+
+### D-20261120-04 F2 で見つかった仕様と実装の食い違いの扱い
+
+- **内容**：(1) `kio diff` の派生物だけの変化の表示（`tasks/step4b-contract-tests-p3b.md` の QB39）を v1 で実装する。(2) tree と Evidence Pointer の名前は、論理名と物理名を分けて判定する。論理名は `/`・NUL・空・単独の `.`／`..` を拒否し、それ以外は履歴に保存できる。宛先 OS で安全に作れない名前は、ファイルとして書き出すときに拒否する。Evidence Pointer の `path_at_commit` も同じ論理名の規則で検証する。(3) 明示的に選んだ HTTP embedding が未承認のときは、`docs/05-runtime.md` §1.1 のとおり auto／hybrid を全文検索に縮退させ、EG2 に切り替えない。(4) 有料 OCR の Batch の `fallback_to_full` は、sync と同じく元の要求を精算し、task を終端にせず Full を新しい相 1 から投入する。これを v1 で実装する。
+- **理由**：利用者の決定。(1) と (4) は承認済みの契約で、実装が欠けていた。(2) は Unix で正当なファイル名を保存できるようにするため、(3) は利用者が選んだ送信先を黙って別のモデルに替えないため、仕様を揃える。
+- **関係する資料**：`docs/06-cli-spec.md` §1、`docs/03-data-model.md` §2・§3、`docs/08-evidence-pointer-spec.md` §2、`docs/05-runtime.md` §1.1、`docs/07-adapter-spec.md` §2.1、`docs/04-pipeline.md` §5.8、`tasks/v1-plan.md` §3.2b の H1〜H3。
