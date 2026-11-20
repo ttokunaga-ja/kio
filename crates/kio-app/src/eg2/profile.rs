@@ -1,6 +1,6 @@
 use super::input::{DOCUMENT_PROMPT, MAX_BODY_CHARS, QUERY_PROMPT};
 use super::{DIMENSIONS, TOKEN_CAP, native, window};
-use crate::{embedding::image_input::transcoder_pin, model};
+use crate::{embedding::image_input::PNG_TRANSCODE_RECIPE, model};
 use kio_adapter::identity::{prompt_template_hash, tool_profile_hash};
 use kio_core::litert;
 use serde_json::{Value, json};
@@ -45,7 +45,11 @@ pub fn profile_value() -> Value {
             },
             "native_normalize": native::NORMALIZE,
             "aggregation": "l2_weighted_mean_l2_f64_to_f32_source_order_v1",
-            "image_input": transcoder_pin(),
+            "image_input": {
+                "original": "png_jpeg_passthrough",
+                "transcode": PNG_TRANSCODE_RECIPE,
+                "receipt": "image_input_receipt_v1",
+            },
         }
     })
 }

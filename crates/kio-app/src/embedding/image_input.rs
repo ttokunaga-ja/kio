@@ -2,6 +2,8 @@
 use kio_core::Result;
 use kio_core::cas::ImageInputReceipt;
 
+pub(crate) const PNG_TRANSCODE_RECIPE: &str = "kio_image_png_v1";
+
 pub(crate) struct PreparedEmbeddingImage {
     pub(crate) bytes: Vec<u8>,
     pub(crate) mime: &'static str,
@@ -71,7 +73,7 @@ pub(crate) fn prepare_embedding_image(
 
 /// The pin includes the exact locked dependency records, rather than a human
 /// version label that could silently remain unchanged after a codec update.
-pub(crate) fn transcoder_pin() -> String {
+fn transcoder_pin() -> String {
     use kio_pipeline::prepare::hash_bytes;
     const LOCK: &str = include_str!("../../../../Cargo.lock");
     let names = [
@@ -92,8 +94,8 @@ pub(crate) fn transcoder_pin() -> String {
         "bitflags",
         "cfg-if",
     ];
-    let mut recipe = String::from(
-        "kio_image_png_v1;frame0;transparent-fullcanvas;rgba8-straight;alpha0-rgb0;webp-exif;no-color-transform;png-fast-no-filter;no-metadata\n",
+    let mut recipe = format!(
+        "{PNG_TRANSCODE_RECIPE};frame0;transparent-fullcanvas;rgba8-straight;alpha0-rgb0;webp-exif;no-color-transform;png-fast-no-filter;no-metadata\n",
     );
     for block in LOCK.split("[[package]]").skip(1) {
         let name = block
@@ -112,7 +114,7 @@ pub(crate) fn transcoder_pin() -> String {
             }
         }
     }
-    format!("kio_image_png_v1:{}", hash_bytes(recipe.as_bytes()))
+    format!("{PNG_TRANSCODE_RECIPE}:{}", hash_bytes(recipe.as_bytes()))
 }
 
 /// One-bit visitation keeps a 16M-pixel RGBA canvas and orientation work below
@@ -228,6 +230,73 @@ mod tests {
             assert_eq!(receipt.sent_hash, hash_bytes(&prepared.bytes));
             assert_eq!(receipt.sent_mime, prepared.mime);
             receipt.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn eg2_codec_pin_only_changes_converted_image_identity() {
+        use crate::eg2::{DIMENSIONS, profile_hash, profile_value};
+        use kio_adapter::identity::{jcs_bytes, tool_profile_hash};
+        use kio_core::cas::EmbeddingContext;
+        use kio_index::embedding_store::embedding_hash;
+        use kio_index::{EmbeddingDistance, EmbeddingModality, EmbeddingTargetType};
+
+        // Text, query and images share this semantic profile. The versioned
+        // input rules are part of its identity, independently of the codec pin.
+        let profile = profile_value();
+        assert_eq!(
+            profile["embedding_semantics"]["image_input"],
+            serde_json::json!({
+                "original": "png_jpeg_passthrough",
+                "transcode": "kio_image_png_v1",
+                "receipt": "image_input_receipt_v1",
+            })
+        );
+        assert_eq!(tool_profile_hash(&profile).unwrap(), profile_hash());
+        let canonical = String::from_utf8(jcs_bytes(&profile).unwrap()).unwrap();
+        let old_pin = transcoder_pin();
+        let new_pin = format!("kio_image_png_v1:{}", hash_bytes(b"updated codec"));
+        assert_ne!(old_pin, new_pin);
+        assert!(!canonical.contains(&old_pin));
+        assert!(!canonical.contains(&new_pin));
+
+        for (source, mime, converted) in [
+            ("png-original-control.png", "image/png", false),
+            ("jpeg-original-control.jpg", "image/jpeg", false),
+            ("gif-offset-poison-later.gif", "image/gif", true),
+            ("webp-offset-poison-later.webp", "image/webp", true),
+        ] {
+            let bytes = std::fs::read(format!("{FIXTURES}/{source}")).unwrap();
+            let source_hash = hash_bytes(&bytes);
+            let prepared = prepare_embedding_image(&source_hash, bytes, mime).unwrap();
+            assert_eq!(prepared.receipt.is_some(), converted, "{source}");
+
+            let identity = |receipt: Option<&ImageInputReceipt>| {
+                let context = receipt.map(|receipt| EmbeddingContext::Image {
+                    image_input_hash: receipt.image_input_hash().unwrap(),
+                });
+                let embedding = embedding_hash(
+                    EmbeddingTargetType::Image,
+                    &source_hash,
+                    DIMENSIONS as u64,
+                    EmbeddingDistance::Cosine,
+                    EmbeddingModality::Multimodal,
+                    profile_hash(),
+                    context.as_ref(),
+                )
+                .unwrap();
+                (context, embedding)
+            };
+            let mut updated = prepared.receipt.clone();
+            if let Some(receipt) = &mut updated {
+                assert_eq!(receipt.transcoder_pin, old_pin);
+                // Hold source and sent bytes fixed to isolate a codec-only change.
+                receipt.transcoder_pin.clone_from(&new_pin);
+            }
+            let (old_context, old_embedding) = identity(prepared.receipt.as_ref());
+            let (new_context, new_embedding) = identity(updated.as_ref());
+            assert_eq!(old_context != new_context, converted, "{source}");
+            assert_eq!(old_embedding != new_embedding, converted, "{source}");
         }
     }
 
