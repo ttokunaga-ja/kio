@@ -13,6 +13,7 @@ use kio_adapter::xlsx_extract::SheetUsage;
 #[cfg(test)]
 use kio_core::cas::MAX_CONTENT_OBJECT_BYTES;
 use kio_core::cas::{ContentObjectKind, ObjectStore, is_hash};
+use kio_core::disk_records::RecordStageRoot;
 use kio_core::store_dir::{Publication, StoreDirectory};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -64,13 +65,31 @@ pub fn prepare_staged(
         },
     );
     prepare_staged_with(root, request, &profile, |completed, emit| {
+        let record_stages = kio_adapter::xlsx_extract::is_xlsx_media(request.media_type)
+            .then(|| {
+                ObjectStore::from_bound_kio_with_control(
+                    root.root_handle().as_ref(),
+                    root.control().clone(),
+                )?
+                .record_stages()
+            })
+            .transpose()
+            .map_err(|error| match error.resource_limit() {
+                Some(limit) => PipelineError::ResourceLimit(limit.clone()),
+                None => PipelineError::RecordStage(error),
+            })?;
         prepare_units_emitting(
             request,
             converter.as_ref(),
             budget,
             completed,
             &mut XlsxExtractionProgress::default(),
-            emit,
+            &mut PreparedUnitSink {
+                declare: emit.declare,
+                write: emit.write,
+                read_sheet_usage: emit.read_sheet_usage,
+                record_stages: record_stages.as_ref(),
+            },
         )
     })
 }
@@ -170,6 +189,7 @@ type UnitWriter<'a> = dyn FnMut(&PreparedUnit, &[u8], Option<SheetUsage>) -> Res
 pub struct PreparedUnitSink<'a> {
     pub(super) declare: &'a mut dyn FnMut(usize) -> Result<()>,
     pub(super) write: &'a mut UnitWriter<'a>,
+    pub(super) record_stages: Option<&'a RecordStageRoot>,
     pub(super) read_sheet_usage: &'a dyn Fn(u64) -> Result<SheetUsage>,
 }
 
@@ -310,6 +330,7 @@ fn stage_units_checked(
         &mut PreparedUnitSink {
             declare: &mut declare,
             write: &mut write,
+            record_stages: None,
             read_sheet_usage: &|order| {
                 completed_unit(directory, order)?
                     .sheet_usage

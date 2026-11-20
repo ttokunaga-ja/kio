@@ -14,6 +14,7 @@ use kio_core::scope::Repository;
 use kio_core::store_dir::{ATOMIC_WORKSPACE_DIR, AtomicWorkspaceState};
 use kio_pipeline::markdownize::NormalizedInstanceManifest;
 use kio_pipeline::markdownize::{NormalizedUnitObject, UnitStatus};
+#[cfg(test)]
 use kio_pipeline::prepare::hash_bytes;
 use kio_pipeline::task::{
     TaskDescriptor, TaskOutputRef, TaskStatus, TaskStore, task_failure_is_terminal,
@@ -152,6 +153,31 @@ fn text_leaf(name: &OsString) -> Checked<&str> {
     name.to_str()
         .ok_or_else(|| Blocker::unsafe_state("non-UTF8 maintenance namespace"))
 }
+fn read_projection_manifest(
+    directory: &StoreDirectory,
+    budget: &mut Budget,
+) -> Checked<Option<std::result::Result<NormalizedInstanceManifest, serde_json::Error>>> {
+    let result = checked(directory.read_optional_with(
+        Path::new("manifest.json"),
+        MAX_MANIFEST,
+        |reader| {
+            use std::io::Read as _;
+            let limit = MAX_MANIFEST + 1;
+            let mut source = reader.take(limit);
+            let manifest = serde_json::from_reader(std::io::BufReader::new(&mut source));
+            std::io::copy(&mut source, &mut std::io::sink())
+                .map_err(|error| KioError::io(error.to_string(), "manifest.json"))?;
+            Ok((manifest, limit - source.limit()))
+        },
+    ))?;
+    result
+        .map(|(manifest, bytes)| {
+            budget.bytes(bytes)?;
+            Ok(manifest)
+        })
+        .transpose()
+}
+
 fn read(
     directory: &StoreDirectory,
     path: &Path,
@@ -295,10 +321,9 @@ pub(super) fn preflight(repo: &Repository, scope: &BoundScope) -> Checked<Prefli
                 reference.tool_profile_hash.clone(),
                 reference.r#gen,
             )) {
-                let bytes = checked(canonical_json_bytes(
-                    &serde_json::to_value(manifest).map_err(Blocker::unsafe_state)?,
-                ))?;
-                if hash_bytes(&bytes) != reference.manifest_hash {
+                let hash = kio_pipeline::markdownize::normalized_manifest_hash(manifest)
+                    .map_err(Blocker::unsafe_state)?;
+                if hash != reference.manifest_hash {
                     return Err(Blocker::new(
                         "unfinalized_manifest",
                         reference.manifest_hash.clone(),
@@ -411,19 +436,12 @@ fn inspect_projections(
                 if private_stage(leaf) {
                     // Private publication stages cannot authorize deletion of CAS.
                     // Preserve any valid manifest closure during this invocation.
-                    if let Some(bytes) =
-                        checked(directory.read_optional(Path::new("manifest.json"), MAX_MANIFEST))?
-                    {
-                        budget.bytes(bytes.len() as u64)?;
-                        if let Ok(manifest) =
-                            serde_json::from_slice::<NormalizedInstanceManifest>(&bytes)
-                        {
-                            match load_validated_normalized_units_from_manifest(store, &manifest) {
-                                Ok(units) => protect_manifest(&manifest, &units, state, budget)?,
-                                // The whole private stage can be retired, but incomplete
-                                // references cannot authorize any content deletion this time.
-                                Err(_) => state.preserve_all_content = true,
-                            }
+                    if let Some(Ok(manifest)) = read_projection_manifest(&directory, budget)? {
+                        match load_validated_normalized_units_from_manifest(store, &manifest) {
+                            Ok(units) => protect_manifest(&manifest, &units, state, budget)?,
+                            // The whole private stage can be retired, but incomplete
+                            // references cannot authorize any content deletion this time.
+                            Err(_) => state.preserve_all_content = true,
                         }
                     }
                     state.private_stages.insert(relative);
@@ -474,9 +492,9 @@ fn inspect_instance(
     if checked(directory.inspect_atomic())? == AtomicWorkspaceState::Pending {
         return Err(Blocker::unsafe_state("pending instance atomic publication"));
     }
-    let bytes = read(directory, Path::new("manifest.json"), MAX_MANIFEST, budget)?;
-    let manifest: NormalizedInstanceManifest =
-        serde_json::from_slice(&bytes).map_err(Blocker::unsafe_state)?;
+    let manifest = read_projection_manifest(directory, budget)?
+        .ok_or_else(|| Blocker::unsafe_state("projection manifest is missing"))?
+        .map_err(Blocker::unsafe_state)?;
     if (
         &manifest.raw_hash,
         &manifest.tool_profile_hash,
@@ -485,18 +503,12 @@ fn inspect_instance(
     {
         return Err(Blocker::unsafe_state("projection identity mismatch"));
     }
-    let canonical = checked(canonical_json_bytes(
-        &serde_json::to_value(&manifest).map_err(Blocker::unsafe_state)?,
-    ))?;
-    let hash = hash_bytes(&canonical);
-    let immutable =
-        checked(store.read_content_object_bytes(ContentObjectKind::Manifest, &hash, MAX_MANIFEST))?;
-    budget.bytes(immutable.len() as u64)?;
-    if immutable != canonical {
-        return Err(Blocker::unsafe_state(
-            "projection does not match immutable manifest",
-        ));
-    }
+    let hash = kio_pipeline::markdownize::normalized_manifest_hash(&manifest)
+        .map_err(Blocker::unsafe_state)?;
+    let checked_content = store
+        .inspect_content_accounted(ContentObjectKind::Manifest, &hash)
+        .map_err(|error| Blocker::unsafe_state(error.error))?;
+    budget.bytes(checked_content.size_bytes)?;
     let units = load_validated_normalized_units_from_manifest(store, &manifest)
         .map_err(Blocker::unsafe_state)?;
     let mut expected = BTreeSet::from(["manifest.json".to_owned()]);
@@ -668,21 +680,10 @@ impl Proof {
         // Every retained immutable manifest is a potential owner, including
         // shallow historical closures and pre-projection crash publications.
         for hash in content_inventory(&scope.directory, ContentObjectKind::Manifest, &mut budget)? {
-            let bytes = checked(store.read_content_object_bytes(
-                ContentObjectKind::Manifest,
-                &hash,
-                MAX_MANIFEST,
-            ))?;
-            budget.bytes(bytes.len() as u64)?;
-            let manifest: NormalizedInstanceManifest =
-                serde_json::from_slice(&bytes).map_err(Blocker::unsafe_state)?;
-            if hash_bytes(&bytes) != hash
-                || checked(canonical_json_bytes(
-                    &serde_json::to_value(&manifest).map_err(Blocker::unsafe_state)?,
-                ))? != bytes
-            {
-                return Err(Blocker::unsafe_state("noncanonical immutable manifest"));
-            }
+            let (manifest, consumed) =
+                kio_pipeline::markdownize::read_canonical_manifest(&store, &hash, MAX_MANIFEST)
+                    .map_err(|error| Blocker::unsafe_state(error.error))?;
+            budget.bytes(consumed)?;
             let lifecycle = canonical_lookup(
                 &purge,
                 &manifest.raw_hash,

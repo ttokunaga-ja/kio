@@ -21,6 +21,7 @@ pub(super) struct ValuesWriter<T> {
     pages: Vec<Page>,
     writer: Option<PayloadWriter<Vec<T>>>,
     count: usize,
+    root: Option<RecordStageRoot>,
 }
 
 impl<T> Default for ValuesWriter<T> {
@@ -31,11 +32,19 @@ impl<T> Default for ValuesWriter<T> {
             pages: Vec::new(),
             writer: None,
             count: 0,
+            root: None,
         }
     }
 }
 
 impl<T: Serialize> ValuesWriter<T> {
+    pub fn new(root: Option<&RecordStageRoot>) -> Self {
+        Self {
+            root: root.cloned(),
+            ..Self::default()
+        }
+    }
+
     pub fn push(&mut self, value: T, charge: usize, budget: &mut Budget) -> Result<()> {
         self.pending.push(value);
         self.pending_bytes += charge;
@@ -51,8 +60,13 @@ impl<T: Serialize> ValuesWriter<T> {
             return Ok(());
         }
         if self.writer.is_none() {
-            let root = RecordStageRoot::temporary().map_err(stage_error)?;
-            self.writer = Some(PayloadWriter::new(&root).map_err(stage_error)?);
+            if self.root.is_none() {
+                self.root = Some(RecordStageRoot::temporary().map_err(stage_error)?);
+            }
+            self.writer = Some(
+                PayloadWriter::new(self.root.as_ref().expect("record stage root"))
+                    .map_err(stage_error)?,
+            );
         }
         let reference = self
             .writer
@@ -77,21 +91,23 @@ impl<T: Serialize> ValuesWriter<T> {
         Ok(())
     }
 
-    pub fn finish(mut self, budget: &mut Budget) -> Result<Values<T>> {
+    pub fn finish(&mut self, budget: &mut Budget) -> Result<Values<T>> {
         if self.writer.is_some() {
             self.spill(budget)?;
         }
         let payloads = self
             .writer
+            .take()
             .map(PayloadWriter::finish)
             .transpose()
             .map_err(stage_error)?;
         let resident = self.pending_bytes + self.pages.len() * PAGE_CHARGE;
+        self.pending_bytes = 0;
         Ok(Values {
             resident,
-            count: self.count,
-            memory: self.pending,
-            pages: self.pages,
+            count: std::mem::take(&mut self.count),
+            memory: std::mem::take(&mut self.pending),
+            pages: std::mem::take(&mut self.pages),
             payloads,
         })
     }
@@ -221,6 +237,6 @@ impl<T: DeserializeOwned> Lookup<'_, T> {
 fn stage_error(error: kio_core::KioError) -> AdapterError {
     match error.resource_limit() {
         Some(limit) => AdapterError::ResourceLimit(limit.clone()),
-        None => AdapterError::RuntimeTrust(error),
+        None => AdapterError::RecordStage(error),
     }
 }

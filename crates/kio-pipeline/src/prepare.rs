@@ -241,6 +241,7 @@ pub fn visit_prepared_units_with_budget(
             declare: &mut |_| Ok(()),
             write: &mut |unit, bytes, _| visit(unit, bytes),
             read_sheet_usage: &|_| unreachable!("preview has no staged worksheet"),
+            record_stages: None,
         },
     )
 }
@@ -328,8 +329,12 @@ fn prepare_units_emitting(
     if is_xlsx {
         const CODE: &str = "KIO-E-PREPARE-XLSX-EXTRACT-001";
         *progress = XlsxExtractionProgress::default();
-        let mut workbook = kio_adapter::xlsx_extract::XlsxWorkbook::open(bytes, budget.tier)
-            .map_err(|err| prepare_adapter_error(CODE, err))?;
+        let mut workbook = kio_adapter::xlsx_extract::XlsxWorkbook::open_with_stages(
+            bytes,
+            budget.tier,
+            emit.record_stages,
+        )
+        .map_err(|err| prepare_adapter_error(CODE, err))?;
         let unit_keys = sheet_unit_keys(workbook.sheet_names());
         let total = unit_keys.len();
         progress.total_sheets = Some(total);
@@ -884,6 +889,7 @@ fn prepare_adapter_error(
         kio_adapter::AdapterError::ResourceLimit(limit) => {
             crate::PipelineError::ResourceLimit(limit)
         }
+        kio_adapter::AdapterError::RecordStage(error) => crate::PipelineError::RecordStage(error),
         other => crate::PipelineError::contract(code, other.to_string()),
     }
 }
@@ -891,6 +897,17 @@ fn prepare_adapter_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_preserves_xlsx_spill_io_failure() {
+        let code = "KIO-E-PREPARE-XLSX-EXTRACT-001";
+        let error = kio_core::KioError::io("worksheet spill write failed", "record-stages/records");
+        let original = error.to_error_json();
+        let actual = prepare_adapter_error(code, kio_adapter::AdapterError::RecordStage(error));
+        assert!(
+            matches!(actual, crate::PipelineError::RecordStage(error) if error.to_error_json() == original)
+        );
+    }
 
     #[test]
     fn source_code_extensions_never_prepare_as_sniffed_text() {

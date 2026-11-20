@@ -386,7 +386,7 @@ fn persist_local_normalization(
     let path = path.to_string_lossy();
     persist_resumable_normalized_units(
         &bound_extraction_store(repo)?,
-        &manifest,
+        manifest,
         &path,
         |draft, entry| {
             let bytes = store

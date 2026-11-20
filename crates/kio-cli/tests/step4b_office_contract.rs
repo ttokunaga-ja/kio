@@ -1278,6 +1278,10 @@ fn p0_renderer_drift_storage_failure_is_resumable() {
 }
 
 fn p2_xlsx_workbook() -> Vec<u8> {
+    p2_xlsx_workbook_through(1028)
+}
+
+fn p2_xlsx_workbook_through(last_row: u64) -> Vec<u8> {
     use std::fmt::Write as _;
     use std::io::{Cursor, Write as _};
     use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
@@ -1319,7 +1323,7 @@ fn p2_xlsx_workbook() -> Vec<u8> {
     let third = first.replace("first marker", "third marker");
     let mut second = format!("<worksheet xmlns='{MAIN}'><sheetData>");
     // At 132,000 bytes per row, row 900 + 127 is the first to exceed 16 MiB.
-    for number in 900..=1028 {
+    for number in 900..=last_row {
         write!(
             second,
             "<row r='{number}'><c r='XFD{number}' t='s'><v>0</v></c></row>"
@@ -1501,5 +1505,97 @@ fn p2_completed_large_stage_is_rechecked_under_standard_tier() {
     assert!(
         matches!(prepare_staged(&root, request, ExtractionBudget::new(ResourceTier::Standard)),
         Err(PipelineError::ResourceLimit(limit)) if limit.resource == Resource::UnitText)
+    );
+}
+
+#[test]
+fn p2_spill_uses_the_store_record_stage_registry() {
+    use kio_core::error::ResourceTier;
+    use kio_pipeline::prepare::{
+        ExtractionBudget, PrepareStageBytesRequest, hash_bytes, prepare_staged,
+    };
+    let dir = canonical_tempdir();
+    init(&dir);
+    let input = p2_xlsx_workbook();
+    let hash = hash_bytes(&input);
+    let profile = kio_adapter::catalog::builtin_prepare_profile();
+    let root = kio_core::store_dir::StoreDirectory::open(&dir.path().join(".kio")).unwrap();
+    let request = PrepareStageBytesRequest {
+        input_path: "ranges.xlsx",
+        raw_hash: &hash,
+        bytes: &input,
+        media_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        tool_profile_hash: &profile.tool_profile_hash,
+    };
+    let internal = dir.path().join(".kio/internal");
+    fs::create_dir_all(&internal).unwrap();
+    fs::write(
+        internal.join("record-stages"),
+        b"must retain this non-directory",
+    )
+    .unwrap();
+    let error =
+        prepare_staged(&root, request, ExtractionBudget::new(ResourceTier::Large)).unwrap_err();
+    assert!(
+        matches!(error, kio_pipeline::PipelineError::RecordStage(_)),
+        "{error}"
+    );
+    assert_eq!(
+        fs::read(internal.join("record-stages")).unwrap(),
+        b"must retain this non-directory"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn p2_reclaims_the_workbook_spill_after_process_exit() {
+    use std::time::{Duration, Instant};
+    let dir = canonical_tempdir();
+    init(&dir);
+    fs::write(dir.path().join("spill.xlsx"), p2_xlsx_workbook_through(900)).unwrap();
+    let ready = dir.path().join(".test-data/extraction.ready");
+    fs::create_dir_all(ready.parent().unwrap()).unwrap();
+    let point = "extraction_unit_ready";
+    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin!("kio"));
+    for name in KIO_CHILD_ENV_DENYLIST {
+        command.env_remove(name);
+    }
+    let mut child = command
+        .envs(support::home_env(dir.path()))
+        .env("KIO_TEST_DURABILITY_POINT", point)
+        .env("KIO_TEST_DURABILITY_READY", &ready)
+        .current_dir(dir.path())
+        .args(["index", "--offline"])
+        .spawn()
+        .unwrap();
+    let expected = format!("point={point}\npid={}\n", child.id());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while fs::read_to_string(&ready).ok().as_deref() != Some(&expected) {
+        if child.try_wait().unwrap().is_some() || Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("XLSX extraction did not reach {point}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    child.kill().unwrap();
+    assert!(!child.wait().unwrap().success());
+    let registry = dir.path().join(".kio/internal/record-stages/stages");
+    let spill = fs::read_dir(registry)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| {
+            fs::read(path.join("records")).is_ok_and(|bytes| {
+                bytes
+                    .windows(b"row marker".len())
+                    .any(|part| part == b"row marker")
+            })
+        })
+        .expect("leased XLSX spill retained after interruption");
+    kio(&dir, &["index", "--offline"]).assert().success();
+    assert!(
+        !spill.exists(),
+        "next extraction did not reclaim the XLSX spill"
     );
 }

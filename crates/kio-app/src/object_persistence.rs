@@ -75,14 +75,14 @@ pub(crate) fn copy_normalized_instance_gen(
     let entries = source
         .units
         .iter()
-        .map(|entry| (entry.unit_key.as_str(), entry))
+        .filter_map(|entry| entry.unit_object_hash.clone().map(|pin| (entry.order, pin)))
         .collect::<BTreeMap<_, _>>();
     let identity = NormalizedInstanceIdentity {
         raw_hash: source.raw_hash.clone(),
         tool_profile_hash: source.tool_profile_hash.clone(),
         r#gen: normalize.r#gen,
     };
-    let mut target = source.clone();
+    let mut target = source;
     target.parent_gen = Some(normalize.r#gen);
     target.r#gen = new_gen;
     target.run_id = format!("run_{}", new_ulid(repo.kio_dir()));
@@ -90,14 +90,12 @@ pub(crate) fn copy_normalized_instance_gen(
     let store = repo.object_store();
     let stamped = persist_resumable_normalized_units(
         &directory,
-        &target,
+        target,
         &normalize.manifest_hash,
         |draft, entry| {
-            let mut unit = read_validated_normalized_unit(
-                &store,
-                &identity,
-                entries[entry.unit_key.as_str()],
-            )?;
+            let mut source_entry = entry.clone();
+            source_entry.unit_object_hash = entries.get(&entry.order).cloned();
+            let mut unit = read_validated_normalized_unit(&store, &identity, &source_entry)?;
             unit.r#gen = new_gen;
             unit.generated_at.clone_from(&draft.generated_at);
             Ok(Cow::Owned(unit))
@@ -213,6 +211,7 @@ pub(crate) fn published_manifest_hash(
 
 pub(crate) fn adapter_to_kio(error: kio_adapter::AdapterError) -> KioError {
     match error {
+        kio_adapter::AdapterError::RecordStage(error) => error,
         kio_adapter::AdapterError::ResourceLimit(limit) => {
             limit.into_error("adapter resource exhausted")
         }
@@ -273,6 +272,7 @@ pub(crate) fn adapter_to_kio(error: kio_adapter::AdapterError) -> KioError {
 
 pub(crate) fn pipeline_to_kio(error: kio_pipeline::PipelineError) -> KioError {
     match error {
+        kio_pipeline::PipelineError::RecordStage(error) => error,
         kio_pipeline::PipelineError::ResourceLimit(limit) => {
             limit.into_error("pipeline resource exhausted")
         }

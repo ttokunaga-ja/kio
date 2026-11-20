@@ -6,7 +6,7 @@ use std::{
     io::{BufRead, BufReader},
 };
 
-use kio_core::error::ResourceTier;
+use kio_core::{disk_records::RecordStageRoot, error::ResourceTier};
 use quick_xml::events::{BytesStart, Event};
 
 use crate::{
@@ -60,11 +60,20 @@ pub struct XlsxWorkbook<'a> {
     budget: Budget,
     sheets: Vec<SheetRef>,
     shared: Values<String>,
+    stages: Option<RecordStageRoot>,
     formats: CellFormats,
 }
 
 impl<'a> XlsxWorkbook<'a> {
     pub fn open(bytes: &'a [u8], tier: ResourceTier) -> Result<Self> {
+        Self::open_with_stages(bytes, tier, None)
+    }
+
+    pub fn open_with_stages(
+        bytes: &'a [u8],
+        tier: ResourceTier,
+        stages: Option<&RecordStageRoot>,
+    ) -> Result<Self> {
         let mut budget = Budget::new(tier);
         let mut archive = BoundedZip::open_accounted(
             bytes,
@@ -187,7 +196,9 @@ impl<'a> XlsxWorkbook<'a> {
         // The remaining part names are short-lived and already charged above.
         budget.release(budget.retained() - metadata_start - sheets_memory);
         let shared = match shared_part {
-            Some(part) => with_xml_member(&mut archive, &mut budget, &part, parse_shared_strings)?,
+            Some(part) => with_xml_member(&mut archive, &mut budget, &part, |input, budget| {
+                parse_shared_strings(input, budget, stages)
+            })?,
             None => Values::default(),
         };
         let formats = match styles_part {
@@ -199,6 +210,7 @@ impl<'a> XlsxWorkbook<'a> {
             budget,
             sheets,
             shared,
+            stages: stages.cloned(),
             formats,
         })
     }
@@ -235,7 +247,14 @@ impl<'a> XlsxWorkbook<'a> {
             &mut self.budget,
             &sheet.target,
             |input, budget| {
-                parse_sheet_stream(input, &self.shared, &self.formats, budget, progress)
+                parse_sheet_stream(
+                    input,
+                    &self.shared,
+                    &self.formats,
+                    budget,
+                    progress,
+                    self.stages.as_ref(),
+                )
             },
         );
         self.budget.release(self.budget.retained() - before);
@@ -389,10 +408,14 @@ fn parse_workbook_sheets(
     }
 }
 
-fn parse_shared_strings(input: &mut dyn BufRead, budget: &mut Budget) -> Result<Values<String>> {
+fn parse_shared_strings(
+    input: &mut dyn BufRead,
+    budget: &mut Budget,
+    stages: Option<&RecordStageRoot>,
+) -> Result<Values<String>> {
     let mut xml = Xml::new(input, Some(b"sst"));
     let mut buffer = Vec::new();
-    let mut strings = ValuesWriter::default();
+    let mut strings = ValuesWriter::new(stages);
     let mut current = String::new();
     let mut current_bytes = 0;
     let mut in_item = false;
@@ -707,12 +730,16 @@ fn parse_sheet_stream(
     formats: &CellFormats,
     budget: &mut Budget,
     progress: &mut SheetProgress,
+    stages: Option<&RecordStageRoot>,
 ) -> Result<String> {
     let mut xml = Xml::new(input, Some(b"worksheet"));
     let mut shared = shared.lookup();
     let mut buffer = Vec::new();
     let mut out = String::new();
-    let mut region = Region::default();
+    let mut region = Region {
+        rows: ValuesWriter::new(stages),
+        ..Region::default()
+    };
     let mut row = None;
     let mut cell = None;
     let mut text_depth = None;
@@ -871,7 +898,7 @@ impl Region {
         budget: &mut Budget,
         progress: &mut SheetProgress,
     ) -> Result<()> {
-        let rows = std::mem::take(&mut self.rows).finish(budget)?;
+        let rows = self.rows.finish(budget)?;
         let mut in_table = false;
         rows.for_each(budget, |row, budget| {
             progress.first_unprocessed_row = Some(row.number);
@@ -1203,7 +1230,7 @@ mod tests {
         }
         let shared = writer.finish(budget)?;
         let mut progress = SheetProgress::default();
-        let value = parse_sheet_stream(&mut &*bytes, &shared, formats, budget, &mut progress);
+        let value = parse_sheet_stream(&mut &*bytes, &shared, formats, budget, &mut progress, None);
         *row = progress.completed_through_row;
         value
     }
@@ -1236,7 +1263,7 @@ mod tests {
         let input = format!(r#"<sst xmlns="{namespace}"><si/><si><t>x</t></si></sst>"#);
         let mut budget = standard();
         let before = budget.begin_sheet();
-        let values = parse_shared_strings(&mut input.as_bytes(), &mut budget).unwrap();
+        let values = parse_shared_strings(&mut input.as_bytes(), &mut budget, None).unwrap();
         let mut output = Vec::new();
         values
             .for_each(&mut budget, |value, _| {
@@ -1249,7 +1276,7 @@ mod tests {
         let mut budget = standard();
         budget.memory_limit = required - 1;
         assert!(
-            matches!(parse_shared_strings(&mut input.as_bytes(), &mut budget),
+            matches!(parse_shared_strings(&mut input.as_bytes(), &mut budget, None),
             Err(AdapterError::ResourceLimit(limit)) if limit.resource == Resource::Memory)
         );
     }
@@ -1401,7 +1428,8 @@ mod tests {
                 &Values::default(),
                 &CellFormats::default(),
                 &mut budget,
-                &mut progress
+                &mut progress,
+                None,
             ),
             Err(AdapterError::ResourceLimit(_))
         ));
@@ -1419,7 +1447,8 @@ mod tests {
                 &Values::default(),
                 &CellFormats::default(),
                 &mut budget,
-                &mut progress
+                &mut progress,
+                None,
             ),
             Err(AdapterError::ResourceLimit(_))
         ));
@@ -1456,7 +1485,7 @@ mod tests {
         xml.push_str("</sst>");
         let mut budget = standard();
         budget.memory_limit = 1024 * 1024;
-        let shared = parse_shared_strings(&mut xml.as_bytes(), &mut budget).unwrap();
+        let shared = parse_shared_strings(&mut xml.as_bytes(), &mut budget, None).unwrap();
         budget.set_xml_scratch(0).unwrap();
         assert!(shared.resident() < 128 * 1024);
         let mut shared = shared.lookup();

@@ -841,7 +841,6 @@ fn verify_objects_with_limits(
                         {
                             match validate_purge_explained_missing_closure(
                                 &store,
-                                repo.kio_dir(),
                                 &entry.raw_hash,
                                 reference,
                                 &mut state,

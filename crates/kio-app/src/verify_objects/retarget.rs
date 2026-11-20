@@ -471,33 +471,35 @@ fn retarget_manifest_unit_preflight(
     normalize: &NormalizeRef,
     missing_is_corrupt: bool,
 ) -> Result<()> {
-    let bytes = match store.read_content_object_bytes(
-        ContentObjectKind::Manifest,
-        &normalize.manifest_hash,
-        RETARGET_MAX_MANIFEST_BYTES,
-    ) {
-        Ok(bytes) => bytes,
+    let manifest = match store
+        .decode_content_accounted(
+            ContentObjectKind::Manifest,
+            &normalize.manifest_hash,
+            RETARGET_MAX_MANIFEST_BYTES,
+            |input| {
+                serde_json::from_reader::<_, NormalizedInstanceManifest>(input).map_err(|_| {
+                    retarget_error(
+                        "KIO-E-STORE-CORRUPT-001",
+                        "retarget manifest is not a valid normalized-instance manifest",
+                    )
+                })
+            },
+        )
+        .map_err(|error| error.error)
+    {
+        Ok((manifest, _)) => manifest,
         Err(error) if is_store_not_found(&error) && missing_is_corrupt => {
             return Err(retarget_error(
                 "KIO-E-STORE-CORRUPT-001",
                 "target retarget manifest is missing",
             ));
         }
+        Err(error) if error.error_code() == "KIO-E-STORE-OBJECT-OVERSIZED-001" => {
+            return Err(retarget_limit_error());
+        }
         Err(error) if is_store_not_found(&error) => return Ok(()),
         Err(error) => return Err(error),
     };
-    if hash_bytes(&bytes) != normalize.manifest_hash {
-        return Err(retarget_error(
-            "KIO-E-STORE-CORRUPT-001",
-            "retarget manifest bytes do not match their CAS hash",
-        ));
-    }
-    let manifest: NormalizedInstanceManifest = serde_json::from_slice(&bytes).map_err(|_| {
-        retarget_error(
-            "KIO-E-STORE-CORRUPT-001",
-            "retarget manifest is not a valid normalized-instance manifest",
-        )
-    })?;
     if manifest.raw_hash != raw_hash
         || manifest.tool_profile_hash != normalize.tool_profile_hash
         || manifest.r#gen != normalize.r#gen
@@ -532,6 +534,26 @@ fn recheck_retarget_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retarget_reports_its_own_manifest_size_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = Repository::init(root.path()).unwrap();
+        let store = repo.object_store();
+        let bytes = vec![b' '; RETARGET_MAX_MANIFEST_BYTES as usize + 1];
+        let manifest_hash = store
+            .write_content_object(ContentObjectKind::Manifest, &bytes)
+            .unwrap();
+        let normalize = NormalizeRef {
+            tool_profile_hash: hash_bytes(b"profile"),
+            r#gen: 0,
+            manifest_hash,
+        };
+        let error =
+            retarget_manifest_unit_preflight(&store, &hash_bytes(b"input"), &normalize, false)
+                .unwrap_err();
+        assert_eq!(error.error_code(), "KIO-E-EVIDENCE-RETARGET-LIMIT-001");
+    }
 
     #[test]
     fn retarget_missing_tree_receipt_reads_share_the_active_owner() {
