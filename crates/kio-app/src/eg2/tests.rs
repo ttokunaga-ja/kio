@@ -35,6 +35,14 @@ fn fake_worker_entry() {
     } else {
         None
     };
+    let mut descendant = matches!(mode.to_str(), Some("descendant" | "crash-with-open-pipe"))
+        .then(spawn_pipe_holder);
+    #[cfg(target_os = "linux")]
+    if let Some(descendant) = &descendant
+        && let Some(path) = std::env::var_os("KIO_EG2_DESCENDANT_PID")
+    {
+        std::fs::write(path, descendant.id().to_string()).unwrap();
+    }
     output.write_all(b"\x01\x02").unwrap(); // Ready
     output.flush().unwrap();
     if mode == "blocked-write" {
@@ -50,23 +58,20 @@ fn fake_worker_entry() {
             write_frame(&mut output, &response).unwrap();
         };
         match mode.to_str().unwrap() {
-            "abort" => std::process::abort(),
+            "abort" => {
+                #[cfg(unix)]
+                std::process::abort();
+                // Deliver the fail-fast exit status without invoking Windows
+                // Error Reporting, whose timing is outside the IPC contract.
+                #[cfg(windows)]
+                platform::exit_worker(windows_sys::Win32::Foundation::STATUS_STACK_BUFFER_OVERRUN);
+            }
             "eof" => std::process::exit(0),
             "malformed" => output.write_all(&u32::MAX.to_le_bytes()).unwrap(),
+            "crash-with-open-pipe" => platform::exit_worker(1),
             "descendant" => {
-                #[cfg(unix)]
-                let mut descendant = Command::new("/bin/sleep").arg("4").spawn().unwrap();
-                #[cfg(windows)]
-                let mut descendant = Command::new("powershell.exe")
-                    .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 4"])
-                    .spawn()
-                    .unwrap();
-                #[cfg(target_os = "linux")]
-                if let Some(path) = std::env::var_os("KIO_EG2_DESCENDANT_PID") {
-                    std::fs::write(path, descendant.id().to_string()).unwrap();
-                }
                 std::thread::sleep(Duration::from_secs(5));
-                descendant.wait().unwrap();
+                descendant.as_mut().unwrap().wait().unwrap();
             }
             "timeout" => std::thread::sleep(Duration::from_secs(60)),
             "hard-cap" => reply(&[memory_denial().wire()]),
@@ -124,6 +129,16 @@ fn fake_worker_entry() {
     std::process::exit(0);
 }
 
+fn spawn_pipe_holder() -> std::process::Child {
+    #[cfg(unix)]
+    let child = Command::new("/bin/sleep").arg("4").spawn();
+    #[cfg(windows)]
+    let child = Command::new("powershell.exe")
+        .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 4"])
+        .spawn();
+    child.unwrap()
+}
+
 fn fake_command(mode: &str) -> Command {
     let mut command = Command::new(std::env::current_exe().unwrap());
     command.args([
@@ -176,6 +191,16 @@ fn worker_failures_never_return_a_vector() {
         );
         assert!(worker.child.is_none(), "{mode} child must have been reaped");
     }
+}
+
+#[test]
+fn worker_crash_is_detected_while_a_descendant_keeps_stdout_open() {
+    let mut worker = fake("crash-with-open-pipe");
+    assert_eq!(
+        worker.embed(b"\x00hello", Instant::now() + TEST_TIMEOUT, &|| false),
+        Err(WorkerError::Crash)
+    );
+    assert!(worker.child.is_none());
 }
 
 #[test]

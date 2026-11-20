@@ -25,28 +25,38 @@ pub(crate) fn configure_command(command: &mut Command, memory_bytes: u64) {
             if libc::setrlimit(libc::RLIMIT_CORE, &zero) != 0 {
                 return Err(io::Error::last_os_error());
             }
-            let mut limit = libc::rlimit {
-                rlim_cur: 0,
-                rlim_max: 0,
-            };
-            if libc::getrlimit(libc::RLIMIT_AS, &mut limit) != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            // The address-space ceiling is a kernel bound on the worker's
-            // mappings for its entire lifetime, including idle intervals.
-            let cap = memory_bytes as libc::rlim_t;
-            limit.rlim_cur = limit.rlim_cur.min(cap);
-            limit.rlim_max = limit.rlim_max.min(cap);
-            if libc::setrlimit(libc::RLIMIT_AS, &limit) != 0 {
-                return Err(io::Error::last_os_error());
+            if cfg!(target_os = "linux") {
+                cap_address_space(memory_bytes)?;
             }
             Ok(())
         });
     }
 }
 
+pub(crate) fn cap_address_space(bytes: u64) -> io::Result<()> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: these calls access only this process's limits and the local struct.
+    unsafe {
+        if libc::getrlimit(libc::RLIMIT_AS, &mut limit) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        limit.rlim_cur = limit.rlim_cur.min(bytes as libc::rlim_t);
+        limit.rlim_max = limit.rlim_max.min(bytes as libc::rlim_t);
+        if libc::setrlimit(libc::RLIMIT_AS, &limit) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn configure_worker(slot: EngineSlot) -> Result<(), WorkerError> {
+    #[cfg(target_os = "linux")]
     crate::platform::configure_eg2_worker_privacy()?;
+    #[cfg(target_os = "macos")]
+    crate::platform::cap_eg2_worker_address_space()?;
     // SAFETY: this call acts on the calling worker only.
     unsafe {
         if slot == EngineSlot::Index && libc::setpriority(libc::PRIO_PROCESS, 0, 10) != 0 {

@@ -1,5 +1,5 @@
 use super::*;
-use std::process::{Child, Stdio};
+use std::process::{Child, ExitStatus, Stdio};
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{
     Arc,
@@ -242,7 +242,17 @@ impl Worker {
                     }
                     return response;
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // Descendants can keep stdout open after the worker exits.
+                    // During startup, let the I/O thread deliver the explicit
+                    // initialization status even if the worker has exited.
+                    if self.threads != 0
+                        && let Some(child) = self.child.as_mut()
+                        && let Ok(Some(status)) = platform::peek_exit(child)
+                    {
+                        return Err(exit_reason(status));
+                    }
+                }
             }
         }
     }
@@ -255,10 +265,7 @@ impl Worker {
         let deadline = deadline.min(Instant::now() + Duration::from_millis(50));
         loop {
             match platform::peek_exit(child) {
-                Ok(Some(status)) if platform::memory_exit(status) => {
-                    return WorkerError::MemoryLimit;
-                }
-                Ok(Some(status)) if !status.success() => return WorkerError::Crash,
+                Ok(Some(status)) => return exit_reason(status),
                 Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(2)),
                 _ => return WorkerError::Eof,
             }
@@ -290,6 +297,16 @@ impl Worker {
 
 const STOP_TIMEOUT: Duration = Duration::from_millis(500);
 const IO_POLL: Duration = Duration::from_millis(2);
+
+fn exit_reason(status: ExitStatus) -> WorkerError {
+    if platform::memory_exit(status) {
+        WorkerError::MemoryLimit
+    } else if status.success() {
+        WorkerError::Eof
+    } else {
+        WorkerError::Crash
+    }
+}
 
 fn reap(mut child: Child, deadline: Instant) {
     while let Ok(None) = child.try_wait() {

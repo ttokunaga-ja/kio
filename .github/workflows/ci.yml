@@ -210,9 +210,9 @@ jobs:
     # The two groups are complements, so every test runs once across the matrix.
     # kio-cli's step3_p0_contract takes about 21 minutes on Windows (2.5 on Linux),
     # so it runs in the short reconciliation group instead of the remaining group.
-    # Excluding kio-cli does not change the dependency features, so neither group
-    # rebuilds dependencies.
-    timeout-minutes: 90
+    # The remaining group hit 90 minutes while CLI tests were still running.
+    # Leave headroom without paying for another runner to rebuild the tests.
+    timeout-minutes: ${{ matrix.group == 'remaining' && 120 || 90 }}
     strategy:
       fail-fast: false
       matrix:

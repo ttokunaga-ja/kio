@@ -27,7 +27,7 @@
 
 ### 3.1 検証の土台
 
-V1（テストが実際のホームに書き込まない）と V2（Linux の全テストの job を 25 分以内にする）は完了した。V2 は `ci2_replay_history` の削除と、CI の 3 つの OS のテストを test profile の opt-level 1 で build することで、Linux の job が 19.5 分になった（`9c7fb32`）。Windows の remaining の job は 82.5 分かかり（`step3_p0_contract` が Windows だけで 21 分）、制限を 120 分にしてある。この 1 本を Windows で軽くする作業は 3.2b の WP で行う。
+V1（テストが実際のホームに書き込まない）と V2（Linux の全テストの job を 25 分以内にする）は完了した。V2 は `ci2_replay_history` の削除と、CI の 3 つの OS のテストを test profile の opt-level 1 で build することで、Linux の job が 19.5 分になった（`9c7fb32`）。Windows では WP で約 21 分かかる `step3_p0_contract` を reconciliation に移した。その後も remaining は run 44749317304 で 90 分の制限に達したため、remaining の制限を 120 分にした。
 
 ### 3.2 制約の緩和の残り（優先度「高」12 件）
 

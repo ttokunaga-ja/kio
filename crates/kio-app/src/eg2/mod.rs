@@ -36,7 +36,7 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const INFERENCE_TIMEOUT: Duration = Duration::from_secs(30);
 const SLOT_WAIT: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(20);
-const MEMORY_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+pub(crate) const MEMORY_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EngineSlot {
