@@ -635,11 +635,14 @@ fn write_with_readonly(
         .control()
         .checkpoint(crate::durability::DurabilityPoint::AtomicWriteStaged)?;
     before_publish(&parent, Path::new(&leaf))?;
-    if let Err(error) = workspace.rename_regular_between_raw(
+    if let Err(error) = crate::platform::store::rename_regular_between_unsynced(
+        &workspace.root_handle(),
         Path::new(WRITE),
-        &parent,
+        &parent.root_handle(),
         Path::new(&leaf),
         publication,
+        workspace.path(),
+        parent.path(),
     ) {
         if readonly {
             remove_if_present(&workspace, WRITE)?;
@@ -647,11 +650,11 @@ fn write_with_readonly(
         }
         return Err(error);
     }
-    workspace.sync()?;
     owner
         .control()
         .checkpoint(crate::durability::DurabilityPoint::AtomicWriteBeforeDirectorySync)?;
     parent.sync()?;
+    workspace.sync()?;
     owner
         .control()
         .checkpoint(crate::durability::DurabilityPoint::AtomicWritePublished)

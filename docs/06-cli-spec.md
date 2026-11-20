@@ -170,6 +170,8 @@ kio reindex [--regenerate] [--at <commit>] [--yes] [--online|--offline] [--realt
                                         # --regenerate は first-instance-wins の
                                         # 明示経路で gen+1 の新 instance を作る (07-adapter-spec.md §9。もう 1 つの合法経路 =
                                         # prepared_hash 変化起因の自動 gen+1 — 03-data-model.md §2.1)。
+                                        # HEAD が指す確定 manifest や unit が破損・欠落した文書は旧 gen の参照を保持し、
+                                        # skipped_units に報告する。残りの文書は再 normalize し、検証できた内容をテキスト検索に公開する。
                                         # 上書きチェーンは manifest の parent_gen (同一 raw 内) / parent_instance
                                         # (raw 跨ぎ incremental の三つ組 — full では null) で永続記録 — parent_run_id は
                                         # task cache の揮発情報 (03-data-model.md §8 / §6)。--regenerate は確認プロンプト必須 (--yes で省略可)

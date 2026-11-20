@@ -1003,9 +1003,13 @@ context は `stage` と `resource`（memory|work|unit_text|raw_bytes|member_byte
 利用者が大きい tier を選ぶか、容量・memory 等の制約を解消した後、明示的な同一入力の
 index / reindex / repair / retry で再実行できる。同じ制約のまま通常 resume / watch が
 繰り返し再実行しない。保存済み結果と原本を保持し、未完成結果を完成扱いしない。
-ローカル抽出は unit 本体を R1 の一時領域へ順に書き、対応する stage identity と完了記録を耐久化する。
+ローカル抽出の prepared unit 合計と、normalized の確定 manifest・unit の正本 bytes 合計は、
+それぞれ CAS のストリームバッファ 1 個分（64 KiB）までを小さな書き込みとして扱う。
+小さな結果は従来の atomic 書き込みで公開し、中断後は作り直せる。
+単体画像で prepared source が境界を超えたときは、画像を参照する normalized の公開まで再開可能にする。
+大きな結果は unit 本体を R1 の一時領域へ順に書き、対応する stage identity と完了記録を耐久化する。
 抽出全体の完了記録を最後に書き、再開時は検証済みの完了 stage を使う。
-prepared・normalized unit・immutable manifest・view は、内容検証後に上書きなしの rename で公開する。
+大きな prepared・normalized unit・immutable manifest・view は内容検証後に上書きなしの rename で公開する。
 検証済みの公開済みファイルを再利用する場合も、公開先を同期してから一時領域を回収する。
 normalized の公開は manifest で確定し、HEAD に結び付けた回収記録は回収成功まで保持する。
 prepared CAS・unit 合計・view に固定の保存容量上限を設けない。

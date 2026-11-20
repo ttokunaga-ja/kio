@@ -11758,7 +11758,7 @@ fn r17_5_shallow_commit_via_hash_tag_and_implicit_head_folds_to_commit_shallow()
     );
 }
 
-// R17-2: `reindex --force` must not let ONE document's corrupt normalized unit abort the
+// R17-2: `reindex --regenerate` must not let ONE document's corrupt normalized manifest abort the
 // whole scope's re-normalization (docs/10 §7.2). R16-4 gave `rebuild_step3_index` this
 // skip-continue resilience, but the pre-rebuild copy loop in `run_reindex` never inherited
 // it — a single STORE-CORRUPT unit killed the reindex (exit 4) and the healthy documents
@@ -11766,7 +11766,16 @@ fn r17_5_shallow_commit_via_hash_tag_and_implicit_head_folds_to_commit_shallow()
 // command. Now the corrupt document is skipped (its previous gen kept) and reported under
 // skipped_units; the healthy document is re-normalized and the scope stays searchable.
 #[test]
-fn r17_2_reindex_force_skips_corrupt_unit_and_renormalizes_healthy() {
+fn r17_2_reindex_regenerate_skips_corrupt_manifest_and_renormalizes_healthy() {
+    check_reindex_regenerate_skips_corrupt_manifest(false);
+}
+
+#[test]
+fn r17_2_reindex_regenerate_projects_healthy_text_after_enrichment() {
+    check_reindex_regenerate_skips_corrupt_manifest(true);
+}
+
+fn check_reindex_regenerate_skips_corrupt_manifest(embed: bool) {
     let dir = canonical_tempdir();
     fs::write(
         dir.path().join("healthy.md"),
@@ -11779,20 +11788,59 @@ fn r17_2_reindex_force_skips_corrupt_unit_and_renormalizes_healthy() {
     )
     .unwrap();
     kio(&dir, &["init"]).assert().success();
-    json_success(&dir, &["index", "--yes"]);
-
-    // Corrupt ONE document's normalized-instance manifest → copy_normalized_instance_gen
-    // raises KIO-E-STORE-CORRUPT-001 for that raw_hash during re-normalization.
-    let units_root = dir.path().join(".kio/objects/normalized_units");
-    let manifest = first_manifest_json(&units_root);
-    let corrupt_raw_hash = {
-        let value: Value = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
-        value["raw_hash"].as_str().unwrap().to_owned()
+    let run = if embed {
+        json_success_deterministic_embed
+    } else {
+        json_success
     };
+    run(&dir, &["index", "--yes"]);
+
+    let repo = kio_core::scope::Repository::open(dir.path()).unwrap();
+    let read_head_entries = || {
+        let head = repo.head_commit_hash().unwrap().unwrap();
+        let commit = repo.read_commit(&head).unwrap();
+        repo.read_tree(&commit.tree)
+            .unwrap()
+            .entries
+            .to_vec()
+            .unwrap()
+    };
+    let before = read_head_entries();
+    let corrupt = before
+        .iter()
+        .find(|entry| entry.path == "corrupt.md")
+        .unwrap();
+    let previous = corrupt.normalize.as_ref().unwrap();
+    // Regeneration reads the immutable manifest pinned by HEAD.
+    let manifest = object_path(repo.kio_dir(), "manifests", &previous.manifest_hash);
+    let old_head = head_commit(repo.kio_dir());
+    let corrupt_query = [
+        "search",
+        "corrupttoken",
+        "--mode",
+        "text",
+        "--scope",
+        dir.path().to_str().unwrap(),
+        "--at",
+        &old_head,
+    ];
+    let before_corruption = json_success(&dir, &corrupt_query);
+    assert!(!before_corruption["results"].as_array().unwrap().is_empty());
     fs::write(&manifest, r#"{"torn":"#).unwrap();
+    let repair = json_failure(&dir, &["repair", "rebuild-db"], 4);
+    assert_eq!(repair["error_code"], "KIO-E-STORE-CORRUPT-001");
+    if embed {
+        // Exercise a fresh write-through from enrichment after reindex.
+        let store = ObjectStore::new(repo.kio_dir());
+        let hashes = store.embedding_hashes().unwrap();
+        assert!(!hashes.is_empty());
+        for hash in hashes {
+            fs::remove_file(store.embedding_path(&hash).unwrap()).unwrap();
+        }
+    }
 
     // Before the fix: exit 4 (KIO-E-STORE-CORRUPT-001), no re-normalization at all.
-    let out = json_success(&dir, &["reindex", "--regenerate", "--yes"]);
+    let out = run(&dir, &["reindex", "--regenerate", "--yes"]);
     // The healthy document IS re-normalized (the loop no longer dies on the corrupt one).
     assert_eq!(
         out["reindexed_files"].as_u64().unwrap(),
@@ -11807,19 +11855,44 @@ fn r17_2_reindex_force_skips_corrupt_unit_and_renormalizes_healthy() {
     );
     assert_eq!(skipped[0]["reason"], "KIO-E-STORE-CORRUPT-001");
     assert_eq!(
-        skipped[0]["raw_hash"], corrupt_raw_hash,
+        skipped[0]["raw_hash"], corrupt.raw_hash,
         "the skip names the corrupted document: {out}"
     );
     assert!(
         out["skipped_units_guidance"].as_str().is_some(),
         "the skip is loudly disclosed: {out}"
     );
+    let after = read_head_entries();
+    let kept = after
+        .iter()
+        .find(|entry| entry.path == "corrupt.md")
+        .unwrap();
+    assert_eq!(kept.normalize, corrupt.normalize);
+    let healthy_before = before
+        .iter()
+        .find(|entry| entry.path == "healthy.md")
+        .unwrap();
+    let healthy_after = after
+        .iter()
+        .find(|entry| entry.path == "healthy.md")
+        .unwrap();
+    assert_eq!(
+        healthy_after.normalize.as_ref().unwrap().r#gen,
+        healthy_before.normalize.as_ref().unwrap().r#gen + 1
+    );
     // The scope is not bricked — the healthy document still searches after the reindex.
-    let search = json_success(&dir, &["search", "healthytoken"]);
+    let search = if embed {
+        assert!(out["embedding_tasks_executed"].as_u64().unwrap() > 0);
+        run(&dir, &["search", "healthytoken", "--mode", "text"])
+    } else {
+        json_success(&dir, &["search", "healthytoken"])
+    };
     assert!(
         !search["results"].as_array().unwrap().is_empty(),
         "healthy document searchable after reindex: {search}"
     );
+    let corrupt_history = json_success(&dir, &corrupt_query);
+    assert!(corrupt_history["results"].as_array().unwrap().is_empty());
 }
 
 // R17-4: when EVERY searched scope is excluded for a store-corruption class the search
@@ -15187,6 +15260,60 @@ fn nc2_index_status_does_not_count_old_markdownize_tasks_for_unsupported_path() 
     );
 }
 
+#[test]
+fn p0_small_extraction_publishes_without_identified_workspaces() {
+    let dir = canonical_tempdir();
+    fs::write(
+        dir.path().join("small.md"),
+        "# Small\n\natomicpublicationneedle\n",
+    )
+    .unwrap();
+    json_success(&dir, &["init"]);
+    json_success(&dir, &["index", "--offline"]);
+    let stages = dir.path().join(".kio/extraction-stages");
+    assert!(!stages.join("prepared").exists());
+    assert!(!stages.join("views").exists());
+    let found = json_success(
+        &dir,
+        &["search", "atomicpublicationneedle", "--mode", "text"],
+    );
+    assert!(!found["results"].as_array().unwrap().is_empty());
+}
+
+#[cfg(debug_assertions)]
+fn large_extraction_markdown(text: &str) -> String {
+    format!(
+        "{text}\n\n{}\n",
+        "x".repeat(kio_core::cas::CAS_STREAM_BUFFER_BYTES)
+    )
+}
+
+#[cfg(debug_assertions)]
+fn large_extraction_png() -> Vec<u8> {
+    use base64::Engine as _;
+    let mut png = base64::engine::general_purpose::STANDARD
+        .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGP4DwQACfsD/fteaysAAAAASUVORK5CYII=")
+        .unwrap();
+    // Insert a valid ancillary chunk before IEND. Pixel decoding stays small.
+    let mut chunk = b"tEXtComment\0".to_vec();
+    chunk.extend(std::iter::repeat_n(
+        b'x',
+        kio_core::cas::CAS_STREAM_BUFFER_BYTES,
+    ));
+    let crc = chunk.iter().fold(u32::MAX, |crc, byte| {
+        (0..8).fold(crc ^ u32::from(*byte), |crc, _| {
+            (crc >> 1) ^ if crc & 1 == 0 { 0 } else { 0xedb8_8320 }
+        })
+    }) ^ u32::MAX;
+    let length = (chunk.len() as u32 - 4).to_be_bytes();
+    let iend = png.len() - 12;
+    png.splice(
+        iend..iend,
+        length.into_iter().chain(chunk).chain(crc.to_be_bytes()),
+    );
+    png
+}
+
 #[cfg(debug_assertions)]
 fn extraction_process(dir: &TempDir, args: &[&str]) -> std::process::Command {
     let mut command = hermetic_process_command(&assert_cmd::cargo::cargo_bin("kio"));
@@ -15240,7 +15367,7 @@ fn check_extraction_publication_crash(points: &[&str]) {
         let dir = canonical_tempdir();
         fs::write(
             dir.path().join("stage.md"),
-            "# Saved\n\nextractioncheckpointneedle\n",
+            large_extraction_markdown("# Saved\n\nextractioncheckpointneedle\n"),
         )
         .unwrap();
         json_success(&dir, &["init"]);
@@ -15373,7 +15500,11 @@ fn pause_nc2_reindex(dir: &TempDir, ready: &Path) -> std::process::Child {
 #[test]
 fn p0_stage_write_storage_failure_is_held_until_explicit_retry() {
     let dir = canonical_tempdir();
-    fs::write(dir.path().join("held.md"), "# Held\n\nstoragefaultneedle\n").unwrap();
+    fs::write(
+        dir.path().join("held.md"),
+        large_extraction_markdown("# Held\n\nstoragefaultneedle\n"),
+    )
+    .unwrap();
     json_success(&dir, &["init"]);
     kio(&dir, &["index", "--offline"])
         .env("KIO_TEST_DURABILITY_POINT", "extraction_stage_writing")
@@ -15560,11 +15691,8 @@ fn p0_native_image_resumes_after_prepared_and_normalized_stage_failures() {
 
 #[cfg(debug_assertions)]
 fn assert_native_image_retry(point: &str, kind: &str) {
-    use base64::Engine as _;
     let dir = canonical_tempdir();
-    let image = base64::engine::general_purpose::STANDARD
-        .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGP4DwQACfsD/fteaysAAAAASUVORK5CYII=")
-        .unwrap();
+    let image = large_extraction_png();
     let raw = kio_core::cas::hash_bytes(&image);
     fs::write(dir.path().join("held.png"), image).unwrap();
     json_success(&dir, &["init"]);
@@ -15712,11 +15840,11 @@ fn nc2_aborted_reindex_preserves_published_unsupported_reason() {
 #[test]
 fn p0_edit_reclaims_the_obsolete_extraction_stage() {
     let dir = canonical_tempdir();
-    let old = b"# Old\n\nfirst extraction body\n";
+    let old = large_extraction_markdown("# Old\n\nfirst extraction body\n");
     let path = dir.path().join("held.md");
-    fs::write(&path, old).unwrap();
+    fs::write(&path, &old).unwrap();
     json_success(&dir, &["init"]);
-    let old_hash = kio_core::cas::hash_bytes(old);
+    let old_hash = kio_core::cas::hash_bytes(old.as_bytes());
     let old_workspace = dir
         .path()
         .join(".kio/extraction-stages/prepared")
@@ -15787,8 +15915,8 @@ fn p0_recheck_retries_holds_before_head_even_for_new_or_edited_inputs() {
             fs::write(&path, "# Previous version\n").unwrap();
             json_success(&dir, &["index", "--offline"]);
         }
-        let contents = b"# publishheldneedle\n";
-        fs::write(&path, contents).unwrap();
+        let contents = large_extraction_markdown("# publishheldneedle\n");
+        fs::write(&path, &contents).unwrap();
         interrupt_extraction_command(
             &dir,
             extraction_process(&dir, &["index", "--offline"])
@@ -15819,7 +15947,7 @@ fn p0_recheck_retries_holds_before_head_even_for_new_or_edited_inputs() {
                 .iter()
                 .map(Result::unwrap)
                 .any(|entry| entry.path == "held.md"
-                    && entry.raw_hash == kio_core::cas::hash_bytes(contents)
+                    && entry.raw_hash == kio_core::cas::hash_bytes(contents.as_bytes())
                     && entry.normalize.is_some())
         );
         if args[0] == "batch" {
@@ -15862,7 +15990,11 @@ fn nc2_retry_keeps_reason_for_pending_publication() {
         fs::write(&path, b"\xff").unwrap();
         json_success(&dir, &["init"]);
         if extraction {
-            fs::write(dir.path().join("note.md"), b"# A staged extraction").unwrap();
+            fs::write(
+                dir.path().join("note.md"),
+                large_extraction_markdown("# A staged extraction"),
+            )
+            .unwrap();
         }
         json_success(&dir, &["index", "--yes", "--offline"]);
         fs::write(&path, b"\xfe").unwrap();
@@ -15922,7 +16054,7 @@ fn p0_recovers_retirement_journal_above_the_former_tree_limit() {
     let dir = canonical_tempdir();
     json_success(&dir, &["init"]);
     let path = dir.path().join("held.md");
-    fs::write(&path, b"# Already published\n").unwrap();
+    fs::write(&path, large_extraction_markdown("# Already published\n")).unwrap();
     interrupt_extraction(&dir, "extraction_after_head");
 
     let journal = dir.path().join(".kio/extraction-stages/retirement.json");
@@ -15946,10 +16078,10 @@ fn assert_recheck_stage_retirement(point: &str) {
     let dir = canonical_tempdir();
     json_success(&dir, &["init"]);
     let path = dir.path().join("held.md");
-    let old = b"# stagedretirementneedle\n";
-    fs::write(&path, old).unwrap();
+    let old = large_extraction_markdown("# stagedretirementneedle\n");
+    fs::write(&path, &old).unwrap();
     interrupt_extraction(&dir, point);
-    let hash = kio_core::cas::hash_bytes(old);
+    let hash = kio_core::cas::hash_bytes(old.as_bytes());
     let work = dir
         .path()
         .join(".kio/extraction-stages/prepared")
@@ -15972,7 +16104,11 @@ fn assert_recheck_stage_retirement(point: &str) {
 fn p0_recheck_regenerate_reuses_units_after_synced_view() {
     let dir = canonical_tempdir();
     json_success(&dir, &["init"]);
-    fs::write(dir.path().join("doc.md"), "# copiedneedle\n").unwrap();
+    fs::write(
+        dir.path().join("doc.md"),
+        large_extraction_markdown("# copiedneedle\n"),
+    )
+    .unwrap();
     json_success(&dir, &["index", "--offline"]);
     let args = ["reindex", "--regenerate", "--yes", "--offline"];
     interrupt_extraction_command(
@@ -16026,7 +16162,7 @@ fn p0_recheck_index_keeps_retirement_handles_bounded() {
     for i in 0..42 {
         fs::write(
             dir.path().join(format!("file-{i}.txt")),
-            format!("document number {i}\n"),
+            large_extraction_markdown(&format!("document number {i}")),
         )
         .unwrap();
     }
@@ -16059,7 +16195,11 @@ fn p0_recheck_index_keeps_retirement_handles_bounded() {
 fn p0_recheck_adoption_retries_destination_sync_before_retiring() {
     let dir = canonical_tempdir();
     json_success(&dir, &["init"]);
-    fs::write(dir.path().join("sync.md"), "# syncdurabilityneedle\n").unwrap();
+    fs::write(
+        dir.path().join("sync.md"),
+        large_extraction_markdown("# syncdurabilityneedle\n"),
+    )
+    .unwrap();
     interrupt_extraction(&dir, "extraction_before_destination_sync");
     // The second attempt sees the public name produced by the interrupted
     // rename. Inject failure at its directory sync as well.
@@ -16088,8 +16228,8 @@ fn p0_recheck_retirement_survives_after_clearing_the_hold() {
     let dir = canonical_tempdir();
     json_success(&dir, &["init"]);
     let source = dir.path().join("held.md");
-    let input = b"# retirement hold needle\n";
-    fs::write(&source, input).unwrap();
+    let input = large_extraction_markdown("# retirement hold needle\n");
+    fs::write(&source, &input).unwrap();
     kio(&dir, &["index", "--offline"])
         .env("KIO_TEST_DURABILITY_POINT", "extraction_stage_writing")
         .env("KIO_TEST_DURABILITY_STORAGE_FAULT", "1")
@@ -16104,7 +16244,7 @@ fn p0_recheck_retirement_survives_after_clearing_the_hold() {
         json_success(&dir, &["status"])["paused_by_hold_reason"]["resource_limit"],
         0
     );
-    let hash = kio_core::cas::hash_bytes(input);
+    let hash = kio_core::cas::hash_bytes(input.as_bytes());
     let work = dir
         .path()
         .join(".kio/extraction-stages/prepared")
@@ -16304,8 +16444,8 @@ fn nc2_defers_an_appended_file_while_publishing_other_files() {
 fn p0_keeps_extraction_on_mf3_deferral_until_publication() {
     let dir = canonical_tempdir();
     let path = dir.path().join("held.md");
-    let original = b"# helddeferralneedle";
-    fs::write(&path, original).unwrap();
+    let original = large_extraction_markdown("# helddeferralneedle");
+    fs::write(&path, &original).unwrap();
     json_success(&dir, &["init"]);
     json_success(&dir, &["snapshot", "create"]);
     kio(&dir, &["index", "--offline"])
@@ -16325,7 +16465,7 @@ fn p0_keeps_extraction_on_mf3_deferral_until_publication() {
     assert_eq!(status["deferred_inputs"][0]["reason"], "changed_after_scan");
     assert_eq!(status["paused_by_hold_reason"]["resource_limit"], 1);
 
-    fs::write(&path, original).unwrap();
+    fs::write(&path, &original).unwrap();
     json_success(&dir, args);
     let status = json_success(&dir, &["status"]);
     assert_eq!(status["paused_by_hold_reason"]["resource_limit"], 0);
@@ -16487,7 +16627,11 @@ fn p0_third_batch_completes_projection_after_sqlite_rename() {
 fn assert_batch_reconciles_extraction_index(point: &str) {
     let dir = canonical_tempdir();
     json_success(&dir, &["init"]);
-    fs::write(dir.path().join("held.md"), "# recoveredbatchneedle\n").unwrap();
+    fs::write(
+        dir.path().join("held.md"),
+        large_extraction_markdown("# recoveredbatchneedle\n"),
+    )
+    .unwrap();
     kio(&dir, &["index", "--offline"])
         .env("KIO_TEST_EXTRACTION_WRITE_FAULT_BEFORE_HEAD", "1")
         .assert()
@@ -16505,11 +16649,8 @@ fn assert_batch_reconciles_extraction_index(point: &str) {
 #[cfg(debug_assertions)]
 #[test]
 fn p0_third_image_adoption_rechecks_directory_sync() {
-    use base64::Engine as _;
     let dir = canonical_tempdir();
-    let image = base64::engine::general_purpose::STANDARD
-        .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGP4DwQACfsD/fteaysAAAAASUVORK5CYII=")
-        .unwrap();
+    let image = large_extraction_png();
     fs::write(dir.path().join("held.png"), image).unwrap();
     json_success(&dir, &["init"]);
     for command in [
@@ -16644,7 +16785,11 @@ fn p0_third_rebuild_discards_document_when_a_later_unit_disappears() {
 fn p0_third_retirement_preserves_journal_when_record_stages_are_unavailable() {
     let dir = canonical_tempdir();
     json_success(&dir, &["init"]);
-    fs::write(dir.path().join("held.md"), "# Held until rebuild").unwrap();
+    fs::write(
+        dir.path().join("held.md"),
+        large_extraction_markdown("# Held until rebuild"),
+    )
+    .unwrap();
     kio(&dir, &["index", "--offline"])
         .env("KIO_TEST_EXTRACTION_WRITE_FAULT_BEFORE_HEAD", "1")
         .assert()
@@ -16656,8 +16801,9 @@ fn p0_third_retirement_preserves_journal_when_record_stages_are_unavailable() {
     );
     let kio_dir = dir.path().join(".kio");
     let stages = kio_dir.join("internal/record-stages");
-    let moved = kio_dir.join("test-moved-record-stages");
-    fs::rename(&stages, &moved).unwrap();
+    // With small record runs in memory this scope starts without a registry.
+    // An invalid registry slot must still block recovery and retain the journal.
+    fs::create_dir_all(stages.parent().unwrap()).unwrap();
     fs::write(&stages, b"not a directory").unwrap();
     let journal = kio_dir.join("extraction-stages/retirement.json");
     kio(&dir, &["batch", "retry", "--offline"])
@@ -16665,7 +16811,6 @@ fn p0_third_retirement_preserves_journal_when_record_stages_are_unavailable() {
         .failure();
     assert!(journal.exists());
     fs::remove_file(&stages).unwrap();
-    fs::rename(moved, stages).unwrap();
     json_success(&dir, &["batch", "retry", "--offline"]);
     assert!(!journal.exists());
 }
@@ -16746,7 +16891,7 @@ fn p0_fourth_retry_rejects_changed_raw_before_cas_publication() {
     let dir = canonical_tempdir();
     json_success(&dir, &["init"]);
     let source = dir.path().join("held.md");
-    fs::write(&source, "# pausedretryneedle").unwrap();
+    fs::write(&source, large_extraction_markdown("# pausedretryneedle")).unwrap();
     kio(&dir, &["index", "--offline"])
         .env("KIO_TEST_EXTRACTION_WRITE_FAULT_BEFORE_HEAD", "1")
         .assert()
@@ -16775,11 +16920,9 @@ fn p0_fourth_retry_rejects_changed_raw_before_cas_publication() {
 #[cfg(debug_assertions)]
 #[test]
 fn p0_fourth_discarded_stage_does_not_claim_another_images_generation() {
-    use base64::Engine as _;
     let dir = canonical_tempdir();
     json_success(&dir, &["init"]);
-    let image = base64::engine::general_purpose::STANDARD
-        .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGP4DwQACfsD/fteaysAAAAASUVORK5CYII=").unwrap();
+    let image = large_extraction_png();
     let old = dir.path().join("old.png");
     fs::write(&old, image).unwrap();
     interrupt_extraction(&dir, "extraction_before_manifest");

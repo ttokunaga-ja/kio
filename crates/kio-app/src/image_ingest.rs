@@ -367,12 +367,17 @@ pub(crate) fn ingest_standalone_image(
         repo.kio_dir().to_path_buf(),
         repo.control().clone(),
     )?;
-    let stamped =
-        persist_resumable_normalized_units(&directory, &manifest, input_path, |draft, _| {
+    let stamped = persist_resumable_normalized_units(
+        &directory,
+        &manifest,
+        input_path,
+        staged.has_staged_payloads(),
+        |draft, _| {
             unit.generated_at.clone_from(&draft.generated_at);
             Ok(std::borrow::Cow::Owned(unit.clone()))
-        })
-        .map_err(crate::object_persistence::pipeline_to_kio)?;
+        },
+    )
+    .map_err(crate::object_persistence::pipeline_to_kio)?;
     let manifest_hash = crate::object_persistence::published_manifest_hash(repo, &stamped)?;
     Ok(ImageIngested {
         normalize: NormalizeRef {

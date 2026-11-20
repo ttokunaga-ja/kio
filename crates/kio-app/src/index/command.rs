@@ -27,9 +27,11 @@ use crate::index::pipeline::optional_role_planning_ready;
 use crate::index::pipeline::record_reindex_unsupported_inputs;
 use crate::index::pipeline::run_index_pipeline;
 use crate::index::pipeline::sorted_normalizes;
-use crate::index::rebuild::is_rebuild_skippable_unit_error;
+use crate::index::rebuild::is_regeneration_skippable;
+use crate::index::rebuild::manifest_pin;
 use crate::index::rebuild::read_head_tree_for_rebuild;
 use crate::index::rebuild::rebuild_step3_index;
+use crate::index::rebuild::rebuild_step3_index_with_regeneration_skips;
 use crate::index::rebuild::skipped_disclosure;
 use crate::invocation::Invocation;
 use crate::invocation::merged_index_completion;
@@ -2235,6 +2237,7 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
     // still points at its last-good normalized instance and search keeps serving that
     // gen's cached chunks) and is recorded; healthy documents still re-normalize.
     let mut reindex_skipped = RecordWriter::new(&stages)?;
+    let mut regeneration_skips = BTreeSet::new();
     let mut retire = RecordWriter::new(&stages)?;
     for entry in &tree.entries {
         let entry = entry?;
@@ -2270,7 +2273,8 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
             // STORE-IO (missing unit) / STORE-CORRUPT (malformed manifest/unit) are
             // localized to one document; keep the previous gen and continue. Any other
             // class is not a localized unit fault and still aborts (mirrors R16-4).
-            Err(error) if is_rebuild_skippable_unit_error(&error) => {
+            Err(error) if is_regeneration_skippable(&error) => {
+                regeneration_skips.insert(manifest_pin(&entry.raw_hash, normalize));
                 normalizes.push(&(
                     entry.path.clone(),
                     PendingNormalizeRef {
@@ -2337,7 +2341,7 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
         maybe_inject_replica_after_head_fault("reindex", ctx.control)?;
     }
     super::extraction_retirement::recover(&repo)?;
-    let mut report = rebuild_step3_index(ctx, &repo)?;
+    let mut report = rebuild_step3_index_with_regeneration_skips(ctx, &repo, &regeneration_skips)?;
     // LC42-LC44 (item 2), same ordering rationale as `run_index`'s call.
     recover_index_generation(repo.kio_dir(), repo.control())?;
     // R17-2: fold the re-normalization loop's skips into the rebuild report so the one

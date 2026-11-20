@@ -92,6 +92,7 @@ pub(crate) fn copy_normalized_instance_gen(
         &directory,
         &target,
         &normalize.manifest_hash,
+        false,
         |draft, entry| {
             let mut unit = read_validated_normalized_unit(
                 &store,

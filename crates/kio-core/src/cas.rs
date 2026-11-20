@@ -1398,45 +1398,59 @@ fn bound_publish_between(
     Ok(())
 }
 
+fn verify_bound_content(parent: &File, leaf: &str, hash: &str, expected: &[u8]) -> Result<()> {
+    let corrupt = |actual: Option<&str>| {
+        corrupt_object_error(
+            Path::new(leaf),
+            "CAS content bytes do not match expected object",
+            hash,
+            actual,
+        )
+    };
+    // A corrupt occupant can be arbitrarily large, including in Prepared CAS.
+    match bound_read_regular(
+        &CasReadAccess::Unmetered,
+        parent,
+        leaf,
+        expected.len() as u64,
+    ) {
+        Ok((_, actual)) if actual == expected => Ok(()),
+        Ok((_, actual)) => Err(corrupt(Some(&hash_bytes(&actual)))),
+        Err(error) if error.error_code() == "KIO-E-STORE-OBJECT-OVERSIZED-001" => {
+            Err(corrupt(None))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn bound_publish_content(
     parent: &File,
     temp: &str,
     leaf: &str,
-    kind: ContentObjectKind,
     hash: &str,
     expected: &[u8],
 ) -> Result<()> {
-    match cap_primitives::fs::hard_link(parent, Path::new(temp), parent, Path::new(leaf)) {
-        Ok(()) => {
+    let label = Path::new(leaf);
+    match crate::platform::store::rename_regular_between_unsynced(
+        parent,
+        Path::new(temp),
+        parent,
+        label,
+        crate::store_dir::Publication::CreateOnly,
+        Path::new("CAS parent"),
+        Path::new("CAS parent"),
+    ) {
+        Ok(()) => {}
+        Err(error)
+            if error.context().get("io_error_kind").and_then(Value::as_str)
+                == Some("already_exists") =>
+        {
             bound_remove(parent, temp)?;
-            sync_bound_directory(parent, Path::new(leaf))?;
         }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let (_, existing) =
-                bound_read_regular(&CasReadAccess::Unmetered, parent, leaf, kind.max_bytes())?;
-            if hash_bytes(&existing) != hash || existing != expected {
-                return Err(corrupt_object_error(
-                    Path::new(leaf),
-                    "CAS content bytes do not match existing object",
-                    hash,
-                    Some(&hash_bytes(&existing)),
-                ));
-            }
-            bound_remove(parent, temp)?;
-        }
-        Err(error) => return Err(KioError::io(error.to_string(), leaf)),
+        Err(error) => return Err(error),
     }
-    let (actual_size, actual) =
-        bound_read_regular(&CasReadAccess::Unmetered, parent, leaf, kind.max_bytes())?;
-    if actual_size != expected.len() as u64 || hash_bytes(&actual) != hash || actual != expected {
-        return Err(corrupt_object_error(
-            Path::new(leaf),
-            "published CAS content changed",
-            hash,
-            Some(&hash_bytes(&actual)),
-        ));
-    }
-    Ok(())
+    verify_bound_content(parent, leaf, hash, expected)?;
+    sync_bound_directory(parent, label)
 }
 
 fn bound_leaf<'a>(leaf: &'a str, kind: &str) -> Result<&'a Path> {
@@ -3329,13 +3343,10 @@ mod tests {
     }
 
     #[test]
-    fn st04_keeps_derived_object_limits() {
+    fn raw_and_prepared_have_no_fixed_cas_limit() {
         assert_eq!(ObjectKind::Raw.max_bytes(), u64::MAX);
-        for kind in [
-            ContentObjectKind::Prepared,
-            ContentObjectKind::Image,
-            ContentObjectKind::Toollock,
-        ] {
+        assert_eq!(ContentObjectKind::Prepared.max_bytes(), u64::MAX);
+        for kind in [ContentObjectKind::Image, ContentObjectKind::Toollock] {
             assert_eq!(kind.max_bytes(), 512 * 1024 * 1024);
         }
     }

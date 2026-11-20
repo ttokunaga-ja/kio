@@ -28,7 +28,7 @@ use crate::scope_access::ensure_no_visible_purge_journal;
 use crate::scope_access::is_store_not_found;
 use crate::scope_access::purge_blocks_rebuild_raw;
 use crate::search::projection::mark_replica_unavailable_or_log;
-use crate::search::projection::write_through_projection_or_log_for_repo;
+use crate::search::projection::write_through_repository_projection;
 use crate::search::scope::current_embedding_policy;
 use crate::settings::embedding_profile_summary;
 use crate::settings::persisted_embedding_is_deterministic;
@@ -243,7 +243,7 @@ pub(crate) struct RebuildAuthorities {
 
 type StagedImageOwnership = DiskRecords<(NormalizedInstanceCacheKey, String)>;
 
-fn manifest_pin(raw: &str, normalize: &NormalizeRef) -> NormalizedInstanceCacheKey {
+pub(super) fn manifest_pin(raw: &str, normalize: &NormalizeRef) -> NormalizedInstanceCacheKey {
     (
         raw.to_owned(),
         normalize.tool_profile_hash.clone(),
@@ -257,6 +257,7 @@ fn stage_rebuild_authorities(
     instances: &[RetainedNormalizedInstance],
     roots: BTreeSet<String>,
     image_targets: Option<&BTreeSet<String>>,
+    regeneration_skips: &BTreeSet<NormalizedInstanceCacheKey>,
 ) -> Result<(RebuildAuthorities, Vec<SkippedUnit>)> {
     let store = repo.object_store();
     let stages = store.record_stages()?;
@@ -267,7 +268,22 @@ fn stage_rebuild_authorities(
     let mut unreadable = Vec::new();
     for instance in instances {
         let pin = manifest_pin(&instance.raw_hash, &instance.normalize);
-        let manifest = match pinned_manifest(repo, &instance.raw_hash, &instance.normalize) {
+        let identity = NormalizedInstanceIdentity {
+            raw_hash: pin.0.clone(),
+            tool_profile_hash: pin.1.clone(),
+            r#gen: pin.2,
+        };
+        let manifest =
+            pinned_manifest(repo, &instance.raw_hash, &instance.normalize).and_then(|manifest| {
+                validate_normalized_manifest(
+                    Path::new("normalized manifest"),
+                    &identity,
+                    &manifest,
+                )
+                .map_err(pipeline_to_kio)?;
+                Ok(manifest)
+            });
+        let manifest = match manifest {
             Ok(manifest) => manifest,
             Err(error) => {
                 if verify_objects::purge_explains_missing_retained_instance(
@@ -277,16 +293,17 @@ fn stage_rebuild_authorities(
                 )? {
                     continue;
                 }
+                if regeneration_skips.contains(&pin) && is_regeneration_skippable(&error) {
+                    // Only this invocation's failed source pins may be omitted
+                    // without a verified same-generation closure. No chunk or
+                    // image authority can originate from the omitted pin.
+                    publication.unavailable_pins.insert(pin.clone());
+                    publication.unreadable_unit_keys.insert(pin, None);
+                    continue;
+                }
                 return Err(error);
             }
         };
-        let identity = NormalizedInstanceIdentity {
-            raw_hash: pin.0.clone(),
-            tool_profile_hash: pin.1.clone(),
-            r#gen: pin.2,
-        };
-        validate_normalized_manifest(Path::new("normalized manifest"), &identity, &manifest)
-            .map_err(pipeline_to_kio)?;
         let mut closure = BTreeSet::new();
         let mut read_error = None;
         let entries = manifest
@@ -340,7 +357,7 @@ fn stage_rebuild_authorities(
             }
             publication.unreadable_unit_keys.insert(
                 pin.clone(),
-                entries.map(|entry| entry.unit_key.clone()).collect(),
+                Some(entries.map(|entry| entry.unit_key.clone()).collect()),
             );
             publication.unavailable_pins.insert(pin.clone());
             unreadable.push((pin, instance, error));
@@ -359,7 +376,7 @@ fn stage_rebuild_authorities(
             .is_some_and(|(healthy, _)| {
                 (&healthy.0, &healthy.1, healthy.2) == (&pin.0, &pin.1, pin.2)
             });
-        if !has_healthy_pin {
+        if !has_healthy_pin && !regeneration_skips.contains(&pin) {
             return Err(error);
         }
         skipped.push(SkippedUnit {
@@ -414,9 +431,17 @@ fn stage_rebuild_authorities(
 
 impl RebuildAuthorities {
     pub(crate) fn excludes(&self, instance: &RetainedNormalizedInstance) -> bool {
+        self.excludes_pin(&instance.raw_hash, &instance.normalize)
+    }
+
+    pub(crate) fn excludes_pin(&self, raw: &str, normalize: &NormalizeRef) -> bool {
         self.publication
             .unavailable_pins
-            .contains(&manifest_pin(&instance.raw_hash, &instance.normalize))
+            .contains(&manifest_pin(raw, normalize))
+    }
+
+    pub(crate) fn has_exclusions(&self) -> bool {
+        !self.publication.unavailable_pins.is_empty()
     }
 
     pub(crate) fn exact_units(
@@ -850,6 +875,14 @@ pub(crate) fn rebuild_step3_index(
     ctx: &Invocation<'_>,
     repo: &Repository,
 ) -> Result<Step3RebuildReport> {
+    rebuild_step3_index_with_regeneration_skips(ctx, repo, &BTreeSet::new())
+}
+
+pub(super) fn rebuild_step3_index_with_regeneration_skips(
+    ctx: &Invocation<'_>,
+    repo: &Repository,
+    regeneration_skips: &BTreeSet<NormalizedInstanceCacheKey>,
+) -> Result<Step3RebuildReport> {
     ensure_no_visible_purge_journal(repo.kio_dir(), repo.control())?;
     // HEAD is the only publication authority. Tags and chunk publication
     // records may retain ancestors, but cannot supply a substitute HEAD.
@@ -887,6 +920,7 @@ pub(crate) fn rebuild_step3_index(
         &retained_instances,
         ref_roots.clone(),
         image_targets.as_ref(),
+        regeneration_skips,
     )
     .map_err(|error| annotate_index_stage(error, "authenticate retained units"))?;
     authorities.roots =
@@ -1008,6 +1042,7 @@ pub(crate) fn rebuild_step3_index(
         + 1;
     let mut appended = Vec::<StoredChunk>::new();
     let mut appended_count = 0u64;
+    let mut appended_bytes = 0usize;
     let mut pending_publication_events = Vec::<ChunkPublicationEvent>::new();
     // R16-4: documents whose normalized units are missing/corrupt are skipped and
     // reported here rather than aborting the whole rebuild (docs/10 §7.2: "最悪
@@ -1031,7 +1066,6 @@ pub(crate) fn rebuild_step3_index(
                        bodies: RecordPayloads<ChunkRow>,
                        introduction: Option<&String>|
      -> Result<()> {
-        let mut appended_bytes = 0usize;
         for row in &chunks {
             let row = bodies.read(row?)?;
             let body_bytes = row
@@ -1070,12 +1104,6 @@ pub(crate) fn rebuild_step3_index(
                 appended.clear();
                 appended_bytes = 0;
             }
-        }
-        if !appended.is_empty() {
-            append_stored_chunks(repo.kio_dir(), &appended)
-                .map_err(|error| annotate_index_stage(error, "append chunk creations"))?;
-            appended_count += appended.len() as u64;
-            appended.clear();
         }
         Ok(())
     };
@@ -1156,6 +1184,12 @@ pub(crate) fn rebuild_step3_index(
         )?;
     }
 
+    // Carry the bounded creation batch across documents. The final batch must
+    // reach disk before any publication events can refer to those creations.
+    append_stored_chunks(repo.kio_dir(), &appended)
+        .map_err(|error| annotate_index_stage(error, "append chunk creations"))?;
+    appended_count += appended.len() as u64;
+    drop(appended);
     authorities.retain_available_introductions(&retained_instances);
     // An attestation cached while selecting roots predates document staging.
     authorities.publication.attestations.clear();
@@ -1414,6 +1448,10 @@ pub(crate) fn is_rebuild_skippable_unit_error(error: &KioError) -> bool {
     )
 }
 
+pub(super) fn is_regeneration_skippable(error: &KioError) -> bool {
+    is_rebuild_skippable_unit_error(error) || is_store_not_found(error)
+}
+
 /// R16-4: disclose a rebuild's skipped documents on the command output. `skipped_units`
 /// is always present (empty on a clean rebuild) so callers can rely on the field; when
 /// non-empty it is accompanied by `skipped_units_guidance` pointing at the recovery
@@ -1610,7 +1648,7 @@ fn rebuild_sqlite_index(
             // one line, and a fourth caller would otherwise have to remember.
             // No rotation here: the rebuild minted a fresh `index_generation`
             // into the temp db moments ago (PB28), so the stamp already moved.
-            write_through_projection_or_log_for_repo(ctx, repo);
+            write_through_repository_projection(ctx, repo, Some(authorities));
             Ok(())
         }
         Err(error) => {
@@ -1916,7 +1954,7 @@ pub(crate) struct PublicationAuthenticationCache {
     trees: BTreeMap<String, CachedPublicationTree>,
     pinned_unit_closures: BTreeMap<NormalizedInstanceCacheKey, BTreeSet<(String, String)>>,
     unavailable_pins: BTreeSet<NormalizedInstanceCacheKey>,
-    unreadable_unit_keys: BTreeMap<NormalizedInstanceCacheKey, BTreeSet<String>>,
+    unreadable_unit_keys: BTreeMap<NormalizedInstanceCacheKey, Option<BTreeSet<String>>>,
     attestations: BTreeMap<PublicationAttestationCacheKey, bool>,
 }
 
@@ -2031,9 +2069,11 @@ pub(crate) fn authenticate_publication_event_cached(
             normalize.manifest_hash.clone(),
         );
         if let Some(keys) = cache.unreadable_unit_keys.get(&unit_key) {
-            // A structurally valid pin can identify the skipped unit but
-            // cannot attest a chunk without a verified unit closure.
-            skipped_attestation |= keys.contains(&creation.row.unit_key);
+            // An excluded pin supplies no authority. When its manifest was
+            // readable, still check whether it describes the claimed unit.
+            skipped_attestation |= keys
+                .as_ref()
+                .is_none_or(|keys| keys.contains(&creation.row.unit_key));
             continue;
         }
         if !cache.pinned_unit_closures.contains_key(&unit_key) {
@@ -2451,9 +2491,14 @@ mod tests {
         }];
         let targets = rebuild_image_targets(&repo).unwrap();
         assert_eq!(targets, Some(BTreeSet::new()));
-        let (authorities, _) =
-            stage_rebuild_authorities(&repo, &instances, BTreeSet::new(), targets.as_ref())
-                .unwrap();
+        let (authorities, _) = stage_rebuild_authorities(
+            &repo,
+            &instances,
+            BTreeSet::new(),
+            targets.as_ref(),
+            &BTreeSet::new(),
+        )
+        .unwrap();
         assert!(authorities.image_units.is_none());
 
         let (authorities, _) = stage_rebuild_authorities(
@@ -2461,6 +2506,7 @@ mod tests {
             &instances,
             BTreeSet::new(),
             Some(&BTreeSet::from([image_hash.clone()])),
+            &BTreeSet::new(),
         )
         .unwrap();
         let stage = authorities.image_units.as_ref().unwrap();
