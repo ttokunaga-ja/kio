@@ -306,6 +306,20 @@ impl StoreDirectory {
         atomic::write_stream(self, relative, publication, write)
     }
 
+    /// Stage an import in a write-only store while preserving the retained source.
+    /// Returns false when the source already occupies the destination and the
+    /// caller must validate it in place. An alias of a recovery artifact is
+    /// rejected before recovery can remove it.
+    pub fn write_atomic_stream_preserving_source(
+        &self,
+        relative: &Path,
+        publication: Publication,
+        source: &File,
+        write: impl FnOnce(&mut File) -> Result<()>,
+    ) -> Result<bool> {
+        atomic::write_stream_preserving(self, relative, publication, source, write)
+    }
+
     /// Publish private bytes only after a caller's final target check succeeds.
     /// The check runs after staging and syncing, immediately before publication,
     /// with the actual retained destination parent and direct leaf name.

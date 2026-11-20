@@ -91,10 +91,6 @@ impl AuthenticatedHttpClient {
     /// Authenticated provider requests use HTTPS without proxies or redirects,
     /// matching the online runtime trust identity.
     pub(crate) fn agent(&self) -> ureq::Agent {
-        self.agent_with_redirect_limit(0)
-    }
-
-    pub(crate) fn agent_with_redirect_limit(&self, max_redirects: u32) -> ureq::Agent {
         // ureq 3's global timeout covers DNS through response-body completion.
         // Keep the strictest cap as the global deadline and explicitly return
         // status responses: callers retain their authenticated 401/403, 402, and
@@ -105,7 +101,7 @@ impl AuthenticatedHttpClient {
         let config = ureq::Agent::config_builder()
             .https_only(true)
             .proxy(None)
-            .max_redirects(max_redirects)
+            .max_redirects(0)
             .http_status_as_error(false)
             .timeout_connect(Some(policy.connect_timeout))
             .timeout_global(Some(effective_overall_timeout));

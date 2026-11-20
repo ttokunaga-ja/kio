@@ -182,32 +182,133 @@ fn offline_import_and_read_only_status_are_device_local() {
     assert_eq!(fixture.status()["readiness"], "ready");
 }
 
+fn failed_json(output: Output, exit: i32, code: &str) -> Value {
+    assert_eq!(output.status.code(), Some(exit), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let error: Value = serde_json::from_str(stderr.lines().last().unwrap()).unwrap();
+    assert_eq!(error["error_code"], code, "{stderr}");
+    error
+}
+
 #[test]
-fn rejected_imports_preserve_existing_model() {
+fn unattended_import_requires_device_consent() {
     let fixture = Fixture::new();
     let source = fixture.source(BYTES);
-    failed(
+    let error = failed_json(
         fixture
-            .command(&["model", "install", "embeddinggemma-2", "--from"])
+            .command(&["--json", "model", "install", "embeddinggemma-2", "--from"])
             .arg(&source)
             .output()
             .unwrap(),
-        "--yes",
+        9,
+        "KIO-E-MODEL-CONSENT-001",
     );
+    assert_eq!(error["context"]["reason"], "model_consent_required");
     assert_eq!(fixture.status()["readiness"], "missing");
-    json_success(fixture.import(&source).output().unwrap());
+}
 
-    for (bytes, error) in [
-        (b"short".as_slice(), "size"),
-        (b"test model extra".as_slice(), "size"),
-        (b"bad  model".as_slice(), "SHA-256"),
-    ] {
+#[test]
+fn hash_mismatch_has_the_documented_error_and_preserves_existing_model() {
+    let fixture = Fixture::new();
+    let source = fixture.source(BYTES);
+    json_success(fixture.import(&source).output().unwrap());
+    fixture.source(b"bad  model");
+    let error = failed_json(
+        fixture.import(&source).output().unwrap(),
+        4,
+        "KIO-E-MODEL-HASH-001",
+    );
+    assert_eq!(error["context"]["reason"], "model_hash_mismatch");
+    assert_eq!(fs::read(&source).unwrap(), b"bad  model");
+    assert_eq!(fs::read(fixture.artifact()).unwrap(), BYTES);
+    assert_eq!(fixture.status()["readiness"], "ready");
+}
+
+#[test]
+fn wrong_sizes_preserve_existing_model() {
+    let fixture = Fixture::new();
+    let source = fixture.source(BYTES);
+    json_success(fixture.import(&source).output().unwrap());
+    for bytes in [b"short".as_slice(), b"test model extra".as_slice()] {
         fixture.source(bytes);
-        failed(fixture.import(&source).output().unwrap(), error);
+        failed(fixture.import(&source).output().unwrap(), "size");
         assert_eq!(fs::read(&source).unwrap(), bytes);
         assert_eq!(fs::read(fixture.artifact()).unwrap(), BYTES);
         assert_eq!(fixture.status()["readiness"], "ready");
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_data_path_is_displayed_after_import_and_in_status() {
+    use std::os::unix::ffi::OsStrExt;
+    let mut fixture = Fixture::new();
+    let data = fixture
+        .temp
+        .path()
+        .join(std::ffi::OsStr::from_bytes(b"data-\xff"));
+    fs::rename(&fixture.data, &data).unwrap();
+    fixture.data = data;
+    let source = fixture.source(BYTES);
+    let import = fixture
+        .import(&source)
+        .env("XDG_DATA_HOME", &fixture.data)
+        .output()
+        .unwrap();
+    assert!(fixture.artifact().is_file(), "{import:?}");
+    let result = json_success(import);
+    assert_eq!(result["readiness"], "ready");
+    assert_eq!(result["path"], fixture.artifact().display().to_string());
+    let status = fixture
+        .command(&["model", "status"])
+        .env("XDG_DATA_HOME", &fixture.data)
+        .output()
+        .unwrap();
+    assert!(status.status.success(), "{status:?}");
+    assert!(
+        String::from_utf8(status.stdout)
+            .unwrap()
+            .contains("data-\u{fffd}")
+    );
+}
+
+#[test]
+fn partial_stage_write_exhausts_storage_without_replacing_the_model() {
+    let fixture = Fixture::new();
+    let source = fixture.source(BYTES);
+    json_success(fixture.import(&source).output().unwrap());
+
+    let artifact = fixture.artifact();
+    let old_identity = kio_core::platform::real_regular_file_identity(&artifact)
+        .unwrap()
+        .unwrap();
+    let output = fixture
+        .import(&source)
+        .env("KIO_TEST_MODEL_WRITE_ENOSPC", "1")
+        .output()
+        .unwrap();
+    let error = failed_json(output, 3, "KIO-E-RESOURCE-LIMIT-001");
+    assert_eq!(error["context"]["resource"], "storage");
+    assert_eq!(error["context"]["stage"], "model_install");
+    assert_eq!(
+        kio_core::platform::real_regular_file_identity(&artifact).unwrap(),
+        Some(old_identity)
+    );
+    let stage = fixture
+        .artifact()
+        .parent()
+        .unwrap()
+        .join(".kio-atomic/write");
+    assert_eq!(fs::read(&stage).unwrap(), &BYTES[..1]);
+    assert_eq!(fs::read(&source).unwrap(), BYTES);
+    assert_eq!(fs::read(fixture.artifact()).unwrap(), BYTES);
+    assert_eq!(fixture.status()["readiness"], "ready");
+    assert_eq!(
+        json_success(fixture.import(&source).output().unwrap())["readiness"],
+        "ready"
+    );
+    assert!(!stage.exists());
 }
 
 #[test]

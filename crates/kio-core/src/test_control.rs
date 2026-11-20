@@ -194,6 +194,7 @@ pub struct CoreTestControl {
 /// CLI-only seams and process coordination controls.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CliTestControl {
+    pub model_write_enospc: bool,
     pub snapshot_pre_gc_preflight_ready: Option<PathBuf>,
     pub snapshot_prelock_ready: Option<PathBuf>,
     pub snapshot_locked_ready: Option<PathBuf>,
@@ -331,6 +332,8 @@ impl DebugTestControl {
                     .is_some(),
             },
             cli: CliTestControl {
+                model_write_enospc: std::env::var_os("KIO_TEST_MODEL_WRITE_ENOSPC")
+                    .is_some_and(|value| value == "1"),
                 snapshot_pre_gc_preflight_ready: path(
                     "KIO_TEST_SNAPSHOT_AUTO_PRE_GC_PREFLIGHT_READY",
                 ),

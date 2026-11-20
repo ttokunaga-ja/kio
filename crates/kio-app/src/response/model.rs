@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use serde::Serialize;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -20,7 +18,7 @@ pub struct ModelResponse {
     pub runtime_version: Option<String>,
     pub readiness: ModelReadiness,
     pub reason: &'static str,
-    pub path: PathBuf,
+    pub path: String,
     pub reembedding_count: Option<u64>,
     pub producers: Vec<ModelProducer>,
     pub mixed_producers: bool,

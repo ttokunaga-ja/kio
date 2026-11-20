@@ -532,9 +532,34 @@ pub(super) fn write_stream(
     publication: Publication,
     write: impl FnOnce(&mut File) -> Result<()>,
 ) -> Result<()> {
-    write_with_readonly(owner, owner, relative, write, publication, false, |_, _| {
-        Ok(())
-    })
+    write_with_mode(
+        owner,
+        owner,
+        relative,
+        write,
+        publication,
+        WriteMode::Regular,
+        |_, _| Ok(()),
+    )
+    .map(|_| ())
+}
+
+pub(super) fn write_stream_preserving(
+    owner: &StoreDirectory,
+    relative: &Path,
+    publication: Publication,
+    source: &File,
+    write: impl FnOnce(&mut File) -> Result<()>,
+) -> Result<bool> {
+    write_with_mode(
+        owner,
+        owner,
+        relative,
+        write,
+        publication,
+        WriteMode::PreserveSource(source),
+        |_, _| Ok(()),
+    )
 }
 
 pub(super) fn write(
@@ -556,15 +581,16 @@ pub(super) fn write_with(
     publication: Publication,
     write: impl FnOnce(&mut dyn Write) -> std::io::Result<()>,
 ) -> Result<()> {
-    write_with_readonly(
+    write_with_mode(
         owner,
         target,
         relative,
         |file| write(file).map_err(|e| io_failure("cannot write atomic publication artifact", e)),
         publication,
-        false,
+        WriteMode::Regular,
         |_, _| Ok(()),
     )
+    .map(|_| ())
 }
 
 pub(super) fn write_checked(
@@ -574,50 +600,106 @@ pub(super) fn write_checked(
     publication: Publication,
     before_publish: impl FnOnce(&StoreDirectory, &Path) -> Result<()>,
 ) -> Result<()> {
-    write_with_readonly(
+    write_with_mode(
         owner,
         owner,
         relative,
         |file| write_artifact(file, bytes),
         publication,
-        false,
+        WriteMode::Regular,
         before_publish,
     )
+    .map(|_| ())
 }
 
 pub(super) fn write_readonly(owner: &StoreDirectory, relative: &Path, bytes: &[u8]) -> Result<()> {
-    write_with_readonly(
+    write_with_mode(
         owner,
         owner,
         relative,
         |file| write_artifact(file, bytes),
         Publication::CreateOnly,
-        true,
+        WriteMode::ReadOnly,
         |_, _| Ok(()),
     )
+    .map(|_| ())
 }
 
-fn write_with_readonly(
+#[derive(Clone, Copy)]
+enum WriteMode<'a> {
+    Regular,
+    ReadOnly,
+    PreserveSource(&'a File),
+}
+
+fn retained_identity(file: File) -> Result<same_file::Handle> {
+    same_file::Handle::from_file(file)
+        .map_err(|error| io_failure("cannot identify retained import file", error))
+}
+
+fn matches_retained_file(
+    directory: &StoreDirectory,
+    leaf: &Path,
+    source: &same_file::Handle,
+) -> Result<bool> {
+    if !directory.contains_entry(leaf)? {
+        return Ok(false);
+    }
+    let candidate = retained_identity(directory.open_regular_read(leaf, u64::MAX)?)?;
+    Ok(&candidate == source)
+}
+
+fn protect_import_source(workspace: &StoreDirectory, source: &same_file::Handle) -> Result<()> {
+    // Import is used on write-only stores. A removal journal could name a
+    // different public target, so do not replay one during an import.
+    if workspace.contains_entry(Path::new(REMOVE_READY))? {
+        return Err(failure("atomic import cannot recover a removal intent"));
+    }
+    for name in [WRITE, REMOVE_PENDING] {
+        if matches_retained_file(workspace, Path::new(name), source)? {
+            return Err(failure("import source is an atomic recovery artifact"));
+        }
+    }
+    Ok(())
+}
+
+fn write_with_mode(
     owner: &StoreDirectory,
     target: &StoreDirectory,
     relative: &Path,
     write: impl FnOnce(&mut File) -> Result<()>,
     publication: Publication,
-    readonly: bool,
+    mode: WriteMode<'_>,
     before_publish: impl FnOnce(&StoreDirectory, &Path) -> Result<()>,
-) -> Result<()> {
+) -> Result<bool> {
     let normalized = valid_relative(relative)?;
     validate_target_namespace(owner, target, &normalized)?;
     let (preflight_parent, _, _) = parent_chain(target, relative)?;
     same_volume(owner, &preflight_parent)?;
     let workspace = workspace_create(owner)?;
     let _gate = lock_workspace(&workspace)?;
+    let source = if let WriteMode::PreserveSource(source) = mode {
+        let source = retained_identity(
+            source
+                .try_clone()
+                .map_err(|error| io_failure("cannot retain import source", error))?,
+        )?;
+        protect_import_source(&workspace, &source)?;
+        Some(source)
+    } else {
+        None
+    };
     let _ = recover_locked(owner, &workspace, &[target], false)?;
     let (parent, leaf, _) = parent_chain(target, relative)?;
     same_volume(&workspace, &parent)?;
+    if let Some(source) = source.as_ref()
+        && matches_retained_file(&parent, Path::new(&leaf), source)?
+    {
+        return Ok(false);
+    }
     let mut staged = workspace.create_private_file(Path::new(WRITE))?;
     write(&mut staged)?;
-    if readonly {
+    if matches!(mode, WriteMode::ReadOnly) {
         let mut permissions = staged
             .metadata()
             .map_err(|e| io_failure("cannot inspect atomic publication artifact", e))?
@@ -636,6 +718,13 @@ fn write_with_readonly(
         .control()
         .checkpoint(crate::durability::DurabilityPoint::AtomicWriteStaged)?;
     before_publish(&parent, Path::new(&leaf))?;
+    if let Some(source) = source.as_ref()
+        && matches_retained_file(&parent, Path::new(&leaf), source)?
+    {
+        return Err(failure(
+            "import destination became the import source during staging",
+        ));
+    }
     if let Err(error) = crate::platform::store::rename_regular_between_unsynced(
         &workspace.root_handle(),
         Path::new(WRITE),
@@ -645,7 +734,7 @@ fn write_with_readonly(
         workspace.path(),
         parent.path(),
     ) {
-        if readonly {
+        if matches!(mode, WriteMode::ReadOnly) {
             remove_if_present(&workspace, WRITE)?;
             workspace.sync()?;
         }
@@ -658,7 +747,8 @@ fn write_with_readonly(
     workspace.sync()?;
     owner
         .control()
-        .checkpoint(crate::durability::DurabilityPoint::AtomicWritePublished)
+        .checkpoint(crate::durability::DurabilityPoint::AtomicWritePublished)?;
+    Ok(true)
 }
 
 pub(super) fn remove(

@@ -29,6 +29,7 @@ getrandom.workspace = true
 # Authenticated adapter responses use identity encoding so wire and decoded
 # byte ceilings cannot be bypassed through transparent decompression.
 ureq.workspace = true
+url = "2"
 ring = "=0.17.14"
 rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
 # XLSX sheet extraction (07 §5.1): OOXML is namespaced XML with entity escaping

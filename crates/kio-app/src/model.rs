@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use kio_core::control::ControlHandle;
 use kio_core::error::{Resource, ResourceLimit};
-use kio_core::store_dir::{ATOMIC_WORKSPACE_DIR, Publication, StoreDirectory, hash_regular_file};
+use kio_core::store_dir::{Publication, StoreDirectory, hash_regular_file};
 use kio_core::{ExitCode, KioError, Result};
 
 use crate::commands::ModelCommand;
@@ -50,7 +50,7 @@ impl Pin {
 
     fn response(
         &self,
-        path: PathBuf,
+        path: &Path,
         readiness: ModelReadiness,
         reason: &'static str,
     ) -> CommandResponse {
@@ -64,7 +64,7 @@ impl Pin {
                 runtime_version: None,
                 readiness,
                 reason,
-                path,
+                path: path.display().to_string(),
                 reembedding_count: None,
                 producers: Vec::new(),
                 mixed_producers: false,
@@ -74,17 +74,17 @@ impl Pin {
     }
 
     /// Returns a mismatch reason for a regular file whose bytes fail the pin.
-    fn mismatch(&self, file: &mut File, path: &Path) -> Result<Option<&'static str>> {
+    fn mismatch(&self, file: &mut File, path: &Path) -> Result<Option<ModelMismatch>> {
         if file
             .metadata()
             .map_err(|error| file_error(path, error))?
             .len()
             != self.bytes
         {
-            return Ok(Some("model size differs from the pinned size"));
+            return Ok(Some(ModelMismatch::Size));
         }
         let (digest, _) = hash_regular_file(file, self.bytes)?;
-        Ok((digest != self.sha256).then_some("model SHA-256 differs from the pinned hash"))
+        Ok((digest != self.sha256).then_some(ModelMismatch::Hash))
     }
 }
 
@@ -101,15 +101,15 @@ pub(crate) fn run(
         ModelCommand::Status => {
             let installed = crate::private_state::open_readonly(&directory, &base, control)?;
             let Some(installed) = installed else {
-                return Ok(missing(&pin, path));
+                return Ok(missing(&pin, &path));
             };
             let leaf = Path::new(ARTIFACT);
             if !installed.contains_entry(leaf)? {
-                return Ok(missing(&pin, path));
+                return Ok(missing(&pin, &path));
             }
             let mut file = verified_model_file(&installed)?;
-            if let Some(reason) = pin.mismatch(&mut file, &path)? {
-                return Ok(pin.response(path, ModelReadiness::HashMismatch, reason));
+            if let Some(mismatch) = pin.mismatch(&mut file, &path)? {
+                return Ok(pin.response(&path, ModelReadiness::HashMismatch, mismatch.message()));
             }
         }
         ModelCommand::Install { from, yes, offline } => {
@@ -127,29 +127,11 @@ pub(crate) fn run(
                     .map_err(|error| file_error(&source, error))?;
                 let (mut file, bytes) = open_import(&source)?;
                 if bytes != pin.bytes {
-                    return Err(integrity_error("model size differs from the pinned size"));
+                    return Err(ModelMismatch::Size.error());
                 }
                 let installed =
                     crate::private_state::ensure_private_directory(&directory, &base, control)?;
-                // An import may point to the installed file itself through a
-                // user-supplied alias. Keep its existing binding intact.
-                if path.canonicalize().is_ok_and(|target| source == target) {
-                    let mut existing = verified_model_file(&installed)?;
-                    if let Some(reason) = pin.mismatch(&mut existing, &path)? {
-                        return Err(integrity_error(reason));
-                    }
-                } else {
-                    if directory
-                        .join(ATOMIC_WORKSPACE_DIR)
-                        .canonicalize()
-                        .is_ok_and(|workspace| source.starts_with(workspace))
-                    {
-                        return Err(KioError::invalid_usage(
-                            "model import source must be outside the installation staging directory",
-                        ));
-                    }
-                    publish(&installed, &pin, &mut file)?;
-                }
+                import_file(&installed, &pin, &mut file)?;
             } else {
                 let mut body = kio_adapter::model_download::open(&source_url, pin.bytes, control)
                     .map_err(|error| {
@@ -167,7 +149,7 @@ pub(crate) fn run(
         }
     }
     Ok(pin.response(
-        path,
+        &path,
         ModelReadiness::Ready,
         "model size and SHA-256 verified",
     ))
@@ -194,7 +176,7 @@ fn confirm(
         return Ok(());
     }
     if !ctx.interaction.is_interactive() {
-        return Err(KioError::invalid_usage(
+        return Err(consent_error(
             "model installation requires confirmation or --yes",
         ));
     }
@@ -204,11 +186,11 @@ fn confirm(
     {
         Ok(())
     } else {
-        Err(KioError::invalid_usage("model installation declined"))
+        Err(consent_error("model installation declined"))
     }
 }
 
-fn missing(pin: &Pin, path: PathBuf) -> CommandResponse {
+fn missing(pin: &Pin, path: &Path) -> CommandResponse {
     pin.response(
         path,
         ModelReadiness::Missing,
@@ -248,21 +230,49 @@ fn open_import(path: &Path) -> Result<(File, u64)> {
     Ok((file, metadata.len()))
 }
 
+fn import_file(installed: &StoreDirectory, pin: &Pin, file: &mut File) -> Result<()> {
+    let published = installed.write_atomic_stream_preserving_source(
+        Path::new(ARTIFACT),
+        Publication::Upsert,
+        file,
+        |staged| stage_model(installed, pin, &mut &*file, staged),
+    )?;
+    if !published {
+        kio_core::private_fs::verify_private_regular_file_handle(file)?;
+        verify_pin(pin, file, &installed.path().join(ARTIFACT))?;
+    }
+    Ok(())
+}
+
 fn publish(directory: &StoreDirectory, pin: &Pin, source: &mut impl Read) -> Result<()> {
-    let leaf = Path::new(ARTIFACT);
-    // The shared atomic workspace serializes installers, discards abandoned
-    // staging on retry, and renames only after the callback and sync succeed.
-    directory.write_atomic_stream(leaf, Publication::Upsert, |staged| {
-        let path = directory.path().join(leaf);
-        // Bound staging even when the source has no trustworthy length.
-        io::copy(&mut source.take(pin.bytes + 1), staged)
-            .map_err(|error| file_error(&path, error))?;
-        staged.rewind().map_err(|error| file_error(&path, error))?;
-        if let Some(reason) = pin.mismatch(staged, &path)? {
-            return Err(integrity_error(reason));
-        }
-        Ok(())
+    directory.write_atomic_stream(Path::new(ARTIFACT), Publication::Upsert, |staged| {
+        stage_model(directory, pin, source, staged)
     })
+}
+
+fn stage_model(
+    directory: &StoreDirectory,
+    pin: &Pin,
+    source: &mut impl Read,
+    staged: &mut File,
+) -> Result<()> {
+    let path = directory.path().join(ARTIFACT);
+    #[cfg(debug_assertions)]
+    if directory.control().debug().cli.model_write_enospc {
+        io::copy(&mut source.take(1), staged).map_err(|error| file_error(&path, error))?;
+        return Err(file_error(&path, io::ErrorKind::StorageFull.into()));
+    }
+    // Bound staging even when the source has no trustworthy length.
+    io::copy(&mut source.take(pin.bytes + 1), staged).map_err(|error| file_error(&path, error))?;
+    staged.rewind().map_err(|error| file_error(&path, error))?;
+    verify_pin(pin, staged, &path)
+}
+
+fn verify_pin(pin: &Pin, file: &mut File, path: &Path) -> Result<()> {
+    match pin.mismatch(file, path)? {
+        Some(mismatch) => Err(mismatch.error()),
+        None => Ok(()),
+    }
 }
 
 fn file_error(path: &Path, error: io::Error) -> KioError {
@@ -280,11 +290,125 @@ fn file_error(path: &Path, error: io::Error) -> KioError {
     KioError::io(error.to_string(), path.display().to_string())
 }
 
-fn integrity_error(reason: &str) -> KioError {
+fn consent_error(message: &str) -> KioError {
     KioError::new(
-        "KIO-E-MODEL-INTEGRITY-001",
-        reason,
-        serde_json::json!({}),
-        ExitCode::PermanentFailure,
+        "KIO-E-MODEL-CONSENT-001",
+        message,
+        serde_json::json!({"reason": "model_consent_required"}),
+        ExitCode::ConfirmationRejected,
     )
+}
+
+enum ModelMismatch {
+    Size,
+    Hash,
+}
+
+impl ModelMismatch {
+    fn message(&self) -> &'static str {
+        match self {
+            Self::Size => "model size differs from the pinned size",
+            Self::Hash => "model SHA-256 differs from the pinned hash",
+        }
+    }
+
+    fn error(&self) -> KioError {
+        let (code, reason) = match self {
+            Self::Size => ("KIO-E-MODEL-INTEGRITY-001", "model_size_mismatch"),
+            Self::Hash => ("KIO-E-MODEL-HASH-001", "model_hash_mismatch"),
+        };
+        KioError::new(
+            code,
+            self.message(),
+            serde_json::json!({"reason": reason}),
+            ExitCode::PermanentFailure,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interactive_decline_returns_the_model_consent_error() {
+        struct Decline;
+        impl crate::context::Interaction for Decline {
+            fn confirm(&self, prompt: &str) -> Result<bool> {
+                assert!(prompt.contains("[y/N]"));
+                Ok(false)
+            }
+            fn read_input(&self, _: usize) -> Result<Vec<u8>> {
+                unreachable!("confirmation uses the device prompt")
+            }
+            fn is_interactive(&self) -> bool {
+                true
+            }
+            fn diagnostic(&self, _: &str) {}
+            fn write_diagnostic(&self, _: &str) -> Result<()> {
+                Ok(())
+            }
+            fn flush_diagnostics(&self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let ctx = AppContext {
+            working_directory: PathBuf::from("."),
+            interaction: std::sync::Arc::new(Decline),
+        };
+        let pin = Pin::current(&ControlHandle::default());
+        let error = confirm(&ctx, None, false, SOURCE, &pin, Path::new(ARTIFACT)).unwrap_err();
+        assert_eq!(error.exit_code().code(), 9);
+        assert_eq!(error.error_code(), "KIO-E-MODEL-CONSENT-001");
+        assert_eq!(error.context()["reason"], "model_consent_required");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn import_preserves_the_retained_source_under_its_other_name() {
+        use kio_core::store_dir::ATOMIC_WORKSPACE_DIR;
+        use std::{io::Write as _, os::unix::fs::MetadataExt as _};
+
+        for target_is_stage in [false, true] {
+            let root = crate::test_support::PrivateTempDir::new();
+            let installed = StoreDirectory::open(root.path()).unwrap();
+            let source_path = root.path().join("other-name");
+            let mut source = installed
+                .create_private_file(Path::new("other-name"))
+                .unwrap();
+            source.write_all(b"test model").unwrap();
+            source.rewind().unwrap();
+
+            let artifact = root.path().join(ARTIFACT);
+            let protected_path = if target_is_stage {
+                installed
+                    .create_directory(Path::new(ATOMIC_WORKSPACE_DIR))
+                    .unwrap();
+                root.path().join(ATOMIC_WORKSPACE_DIR).join("write")
+            } else {
+                artifact.clone()
+            };
+            // Use distinct path and handle names without requiring a privileged
+            // bind mount. The already-open file is the caller's authority.
+            let inode = source.metadata().unwrap().ino();
+            std::fs::rename(&source_path, &protected_path).unwrap();
+            let pin = Pin {
+                bytes: 10,
+                sha256: "e6a8036e9cb9f8c9f52ffd985c4d6f0498d94e6919f4c67b6423da0176e549fa",
+            };
+            let result = import_file(&installed, &pin, &mut source);
+            if target_is_stage {
+                assert!(
+                    result.is_err(),
+                    "recovery must reject the retained import source"
+                );
+                assert!(!artifact.exists());
+            } else {
+                result.unwrap();
+            }
+            assert_eq!(std::fs::metadata(&protected_path).unwrap().ino(), inode);
+            assert_eq!(std::fs::read(&protected_path).unwrap(), b"test model");
+        }
+    }
 }
