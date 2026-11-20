@@ -4,7 +4,7 @@ use super::history::{
 };
 use super::{CommandResponse, Completion, ResponseBody};
 use kio_core::dag::{CommitObject, CommitStats, CommitType, TreeEntry, TreeObject};
-use kio_core::scope::{DiffEntry, LogEntry};
+use kio_core::scope::{DiffChange, DiffEntry, LogEntry};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
@@ -65,27 +65,35 @@ fn log_projection_preserves_empty_populated_and_truncated_history() {
 
 #[test]
 fn diff_projection_preserves_empty_changes_and_domain_field_omissions() {
-    for changes in [
-        Vec::new(),
-        vec![
-            DiffEntry {
-                path: Some(PathBuf::from("notes.md")),
-                relative_path: "notes.md".to_owned(),
-                change: "added".to_owned(),
-                old_raw_hash: None,
-                new_raw_hash: Some("d".repeat(64)),
-            },
-            DiffEntry {
-                path: None,
-                relative_path: "removed.md".to_owned(),
-                change: "deleted".to_owned(),
-                old_raw_hash: Some("e".repeat(64)),
-                new_raw_hash: None,
-            },
-        ],
+    for (changes, expected) in [
+        (Vec::new(), json!([])),
+        (
+            vec![
+                DiffEntry {
+                    path: Some(PathBuf::from("notes.md")),
+                    relative_path: Some("notes.md".to_owned()),
+                    change: DiffChange::Added,
+                    old_raw_hash: None,
+                    new_raw_hash: Some("d".repeat(64)),
+                },
+                DiffEntry {
+                    path: None,
+                    relative_path: Some("removed.md".to_owned()),
+                    change: DiffChange::Deleted,
+                    old_raw_hash: Some("e".repeat(64)),
+                    new_raw_hash: None,
+                },
+            ],
+            json!([
+                {"path":"notes.md","relative_path":"notes.md","change":"added","new_raw_hash":"d".repeat(64)},
+                {"relative_path":"removed.md","change":"deleted","old_raw_hash":"e".repeat(64)},
+            ]),
+        ),
     ] {
-        let legacy = json!({ "changes": changes });
-        assert_projection(ResponseBody::Diff(DiffResponse { changes }), legacy);
+        assert_projection(
+            ResponseBody::Diff(DiffResponse { changes }),
+            json!({ "changes": expected }),
+        );
     }
 }
 

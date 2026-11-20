@@ -680,9 +680,8 @@ archive として保持する。歴史 measurement outputs も fixture producer 
 - 正本: 06-cli-spec.md §1 L94 (『`kio diff` は raw / path の差分に加え、
   `normalize_manifest_changed` / `chunking_config_changed` / `tool_lock_changed` /
   `resurrection_published` を差分として表示する。derived-only commit を「差分なし」と表示してはならない』)
-- 前提: 2 つの commit `Ca`/`Cb` が同一 tree_hash かつ同一 raw_hash 集合を持つが (raw/path 差分は
-  0 件)、`Cb` の tree の `manifest_hash` が `Ca` と異なる (same-gen partial retry の finalize による
-  derived-only commit — no-op 規則の例外扱いで別 commit が作られたケース)。
+- 前提: 2 つの commit `Ca`/`Cb` で各 path とその `raw_hash` は同一だが、same-gen partial
+  retry の finalize によって `Cb` の tree では `manifest_hash` が変わり、別の `tree_hash` になる。
 - 操作: `kio diff Ca Cb` を実行する。
 - 期待: raw/path 差分が 0 件であっても `normalize_manifest_changed` を含む差分エントリが返り、
   「差分なし」ではなく derived-only の変化として表示される。current tree の必須 field が欠落すれば

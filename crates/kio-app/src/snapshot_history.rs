@@ -63,6 +63,8 @@ use std::fs;
 use std::path::Path;
 use std::time::Instant;
 
+mod diff_events;
+
 pub(crate) fn run_snapshot_create(
     ctx: &Invocation<'_>,
     args: commands::SnapshotCreateArgs,
@@ -240,7 +242,7 @@ pub(crate) fn run_diff(ctx: &Invocation<'_>, args: commands::DiffArgs) -> Result
     validate_repo_tool_lock(&repo)?;
     // QB5/QB6/裁定1: shared (1)+(3) preflight pair.
     let checkpoint = preflight_barrier_and_index(repo.kio_dir(), repo.control())?;
-    let changes = repo.diff(&args.a, &args.b)?;
+    let changes = diff_events::diff(&repo, &args.a, &args.b)?;
     // §I checkpoint 2 (LC54/LC55).
     checkpoint.finish(CommandResponse {
         body: ResponseBody::Diff(DiffResponse { changes }),

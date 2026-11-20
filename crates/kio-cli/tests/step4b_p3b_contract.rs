@@ -9,7 +9,7 @@
 //! lives in the exit/error/log/config/search-carryover lane.
 //!
 //! Covered here: QB1-QB9 (§A, full), QB11/QB12/QB14/QB15/QB18/QB19/QB20/
-//! QB23 (§B slice), QB29/QB31/QB32/QB37 (§C slice), QB50-QB58 (§D, full —
+//! QB23 (§B slice), QB29/QB31/QB32/QB37/QB39 (§C slice), QB50-QB58 (§D, full —
 //! `kio log --at/--since` real implementation), QB61 (§E slice). QB24's
 //! Recall@10 projection and frozen malformed-wire cases live in the Rust
 //! `kio-eval` runner/tests; they are not CLI contracts here.
@@ -21,10 +21,10 @@
 //! section), QB16 (`kio import --as-new-scope` fork — command does not
 //! exist), QB17 (`.kioz` export sanitize warning — command does not exist),
 //! QB21/QB22 (system-directory ignore patterns + template-version hashing),
-//! QB25-QB28/QB30/QB33-QB49 except QB29/31/32/37 (mtime racy-check, fsync
+//! QB25-QB28/QB30/QB33-QB49 except QB29/31/32/37/39 (mtime racy-check, fsync
 //! chaining, XLSX escaping, LCS tie-break proof, UCD Script property,
 //! query-vector cache persistence, embedding CAS byte reformat, tree
-//! chunking_config_hash/chunk_set_hash fields, diff derived-only detection,
+//! chunking_config_hash/chunk_set_hash fields,
 //! `parent_instance`, auto gen+1 on prepared_hash change, the 9-state
 //! `up_to_date` machine, tool_lock_hash no-op comparison, batch resume/retry
 //! auto-snapshot wiring, manifest/toollock CAS write timing, `.kio/staging/`
@@ -43,7 +43,7 @@ use std::fs;
 use std::str::FromStr;
 
 use assert_cmd::Command;
-use kio_core::cas::{ObjectKind, ObjectStore, hash_bytes};
+use kio_core::cas::{ContentObjectKind, ObjectKind, ObjectStore, canonical_json_bytes, hash_bytes};
 use kio_core::purge::{PurgeReason, PurgeState, TombstoneMode};
 use kio_core::scope::{Repository, StoreLock};
 #[cfg(windows)]
@@ -1307,6 +1307,277 @@ fn three_commit_history() -> (TempDir, [String; 3]) {
     let c2 = index_at(&dir, "2026-01-08T00:00:00Z", "# A\n\nv2\n");
     let c3 = index_at(&dir, "2026-01-15T00:00:00Z", "# A\n\nv3\n");
     (dir, [c1, c2, c3])
+}
+
+fn qb39_snapshot() -> (TempDir, String, Value, Value) {
+    let dir = canonical_tempdir();
+    success(&dir, &["init"]);
+    fs::write(dir.path().join("notes.txt"), b"original").unwrap();
+    let snapshot = success(&dir, &["snapshot", "create", "-m", "base"]);
+    let hash = snapshot["commit_hash"].as_str().unwrap().to_owned();
+    let commit = snapshot["commit"].clone();
+    let tree = success(&dir, &["inspect", commit["tree"].as_str().unwrap()]);
+    (dir, hash, commit, tree)
+}
+
+fn qb39_child(store: &ObjectStore, parent: &str, mut commit: Value, tree: &Value) -> String {
+    commit["parent"] = serde_json::json!(parent);
+    commit["tree"] = serde_json::json!(store.write_json(ObjectKind::Tree, tree).unwrap().0);
+    commit["stats"] = serde_json::json!({
+        "files_added": 0, "files_modified": 0, "files_deleted": 0,
+    });
+    store.write_json(ObjectKind::Commit, &commit).unwrap().0
+}
+
+fn qb39_change(dir: &TempDir, a: &str, b: &str, kind: &str) -> (Value, String) {
+    let response = success(dir, &["diff", a, b]);
+    let changes = response["changes"].as_array().unwrap();
+    assert_eq!(changes.len(), 1, "{response}");
+    assert_eq!(changes[0]["change"], kind);
+    let output = kio(dir, &["diff", a, b]).assert().success();
+    let text = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+    assert!(text.starts_with(kind), "{text}");
+    (changes[0].clone(), text)
+}
+
+#[test]
+fn qb39_diff_detects_a_same_gen_manifest_change() {
+    let (dir, base, commit, mut tree) = qb39_snapshot();
+    let store = ObjectStore::new(kio_dir(&dir));
+    // Diff compares the pins in the tree. Manifest bodies are outside this fixture.
+    tree["entries"][0]["normalize"] = serde_json::json!({
+        "tool_profile_hash": hash_bytes(b"same profile"),
+        "gen": 0,
+        "manifest_hash": hash_bytes(b"partial manifest")
+    });
+    let a = qb39_child(&store, &base, commit.clone(), &tree);
+    tree["entries"][0]["normalize"]["manifest_hash"] =
+        serde_json::json!(hash_bytes(b"completed manifest"));
+    let b = qb39_child(&store, &a, commit, &tree);
+
+    let (change, text) = qb39_change(&dir, &a, &b, "normalize_manifest_changed");
+    assert_eq!(change["relative_path"], "notes.txt");
+    assert!(text.contains("notes.txt"), "{text}");
+}
+
+#[test]
+fn qb39_diff_detects_a_chunking_config_change() {
+    let (dir, a, commit, mut tree) = qb39_snapshot();
+    let store = ObjectStore::new(kio_dir(&dir));
+    tree["chunking_config_hash"] =
+        serde_json::json!(kio_core::dag::chunking_config_hash("heading", 1200).unwrap());
+    let b = qb39_child(&store, &a, commit, &tree);
+    qb39_change(&dir, &a, &b, "chunking_config_changed");
+}
+
+#[test]
+fn qb39_diff_reports_historical_tool_lock_hashes_and_roles() {
+    let (dir, base, commit, tree) = qb39_snapshot();
+    let store = ObjectStore::new(kio_dir(&dir));
+    let write_lock = |profile: &[u8]| {
+        let lock = serde_json::json!({
+            "spec_version": 1,
+            "markdown": { "tool_id": "test", "profile_hash": hash_bytes(profile) },
+        });
+        store
+            .write_content_object(
+                ContentObjectKind::Toollock,
+                &canonical_json_bytes(&lock).unwrap(),
+            )
+            .unwrap()
+    };
+    let old = write_lock(b"old profile");
+    let new = write_lock(b"new profile");
+    let mut a_commit = commit.clone();
+    a_commit["tool_lock_hash"] = serde_json::json!(old);
+    let a = qb39_child(&store, &base, a_commit, &tree);
+    let mut b_commit = commit;
+    b_commit["tool_lock_hash"] = serde_json::json!(new);
+    let b = qb39_child(&store, &a, b_commit, &tree);
+
+    let (change, text) = qb39_change(&dir, &a, &b, "tool_lock_changed");
+    assert_eq!(change["old_tool_lock_hash"], old);
+    assert_eq!(change["new_tool_lock_hash"], new);
+    assert_eq!(change["changed_roles"], serde_json::json!(["markdown"]));
+    for expected in [&old, &new, "markdown"] {
+        assert!(text.contains(expected), "{text}");
+    }
+}
+
+#[test]
+fn qb39_diff_reports_only_modified_when_raw_changes() {
+    let (dir, a, _, _) = qb39_snapshot();
+    fs::write(dir.path().join("notes.txt"), b"updated").unwrap();
+    let snapshot = success(&dir, &["snapshot", "create", "-m", "updated"]);
+    let b = snapshot["commit_hash"].as_str().unwrap();
+    qb39_change(&dir, &a, b, "modified");
+}
+
+#[test]
+fn qb39_diff_rejects_missing_required_derived_fields() {
+    let (dir, a, commit, tree) = qb39_snapshot();
+    let store = ObjectStore::new(kio_dir(&dir));
+    let mut missing_config = tree.clone();
+    missing_config
+        .as_object_mut()
+        .unwrap()
+        .remove("chunking_config_hash");
+    let mut missing_manifest = tree;
+    missing_manifest["entries"][0]["normalize"] = serde_json::json!({
+        "tool_profile_hash": hash_bytes(b"profile"),
+        "gen": 0
+    });
+    for (tree, field) in [
+        (missing_config, "chunking_config_hash"),
+        (missing_manifest, "manifest_hash"),
+    ] {
+        let b = qb39_child(&store, &a, commit.clone(), &tree);
+        let (code, error) = run(&dir, &["diff", &a, &b]);
+        assert_ne!(code, 0, "{error}");
+        assert_eq!(error["error_code"], "KIO-E-CONFIG-SCHEMA-001", "{error}");
+        assert!(
+            error["message"].as_str().unwrap().contains(field),
+            "{error}"
+        );
+    }
+}
+
+fn qb39_chunk_history() -> (TempDir, String, String, String) {
+    let dir = canonical_tempdir();
+    success(&dir, &["init"]);
+    let a = index_at(&dir, "2026-07-12T00:00:00Z", "# Publication\n\nA chunk.\n");
+    let commit = success(&dir, &["inspect", &a]);
+    let tree = success(&dir, &["inspect", commit["tree"].as_str().unwrap()]);
+    let store = ObjectStore::new(kio_dir(&dir));
+    let b = qb39_child(&store, &a, commit.clone(), &tree);
+    let c = qb39_child(&store, &b, commit, &tree);
+    let ledger = kio_dir(&dir).join("index/chunks.jsonl");
+    let original = fs::read_to_string(&ledger).unwrap();
+    let changed = original.replace(&a, &b);
+    assert_ne!(original, changed, "fixture must have a publication event");
+    fs::write(&ledger, changed).unwrap();
+    let sqlite = kio_dir(&dir).join("index/sqlite.db");
+    support::prepare_private_sqlite_sidecars(&sqlite).unwrap();
+    rusqlite::Connection::open(sqlite)
+        .unwrap()
+        .execute(
+            "UPDATE chunk_publications SET introduction_commit = ?1 WHERE introduction_commit = ?2",
+            [&b, &a],
+        )
+        .unwrap();
+    (dir, a, b, c)
+}
+
+#[test]
+fn qb39_diff_detects_a_chunk_publication_with_the_same_tree() {
+    let (dir, a, b, _) = qb39_chunk_history();
+    qb39_change(&dir, &a, &b, "chunk_set_changed");
+}
+
+#[test]
+fn qb39_diff_omits_chunk_change_when_both_inherit_the_publication() {
+    let (dir, _, b, c) = qb39_chunk_history();
+    assert_eq!(
+        success(&dir, &["diff", &b, &c])["changes"],
+        serde_json::json!([])
+    );
+}
+
+#[test]
+fn qb39_diff_rejects_missing_or_malformed_chunk_publication() {
+    let (dir, a, b, _) = qb39_chunk_history();
+    let ledger = kio_dir(&dir).join("index/chunks.jsonl");
+    let records = fs::read_to_string(&ledger).unwrap();
+    for replacement in [
+        "",
+        "{\"event\":\"publication\"}\n",
+        "{\"event\":\"publication\"",
+    ] {
+        let mut contents = records
+            .lines()
+            .filter(|line| !line.contains("\"event\":\"publication\""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        contents.push('\n');
+        contents.push_str(replacement);
+        fs::write(&ledger, contents).unwrap();
+        let (code, error) = run(&dir, &["diff", &a, &b]);
+        assert_ne!(code, 0, "{error}");
+        assert_eq!(error["error_code"], "KIO-E-STORE-CORRUPT-001", "{error}");
+    }
+}
+
+fn qb39_resurrection_history() -> (TempDir, String, String, String) {
+    let dir = canonical_tempdir();
+    success(&dir, &["init"]);
+    let bytes = b"original raw";
+    let raw = hash_bytes(bytes);
+    let path = dir.path().join("notes.txt");
+    fs::write(&path, bytes).unwrap();
+    let a = success(&dir, &["snapshot", "create", "-m", "original"])["commit_hash"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    fs::remove_file(&path).unwrap();
+    success(
+        &dir,
+        &["purge", "--raw-hash", &raw, "--reason", "privacy", "--yes"],
+    );
+    let purged = fs::read_to_string(kio_dir(&dir).join("HEAD"))
+        .unwrap()
+        .trim()
+        .to_owned();
+    fs::write(&path, bytes).unwrap();
+    let b = success(&dir, &["snapshot", "create", "-m", "republished"])["commit_hash"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    success(&dir, &["repair", "rebuild-db"]);
+    (dir, a, purged, b)
+}
+
+#[test]
+fn qb39_diff_detects_a_resurrection_of_identical_raw() {
+    let (dir, a, _, b) = qb39_resurrection_history();
+    qb39_change(&dir, &a, &b, "resurrection_published");
+}
+
+#[test]
+fn qb39_diff_omits_resurrection_for_the_purge_or_same_commit() {
+    let (dir, a, purged, b) = qb39_resurrection_history();
+    qb39_change(&dir, &a, &purged, "deleted");
+    assert_eq!(
+        success(&dir, &["diff", &b, &b])["changes"],
+        serde_json::json!([])
+    );
+}
+
+#[test]
+fn qb39_diff_rejects_missing_or_malformed_resurrection_events() {
+    let (dir, a, _, b) = qb39_resurrection_history();
+    let purge = PurgeState::open(kio_dir(&dir)).unwrap();
+    let marker = purge.tombstone_path(&hash_bytes(b"original raw")).unwrap();
+    let mut malformed: Value = serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
+    malformed["events"][1]
+        .as_object_mut()
+        .unwrap()
+        .remove("resurrection_commit");
+    let mut missing_retired = malformed.clone();
+    missing_retired["events"]
+        .as_array_mut()
+        .unwrap()
+        .pop()
+        .unwrap();
+    for record in [Some(malformed), Some(missing_retired), None] {
+        if let Some(record) = record {
+            fs::write(&marker, serde_json::to_vec(&record).unwrap()).unwrap();
+        } else {
+            fs::remove_file(&marker).unwrap();
+        }
+        let (code, error) = run(&dir, &["diff", &a, &b]);
+        assert_ne!(code, 0, "{error}");
+        assert_eq!(error["error_code"], "KIO-E-STORE-CORRUPT-001", "{error}");
+    }
 }
 
 fn log_commit_hashes(response: &Value) -> Vec<String> {

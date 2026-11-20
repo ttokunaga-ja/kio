@@ -340,12 +340,54 @@ pub struct LogReport {
 pub struct DiffEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
-    pub relative_path: String,
-    pub change: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relative_path: Option<String>,
+    #[serde(flatten)]
+    pub change: DiffChange,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub old_raw_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_raw_hash: Option<String>,
+}
+
+impl DiffEntry {
+    pub fn scope(change: DiffChange) -> Self {
+        Self {
+            path: None,
+            relative_path: None,
+            change,
+            old_raw_hash: None,
+            new_raw_hash: None,
+        }
+    }
+}
+
+pub struct DiffReport {
+    pub before: DiffSnapshot,
+    pub after: DiffSnapshot,
+    pub changes: Vec<DiffEntry>,
+}
+
+pub struct DiffSnapshot {
+    pub commit_hash: String,
+    pub tree: TreeObject,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "change", rename_all = "snake_case")]
+pub enum DiffChange {
+    Added,
+    Deleted,
+    Modified,
+    NormalizeManifestChanged,
+    ChunkingConfigChanged,
+    ChunkSetChanged,
+    ResurrectionPublished,
+    ToolLockChanged {
+        old_tool_lock_hash: String,
+        new_tool_lock_hash: String,
+        changed_roles: Vec<&'static str>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -1471,16 +1513,6 @@ fn snapshot_authority_changed(message: &str) -> KioError {
 /// whole subtree regardless of child modes. No-op on non-unix.
 pub fn restrict_dir_to_owner(dir: &Path) -> Result<()> {
     set_scope_directory_permissions(dir)
-}
-
-fn tree_map(tree: &TreeObject) -> Result<BTreeMap<String, String>> {
-    tree.entries
-        .iter()
-        .map(|entry| {
-            let entry = entry?;
-            Ok((entry.path, entry.raw_hash))
-        })
-        .collect()
 }
 
 /// Merge the two sorted streams without a path map proportional to tree size.
