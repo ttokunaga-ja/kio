@@ -68,8 +68,11 @@ cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 root="$(pwd -P)"
 mkdir -p "scratch/validate/$work"
 run="$(mktemp -d "$root/scratch/validate/$work/run.XXXXXXXX")"
-mkdir "$run/tmp"
-export TMPDIR="$run/tmp"
+# Unix socket paths must stay under SUN_LEN (104 bytes on macOS), so tests get
+# a short temporary directory outside the deep scratch path.
+short_tmp="$(mktemp -d "${TMPDIR:-/tmp}/kio-lc.XXXXXX")"
+trap 'rm -rf "$short_tmp"' EXIT
+export TMPDIR="$short_tmp"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$root/scratch/target}"
 case "$CARGO_TARGET_DIR" in
     /*) ;;
