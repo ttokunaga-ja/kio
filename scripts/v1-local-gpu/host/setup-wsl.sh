@@ -447,7 +447,8 @@ UNIT
 cat > "$tmp/dockerd" <<CONFIG
 {"data-root":"$state/docker","features":{"cdi":true}}
 CONFIG
-"$engine/dockerd" --validate --config-file "$tmp/dockerd"
+# Validate with the unit's PATH so dockerd finds the bundled docker-proxy.
+PATH=$rootless_path "$engine/dockerd" --validate --config-file "$tmp/dockerd"
 "$tmp/nvidia/usr/bin/nvidia-ctk" cdi generate --help | grep -F -- --nvidia-cdi-hook-path >/dev/null ||
   die "Toolkit lacks the CDI hook path option."
 # CDI discovers files in WSL's driver store, which can itself be a 9p mount.
