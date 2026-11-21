@@ -289,3 +289,10 @@
 - **受入**：整理の A・B・C・D をすべて終えた構成で F4 の 51 件と最終集約を一度だけ回す。候補は整理後の通常 CI が成功した main の SHA に固定する。
 - **理由**：利用者の決定。現役の仕様・入力・手順を発見しやすくし、再生成物や旧資料への依存と、候補変更による正式受入の再実行を避ける。
 - **関係する資料**：[製品仕様の索引](README.md)、[正式受入](../tasks/v1-acceptance.md)、[引き継ぎ](../tasks/handoff.md)、[AGENTS.md](../AGENTS.md)「エージェント運用」。環境切替時に手で移す作業ファイルの範囲は D-20261121-02 を更新する。
+
+### D-20261121-05 F4 の GPU 受入を 2 台の WSL に同一構成で置く
+
+- **決定**：研究室 RTX 4060（`rm2c` / `Ubuntu-26.04`）と個人 RTX 4070（`ttokunaga-ja` / `Ubuntu` 24.04）で、WSL 内の kio-test 専用 rootless Docker Engine と NVIDIA Container Toolkit の CDI、同一候補の dispatcher・固定 OCR 入力を使う。Mac 作業中は 4060 を優先し、停止・利用不可時は 4070。4070 で作業中は 4070 を選ぶ。
+- **切り替え**：受入専用鍵を両台の Windows と WSL に登録し、両台の 2 段分のホスト鍵を固定別名で pin する。受入 run の前に Environment の `KIO_LAB_JUMP_HOST` だけを手動変更し、3 OS の実行とリース回収まで固定する。
+- **理由**：研究室 Docker Desktop は競馬のサービスが使用中。個人 WSL の既存 dockerd は eduanima が利用している。受入には専用ソケットと data-root を設け、共有 dockerd の設定とサービス状態を維持する。
+- **関係する資料**：[正式受入](../tasks/v1-acceptance.md)、[受入ホストの構築と切り替え](../scripts/v1-local-gpu/README.md#受入ホストの構築)。

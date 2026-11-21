@@ -1,0 +1,94 @@
+#!/usr/bin/python3 -I
+"""Report the running shared Engine containers with Docker device requests."""
+import http.client
+import json
+import os
+import re
+import signal
+import socket
+import stat
+import subprocess
+import sys
+
+SOCKET = "/run/docker.sock"
+MAX_RESPONSE = 8 * 1024 * 1024
+
+
+class Engine(http.client.HTTPConnection):
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(SOCKET)
+
+    def read_json(self, path):
+        self.request("GET", path)
+        with self.getresponse() as response:
+            if response.status != 200:
+                raise ValueError("Docker query failed")
+            body = response.read(MAX_RESPONSE + 1)
+        if len(body) > MAX_RESPONSE:
+            raise ValueError("Docker response exceeded limit")
+        return json.loads(body)
+
+
+def running_requests(engine):
+    count = 0
+    for entry in engine.read_json("/containers/json"):
+        container = entry["Id"]
+        if not re.fullmatch(r"[0-9a-f]{64}", container):
+            raise ValueError("invalid Docker container ID")
+        state = engine.read_json(f"/containers/{container}/json")
+        running = state["State"]["Running"]
+        requests = state["HostConfig"]["DeviceRequests"]
+        if not isinstance(running, bool) or (requests is not None and not isinstance(requests, list)):
+            raise ValueError("invalid Docker response")
+        # The original admission check treated any DeviceRequests as GPU use.
+        count += int(running and bool(requests))
+    return count
+
+
+def service_state():
+    result = subprocess.run(
+        ["/usr/bin/systemctl", "is-active", "docker.service"],
+        timeout=3, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        check=False, env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+    )
+    state = result.stdout.strip()
+    if result.returncode == 4 and state in ("unknown", "inactive"):
+        return "not-found"
+    if (result.returncode, state) in ((0, "active"), (3, "inactive"), (3, "failed")):
+        return state
+    raise ValueError("shared Docker service state is unavailable")
+
+
+def main():
+    if len(sys.argv) != 1 or os.geteuid() != 0:
+        return 1
+    signal.alarm(20)
+    try:
+        state = service_state()
+        try:
+            endpoint = os.lstat(SOCKET)
+        except FileNotFoundError:
+            # A configured but unavailable Engine may have live-restored containers.
+            if state != "not-found":
+                raise ValueError("shared Docker socket missing")
+            print(0)
+            return 0
+        # Do not follow a redirected socket or activate an inactive daemon.
+        if not stat.S_ISSOCK(endpoint.st_mode) or endpoint.st_uid != 0 or state != "active":
+            raise ValueError("shared Docker endpoint is not a running native Engine")
+        engine = Engine("localhost", timeout=4)
+        try:
+            count = running_requests(engine)
+        finally:
+            engine.close()
+        print(count)
+        return 0
+    except (OSError, ValueError, TypeError, KeyError, http.client.HTTPException, subprocess.SubprocessError):
+        print("shared Docker GPU query failed", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,7 +1,7 @@
 # Authenticated OCR GPU controller
 
-`gpu-phase.sh` is the host-side PaddleOCR controller for the measured
-`kio-lab` GPU. Run it as `kio-test`. The private route binds the pinned
+`gpu-phase.sh` is the host-side PaddleOCR controller for both acceptance hosts.
+Run it as `kio-test`. The private route binds the pinned
 OCR service and public TLS identity to the exact release candidate.
 A08 stops OCR and releases its GPU lease before the Actions client explicitly
 installs and verifies EG2 in its isolated device state. The packaged native
@@ -47,14 +47,13 @@ including exited containers. A failed cleanup preserves the lease as unknown.
 
 Before starting, the controller proves the OCR project absent and captures an
 immutable private GPU baseline. It checks the GPU UUID and total memory,
-requires 6,141 MiB plus 128 MiB of free memory, and refuses unrelated running
-GPU containers. Cleanup waits for the same GPU to return to within 128 MiB of
+requires 6,141 MiB plus 128 MiB of free memory, and refuses unrelated running containers on the dedicated engine. Cleanup waits for the same GPU to return to within 128 MiB of
 its recorded used memory. After interrupted init, cleanup without a baseline
 requires a valid GPU sample and proof that the exact OCR project is absent.
 
 ## Candidate-bound deployment proposal
 
-The forced private route uses an owner-private deployment record with schema
+The forced private route uses an root-controlled deployment record with schema
 `kio.v1.local_gpu.deployment/v2`. Do not handwrite this record or a stale
 fixed-source digest list. Generate the proposal from a clean exact candidate
 with the candidate-built helper. The source map includes both OCR YAML files
@@ -82,22 +81,236 @@ integrity; it is not independent provenance for a candidate-built executable.
 The dispatcher must be installed as the reviewed binary and the forced command
 must end in `kio-acceptance-tools dispatch`, never a mutable repository script.
 
-As of the 2026-09-26 snapshot, there was no installed private CI route or authorized new accounts,
-keys, ACLs, firewall changes, or Environment configuration, and no local
-acceptance receipt. On 2026-10-03, the owner approved the narrowed Tailscale
-policy, CI OIDC credential, and main-only `v1-local-acceptance` Environment;
-these three settings were applied and read back. Windows/WSL account, key,
-dispatcher installation, and SSH configuration changes were additionally
-approved with the detailed execution plan on 2026-10-04. They remain unapplied
-until the final candidate bundle is regenerated and validated. See the
-[v1 acceptance procedure](../../tasks/v1-acceptance.md) for current preparation
-and candidate-specific validation; no authenticated-local receipt is claimed.
-On 2026-09-26, the account's Daybreak Blue entitlement was
-confirmed. Collaboration invocation lacked `access_programs.cyber=daybreak_blue`;
-a process-scoped CLI probe succeeded and an independent architecture review
-started. Neither the probe nor a running review establishes completed audit
-coverage. Prior GPT-6 Sol reviews and Astra cross-checks are separate evidence.
-Earlier Terra reviews remain historical; no new work uses a legacy model.
+## 受入ホストの構築
+
+| GPU | Windows の WSL 登録所有者 | WSL2 ディストリビューション | Windows の既存 `AllowUsers` | Tailscale IPv4（調査時） |
+| --- | --- | --- | --- | --- |
+| 研究室 RTX 4060 | `rm2c` | `Ubuntu-26.04` | `AllowUsers rm2c` | `100.68.218.37` |
+| 個人 RTX 4070 | `ttokunaga-ja` | `Ubuntu`（24.04） | `AllowUsers ttokunaga-ja@100.102.187.14` | `100.97.109.109` |
+
+両台で Windows NVIDIA ドライバー、WSL2 の `/dev/dxg`、systemd、Windows と WSL の
+OpenSSH を用意する。WSL は `sudo`、 `rootlesskit`、`slirp4netns`、`uidmap`、`dbus-user-session`、
+`curl`、OpenSSL、Python 3 が必要。 `/run/sshd` は root 所有・0755。既存の WSL Ed25519
+ホスト鍵を使う。systemd を初めて有効化する場合は対象 distro だけを作業時間内に再起動する。
+既存の `ssh.service` / `ssh.socket` と portproxy は棚卸しされる。TCP 2222 に競合があれば
+現地で移行を調整し、既存サービスを維持する。
+
+1. 同じレビュー済み版の Docker Engine 静的配布物（28.3 以降）を `/opt/kio-v1-local/docker`
+   に展開し、同じ版の rootless extras から `dockerd-rootless.sh` を同ディレクトリに置く。
+   RootlessKit は Ubuntu の `/usr/bin/rootlesskit` を使う。CDI 対応の Compose V2 は
+   `/opt/kio-v1-local/docker-cli/cli-plugins/docker-compose` に置く。各実行ファイル、構成、
+   祖先を root 所有・group/other 書込不可にする。Ubuntu の AppArmor では対象となる
+   ディストリビューションの RootlessKit プロファイルを使う。
+   [Docker Rootless](https://docs.docker.com/engine/security/rootless/) ·
+   [Docker の CDI](https://docs.docker.com/reference/cli/dockerd/#configure-cdi-devices)
+2. [候補固定の配置](#candidate-bound-deployment-proposal)に従い、同じ候補の固定入力、
+   Linux helper、canonical な `deployment.json` を `/var/lib/kio-v1-local/source` 以下に
+   配置する。ファイル・全祖先は root 所有・group/other 書込不可・非 symlink。
+   `kio-test` が読めるよう、ディレクトリとバイナリは 0755、deployment は 0644 とする。
+   deployment の内容は公開 digest。候補の更新は受入とリース回収が終わってから行う。
+3. 両台の各段に同じ受入用 Ed25519 公開鍵を渡す。秘密鍵は GitHub Environment と承認済みの
+   保管先で保持する。NVIDIA の署名付き APT リポジトリから取得・照合した
+   `nvidia-container-toolkit-base` 1.20 以降の .deb と、レビュー済み CUDA smoke image の
+   digest を用意する。研究室の VHD 空き容量は現地で再確認し、30〜50 GiB を見込む。
+
+   ```bash
+   sudo --preserve-env=WSL_DISTRO_NAME bash scripts/v1-local-gpu/host/setup-wsl.sh \
+     Ubuntu-26.04 /path/kio-ci.pub /path/toolkit-base.deb "$CUDA_SMOKE_IMAGE"
+   ```
+
+   個人機では `Ubuntu` を渡す。Toolkit は .deb の CDI 用バイナリだけを専用パスへ展開する。
+   GPU は CDI で渡し、グローバルな `no-cgroups` や共有 Docker の設定を変更する必要はない。
+   WSL が生成する `nvidia.com/gpu=all` を使い、導入時に GPU が 1 台であることとコンテナ内外の
+   UUID 一致を確認する。ソケットは `/run/user/<uid>/kio-v1-local-docker.sock`、data-root は
+   `/var/lib/kio-v1-local/state/docker`。 `kio-test` が他グループに所属するか共有ソケットに
+   書き込める場合は適用を止める。起動中の共有 Engine の bind mount にアクセスできる場合も
+   止める。共有アプリの独自データパスや Windows マウントの ACL は現地で確認する。
+   既存の管理者は別の管理アカウントを使う。WSL の既存 sshd は drop-in の
+   `DenyUsers kio-test` を読み、稼働中は reload する。 `kio-test` のパスワードは lock し、
+   旧 `~kio-test/.ssh/authorized_keys` は同じディレクトリ内の専用退避先へ移す。
+   既存のセッションまたは kio-test UID のプロセス（専用 Docker、user manager を含む）があれば、
+   一覧を表示して変更前に止まる。終了を許可する場合だけ `bash scripts/v1-local-gpu/host/setup-wsl.sh`
+   の直後に `--terminate-kio-test` を渡す。リースの不在を確認後、当該アカウントのセッションと
+   残存プロセスを終了し、消失を確認してから進む。専用 sshd は root 管理の鍵と ForceCommand を使う。 [Ubuntu の SSH drop-in](https://ubuntu.com/server/docs/openssh-server/)
+   [NVIDIA CDI](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/cdi-support.html) ·
+   [WSL の CDI デバイス名](https://github.com/NVIDIA/nvidia-container-toolkit/blob/v1.20.1/pkg/nvcdi/lib-wsl.go)
+4. Windows のローカルコンソールで WSL 登録所有者として昇格した 64-bit PowerShell を開く。
+   管理用 Mac と検証用 CI の実際の Tailscale IPv4 を渡す。最初はタスク用 Windows 資格情報が必要。
+   スクリプトは既存の portproxy、待受、広い firewall 許可を検査し、受信許可を Tailscale IF、
+   宛先 Tailscale IPv4、`sshd.exe`、送信元 `100.64.0.0/10`、TCP 22 に限定する。
+
+   ```powershell
+   $cred = Get-Credential -UserName "$env:COMPUTERNAME\rm2c" -Message 'WSL keepalive task'
+   .\scripts\v1-local-gpu\host\setup-windows.ps1 -WslOwner rm2c -Distro Ubuntu-26.04 `
+       -ExistingAllowUsers 'AllowUsers rm2c' -PublicKeyFile C:\path\kio-ci.pub `
+       -AdminSource 100.102.187.14 -CiSource $ObservedCiIpv4 -KeepaliveCredential $cred
+   Remove-Variable cred
+   ```
+
+   個人機は表の値に置き換える。対応している OpenSSH オプションはインストール済みの
+   `sshd.exe` で判定する。専用タスクは起動・ログオン時に WSL の foreground プロセスを
+   維持する。再起動とサインアウト後の疎通が確認できるまで旧タスクを保管する。
+   [Windows OpenSSH](https://learn.microsoft.com/windows-server/administration/openssh/openssh-server-configuration) ·
+   [WSL と systemd](https://learn.microsoft.com/windows/wsl/systemd/)
+
+### Tailscale の設定
+
+Tailscale 管理者が現在の policy に次の条件を反映する。既存の Mac 管理経路を維持し、
+接続先端末の現行アドレスを Machines で確認する。下は該当部分の例。
+
+```json
+{
+  "tagOwners": { "tag:kio-ci": ["autogroup:admin"] },
+  "grants": [
+    { "src": ["tag:kio-ci"], "dst": ["100.68.218.37", "100.97.109.109"], "ip": ["tcp:22"] }
+  ],
+  "tests": [
+    {
+      "src": "tag:kio-ci",
+      "accept": ["100.68.218.37:22", "100.97.109.109:22"],
+      "deny": ["100.68.218.37:2222", "100.97.109.109:2222", "100.68.218.37:18443", "100.97.109.109:18443", "100.102.187.14:22"]
+    }
+  ]
+}
+```
+
+重複する `acls` / `grants` も見直し、CI の tag から他の接続を許す規則を除く。
+`tag:kio-ci` は短命の GitHub runner に割り当て、Windows には既存の端末 ID を使う。
+OIDC Trust credential は対象 repo と `v1-local-acceptance` Environment の正確な subject、
+`ref=refs/heads/main`、対象 `workflow_ref`、`event_name=workflow_dispatch`、
+`runner_environment=github-hosted`、当該 tag に束縛する。接続は Windows OpenSSH を使う。
+[Tailscale policy](https://tailscale.com/docs/reference/syntax/policy-file) ·
+[GitHub Action と OIDC](https://tailscale.com/docs/integrations/github/github-action)
+
+### 構築後の確認
+
+検証用 SSH 設定では `kio-lab-jump`（選択した Windows、`kio-ci`、22）と `kio-lab-wsl`
+（`127.0.0.1`、`kio-test`、2222、`ProxyJump kio-lab-jump`）を設定する。各 `HostKeyAlias`
+には同じ別名を使い、`IdentitiesOnly yes`、受入用 `IdentityFile`、`StrictHostKeyChecking yes`、
+4 本の pin を記載した `UserKnownHostsFile`、`GlobalKnownHostsFile none` を指定する。
+Windows・WSL の公開ホスト鍵は現地コンソールの出力と照合する。
+
+```bash
+ssh -F "$cfg" -o BatchMode=yes -vv -W 127.0.0.1:2222 kio-lab-jump </dev/null
+ssh -F "$cfg" -o BatchMode=yes -tt kio-lab-jump whoami
+ssh -F "$cfg" -o BatchMode=yes kio-lab-wsl id
+ssh -F "$cfg" -o BatchMode=yes -W 127.0.0.1:3389 kio-lab-jump </dev/null
+ssh -F "$cfg" -o BatchMode=yes -W 127.0.0.1:22 kio-lab-wsl </dev/null
+```
+
+最初のコマンドで WSL のバナー、残りで認証後の拒否を確認する。両段の remote forward
+には `-N -R 127.0.0.1:39123:127.0.0.1:22 -o ExitOnForwardFailure=yes` を使う。
+WSL の Unix socket 転送は `-N -L 127.0.0.1:39124:/var/run/docker.sock` で開始し、
+ローカルポートへの接続で SSH チャネルが拒否されることを確認する。WSL 段の IdentityFile
+だけを旧管理用鍵へ差し替えた検証用設定でも、専用 listener が認証を拒否することを確認する。
+Windows 側で省略されたオプションの機能も実接続で確認する。
+
+Windows の LAN IPv4 を `WIN_LAN_IP`、Tailscale IPv4 を `WIN_TAILNET_IP` に設定し、それぞれ
+指定の端末から TCP 接続を試す。4 件とも失敗し、管理 Mac と許可した CI の TCP 22 は成功することを
+確認する。Tailscale 管理画面でも現在の grant・OIDC の条件を確認する。
+
+```bash
+# LAN 上の別端末から
+nc -vz -w 5 "$WIN_LAN_IP" 2222
+nc -vz -w 5 "$WIN_LAN_IP" 22
+# tailnet の別端末から。TCP 22 は許可対象外の端末で試す。
+nc -vz -w 5 "$WIN_TAILNET_IP" 2222
+nc -vz -w 5 "$WIN_TAILNET_IP" 22
+```
+
+新規の Mac 管理者ログインにも成功したら、Windows コンソールに `verified` と入力する。
+確認が失敗した場合は別の入力で設定を復元する。
+
+WSL の管理コンソールで次を確認する。通常の SSH では `denyusers kio-test`、パスワード状態は
+`L`。通常の SSH ポートが稼働中なら、旧鍵でのログインも拒否されることを別の管理端末で確かめる。
+共有 socket に対する `test` と、追加引数付きの sudo は失敗が期待値。`sudo -l` では引数なしの
+照会だけが許可されていることを確認する。照会は件数だけを返す。共有 Engine が構成済みで利用できない
+場合は、稼働コンテナを確認できないため失敗する。
+
+```bash
+sudo /usr/sbin/sshd -T -C user=kio-test,host=localhost,addr=127.0.0.1 | grep -i '^denyusers '
+sudo passwd -S kio-test
+sudo -u kio-test test -w /run/docker.sock
+sudo -l -U kio-test
+sudo -u kio-test sudo -n -- /var/lib/kio-v1-local/shared-gpu-count
+sudo -u kio-test sudo -n -- /var/lib/kio-v1-local/shared-gpu-count unexpected
+```
+
+Windows マウント・共有アプリ配下も、管理者が存在を確認済みの対象で実効権限を検査する。
+次の `probe` は実在する保護対象（Windows の利用者ディレクトリ、または bind mount 配下の保護対象）に
+置き換える。読み取り・書き込みテストはどちらも失敗が期待値。 `findmnt` で対象マウントが
+未接続だった場合はその状態を記録し、権限拒否とは区別する。
+
+```bash
+probe='/mnt/c/Users/<実在する保護対象の Windows ユーザー>'
+findmnt -T "$probe"
+sudo test -e "$probe" && sudo -u kio-test test -r "$probe"
+sudo test -e "$probe" && sudo -u kio-test test -w "$probe"
+```
+
+固定 OCR image は専用 Engine に pull する。受入直前に空き VRAM が 6,269 MiB 以上で、
+Windows・WSL の他ワークロードによる GPU 使用がないことを管理者が確かめる。コントローラは
+専用 Engine のコンテナを列挙し、VRAM の起動前後はホスト全体の実測で照合する。
+共有 Engine には root 管理の引数なし照会だけを使う。sudoers の規則は `NOSETENV` を指定する。
+構築時の CUDA スモークテストにも件数 0 が必要。admission・停止・cleanup の前に、
+DeviceRequests を持つ稼働コンテナが 1 件以上、または照会に失敗した場合は中断する。
+cleanup の中断時はリースを保持する。
+
+```bash
+uid=$(id -u kio-test)
+docker=(/opt/kio-v1-local/docker/docker --host "unix:///run/user/$uid/kio-v1-local-docker.sock"
+        --config /opt/kio-v1-local/docker-cli)
+sudo -u kio-test env -u DOCKER_HOST -u DOCKER_CONTEXT "${docker[@]}" compose \
+  -f scripts/v1-local-gpu/config/compose.yaml pull
+```
+
+### ロールバック
+
+WSL の再適用は dispatcher と共通のロックを取得し、`lease.json` が存在する間は専用 Engine の
+再起動前に拒否する。OCR 未起動・停止後でもリースは保護される。ロック導入前の専用 SSH が
+稼働中の移行は、受入を完了して専用経路を閉じた状態で行う。ロックは root 所有、
+kio-test 専用グループの 0640。旧 0644 からの移行では旧ファイルと新ファイルの両方に
+ロックを取って更新する。
+専用 Engine のコンテナの実行状態は復元の対象外で、稼働中の受入はこの適用前の拒否で保護する。
+
+適用に失敗すると両スクリプトが今回の変更を復元する。明示パスに保存した退避と復元結果を確認する。
+成功後の取り消しでは、適用直前の退避を使用する。
+
+- Windows はローカルコンソールで退避版を `sshd.exe -t -f <backup>\sshd_config` に通す。
+  `%ProgramData%\ssh\sshd_config` と鍵ファイル、保存した SDDL を復元する。元からなかった
+  鍵ファイル、今回新設した `KioV1LocalGpuSshAllow` と `KioV1LocalGpuKeepalive` だけを撤去する。
+  既存のタスクが Ready から起動された場合は止める。 `created-account` のある適用に限り作成した
+  `kio-ci` を無効化・撤去する。sshd 再起動後に Mac 管理者の新規ログインを確認する。
+- WSL は専用 SSH と `kio-test` の user systemd 上の専用 Docker を止める。退避ファイルを
+  所有者・モード付きで復元し、`absent` に記録された今回の導入分を除く。system/user の
+  unit を読み直し、保存した enabled・active・linger を復元する。既存アカウントは元の login shell
+  に戻す。 `password-state` と `password-last-change` から元のパスワード状態を復元し、
+  `authorized-keys-location` に退避した鍵がある場合は使用中のファイルを上書きせず戻す。
+  元の SSH drop-in を復元後、稼働中の通常 sshd は reload する。新規アカウントを撤去する場合は
+  専用データとホームを先に退避する。共有 dockerd の状態は維持する。
+  `--terminate-kio-test` で終了したセッションやプロセスは復元の対象外。
+
+## ホストの切り替え
+
+`main` 専用の GitHub Environment `v1-local-acceptance` に以下を登録する。
+
+| 種別 | 名前 | 値 |
+| --- | --- | --- |
+| Secret | `KIO_LAB_SSH_PRIVATE_KEY` | 両台・両段で使う専用秘密鍵 |
+| Variable | `KIO_LAB_KNOWN_HOSTS` | Windows 2 本を `kio-lab-jump`、WSL 2 本を `kio-lab-wsl` とした計 4 行の公開ホスト鍵 |
+| Variable | `KIO_LAB_JUMP_USER` | `kio-ci` |
+| Variable | `KIO_LAB_JUMP_HOST` | 選んだ Windows の Tailscale IPv4 または DNS 名 |
+| Variable | `KIO_TS_CLIENT_ID` | Tailscale OIDC client ID |
+| Variable | `KIO_TS_AUDIENCE` | Tailscale OIDC audience |
+
+`known_hosts` は `kio-lab-jump ssh-ed25519 <Windows公開鍵本体>` の行を 2 本、
+`kio-lab-wsl ssh-ed25519 <WSL公開鍵本体>` の行を 2 本入れる。別名にポートは付けない。
+鍵のローテーション時は該当する公開ホスト鍵をコンソールで再確認する。
+
+Mac で開発中は研究室 4060 を優先し、停止・利用不可なら個人 4070 を選ぶ。4070 で開発中は
+4070 を選ぶ。接続確認と候補配置の照合後、GitHub の Settings → Environments →
+`v1-local-acceptance` で **`KIO_LAB_JUMP_HOST` のみ**を変更し、該当候補を dispatch する。
+キュー中の run、3 OS のジョブ実行中、リース回収が未確認の間は接続先を固定する。
 
 ## RTX 4060 OCR measurement
 
@@ -121,8 +334,8 @@ requirement uses the observed 6,141 MiB increase plus its 128 MiB margin.
 
 ### Reproduce the measurement
 
-1. From the repository root on an RTX 4060 8 GiB WSL2 host with Docker Compose
-   and NVIDIA GPU support, use
+1. From the repository root on an RTX 4060 8 GiB WSL2 host, select the dedicated
+   rootless Docker endpoint above and use
    `docker compose -p kio-v1-ocr-r32 -f scripts/v1-local-gpu/config/compose.yaml`.
    Run `config`, then `pull` if either pinned image is absent, and `up -d`.
    The measured `backend-config.yaml` SHA-256 was

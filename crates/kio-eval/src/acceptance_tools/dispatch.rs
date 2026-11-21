@@ -18,28 +18,35 @@ pub fn run(args: Args) -> Result<(), String> {
 #[cfg(unix)]
 mod unix {
     use super::super::route_preflight::{
-        FIXED_SOURCES, MAX_BINARY_BYTES, MAX_FIXED_BYTES, SCHEMA, checked_digest, valid_sha,
+        FIXED_SOURCES, MAX_BINARY_BYTES, MAX_FIXED_BYTES, SCHEMA, checked_digest, checked_open,
+        valid_sha,
     };
     use super::Args;
     use kio_core::{
         private_fs::{
-            read_private_file, read_private_file_at, verify_private_directory,
-            verify_private_directory_handle,
+            read_private_file_at, verify_private_directory, verify_private_directory_handle,
         },
         store_dir::{Publication, StoreDirectory},
     };
     use serde::{Deserialize, Serialize};
     use std::{
-        env,
-        os::unix::io::AsRawFd,
+        env, fs,
+        io::Read,
+        os::unix::{
+            fs::{MetadataExt, OpenOptionsExt},
+            io::AsRawFd,
+        },
         path::{Path, PathBuf},
         process::{Command, Stdio},
         time::Duration,
     };
     use subtle::ConstantTimeEq;
 
-    const ROOT: &str = "/home/kio-test/work/kio/v1-actions-gpu";
-    const SOURCE: &str = "/home/kio-test/work/kio/v1-actions-source";
+    const ROOT: &str = "/var/lib/kio-v1-local/state";
+    const SOURCE: &str = "/var/lib/kio-v1-local/source";
+    const MAINTENANCE_LOCK: &str = "/var/lib/kio-v1-local/maintenance.lock";
+    const SHARED_GPU_QUERY: &str = "/var/lib/kio-v1-local/shared-gpu-count";
+    const SHARED_GPU_QUERY_SOURCE: &str = "scripts/v1-local-gpu/host/shared-gpu-count";
     #[derive(Deserialize, Serialize)]
     #[serde(deny_unknown_fields)]
     struct Deployment {
@@ -315,10 +322,27 @@ mod unix {
         }
         Ok(s.into())
     }
+    fn require_root_owned(path: &Path) -> Result<(), String> {
+        for path in path.ancestors() {
+            let metadata = fs::symlink_metadata(path).map_err(|_| "deployment path is missing")?;
+            if metadata.is_symlink() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+                return Err("deployment path is not root controlled".into());
+            }
+        }
+        Ok(())
+    }
+
     fn deployment() -> Result<Deployment, String> {
         let p = Path::new(SOURCE).join("scripts/v1-local-gpu/deployment.json");
-        let b = read_private_file(&p, 65536)
-            .map_err(|_| "required private deployment is absent".to_string())?;
+        require_root_owned(&p)?;
+        let mut b = Vec::new();
+        checked_open(&p, 65536)?
+            .take(65537)
+            .read_to_end(&mut b)
+            .map_err(|_| "cannot read installed deployment".to_string())?;
+        if b.len() > 65536 {
+            return Err("installed deployment exceeds its size limit".into());
+        }
         let d: Deployment =
             serde_json::from_slice(&b).map_err(|_| "deployment is not JSON".to_string())?;
         if canonical(&d)? != b {
@@ -334,14 +358,24 @@ mod unix {
         }
         for s in FIXED_SOURCES {
             let h = d.sources.get(*s).ok_or("deployment source list differs")?;
-            if !valid_sha(h, 64)
-                || checked_digest(&Path::new(SOURCE).join(s), MAX_FIXED_BYTES)? != *h
-            {
+            let path = Path::new(SOURCE).join(s);
+            require_root_owned(&path)?;
+            if !valid_sha(h, 64) || checked_digest(&path, MAX_FIXED_BYTES)? != *h {
                 return Err("installed source hash differs".into());
             }
         }
+        let query = Path::new(SHARED_GPU_QUERY);
+        require_root_owned(query)?;
+        let query_hash = d
+            .sources
+            .get(SHARED_GPU_QUERY_SOURCE)
+            .ok_or("shared GPU query is not in the deployment")?;
+        if checked_digest(query, MAX_FIXED_BYTES)? != *query_hash {
+            return Err("installed shared GPU query hash differs".into());
+        }
         let exe = env::current_exe().map_err(|_| "cannot locate tools executable".to_string())?;
         let expected = Path::new(SOURCE).join("scripts/v1-local-gpu/kio-acceptance-tools");
+        require_root_owned(expected.as_path())?;
         if exe != expected || checked_digest(&exe, MAX_BINARY_BYTES)? != d.tools_binary_sha256 {
             return Err("tools executable differs from deployment".into());
         }
@@ -355,7 +389,7 @@ mod unix {
             .env_clear()
             .env(
                 "PATH",
-                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "/opt/kio-v1-local/docker:/usr/sbin:/usr/bin:/sbin:/bin",
             )
             .env("KIO_GPU_ROOT", root)
             .env("HOME", "/home/kio-test")
@@ -388,6 +422,9 @@ mod unix {
         // A client must finish its bounded capability input before holding
         // the shared GPU lease gate.
         let supplied = capability()?;
+        let maintenance = Path::new(MAINTENANCE_LOCK);
+        require_root_owned(maintenance)?;
+        let _maintenance = maintenance_gate(maintenance, 0, unsafe { libc::getegid() })?;
         let d = deployment()?;
         if request.tuple.candidate != d.candidate {
             return Err("candidate is not installed deployment".into());
@@ -399,6 +436,30 @@ mod unix {
         std::io::stdout()
             .write_all(&response)
             .map_err(|_| "cannot write dispatcher response".into())
+    }
+
+    fn maintenance_gate(path: &Path, owner: u32, group: u32) -> Result<DispatcherGate, String> {
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+            .map_err(|_| "maintenance lock is unavailable")?;
+        let metadata = lock
+            .metadata()
+            .map_err(|_| "cannot inspect maintenance lock")?;
+        if !metadata.is_file()
+            || metadata.uid() != owner
+            || metadata.gid() != group
+            || metadata.mode() & 0o7777 != 0o640
+        {
+            return Err(
+                "maintenance lock must be owned by root and readable only by the dedicated group"
+                    .into(),
+            );
+        }
+        lock.try_lock_shared()
+            .map_err(|_| "GPU host setup is in progress")?;
+        Ok(DispatcherGate(lock))
     }
 
     struct DispatcherGate(std::fs::File);
@@ -686,6 +747,37 @@ mod unix {
             drop(child);
         }
         #[test]
+        fn setup_and_dispatch_exclude_each_other() {
+            let (temp, _) = fixture();
+            let path = temp.path().join("maintenance.lock");
+            use std::os::unix::fs::PermissionsExt;
+            let setup = fs::File::create(&path).unwrap();
+            let meta = setup.metadata().unwrap();
+            let (owner, group) = (meta.uid(), meta.gid());
+            setup
+                .set_permissions(fs::Permissions::from_mode(0o644))
+                .unwrap();
+            assert!(
+                maintenance_gate(&path, owner, group).is_err(),
+                "dispatcher accepted a public lock"
+            );
+            setup
+                .set_permissions(fs::Permissions::from_mode(0o640))
+                .unwrap();
+            assert!(maintenance_gate(&path, owner, group.wrapping_add(1)).is_err());
+            let alias = temp.path().join("alias");
+            std::os::unix::fs::symlink(&path, &alias).unwrap();
+            assert!(maintenance_gate(&alias, owner, group).is_err());
+            setup.try_lock().unwrap();
+            assert!(maintenance_gate(&path, owner, group).is_err());
+            setup.unlock().unwrap();
+            let dispatch = maintenance_gate(&path, owner, group).unwrap();
+            assert!(setup.try_lock().is_err());
+            drop(dispatch);
+            setup.try_lock().unwrap();
+        }
+
+        #[test]
         fn active_dispatcher_gate_rejects_concurrent_handle() {
             let (_temp, base) = fixture();
             let cap = "b".repeat(64);
@@ -834,28 +926,102 @@ mod unix {
             }
         }
         #[test]
-        fn cleanup_never_confuses_failed_docker_inspection_with_absence() {
+        fn docker_checks_use_the_dedicated_engine_and_fail_closed() {
             use std::os::unix::fs::PermissionsExt;
             let (temp, base) = fixture();
             let stub = temp.path().join("docker");
-            std::fs::write(&stub, b"#!/bin/bash\ncase \"$*\" in 'ps -a --filter label=com.docker.compose.project=kio-v1-local-gpu-ocr -q') ;; *) exit 42 ;; esac\ncase \"$KIO_FIXTURE_DOCKER\" in empty) exit 0 ;; container) echo retained-container ;; unavailable) exit 7 ;; *) exit 43 ;; esac\n").unwrap();
+            std::fs::write(
+                &stub,
+                br#"#!/bin/bash
+[ -z "${DOCKER_HOST+x}${DOCKER_CONTEXT+x}" ] || exit 40
+case "$1 $2" in
+  '--host unix:///run/user/'*'/kio-v1-local-docker.sock') shift 2 ;;
+  *) exit 41 ;;
+esac
+[ "$1 $2" = "--config /opt/kio-v1-local/docker-cli" ] || exit 42
+shift 2
+case "$*" in
+  'ps -a --filter label=com.docker.compose.project=kio-v1-local-gpu-ocr -q')
+    case "$KIO_FIXTURE_DOCKER" in
+      empty) exit 0 ;;
+      container) echo retained-container ;;
+      *) exit 7 ;;
+    esac ;;
+  'ps -q') if [ "$KIO_FIXTURE_DOCKER" = foreign ]; then echo running-container; fi ;;
+  *DeviceRequests*) echo null ;;
+  *com.docker.compose.project*running-container) echo foreign-project ;;
+  *) exit 43 ;;
+esac
+"#,
+            )
+            .unwrap();
             std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let sudo = temp.path().join("sudo");
+            std::fs::write(
+                &sudo,
+                br#"#!/bin/bash
+[ "$*" = "-n -- /var/lib/kio-v1-local/shared-gpu-count" ] || exit 31
+case "$KIO_FIXTURE_DOCKER" in
+  shared*) echo 1 ;;
+  malformed*) echo invalid ;;
+  broken*) exit 1 ;;
+  *) echo 0 ;;
+esac
+"#,
+            )
+            .unwrap();
+            std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o700)).unwrap();
             let source = include_str!("../../../../scripts/v1-local-gpu/gpu-phase.sh");
             let definitions = source.split_once("case ${1:-} in").unwrap().0;
-            let script = temp.path().join("cleanup-fixture.sh");
-            std::fs::write(&script, format!("{definitions}\ncleanup_project \"$OCR_PROJECT\" \"$ROOT/missing-compose.yaml\"\n")).unwrap();
-            for (mode, success) in [
-                ("empty", true),
-                ("container", false),
-                ("unavailable", false),
+            let script = temp.path().join("docker-fixture.sh");
+            for (mode, operation, expected_error) in [
+                (
+                    "empty",
+                    r#"cleanup_project "$OCR_PROJECT" "$ROOT/missing-compose.yaml""#,
+                    None,
+                ),
+                (
+                    "container",
+                    r#"cleanup_project "$OCR_PROJECT" "$ROOT/missing-compose.yaml""#,
+                    Some("has containers but no verified compose file"),
+                ),
+                (
+                    "unavailable",
+                    r#"cleanup_project "$OCR_PROJECT" "$ROOT/missing-compose.yaml""#,
+                    Some("cannot inspect Docker"),
+                ),
+                ("foreign", "gpu_guard", Some("unrelated container")),
+                ("shared", "gpu_guard", Some("shared Docker GPU container")),
+                (
+                    "shared-cleanup",
+                    "cleanup",
+                    Some("shared Docker GPU container"),
+                ),
+                (
+                    "malformed",
+                    "gpu_guard",
+                    Some("invalid shared Docker GPU count"),
+                ),
+                (
+                    "broken",
+                    "cleanup",
+                    Some("cannot inspect shared Docker GPU containers"),
+                ),
             ] {
+                std::fs::write(
+                    &script,
+                    format!("{definitions}\nlock() {{ :; }}\n{operation}\n"),
+                )
+                .unwrap();
                 let mut command = Command::new("/bin/bash");
                 command
                     .arg(&script)
                     .env_clear()
                     .env("PATH", format!("{}:/usr/bin:/bin", temp.path().display()))
                     .env("KIO_GPU_ROOT", base.path())
-                    .env("KIO_FIXTURE_DOCKER", mode);
+                    .env("KIO_FIXTURE_DOCKER", mode)
+                    .env("DOCKER_HOST", "unix:///var/run/docker.sock")
+                    .env("DOCKER_CONTEXT", "shared");
                 let result = kio_process::run_bounded_command(
                     &mut command,
                     kio_process::BoundedProcessOptions {
@@ -868,10 +1034,13 @@ mod unix {
                 .unwrap();
                 assert_eq!(
                     result.status.success(),
-                    success,
+                    expected_error.is_none(),
                     "{mode}: {}",
                     result.stderr
                 );
+                if let Some(error) = expected_error {
+                    assert!(result.stderr.contains(error), "{mode}: {}", result.stderr);
+                }
             }
         }
     }

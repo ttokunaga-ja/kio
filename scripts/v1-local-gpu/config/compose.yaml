@@ -1,4 +1,4 @@
-# RTX 4060 measurement Compose. The GPU controller stages a TLS variant.
+# Measured OCR images and settings, with the single WSL GPU passed through using CDI.
 # Image and weight provenance and reproduction steps are in ../README.md.
 services:
   paddleocr-vl-api:
@@ -8,13 +8,8 @@ services:
     depends_on:
       paddleocr-vlm-server:
         condition: service_healthy
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              device_ids: ["0"]
-              capabilities: [gpu]
+    devices:
+      - nvidia.com/gpu=all
     # 8g, not the stock 64g: the pipeline fits within 8 GiB on WSL2.
     shm_size: 8g
     user: root
@@ -32,13 +27,8 @@ services:
 
   paddleocr-vlm-server:
     image: ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-genai-vllm-server@sha256:d0d32c04a2119613d25a0a4c292e165ccc107954b74580613cf59e378037f8f5
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              device_ids: ["0"]
-              capabilities: [gpu]
+    devices:
+      - nvidia.com/gpu=all
     shm_size: 8g
     user: root
     restart: "no"
