@@ -283,8 +283,11 @@ jobs:
           if ((Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:OFFICE_WINDOWS_X64_SHA256) {
             throw 'downloaded LibreOffice MSI hash differs from the pinned release hash'
           }
-          $install = Start-Process msiexec.exe -Wait -PassThru -NoNewWindow -ArgumentList @('/i', $installer, '/qn', '/norestart')
-          if ($install.ExitCode -ne 0) { throw "LibreOffice MSI exited with $($install.ExitCode)" }
+          # Start-Process -Wait also waits for the msiexec service (/V) that outlives the install.
+          $log = Join-Path $env:RUNNER_TEMP 'kio-v1-office-msi.log'
+          $install = Start-Process msiexec.exe -PassThru -NoNewWindow -ArgumentList @('/i', $installer, '/qn', '/norestart', '/l*v', $log)
+          if (-not $install.WaitForExit(1200000)) { Get-Content -LiteralPath $log -Tail 60; throw 'LibreOffice MSI did not finish within 20 minutes' }
+          if ($install.ExitCode -ne 0) { Get-Content -LiteralPath $log -Tail 60; throw "LibreOffice MSI exited with $($install.ExitCode)" }
           $converter = Join-Path $env:ProgramFiles 'LibreOffice\program\soffice.exe'
           if (-not (Test-Path -LiteralPath $converter -PathType Leaf)) {
             throw "LibreOffice converter was not installed at $converter"

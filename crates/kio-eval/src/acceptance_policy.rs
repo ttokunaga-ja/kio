@@ -9,6 +9,7 @@ use std::{
     process::Command,
 };
 
+use kio_core::store_dir::StoreDirectory;
 use serde_json::Value;
 
 use crate::{
@@ -165,7 +166,7 @@ pub fn run_a04(options: &PolicyOptions) -> Result<AcceptanceReceipt, AcceptanceE
         clone.join("policy-fixture.md"),
     )
     .map_err(io)?;
-    copy_tree(&child.join(".kio"), &clone.join(".kio"))?;
+    copy_tree(&child.join(".kio"), &clone)?;
     command_error_code(
         &options.binary,
         &device,
@@ -463,10 +464,11 @@ fn private_dir(_path: &Path) -> Result<(), AcceptanceError> {
     Ok(())
 }
 
-fn copy_tree(source: &Path, destination: &Path) -> Result<(), AcceptanceError> {
+fn copy_tree(source: &Path, clone_root: &Path) -> Result<(), AcceptanceError> {
     fn copy(
         source: &Path,
-        destination: &Path,
+        parent: &StoreDirectory,
+        name: &Path,
         files: &mut usize,
         bytes: &mut u64,
     ) -> Result<(), AcceptanceError> {
@@ -475,12 +477,18 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<(), AcceptanceError> {
             return Err(invalid("A04 clone contains a symlink"));
         }
         if metadata.is_dir() {
-            fs::create_dir_all(destination).map_err(io)?;
+            // A04 tests management identity after the store's owner-only protection is admitted.
+            let handle = parent
+                .create_directory(name)
+                .map_err(|error| failure(error.to_string()))?;
+            let destination = StoreDirectory::from_retained(handle, parent.path().join(name))
+                .map_err(|error| failure(error.to_string()))?;
             for entry in fs::read_dir(source).map_err(io)? {
                 let entry = entry.map_err(io)?;
                 copy(
                     &entry.path(),
-                    &destination.join(entry.file_name()),
+                    &destination,
+                    Path::new(&entry.file_name()),
                     files,
                     bytes,
                 )?;
@@ -491,7 +499,7 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<(), AcceptanceError> {
             if *files > MAX_CLONE_FILES || *bytes > MAX_CLONE_BYTES {
                 return Err(invalid("A04 clone exceeds bound"));
             }
-            fs::copy(source, destination).map_err(io)?;
+            fs::copy(source, parent.path().join(name)).map_err(io)?;
         } else {
             return Err(invalid("A04 clone contains non-regular entry"));
         }
@@ -499,7 +507,8 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<(), AcceptanceError> {
     }
     let mut files = 0;
     let mut bytes = 0;
-    copy(source, destination, &mut files, &mut bytes)
+    let parent = StoreDirectory::open(clone_root).map_err(|error| failure(error.to_string()))?;
+    copy(source, &parent, Path::new(".kio"), &mut files, &mut bytes)
 }
 
 fn invalid(message: impl Into<String>) -> AcceptanceError {
@@ -510,4 +519,38 @@ fn failure(message: impl Into<String>) -> AcceptanceError {
 }
 fn io(error: std::io::Error) -> AcceptanceError {
     AcceptanceError::Io(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kio_core::{
+        management::{ManagementBinding, validate_live_chain},
+        scope::Repository,
+    };
+
+    #[test]
+    fn cloned_and_moved_scopes_reach_the_management_authority_check() {
+        let fixture = tempfile::tempdir().unwrap();
+        let device = fixture.path().canonicalize().unwrap();
+        let original = device.join("original");
+        fs::create_dir(&original).unwrap();
+        drop(Repository::init(&original).unwrap());
+
+        let clone = device.join("clone");
+        fs::create_dir(&clone).unwrap();
+        copy_tree(&original.join(".kio"), &clone).unwrap();
+
+        let moved = device.join("moved");
+        fs::rename(&original, &moved).unwrap();
+        let results = [clone, moved].map(|scope| {
+            ManagementBinding::bind(&scope)
+                .and_then(|binding| validate_live_chain(&binding))
+                .unwrap_err()
+                .error_code()
+                .to_owned()
+        });
+
+        assert_eq!(results, [MANAGEMENT_AUTHORITY_ERROR; 2]);
+    }
 }

@@ -10,6 +10,7 @@ kio の作業環境は時期によって丸ごと切り替わる（D-20261121-02
 - `2c270c5` の後の commit は、計画の記録と、この引き継ぎの文書だけである。移管の時点では、最新の commit の通常の CI が実行中だった（`ci.yml` の concurrency により、`87910b1` の run は取り消される）。正式な受入の候補にできるのは、CI の push の run が成功した main の commit だけである。再開したら最初に `gh run list -L 5` で結果を確かめる。
 - 次の作業は [v1 正式受入](v1-acceptance.md)。構成の整理を統合してから、候補の CI と外部資源の準備を確認し、51 件と集約を一度だけ回す。GPU ホストの決定と接続前提は正式受入の手順に記録する。
 - GPU 受入ホスト（D-20261121-05）：研究室 4060 と個人デスクトップ 4070 の両方に `scripts/v1-local-gpu/host/` で構築済み（2026-11-21。管理者 SSH、`kio-ci` の制限、2 段 SSH で候補未配置の拒否、CUDA スモークを確認）。Environment `v1-local-acceptance` は両台の host key と新しい受入鍵を登録し、`KIO_LAB_JUMP_HOST` は Mac で開発中のため研究室（`100.68.218.37`）。4070 で開発する期間は `100.97.109.109` に書き換える。Tailscale の policy は 2026-11-22 に `tag:kio-ci` から両台の TCP 22 だけを許可した。route-probe（run 44919717116）で `tag:kio-ci` の経路と拒否を確かめた。研究室のネットワークは OCR イメージの Baidu レジストリ（`120.48.94.1:443`）への TCP 接続だけを遮断する（他の中国本土のミラーと 780 MB の取得は成功、2026-11-22）。そのため F4 の GPU 受入は 4070 で行い、`KIO_LAB_JUMP_HOST` は `100.97.109.109` にしている。F4 後に研究室へ戻すには、イメージを digest を保って移す方法か、研究室ネットワークでの許可が要る。S4U の keepalive はサインアウト後が未確認。
+- F4 後に扱う事項：macOS で LibreOffice 26.8.3.1 を変換器に指定すると、製品の probe が `renderer scratch contains a symlink` で拒否し、DOCX・PPTX が `office_conversion_unavailable` になる（2026-11-22 に手元で確認。受入が固定する 26.8.0.3 では通る）。現行の LibreOffice への対応として調べる。
 - 観察を続けている事項：`v1_local_http` のテストで「database disk image is malformed」が一度だけ出た。その後は再現していない（64 回と 24 回の並列実行、CI）。再発したらログを残して調べる。
 
 ## 2. Mac での開始の手順
