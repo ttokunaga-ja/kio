@@ -53,6 +53,6 @@
    - `kio-lab-windows` は今も GPU の host として使う予定か。それとも、個人デスクトップ（`ttokunaga-ja`）に移すのか。
    - lab Windows に `kio-ci` user、`sshd_config` の `Match User kio-ci`、WSL の `kio-test` と dispatcher を設定したことがあるか。
 
-接続先の決定後は、選んだホストに対する OIDC/grant、固定 host key、Windows の制限付き forwarding と WSL の forced command、候補に束縛された deployment、既存管理者経路の維持を確かめる。GitHub の dispatch 権限を持つ主体も再確認する。main 専用 Environment の branch 制限と、dispatch できる利用者の権限は別に確かめる。候補に束縛した配置の詳細は GPU コントローラの README を参照する。
+接続先の決定後は、選んだホストに対する OIDC/grant、固定 host key、Windows の制限付き forwarding と WSL の forced command、候補に束縛された deployment、既存管理者経路の維持を確かめる。GitHub の dispatch 権限を持つ主体も再確認する。main 専用 Environment の branch 制限と、dispatch できる利用者の権限は別に確かめる。整理後の候補 SHA から、移管済みの OCR 設定を含む deployment を生成する。[候補の固定入力と配置の手順](../scripts/v1-local-gpu/README.md#candidate-bound-deployment-proposal) に従う。
 
 確認結果は `scratch/reports/f4/external-status.md` に、9 件を実行できるか、項目番号ごとの状態と根拠、利用者が決めたホスト、必要な対応と担当を記録する。
