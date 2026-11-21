@@ -2,8 +2,9 @@
 # Usage: bash scripts/ci/local-checks.sh WORK [all | CHECK ...]
 # WORK uses lowercase letters and hyphens, e.g. reorg-a.
 # With no CHECK, "all" runs fmt, clippy, test, code-limits and ci-checks,
-# plus confinement and windows-clippy on Linux. Add synthetic-history when
-# checking changes to kio-eval, search, indexing or history.
+# plus confinement and windows-clippy on Linux. On Linux, add synthetic-history
+# when checking changes to kio-eval, search, indexing or history (it needs the
+# Linux descriptor process boundary; on macOS leave it to CI).
 # Examples:
 #   bash scripts/ci/local-checks.sh reorg-a fmt code-limits
 #   bash scripts/ci/local-checks.sh reorg-a all synthetic-history
@@ -50,10 +51,10 @@ for check in "$@"; do
                 checks+=(windows-clippy)
             fi
             ;;
-        fmt|clippy|test|code-limits|ci-checks|synthetic-history)
+        fmt|clippy|test|code-limits|ci-checks)
             checks+=("$check")
             ;;
-        confinement|windows-clippy)
+        confinement|windows-clippy|synthetic-history)
             if [[ "$platform" != Linux ]]; then
                 printf '%s requires Linux\n' "$check" >&2
                 exit 2

@@ -34,7 +34,7 @@ export KIO_LITERT_C_API_ZIP="$PWD/scratch/runtime/litert/litert_lm_c_api-1.0.0.z
 
 ## 3. Mac でのローカル検証
 
-LiteRT ZIP を設定したシェルから [ローカル検証スクリプト](../scripts/ci/local-checks.sh) を `bash scripts/ci/local-checks.sh <作業名> all` で実行する。評価・検索・索引・履歴に触れた場合は引数に `synthetic-history` を足す。終了値とログを確認し、実際のホームに kio のデータが作られていないことを確かめる。
+LiteRT ZIP を設定したシェルから [ローカル検証スクリプト](../scripts/ci/local-checks.sh) を `bash scripts/ci/local-checks.sh <作業名> all` で実行する。評価・検索・索引・履歴に触れた場合は引数に `synthetic-history` を足す（Linux だけ。Mac では動かないので通常の CI の `synthetic-history-eval` で確かめる）。終了値とログを確認し、実際のホームに kio のデータが作られていないことを確かめる。
 
 - Linux 固有の confinement・cgroup・systemd と Windows の動作は通常 CI の対象 job で確かめる。
 - CI の `sudo kio-prepare-macos-sdk` は使い捨て runner 用。手元で必要になった場合は内容を読んで利用者に確かめる。
