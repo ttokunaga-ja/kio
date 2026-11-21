@@ -51,36 +51,6 @@ requires 6,141 MiB plus 128 MiB of free memory, and refuses unrelated running co
 its recorded used memory. After interrupted init, cleanup without a baseline
 requires a valid GPU sample and proof that the exact OCR project is absent.
 
-## Candidate-bound deployment proposal
-
-The forced private route uses an root-controlled deployment record with schema
-`kio.v1.local_gpu.deployment/v2`. Do not handwrite this record or a stale
-fixed-source digest list. Generate the proposal from a clean exact candidate
-with the candidate-built helper. The source map includes both OCR YAML files
-above, and the installed dispatcher verifies those paths and digests before
-invoking the controller.
-
-```bash
-target/debug/kio-acceptance-tools route-preflight \
-  --repository "$PWD" \
-  --candidate <reviewed-main-sha> \
-  --tools-binary target/debug/kio-acceptance-tools
-```
-
-Preflight requires the requested lowercase 40-hex candidate to resolve and be
-the exact local `HEAD`; every member of the Rust-defined `FIXED_SOURCES` list
-must be a clean committed regular blob; and the helper binary must pass its
-bounded trusted-file digest check. Its output includes the v2 schema,
-`tools_binary_sha256`, and the complete source map. It is review material only:
-it proves neither that GitHub `main` is protected nor that a remote deployment
-or Actions package exists.
-
-For source-derived routes, the exact default `main` candidate approval is the
-authority trust root. Same-job transfer of a helper hash proves only transfer
-integrity; it is not independent provenance for a candidate-built executable.
-The dispatcher must be installed as the reviewed binary and the forced command
-must end in `kio-acceptance-tools dispatch`, never a mutable repository script.
-
 ## 受入ホストの構築
 
 | GPU | Windows の WSL 登録所有者 | WSL2 ディストリビューション | Windows の既存 `AllowUsers` | Tailscale IPv4（調査時） |
@@ -103,11 +73,48 @@ OpenSSH を用意する。WSL は `sudo`、 `rootlesskit`、`slirp4netns`、`uid
    ディストリビューションの RootlessKit プロファイルを使う。
    [Docker Rootless](https://docs.docker.com/engine/security/rootless/) ·
    [Docker の CDI](https://docs.docker.com/reference/cli/dockerd/#configure-cdi-devices)
-2. [候補固定の配置](#candidate-bound-deployment-proposal)に従い、同じ候補の固定入力、
-   Linux helper、canonical な `deployment.json` を `/var/lib/kio-v1-local/source` 以下に
-   配置する。ファイル・全祖先は root 所有・group/other 書込不可・非 symlink。
-   `kio-test` が読めるよう、ディレクトリとバイナリは 0755、deployment は 0644 とする。
-   deployment の内容は公開 digest。候補の更新は受入とリース回収が終わってから行う。
+2. 初期構築用に、検証済みの `main` コミット
+   `3c5e5b28e56d3542cb9bb984696bdae0e0e5520d` を使う。このコミットの dispatcher は、
+   候補未配置時の拒否と専用ロックの検査を備えている。受入ホストとは別の信頼済み
+   Ubuntu 24.04 x86_64 Linux ビルド環境で、クリーンな当該コミットから Linux 版を作り、両ホストに渡す。
+   Mac を使う場合は Linux で作ったファイルの中継に使う。ビルド元でコミットと SHA-256 を記録する。
+
+   ```bash
+   (
+     set -euo pipefail
+     bootstrap_sha=3c5e5b28e56d3542cb9bb984696bdae0e0e5520d
+     test "$(git rev-parse HEAD)" = "$bootstrap_sha"
+     test -z "$(git status --porcelain)"
+     cargo +1.98.0 build -p kio-eval --bin kio-acceptance-tools --locked
+     bundle=$(mktemp -d)
+     cp target/debug/kio-acceptance-tools "$bundle/"
+     git show "$bootstrap_sha":scripts/v1-local-gpu/host/shared-gpu-count > "$bundle/shared-gpu-count"
+     (cd "$bundle" && sha256sum kio-acceptance-tools shared-gpu-count > SHA256SUMS)
+     printf '%s\n' "$bundle"
+   )
+   ```
+
+   転送後は WSL でレビュー済みの `SHA256SUMS` と照合し、 `file kio-acceptance-tools` が対象の
+   Linux x86-64 ELF であることを確認する。下の配置例は `--help` の実行も確かめる。
+   各祖先は root 所有、group/other 書込不可、非 symlink とし、管理者が照合した 2 ファイルを
+   以下のパスに置く。root 管理下に置いた後のファイルも同じ SHA-256 と照合する。
+   初期構築では `deployment.json` と F4 の固定入力を置かない。
+
+   ```bash
+   (
+     set -euo pipefail
+     sha256sum -c SHA256SUMS
+     file kio-acceptance-tools
+     ./kio-acceptance-tools --help
+     dest=/var/lib/kio-v1-local/source/scripts/v1-local-gpu
+     sudo install -d -o root -g root -m 0755 "$dest/host"
+     sudo install -o root -g root -m 0755 kio-acceptance-tools "$dest/kio-acceptance-tools"
+     sudo install -o root -g root -m 0755 shared-gpu-count "$dest/host/shared-gpu-count"
+     sudo cmp kio-acceptance-tools "$dest/kio-acceptance-tools"
+     sudo cmp shared-gpu-count "$dest/host/shared-gpu-count"
+   )
+   ```
+
 3. 両台の各段に同じ受入用 Ed25519 公開鍵を渡す。秘密鍵は GitHub Environment と承認済みの
    保管先で保持する。NVIDIA の署名付き APT リポジトリから取得・照合した
    `nvidia-container-toolkit-base` 1.20 以降の .deb と、レビュー済み CUDA smoke image の
@@ -135,21 +142,26 @@ OpenSSH を用意する。WSL は `sudo`、 `rootlesskit`、`slirp4netns`、`uid
    [NVIDIA CDI](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/cdi-support.html) ·
    [WSL の CDI デバイス名](https://github.com/NVIDIA/nvidia-container-toolkit/blob/v1.20.1/pkg/nvcdi/lib-wsl.go)
 4. Windows のローカルコンソールで WSL 登録所有者として昇格した 64-bit PowerShell を開く。
-   管理用 Mac と検証用 CI の実際の Tailscale IPv4 を渡す。最初はタスク用 Windows 資格情報が必要。
+   管理用 Mac と検証用 CI の実際の Tailscale IPv4 を渡す。
    スクリプトは既存の portproxy、待受、広い firewall 許可を検査し、受信許可を Tailscale IF、
    宛先 Tailscale IPv4、`sshd.exe`、送信元 `100.64.0.0/10`、TCP 22 に限定する。
 
    ```powershell
-   $cred = Get-Credential -UserName "$env:COMPUTERNAME\rm2c" -Message 'WSL keepalive task'
    .\scripts\v1-local-gpu\host\setup-windows.ps1 -WslOwner rm2c -Distro Ubuntu-26.04 `
        -ExistingAllowUsers 'AllowUsers rm2c' -PublicKeyFile C:\path\kio-ci.pub `
-       -AdminSource 100.102.187.14 -CiSource $ObservedCiIpv4 -KeepaliveCredential $cred
-   Remove-Variable cred
+       -AdminSource 100.102.187.14 -CiSource $ObservedCiIpv4
    ```
 
    個人機は表の値に置き換える。対応している OpenSSH オプションはインストール済みの
-   `sshd.exe` で判定する。専用タスクは起動・ログオン時に WSL の foreground プロセスを
-   維持する。再起動とサインアウト後の疎通が確認できるまで旧タスクを保管する。
+   `sshd.exe` で判定する。専用タスクはディストリビューションの登録所有者を S4U の principal にし、
+   起動・ログオン時に WSL の foreground プロセスを維持する。S4U はアカウントのパスワードを要求せず、
+   保存もしない。登録所有者に有効なバッチ ログオン権限があり、distro の VHDX は
+   所有者がアクセスできるローカルの EFS 非暗号化ファイルであることを確認する。
+   同名の旧 Password タスクが残っていれば適用前に止まる。旧タスクは管理者が退避し、
+   設定移行を調整する。Password タスクへの自動切り替えはない。
+   [Task Scheduler の S4U 制約](https://learn.microsoft.com/windows/win32/api/taskschd/ne-taskschd-task_logon_type) ·
+   [バッチ ログオン権限](https://learn.microsoft.com/windows/win32/taskschd/security-contexts-for-running-tasks) ·
+   [WSL の Session 0 対応履歴](https://github.com/microsoft/WSL/releases/tag/2.0.1)
    [Windows OpenSSH](https://learn.microsoft.com/windows-server/administration/openssh/openssh-server-configuration) ·
    [WSL と systemd](https://learn.microsoft.com/windows/wsl/systemd/)
 
@@ -248,21 +260,31 @@ sudo test -e "$probe" && sudo -u kio-test test -r "$probe"
 sudo test -e "$probe" && sudo -u kio-test test -w "$probe"
 ```
 
-固定 OCR image は専用 Engine に pull する。受入直前に空き VRAM が 6,269 MiB 以上で、
-Windows・WSL の他ワークロードによる GPU 使用がないことを管理者が確かめる。コントローラは
-専用 Engine のコンテナを列挙し、VRAM の起動前後はホスト全体の実測で照合する。
-共有 Engine には root 管理の引数なし照会だけを使う。sudoers の規則は `NOSETENV` を指定する。
-構築時の CUDA スモークテストにも件数 0 が必要。admission・停止・cleanup の前に、
-DeviceRequests を持つ稼働コンテナが 1 件以上、または照会に失敗した場合は中断する。
-cleanup の中断時はリースを保持する。
+初期構築では、候補と manifest が未配置であることによる拒否を 2 段 SSH で確認する。
+WSL 側で `maintenance.lock` が root:kio-test の 0640 で存在し、`deployment.json` が未配置であることを
+先に確かめる。`id` の拒否だけでは manifest の検査まで到達したことを確認できない。試験用の値で
+読み取り専用 `identity` 要求を送り、失敗し、標準エラーに `deployment path is missing` が
+含まれることを確認する。
 
 ```bash
-uid=$(id -u kio-test)
-docker=(/opt/kio-v1-local/docker/docker --host "unix:///run/user/$uid/kio-v1-local-docker.sock"
-        --config /opt/kio-v1-local/docker-cli)
-sudo -u kio-test env -u DOCKER_HOST -u DOCKER_CONTEXT "${docker[@]}" compose \
-  -f scripts/v1-local-gpu/config/compose.yaml pull
+bootstrap_sha=3c5e5b28e56d3542cb9bb984696bdae0e0e5520d
+printf '%064d\n' 0 | ssh -F "$cfg" -o BatchMode=yes kio-lab-wsl \
+  "v1 identity $bootstrap_sha 1 1 linux"
 ```
+
+起動タスクは、Windows の再起動後に登録所有者がサインインしたり手動で WSL を起動したりする
+前に、別端末から Windows 経由で WSL 2222 に到達できることを上の `ssh -W` で確認する。
+通常どおりサインアウトした後も同じ確認を行う。Windows のコンソールではタスクの
+`Principal.LogonType`、`State`、`LastTaskResult` を確認できる。
+
+```powershell
+Get-ScheduledTask -TaskName KioV1LocalGpuKeepalive |
+    Select-Object State, @{N='LogonType';E={$_.Principal.LogonType}}
+Get-ScheduledTaskInfo -TaskName KioV1LocalGpuKeepalive | Select-Object LastTaskResult
+```
+
+S4U で起動できない場合は、Task Scheduler の Operational ログとバッチ ログオン権限、
+ローカル VHDX へのアクセスを確認する。現地で起動が確認できるまで無人運用は保留する。
 
 ### ロールバック
 
@@ -289,6 +311,63 @@ kio-test 専用グループの 0640。旧 0644 からの移行では旧ファイ
   元の SSH drop-in を復元後、稼働中の通常 sshd は reload する。新規アカウントを撤去する場合は
   専用データとホームを先に退避する。共有 dockerd の状態は維持する。
   `--terminate-kio-test` で終了したセッションやプロセスは復元の対象外。
+
+## Candidate-bound deployment proposal
+
+初期構築と候補未配置の拒否確認が済んだら、F4 の前に、通常 CI が通った exact `main` 候補から
+Linux helper と固定入力を準備する。初期構築用のコミットは F4 の候補を固定しない。
+
+1. クリーンな候補の Linux ビルド環境で、候補からビルドした helper を使って proposal を生成する。
+   `F4_CANDIDATE_SHA` に承認済み候補の完全な SHA を、`bundle` にリポジトリ外の一時ディレクトリを
+   指定する。canonical manifest は proposal の
+   `deployment` オブジェクトだけを、キー順でコンパクトにシリアライズし、末尾改行なしで保存する。
+
+   ```bash
+   (
+     set -euo pipefail
+     candidate=$F4_CANDIDATE_SHA
+     test "$(git rev-parse HEAD)" = "$candidate"
+     test -z "$(git status --porcelain)"
+     cargo +1.98.0 build -p kio-eval --bin kio-acceptance-tools --locked
+     target/debug/kio-acceptance-tools route-preflight \
+       --repository "$PWD" --candidate "$candidate" \
+       --tools-binary target/debug/kio-acceptance-tools > "$bundle/proposal.json"
+     jq -cSj -e '.deployment | objects' "$bundle/proposal.json" > "$bundle/deployment.json"
+   )
+   ```
+
+   Preflight は exact HEAD、Rust 定義の `FIXED_SOURCES` と helper の SHA-256 を検査する。
+   candidate、scope、各 digest を独立したレビュー経路で確認する。同じ経路から受け取った hash
+   との一致は転送の完全性を示す。候補ビルドの出どころは承認済みの exact `main` とビルド記録で確認する。
+2. manifest の `sources` に列挙されたパスと同一の相対パスを保って固定入力を転送し、
+   `sources` の SHA-256 と `tools_binary_sha256` の両方を照合する。
+   両機で `/var/lib/kio-v1-local/maintenance.lock` を root が排他取得し、
+   `/var/lib/kio-v1-local/state/lease.json` が存在しない間に配置する。
+   `/var/lib/kio-v1-local/source` の下に固定入力を置き、初期構築用 helper を候補の
+   `scripts/v1-local-gpu/kio-acceptance-tools` で置き換える。 `shared-gpu-count` は
+   候補の `scripts/v1-local-gpu/host/shared-gpu-count` と実行用
+   `/var/lib/kio-v1-local/shared-gpu-count` の両方を照合して配置する。
+   実行ファイルは 0755、manifest は 0644。ファイルと全祖先は root 所有、
+   group/other 書込不可、非 symlink とする。配置後の digest を再確認し、
+   最後に canonical な `deployment.json` を `source/scripts/v1-local-gpu/` に置いてロックを解放する。
+   dispatcher は要求された候補 SHA、manifest、実行中の helper、固定入力、実行用照会を照合する。
+3. F4 に使うホストを固定し、専用 Engine に固定 OCR image を pull する。
+
+受入直前に空き VRAM が 6,269 MiB 以上で、
+Windows・WSL の他ワークロードによる GPU 使用がないことを管理者が確かめる。コントローラは
+専用 Engine のコンテナを列挙し、VRAM の起動前後はホスト全体の実測で照合する。
+共有 Engine には root 管理の引数なし照会だけを使う。sudoers の規則は `NOSETENV` を指定する。
+構築時の CUDA スモークテストにも件数 0 が必要。admission・停止・cleanup の前に、
+DeviceRequests を持つ稼働コンテナが 1 件以上、または照会に失敗した場合は中断する。
+cleanup の中断時はリースを保持する。
+
+```bash
+uid=$(id -u kio-test)
+docker=(/opt/kio-v1-local/docker/docker --host "unix:///run/user/$uid/kio-v1-local-docker.sock"
+        --config /opt/kio-v1-local/docker-cli)
+sudo -u kio-test env -u DOCKER_HOST -u DOCKER_CONTEXT "${docker[@]}" compose \
+  -f /var/lib/kio-v1-local/source/scripts/v1-local-gpu/config/compose.yaml pull
+```
 
 ## ホストの切り替え
 

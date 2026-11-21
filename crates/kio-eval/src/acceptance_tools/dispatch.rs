@@ -926,6 +926,62 @@ mod unix {
             }
         }
         #[test]
+        fn host_bootstrap_accepts_helpers_without_a_deployment() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let (temp, _) = fixture();
+            let gpu = temp.path().join("scripts/v1-local-gpu");
+            fs::create_dir_all(gpu.join("host")).unwrap();
+            let helper = gpu.join("kio-acceptance-tools");
+            let query = gpu.join("host/shared-gpu-count");
+            for path in [&helper, &query] {
+                fs::write(path, b"fixture").unwrap();
+                fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+
+            let setup = include_str!("../../../../scripts/v1-local-gpu/host/setup-wsl.sh");
+            let (_, setup) = setup
+                .split_once("# Begin bootstrap payload validation.")
+                .unwrap();
+            let (preflight, _) = setup
+                .split_once("# End bootstrap payload validation.")
+                .unwrap();
+            let shell = format!(
+                "set -euo pipefail\nsource=$1\nquery_source=$2\n\
+                 die() {{ echo \"$*\" >&2; exit 1; }}\n\
+                 trusted_path() {{ [[ -f $1 && ! -L $1 ]]; }}\n{preflight}"
+            );
+            let run = || {
+                Command::new("/bin/bash")
+                    .arg("-c")
+                    .arg(&shell)
+                    .arg("bootstrap-fixture")
+                    .arg(temp.path())
+                    .arg(&query)
+                    .output()
+                    .unwrap()
+            };
+            let missing = gpu.join("deployment.json");
+            assert_eq!(
+                require_root_owned(&missing),
+                Err("deployment path is missing".into())
+            );
+            let result = run();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+
+            fs::remove_file(&query).unwrap();
+            assert!(!run().status.success());
+            fs::write(&query, b"fixture").unwrap();
+            fs::set_permissions(&query, fs::Permissions::from_mode(0o755)).unwrap();
+            fs::remove_file(&helper).unwrap();
+            assert!(!run().status.success());
+        }
+
+        #[test]
         fn docker_checks_use_the_dedicated_engine_and_fail_closed() {
             use std::os::unix::fs::PermissionsExt;
             let (temp, base) = fixture();

@@ -4,11 +4,12 @@
 
 ## 実行前の条件と順序
 
-1. 整理後の `main` の完全な 40 桁 SHA を候補にし、同じ SHA の `ci.yml` の push run が成功したことを確かめ、候補 SHA と run ID を記録する。
-2. 下記の読み取り確認で外部資源 9 件の準備状況を確認する。D-20261121-05 に従って GPU ホストを選び、必要な設定と接続確認を済ませる。候補に対応する dispatcher と固定入力の照合・配置は [GPU コントローラの手順](../scripts/v1-local-gpu/README.md)、台帳・権限・予算の確認と初期化条件は [provider 予算台帳](acceptance/provider-budget.md) に従う。全経路の準備が揃ってから dispatch に進む。
-3. `main` を ref とし、[ネイティブ受入](../.github/workflows/v1-acceptance.yml) を `candidate_sha` で実行する。42 件と 3 OS の候補 package の成功後に、この run ID を外部 2 workflow の `package_run_id` に渡す。
-4. [provider 受入](../.github/workflows/v1-provider-acceptance.yml) は `operation=run`、`campaign_id`、`candidate_sha`、`package_run_id` を使う。[GPU 受入](../.github/workflows/v1-local-acceptance.yml) は同じ `candidate_sha` と `package_run_id` を使う。台帳の予約は失敗・結果不明も消費として扱う。
-5. 3 run の成功後、[最終集約](../.github/workflows/v1-acceptance-verify.yml) を同じ候補で実行する。`candidate_sha`、`ci_run_id`、`native_run_id`、`provider_run_id`、`local_run_id` を渡し、集約成功と 51 件の証跡を確認する。候補 SHA、各 run ID、パッケージと集約の証跡を記録する。
+1. [受入ホストの構築](../scripts/v1-local-gpu/README.md#受入ホストの構築)に従い、検証済みの初期構築用 Linux helper と共有 GPU 照会だけを root 管理で先に配置する。WSL と Windows を構築し、候補未配置の状態で 2 段 SSH の `deployment path is missing` を確認する。
+2. 整理後の `main` の完全な 40 桁 SHA を候補にし、同じ SHA の `ci.yml` の push run が成功したことを確かめ、候補 SHA と run ID を記録する。
+3. 下記の読み取り確認で外部資源 9 件の準備状況を確認する。F4 前に両台で同じ候補の dispatcher・固定入力・canonical な deployment を照合して配置する。その後 D-20261121-05 に従って GPU ホストを選び、固定 OCR image を用意して接続を確認する。[候補の固定入力と配置](../scripts/v1-local-gpu/README.md#candidate-bound-deployment-proposal)に従う。台帳・権限・予算の確認と初期化条件は [provider 予算台帳](acceptance/provider-budget.md) に従う。全経路の準備が揃ってから dispatch に進む。
+4. `main` を ref とし、[ネイティブ受入](../.github/workflows/v1-acceptance.yml) を `candidate_sha` で実行する。42 件と 3 OS の候補 package の成功後に、この run ID を外部 2 workflow の `package_run_id` に渡す。
+5. [provider 受入](../.github/workflows/v1-provider-acceptance.yml) は `operation=run`、`campaign_id`、`candidate_sha`、`package_run_id` を使う。[GPU 受入](../.github/workflows/v1-local-acceptance.yml) は同じ `candidate_sha` と `package_run_id` を使う。台帳の予約は失敗・結果不明も消費として扱う。
+6. 3 run の成功後、[最終集約](../.github/workflows/v1-acceptance-verify.yml) を同じ候補で実行する。`candidate_sha`、`ci_run_id`、`native_run_id`、`provider_run_id`、`local_run_id` を渡し、集約成功と 51 件の証跡を確認する。候補 SHA、各 run ID、パッケージと集約の証跡を記録する。
 
 ## 外部資源の読み取り確認
 
@@ -53,6 +54,6 @@
    - Windows の `kio-ci` と制限付き転送、WSL の `kio-test`・forced command・専用 rootless Docker/GPU を両台で確認する。
    - 接続先の WSL が稼働し、空き VRAM が 6,269 MiB 以上あり、Windows・WSL の他ワークロードが GPU を使用していないことを管理者が確認する。受入コントローラは専用 Docker 内の他コンテナ、共有 Docker の稼働中 DeviceRequests 件数、ホスト全体の VRAM を検査する。
 
-接続先の決定後は、選んだホストに対する OIDC/grant、固定 host key、Windows の制限付き forwarding と WSL の forced command、候補に束縛された deployment、既存管理者経路の維持を確かめる。GitHub の dispatch 権限を持つ主体も再確認する。main 専用 Environment の branch 制限と、dispatch できる利用者の権限は別に確かめる。整理後の候補 SHA から、移管済みの OCR 設定を含む deployment を生成する。[候補の固定入力と配置の手順](../scripts/v1-local-gpu/README.md#candidate-bound-deployment-proposal) に従う。
+初期構築では OIDC/grant、固定 host key、Windows の制限付き forwarding、WSL の forced command と候補未配置時の拒否、既存管理者経路の維持を確かめる。F4 前には選んだホストの候補に束縛された deployment を照合する。GitHub の dispatch 権限を持つ主体も再確認する。main 専用 Environment の branch 制限と、dispatch できる利用者の権限は別に確かめる。整理後の候補 SHA から、移管済みの OCR 設定を含む deployment を生成する。[候補の固定入力と配置の手順](../scripts/v1-local-gpu/README.md#candidate-bound-deployment-proposal) に従う。
 
 確認結果は `scratch/reports/f4/external-status.md` に、9 件を実行できるか、項目番号ごとの状態と根拠、利用者が決めたホスト、必要な対応と担当を記録する。

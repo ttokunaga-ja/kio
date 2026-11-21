@@ -7,8 +7,7 @@ param(
     [Parameter(Mandatory)][string]$PublicKeyFile,
     [Parameter(Mandatory)][string]$AdminSource,
     [Parameter(Mandatory)][string]$CiSource,
-    [string]$TailscaleInterface = 'Tailscale',
-    [pscredential]$KeepaliveCredential
+    [string]$TailscaleInterface = 'Tailscale'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -147,14 +146,12 @@ if ($task) {
         ([Security.Principal.NTAccount]$task.Principal.UserId).Translate([Security.Principal.SecurityIdentifier]).Value
     }
     $triggers = @($task.Triggers | Where-Object Enabled | ForEach-Object { $_.CimClass.CimClassName })
-    if ($taskSid -ne $owner.SID.Value -or $task.Principal.LogonType -ne 'Password' -or
+    if ($taskSid -ne $owner.SID.Value -or $task.Principal.LogonType -ne 'S4U' -or $task.Principal.RunLevel -ne 'Limited' -or
         $task.State -notin 'Running','Ready' -or $task.Settings.ExecutionTimeLimit -ne 'PT0S' -or
         $triggers -notcontains 'MSFT_TaskBootTrigger' -or $triggers -notcontains 'MSFT_TaskLogonTrigger' -or
         @($task.Actions).Count -ne 1 -or $task.Actions[0].Execute -ne $wsl -or $task.Actions[0].Arguments -ne $taskCommand) {
         throw 'Existing Kio keepalive task differs. Review it before applying.'
     }
-} elseif (!$KeepaliveCredential -or $KeepaliveCredential.UserName -ine $identity.Name) {
-    throw "Supply the Windows credential for $($identity.Name) for the boot task."
 }
 $account = Get-LocalUser -Name kio-ci -ErrorAction SilentlyContinue
 if ($account) {
@@ -269,8 +266,9 @@ try {
         $triggers = @((New-ScheduledTaskTrigger -AtStartup), (New-ScheduledTaskTrigger -AtLogOn -User $identity.Name))
         $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable `
             -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+        $principal = New-ScheduledTaskPrincipal -UserId $identity.Name -LogonType S4U -RunLevel Limited
         Register-ScheduledTask -TaskName $taskName -TaskPath '\' -Action $action -Trigger $triggers -Settings $settings `
-            -User $identity.Name -Password ($KeepaliveCredential.GetNetworkCredential().Password) -RunLevel Limited | Out-Null
+            -Principal $principal | Out-Null
         $createdTask = $true
     }
     if ((Get-ScheduledTask -TaskName $taskName -TaskPath '\').State -ne 'Running') {
@@ -315,7 +313,10 @@ try {
         Start-Sleep -Seconds 1
     }
     Get-NetworkInventory
-    if (!$reachable) { throw 'Keepalive or pinned SSH reachability failed after applying.' }
+    if (!$reachable) {
+        $taskResult = (Get-ScheduledTaskInfo -TaskName $taskName -TaskPath '\').LastTaskResult
+        throw "S4U keepalive or pinned SSH reachability failed (task result $taskResult)."
+    }
     if ((Read-Host 'Confirm a NEW Mac administrator login and the README network/SSH checks, then enter verified') -cne 'verified') {
         throw 'Route verification was not confirmed.'
     }
