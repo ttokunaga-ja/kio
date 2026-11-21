@@ -1,6 +1,11 @@
 use crate::eg2::{MEMORY_BYTES, WorkerError, runtime::VerifiedLibrary};
 use std::path::PathBuf;
 
+unsafe extern "C" {
+    // Darwin's mach_task_self() macro reads this task port.
+    static mach_task_self_: libc::mach_port_t;
+}
+
 #[cfg(not(test))]
 pub(crate) const EG2_SLOT_ROOT: &str = "/private/tmp";
 
@@ -10,10 +15,10 @@ pub(crate) fn cap_eg2_worker_address_space() -> Result<(), WorkerError> {
     // the dyld shared region) plus its budget for loading and inference.
     let mut info = std::mem::MaybeUninit::<libc::mach_task_basic_info>::uninit();
     let mut count = libc::MACH_TASK_BASIC_INFO_COUNT;
-    // SAFETY: the flavor and count match the local output struct.
+    // SAFETY: Darwin initializes the task port; the flavor and count match the output struct.
     let status = unsafe {
         libc::task_info(
-            libc::mach_task_self(),
+            mach_task_self_,
             libc::MACH_TASK_BASIC_INFO,
             info.as_mut_ptr().cast(),
             &mut count,
