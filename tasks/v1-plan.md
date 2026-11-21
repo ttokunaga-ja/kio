@@ -99,9 +99,9 @@ V1（テストが実際のホームに書き込まない）と V2（Linux の全
 
 ## 4. 検証の回し方
 
-### 4.1 ローカル（WSL）
+### 4.1 ローカル
 
-Mac での検証の範囲と手順は [handoff.md](handoff.md) の 3 にある（D-20261121-01）。
+今の作業環境で回す（D-20261121-02）。Mac での範囲と手順は [handoff.md](handoff.md) の 3 にある。以下は WSL で作業する期間の手順である。
 
 CI の Linux の job と同じ順で回す。全テストは、systemd の scope の中で、HOME と XDG を repo の `scratch/` に向けて実行する。Codex のサンドボックスの中ではテストが通らない（`/` と `/home` の所有者が別の UID に見える）ので、全テストと synthetic-history は統括がサンドボックスの外で実行する。
 
@@ -129,7 +129,7 @@ ls -d ~/.local/share/kio ~/.local/state/kio ~/.config/kio ~/.cache/kio   # 何�
 
 ### 4.2 CI
 
-push すると通常の CI が動き、全体で約 85 分かかる（Windows の remaining の job が最も長い）。Linux の全テストの job は約 20 分で、制限は 45 分である。push は、ローカル検証が通った区切りでまとめて行う。macOS と Windows の結果はここでしか分からないので、OS 固有の変更は小さい単位で push する。
+push すると通常の CI が動き、全体で約 85 分かかる（Windows の remaining の job が最も長い）。Linux の全テストの job は約 20 分で、制限は 45 分である。push は、ローカル検証が通った区切りでまとめて行う。今の作業環境以外の OS（Mac で作業中なら Linux と Windows、WSL で作業中なら macOS と Windows）の結果はここでしか分からないので、OS 固有の変更は小さい単位で push する。
 
 ### 4.3 高いコストの検証
 

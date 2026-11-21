@@ -1,8 +1,10 @@
 # 作業環境の引き継ぎ
 
-2026-11-21、kio の作業を個人デスクトップ WSL から Mac に移した（D-20261121-01）。WSL の clone と `scratch/` は消していない。どちらの環境でも、この文書と `git pull` で作業を再開できる。同時に両方の環境で作業しない。
+**現在の作業環境：Mac**（2026-11-21 から）。
 
-## 1. 移管の時点の状態
+kio の作業環境は時期によって丸ごと切り替わる（D-20261121-02）。通常は Mac、学会などで Mac を安定して使えない期間は個人デスクトップ WSL を使う。切り替えは利用者が指示し、作業内容によって環境を使い分けない。同時に両方の環境で作業しない。どちらの環境でも、この文書と `git pull` で作業を再開できる。切り替えるときは「6. 環境の切り替え」の手順に従い、この冒頭と「1」を書き換える。
+
+## 1. 最後に環境を切り替えた時点の状態（2026-11-21、WSL → Mac）
 
 - 計画（`tasks/v1-plan.md`）の残りは **F4（正式な受入）だけ**である。F3（実装完了の判定）は main の `2c270c5` で完了した。ローカル検証と、通常の CI の 3 つの OS の全 job（run 44786625755）が成功している。
 - `2c270c5` の後の commit は、計画の記録と、この引き継ぎの文書だけである。移管の時点では、最新の commit の通常の CI が実行中だった（`ci.yml` の concurrency により、`87910b1` の run は取り消される）。正式な受入の候補にできるのは、CI の push の run が成功した main の commit だけである。再開したら最初に `gh run list -L 5` で結果を確かめる。
@@ -34,7 +36,7 @@ export KIO_LITERT_C_API_ZIP="$PWD/scratch/litert/litert_lm_c_api-1.0.0.zip"
 
 ## 3. Mac でのローカル検証
 
-Mac では、通常の CI の `macos-security-r23` の job と同じ範囲を確かめられる。
+WSL で作業する期間の手順は `tasks/v1-plan.md` の 4.1 にある。Mac では、通常の CI の `macos-security-r23` の job と同じ範囲を確かめられる。
 
 ```bash
 cargo +1.98.0 fmt --all -- --check
@@ -43,9 +45,9 @@ CARGO_PROFILE_TEST_OPT_LEVEL=1 cargo +1.98.0 test --workspace --all-targets --lo
 cargo +1.98.0 run -q -p kio-ci --bin kio-code-limits --locked -- --root . > scratch/code-limits.json; echo $?   # 0 であること
 ```
 
-- Linux 固有のコード（confinement、cgroup、systemd の scope を使うテスト）と Windows の動作は、Mac では確かめられない。通常の CI の `rust` と `windows-workspace-tests` の job で確かめる。Linux 固有の変更は、WSL に戻るか、小さい単位で push して CI で確かめる。
+- Linux 固有のコード（confinement、cgroup、systemd の scope を使うテスト）と Windows の動作は、Mac では確かめられない。通常の CI の `rust` と `windows-workspace-tests` の job で確かめる。Linux 固有の変更も環境は切り替えず、小さい単位で push して CI で確かめる。
 - CI の macOS の job は、テストの前に `sudo` で `kio-prepare-macos-sdk` を実行する。これは使い捨ての runner 用の手順である。手元の Mac では、中身を読んで利用者に確かめるまで実行しない。
-- synthetic-history（`kio-eval`・検索・索引・履歴に触れた変更の push の前）は、`.github/workflows/ci.yml` の `synthetic-history-eval` の job の手順を、`/tmp` を `scratch/ci-local` に置き換えて回す。WSL ではこれを `scratch/ci-local.sh`（gitignore 済みで、WSL にだけある）にまとめていた。この script の Linux 固有の部分（`target-win` の clippy、confinement の準備）は Mac では動かない。
+- synthetic-history（`kio-eval`・検索・索引・履歴に触れた変更の push の前）は、`.github/workflows/ci.yml` の `synthetic-history-eval` の job の手順を、`/tmp` を `scratch/ci-local` に置き換えて回す。WSL ではこれを `scratch/ci-local.sh`（gitignore 済み。2026-11-21 に Mac にも写した）にまとめていた。この script の Linux 固有の部分（`target-win` の clippy、confinement の準備）は Mac では動かない。
 - 全テストの後に、テストが実際のホームに書き込んでいないことを確かめる。Mac での kio の保存場所を確かめてから、その場所を `ls` する。
 
 ## 4. Codex への委譲（AGENTS.md「エージェント運用」に従う）
@@ -66,14 +68,13 @@ cargo +1.98.0 run -q -p kio-ci --bin kio-code-limits --locked -- --root . > scra
 - GitHub の API の rate limit に当たったことがある。CI の完了待ちは、30 分以上の間隔で確かめる（CI 全体は約 85〜90 分で、Windows の remaining の job が最も長い）。
 - `ci.yml` は concurrency で前の run を取り消す。CI の途中で push すると、前の run の結果は出ない。
 
-## 6. WSL に残したもの
+## 6. 環境の切り替え
 
-WSL の clone（`~/dev/github.com/ttokunaga-ja/kio`）の、gitignore 済みの `scratch/` に次を残した。repo には入っていないので、Mac にはない。
+Git に入らないものは、自動では移らない。切り替えるたびに次を行う。
 
-- `scratch/briefs/`：これまでの Codex への指示書（`common.md` が共通の指示の雛形）。
-- `scratch/reports/`：Codex の報告とレビュー、作業記録 `worklog.md`、F2 の食い違いの一覧。
-- `scratch/ci-logs/` と `scratch/ci-*.log`：失敗した CI の job のログ。
-- `scratch/ci-local.sh`：Linux の CI の job のうち、全テスト以外の手順をまとめた script。
-- `scratch/litert/c_api.zip`：EG2 の runtime の ZIP（Mac では 2 の手順で取り直す）。
+1. **離れる環境で**：作業を区切りの良いところで commit・push する。この文書の「1」に、その時点の状態（計画の進み具合、実行中の CI、未確定の点）を書いて commit・push する。
+2. **Git に入らない作業用のファイルを移す**：`scratch/briefs/`（Codex への指示書。`common.md` が共通の雛形）、`scratch/reports/`（報告・レビュー・作業記録 `worklog.md`）、`scratch/ci-local.sh`、`scratch/ci-logs/` と `scratch/ci-*.log`、`.env`（単体で送り、権限を 600 にする。中身を表示しない）。両方の環境で sha256 を照合する。数百 MB を超えるときは、同じ LAN にいれば LAN 経由で送る（Tailscale 経由は約 13Mbps）。
+3. **移さないもの**：ビルドの出力（`target/`、`scratch/target-win/`）、ローカル CI の出力（`scratch/ci-local/`）、一時フォルダ、EG2 の runtime の ZIP（OS ごとに違うので、「2」の手順で取り直す）。
+4. **移る先の環境で**：`git pull --ff-only` で最新にし、「2」の開始の手順と、その OS のローカル検証を行う。この文書の冒頭の「現在の作業環境」と、`AGENTS.md` の「作業場所」に書いた環境の説明が今の状態と合っているかを確かめる。
 
-WSL に戻るときは、WSL で `git pull --ff-only` してから、`AGENTS.md` の「作業場所」と、この文書の冒頭を書き換える。
+2026-11-21 の WSL → Mac の切り替えでは、2 の作業用のファイル（507 ファイル）と `.env` を Mac に写し、sha256 の一致を確かめた。WSL の `scratch/` は消していない。
