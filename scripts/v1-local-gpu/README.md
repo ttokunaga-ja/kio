@@ -59,11 +59,58 @@ requires a valid GPU sample and proof that the exact OCR project is absent.
 | 個人 RTX 4070 | `ttokunaga-ja` | `Ubuntu`（24.04） | `AllowUsers ttokunaga-ja@100.102.187.14` | `100.97.109.109` |
 
 両台で Windows NVIDIA ドライバー、WSL2 の `/dev/dxg`、systemd、Windows と WSL の
-OpenSSH を用意する。WSL は `sudo`、 `rootlesskit`、`slirp4netns`、`uidmap`、`dbus-user-session`、
+OpenSSH を用意する。WSL は `sudo`、`util-linux`、`rootlesskit`、`slirp4netns`、`uidmap`、`dbus-user-session`、
 `curl`、OpenSSL、Python 3 が必要。 `/run/sshd` は root 所有・0755。既存の WSL Ed25519
 ホスト鍵を使う。systemd を初めて有効化する場合は対象 distro だけを作業時間内に再起動する。
 既存の `ssh.service` / `ssh.socket` と portproxy は棚卸しされる。TCP 2222 に競合があれば
 現地で移行を調整し、既存サービスを維持する。
+
+### 共有 Engine と interop の事前準備
+
+- **研究室**。`rm2c` の対話セッションを維持し、Docker Desktop の **Settings → Resources →
+  WSL Integration** で `Ubuntu-26.04` だけを有効にする。既存の Linux Engine と他のトグルは
+  維持する。通常の **Apply** が使える場合だけ適用する。**Apply & restart** が表示される場合や、
+  反映に Desktop・Engine の再起動が必要な場合はその場で止める。公式資料は Apply を案内しているが、
+  研究室のインストール版での無停止反映は未確認。次を Windows で前後に実行し、Engine ID、
+  競馬コンテナの ID と StartedAt が一致することを確認する。WSL 全体の終了、Desktop の再起動、
+  rm2c のサインアウトは行わない。
+  [Docker Desktop の WSL integration](https://docs.docker.com/desktop/features/wsl/#enable-docker-in-a-wsl-2-distribution)
+
+  ```powershell
+  $desktop = 'npipe:////./pipe/dockerDesktopLinuxEngine'
+  docker -H $desktop info --format '{{.ID}}'
+  docker -H $desktop ps -q | ForEach-Object {
+      docker -H $desktop inspect --format '{{.Id}} {{.State.StartedAt}}' $_
+  }
+  ```
+
+- 研究室の専用 distro の `/etc/wsl.conf` を退避し、`[interop]` 節に `enabled=false` と
+  `appendWindowsPath=false` を設定する。既存の `[boot]` は保持する。設定の反映には影響を確認して
+  **Ubuntu-26.04 だけ**を終了・起動する。管理者が WSL から Windows の `cmd.exe` を起動できなく
+  なったことを確認し、次の Unix socket 照会で Windows 側と同じ Engine ID が出ることを確認する。
+  Docker Desktop の WSL 2 backend はソケットを提供する。Windows `docker.exe` の起動に依存し、
+  distro 内にソケットを提供しない Docker VMM の経路は使えない。
+  研究室の版で interop 無効化によりソケットが利用できなくなり、専用 distro の再起動だけで
+  復旧できる場合は、`wsl.conf` を戻して Ubuntu-26.04 だけを再起動し、ソケットを再確認する。
+  この場合は setup の `--desktop-interop-required` を渡し、受入専用サービスの名前空間で
+  制限する。Desktop の再起動が必要なら保留する。
+  [WSL の distro 別設定](https://learn.microsoft.com/windows/wsl/wsl-config) ·
+  [WSL の interop 実装](https://github.com/microsoft/WSL/blob/master/doc/docs/technical-documentation/interop.md)
+
+  ```bash
+  shared_socket=$(readlink -e /var/run/docker.sock)
+  sudo test -S "$shared_socket"
+  sudo curl -q --fail --silent --show-error --max-time 10 --noproxy '*' \
+    --unix-socket "$shared_socket" http://localhost/info | jq '{ID,OperatingSystem}'
+  ```
+
+- **個人機**。通常の Ubuntu の `wsl.conf`、interop、既存 native Engine は維持する。
+  `shared_socket=/run/docker.sock` を使い、上と同じ API で起動中の native Engine を照合する。
+  setup は、両ホストとも指定した 1 ソケットが利用できなければ適用前に止まる。
+  接続先は root 所有で、全ユーザーに書込可能な socket は使わない。`kio-test` は Docker グループに
+  加えず、接続できないことを確認する。sudo は引数なしの件数照会だけを許可する。
+
+### ホストへの配置
 
 1. 同じレビュー済み版の Docker Engine 静的配布物（28.3 以降）を `/opt/kio-v1-local/docker`
    に展開し、同じ版の rootless extras から `dockerd-rootless.sh` を同ディレクトリに置く。
@@ -74,7 +121,7 @@ OpenSSH を用意する。WSL は `sudo`、 `rootlesskit`、`slirp4netns`、`uid
    [Docker Rootless](https://docs.docker.com/engine/security/rootless/) ·
    [Docker の CDI](https://docs.docker.com/reference/cli/dockerd/#configure-cdi-devices)
 2. 初期構築用に、検証済みの `main` コミット
-   `3c5e5b28e56d3542cb9bb984696bdae0e0e5520d` を使う。このコミットの dispatcher は、
+   `77016e56d7532401b7c3ad22c79ab4e5849142ad` を使う。このコミットの dispatcher は、
    候補未配置時の拒否と専用ロックの検査を備えている。受入ホストとは別の信頼済み
    Ubuntu 24.04 x86_64 Linux ビルド環境で、クリーンな当該コミットから Linux 版を作り、両ホストに渡す。
    Mac を使う場合は Linux で作ったファイルの中継に使う。ビルド元でコミットと SHA-256 を記録する。
@@ -82,18 +129,20 @@ OpenSSH を用意する。WSL は `sudo`、 `rootlesskit`、`slirp4netns`、`uid
    ```bash
    (
      set -euo pipefail
-     bootstrap_sha=3c5e5b28e56d3542cb9bb984696bdae0e0e5520d
+     bootstrap_sha=77016e56d7532401b7c3ad22c79ab4e5849142ad
      test "$(git rev-parse HEAD)" = "$bootstrap_sha"
      test -z "$(git status --porcelain)"
-     cargo +1.98.0 build -p kio-eval --bin kio-acceptance-tools --locked
+     cargo +1.98.0 build --release -p kio-eval --bin kio-acceptance-tools --locked
      bundle=$(mktemp -d)
-     cp target/debug/kio-acceptance-tools "$bundle/"
-     git show "$bootstrap_sha":scripts/v1-local-gpu/host/shared-gpu-count > "$bundle/shared-gpu-count"
-     (cd "$bundle" && sha256sum kio-acceptance-tools shared-gpu-count > SHA256SUMS)
+     cp target/release/kio-acceptance-tools "$bundle/"
+     (cd "$bundle" && sha256sum kio-acceptance-tools > SHA256SUMS)
      printf '%s\n' "$bundle"
    )
    ```
 
+   `77016e56` の既存 Linux ビルドを使う場合は、ビルド記録の SHA-256 と照合する。
+   `shared-gpu-count` は明示ソケット対応を含む **setup と同じレビュー済み commit** から採り、
+   転送前にその SHA-256 を `SHA256SUMS` に追加する。
    転送後は WSL でレビュー済みの `SHA256SUMS` と照合し、 `file kio-acceptance-tools` が対象の
    Linux x86-64 ELF であることを確認する。下の配置例は `--help` の実行も確かめる。
    各祖先は root 所有、group/other 書込不可、非 symlink とし、管理者が照合した 2 ファイルを
@@ -122,16 +171,17 @@ OpenSSH を用意する。WSL は `sudo`、 `rootlesskit`、`slirp4netns`、`uid
 
    ```bash
    sudo --preserve-env=WSL_DISTRO_NAME bash scripts/v1-local-gpu/host/setup-wsl.sh \
-     Ubuntu-26.04 /path/kio-ci.pub /path/toolkit-base.deb "$CUDA_SMOKE_IMAGE"
+     Ubuntu-26.04 /path/kio-ci.pub /path/toolkit-base.deb "$CUDA_SMOKE_IMAGE" "$shared_socket"
    ```
 
-   個人機では `Ubuntu` を渡す。Toolkit は .deb の CDI 用バイナリだけを専用パスへ展開する。
+   個人機では `Ubuntu` と `/run/docker.sock` を渡す。Toolkit は .deb の CDI 用バイナリだけを専用パスへ展開する。
    GPU は CDI で渡し、グローバルな `no-cgroups` や共有 Docker の設定を変更する必要はない。
    WSL が生成する `nvidia.com/gpu=all` を使い、導入時に GPU が 1 台であることとコンテナ内外の
    UUID 一致を確認する。ソケットは `/run/user/<uid>/kio-v1-local-docker.sock`、data-root は
    `/var/lib/kio-v1-local/state/docker`。 `kio-test` が他グループに所属するか共有ソケットに
    書き込める場合は適用を止める。起動中の共有 Engine の bind mount にアクセスできる場合も
-   止める。共有アプリの独自データパスや Windows マウントの ACL は現地で確認する。
+   止める。照会先は root 所有 0600 の `/etc/kio-v1-local-shared-gpu-socket` に保存する。
+   照会はそのソケットだけに接続し、応答不能なら失敗する。
    既存の管理者は別の管理アカウントを使う。WSL の既存 sshd は drop-in の
    `DenyUsers kio-test` を読み、稼働中は reload する。 `kio-test` のパスワードは lock し、
    旧 `~kio-test/.ssh/authorized_keys` は同じディレクトリ内の専用退避先へ移す。
@@ -212,7 +262,7 @@ ssh -F "$cfg" -o BatchMode=yes -W 127.0.0.1:22 kio-lab-wsl </dev/null
 
 最初のコマンドで WSL のバナー、残りで認証後の拒否を確認する。両段の remote forward
 には `-N -R 127.0.0.1:39123:127.0.0.1:22 -o ExitOnForwardFailure=yes` を使う。
-WSL の Unix socket 転送は `-N -L 127.0.0.1:39124:/var/run/docker.sock` で開始し、
+WSL の Unix socket 転送は `-N -L "127.0.0.1:39124:$shared_socket"` で開始し、
 ローカルポートへの接続で SSH チャネルが拒否されることを確認する。WSL 段の IdentityFile
 だけを旧管理用鍵へ差し替えた検証用設定でも、専用 listener が認証を拒否することを確認する。
 Windows 側で省略されたオプションの機能も実接続で確認する。
@@ -242,23 +292,56 @@ WSL の管理コンソールで次を確認する。通常の SSH では `denyus
 ```bash
 sudo /usr/sbin/sshd -T -C user=kio-test,host=localhost,addr=127.0.0.1 | grep -i '^denyusers '
 sudo passwd -S kio-test
-sudo -u kio-test test -w /run/docker.sock
+sudo -u kio-test test -w "$shared_socket"
 sudo -l -U kio-test
 sudo -u kio-test sudo -n -- /var/lib/kio-v1-local/shared-gpu-count
 sudo -u kio-test sudo -n -- /var/lib/kio-v1-local/shared-gpu-count unexpected
 ```
 
-Windows マウント・共有アプリ配下も、管理者が存在を確認済みの対象で実効権限を検査する。
-次の `probe` は実在する保護対象（Windows の利用者ディレクトリ、または bind mount 配下の保護対象）に
-置き換える。読み取り・書き込みテストはどちらも失敗が期待値。 `findmnt` で対象マウントが
-未接続だった場合はその状態を記録し、権限拒否とは区別する。
+専用 sshd と `user@<kio-test UID>.service` に root 管理の mount namespace を使う。
+両方で `/mnt` は読み取り専用の空 tmpfs、`/init` と `/run/WSL` は不可視とし、
+`WSL_INTEROP` を削除する。専用 sshd には `/mnt` 下にある場合だけ設定したソケット 1 個を
+bind する。rootless Docker 側には共有 socket を見せない。Desktop が bind 元のソケットを再生成して
+接続不能になった場合は照会が失敗する。受入のリースを回収してから専用 sshd の bind を更新する。
+
+setup は両名前空間を検査し、CUDA smoke のコンテナ内でも Engine から見た `/mnt` が空である
+ことを検証する。現地では管理者が保護対象 Windows パスの存在を通常の名前空間で確かめ、
+専用サービスの両名前空間では `kio-test` が書込・起動できないことを確認する。
 
 ```bash
+uid=$(id -u kio-test)
 probe='/mnt/c/Users/<実在する保護対象の Windows ユーザー>'
-findmnt -T "$probe"
-sudo test -e "$probe" && sudo -u kio-test test -r "$probe"
-sudo test -e "$probe" && sudo -u kio-test test -w "$probe"
+sudo test -e "$probe"
+for unit in kio-v1-local-sshd.service "user@$uid.service"; do
+  pid=$(systemctl show "$unit" -p MainPID --value)
+  sudo nsenter --target "$pid" --mount -- runuser -u kio-test -- test -w "$probe"
+  sudo nsenter --target "$pid" --mount -- runuser -u kio-test -- test -x /init
+done
 ```
+
+両テストは失敗が期待値。`binfmt_misc` の `F` フラグは `/init` を固定できるため、`/init` の
+非表示だけで Windows 実行を防げたと判定しない。`/run/WSL` も遮断する。実際の PE 実行も
+確かめる場合は、同じ Windows の `cmd.exe` を管理者が一時的に Linux 側に置き、
+両名前空間内の `kio-test` から副作用のない終了コマンドを実行する。
+
+```bash
+exe_probe=$(mktemp /tmp/kio-pe-probe.XXXXXXXX)
+sudo install -m 0755 /mnt/c/Windows/System32/cmd.exe "$exe_probe"
+for unit in kio-v1-local-sshd.service "user@$uid.service"; do
+  pid=$(systemctl show "$unit" -p MainPID --value)
+  sudo nsenter --target "$pid" --mount -- runuser -u kio-test --     timeout 5 "$exe_probe" /d /c 'echo KIO_INTEROP_PROBE'
+done
+sudo unlink "$exe_probe"
+```
+
+Windows 側の `KIO_INTEROP_PROBE` が出た場合は受入を止める。終了コード 124 の時間切れも
+拒否の証拠にはしない。
+通常の利用者の interop は個人機と研究室の代替手順で保持される。
+Linux カーネルや WSL 自体の隔離、後から追加する別マウント・代理ソケット、管理者が
+専用サービスの外から直接起動した同 UID のプロセスまではこの対策の対象外。
+Windows ドライブが `/mnt` 外にある状態での適用は止める。マウント変更時には再検証する。
+[systemd のファイルシステム名前空間](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html) ·
+[binfmt の固定インタープリター](https://docs.kernel.org/admin-guide/binfmt-misc.html)
 
 初期構築では、候補と manifest が未配置であることによる拒否を 2 段 SSH で確認する。
 WSL 側で `maintenance.lock` が root:kio-test の 0640 で存在し、`deployment.json` が未配置であることを
@@ -267,15 +350,16 @@ WSL 側で `maintenance.lock` が root:kio-test の 0640 で存在し、`deploym
 含まれることを確認する。
 
 ```bash
-bootstrap_sha=3c5e5b28e56d3542cb9bb984696bdae0e0e5520d
+bootstrap_sha=77016e56d7532401b7c3ad22c79ab4e5849142ad
 printf '%064d\n' 0 | ssh -F "$cfg" -o BatchMode=yes kio-lab-wsl \
   "v1 identity $bootstrap_sha 1 1 linux"
 ```
 
-起動タスクは、Windows の再起動後に登録所有者がサインインしたり手動で WSL を起動したりする
-前に、別端末から Windows 経由で WSL 2222 に到達できることを上の `ssh -W` で確認する。
-通常どおりサインアウトした後も同じ確認を行う。Windows のコンソールではタスクの
-`Principal.LogonType`、`State`、`LastTaskResult` を確認できる。
+研究室では競馬サービスの Docker Desktop を維持するため、rm2c の対話セッションを保ったまま
+S4U タスクを開始する。対象の専用 Ubuntu が停止している状態からタスクが起動・維持できることを、
+タスク状態と別端末からの Windows 経由の SSH 2222 で確認する。対象 Ubuntu を停止して試す場合は、
+受入リースがないことを確認し、Ubuntu-26.04 だけを対象とする。サインアウト後の挙動は未確認。
+Windows のコンソールでは以下を確認する。
 
 ```powershell
 Get-ScheduledTask -TaskName KioV1LocalGpuKeepalive |
@@ -284,7 +368,7 @@ Get-ScheduledTaskInfo -TaskName KioV1LocalGpuKeepalive | Select-Object LastTaskR
 ```
 
 S4U で起動できない場合は、Task Scheduler の Operational ログとバッチ ログオン権限、
-ローカル VHDX へのアクセスを確認する。現地で起動が確認できるまで無人運用は保留する。
+ローカル VHDX へのアクセスを確認する。
 
 ### ロールバック
 
@@ -308,6 +392,7 @@ kio-test 専用グループの 0640。旧 0644 からの移行では旧ファイ
   unit を読み直し、保存した enabled・active・linger を復元する。既存アカウントは元の login shell
   に戻す。 `password-state` と `password-last-change` から元のパスワード状態を復元し、
   `authorized-keys-location` に退避した鍵がある場合は使用中のファイルを上書きせず戻す。
+  ソケット設定と専用 user manager の drop-in は退避から復元する。
   元の SSH drop-in を復元後、稼働中の通常 sshd は reload する。新規アカウントを撤去する場合は
   専用データとホームを先に退避する。共有 dockerd の状態は維持する。
   `--terminate-kio-test` で終了したセッションやプロセスは復元の対象外。

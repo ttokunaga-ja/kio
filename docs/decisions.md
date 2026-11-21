@@ -296,3 +296,4 @@
 - **切り替え**：受入専用鍵を両台の Windows と WSL に登録し、両台の 2 段分のホスト鍵を固定別名で pin する。受入 run の前に Environment の `KIO_LAB_JUMP_HOST` だけを手動変更し、3 OS の実行とリース回収まで固定する。
 - **理由**：研究室 Docker Desktop は競馬のサービスが使用中。個人 WSL の既存 dockerd は eduanima が利用している。受入には専用ソケットと data-root を設け、共有 dockerd の設定とサービス状態を維持する。
 - **関係する資料**：[正式受入](../tasks/v1-acceptance.md)、[受入ホストの構築と切り替え](../scripts/v1-local-gpu/README.md#受入ホストの構築)。
+- **共有 GPU と Windows 権限**：研究室は Docker Desktop WSL integration のソケット、個人機は native `/run/docker.sock` に管理者の件数照会を向ける。接続できなければ受入を止める。研究室の Ubuntu-26.04 は distro 内の interop 無効を優先し、integration が依存する場合は受入専用サービスの mount namespace で制限する。個人機では通常の interop を維持し、受入専用 SSH と rootless Docker に同じ制限を適用する。通常の管理者プロセス、追加のマウントや代理ソケット、WSL とカーネル実装に由来するリスクは残る。研究室の Docker Desktop を支える対話セッションを維持し、S4U はその状態で検証する。
