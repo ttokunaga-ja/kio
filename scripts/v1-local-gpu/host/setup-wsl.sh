@@ -5,13 +5,35 @@ export LC_ALL=C
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 terminate_kio_test=false
-if [[ ${1:-} == --terminate-kio-test ]]; then
-  terminate_kio_test=true
+desktop_interop_required=false
+while [[ ${1:-} == --* ]]; do
+  case $1 in
+    --terminate-kio-test) terminate_kio_test=true ;;
+    --desktop-interop-required) desktop_interop_required=true ;;
+    *) die "Unknown option: $1" ;;
+  esac
   shift
-fi
-[[ $# == 4 && $EUID == 0 ]] ||
-  die "Usage: sudo --preserve-env=WSL_DISTRO_NAME bash $0 [--terminate-kio-test] DISTRO CI_PUBLIC_KEY_FILE TOOLKIT_BASE_DEB CUDA_SMOKE_IMAGE_DIGEST"
+done
+[[ $# == 5 && $EUID == 0 ]] ||
+  die "Usage: sudo --preserve-env=WSL_DISTRO_NAME bash $0 [--terminate-kio-test] [--desktop-interop-required] DISTRO CI_PUBLIC_KEY_FILE TOOLKIT_BASE_DEB CUDA_SMOKE_IMAGE_DIGEST SHARED_DOCKER_SOCKET"
 [[ -n ${WSL_DISTRO_NAME:-} && $WSL_DISTRO_NAME == "$1" ]] || die "WSL distro mismatch."
+if $desktop_interop_required && [[ $1 != Ubuntu-26.04 ]]; then
+  die "The Desktop interop exception is only for the dedicated Ubuntu-26.04 distro."
+fi
+if [[ $1 == Ubuntu-26.04 ]] && ! $desktop_interop_required; then
+  /usr/bin/python3 -I - <<'PYWSL'
+import configparser
+
+config = configparser.ConfigParser(interpolation=None)
+config.read("/etc/wsl.conf")
+if config.getboolean("interop", "enabled", fallback=True):
+    raise SystemExit("Disable interop in the dedicated distro and relaunch that distro before setup.")
+PYWSL
+fi
+[[ $5 == /* ]] || die "Supply the absolute shared Docker socket path."
+shared_socket=$(realpath -e -- "$5") || die "The selected shared Docker socket is unavailable."
+[[ $shared_socket =~ ^/[A-Za-z0-9_./-]+$ && ${#shared_socket} -lt 108 && -S $shared_socket ]] ||
+  die "The selected path must resolve to one Unix socket."
 smoke=$4
 [[ $smoke =~ ^[a-z0-9./:_-]+@sha256:[a-f0-9]{64}$ ]] || die "Use a reviewed GPU smoke image pinned by digest."
 grep -qi microsoft /proc/sys/kernel/osrelease && [[ -c /dev/dxg ]] || die "Expected WSL2 GPU support."
@@ -47,6 +69,7 @@ legacy_deny=/etc/ssh/sshd_config.d/00-kio-v1-local-deny.conf
 query=$homes/shared-gpu-count
 query_source=$source/scripts/v1-local-gpu/host/shared-gpu-count
 query_rule=/etc/sudoers.d/kio-v1-local-shared-gpu
+query_config=/etc/kio-v1-local-shared-gpu-socket
 maintenance=$homes/maintenance.lock
 legacy_keys=$home/.ssh/authorized_keys
 readonly rootless_path="$engine:/usr/bin:/bin"
@@ -66,11 +89,42 @@ echo 'Shared Docker socket and service (inventory only):'
 if ss -H -ltnp | grep -F '("dockerd",' ; then
   die "An existing Docker daemon listens on TCP. Review its access before applying."
 fi
-systemctl show docker.service docker.socket -p Id -p UnitFileState -p ActiveState -p MainPID || true
-[[ ! -e /var/run/docker.sock ]] || stat -Lc '%A %U:%G %n' /var/run/docker.sock
-if [[ -S /var/run/docker.sock ]] && systemctl is-active --quiet docker.service; then
-  timeout 10 curl --silent --show-error --fail --unix-socket /var/run/docker.sock 'http://localhost/containers/json?all=1' |
-    python3 -c '
+if [[ $1 == Ubuntu ]]; then
+  [[ $shared_socket == /run/docker.sock ]] || die "Use the personal host's native /run/docker.sock."
+  systemctl is-active --quiet docker.service || die "The existing native Engine must already be running."
+fi
+# Owners and modes of every component matter, including the candidate payload.
+trusted_path() {
+  local path=$1 mode
+  while [[ $path != / ]]; do
+    [[ ! -L $path && $(stat -c %u "$path") == 0 ]] || die "Expected root-owned path: $path"
+    mode=$(stat -c %a "$path")
+    (( (8#$mode & 022) == 0 )) || die "Writable by non-root: $path"
+    path=${path%/*}
+    path=${path:-/}
+  done
+}
+[[ $(stat -c %u "$shared_socket") == 0 ]] || die "The shared Docker socket must be root-owned."
+socket_mode=$(stat -c %a "$shared_socket")
+(( (8#$socket_mode & 002) == 0 )) || die "The shared Docker socket must not be world-writable."
+trusted_path "$(dirname -- "$shared_socket")"
+stat -Lc '%A %U:%G %n' "$shared_socket"
+shared_get() {
+  curl -q --max-time 10 --silent --show-error --fail --noproxy '*' \
+    --unix-socket "$shared_socket" "http://localhost$1"
+}
+shared_get /info | python3 -c '
+import json, sys
+info = json.load(sys.stdin)
+if not info["ID"]:
+    raise SystemExit("Missing shared Engine ID")
+print("Shared Engine:", info["ID"], info.get("OperatingSystem", ""))
+desktop = info.get("OperatingSystem") == "Docker Desktop"
+if desktop != (sys.argv[1] == "Ubuntu-26.04"):
+    raise SystemExit("The selected shared Engine does not match this host")
+' "$1" || die "Cannot identify the selected shared Engine. Check integration without restarting it."
+shared_get '/containers/json?all=1' |
+  python3 -c '
 import json, os, sys
 rows = json.load(sys.stdin)
 print("Shared containers:", len(rows))
@@ -80,7 +134,19 @@ with open(sys.argv[1], "wb") as output:
     for path in paths:
         output.write(os.fsencode(path) + b"\0")
 ' "$tmp/shared-bind-sources"
-fi
+printf '%s\n' "$shared_socket" > "$tmp/query-config"
+
+# Only this mount tree is shadowed below. Reject Windows drives mounted elsewhere.
+findmnt -J -l -o TARGET,FSTYPE,SOURCE,OPTIONS | /usr/bin/python3 -I -c '
+import json, re, sys
+for mount in json.load(sys.stdin)["filesystems"]:
+    target = mount["target"]
+    if (mount["fstype"] == "drvfs" or "aname=drvfs" in mount["options"]
+        or re.match(r"^[A-Za-z]:", mount["source"] or "")):
+        if not target.startswith("/mnt/") or target.startswith("/mnt/wsl/") or target == "/mnt/wsl":
+            raise SystemExit(f"Windows drive mount outside the protected mount tree: {target}")
+'
+
 [[ -e $host_key && -f $host_key.pub && ! -L $host_key ]] || die "Prepare the distro Ed25519 host key first."
 
 public_key=$(tr -d '\r' < "$2")
@@ -99,21 +165,11 @@ for tool in nvidia-ctk nvidia-cdi-hook; do
   [[ -x $tmp/nvidia/usr/bin/$tool ]] || die "Missing NVIDIA CDI tool $tool."
 done
 
-# Owners and modes of every component matter, including the candidate payload.
-trusted_path() {
-  local path=$1 mode
-  while [[ $path != / ]]; do
-    [[ ! -L $path && $(stat -c %u "$path") == 0 ]] || die "Expected root-owned path: $path"
-    mode=$(stat -c %a "$path")
-    (( (8#$mode & 022) == 0 )) || die "Writable by non-root: $path"
-    path=${path%/*}
-    path=${path:-/}
-  done
-}
 trusted_path "$source"
 trusted_path "$legacy_config"
 trusted_path /etc/ssh/sshd_config.d
 trusted_path /etc/sudoers.d
+
 
 check_lease() {
   [[ ! -e $state/lease.json && ! -L $state/lease.json ]] ||
@@ -255,7 +311,7 @@ if getent passwd "$user" > "$tmp/account"; then
     printf 'Existing kio-test activity:\n%s\n' "$activity" >&2
     die "kio-test is active; supply --terminate-kio-test to end its sessions and processes."
   fi
-  if [[ -S /var/run/docker.sock ]] && runuser -u "$user" -- test -w /var/run/docker.sock; then
+  if runuser -u "$user" -- test -w "$shared_socket"; then
     die "kio-test can write the shared Docker socket. Revoke its access and end old sessions before setup."
   fi
 else
@@ -356,12 +412,34 @@ printf '%s ALL=(root) NOPASSWD:NOSETENV: %s ""\n' "$user" "$query" > "$tmp/query
 grep -Eq '^(@|#)includedir[[:space:]]+/etc/sudoers.d/?[[:space:]]*$' /etc/sudoers ||
   die "Expected the distro sudoers.d include."
 /usr/sbin/visudo -cf "$tmp/query-sudoers" >/dev/null
+# Root system units create these mount namespaces before running the kio-test
+# session or its user manager; the normal distro user keeps the host view.
+cat > "$tmp/interop-policy" <<'UNIT'
+TemporaryFileSystem=/mnt:ro
+InaccessiblePaths=-/init -/run/WSL
+UnsetEnvironment=WSL_INTEROP
+UNIT
+{
+  printf '[Service]\n'
+  cat "$tmp/interop-policy"
+  if [[ $shared_socket != /mnt/* ]]; then
+    printf 'InaccessiblePaths=-%s\n' "$shared_socket"
+  fi
+} > "$tmp/user-interop"
+ssh_socket_bind=
+if [[ $shared_socket == /mnt/* ]]; then
+  # Expose only the configured socket inside the SSH namespace.
+  ssh_socket_bind="BindReadOnlyPaths=$shared_socket"
+fi
+interop_policy=$(cat "$tmp/interop-policy")
 cat > "$tmp/ssh-unit" <<UNIT
 [Unit]
 Description=Kio v1 local GPU SSH
 After=network.target
 
 [Service]
+$interop_policy
+$ssh_socket_bind
 UMask=0022
 ExecStartPre=/usr/bin/mkdir -p /run/sshd
 ExecStartPre=/usr/sbin/sshd -t -f $ssh_config
@@ -401,7 +479,14 @@ UNIT
 
 backup=$(mktemp -d /var/backups/kio-v1-local.XXXXXXXX)
 printf 'Backup: %s\n' "$backup"
-paths=("$legacy_deny" "$query" "$query_rule" "$ssh_config" "$keys" "$ssh_service" "$docker_service" "$dockerd_config" "$toolkit/nvidia-ctk" "$toolkit/nvidia-cdi-hook")
+paths=("$legacy_deny" "$query" "$query_rule" "$query_config" "$ssh_config" "$keys" "$ssh_service" "$docker_service" "$dockerd_config" "$toolkit/nvidia-ctk" "$toolkit/nvidia-cdi-hook")
+manager_policy_dir=
+manager_policy_created_dir=false
+manager_policy_changed=false
+if $have_account; then
+  manager_policy_dir=/etc/systemd/system/user@$uid.service.d
+  paths+=("$manager_policy_dir/50-kio-v1-local-interop.conf")
+fi
 [[ -d $toolkit ]] || touch "$backup/new-toolkit"
 for path in "${paths[@]}"; do
   [[ ! -L $path ]] || die "Unexpected symlink at $path."
@@ -493,10 +578,9 @@ rollback() {
   fi
   for path in "${changed[@]}"; do restore_path "$path" || failed=1; done
   if [[ -f $backup/new-toolkit && -d $toolkit ]]; then rmdir "$toolkit" || failed=1; fi
-  if $ssh_changed; then
-    systemctl daemon-reload || failed=1
-    if [[ $(cat "$backup/ssh-active") == active ]]; then systemctl start "$ssh_unit" || failed=1; fi
-  fi
+  if $manager_policy_created_dir; then rmdir "$manager_policy_dir" || failed=1; fi
+  if $ssh_changed || $manager_policy_changed; then systemctl daemon-reload || failed=1; fi
+  if $ssh_changed && [[ $(cat "$backup/ssh-active") == active ]]; then systemctl start "$ssh_unit" || failed=1; fi
   if $managed; then
     if $manager_before; then systemctl start "user@$uid.service" || failed=1; fi
     if systemctl is-active --quiet "user@$uid.service"; then
@@ -545,7 +629,7 @@ check_subids() {
 }
 test_shared_access() {
   local path
-  if [[ -S /var/run/docker.sock ]] && as_user test -w /var/run/docker.sock; then
+  if as_user test -w "$shared_socket"; then
     printf '%s\n' 'kio-test can access the shared Docker socket.' >&2
     return 1
   fi
@@ -610,6 +694,7 @@ if as_user test -e "$legacy_keys" || as_user test -L "$legacy_keys"; then
   printf '%s\n' "$saved_keys" > "$backup/authorized-keys-location"
   as_user mv -T -- "$legacy_keys" "$saved_keys"
 fi
+apply_file "$tmp/query-config" 0600 "$query_config"
 apply_file "$query_source" 0755 "$query"
 apply_file "$tmp/query-sudoers" 0440 "$query_rule"
 /usr/sbin/visudo -cf /etc/sudoers >/dev/null
@@ -629,6 +714,20 @@ apply_file "$tmp/nvidia/usr/bin/nvidia-ctk" 0755 "$toolkit/nvidia-ctk"
 apply_file "$tmp/nvidia/usr/bin/nvidia-cdi-hook" 0755 "$toolkit/nvidia-cdi-hook"
 apply_file "$tmp/dockerd" 0644 "$dockerd_config"
 apply_file "$tmp/docker-unit" 0644 "$docker_service"
+if ! $have_account; then
+  manager_policy_dir=/etc/systemd/system/user@$uid.service.d
+  [[ ! -e $manager_policy_dir && ! -L $manager_policy_dir ]]
+  printf '%s\n' "$manager_policy_dir/50-kio-v1-local-interop.conf" >> "$backup/absent"
+fi
+if [[ -e $manager_policy_dir || -L $manager_policy_dir ]]; then
+  trusted_path "$manager_policy_dir"
+else
+  install -d -m 0755 "$manager_policy_dir"
+  manager_policy_created_dir=true
+fi
+manager_policy_changed=true
+apply_file "$tmp/user-interop" 0644 "$manager_policy_dir/50-kio-v1-local-interop.conf"
+systemctl daemon-reload
 managed=true
 loginctl enable-linger "$user"
 systemctl start "user@$uid.service"
@@ -655,8 +754,16 @@ if [[ $shared_count != 0 ]]; then
   printf 'CUDA smoke refused: shared GPU count is not zero.\n' >&2
   rollback
 fi
+# Expand the mount probe inside the container, not on the host.
+# shellcheck disable=SC2016
 container_gpu=$(as_user "${docker[@]}" run --rm --pull=never --device nvidia.com/gpu=all \
-  --entrypoint nvidia-smi "$smoke" --query-gpu=uuid --format=csv,noheader)
+  --mount type=bind,source=/mnt,target=/kio-host-mnt,readonly \
+  --entrypoint /bin/sh "$smoke" -ec '
+    mount_entries=$(ls -A /kio-host-mnt)
+    test -z "$mount_entries"
+    test ! -x /init
+    exec nvidia-smi --query-gpu=uuid --format=csv,noheader
+  ')
 [[ $container_gpu == "$gpu_uuid" ]]
 printf 'Rootless container GPU: %s\n' "$container_gpu"
 test_shared_access
@@ -679,5 +786,24 @@ for _ in {1..10}; do
   sleep 1
 done
 $live
+for unit in "$ssh_unit" "user@$uid.service"; do
+  pid=$(systemctl show "$unit" -p MainPID --value)
+  [[ $pid =~ ^[1-9][0-9]*$ ]]
+  nsenter --target "$pid" --mount -- /usr/bin/python3 -I -c '
+import os
+import sys
+if os.access("/init", os.X_OK) or (os.path.isdir("/run/WSL") and os.listdir("/run/WSL")):
+    raise SystemExit("Windows interop is available inside the acceptance namespace")
+visible = set(os.listdir("/mnt"))
+allowed = {sys.argv[1]} if sys.argv[1] else set()
+if visible != allowed:
+    raise SystemExit("Unexpected entries inside the acceptance /mnt namespace")
+' "$(if [[ $unit == "$ssh_unit" && $shared_socket == /mnt/* ]]; then
+    part=${shared_socket#/mnt/}; printf '%s' "${part%%/*}";
+  fi)"
+done
+pid=$(systemctl show "$ssh_unit" -p MainPID --value)
+shared_count=$(nsenter --target "$pid" --mount -- runuser -u "$user" -- /usr/bin/sudo -n -- "$query")
+[[ $shared_count =~ ^(0|[1-9][0-9]*)$ ]]
 ss -ltnp
 printf 'kio-lab-wsl %s\n' "$(awk '{print $1, $2}' "$host_key.pub")"

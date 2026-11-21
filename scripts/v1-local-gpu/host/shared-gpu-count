@@ -7,18 +7,21 @@ import re
 import signal
 import socket
 import stat
-import subprocess
 import sys
 
-SOCKET = "/run/docker.sock"
+CONFIG = "/etc/kio-v1-local-shared-gpu-socket"
 MAX_RESPONSE = 8 * 1024 * 1024
 
 
 class Engine(http.client.HTTPConnection):
+    def __init__(self, endpoint, **kwargs):
+        super().__init__("localhost", **kwargs)
+        self.endpoint = endpoint
+
     def connect(self):
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.sock.settimeout(self.timeout)
-        self.sock.connect(SOCKET)
+        self.sock.connect(self.endpoint)
 
     def read_json(self, path):
         self.request("GET", path)
@@ -47,18 +50,28 @@ def running_requests(engine):
     return count
 
 
-def service_state():
-    result = subprocess.run(
-        ["/usr/bin/systemctl", "is-active", "docker.service"],
-        timeout=3, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        check=False, env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
-    )
-    state = result.stdout.strip()
-    if result.returncode == 4 and state in ("unknown", "inactive"):
-        return "not-found"
-    if (result.returncode, state) in ((0, "active"), (3, "inactive"), (3, "failed")):
-        return state
-    raise ValueError("shared Docker service state is unavailable")
+def configured_socket(config):
+    fd = os.open(config, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as handle:
+        info = os.fstat(handle.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o600:
+            raise ValueError("unsafe shared Docker configuration")
+        raw = handle.read(109)
+    if not re.fullmatch(rb"/[A-Za-z0-9_./-]+\n", raw) or len(raw) > 108:
+        raise ValueError("invalid shared Docker endpoint")
+    path = os.fsdecode(raw[:-1])
+    if path != os.path.normpath(path) or path.startswith("//"):
+        raise ValueError("shared Docker endpoint is not canonical")
+    endpoint = os.lstat(path)
+    if not stat.S_ISSOCK(endpoint.st_mode) or endpoint.st_uid != 0 or endpoint.st_mode & 0o002:
+        raise ValueError("unsafe shared Docker socket")
+    parent = os.path.dirname(path)
+    while parent != "/":
+        info = os.lstat(parent)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            raise ValueError("unsafe shared Docker socket ancestry")
+        parent = os.path.dirname(parent)
+    return path
 
 
 def main():
@@ -66,26 +79,14 @@ def main():
         return 1
     signal.alarm(20)
     try:
-        state = service_state()
-        try:
-            endpoint = os.lstat(SOCKET)
-        except FileNotFoundError:
-            # A configured but unavailable Engine may have live-restored containers.
-            if state != "not-found":
-                raise ValueError("shared Docker socket missing")
-            print(0)
-            return 0
-        # Do not follow a redirected socket or activate an inactive daemon.
-        if not stat.S_ISSOCK(endpoint.st_mode) or endpoint.st_uid != 0 or state != "active":
-            raise ValueError("shared Docker endpoint is not a running native Engine")
-        engine = Engine("localhost", timeout=4)
+        engine = Engine(configured_socket(CONFIG), timeout=4)
         try:
             count = running_requests(engine)
         finally:
             engine.close()
         print(count)
         return 0
-    except (OSError, ValueError, TypeError, KeyError, http.client.HTTPException, subprocess.SubprocessError):
+    except (OSError, ValueError, TypeError, KeyError, http.client.HTTPException):
         print("shared Docker GPU query failed", file=sys.stderr)
         return 1
 
