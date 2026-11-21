@@ -56,13 +56,53 @@ function Get-NetworkInventory {
     if ($rules -match '^\s*\S+\s+2222\s+\S+\s+\d+\s*$') { throw 'Existing TCP 2222 portproxy requires review.' }
 }
 
-function Test-Port22($Filter) {
-    if ([string]$Filter.Protocol -notin 'TCP','6','Any','256') { return $false }
+function Get-Port22Scope($Filter) {
+    $protocol = [string]$Filter.Protocol
+    if ($protocol -in 'UDP','ICMPv4','ICMPv6' -or
+        ($protocol -match '^\d+$' -and $protocol -notin '6','256')) { return 'Ignore' }
+    $unknown = $false
     foreach ($port in @($Filter.LocalPort)) {
-        if ($port -in 'Any','22') { return $true }
-        if ($port -match '^(\d+)-(\d+)$' -and [int]$Matches[1] -le 22 -and [int]$Matches[2] -ge 22) { return $true }
+        if ($port -in 'Any','22' -or
+            ($port -match '^(\d{1,5})-(\d{1,5})$' -and [int]$Matches[1] -le 22 -and [int]$Matches[2] -ge 22)) {
+            if ($protocol -in 'TCP','6','Any','256') { return 'Match' }
+            return 'Warn'
+        }
+        if ($port -notmatch '^\d{1,5}(?:-\d{1,5})?$') { $unknown = $true }
     }
-    return $false
+    if ($unknown -or !$Filter.LocalPort) { return 'Warn' }
+    return 'Ignore'
+}
+
+function Get-SshAllowDisposition($Rule, [string]$PortScope, $Application, $ServiceFilter, $Interface, $InterfaceType,
+    [hashtable]$NetworkProfiles, [string]$TailAlias, [string]$Sshd, [string]$RawRule) {
+    if ($PortScope -eq 'Ignore') { return 'Ignore' }
+    $package = [string]$Application.Package
+    $service = [string]$ServiceFilter.Service
+    # ActiveStore can omit Package even when the corresponding local rule has a PFN.
+    if (($package -and $package -ne 'Any') -or $RawRule -match '(?:^|\|)PFN=[^|]+(?:\||$)') { return 'Ignore' }
+    if ($service -and $service -notin 'Any','sshd' -and $service -notmatch '[*?]') { return 'Ignore' }
+    $program = [Environment]::ExpandEnvironmentVariables([string]$Application.Program)
+    if ($program -and $program -notin 'System','Any','sshd.exe',$Sshd -and
+        $program -notmatch '[*?%]|(?:^|[\\/])sshd\.exe$') { return 'Ignore' }
+    $aliases = @($Interface.InterfaceAlias | Where-Object { $_ -and $_ -ne $TailAlias })
+    if ($aliases.Count -eq 0 -and $Interface.InterfaceAlias) { return 'Ignore' }
+    if ($aliases -contains 'Any') { $aliases = @($NetworkProfiles.Keys) }
+    $profiles = ([string]$Rule.Profile -replace '\s', '') -split ','
+    $unknown = $aliases.Count -eq 0 -or
+        @($profiles | Where-Object { $_ -notin 'Any','Domain','Private','Public' }).Count -gt 0
+    foreach ($alias in $aliases) {
+        if (!$NetworkProfiles.ContainsKey($alias)) { $unknown = $true; continue }
+        if ($profiles -contains 'Any' -or @($NetworkProfiles[$alias] | Where-Object { $_ -in $profiles }).Count -gt 0) {
+            if ($PortScope -eq 'Match' -and $program -in 'Any','sshd.exe',$Sshd -and
+                (!$service -or $service -eq 'Any') -and ($InterfaceType.InterfaceType -join ',') -eq 'Any' -and
+                ($package -eq 'Any' -or $RawRule) -and $RawRule -notmatch '(?:^|\|)LUOwn=[^|]+(?:\||$)') {
+                return 'Block'
+            }
+            return 'Warn'
+        }
+    }
+    if ($unknown) { return 'Warn' }
+    return 'Ignore'
 }
 
 function Test-FirewallScope($Rule) {
@@ -150,23 +190,50 @@ if (Get-NetFirewallProfile -PolicyStore ActiveStore |
 
 $priorRule = Get-NetFirewallRule -Name $ruleName -PolicyStore PersistentStore -ErrorAction SilentlyContinue
 if ($priorRule -and !(Test-FirewallScope $priorRule)) { throw "Existing $ruleName has a different scope. Review it before applying." }
-$overlaps = foreach ($rule in Get-NetFirewallRule -PolicyStore ActiveStore -TracePolicyStore -Enabled True -Direction Inbound -Action Allow) {
-    $port = $rule | Get-NetFirewallPortFilter
-    if (!(Test-Port22 $port)) { continue }
-    if ($rule.Name -eq $ruleName -and $priorRule -and (Test-FirewallScope $rule)) { continue }
-    $program = [Environment]::ExpandEnvironmentVariables(($rule | Get-NetFirewallApplicationFilter).Program)
-    if ($program -notin 'Any','System',$sshd -and $program -notmatch '(?i)sshd\.exe$|[*?]') { continue }
-    $interface = $rule | Get-NetFirewallInterfaceFilter
-    $address = $rule | Get-NetFirewallAddressFilter
-    if ($rule.DisplayName -ceq 'Tailscale-In' -and
-        (Test-TailscaleInboundRule $rule $port $address $interface $program ($rule | Get-NetFirewallServiceFilter).Service $tailAddresses)) {
-        continue
+$networkProfiles = @{}
+try {
+    foreach ($connection in Get-NetConnectionProfile) {
+        if ($connection.InterfaceIndex -eq $adapter.InterfaceIndex) { continue }
+        $category = [string]$connection.NetworkCategory
+        if ($category -eq 'DomainAuthenticated') { $category = 'Domain' }
+        if ($category -in 'Domain','Private','Public') { $networkProfiles[$connection.InterfaceAlias] += @($category) }
     }
-    $iface = $interface.InterfaceAlias -join ','
-    $remote = $address.RemoteAddress -join ','
-    if ($iface -eq $adapter.Name -and $remote -in $AdminSource,"$AdminSource/32") { continue }
-    $rule.Name
+} catch {
+    Write-Warning "Could not inventory connection profiles: $_"
 }
+$localRules = $null
+try {
+    $localRules = Get-Item -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\FirewallRules'
+} catch {
+    Write-Warning "Could not read local firewall rule metadata: $_"
+}
+$uncertain = @()
+$overlaps = foreach ($rule in Get-NetFirewallRule -PolicyStore ActiveStore -TracePolicyStore -Enabled True -Direction Inbound -Action Allow) {
+    try {
+        $port = $rule | Get-NetFirewallPortFilter
+        $portScope = Get-Port22Scope $port
+        if ($portScope -eq 'Ignore') { continue }
+        $application = $rule | Get-NetFirewallApplicationFilter
+        $service = $rule | Get-NetFirewallServiceFilter
+        $interface = $rule | Get-NetFirewallInterfaceFilter
+        if ($rule.DisplayName -ceq 'Tailscale-In' -and
+            (Test-TailscaleInboundRule $rule $port ($rule | Get-NetFirewallAddressFilter) $interface $application.Program $service.Service $tailAddresses)) {
+            continue
+        }
+        $interfaceType = $rule | Get-NetFirewallInterfaceTypeFilter
+        $rawRule = $null
+        if ($localRules -and $rule.PolicyStoreSourceType -eq 'Local' -and $rule.PolicyStoreSource -eq 'PersistentStore') {
+            $rawRule = $localRules.GetValue($rule.Name)
+        }
+        $disposition = Get-SshAllowDisposition $rule $portScope $application $service $interface $interfaceType `
+            $networkProfiles $adapter.Name $sshd $rawRule
+        if ($disposition -eq 'Block') { $rule.Name }
+        if ($disposition -eq 'Warn') { $uncertain += $rule.Name }
+    } catch {
+        $uncertain += "$($rule.Name) ($_)"
+    }
+}
+if ($uncertain) { Write-Warning "Inconclusive inbound TCP 22 allow rules: $($uncertain -join ', ')" }
 if ($overlaps) { throw "Review existing inbound TCP 22 allow rules before applying: $($overlaps -join ', ')" }
 
 Get-NetworkInventory

@@ -197,9 +197,11 @@ OpenSSH を用意する。WSL は `sudo`、`util-linux`、`rootlesskit`、`slirp
    宛先 Tailscale IPv4、`sshd.exe`、送信元 `100.64.0.0/10`、TCP 22 に限定する。
    この Windows Firewall 規則と既定の受信拒否は、LAN など tailnet 外からの到達を防ぐ多層防御を担う。
    tailnet 内で TCP 22 に到達できる送信元の境界は Tailscale の ACL・grant が担う。
-   事前検査では、ローカルの規則ストアと Tailscale の生成条件に合い、稼働中の Tailscale IF の
-   単一アドレスだけを宛先とする `Tailscale-In` を例外とする。規則名だけが一致する場合や、
-   その他の広い TCP 22 許可があれば適用前に止まる。
+   事前検査で停止するのは、稼働中の tailnet 外の IF とプロファイルに適用され、TCP 22 を含み、
+   プログラムが `Any` または `sshd.exe` で、パッケージ・サービスに限定されない有効な受信許可。
+   別のプログラムやサービス、PFN・AppContainer に限定される規則は通過し、判定が曖昧な規則は
+   警告に一覧表示する。稼働中の Tailscale IF の単一アドレスを宛先とし、ローカルの規則ストアと
+   生成条件に合う `Tailscale-In` は例外とする。遮断の合否は構築後の接続試験で判定する。
    [Tailscale の規則生成コード](https://github.com/tailscale/tailscale/blob/301e59f/wgengine/router/router_windows.go#L264-L272) ·
    [Tailscale の grant](https://tailscale.com/docs/features/access-control/grants)
 
@@ -275,12 +277,16 @@ WSL の Unix socket 転送は `-N -L "127.0.0.1:39124:$shared_socket"` で開始
 Windows 側で省略されたオプションの機能も実接続で確認する。
 
 Windows の LAN IPv4 を `WIN_LAN_IP`、Tailscale IPv4 を `WIN_TAILNET_IP` に設定し、それぞれ
-指定の端末から TCP 接続を試す。4 件とも失敗し、管理 Mac と許可した CI の TCP 22 は成功することを
-確認する。許可対象外の tailnet 端末からの TCP 22 の拒否は Tailscale の grant の検証とする。
+指定の端末から TCP 接続を試す。同じ LAN の Mac から Windows の TCP 22 と WSL の TCP 2222
+（Windows の LAN IP 宛て）、許可外の tailnet 端末から Windows の TCP 22 がいずれも拒否されることを
+遮断の合格条件とする。許可外端末での TCP 22 の拒否は Tailscale の grant の検証を兼ねる。
+LAN 試験では宛先への経路が Mac の LAN IF を通ることを `route -n get "$WIN_LAN_IP"` で確認する。
+TCP の接続拒否またはタイムアウトを確認する。経路やコマンドのエラー時は試験をやり直す。
+tailnet からの TCP 2222 も失敗し、管理 Mac と許可した CI の TCP 22 は成功することを確認する。
 Tailscale 管理画面でも現在の grant・OIDC の条件を確認する。
 
 ```bash
-# LAN 上の別端末から
+# Windows と同じ LAN に接続した Mac から
 nc -vz -w 5 "$WIN_LAN_IP" 2222
 nc -vz -w 5 "$WIN_LAN_IP" 22
 # tailnet の別端末から。TCP 22 は許可対象外の端末で試す。
@@ -288,7 +294,7 @@ nc -vz -w 5 "$WIN_TAILNET_IP" 2222
 nc -vz -w 5 "$WIN_TAILNET_IP" 22
 ```
 
-新規の Mac 管理者ログインにも成功したら、Windows コンソールに `verified` と入力する。
+上記の接続試験がすべて期待どおりで、新規の Mac 管理者ログインにも成功したら、Windows コンソールに `verified` と入力する。
 確認が失敗した場合は別の入力で設定を復元する。
 
 WSL の管理コンソールで次を確認する。通常の SSH では `denyusers kio-test`、パスワード状態は
