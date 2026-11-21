@@ -175,7 +175,7 @@ jobs:
         shell: bash
     env:
       KIO_REAL_OFFICE: "1"
-      OFFICE_VERSION: "26.8.0"
+      OFFICE_VERSION: "26.8.0.3"
       OFFICE_LINUX_SHA256: "d0a6031a3837e48f9854e6d2da6489b9fadbd814afa4741fa32a197741663a22"
       OFFICE_MACOS_AARCH64_SHA256: "8858d8058da4f862f47559486814e65efc27294da67c5e4bb56b006b1ee59f89"
       OFFICE_WINDOWS_X64_SHA256: "4aa6c6e1895f4055104effcb556bd3362d20c6ad707c149543304f395ef9db95"
@@ -229,7 +229,7 @@ jobs:
           office_archive="$RUNNER_TEMP/LibreOffice_${OFFICE_VERSION}_Linux_x86-64_deb.tar.gz"
           curl --fail --location --proto '=https' --tlsv1.2 --retry 3 \
             --output "$office_archive" \
-            "https://download.documentfoundation.org/libreoffice/stable/${OFFICE_VERSION}/deb/x86_64/LibreOffice_${OFFICE_VERSION}_Linux_x86-64_deb.tar.gz"
+            "https://downloadarchive.documentfoundation.org/libreoffice/old/${OFFICE_VERSION}/deb/x86_64/LibreOffice_${OFFICE_VERSION}_Linux_x86-64_deb.tar.gz"
           printf '%s  %s\n' "$OFFICE_LINUX_SHA256" "$office_archive" | sha256sum --check --status
           office_unpack="$RUNNER_TEMP/kio-v1-office-unpack"
           mkdir "$office_unpack"
@@ -258,7 +258,7 @@ jobs:
           office_dmg="$RUNNER_TEMP/LibreOffice_${OFFICE_VERSION}_MacOS_aarch64.dmg"
           curl --fail --location --proto '=https' --tlsv1.2 --retry 3 \
             --output "$office_dmg" \
-            "https://download.documentfoundation.org/libreoffice/stable/${OFFICE_VERSION}/mac/aarch64/LibreOffice_${OFFICE_VERSION}_MacOS_aarch64.dmg"
+            "https://downloadarchive.documentfoundation.org/libreoffice/old/${OFFICE_VERSION}/mac/aarch64/LibreOffice_${OFFICE_VERSION}_MacOS_aarch64.dmg"
           printf '%s  %s\n' "$OFFICE_MACOS_AARCH64_SHA256" "$office_dmg" | shasum -a 256 --check --status
           office_mount="$RUNNER_TEMP/kio-v1-office-mount"
           mkdir "$office_mount"
@@ -279,7 +279,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $installer = Join-Path $env:RUNNER_TEMP "LibreOffice_$env:OFFICE_VERSION`_Win_x86-64.msi"
-          Invoke-WebRequest -Uri "https://download.documentfoundation.org/libreoffice/stable/$env:OFFICE_VERSION/win/x86_64/LibreOffice_$env:OFFICE_VERSION`_Win_x86-64.msi" -OutFile $installer
+          Invoke-WebRequest -Uri "https://downloadarchive.documentfoundation.org/libreoffice/old/$env:OFFICE_VERSION/win/x86_64/LibreOffice_$env:OFFICE_VERSION`_Win_x86-64.msi" -OutFile $installer
           if ((Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:OFFICE_WINDOWS_X64_SHA256) {
             throw 'downloaded LibreOffice MSI hash differs from the pinned release hash'
           }

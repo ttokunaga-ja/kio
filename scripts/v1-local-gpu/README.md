@@ -534,14 +534,18 @@ Linux helper と固定入力を準備する。初期構築用のコミットは 
      candidate=$F4_CANDIDATE_SHA
      test "$(git rev-parse HEAD)" = "$candidate"
      test -z "$(git status --porcelain)"
-     cargo +1.98.0 build -p kio-eval --bin kio-acceptance-tools --locked
-     target/debug/kio-acceptance-tools route-preflight \
+     cargo +1.98.0 build --release -p kio-eval --bin kio-acceptance-tools --locked
+     install -m 0755 target/release/kio-acceptance-tools "$bundle/kio-acceptance-tools"
+     test "$(stat -c %h "$bundle/kio-acceptance-tools")" = 1
+     "$bundle/kio-acceptance-tools" route-preflight \
        --repository "$PWD" --candidate "$candidate" \
-       --tools-binary target/debug/kio-acceptance-tools > "$bundle/proposal.json"
+       --tools-binary "$bundle/kio-acceptance-tools" > "$bundle/proposal.json"
      jq -cSj -e '.deployment | objects' "$bundle/proposal.json" > "$bundle/deployment.json"
    )
    ```
 
+   helper は release ビルドを `$bundle` へ単一リンクで複製して渡す。preflight は絶対パス・リンク数 1・256 MiB 以下の
+   ファイルだけを受け付け、cargo の `target/*/kio-acceptance-tools` は `deps/` へのハードリンク、debug ビルドは上限超過で拒否される。
    Preflight は exact HEAD、Rust 定義の `FIXED_SOURCES` と helper の SHA-256 を検査する。
    candidate、scope、各 digest を独立したレビュー経路で確認する。同じ経路から受け取った hash
    との一致は転送の完全性を示す。候補ビルドの出どころは承認済みの exact `main` とビルド記録で確認する。
