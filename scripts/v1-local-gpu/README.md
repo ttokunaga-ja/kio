@@ -195,6 +195,13 @@ OpenSSH を用意する。WSL は `sudo`、`util-linux`、`rootlesskit`、`slirp
    管理用 Mac と検証用 CI の実際の Tailscale IPv4 を渡す。
    スクリプトは既存の portproxy、待受、広い firewall 許可を検査し、受信許可を Tailscale IF、
    宛先 Tailscale IPv4、`sshd.exe`、送信元 `100.64.0.0/10`、TCP 22 に限定する。
+   この Windows Firewall 規則と既定の受信拒否は、LAN など tailnet 外からの到達を防ぐ多層防御を担う。
+   tailnet 内で TCP 22 に到達できる送信元の境界は Tailscale の ACL・grant が担う。
+   事前検査では、ローカルの規則ストアと Tailscale の生成条件に合い、稼働中の Tailscale IF の
+   単一アドレスだけを宛先とする `Tailscale-In` を例外とする。規則名だけが一致する場合や、
+   その他の広い TCP 22 許可があれば適用前に止まる。
+   [Tailscale の規則生成コード](https://github.com/tailscale/tailscale/blob/301e59f/wgengine/router/router_windows.go#L264-L272) ·
+   [Tailscale の grant](https://tailscale.com/docs/features/access-control/grants)
 
    ```powershell
    .\scripts\v1-local-gpu\host\setup-windows.ps1 -WslOwner rm2c -Distro Ubuntu-26.04 `
@@ -269,7 +276,8 @@ Windows 側で省略されたオプションの機能も実接続で確認する
 
 Windows の LAN IPv4 を `WIN_LAN_IP`、Tailscale IPv4 を `WIN_TAILNET_IP` に設定し、それぞれ
 指定の端末から TCP 接続を試す。4 件とも失敗し、管理 Mac と許可した CI の TCP 22 は成功することを
-確認する。Tailscale 管理画面でも現在の grant・OIDC の条件を確認する。
+確認する。許可対象外の tailnet 端末からの TCP 22 の拒否は Tailscale の grant の検証とする。
+Tailscale 管理画面でも現在の grant・OIDC の条件を確認する。
 
 ```bash
 # LAN 上の別端末から
