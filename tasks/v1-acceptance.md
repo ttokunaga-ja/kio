@@ -6,9 +6,9 @@
 
 1. [受入ホストの構築](../scripts/v1-local-gpu/README.md#受入ホストの構築)に従い、検証済みの初期構築用 Linux helper と共有 GPU 照会だけを root 管理で先に配置する。WSL と Windows を構築し、候補未配置の状態で 2 段 SSH の `deployment path is missing` を確認する。
 2. 整理後の `main` の完全な 40 桁 SHA を候補にし、同じ SHA の `ci.yml` の push run が成功したことを確かめ、候補 SHA と run ID を記録する。
-3. 下記の読み取り確認で外部資源 9 件の準備状況を確認する。F4 前に両台で同じ候補の dispatcher・固定入力・canonical な deployment を照合して配置する。その後 D-20261121-05 に従って GPU ホストを選び、固定 OCR image を用意して接続を確認する。[候補の固定入力と配置](../scripts/v1-local-gpu/README.md#candidate-bound-deployment-proposal)に従う。台帳・権限・予算の確認と初期化条件は [provider 予算台帳](acceptance/provider-budget.md) に従う。全経路の準備が揃ってから dispatch に進む。
+3. 下記の読み取り確認で外部資源 9 件の準備状況を確認する。F4 前に両台で同じ候補の dispatcher・固定入力・canonical な deployment を照合して配置する。その後 D-20261121-05 に従って GPU ホストを選び、固定 OCR image を用意して接続を確認する。[候補の固定入力と配置](../scripts/v1-local-gpu/README.md#candidate-bound-deployment-proposal)に従う。台帳・権限・予算の確認と初期化条件は [provider 予算台帳](acceptance/provider-budget.md) に従う。全経路の準備が揃ってから dispatch に進む。GPU の経路は、候補を配置する前に [GPU 受入](../.github/workflows/v1-local-acceptance.yml) を `operation=route-probe` で dispatch し、`tag:kio-ci` の runner から両台の TCP 22 と WSL のホスト鍵の照合が成功し、TCP 2222・18443 と管理 Mac の TCP 22 が拒否されることを確かめる。
 4. `main` を ref とし、[ネイティブ受入](../.github/workflows/v1-acceptance.yml) を `candidate_sha` で実行する。42 件と 3 OS の候補 package の成功後に、この run ID を外部 2 workflow の `package_run_id` に渡す。
-5. [provider 受入](../.github/workflows/v1-provider-acceptance.yml) は `operation=run`、`campaign_id`、`candidate_sha`、`package_run_id` を使う。[GPU 受入](../.github/workflows/v1-local-acceptance.yml) は同じ `candidate_sha` と `package_run_id` を使う。台帳の予約は失敗・結果不明も消費として扱う。
+5. [provider 受入](../.github/workflows/v1-provider-acceptance.yml) は `operation=run`、`campaign_id`、`candidate_sha`、`package_run_id` を使う。[GPU 受入](../.github/workflows/v1-local-acceptance.yml) は `operation=run` と同じ `candidate_sha`・`package_run_id` を使う。台帳の予約は失敗・結果不明も消費として扱う。
 6. 3 run の成功後、[最終集約](../.github/workflows/v1-acceptance-verify.yml) を同じ候補で実行する。`candidate_sha`、`ci_run_id`、`native_run_id`、`provider_run_id`、`local_run_id` を渡し、集約成功と 51 件の証跡を確認する。候補 SHA、各 run ID、パッケージと集約の証跡を記録する。
 
 ## 外部資源の読み取り確認
@@ -22,7 +22,7 @@
 | Environment | 確認対象 |
 | --- | --- |
 | `v1-provider-acceptance` | `GEMINI_API_KEY`、`MISTRAL_API_KEY`、`GEMINI_TEST_BUDGET_USD` と `MISTRAL_TEST_BUDGET_USD`（各 USD 10） |
-| `v1-provider-ledger-authority` | `KIO_LEDGER_APP_PRIVATE_KEY`、`KIO_LEDGER_APP_CLIENT_ID`、`KIO_LEDGER_APP_ID`、`KIO_LEDGER_APP_SLUG`、`KIO_LEDGER_APP_INSTALLATION_ID` |
+| `v1-provider-ledger-authority` | `KIO_LEDGER_APP_PRIVATE_KEY`、`KIO_LEDGER_APP_CLIENT_ID`、`KIO_LEDGER_APP_ID`、`KIO_LEDGER_APP_SLUG`、`KIO_LEDGER_INSTALLATION_ID` |
 | `v1-local-acceptance` | `KIO_LAB_SSH_PRIVATE_KEY`、`KIO_LAB_JUMP_HOST`、`KIO_LAB_JUMP_USER`、`KIO_LAB_KNOWN_HOSTS`、`KIO_TS_CLIENT_ID`、`KIO_TS_AUDIENCE` |
 
 **GPU ホストは研究室の RTX 4060 と個人デスクトップの RTX 4070。** 両台とも WSL 内の kio-test 専用 rootless Docker Engine と NVIDIA Container Toolkit の CDI を使う。Mac 作業中は 4060、停止中・利用不可なら 4070、4070 で作業中は 4070 を使う。両台の構築・接続確認は実行前に行う。同一の受入鍵と両台の Windows・WSL ホスト鍵を登録し、run 開始前に `KIO_LAB_JUMP_HOST` のみを手動で切り替える。3 OS の実行とリース回収が完了するまで接続先を固定する。[構築・切り替え手順](../scripts/v1-local-gpu/README.md#受入ホストの構築)

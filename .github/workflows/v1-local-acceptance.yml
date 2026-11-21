@@ -1,11 +1,12 @@
 name: V1 private local GPU acceptance
-run-name: v1 local GPU acceptance ${{ inputs.candidate_sha }}
+run-name: v1 local GPU ${{ inputs.operation }} ${{ inputs.candidate_sha }}
 
 on:
   workflow_dispatch:
     inputs:
-      candidate_sha: { description: Exact 40-character main SHA, required: true, type: string }
-      package_run_id: { description: Successful v1-acceptance.yml run ID, required: true, type: string }
+      operation: { description: "route-probe checks only the tag:kio-ci SSH route; run executes A08", required: true, type: choice, options: [run, route-probe] }
+      candidate_sha: { description: Exact 40-character main SHA (run only), required: false, type: string }
+      package_run_id: { description: Successful v1-acceptance.yml run ID (run only), required: false, type: string }
 
 # Serializes all three native clients against one leased WSL GPU.  A failed job
 # never cancels a lease-owning sibling.
@@ -13,7 +14,67 @@ concurrency: { group: v1-local-acceptance-global, cancel-in-progress: false }
 permissions: { actions: read, contents: read, id-token: write }
 
 jobs:
+  # Proves, before F4, that a github-hosted runner tagged tag:kio-ci reaches
+  # both Windows hosts on TCP 22 only and that the WSL host key matches its pin.
+  # It authenticates nowhere and never reaches the acceptance dispatcher.
+  route-probe:
+    if: inputs.operation == 'route-probe'
+    name: route probe ${{ matrix.host }}
+    environment: v1-local-acceptance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        host: [100.68.218.37, 100.97.109.109]
+    steps:
+      - uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4
+        with:
+          oauth-client-id: ${{ vars.KIO_TS_CLIENT_ID }}
+          audience: ${{ vars.KIO_TS_AUDIENCE }}
+          tags: tag:kio-ci
+          version: 1.94.2
+      - name: Check the allowed hop, the WSL host key pin, and denied destinations
+        env:
+          KIO_LAB_KEY: ${{ secrets.KIO_LAB_SSH_PRIVATE_KEY }}
+          KIO_LAB_HOSTS: ${{ vars.KIO_LAB_KNOWN_HOSTS }}
+          HOST: ${{ matrix.host }}
+        run: |
+          set -euo pipefail
+          d="$RUNNER_TEMP/kio-route-probe"; (umask 077; mkdir "$d"; printf '%s\n' "$KIO_LAB_KEY" > "$d/id"; printf '%s\n' "$KIO_LAB_HOSTS" > "$d/known_hosts")
+          test "$(grep -c . "$d/known_hosts")" = 4
+          cat > "$d/config" <<CFG
+          Host kio-lab-jump
+            HostName $HOST
+            User kio-ci
+            HostKeyAlias kio-lab-jump
+          Host kio-lab-wsl
+            HostName 127.0.0.1
+            Port 2222
+            User kio-test
+            HostKeyAlias kio-lab-wsl
+            ProxyJump kio-lab-jump
+          Host *
+            IdentitiesOnly yes
+            IdentityFile $d/id
+            StrictHostKeyChecking yes
+            UserKnownHostsFile $d/known_hosts
+            GlobalKnownHostsFile none
+            BatchMode yes
+            ConnectTimeout 15
+          CFG
+          out="$(timeout 60 ssh -F "$d/config" -o PreferredAuthentications=none kio-lab-wsl true 2>&1 < /dev/null || true)"
+          printf '%s\n' "$out" | grep -q 'Host key verification failed' && { echo 'host key pin mismatch' >&2; exit 1; }
+          printf '%s\n' "$out" | grep -q 'kio-test@127.0.0.1: Permission denied' || { printf '%s\n' "$out" >&2; exit 1; }
+          echo "allowed: $HOST:22 -> WSL 127.0.0.1:2222 with both host keys pinned"
+          for target in "$HOST:2222" "$HOST:18443" "100.102.187.14:22"; do
+            if timeout 10 nc -z -w 5 "${target%:*}" "${target##*:}"; then echo "unexpectedly reachable: $target" >&2; exit 1; fi
+            echo "denied: $target"
+          done
+
   local-a08:
+    if: inputs.operation == 'run'
     name: ${{ matrix.os }} authenticated local A08
     environment: v1-local-acceptance
     runs-on: ${{ matrix.runner }}

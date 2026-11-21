@@ -336,6 +336,10 @@ TCP の接続拒否またはタイムアウトを確認する。経路やコマ�
 tailnet からの TCP 2222 も失敗し、管理 Mac と許可した CI の TCP 22 は成功することを確認する。
 Tailscale 管理画面でも現在の grant・OIDC の条件を確認する。
 
+CI の tag からの到達は `v1-local-acceptance.yml` を `operation=route-probe` で dispatch して確かめる。
+`tag:kio-ci` の runner が両台の Windows TCP 22 を経由して WSL のホスト鍵を pin と照合し（認証はしない）、
+各台の TCP 2222・18443 と管理 Mac（`100.102.187.14`）の TCP 22 に到達できないことを確認する。
+
 ```bash
 # Windows と同じ LAN に接続した Mac から
 nc -vz -w 5 "$WIN_LAN_IP" 2222
