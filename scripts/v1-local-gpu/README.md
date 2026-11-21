@@ -60,7 +60,7 @@ requires a valid GPU sample and proof that the exact OCR project is absent.
 
 両台で Windows NVIDIA ドライバー、WSL2 の `/dev/dxg`、systemd、Windows と WSL の
 OpenSSH を用意する。WSL は `sudo`、`util-linux`、`rootlesskit`、`slirp4netns`、`uidmap`、`dbus-user-session`、
-`curl`、OpenSSL、Python 3 が必要。 `/run/sshd` は root 所有・0755。既存の WSL Ed25519
+`curl`、OpenSSL、`jq`、`acl`（`setfacl`）が必要。 `/run/sshd` は root 所有・0755。既存の WSL Ed25519
 ホスト鍵を使う。systemd を初めて有効化する場合は対象 distro だけを作業時間内に再起動する。
 既存の `ssh.service` / `ssh.socket` と portproxy は棚卸しされる。TCP 2222 に競合があれば
 現地で移行を調整し、既存サービスを維持する。
@@ -200,7 +200,7 @@ OpenSSH を用意する。WSL は `sudo`、`util-linux`、`rootlesskit`、`slirp
    旧構成の復元が必要なら、退避した unit と `unit-state` を使って元の登録・稼働状態に戻す。
    補助グループを戻すと共有 Docker へのアクセス権も戻るため、旧構成の管理者が必要性を確認する。
 
-   `setup-wsl.sh` と同じレビュー済み commit の `wsl-windows-mounts.py` を同じディレクトリに置き、
+   `setup-wsl.sh` と同じレビュー済み commit の `wsl-windows-mounts.sh` を同じディレクトリに置き、
    転送した両ファイルの SHA-256 を照合する。
 
    ```bash
@@ -366,8 +366,10 @@ Confirm は退避に確定状態を記録し、復旧タスクを解除する。
 WSL の管理コンソールで次を確認する。通常の SSH では `denyusers kio-test`、パスワード状態は
 `L`。通常の SSH ポートが稼働中なら、旧鍵でのログインも拒否されることを別の管理端末で確かめる。
 共有 socket に対する `test` と、追加引数付きの sudo は失敗が期待値。`sudo -l` では引数なしの
-照会だけが許可されていることを確認する。照会は件数だけを返す。共有 Engine が構成済みで利用できない
-場合は、稼働コンテナを確認できないため失敗する。
+照会だけが許可されていることを確認する。照会は呼び出し元の環境を外して同梱の Docker CLI を起動し、
+root 管理の設定にあるソケットだけを `--host` に渡す。稼働中で `HostConfig.DeviceRequests`
+を持つコンテナの件数を返す。エンジンに接続できない場合や照会の途中で失敗した場合は異常終了する。
+[Docker CLI のコンテナ一覧](https://docs.docker.com/reference/cli/docker/container/ls/)
 
 ```bash
 sudo /usr/sbin/sshd -T -C user=kio-test,host=localhost,addr=127.0.0.1 | grep -i '^denyusers '

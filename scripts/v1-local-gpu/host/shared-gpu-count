@@ -1,95 +1,72 @@
-#!/usr/bin/python3 -I
-"""Report the running shared Engine containers with Docker device requests."""
-import http.client
-import json
-import os
-import re
-import signal
-import socket
-import stat
-import sys
+#!/bin/bash -p
+# Privileged mode ignores BASH_ENV and imported functions before clearing Docker's environment.
+set -euo pipefail
+export LC_ALL=C
 
-CONFIG = "/etc/kio-v1-local-shared-gpu-socket"
-MAX_RESPONSE = 8 * 1024 * 1024
+configured_socket() {
+  local config=$1 socket extra size endpoint parent mode
+  [[ -f $config && ! -L $config ]] || return 1
+  {
+    [[ $(/usr/bin/stat -Lc '%u:%a' /proc/self/fd/3) == 0:600 ]] || return 1
+    size=$(/usr/bin/stat -Lc '%s' /proc/self/fd/3) || return 1
+    [[ $size -lt 109 ]] || return 1
+    IFS= read -r socket <&3 || return 1
+    if IFS= read -r extra <&3 || [[ -n $extra ]]; then return 1; fi
+  } 3< "$config"
+  [[ $socket =~ ^/[A-Za-z0-9_./-]+$ && $size == "$((${#socket} + 1))" && -S $socket ]] || return 1
+  endpoint=$(/usr/bin/realpath -e -- "$socket") || return 1
+  [[ $endpoint == "$socket" && $endpoint != //* ]] || return 1
+  mode=$(/usr/bin/stat -c '%u:%a' -- "$socket") || return 1
+  [[ $mode == 0:* ]] && (( (8#${mode#*:} & 002) == 0 )) || return 1
+  parent=${socket%/*}
+  while [[ -n $parent ]]; do
+    mode=$(/usr/bin/stat -c '%u:%a' -- "$parent") || return 1
+    [[ $mode == 0:* ]] && (( (8#${mode#*:} & 022) == 0 )) || return 1
+    parent=${parent%/*}
+  done
+  printf '%s\n' "$socket"
+}
 
+docker_query() {
+  local socket=$1 remaining=$((20 - SECONDS))
+  shift
+  (( remaining > 0 )) || return 1
+  if (( remaining > 4 )); then remaining=4; fi
+  /usr/bin/env -i LC_ALL=C PATH=/usr/bin:/bin /usr/bin/timeout -k 1 "$remaining" \
+    /opt/kio-v1-local/docker/docker --config /etc/kio-v1-local-shared-gpu-cli \
+    --host "unix://$socket" container "$@"
+}
 
-class Engine(http.client.HTTPConnection):
-    def __init__(self, endpoint, **kwargs):
-        super().__init__("localhost", **kwargs)
-        self.endpoint = endpoint
+running_requests() {
+  local socket=$1 ids id result count=0
+  ids=$(docker_query "$socket" ls --quiet --no-trunc) || return 1
+  if [[ -n $ids ]]; then
+    while IFS= read -r id; do
+      [[ $id =~ ^[0-9a-f]{64}$ ]] || return 1
+      result=$(docker_query "$socket" inspect --format \
+        '{{if and .State.Running .HostConfig.DeviceRequests}}1{{else}}0{{end}}' "$id") || return 1
+      case $result in
+        1) count=$((count + 1)) ;;
+        0) ;;
+        *) return 1 ;;
+      esac
+    done <<< "$ids"
+  fi
+  printf '%s\n' "$count"
+}
 
-    def connect(self):
-        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.sock.settimeout(self.timeout)
-        self.sock.connect(self.endpoint)
+main() {
+  [[ $# == 0 && $EUID == 0 ]] || return 1
+  cd /
+  SECONDS=0
+  local socket count
+  if socket=$(configured_socket /etc/kio-v1-local-shared-gpu-socket 2>/dev/null) &&
+    count=$(running_requests "$socket" 2>/dev/null); then
+    printf '%s\n' "$count"
+  else
+    printf '%s\n' 'shared Docker GPU query failed' >&2
+    return 1
+  fi
+}
 
-    def read_json(self, path):
-        self.request("GET", path)
-        with self.getresponse() as response:
-            if response.status != 200:
-                raise ValueError("Docker query failed")
-            body = response.read(MAX_RESPONSE + 1)
-        if len(body) > MAX_RESPONSE:
-            raise ValueError("Docker response exceeded limit")
-        return json.loads(body)
-
-
-def running_requests(engine):
-    count = 0
-    for entry in engine.read_json("/containers/json"):
-        container = entry["Id"]
-        if not re.fullmatch(r"[0-9a-f]{64}", container):
-            raise ValueError("invalid Docker container ID")
-        state = engine.read_json(f"/containers/{container}/json")
-        running = state["State"]["Running"]
-        requests = state["HostConfig"]["DeviceRequests"]
-        if not isinstance(running, bool) or (requests is not None and not isinstance(requests, list)):
-            raise ValueError("invalid Docker response")
-        # The original admission check treated any DeviceRequests as GPU use.
-        count += int(running and bool(requests))
-    return count
-
-
-def configured_socket(config):
-    fd = os.open(config, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    with os.fdopen(fd, "rb") as handle:
-        info = os.fstat(handle.fileno())
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o600:
-            raise ValueError("unsafe shared Docker configuration")
-        raw = handle.read(109)
-    if not re.fullmatch(rb"/[A-Za-z0-9_./-]+\n", raw) or len(raw) > 108:
-        raise ValueError("invalid shared Docker endpoint")
-    path = os.fsdecode(raw[:-1])
-    if path != os.path.normpath(path) or path.startswith("//"):
-        raise ValueError("shared Docker endpoint is not canonical")
-    endpoint = os.lstat(path)
-    if not stat.S_ISSOCK(endpoint.st_mode) or endpoint.st_uid != 0 or endpoint.st_mode & 0o002:
-        raise ValueError("unsafe shared Docker socket")
-    parent = os.path.dirname(path)
-    while parent != "/":
-        info = os.lstat(parent)
-        if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
-            raise ValueError("unsafe shared Docker socket ancestry")
-        parent = os.path.dirname(parent)
-    return path
-
-
-def main():
-    if len(sys.argv) != 1 or os.geteuid() != 0:
-        return 1
-    signal.alarm(20)
-    try:
-        engine = Engine(configured_socket(CONFIG), timeout=4)
-        try:
-            count = running_requests(engine)
-        finally:
-            engine.close()
-        print(count)
-        return 0
-    except (OSError, ValueError, TypeError, KeyError, http.client.HTTPException):
-        print("shared Docker GPU query failed", file=sys.stderr)
-        return 1
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then main "$@"; fi
