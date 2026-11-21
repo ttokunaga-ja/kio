@@ -62,7 +62,7 @@ pub(super) struct ParsedReindex {
     pub(super) force: bool,
     pub(super) yes: bool,
     pub(super) at: Option<String>,
-    /// QA31 (step4b-contract-tests-p3a.md §I, 06-cli-spec.md §1 L77-83,
+    /// QA31 (docs/06-cli-spec.md §1,
     /// 07-adapter-spec.md §3 L220-222): one-shot embedding opt-in for THIS
     /// reindex — both `--force` and `--at` can drive online embedding
     /// enrichment. Mutually exclusive with `offline`.
@@ -718,7 +718,7 @@ pub(super) fn run(
         &config.chunking_config_hash,
     )?;
 
-    // QA31 (step4b-contract-tests-p3a.md §I): `--online`/`--offline` now
+    // QA31 (docs/06-cli-spec.md §1): `--online`/`--offline` now
     // reach `--at`'s historical-enrichment pass instead of the hard-coded
     // `(false, false, false)` this used to pass unconditionally.
     // `online_confirmed = false`: `kio reindex` carries no same-invocation

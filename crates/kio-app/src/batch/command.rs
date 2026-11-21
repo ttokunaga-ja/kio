@@ -250,7 +250,7 @@ pub(crate) fn run_batch(ctx: &Invocation<'_>, args: BatchArgs) -> Result<Command
                         return false;
                     }
                     let held_secret = task.fallback_reason.as_deref() == Some(SECRETS_TIER_B_HOLD);
-                    // QA2 (step4b-contract-tests-p3a.md §A, 04 §5.2): this generic
+                    // QA2 (docs/04-pipeline.md §5.2): this generic
                     // flip already covers an auth hold (`hold_reason=auth`) — any
                     // non-budget, non-secret Paused task, auth included — so
                     // `batch resume` is the release for auth_error too, not just
@@ -515,7 +515,7 @@ pub(crate) fn run_adapter_lifecycle(
     }
 }
 
-/// `kio ledger reconcile` (QA14/QA15, step4b-contract-tests-p3a.md L307-338,
+/// `kio ledger reconcile` (QA14/QA15, 1b46cbb5:tasks/step4b-contract-tests-p3a.md L307-338,
 /// 10-operations.md §7.5.2 / 04-pipeline.md §5.8). Unlike `kio batch *`/
 /// `kio adapter *`, this command is device-global — it does not operate on
 /// the current directory's `.kio` scope (there may not even be one), so it

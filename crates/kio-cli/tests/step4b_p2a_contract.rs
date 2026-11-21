@@ -1,9 +1,9 @@
 //! Step4b Phase 2-A contract tests: `open` image cache / `export` safety
 //! and evacuation protocol / `purge` scope and closure completion.
 //!
-//! Source: `tasks/step4b-contract-tests-p2a.md` (PA01-PA50, §R rulings 1-3).
-//! Test names carry their PA number(s) so failures map directly back to the
-//! contract text. Sections mirror the spec's §A-§O structure.
+//! Current contracts: docs/05-runtime.md §§3–4 and docs/08-evidence-pointer-spec.md §3.
+//! PA01-PA50 and section labels refer to the historical case list at
+//! `1b46cbb5:tasks/step4b-contract-tests-p2a.md` (§R rulings 1-3).
 
 mod support;
 

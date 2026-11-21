@@ -41,7 +41,7 @@ kio-eval u7 \
 `local_files_only`でロードする。Rust は child environment を clear し、cache/GPU の
 非credential設定だけを allowlist する。
 text control は最低 1 件必須で、画像は `--image` を繰り返して明示する。追跡済みの
-`experiments/ocr-verification/fixtures/generated-images` を使えば追加費用はないが、
+`experiments/ocr-verification/fixtures/images` を使えば追加費用はないが、
 Rust runner が暗黙に directory 探索することはない。report は create-only である。
 
 ## 結論の読み方 — text は対照群である

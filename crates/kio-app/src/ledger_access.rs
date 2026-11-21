@@ -444,7 +444,7 @@ pub(crate) const RETIRED_NON_LIVE: &str = "retired_non_live";
 
 // ---------------------------------------------------------------------------
 // cost-ledger.sqlite task-charge helpers (04-pipeline.md §5.4's sync degenerate
-// 2-phase — CL41-47/CL56-61 in tasks/step4b-contract-tests-ledger.md). Replaces
+// 2-phase — CL41-47/CL56-61 in 1b46cbb5:tasks/step4b-contract-tests-ledger.md). Replaces
 // the retired JSONL `budget::CostLedger`/`ReservationLedger` F8 reservation flow
 // (2026-07-21) — see the implementation report for the behavior changes this
 // entails (a "markdownize"/"embedding" TASK's online adapter call is now itself
@@ -564,7 +564,7 @@ pub(crate) fn reserve_or_reuse_task_charge(
     // mechanism covers batch rows instead — see `ops::phase1_intent`'s doc).
     request_kind: RequestKind,
 ) -> Result<TaskChargeOutcome> {
-    // QA67 (step4b-contract-tests-p3a.md §T, PB24): online task phase 1 must
+    // QA67 (docs/10-operations.md §3, PB24): online task phase 1 must
     // fail-closed on a live registry scope_id duplicate (10 §3 L297-299) —
     // two `.kio` clones sharing this device-global `batch_requests` row's PK
     // (scope_id, adapter_kind, input_hash, tool_profile_hash) mix up which
@@ -602,7 +602,7 @@ pub(crate) fn reserve_or_reuse_task_charge(
     })
 }
 
-/// QA18/QA19 (step4b-contract-tests-p3a.md §F): `AdapterProfile.billable_kinds`
+/// QA18/QA19 (docs/07-adapter-spec.md §4): `AdapterProfile.billable_kinds`
 /// (the typed `BillableUnitKind` enum) as the string keys
 /// `resolve_billing_from_reported_usage`'s `declared_billable_kinds` parameter
 /// expects (`kio-pipeline`'s ledger, which has no dependency on the specific
@@ -624,7 +624,7 @@ pub(crate) fn declared_billable_kind_strings(
         .collect()
 }
 
-/// QA19 (step4b-contract-tests-p3a.md §F, 07 §4 L266-269): record a
+/// QA19 (docs/07-adapter-spec.md §4): record a
 /// one-per-run `level=warn` when a `billable_units[].kind` the Adapter
 /// reported has no `tools.toml` `[pricing]` entry ("単価未被覆の kind"). The
 /// settle call site already degrades that charge to `estimated`

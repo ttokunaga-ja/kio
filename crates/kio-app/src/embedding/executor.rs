@@ -1126,7 +1126,7 @@ fn run_embedding_enrichment_for_instances(
             };
             let intent_token = job.intent_token.clone();
             let reserved_usd = candidate_usd;
-            // QA13 (step4b-contract-tests-p3a.md §E, 04 §5.5 L880): a provider
+            // QA13 (docs/04-pipeline.md §5.5): a provider
             // idempotency key identifies one HTTP call, and now every call is
             // one group, so each send carries its OWN reservation's token
             // rather than a representative standing in for the batch.
@@ -1341,7 +1341,7 @@ pub(crate) fn embedding_failure_transition(failure: &TaskExecutionFailure) -> Em
     }
 }
 
-/// QA3 (step4b-contract-tests-p3a.md §A, 04 §5.2/§5.3): a rate-limited
+/// QA3 (docs/04-pipeline.md §5.2/§5.3): a rate-limited
 /// embedding send stays Pending (never Failed/Paused) — mirrors the
 /// markdownize send handler's RateLimit branch. `apply_embedding_transitions`
 /// reads `retry_after_ms` to honor the provider's `Retry-After` header (else
@@ -1356,7 +1356,7 @@ fn embedding_rate_limit_transition(retry_after_ms: Option<u64>) -> EmbeddingTran
     }
 }
 
-/// QA2 (step4b-contract-tests-p3a.md §A, 04 §5.2): an auth-failed embedding
+/// QA2 (docs/04-pipeline.md §5.2): an auth-failed embedding
 /// send lands Paused(hold_reason=auth) (never Failed) — mirrors the
 /// markdownize send handler's AuthError branch. `apply_embedding_transitions`
 /// does not bump `attempts` and clears `next_retry_at`; `hold_reason` is
@@ -1438,7 +1438,7 @@ pub(crate) fn apply_embedding_transitions(
             task.resource_limit = transition.resource_limit.clone();
             task.status = transition.status;
             task.fallback_reason = Some(transition.reason.to_owned());
-            // QA1 (step4b-contract-tests-p3a.md §A): the closed hold_reason
+            // QA1 (docs/04-pipeline.md §5.2–5.3): the closed hold_reason
             // enum accompanies every Paused task (currently only
             // `embedding_pause_transition`'s `budget_exceeded`).
             task.hold_reason = (transition.status == TaskStatus::Paused)
@@ -1688,7 +1688,7 @@ pub(crate) fn send_embed_group(
     adapter_settings: &Arc<AdapterRuntimeSettings>,
     embedding: &EmbeddingExecutionContext<'_>,
     group: &EmbeddingSendGroup<'_>,
-    // QA13 (step4b-contract-tests-p3a.md §E, 04 §5.5 L880): this group's own
+    // QA13 (docs/04-pipeline.md §5.5): this group's own
     // reservation token. A provider idempotency key identifies one HTTP call,
     // and one call is now one group, so there is nothing to pick a
     // representative from.

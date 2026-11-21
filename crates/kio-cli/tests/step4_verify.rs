@@ -205,7 +205,7 @@ fn ct4_verify_rejects_non_pointer_and_ambiguous_cli_forms() {
         .code(2);
 }
 
-// step4b-contract-tests-p2b.md PB65(c) / LC14(a): a raw object missing with
+// 1b46cbb5:tasks/step4b-contract-tests-p2b.md PB65(c) / LC14(a): a raw object missing with
 // NO tombstone/erase-receipt marker at all to explain the absence is
 // unmarked corruption (`KIO-E-STORE-CORRUPT-001`, a raw command error, exit
 // 4) — distinct from the expected-absence `not_found` status this used to

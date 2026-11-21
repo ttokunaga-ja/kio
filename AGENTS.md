@@ -96,4 +96,5 @@
 - **委譲方法**：統括（Opus）が `codex exec -m <model> -c model_reasoning_effort=medium ... < /dev/null` で Codex を直接起動し、終了を受けて結果を確認する（stdin を閉じないと入力待ちで止まる）。kio には常駐の監視や定期的な状態確認を置かない。
 - **停止の基準**：Codex が作業全体を止めてよいのは、取り返しのつかない操作、外部への公開・デプロイ、秘密情報、課金に関わる判断だけである。それ以外の不明点はその項目だけ保留として理由と選択肢を記録し、残りを進める。保留は統括が解決する。Codex は新しい停止規則・承認手続きを自分で作らず、repo の資料にも追加しない。規則の追加・変更は統括（Opus）が行い、`docs/decisions.md` に記録する。
 - **作業場所と出力先**：Codex の作業、出力、一時ファイルは、この repo の中か `$TMPDIR` に限る。repo の中の一時物は `scratch/`（gitignore 済み）に置く。`~/Documents`、ホーム直下、`~/dev/github.com/ttokunaga-ja` 直下など、repo の外には作らない。Codex への指示書には、出力先を必ず書く。残す結果は repo の決まった場所に commit し、残さないものは作業の終わりに消す。
+- **scratch の運用**：共通の指示書は [委譲用の雛形](tasks/agent/brief-template.md) を使う。個別の指示書・報告・ログ・検証出力は、それぞれ `scratch/briefs/<作業名>/`、`scratch/reports/<作業名>/`、`scratch/logs/<作業名>/`、`scratch/validate/<作業名>/` に置く。登録済み worktree は `scratch/wt/<作業名>/`、再取得できる実行依存は `scratch/runtime/<ツール名>/` に置く。名前は英小文字とハイフンを使い、日付・候補 SHA は本文か実行情報に書く。完了時に決定・再開条件・必要な証跡を所定の場所に記録し、使い終えた一時物を片付ける。
 - **検証**：Codex の報告のうち、完了・一致・失敗原因などの重要な主張は、統括がコマンドで確認してから採用する。

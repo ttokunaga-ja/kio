@@ -14,7 +14,7 @@
     "scope_path": { "type": "string", "minLength": 1 },
     "scan_approval": {
       "type": "object",
-      "description": "QA5 (step4b-contract-tests-p3a.md §B, 10 §1 L97-113): the one-time scope-level scan approval record, distinct from the adapter-level network opt-in (`approvals[]`).",
+      "description": "QA5 (docs/10-operations.md §1): the one-time scope-level scan approval record, distinct from the adapter-level network opt-in (`approvals[]`).",
       "properties": {
         "scope_id": { "type": "string" },
         "root_path": { "type": "string" },
@@ -45,7 +45,7 @@
     },
     "approvals": {
       "type": "array",
-      "description": "QA21-27 (step4b-contract-tests-p3a.md §G/§H, 07 §3 L148-168): adapter-level network opt-in rows, distinct from `scan_approval`. One row per (scope_id, tool_id); revoke/invalidation updates `status` in place (rows are never deleted, for audit).",
+      "description": "QA21-27 (docs/07-adapter-spec.md §3): adapter-level network opt-in rows, distinct from `scan_approval`. One row per (scope_id, tool_id); revoke/invalidation updates `status` in place (rows are never deleted, for audit).",
       "items": {
         "type": "object",
         "properties": {

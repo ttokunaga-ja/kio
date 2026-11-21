@@ -63,20 +63,20 @@ PaddleOCR-VL が実際に返したバイト列。**整形も切り詰めもし�
 
 ## 入力
 
-すべて**リポジトリ内の合成画像** (`experiments/ocr-verification/fixtures/generated-images/`)。
+すべて**リポジトリ内の合成画像** (`experiments/ocr-verification/fixtures/images/`)。
 公開済み・再現可能で、社内文書は使っていない。
 
 | ファイル | 入力画像 | `fileType` | サイズ |
 |---|---|---|---:|
-| `infographic-two-charts.json` | `g5_infographic_high_01.png` | 1 (image) | 1,472,174 B |
-| `invoice-table.json` | `g4_invoice_photo_03.png` | 1 (image) | 1,117,633 B |
-| `slide-single-figure.json` | `g2_slide_dense_02.png` | 1 (image) | 1,285,842 B |
+| `infographic-two-charts.json` | `infographic-high.png` | 1 (image) | 1,472,174 B |
+| `invoice-table.json` | `invoice-photo.png` | 1 (image) | 1,117,633 B |
+| `slide-single-figure.json` | `slide-dense.png` | 1 (image) | 1,285,842 B |
 | `infographic-two-charts-as-pdf.json` | 同上を 150 dpi で PDF 化 | **0 (pdf)** | 1,279,343 B |
-| `code-editor-no-crops.json` | `g1_code_editor_01.png` | 1 (image) | 613,462 B |
-| `terminal-dark-no-crops.json` | `g1_terminal_02.png` | 1 (image) | 631,733 B |
-| `chat-light-avatar-crops.json` | `g1_chat_03.png` | 1 (image) | 737,967 B |
-| `whiteboard-no-crops.json` | `g3_whiteboard_flow_02.png` | 1 (image) | 1,031,702 B |
-| `seal-crop-uncited.json` | `g4_circular_photo_02.png` | 1 (image) | 1,175,730 B |
+| `code-editor-no-crops.json` | `code-editor.png` | 1 (image) | 613,462 B |
+| `terminal-dark-no-crops.json` | `terminal.png` | 1 (image) | 631,733 B |
+| `chat-light-avatar-crops.json` | `chat.png` | 1 (image) | 737,967 B |
+| `whiteboard-no-crops.json` | `whiteboard-flow.png` | 1 (image) | 1,031,702 B |
+| `seal-crop-uncited.json` | `circular-photo.png` | 1 (image) | 1,175,730 B |
 
 ## PDF 入力 (2026-08-05 追加)
 
@@ -175,7 +175,7 @@ pdf は `...detected. OCR output`)。
 最後に掛ける処理 (`d66d063`) はここでも必要になる。
 
 > ⚠ **`slide-single-figure.json` は名前どおりではない。** 由来の
-> `g2_slide_dense_02.png` には `table` が **2 つ**と `chart` が 1 つ入っており、
+> `slide-dense.png` には `table` が **2 つ**と `chart` が 1 つ入っており、
 > 「図が 1 つだけのページ」ではない。単一図のケースが要るなら別の画像で
 > 採り直すこと。名前は依頼された通りにしてある。
 
@@ -245,7 +245,7 @@ pdf は `...detected. OCR output`)。
 
 ## トークン照合 — `ground-truth.json` の宣言トークンは戻るか
 
-**この検査は今まで 1 度もやっていなかった。**`experiments/ocr-verification/fixtures/generated-images/ground-truth.json`
+**この検査は今まで 1 度もやっていなかった。**`experiments/ocr-verification/fixtures/images/ground-truth.json`
 は各画像に埋め込まれたトークンを宣言している。照合は NFKC + 空白除去。
 
 ### 出荷済みの 4 本 (遡って検査)
@@ -274,7 +274,7 @@ pdf は `...detected. OCR output`)。
 
 ## `code-editor-no-crops.json` はトークンを失う — 原因は暗色地ではない
 
-`g1_code_editor_01.png` は `ground-truth.json` が **`expect: "text-dominant"`**
+`code-editor.png` は `ground-truth.json` が **`expect: "text-dominant"`**
 と分類する、最も易しいはずのページである。宣言トークン `G1-01-TOKEN-4827` は
 **613 KB の応答のどこにも無い** — `markdown.text` にも、どの `block_content` にもである。
 落ちたのはエディタ本文まるごと (関数定義・トークンのコメント行・日本語コメント)。

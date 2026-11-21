@@ -301,7 +301,7 @@ pub(crate) fn execute_pending_tasks(
     // (docs/04 §5.6, `auth_error: max_attempts=0`) makes non-retryability of an auth failure a
     // contract of that command specifically.
     allow_auth_revive: bool,
-    // QA30 (step4b-contract-tests-p3a.md §I, 06-cli-spec.md §1 L21-30,
+    // QA30 (docs/06-cli-spec.md §1,
     // 07-adapter-spec.md §3 L220-222): `kio batch resume`/`kio batch retry`'s
     // own `--online`/`--offline` one-shot embedding opt-in for this pass.
     // Mutually exclusive, validated by the caller before this is reached.
@@ -403,7 +403,7 @@ fn execute_pending_markdownize_tasks(
         &online_profile.tool_profile_hash,
     );
     let output_ref = online_output_ref(&online_profile.adapter_id);
-    // R22-6(a), updated for QA2 (step4b-contract-tests-p3a.md §A, 04 §5.2):
+    // R22-6(a), updated for QA2 (docs/04-pipeline.md §5.2):
     // R21-6 gave the embedding pipeline a live-AuthError revive but never wired
     // the markdownize twin, so a 401/403 left its task stranded — with its
     // reservation eating the month's cap. Under QA2 an auth failure lands
@@ -851,7 +851,7 @@ fn execute_pending_markdownize_tasks(
             }
         })
         .map_err(pipeline_to_kio)?;
-        // QA13 (step4b-contract-tests-p3a.md §E, 04 §5.5 L880): thread this
+        // QA13 (docs/04-pipeline.md §5.5): thread this
         // send's ledger `intent_token` (stable across a crash-window resend —
         // see `MarkdownizeRequest::idempotency_token`'s doc) into the adapter
         // boundary, so a provider that declares a sync idempotency key can be
@@ -864,7 +864,7 @@ fn execute_pending_markdownize_tasks(
             Some(intent_token.clone()),
         ) {
             Ok(outcome) => {
-                // QA17/QA18/QA19 (step4b-contract-tests-p3a.md §F): bill the
+                // QA17/QA18/QA19 (docs/07-adapter-spec.md §4): bill the
                 // adapter's self-reported `usage` when it provided one
                 // (Mistral OCR's real processed-page count), converted to
                 // USD via tools.toml's declared `[pricing]` — degrading to
@@ -1059,7 +1059,7 @@ fn record_sync_markdownize_failure(
     Ok(())
 }
 
-/// QA2/QA3 (step4b-contract-tests-p3a.md §A, 04 §5.2/§5.3): the shared
+/// QA2/QA3 (docs/04-pipeline.md §5.2/§5.3): the shared
 /// send-failure mapping — a 3-way branch on `error.retry_kind`. rate_limit
 /// and auth_error each get a dedicated non-Failed landing state; every other
 /// kind keeps the Failed/backoff logic. Extracted from the sync send site
@@ -1301,7 +1301,7 @@ pub(crate) fn scheduled_retry_at(now: &str, backoff: &str, attempts: u32) -> Str
         .unwrap_or_else(|| now.to_owned())
 }
 
-/// QA3 (step4b-contract-tests-p3a.md §A, 04 §5.3): `next_retry_at` for a
+/// QA3 (docs/04-pipeline.md §5.3): `next_retry_at` for a
 /// rate-limited send. `Some(ms)` honors the provider's `Retry-After` header
 /// exactly — rounded up to whole seconds, floored at 1s so a sub-second
 /// header value still schedules strictly in the future. `None` (header
@@ -1853,7 +1853,7 @@ pub(crate) fn budget_remaining_from_totals(
     if let Some(adapter_cap) = budget_caps.device_per_adapter.get(adapter_kind) {
         device_remaining = device_remaining.min(adapter_cap - device_adapter_spent);
     }
-    // QA11 (step4b-contract-tests-p3a.md §D): folder per_adapter does not
+    // QA11 (docs/04-pipeline.md §5.4): folder per_adapter does not
     // exist (04 §5.4 — "folder cap は total のみ"); this estimate must not
     // narrow `folder_remaining` for a constraint the Tx-atomic gate
     // (`check_then_reserve`/`BudgetCapConfig`) never applies either — a real

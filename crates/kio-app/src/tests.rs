@@ -3044,7 +3044,7 @@ fn r23_06_katakana_middle_dot_is_other_not_katakana() {
 #[test]
 fn feedback2_mixed_query_drops_short_units_entirely_not_and_filtered() {
     use crate::search::query::build_query_plan;
-    // 05 §1.3 2026-07-22 feedback #2 / step4b-contract-tests-p2c.md
+    // 05 §1.3 2026-07-22 feedback #2 / 1b46cbb5:tasks/step4b-contract-tests-p2c.md
     // R-追記: a mixed query (>= 1 long unit) fully discards every short
     // unit — it never enters `match_expr`, and (unlike the superseded
     // PC12/13 AND-instr eligibility predicate) never enters
@@ -3549,7 +3549,7 @@ fn r10_4_partial_retry_plan_gates_on_retryability_and_budget() {
     let plan = partial_retry_plan_from_manifest(&manifest(None, Some("invalid_input")), 0);
     assert!(plan.retryable_units.is_empty());
 
-    // Mixed: QA45 (step4b-contract-tests-p3a.md §M, 04 §5.3 L738-740) made
+    // Mixed: QA45 (docs/04-pipeline.md §5.3) made
     // contract_violation retryable (max_attempts=1, same-mode retry for
     // output jitter) instead of dropped — both units now survive, and
     // the plan's ceiling is the min across them (1, tighter than

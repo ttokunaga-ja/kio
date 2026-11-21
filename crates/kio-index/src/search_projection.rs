@@ -17,7 +17,7 @@
 //!
 //! **Code is left alone**, and that is the whole design of this module rather
 //! than an afterthought. Counting `\` followed by ASCII punctuation across the
-//! 1,165 tracked `.md` files in this repository:
+//! 1,165 Markdown files tracked at commit `1b46cbb5`:
 //!
 //! | where | occurrences |
 //! |---|---|
@@ -25,8 +25,8 @@
 //! | inside an inline code span | 16 |
 //! | plain body text | 23 |
 //!
-//! 416 of the fenced ones were measured in the retained, non-authorizing paid
-//! OCR archive at `eval/fixtures/normalized-corpus/`. That archive supplied the
+//! 416 of the fenced ones were measured in the historical paid OCR
+//! archive at `1b46cbb5:eval/fixtures/normalized-corpus/`. That archive supplied the
 //! frozen regression examples but is not a current evaluator manifest input.
 //! A blanket unescape would rewrite 455 sequences of genuine code — `find … -exec … \;`,
 //! `\(\s*\)`, `AppData\Local\Temp`, JSON `\"` — to repair 23. Inside code a

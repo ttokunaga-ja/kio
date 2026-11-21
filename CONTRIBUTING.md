@@ -74,6 +74,9 @@ Development, CI, and the workspace contract all use Rust `1.98.0` with
 Edition 2024 (see `rust-toolchain.toml` and the workspace `Cargo.toml`). Kio is
 pre-stable and does not maintain a second MSRV compatibility contract.
 
+Linux runner prerequisites and setup diagnostics are in the
+[confinement guide](scripts/ci/linux-confinement.md).
+
 ## Pull requests
 
 - Keep one concern per PR. A rename, a refactor, and a fix are three PRs.
@@ -199,6 +202,13 @@ Pull Request を出す前に上記の **Contributor License Agreement (CLA) 英�
 - ハッシュ同一性 (`tool_profile_hash` / `prompt_template_hash` / `raw_hash` / chunk・embedding
   identity) は契約です。凍結されたハッシュ期待値が動く変更は、期待値を黙って書き換えず、
   **PR に明示してください**。保存済み artifact が無効化されます。
+
+## 仕様書の編集
+
+- GitHub-flavored Markdown を日本語で書く。固有名詞とコード片は原語のままにし、新しいコードブロックには言語タグを付ける。図や列挙には `text` を使う。リポジトリ内の資料には相対リンクを使う。
+- 保存形式と Adapter のスキーマ変更は破壊的変更として扱う。安定版前は旧形式を明示的に拒否する。利用者のファイルや保存済みの知識を破壊する操作には明示的な指示が必要である。
+- 利用者や外部 Agent が依存する契約を書く。CLI の構文・出力・終了値・分岐に使うエラーコード、保存形式、Evidence Pointer、送信承認・課金、回復と失敗時のふるまいが対象である。実装機構はコードに、日付付きの裁定は [決定記録](docs/decisions.md) に置く。規則は一か所で定め、他の資料から参照する。
+- 製品の呼称と表現は [ポジショニング](docs/01-positioning.md) §1・§9 に従う。`offline-first` は用語の説明や比較で言及できる。
 
 ## ビルドと検証
 

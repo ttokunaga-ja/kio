@@ -3,7 +3,7 @@
 //! Source: docs/07-adapter-spec.md §5.1 ("Office intermediate の変換機構
 //! (DOCX / PPTX — 実装フィードバック 2026-07-23)"), docs/04-pipeline.md §2
 //! (unit table) / §5.3 (contract_violation semantics), and QB41
-//! (tasks/step4b-contract-tests-p3b.md L762-775, normative source
+//! (1b46cbb5:tasks/step4b-contract-tests-p3b.md L762-775, normative source
 //! docs/03-data-model.md §2.1's "prepare profile / renderer 変更による
 //! prepared_hash 変化が駆動する再 Markdownize" second legal gen+1 path).
 //!

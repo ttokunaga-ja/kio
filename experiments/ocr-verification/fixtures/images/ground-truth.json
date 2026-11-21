@@ -1,0 +1,107 @@
+[
+  {
+    "file": "code-editor.png",
+    "family": "G1",
+    "tokens": ["G1-01-TOKEN-4827"],
+    "visible_text": "project; EXPLORER; PROJECT; src; utils.js; search.js; index.js; data; README.md; OUTLINE; function normalizeQuery(input) {; // OCR fixture token: G1-01-TOKEN-4827; return input.trim().toLowerCase();; // 日本語メモ: 検索対象の確認; }; Ln 1, Col 1; Spaces: 2; UTF-8; LF; JavaScript",
+    "expect": "text-dominant"
+  },
+  {
+    "file": "terminal.png",
+    "family": "G1",
+    "tokens": ["G1-02-TOKEN-6194"],
+    "visible_text": "terminal; $ kio verify --ocr; status: mixed image text; token: G1-02-TOKEN-6194; メモ: 画像内テキスト確認; done in 42 ms; $",
+    "expect": "text-dominant"
+  },
+  {
+    "file": "chat.png",
+    "family": "G1",
+    "tokens": ["G1-03-TOKEN-7358"],
+    "visible_text": "Chat; Aya: OCR画像の確認をお願いします; 10:12; Ben: Sure, checking the token now.; 10:13; Aya: G1-03-TOKEN-7358; 10:13; Ben: token is visible; 10:14; Type a message...",
+    "expect": "text-dominant"
+  },
+  {
+    "file": "slide-sparse.png",
+    "family": "G2",
+    "tokens": ["G2-01-TOKEN-1462"],
+    "visible_text": "OCR Boundary Check; G2-01-TOKEN-1462; Text in figures or charts may be returned as images.; Tokens inside images can be lost from searchable text.; Measure token recall across page types.; Input image; Markdown; images[]; Goal: token recall",
+    "expect": "mixed"
+  },
+  {
+    "file": "slide-dense.png",
+    "family": "G2",
+    "tokens": ["G2-02-TOKEN-2905"],
+    "visible_text": "Risk Matrix; OCR verification: probability of image fallback and impact on searchability; G2-02-TOKEN-2905; Objective; Evaluate risk that content is returned as images[] instead of markdown text, which reduces searchability.; Content Types; High text density; Many paragraphs and lists. Low risk of image fallback.; Raster chart; Charts and graphs as images. Medium to high risk.; Photo document; Scanned or photographed pages. High risk.; Handwritten board; Handwritten notes and sketches. Very high risk.; Recall target: 0.90; Review: manual spot check; Risk Assessment; Content Type; Image Fallback Likelihood; Impact on Searchability; Overall Risk; High text density; Low; Low; Low; Raster chart; Medium; High; High; Photo document; High; High; High; Handwritten board; Very High; Very High; Very High; Risk vs. Impact; Impact on Searchability; High; Medium; Low; Image Fallback Likelihood; Low; Medium; High; Very High",
+    "expect": "mixed"
+  },
+  {
+    "file": "slide-flow.png",
+    "family": "G2",
+    "tokens": ["G2-03-TOKEN-8731"],
+    "visible_text": "Image Fixture Flow; G2-03-TOKEN-8731; 1; Generate; 2; Inspect; 3; Record truth; 4; Evaluate OCR; OCR; Note: text may stay inside image",
+    "expect": "mixed"
+  },
+  {
+    "file": "whiteboard-notes.png",
+    "family": "G3",
+    "tokens": ["G3-01-TOKEN-5540"],
+    "visible_text": "OCRメモ; G3-01-TOKEN-5540; 入力画像; markdown; images[]; 要確認",
+    "expect": "mixed"
+  },
+  {
+    "file": "whiteboard-flow.png",
+    "family": "G3",
+    "tokens": ["G3-02-TOKEN-9216"],
+    "visible_text": "OCR確認; G3-02-TOKEN-9216; Scan; Token; Search; 日本語OK; 再実行?",
+    "expect": "mixed"
+  },
+  {
+    "file": "whiteboard-standup.png",
+    "family": "G3",
+    "tokens": ["G3-03-TOKEN-3378"],
+    "visible_text": "今日の確認; G3-03-TOKEN-3378; image?; text?; OK; Mistral OCR; 次: 評価",
+    "expect": "mixed"
+  },
+  {
+    "file": "receipt-photo.png",
+    "family": "G4",
+    "tokens": ["G4-01-TOKEN-4086"],
+    "visible_text": "領収書; G4-01-TOKEN-4086; 日付 2026-07-03; OCR検証費; 合計 4,860円; 担当 Kio",
+    "expect": "image-dominant"
+  },
+  {
+    "file": "circular-photo.png",
+    "family": "G4",
+    "tokens": ["G4-02-TOKEN-7621"],
+    "visible_text": "回覧; G4-02-TOKEN-7621; OCR境界確認; 確認後に署名; 佐藤; 田中; 鈴木; 期限 7/10",
+    "expect": "image-dominant"
+  },
+  {
+    "file": "invoice-photo.png",
+    "family": "G4",
+    "tokens": ["G4-03-TOKEN-1950"],
+    "visible_text": "請求メモ; G4-03-TOKEN-1950; 項目; 数量; OCR画像; 3; OCR画像; 合計 19,500円; 確認済",
+    "expect": "image-dominant"
+  },
+  {
+    "file": "infographic-high.png",
+    "family": "G5",
+    "tokens": ["G5-01-TOKEN-6843"],
+    "visible_text": "OCR Recall Dashboard; G5-01-TOKEN-6843; Text ratio: HIGH; Pages; 15; Total documents processed; Tokens; 15; Unique ground-truth tokens embedded; Recall; 0.92; Token recall rate (verified in markdown); Image fallback; Content returned as image; Manual review; Human verification required; Searchable text; Text available for search & indexing; Risk: medium; Potential text loss in images; Verification Timeline; 1. Ingest; Load documents & images; 2. OCR; Mistral OCR processing; 3. Evaluate; Compare tokens in markdown; 4. Report; Generate metrics & dashboard; Recall Trend; 1.00; 0.75; 0.50; 0.25; 0.00; 0.78; 0.85; 0.90; 0.92; 0.92; Run 1; Run 2; Run 3; Run 4; Run 5; Content Classification; 10%; 22%; 68%; Searchable text; Manual review; Image fallback; Overall Status; All critical tokens detected. OCR output is highly searchable.",
+    "expect": "text-dominant"
+  },
+  {
+    "file": "infographic-medium.png",
+    "family": "G5",
+    "tokens": ["G5-02-TOKEN-3197"],
+    "visible_text": "OCR Route Summary; G5-02-TOKEN-3197; Text ratio: MEDIUM; Text; 72%; Image; 18%; Mixed; 10%; Text; Image; Mixed; Next: verify tokens",
+    "expect": "mixed"
+  },
+  {
+    "file": "infographic-low.png",
+    "family": "G5",
+    "tokens": ["G5-03-TOKEN-8574"],
+    "visible_text": "Image Heavy; Text ratio: LOW; Scan; OCR; Review; G5-03-TOKEN-8574",
+    "expect": "image-dominant"
+  }
+]

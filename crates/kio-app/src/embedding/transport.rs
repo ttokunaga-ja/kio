@@ -73,7 +73,7 @@ pub(crate) fn run_embedding_adapter(
     execution: EmbeddingExecution,
     items: Vec<EmbeddingItem>,
     input_type: EmbeddingInputType,
-    // QA13 (step4b-contract-tests-p3a.md §E, 04 §5.5 L880): the caller's
+    // QA13 (docs/04-pipeline.md §5.5): the caller's
     // ledger `intent_token` for this send — see
     // `kio_adapter::types::EmbeddingRequest::idempotency_token`'s doc.
     idempotency_token: Option<String>,

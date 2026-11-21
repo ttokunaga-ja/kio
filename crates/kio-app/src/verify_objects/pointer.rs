@@ -183,7 +183,7 @@ pub(super) fn batch_limit_error(line: usize, limit: &str, maximum: usize) -> Kio
 /// does not call `resolve_pointer_for_cli`: open/view may materialize an open-cache
 /// file and return chunk text, both forbidden for verify.
 ///
-/// PB64-68 (step4b-contract-tests-p2b.md §X, LC21 principle extended past
+/// PB64-68 (1b46cbb5:tasks/step4b-contract-tests-p2b.md §X, LC21 principle extended past
 /// malformed-marker corruption to canonical-event *aggregation*): the
 /// tombstone/erase-receipt dispatch below calls `enforce_canonical_marker_barrier`
 /// (main.rs) — the SAME function `open`/`view`/`restore` use — instead of a
@@ -330,7 +330,7 @@ pub(super) fn bind_evidence_scope(
     if !sqlite_path(&target.kio_dir).exists() {
         return Err(index_rebuilding_error());
     }
-    // QB6 (step4b-contract-tests-p3b.md §A, 10 §3 L300-305): (0)
+    // QB6 (docs/10-operations.md §3): (0)
     // kio_format_version compatibility, checked before (1)/(3) below — this
     // used to open second, so a format-incompatible scope with an active
     // purge journal surfaced the lower-priority

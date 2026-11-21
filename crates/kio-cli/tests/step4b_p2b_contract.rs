@@ -1,9 +1,7 @@
-//! Contract tests for `tasks/step4b-contract-tests-p2b.md` (fsck expansion /
-//! evidence pointer resolve-verify-retarget, P2-B). Test names embed the PB
-//! number they lock down. §M/§L's display-field pieces (PB34-36) remain
-//! outside this pass's scope (they need `path_at_commit`/`heading_path`
-//! output fields `resolve_pointer_for_cli` does not produce yet). This file
-//! does not fabricate coverage for those.
+//! Fsck and Evidence Pointer resolve, verify, and retarget contracts.
+//! See docs/10-operations.md §7.5.1 and docs/08-evidence-pointer-spec.md §§3–5.
+//! PB case numbers refer to `1b46cbb5:tasks/step4b-contract-tests-p2b.md`.
+//! The historical display-field cases PB34-36 (§M/§L) are outside this suite.
 
 mod support;
 

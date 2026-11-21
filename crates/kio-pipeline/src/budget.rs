@@ -61,7 +61,7 @@ pub struct BudgetCaps {
     pub device_monthly_usd_cap: f64,
     pub folder_monthly_usd_cap: Option<f64>,
     pub device_per_adapter: BTreeMap<String, f64>,
-    // QA11/QA12 (step4b-contract-tests-p3a.md §D, arbitration #2): folder-layer
+    // QA11/QA12 (1b46cbb5:tasks/step4b-contract-tests-p3a.md §D, arbitration #2): folder-layer
     // `[budget.per_adapter]` does not exist as a concept (04 §5.4 L768 —
     // `per_adapter` is device-layer only, folder cap is total-only) — there is
     // deliberately no `folder_per_adapter` field here for any code to read.
@@ -126,7 +126,7 @@ pub fn read_budget_policy(
     let device = read_budget_config(device_config_path)?;
     let folder_path_display = folder_config_path.as_ref().display().to_string();
     let folder = read_budget_config(folder_config_path)?;
-    // QA12 (step4b-contract-tests-p3a.md §D, arbitration #2): folder
+    // QA12 (1b46cbb5:tasks/step4b-contract-tests-p3a.md §D, arbitration #2): folder
     // `.kio/config.toml` does not define `[budget.per_adapter]` (04 §5.4
     // L768) — reject it as a config schema error rather than silently
     // dropping it (the earlier behavior QA11 fixes: it used to be parsed and
@@ -427,7 +427,7 @@ mod tests {
         assert!(matches!(err, PipelineError::Schema(_)), "got {err:?}");
     }
 
-    // QA12 (step4b-contract-tests-p3a.md §D, arbitration #2): folder
+    // QA12 (1b46cbb5:tasks/step4b-contract-tests-p3a.md §D, arbitration #2): folder
     // `.kio/config.toml` does not define `[budget.per_adapter]` (04 §5.4
     // L768 — device-layer only) — a folder config setting it is a schema
     // error, not a silently-ignored key. The identical key on the DEVICE

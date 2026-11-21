@@ -618,7 +618,7 @@ impl MarkdownizeAdapter for TestIncrementalMarkdownizeAdapter {
             // the built-in deterministic adapter.
             billable_kinds: Vec::new(),
             reject_billing: Some(kio_adapter::types::BillingDeclaration::Nonbillable),
-            // QA13 (step4b-contract-tests-p3a.md §E, 04 §5.5 L880): local/
+            // QA13 (docs/04-pipeline.md §5.5): local/
             // offline test seam, never a sync provider call.
             provider_idempotency: kio_adapter::types::ProviderIdempotency::NotProvided,
         }
@@ -867,7 +867,7 @@ pub(crate) fn run_index_pipeline(
     // live candidate. Runs before the enqueue loop so the freed cap is available to
     // this index's tasks.
     //
-    // QA2/QA3 (step4b-contract-tests-p3a.md §A, 04 §5.2/§5.3): a
+    // QA2/QA3 (docs/04-pipeline.md §5.2/§5.3): a
     // reservation-bearing send failure no longer always lands `Failed` —
     // rate_limit stays `Pending` and auth_error lands `Paused`. Admit both
     // statuses here too (`is_reservation_bearing_send_failure` already scopes
@@ -1591,7 +1591,7 @@ pub(crate) fn run_index_pipeline(
                 bbox_annotation_enabled: false,
                 tool_profile_hash: markdown_profile_hash.clone(),
                 spec_version: 1,
-                // QA13 (step4b-contract-tests-p3a.md §E, 04 §5.5 L880): this is
+                // QA13 (docs/04-pipeline.md §5.5): this is
                 // the free/local (no ledger charge) offline Markdownize path —
                 // there is no `intent_token` to carry.
                 idempotency_token: None,

@@ -21,8 +21,6 @@
 | `history-manifest.json` | `kio-eval replay-history/v1` のstrictな出力fixture。plan/corpus digestと、scope別step/message/commit数の実行証拠だけを保持。操作materialの正本は`history-plan.json`に一本化 |
 | `golden-queries-crossscope.jsonl` | **横断増補 16 問** (09 §4.3、2026-07-26 凍結)。expected が必ず 2 scope に跨る。正解担体は既存 anchor そのもので、コーパスには手を入れていない |
 | `kio-eval crossscope` | 横断増補のRust専用ランナー。full evaluatorのセット全体ゲートを部分集合へ誤適用せず、Recall/latency/Evidenceと診断値`worst_expected_rank`を検証する |
-| `crossscope-results.json` | 現行の replica 単独経路で再生成した横断評価結果。per-query の `aggregator` や `aggregator_applied` は出力せず、`counts` に `worst_expected_rank_mean/max` を記録する |
-| `crossscope-results-no-replica-2026-07-26.json` | 2026-07-26 の比較対照を保存した**履歴成果物**。移行前 schema の `aggregator_applied` を意図的に含むが、現行 runner の出力や入力には用いない |
 | `kio-eval rerank dump --dataset synthetic` | current-tree queryの候補順・3要素key・検証済みChunk CAS textをcreate-only JSONへ固定するRust経路。offline GPU差分のpass 1 |
 | `golden-queries-qhard.jsonl` | 実データの raster PDF / 図表・画像を正解担体にする、凍結済み Q_hard 8 問。digest も Rust runner が固定照合する |
 | `kio-eval benchmark qhard` | attest済み外部fixtureとsynthetic M3-1を同一実行で再測定する唯一のQ_hard判定経路 |
@@ -33,52 +31,72 @@
 | `kio-eval scale attest` | manifest・commit/tree/chunk CAS・SQLite/FTS/vector・registryをread-onlyで再計算し、current/historical-only/deleted/physicalを分離する |
 | `kio-eval scale benchmark` | 2 laneのattestationを同時に束縛し、text/vector/hybrid/history/deletedをfallbackなしで測定する |
 
+手動の Full・cold 検証と Adapter 計測は [手動検証手順](../tasks/manual-full-cold-gates.md) を参照する。
+
+## 過去の比較
+
+以下は旧構成の観測で、原本はコミット `1b46cbb5` の `eval/` にある。現行の品質判定には再計測の結果を使う。
+
+- fixture-B の旧 24 問では Kio の Recall@10 が 8/24、9/24、22/24 と推移し、7 月 27 日も 22/24 だった。比較ログの Spotlight と rga はいずれも 0/24 だった。現行の再計測では [fixture-B baseline 比較](#fixture-b-baseline-比較) の attestation と比較器の稼働条件を満たす。
+- 2026-07-26 の合成履歴評価では 50 問すべてを回収し、148 件の pointer を検証した。再現は下記の合成コーパス・履歴の手順で行う。
+- 横断増補は replica 単独経路と 2026-07-26 の replica 不使用の対照でともに 16 問を回収した。replica 単独の各問で、期待結果のうち最も低い順位は平均 2.5、最大 4。保存結果では replica 側のシナリオ別 p95 は約 170〜193 ms、対照は約 73〜79 ms だった。この比較の実行条件から replica の速度効果は確定できない。現行の `crossscope` は replica 単独で実行し、`counts.worst_expected_rank_mean/max` を出す。
+- 固定候補の rerank 採点では BGE、Japanese Reranker、Ruri の 3 応答とも Recall@10 が 0.750 から 0.875 へ変化し、4 問が改善、1 問が悪化した。BGE の再採点は下記の圧縮 fixture で行う。他の 2 応答は `1b46cbb5` の `eval/rerank/` から同じコマンドで再採点できる。
+
 ## 使い方
 
-コーパス本体は再生成可能なため **リポジトリにコミットしない** (一時ディレクトリへ生成する)。
+コーパス本体は再生成可能なため **リポジトリにコミットしない**。ローカル出力は `scratch/validate/` の作業名配下に置く。
 
 ```bash
+work="$PWD/scratch/validate/synthetic-history"
+mkdir -p "$work"
+
 # 0. バイナリ (未ビルドなら)
 cargo build --release --locked --all-features
 
 # 1. 合成コーパス生成
-target/release/kio-eval generate-corpus --out /tmp/kio-eval-corpus
+target/release/kio-eval generate-corpus --out "$work/corpus"
 
 # 2. Rust履歴シナリオ再現 (single-link binary copyを使い、manifestはcorpus直下へcreate-only公開)
-install -m 0755 target/release/kio /tmp/kio-replay-kio
+install -m 0755 target/release/kio "$work/kio-replay"
 target/release/kio-eval replay-history \
-  --corpus /tmp/kio-eval-corpus --bin /tmp/kio-replay-kio
+  --corpus "$work/corpus" --bin "$work/kio-replay"
 
 # 3c. 横断増補 (別ファイル・Rust専用ランナー、09 §4.3)。既存 50 問とは独立に走る
-target/release/kio-eval crossscope --corpus /tmp/kio-eval-corpus --bin target/release/kio --dry-run --out /tmp/crossscope-unused.json
-target/release/kio-eval crossscope --corpus /tmp/kio-eval-corpus --bin target/release/kio --out /tmp/crossscope-results.json
+target/release/kio-eval crossscope --corpus "$work/corpus" --bin target/release/kio --dry-run --out "$work/crossscope-unused.json"
+target/release/kio-eval crossscope --corpus "$work/corpus" --bin target/release/kio --out "$work/crossscope-report.json"
 
 # 3a. dry-run: Rust の正本 evaluator が golden-queries / manifest を検証する
-target/release/kio-eval --dry-run --corpus /tmp/kio-eval-corpus
+target/release/kio-eval --dry-run --corpus "$work/corpus"
 
 # 3b. 本評価: Rust の正本 evaluator が Recall@10 をシナリオ別に集計。
 #     kio search 未実装の間は全クエリ NOT-IMPLEMENTED → exit 2 (未実装を green にしない)。
-target/release/kio-eval --corpus /tmp/kio-eval-corpus --bin target/release/kio
+target/release/kio-eval --corpus "$work/corpus" --bin target/release/kio
 
 # 3c. シナリオ絞り込み (複数指定可)。最終HEADのCIは3シナリオを個別に実行する。
-target/release/kio-eval --scenario M3-1 --corpus /tmp/kio-eval-corpus --bin target/release/kio
+target/release/kio-eval --scenario M3-1 --corpus "$work/corpus" --bin target/release/kio
 
 # 4. offline rerankerへ渡すcurrent-tree候補を、検証済みChunk CASから固定する。
 #    --outは既存fileを上書きしない。
 target/release/kio-eval rerank dump --dataset synthetic \
-  --corpus /tmp/kio-eval-corpus \
-  --bin target/release/kio --out /tmp/rerank-input.json
+  --corpus "$work/corpus" \
+  --bin target/release/kio --out "$work/rerank-input.json"
 
 # 5. GPU が返した JSON を固定dumpへ適用する。--report もcreate-only。
-target/release/kio-eval rerank apply --input /tmp/rerank-input.json \
-  --output /tmp/rerank-output.json --report /tmp/rerank-report.json
+target/release/kio-eval rerank apply --input "$work/rerank-input.json" \
+  --output "$work/rerank-output.json" --report "$work/rerank-report.json"
+
+# CI と同じ固定入力・BGE 応答の再採点
+gzip -dc eval/rerank/rerank-input-fixture.json.gz > "$work/bge-input.json"
+gzip -dc eval/rerank/rerank-output-bge-reranker-v2-m3.json.gz > "$work/bge-output.json"
+target/release/kio-eval rerank apply --input "$work/bge-input.json" \
+  --output "$work/bge-output.json" --report "$work/bge-report.json"
 ```
 
 `replay-history` は、既に open した executable と HOME/XDG directory を pathname
 再解決なしで child process へ渡せる Linux だけで実行する。macOS/Windows では
 descriptor-exec 相当の安全な境界がないため、corpus を変更する前に structured error で
 fail-closed にする。`--bin` はsingle-link regular executableに限定し、Cargoが
-`target/release/kio`を`deps/`とhardlinkした環境では、`install -m 0755`で`/tmp`へ
+`target/release/kio`を`deps/`とhardlinkした環境では、`install -m 0755`で検証ディレクトリへ
 single-link copyを作ってそのpathを渡す。pathname fallbackやhardlink例外は設けない。
 `replay-history` の子プロセスには、コマンドごとに 30 秒の上限を適用する。
 

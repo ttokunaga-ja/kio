@@ -35,12 +35,12 @@ pub const RETIRED_NON_LIVE_REASON: &str = "retired_non_live";
 /// result. It is terminal until an operator explicitly authorizes a fresh send.
 pub const RESULT_UNKNOWN_REASON: &str = "result_unknown";
 
-/// step4b-contract-tests-p3a.md QA1: the closed `hold_reason` enum for a
+/// QA1 (docs/04-pipeline.md §5.2): the closed `hold_reason` enum for a
 /// `Paused` task (`budget`, `auth`, `tier_b_approval`, or
 /// `ledger_initialization_required`), distinct from `fallback_reason`'s `RetryErrorKind`
 /// classification for `Failed` tasks.
 ///
-/// QA2/QA3 (step4b-contract-tests-p3a.md §A, 04 §5.2/§5.3, implemented): the
+/// QA2/QA3 (docs/04-pipeline.md §5.2/§5.3, implemented): the
 /// status-machine transitions this enum enables are wired at every send site
 /// (markdownize's online-send failure handler and the embedding batch-send
 /// handler in `kio-cli`'s `main.rs`):
@@ -165,7 +165,7 @@ pub struct TaskDescriptor {
     /// Frozen bbox-annotation policy for online Markdownize task identity.
     /// Non-Markdownize tasks persist an explicit JSON null.
     pub bbox_annotation_enabled: Option<bool>,
-    /// QA1 (step4b-contract-tests-p3a.md §A): the closed hold reason for a
+    /// QA1 (docs/04-pipeline.md §5.2–5.3): the closed hold reason for a
     /// `Paused` task (04 §5.2). Non-paused tasks persist an explicit JSON null.
     pub hold_reason: Option<HoldReason>,
     // R17-3: the exact F8 reservation this task currently holds (amount + the
@@ -945,7 +945,7 @@ pub fn task_can_enter_secret_hold(task: &TaskDescriptor) -> bool {
 }
 
 /// Materialized output can converge ordinary work, budget pauses, AND (QA2,
-/// step4b-contract-tests-p3a.md §A) auth pauses to `Done` — a chunk/unit
+/// docs/04-pipeline.md §5.2–5.3) auth pauses to `Done` — a chunk/unit
 /// whose vector or normalized output already exists (e.g. via a
 /// content-identity twin) satisfies an auth-paused task the same way it
 /// satisfies a budget-paused one, since the auth hold never blocked anything
@@ -963,7 +963,7 @@ pub fn task_can_complete_from_materialized_output(task: &TaskDescriptor) -> bool
     }
 }
 
-/// QA2 (step4b-contract-tests-p3a.md §A, 04 §5.2): an auth failure now lands
+/// QA2 (docs/04-pipeline.md §5.2): an auth failure now lands
 /// `Paused` (never `Failed`), so revival on `batch resume` is Paused-based.
 #[must_use]
 pub fn task_auth_revival_allowed(task: &TaskDescriptor, mode: TaskRecoveryMode) -> bool {
@@ -1330,7 +1330,7 @@ pub fn retry_policy(error_kind: RetryErrorKind) -> RetryPolicy {
             error_code: "KIO-E-BATCH-RATE-001".to_owned(),
             paused: false,
         },
-        // QA2 (step4b-contract-tests-p3a.md §A, 04 §5.2 L679): `paused: true`
+        // QA2 (docs/04-pipeline.md §5.2): `paused: true`
         // now truthfully describes the wired transition — an auth failure
         // lands `Paused(hold_reason=auth)`, not `Failed`. The send handlers
         // (kio-cli `main.rs`) branch on `error.retry_kind` directly rather
@@ -1359,7 +1359,7 @@ pub fn retry_policy(error_kind: RetryErrorKind) -> RetryPolicy {
             error_code: "KIO-E-BATCH-INPUT-001".to_owned(),
             paused: false,
         },
-        // QA45 (step4b-contract-tests-p3a.md §M): 04 §5.3 L738-740 —
+        // QA45 (docs/04-pipeline.md §5.3): 04 §5.3 —
         // `retryable, max_attempts=1` (one same-mode retry for output jitter;
         // a repeat violation is failed permanent — an Adapter bug, not a
         // transient condition). No automatic fallback to `full` here (that
@@ -1727,7 +1727,7 @@ mod tests {
         );
     }
 
-    /// QA1 (step4b-contract-tests-p3a.md §A): the closed `hold_reason` enum
+    /// QA1 (docs/04-pipeline.md §5.2–5.3): the closed `hold_reason` enum
     /// round-trips the 3 spec values, and all 3 reasons
     /// (`budget_exceeded`/`secrets_tier_b_hold`/`auth_error`) map onto it —
     /// QA2 wires the `auth_error` -> `Paused` transition itself (see the
@@ -1886,7 +1886,7 @@ mod tests {
         assert!(task_failure_is_terminal(&task));
     }
 
-    /// QA16 (step4b-contract-tests-p3a.md §F, 07 §4 L286-290): `AdapterError`
+    /// QA16 (docs/07-adapter-spec.md §4): `AdapterError`
     /// lives in `kio-adapter`, which cannot depend on `kio-pipeline`, so
     /// `AdapterError::error_code`/`error_category` independently duplicate
     /// this crate's `retry_policy`/`RetryErrorKind` classification instead of

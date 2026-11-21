@@ -291,7 +291,7 @@ pub struct StandardOnlineMarkdownizeRequest<'a> {
     /// A fresh full send leaves this `false`.
     pub restrict_to_hint_pages: bool,
     pub bbox_annotation_enabled: bool,
-    /// QA13 (step4b-contract-tests-p3a.md §E, 04 §5.5 L880): the ledger
+    /// QA13 (docs/04-pipeline.md §5.5): the ledger
     /// phase-1 `intent_token` for this send — see
     /// `MarkdownizeRequest::idempotency_token`'s doc. `None` when this call
     /// has no ledger charge (e.g. a resolve-only profile lookup site never
@@ -435,7 +435,7 @@ pub fn run_standard_online_markdownize_with_bytes_with_control(
         bbox_annotation_enabled: request.bbox_annotation_enabled,
         tool_profile_hash: String::new(),
         spec_version: 1,
-        // QA13 (step4b-contract-tests-p3a.md §E, 04 §5.5 L880): thread the
+        // QA13 (docs/04-pipeline.md §5.5): thread the
         // caller's ledger `intent_token` through so the Adapter boundary can
         // enforce/attach a provider idempotency header when the resolved
         // profile declares one.
@@ -445,7 +445,7 @@ pub fn run_standard_online_markdownize_with_bytes_with_control(
     match test_mode {
         Some("auth_error") => return Err(AdapterError::Auth("mock auth failure".to_owned())),
         Some("rate_limit") => return Err(AdapterError::rate_limit("mock 429")),
-        // QA3 (step4b-contract-tests-p3a.md §A, 04 §5.3): a rate limit WITH a
+        // QA3 (docs/04-pipeline.md §5.3): a rate limit WITH a
         // provider `Retry-After` header (30s), proving `retry_after_ms`
         // wiring end-to-end into `next_retry_at` — unlike the headerless
         // "rate_limit" seam above, which exercises the synthetic +2s
@@ -536,7 +536,7 @@ pub fn run_standard_online_markdownize_with_bytes_with_control(
                 effective_prepared_unit_hints,
             });
         }
-        // QA13 (step4b-contract-tests-p3a.md §E, 04 §5.5 L880): behaves like
+        // QA13 (docs/04-pipeline.md §5.5): behaves like
         // "mock", but the adapter declares `ProviderIdempotency::HttpHeader`
         // — proving the CLI threads `idempotency_token` end-to-end. A missing
         // token surfaces as `AdapterError::ContractViolation` (fail closed,
@@ -991,7 +991,7 @@ pub enum AdoptedEmbeddingExecution {
     AuthError,
     #[cfg(debug_assertions)]
     RateLimit,
-    /// QA3 (step4b-contract-tests-p3a.md §A, 04 §5.3): a rate limit WITH a
+    /// QA3 (docs/04-pipeline.md §5.3): a rate limit WITH a
     /// provider `Retry-After` header (30s) — proves `retry_after_ms` wiring
     /// into `next_retry_at`, unlike `RateLimit` above (headerless, synthetic
     /// +2s backoff).
@@ -999,7 +999,7 @@ pub enum AdoptedEmbeddingExecution {
     RateLimitAfter,
     #[cfg(debug_assertions)]
     NetworkError,
-    /// QA13 (step4b-contract-tests-p3a.md §E, 04 §5.5 L880): behaves like
+    /// QA13 (docs/04-pipeline.md §5.5): behaves like
     /// `Mock`, but the adapter declares `ProviderIdempotency::HttpHeader` —
     /// proving the CLI threads `EmbeddingRequest.idempotency_token`
     /// end-to-end (a missing token surfaces as `ContractViolation`). Never
@@ -1582,7 +1582,7 @@ pub fn run_adopted_embedding(
     execution: AdoptedEmbeddingExecution,
     items: Vec<EmbeddingItem>,
     input_type: EmbeddingInputType,
-    // QA13 (step4b-contract-tests-p3a.md §E, 04 §5.5 L880): the caller's
+    // QA13 (docs/04-pipeline.md §5.5): the caller's
     // ledger `intent_token` for this send — see
     // `EmbeddingRequest::idempotency_token`'s doc. `None` for a call with no
     // ledger charge.

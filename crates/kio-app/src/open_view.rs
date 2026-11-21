@@ -505,7 +505,7 @@ fn resolve_short_hash_command(
 }
 
 // ===========================================================================
-// 08 §3.1 procedures 6a/6b (step4b-contract-tests-p2b.md PB39-50/55; item 2 of
+// 08 §3.1 procedures 6a/6b (1b46cbb5:tasks/step4b-contract-tests-p2b.md PB39-50/55; item 2 of
 // this session's task). Shared by `resolve_pointer_for_cli` (open/view/
 // restore) and `verify_pointer_for_cli` (`crates/kio-cli/src/verify_objects.rs`,
 // PB66's structural requirement — one implementation, not two independently
@@ -901,7 +901,7 @@ fn resolve_pointer_for_cli(
         pointer.scope_path.as_deref(),
         ctx.control,
     )?;
-    // QB6 (step4b-contract-tests-p3b.md §A, 10 §3 L300-305): (0)
+    // QB6 (docs/10-operations.md §3): (0)
     // kio_format_version compatibility must be checked BEFORE (1) the purge
     // read barrier — this used to open the checkpoint first, so a scope that
     // was both format-incompatible and mid-purge-journal surfaced the lower-
@@ -1988,7 +1988,7 @@ fn resolve_object_uri(
         None,
         ctx.control,
     )?;
-    // QB6 (step4b-contract-tests-p3b.md §A, 10 §3 L300-305): (0)
+    // QB6 (docs/10-operations.md §3): (0)
     // kio_format_version compatibility, checked before (1)/(3) below. This
     // object-URI path previously never opened a `Repository` at all — every
     // read went straight through `target`/CAS — so a format-incompatible

@@ -92,12 +92,16 @@ lifetime, and revocation rules.
 
 ## Documentation
 
-[docs/README.md](docs/README.md) is the entry point and defines the reading
+[The specification index](docs/README.md) defines the reading
 order. The numbered files distinguish current implementation contracts, product
 requirements, approved design directions, and planned additions. Implementation
 follows the applicable contracts; a plan alone is not evidence of delivery.
 
-The [approved knowledge UX plan](tasks/knowledge-ux-implementation-plan-2026-10-03.md)
+The [v1 plan](tasks/v1-plan.md) tracks remaining work and links to the
+[formal acceptance runbook](tasks/v1-acceptance.md). Local evaluation starts
+with the [evaluation guide](eval/README.md).
+
+The [approved knowledge UX plan](tasks/post-v1/knowledge-ux.md)
 keeps the CAS and immutable citations, completes existing v1 acceptance first,
 then improves version-specific readiness, citation retention using existing tags,
 and restore status. These additions are planned, not delivered functionality.
@@ -174,7 +178,9 @@ bytesを変更せず拒否します。移行コマンドは提供しません。
    `purge` / `erase`、履歴欠損の影響は別に扱います。
 
 引用の保持範囲は [Evidence Pointer仕様](docs/08-evidence-pointer-spec.md#24-識別子の安定性と引用の保持)、
-承認済みの改善工程は [保存・復元・引用保持の実装計画](tasks/knowledge-ux-implementation-plan-2026-10-03.md)
+製品仕様は [仕様の索引](docs/README.md)、残作業と正式受入は [v1 計画](tasks/v1-plan.md) と [正式受入の手順](tasks/v1-acceptance.md)、評価は [評価ガイド](eval/README.md) を参照してください。
+
+承認済みの改善工程は [保存・復元・引用保持の実装計画](tasks/post-v1/knowledge-ux.md)
 を参照してください。追加改善は未実装です。
 
 ## 対象ユーザー

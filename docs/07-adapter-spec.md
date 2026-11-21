@@ -478,7 +478,7 @@ incremental の詳細プロンプト規約は §8 (生成 LLM 系のみ。§8 �
 **標準 Adapter (非 text-native)**: PDF / DOCX / PPTX / 画像の Markdownize 第一候補は Mistral OCR 系文書処理 API (`mistral_ocr_markdownize`) とする (経緯: 旧 `research/markdown.md` — git 履歴)。規約:
 
 - 表は Markdown 本文に inline で保持する (`table_format=null` 相当)。独立 table object は作らない。
-- 文書内 embedded image は抽出して image object ([03-data-model.md §2](03-data-model.md)) として保存し、Markdown 内の参照は `kio://<scope_id>/object/image/<image_hash>` に置換する ([08-evidence-pointer-spec.md §2.3](08-evidence-pointer-spec.md))。実装は Step 2 ([09-mvp-scope.md §3.1](09-mvp-scope.md))。
+- 文書内 embedded image は抽出して image object ([03-data-model.md §2](03-data-model.md)) として保存し、Markdown 内の参照は `kio://<scope_id>/object/image/<image_hash>` に置換する ([08-evidence-pointer-spec.md §2.3](08-evidence-pointer-spec.md))。
 - bbox / page / confidence score は unit metadata に記録する。**Evidence Pointer schema には含めない**。
 - 図中テキストは `[markdownize] bbox_annotation` が有効な場合（既定）、説明・書き起こしを
   unit metadata に記録し、参照画像の近くに検索可能テキストとして反映する。設定は `tool_profile_hash` に含める。

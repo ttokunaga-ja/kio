@@ -107,7 +107,7 @@ pub use read_budget::{VerifiedCasReadBudget, VerifiedCasReadCapability};
 pub enum ContentObjectKind {
     Prepared,
     Image,
-    /// PB01/PB02 (step4b-contract-tests-p2b.md §A/§B, 10-operations.md
+    /// PB01/PB02 (1b46cbb5:tasks/step4b-contract-tests-p2b.md §A/§B, 10-operations.md
     /// §7.5.1 L489): content-addressed embedding object (vector + declared
     /// dimensions), stored under `objects/embeddings/`.
     Embedding,

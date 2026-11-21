@@ -151,7 +151,7 @@ credentials. Inputs and outputs are explicit absolute paths and create-only.
 ```sh
 target/release/kio-eval ocr render \
   --python /absolute/path/to/renderer-venv/bin/python3 \
-  --adapter /absolute/path/to/kio/experiments/ocr-verification/fixtures/render_native.py \
+  --adapter /absolute/path/to/kio/experiments/ocr-verification/render-native.py \
   --request-id fixture-001 \
   --image /absolute/path/to/page-001.png \
   --out /absolute/new/fixture.pdf

@@ -1,6 +1,6 @@
-//! Contract tests for `tasks/step4b-contract-tests-p2c.md` (search / gate /
-//! mode / cursor / multi-scope / exit, P2-C). Test names embed the PC number
-//! they lock down. This file complements — rather than duplicates — the PC
+//! Search, cursor, multi-scope, and exit contracts from docs/05-runtime.md §1
+//! and docs/06-cli-spec.md §7. PC numbers refer to the historical cases at
+//! `1b46cbb5:tasks/step4b-contract-tests-p2c.md`. This file complements the PC
 //! regression fixes folded directly into `step3_p0_contract.rs` and
 //! `step4_time_travel.rs` where an existing test already exercised the
 //! behavior a PC item changed (e.g. `pc19_pc21_index_generation_rotation_...`,
@@ -3038,7 +3038,7 @@ fn pc20_purge_rotates_index_generation() {
 // §C — tokenizer / MATCH generation (PC8-14)
 // ---------------------------------------------------------------------------
 
-/// PC12/PC13, reversed by the R-追記 (step4b-contract-tests-p2c.md,
+/// PC12/PC13, reversed by the R-追記 (1b46cbb5:tasks/step4b-contract-tests-p2c.md,
 /// 2026-07-22 spec feedback #2 — 05 §1.3 L120-134): a short (< 3 Unicode
 /// scalar) unit in a MIXED query (>= 1 long unit) no longer enters the FTS5
 /// MATCH expression (PC9 — trigram MATCH can't carry it) NOR acts as an
@@ -3201,7 +3201,7 @@ fn pc8_deterministic_numeric_and_bilingual_equivalence_forms_are_restored() {
     );
 }
 
-/// R-追記 (step4b-contract-tests-p2c.md, 2026-07-22 spec feedback #2 — 05
+/// R-追記 (1b46cbb5:tasks/step4b-contract-tests-p2c.md, 2026-07-22 spec feedback #2 — 05
 /// §1.3 L120-134): a document whose body never spells the query's
 /// agglutinated particle ("トークン**の**"/"...が") is still found. The query
 /// token "認証仕様のトークン" script-segments into 認証仕様 / の / トークン,
@@ -3250,7 +3250,7 @@ fn r_addendum_feedback2_mixed_query_short_particle_does_not_exclude_a_document_l
     );
 }
 
-/// R-追記 (step4b-contract-tests-p2c.md, 2026-07-22 spec feedback #2 — 05
+/// R-追記 (1b46cbb5:tasks/step4b-contract-tests-p2c.md, 2026-07-22 spec feedback #2 — 05
 /// §1.3 L120-134): a symbol-joined query token (`read/write/admin`)
 /// script-segments into read / write / admin, matching a document that
 /// spells the same enumeration with spaces around the slashes
@@ -3332,9 +3332,9 @@ fn f3_escaped_punctuation_is_findable_by_the_plain_query_and_shown_unescaped() {
 
 /// The other half of F3, and the reason the projection exempts code instead of
 /// unescaping everything: inside a fence a backslash is content, not escaping.
-/// Counted across this repository's tracked Markdown, 439 of the 478
+/// Counted across the Markdown tracked at `1b46cbb5`, 439 of the 478
 /// `\`-before-punctuation sequences are inside fences (416 of those in the
-/// retained non-authorizing `eval/fixtures/normalized-corpus/` archive), so a
+/// historical `1b46cbb5:eval/fixtures/normalized-corpus/` archive), so a
 /// blanket unescape would rewrite genuine archived code to repair 23 body-text
 /// escapes. The runtime vector below carries the same distinct behavior signal.
 #[test]

@@ -385,7 +385,7 @@ fn run_rebuild_db_locked(
     // enrichment never ran) is enqueued/embedded rather than silently reported as
     // fully enriched. `rebuild_sqlite_index` already preserved existing
     // embeddings, so reuse keeps this near-free; offline it only enqueues.
-    // QA29 (step4b-contract-tests-p3a.md §I, 06-cli-spec.md §1 L52-55, 07 §3
+    // QA29 (docs/06-cli-spec.md §1, 07 §3
     // L220-222): `--online`/`--offline` now reach the post-rebuild enrichment
     // pass instead of the hard-coded `(false, false, false)` this used to
     // pass unconditionally.
@@ -828,7 +828,7 @@ fn run_one_device_repair(
 enum RepairMode {
     RebuildDb,
     VerifyObjects,
-    /// PB12 (step4b-contract-tests-p2b.md §E, 10-operations.md §7.5.1
+    /// PB12 (docs/10-operations.md §7.5.1
     /// L586-626): `--verify-objects --prune-orphans` — `--prune-orphans` is a
     /// modifier on `--verify-objects`, never valid alone or with
     /// `--rebuild-db`.
@@ -837,7 +837,7 @@ enum RepairMode {
     RegistryPrune,
 }
 
-/// QA29 (step4b-contract-tests-p3a.md §I): [`parsed_repair`]'s parsed
+/// QA29 (docs/06-cli-spec.md §1): [`parsed_repair`]'s parsed
 /// result — the primary mode plus `--rebuild-db`'s optional
 /// `--online`/`--offline` sub-flags (06-cli-spec.md §1 L52-55).
 struct ParsedRepair {

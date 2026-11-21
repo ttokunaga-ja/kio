@@ -2394,7 +2394,7 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
     // embedding adapter's opt-in; offline this enqueues Embedding tasks so
     // `index_status` reports the pending enrichment instead of falsely showing
     // enriched_ratio = 1.0 (the tasks would otherwise never be created).
-    // QA31 (step4b-contract-tests-p3a.md §I): `--force`'s `--online`/
+    // QA31 (docs/06-cli-spec.md §1): `--force`'s `--online`/
     // `--offline` now reach this pass instead of the hard-coded
     // `(false, false, false)` this used to pass unconditionally.
     let embedding_online = embedding_online_allowed(

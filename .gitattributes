@@ -16,6 +16,3 @@
 # PDF fixtures contain fixed-width cross-reference records, including spaces.
 # Preserve their bytes and avoid text diffs or text merges of binary documents.
 crates/kio-eval/acceptance-fixtures/**/*.pdf binary
-
-# Security audit exports preserve source bytes for receipt and checksum bindings.
-security/audits/** -whitespace

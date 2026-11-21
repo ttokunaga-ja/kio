@@ -145,7 +145,7 @@ pub(crate) fn run_status(ctx: &Invocation<'_>) -> Result<CommandResponse> {
             files: status.files,
             stage_residues: status.stage_residues,
             head_shallow: status.head_shallow,
-            // QA4 (step4b-contract-tests-p3a.md §A, 10 §1 L117): the
+            // QA4 (docs/10-operations.md §1): the
             // paused-task count broken down by hold_reason (budget/auth/
             // tier_b_approval), alongside the raw task list callers
             // previously had to filter client-side themselves.

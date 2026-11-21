@@ -2,7 +2,7 @@
 //! validation, crash recovery, sync degenerate 2-phase, the query-embedding
 //! device row, budget cap check-then-reserve, and abandon.
 //!
-//! Section markers below (`§A`.."§K") mirror `tasks/step4b-contract-tests-ledger.md`'s
+//! Section markers below (`§A`.."§K") mirror `1b46cbb5:tasks/step4b-contract-tests-ledger.md`'s
 //! own letter groups, so a CL number in a test name or comment can be traced back
 //! here directly.
 //!
@@ -591,7 +591,7 @@ fn unknown_sync_resend_error(message: impl Into<String>) -> PipelineError {
 /// plus 60, 600)` seconds.
 ///
 /// This deliberately deviates from CL49's own first worked example (see
-/// `tasks/step4b-contract-tests-ledger.md` §H CL49). That example computes
+/// `1b46cbb5:tasks/step4b-contract-tests-ledger.md` §H CL49). That example computes
 /// `max(300, 120) + 60 = 360` as the final offset for `effective_timeout=300`,
 /// never applying the 600s floor even though 360 is less than 600 — while its
 /// own second example, in the same paragraph, applies the floor for the
@@ -904,7 +904,7 @@ pub fn resolve_billing_from_billable_units(
     }
 }
 
-/// QA17/QA18/QA19 (step4b-contract-tests-p3a.md §F): resolve a terminal
+/// QA17/QA18/QA19 (docs/07-adapter-spec.md §4): resolve a terminal
 /// task's billed amount from the Adapter's self-reported `usage` (07 §4
 /// L291-307's one-of `usd`|`billable_units`), the Adapter's declared
 /// `billable_kinds` (QA18), and `tools.toml`'s `[pricing]` table (QA19) — the
@@ -2656,7 +2656,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // QA17/QA18/QA19 (step4b-contract-tests-p3a.md §F): the AdapterRun-usage
+    // QA17/QA18/QA19 (docs/07-adapter-spec.md §4): the AdapterRun-usage
     // -> BilledAmount join point, `resolve_billing_from_reported_usage`.
     // ------------------------------------------------------------------
 
@@ -2845,7 +2845,7 @@ mod tests {
 
     // -----------------------------------------------------------------
     // QA14 — the restore-reconcile gate inside `phase1_intent`/`device_claim`
-    // (step4b-contract-tests-p3a.md L307-321, 10-operations.md §7.5.2)
+    // (docs/10-operations.md §7.5.2)
     // -----------------------------------------------------------------
 
     /// Raw fixture access is deliberately test-only. Production callers use

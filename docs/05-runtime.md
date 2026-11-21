@@ -485,7 +485,7 @@ Kio の主たる消費者は LLM Agent であり ([06-cli-spec.md §9](06-cli-sp
 v1 の result 行は、上の規則どおり **alias 展開後の chunk 行**であり、`--limit` / `--offset` / cursor の
 単位もその行である。同じ内容のリネーム前後の path は別の行として返す。
 
-文書単位の結果表示は [後続の設計](../tasks/search-result-presentation-design.md) で扱う。
+文書単位の結果表示は [後続の設計](../tasks/post-v1/search-result-presentation.md) で扱う。
 
 **検索応答に本文の全文は載せない。**`--limit` は最大 100 で、全文を載せると応答が桁違いになる。
 result 行は**検証可能な span** を指し (`kio evidence verify` が成立する)、実体は別途取得する。
@@ -939,7 +939,7 @@ current reader は上記以外を拒否し、legacy enum の読取りや変換�
 
 ## 2.2 GC
 
-> GC (§2.2-2.7) は Phase 4 で段階導入する ([09-mvp-scope.md §3.1](09-mvp-scope.md))。milestone 1 は read-only planner、milestone 2 は明示確認付きの receipt先行 tree-only shallow sweep、milestone 3 は bounded `after_index` hook、milestone 4 は OS scheduler から呼ぶ scheduled auto snapshot、milestone 5 は同じ `kio snapshot auto` invocation 内だけで動く Rust-only `on_idle` GC、milestone 8 は独立したRust-only unreachable-object read-only inventoryである。Kio は daemon / scheduler installer を持たない。
+> GC (§2.2〜2.7) は read-only planner、明示確認付きの receipt 先行 tree-only shallow sweep、bounded `after_index` hook、OS scheduler から呼ぶ scheduled auto snapshot、同じ `kio snapshot auto` 内の `on_idle` GC、独立した到達不能 object の read-only inventory を扱う。 定期 auto snapshot の起動は OS scheduler に委ね、Kio は daemon や scheduler installer を持たない。
 
 ```text
 gc_policy(commit_type):

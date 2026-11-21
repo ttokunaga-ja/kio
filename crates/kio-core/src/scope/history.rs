@@ -12,7 +12,7 @@ impl Repository {
         self.log_from(None)
     }
 
-    /// QB50 (step4b-contract-tests-p3b.md §D, 06 §1 L61 + 裁定5's adopted
+    /// QB50 (1b46cbb5:tasks/step4b-contract-tests-p3b.md §D, 06 §1 L61 + 裁定5's adopted
     /// analogy to `--at`'s established "resolve the operand, then treat it
     /// as the walk's basis" semantics elsewhere — search 06 §3 L226 /
     /// 05-runtime.md §1.6 L214): `kio log --at <commit>` walks from an

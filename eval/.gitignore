@@ -1,5 +1,3 @@
-# 生成物 (Rust kio-eval の出力)。コーパス本体は /tmp 等へ生成しコミットしない。
-results.json
-report.md
-__pycache__/
-*.pyc
+# 直下の評価生成物
+/results.json
+/report.md

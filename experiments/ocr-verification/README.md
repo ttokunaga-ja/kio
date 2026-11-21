@@ -21,7 +21,7 @@ differ on whether the first source index is zero or one, Rust converts the
 received array order to the normalized artifact's canonical zero-based
 `index`; duplicate, decreasing, or missing required fields fail closed.
 
-`fixtures/render_native.py` remains a distinct Python-native boundary. It uses
+`render-native.py` remains a distinct Python-native boundary. It uses
 Pillow and reportlab to render explicitly named PNG inputs to one explicitly
 named create-only PDF. Its request and response schemas are
 `kio.ocr.fixture-render.request/v1` and `kio.ocr.fixture-render.response/v1`;
@@ -32,6 +32,13 @@ replace an archive artifact.
 Both lanes are manual only: normal push/PR CI makes no live provider call.
 `MISTRAL_API_KEY` is used only for the direct provider request and is never
 persisted. The renderer receives no credentials.
+
+## Fixed OCR inputs
+
+[fixtures/images/](fixtures/images/) contains the 15 synthetic PNGs and their
+[ground truth](fixtures/images/ground-truth.json). The renderer converts those
+images to PDF. The [capture manifest](../../crates/kio-adapter/tests/fixtures/layout-parsing/capture-manifest.json)
+maps the stored OCR responses to these inputs for the `token_recall` regression test.
 
 ## Manual Rust-owned flow
 
@@ -51,9 +58,9 @@ kio-eval ocr evaluate \
 
 kio-eval ocr render \
   --python /absolute/path/to/venv/bin/python3 \
-  --adapter /absolute/path/to/fixtures/render_native.py \
+  --adapter /absolute/path/to/kio/experiments/ocr-verification/render-native.py \
   --request-id render-001 \
-  --image /absolute/path/to/page-1.png \
+  --image /absolute/path/to/kio/experiments/ocr-verification/fixtures/images/invoice-photo.png \
   --out /absolute/path/to/rendered.pdf
 ```
 

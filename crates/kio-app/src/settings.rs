@@ -91,7 +91,7 @@ pub(crate) fn read_bbox_annotation_config(path: &Path) -> Result<Option<bool>> {
             path.display()
         ))
     })?;
-    // QA33 (step4b-contract-tests-p3a.md §J, arbitration #4): the spec's
+    // QA33 (1b46cbb5:tasks/step4b-contract-tests-p3a.md §J, arbitration #4): the spec's
     // literal TOML example is a flat `[markdownize] bbox_annotation = true`
     // key (07 §5.2), not a nested `[markdownize.bbox_annotation] enabled =
     // true` table — the schema now matches (config.schema.json).

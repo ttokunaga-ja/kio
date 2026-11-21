@@ -14,8 +14,7 @@ Kio は Git inspired な content-addressed store と snapshot DAG を、ロー�
 Object 種別:
   raw          原本ファイルバイト列
   prepared     Markdownize 前の中間表現 (page image, sheet etc.)
-  image        文書内 embedded image (Markdownize 時に抽出。type は予約済み、実装は Step 2
-               [09-mvp-scope.md §3.1](09-mvp-scope.md))
+  image        文書内 embedded image (Markdownize 時に抽出。07 §5.2)
   manifest     normalized instance manifest の確定版 (canonical JCS bytes — §2.1。tree の
                normalize.manifest_hash が指す)
   toollock     tool-lock.json の確定版 (canonical JCS bytes — §5.2。commit の tool_lock_hash が指す)

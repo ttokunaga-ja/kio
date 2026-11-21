@@ -15,7 +15,7 @@ const PROFILE_FIELDS: &[&str] = &[
     "prompt_template_hash",
     "sampling",
     "output_schema",
-    // QA34 (step4b-contract-tests-p3a.md §J, 03 §5.1 L355-356): prepare-only —
+    // QA34 (docs/03-data-model.md §5.1): prepare-only —
     // {renderer_name, renderer_version, dpi, color_space, output_format}, all
     // rendering settings that affect byte-level determinism (04 §2.1). No
     // current built-in Prepare Adapter renders page images (the bundled one
@@ -264,7 +264,7 @@ mod tests {
         assert!(tool_profile_hash(&profile).is_err());
     }
 
-    // QA34 (step4b-contract-tests-p3a.md §J, 03 §5.1 L355-356): `render_params`
+    // QA34 (docs/03-data-model.md §5.1): `render_params`
     // is a hash input — a renderer setting change perturbs `tool_profile_hash`
     // (04 §2.1's prepared-Adapter byte-stability requirement rests on this).
     #[test]

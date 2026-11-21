@@ -288,7 +288,7 @@ impl Repository {
             .remove_file(Path::new(PUBLICATION_JOURNAL_LEAF))
     }
 
-    /// QA5 (step4b-contract-tests-p3a.md §B, 10 §1 L97-113): record the
+    /// QA5 (docs/10-operations.md §1): record the
     /// one-time scope-level scan approval into `.kio/scope.json`'s
     /// `scan_approval` key — distinct from the adapter-level network opt-in
     /// (`approvals.jsonl`/`consents.jsonl`, 07 §3). Idempotent: a scope is

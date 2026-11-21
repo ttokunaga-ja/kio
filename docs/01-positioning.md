@@ -1,8 +1,8 @@
 # 01 Positioning
 
-Kio のプロダクト位置づけ・対象ユーザー・差別化・競合分析・MVP スコープ・Phase plan を **正本** として定義する。他ドキュメントが「Kio とは何か」を語る場合、本書を参照する。
+Kio のプロダクト位置づけ・対象ユーザー・差別化・競合分析・MVP スコープ を **正本** として定義する。他ドキュメントが「Kio とは何か」を語る場合、本書を参照する。
 
-> 関連: [02-philosophy.md](02-philosophy.md) (理念) / [09-mvp-scope.md](09-mvp-scope.md) (MVP / Phase / Step) / [10-operations.md](10-operations.md) (横断規約)
+> 関連: [02-philosophy.md](02-philosophy.md) (理念) / [09-mvp-scope.md](09-mvp-scope.md) (MVP と評価基準) / [10-operations.md](10-operations.md) (横断規約)
 
 ---
 
@@ -214,7 +214,7 @@ Knowledge Continuityは同じCAS・commit・evidenceを利用できる第二の�
 | blockchain-powered | **使用しない**。有効化した外部anchorの方式と保証範囲を具体的に説明する |
 | ransomware-proof | **使用しない** |
 
-将来Cloudの推奨category、wedge、優位性、非目標、claim gateの詳細は、非規範の戦略文書 [cloud-competitive-advantage.md](../strategy/cloud-competitive-advantage.md) を参照する。multi-device sync / cloud sharing自体は現行MVPの未承認roadmapである（[09-mvp-scope.md §2](09-mvp-scope.md)）。
+将来Cloudの推奨category、wedge、優位性、非目標、claim gateの詳細は、非規範の戦略文書 [cloud-competitive-advantage.md](proposals/cloud-competitive-advantage.md) を参照する。multi-device sync / cloud sharing自体は現行MVPの未承認roadmapである（[09-mvp-scope.md §2](09-mvp-scope.md)）。
 
 ## 4.4.4 Gemini Notebook / NotebookLMとの差別化 — citationとEvidence Pointerは別物
 
@@ -256,7 +256,7 @@ Kio が同じ轍を踏まないための行動原則:
 
 Kio は要素が多すぎるので、MVP では **一次・二次** を厳格に分ける。
 
-### 5.1 MVP に含める (Phase 1〜3)
+### 5.1 MVP に含める
 
 ```text
 content-addressed raw object 保存
@@ -276,27 +276,11 @@ time-travel search (--at)
 
 ---
 
-# 6. Phase Plan (価値の柱の区分 — 実装順ではない。実装順の正本は [09-mvp-scope.md §3](09-mvp-scope.md) の Step 計画 / README §2)
+# 6. 製品の柱
 
-```
-Phase 1: Evidence 基盤
-  - raw object 保存
-  - normalized markdown 生成 (incremental 含む)
-  - chunk 生成
-  - Evidence Pointer
-
-Phase 2: 検索
-  - FTS5
-  - sqlite-vec
-  - hybrid search (paging / MMR)
-
-Phase 3: 履歴
-  - tree
-  - commit / snapshot object
-  - restore
-  - --at / --all-history
-
-```
+- 根拠の保存と引用。原本・正規化 Markdown・chunk を保存し、Evidence Pointer で根拠を指す。
+- 検索。FTS5 と sqlite-vec による hybrid 検索、paging、MMR を提供する。
+- 履歴。tree と commit に版を記録し、過去版を検索して復元できる。
 
 ---
 

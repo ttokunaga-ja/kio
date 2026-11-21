@@ -221,7 +221,7 @@ const TOOLS_ADAPTER_ROLES: &[&str] = &["prepare", "markdown", "embedding"];
 /// R13-2: the documented per-adapter fields (docs/03 §11 + docs/07 §1/§6). Any
 /// other field in an adapter entry is a typo/unknown key → rejected. `dimensions`
 /// / `distance` / `modality` / `mode` are embedding fields (docs/07 §6).
-/// `pricing` is QA19 (step4b-contract-tests-p3a.md §F, 03 §11 L832-837 /
+/// `pricing` is QA19 (docs/03-data-model.md §11 /
 /// 07 §4 L298-303): the `[<role>.<tool_id>.pricing]` nested price table.
 const TOOLS_ENTRY_FIELDS: &[&str] = &[
     "kind",
@@ -252,7 +252,7 @@ const LOCAL_EMBEDDING_FIELDS: &[&str] = &[
     "truncate_dimensions",
 ];
 
-/// QA19 (step4b-contract-tests-p3a.md §F, 10 §11.3 L952): the closed
+/// QA19 (docs/10-operations.md §11.3): the closed
 /// `billable_units[].kind` enum a `[pricing]` table's keys must be drawn from
 /// — identical to `kio_pipeline::ledger::ops::BILLABLE_UNIT_KINDS` and
 /// `types::BillableUnitKind`'s serialized variants (kio-adapter cannot depend
@@ -1080,7 +1080,7 @@ fn declared_adapter(tool_id: Option<&str>, entry: &toml::value::Table) -> Declar
     }
 }
 
-/// QA19 (step4b-contract-tests-p3a.md §F, 03 §11 L832-837): the declared
+/// QA19 (docs/03-data-model.md §11): the declared
 /// `[pricing]` table for `role` in an already-parsed `tools.toml`, resolved
 /// the same way [`declared_adapter_for_role`] resolves the adapter fields —
 /// both the flat `[role] pricing = {...}` shape and the nested
@@ -2532,7 +2532,7 @@ auth = "env:MISTRAL_API_KEY"
     }
 
     // ------------------------------------------------------------------
-    // QA19 (step4b-contract-tests-p3a.md §F): tools.toml `[pricing]`.
+    // QA19 (docs/07-adapter-spec.md §4): tools.toml `[pricing]`.
     // ------------------------------------------------------------------
 
     /// `PRICING_KIND_ENUM` must stay byte-for-byte identical to

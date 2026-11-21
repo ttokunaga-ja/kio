@@ -1204,7 +1204,7 @@ impl RegistryDb {
     }
 
     /// Every registration, deterministic order — PB25's `--registry-prune`
-    /// (step4b-contract-tests-p2b.md §H) enumerates the whole table to find
+    /// (docs/10-operations.md §3) enumerates the whole table to find
     /// unreachable rows, not just search targets or one scope_id's rows.
     pub fn all_entries(&self) -> Result<Vec<RegistryEntry>> {
         self.query_entries(
@@ -2874,7 +2874,7 @@ mod tests {
         assert_eq!(found[0].root_path, "/tmp/new");
     }
 
-    // PB25 (step4b-contract-tests-p2b.md §H): `all_entries`/`remove` are the
+    // PB25 (docs/10-operations.md §3): `all_entries`/`remove` are the
     // primitives `kio repair registry-prune` uses to enumerate the whole
     // table and delete a proven-unreachable row.
     #[test]

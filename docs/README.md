@@ -1,75 +1,9 @@
-# Kio 設計ドキュメント
+# Kio 製品仕様
 
-> **Local-first knowledge archive, powered by frontier AI.**
-> **データはローカル、計算は最強の AI を使う。**
-
-Kio は **local-first** な知識アーカイブ。データの主権はあなたのマシンにあり、Markdownize や Embedding には外部 Adapter を opt-in で利用できる。embedding はモデル準備後の既定 local EG2 と Gemini、汎用 local endpoint を同じ契約で扱う（[07 §5.3](07-adapter-spec.md)）。取得済み EG2 はネットワークなしで動く。現行 RC の組込み接続は Mistral OCR と Gemini embedding が中心であり、任意の Claude / GPT 等を呼ぶ汎用 dispatcher は未提供である。実 provider の利用可能性は接続試験で確認する。
-
-二次表現: **Evidence-grounded local knowledge archive (原文根拠付きローカル知識アーカイブ)**。
-
-> **第一価値命題**: 「探せなかったファイルがすぐ見つかる」「根拠が死なない」。
-
----
-
-# 0. Kio の中核 (3 点)
-
-```
-1. Evidence Pointer        path ではなく commit / tree / raw_hash / chunk_hash / span で根拠を指す
-2. Markdown 正規化         全ファイル種別を Normalized Markdown に変換、人間と AI が同じビューを使う
-3. Content-addressed CAS   全ファイルを CAS object として保存。削除済み・過去版・移動済みでも到達可能
-                           (必要な履歴の保持と現行policyによる許可が必要。shallow / purge / erase は別扱い)
-```
-
-最低体験ライン:
-
-引用の意味は不変でも、本文解決には必要な履歴の保持と現在のpolicyが必要である。
-重要な版のtag保護とshallow / purge / eraseの違いは
-[08-evidence-pointer-spec.md §2.4](08-evidence-pointer-spec.md#24-識別子の安定性と引用の保持) を参照する。
-
-```bash
-kio init
-kio index --preview      # ローカル取り込み対象と送信policyを確認
-kio index --offline --yes # ローカル取り込み + ベースライン index。外部ネットワーク禁止 (07 §3)
-kio search "あの PDF"
-kio open <検索結果の pointer>
-```
-
-# 0.1 ターゲットユーザー
-
-```
-- 大量の PDF・Markdown・コード・画像・研究資料を扱う
-- 開発者・研究者・技術者
-- Git や CLI に抵抗がない
-- ローカルファイルが散らかっている
-- AI 検索を試したいが、クラウド丸投げは嫌
-```
-
-# 0.2 二層構造 — truth と cache
-
-```
-truth = folder-local .kio                知識・scope・送信承認の正本: raw object / normalized / chunks / commits / refs
-truth = device/central operational state 課金台帳・in-flight intent 等の非知識運用正本
-cache = scope_registry                   探索対象一覧 / stale 検出
-cache = aggregator                       全 scope の chunk (live + 過去) の read replica
-                                         (横断検索の採点・候補選択 / 権限状態の横断投影)
-```
-
-`scope_registry` / `aggregator` のみで `.kio` の状態を変える実装は禁止。aggregator は安全性判定の
-最終権限を持たず、結果を返す scope は live `.kio` で再確認する。詳細 [03-data-model.md §4](03-data-model.md) /
-[05-runtime.md §1.8](05-runtime.md)。
-
----
-
-# 1. ドキュメント構成 と Reading Path
-
-`docs/` 直下に実装スペック、製品要件、明示した設計提案を置く。`README.md` (本書) を最初に読み、
-続いて `01-` から `13-` の順に読む。`11-` は製品要件、`12-` と `13-` は承認済み方針、
-変更検知と線形履歴・復元の契約を定める。
-実装済みを3 OS受入・配布済みと同一視しない。
+01 から順に読む。01〜10 と 12〜13 は設計・実装・運用の契約、11 は v1 の製品要件を定める。
 
 | 順 | ファイル | 役割 |
 | --- | --- | --- |
-| 0 | [README.md](README.md) | 全体俯瞰・Reading Path (本書) |
 | **01** | [01-positioning.md](01-positioning.md) | **★最初に読む**。core 一文 / ターゲット / 差別化の核 / **Local・将来Cloudの競合分析 + Perkeep失敗分析** / 既存ワークフロー / 発言禁止リスト |
 | **02** | [02-philosophy.md](02-philosophy.md) | 理念 (Evidence Pointer の根拠、Markdown 正規化の妥協点、忘れない vs purge) |
 | **03** | [03-data-model.md](03-data-model.md) | **★契約**: CAS / `.kio` layout / object 種別 / identity / `tool_profile_hash` / 書き込み境界 / dedup スコープ |
@@ -78,96 +12,11 @@ cache = aggregator                       全 scope の chunk (live + 過去) の
 | **06** | [06-cli-spec.md](06-cli-spec.md) | CLI 全コマンド / exit code / error code namespace / JSON output / observability |
 | **07** | [07-adapter-spec.md](07-adapter-spec.md) | Adapter trait (Prepare / Markdownize / Embedding / etc.) / 実行形態 / **incremental Markdownize プロンプト規約** |
 | **08** | [08-evidence-pointer-spec.md](08-evidence-pointer-spec.md) | Evidence Pointer schema / 解決手順 / **Dead Pointer (purge) のセマンティクス** / exact-only retarget / 外部 Agent 相互運用 |
-| **09** | [09-mvp-scope.md](09-mvp-scope.md) | MVP scope / RC platform support matrix / non-authorizing roadmap / Step 1-4 / **コード規模と構造の上限 (OS 共通ロジックと OS 固有層の分離)** / 北極星シナリオ / 決定済みの設計論点 |
+| **09** | [09-mvp-scope.md](09-mvp-scope.md) | MVP の範囲、コード規模と構造の上限、北極星シナリオと評価規約 |
 | **10** | [10-operations.md](10-operations.md) | 管理とストレージ保護 / 台帳とバックアップ / 設定 / 観測ログ / 導入 |
 | **11** | [11-product-requirements.md](11-product-requirements.md) | **製品要件の正本**: v1 の到達要求、RCとの区別、v2/v3 の境界、検証要求 |
 | **12** | [12-change-detection.md](12-change-detection.md) | **承認済み方針・実装対応**: OSイベント、差分走査、欠落復旧、子scope自動管理、後続の版別状態表示 |
 | **13** | [13-linear-history.md](13-linear-history.md) | **承認済み方針・実装対応**: 線形履歴、管理対象復元、公開・回復、tag保持、後続の操作表示 |
 
-01〜10、12〜13 は設計・実装・運用契約、11 は製品要件である。契約が RC の現状や提案を記録する場合、v1 の到達要求と実装済みを混同しない。旧統合要件ドラフトは current consumer がなく、旧 CLI/schema を残すだけだったため削除済みである。
-
-## 1.1 非規範の戦略文書
-
-[`strategy/`](../strategy/) は市場・事業・将来製品の意思決定材料を置く領域であり、`01-`〜`13-` のReading Pathや実装specには含めない。現在の将来Cloud仮説は [cloud-competitive-advantage.md](../strategy/cloud-competitive-advantage.md) を参照する。同文書の機能・roadmap・設計判断は、明示的にspecへ採用されるまで未承認である。
-
----
-
-# 2. Phase Plan と Step 計画
-
-詳細は [09-mvp-scope.md](09-mvp-scope.md)。
-
-現在の計画・進捗・残作業は [v1 plan](../tasks/v1-plan.md)、利用者の決定は
-[decisions](decisions.md)、技術契約は上記の docs/01〜13、役割と運用は
-[AGENTS.md](../AGENTS.md) を参照する。
-
-`tasks/` には、計画のほかに、任意の高コスト検証の手順、v1 後の設計、正式な受入の経路の資料、
-テストが節番号で引用する試験仕様（`step4b-contract-tests-*.md`）だけを置く。コードや資料にある
-`tasks/<名前>.md (git 56a6831)` という表記は、2026-11-13 に削除した資料を指し、その commit で読める
-（`git show 56a6831:tasks/<名前>.md`）。
-
-```
-Phase 1: Evidence 基盤    raw / normalized / chunk / Evidence Pointer
-Phase 2: 検索             FTS5 / sqlite-vec / hybrid (paging / MMR)
-Phase 3: 履歴             tree / commit / restore / --at / time-travel
-```
-
-Step 計画と、OS 共通ロジック・OS 固有層ごとのコード規模と構造の上限は
-[09-mvp-scope.md §3](09-mvp-scope.md) を正本とする。
-
----
-
-# 3. 北極星シナリオ (Phase 3 完成時の Done 条件)
-
-詳細は [09-mvp-scope.md §4](09-mvp-scope.md)。
-
-```
-M3-1: 「3ヶ月前に書いた結論の根拠 PDF を 5 秒以内に出す」
-M3-2: 「リネーム済みファイルの過去版を含めて検索」
-M3-3: 「削除したはずの資料から特定の数字を再発見」
-```
-
-実装中の機能追加は「3 シナリオのどれに resp するか」で判断する。
-
----
-
-# 4. 決定済みの設計論点
-
-Phase 1 着手前に確定した論点の結論と正本は [09-mvp-scope.md §5](09-mvp-scope.md) にまとめる。
-
----
-
-# 5. 設計判断の正本は spec に閉じる
-
-ADR (Architecture Decision Records) フォルダは廃止しました。本プロジェクトでは:
-
-- **設計・実装・運用契約は01〜10と12〜13、製品要件は11**。
-- 「なぜそう決めたか」は spec の各セクション冒頭に短く埋め込む (例: `01-positioning.md §1.1`「なぜ local-first であって offline-first ではないか」)
-
-将来、本当に「逆方向の判断もありえた」「外部から問われたら答える義務がある」決定が出てきた時点で、改めて `adr/` を作る方針です。
-
----
-
-# 6. 編集規約
-
-- **形式**: GitHub-flavored Markdown。
-- **言語**: 日本語。固有名詞・コード片は原語のまま。英語で書かれた 14 は文書削減工程で各契約書へ統合する。
-- **コードブロック**: 言語タグ必須 (`bash`, `toml`, `json`, `rust`, `sql`, `text`)。既存の列挙・図示 block の無タグ fence は `text` 扱い (新規追加時にタグ必須)。
-- **相対リンク**: docs/ ルート相対。
-- **スキーマ変更**: 03-data-model.md / 07-adapter-spec.md の変更は破壊的変更扱い。安定版前は旧 format を明示的に reject し、migration / alias / compatibility reader を要件にしない。利用者ファイルと knowledge を明示操作なしに破壊しない。
-- **発言禁止フレーズ**:
-  - ✗ "Git for knowledge" / "個人 AI アシスタント" / "OS 級" / "Knowledge Graph for personal data" / "Notion / Obsidian キラー"
-  - ✗ "offline-first" (誤解を招く。"local-first" を使う — 禁止はプロダクトの呼称・訴求としての使用であり、否定・対比文での言及は可)
-  - ✗ "private AI" / "機密 AI"
-  - ✗ "データはあなたのマシンから出ない" (デフォルト構成では偽。「保管と主権はローカル」と言い換える)
-- **採用する語**:
-  - ✓ Local-first knowledge archive, powered by frontier AI. (core)
-  - ✓ データはローカル、計算は最強の AI を使う。(core 日)
-  - ✓ local-first / Evidence-grounded local knowledge archive
-  - ✓ Evidence Pointer / time-travel knowledge navigation
-- **仕様の更新**: 仕様書は現在の合意済み仕様の正本であり、凍結期間を設けない。仕様を変える実装では、
-  先に該当する節を更新する。古い説明・参照・例は同じ変更で更新または削除し、経緯は git 履歴に任せる。
-- **仕様書に書くもの**: 利用者と外部 Agent が観測・依存する契約に限る。CLI の構文・出力・JSON・exit・
-  分岐に使う error code、保存形式、Evidence Pointer、送信承認と課金の境界、回復の保証と失敗時の扱い。
-- **仕様書に書かないもの**: 実装の機構 (system call、lock・retry の内部手順、OS ごとの API や回避策)、
-  コードと同じ内容の転記、実装・検証の経緯や日付付きの裁定記録。OS 固有の機構は OS 固有層のコードとコメントを
-  正本とする ([09-mvp-scope.md §3](09-mvp-scope.md))。同じ規則を複数の文書へ転記せず、正本の節を参照する。
+利用者の決定と背景は [decisions.md](decisions.md) に記録する。
+[Cloud の競争仮説](proposals/cloud-competitive-advantage.md) は将来製品の提案で、仕様への採用には明示的な決定が必要である。

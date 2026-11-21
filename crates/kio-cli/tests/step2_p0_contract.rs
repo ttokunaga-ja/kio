@@ -1623,7 +1623,7 @@ fn ct2_budget_005_online_success_records_ledger_and_caps_next_task() {
     });
     assert!(online_entry.is_some());
 
-    // QA11/QA12 (step4b-contract-tests-p3a.md §D): `[budget.per_adapter]` is
+    // QA11/QA12 (docs/04-pipeline.md §5.4): `[budget.per_adapter]` is
     // DEVICE-layer only (04 §5.4 L768 — "folder cap は total のみ"); the
     // folder `.kio/config.toml` no longer accepts this key at all (schema
     // error). Set the cap in the device config
@@ -1693,7 +1693,7 @@ fn r11_2_batch_resume_budget_pause_exits_6() {
         task["input_path"] == "a.pdf"
             && task["status"] == "paused"
             && task["fallback_reason"] == "budget_exceeded"
-            // QA1 (step4b-contract-tests-p3a.md §A): a budget-paused task
+            // QA1 (docs/04-pipeline.md §5.2–5.3): a budget-paused task
             // carries the closed `hold_reason` enum value.
             && task["hold_reason"] == "budget"
     }));
@@ -1950,7 +1950,7 @@ fn w2_related_images_are_derived_from_chunk_bodies_and_omitted_when_absent() {
     );
 }
 
-/// QA2 (step4b-contract-tests-p3a.md §A, 04 §5.2 L679-683): an auth failure
+/// QA2 (docs/04-pipeline.md §5.2): an auth failure
 /// lands `paused` with `hold_reason="auth"`, never `failed` — this test used
 /// to assert `status=="failed"` + `attempts==1` (the pre-QA2 shape). Under
 /// QA2 a pause is not a retry-budget event, so `attempts` stays 0 (a later
@@ -1993,7 +1993,7 @@ fn ct2_task_005_auth_error_task_is_not_retried() {
     assert_eq!(online_task["attempts"], 0);
 }
 
-/// QA3 (step4b-contract-tests-p3a.md §A, 04 §5.2 L682-683): rate_limit stays
+/// QA3 (docs/04-pipeline.md §5.2): rate_limit stays
 /// `pending` + `next_retry_at` (never `failed`) — this test used to find the
 /// task via `status=="failed"`; it now finds it via
 /// `fallback_reason=="rate_limit"` and asserts `status=="pending"`. The
@@ -2680,7 +2680,7 @@ fn ct2_task_007_online_task_not_reissued_for_completed_identity() {
     );
 }
 
-/// QA3 (step4b-contract-tests-p3a.md §A, 04 §5.2 L682-683): rate_limit stays
+/// QA3 (docs/04-pipeline.md §5.2): rate_limit stays
 /// `pending` + `next_retry_at` (never `failed`), and `attempts` is NOT
 /// consumed (was `1` pre-QA3; max_attempts=∞, 04 §5.3). `late["tasks_updated"]`
 /// also flips `1 -> 0`: that counter is `batch retry`'s Failed->Pending

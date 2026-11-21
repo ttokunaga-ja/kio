@@ -1,17 +1,14 @@
 # 09 MVP Scope
 
-> 本書は MVP の範囲、実装 Step、コード規模と構造の上限、北極星シナリオと評価規約、決定済みの設計論点を定める。
+> 本書は MVP の範囲、コード規模と構造の上限、北極星シナリオと評価規約、決定済みの設計論点を定める。
 
 ---
 
 # 1. MVP に含める / 捨てる
 
-> 本書の Phase、Step、RC matrix と内部評価基準は historical/current implementation contract である。
-> v1 の製品要件、ロードマップの製品境界、未充足状態の正本は
-> [11-product-requirements.md](11-product-requirements.md)。相違する場合は同書を優先し、
-> 本書の古い実装計画から v1 の機能完了を推論してはならない。
+> v1 の製品要件と以降の製品境界は [11-product-requirements.md](11-product-requirements.md) を参照する。
 
-## 1.1 MVP に含める (Phase 1〜3)
+## 1.1 MVP に含める
 
 ```
 - content-addressed raw object 保存
@@ -22,15 +19,17 @@
 - Hybrid search (paging / MMR / cursor)
 - Evidence Pointer
 - snapshot DAG (commit / tree)
-- kio index 完了時の auto snapshot (定期 auto snapshot / watch の Phase 記述は historical RC plan であり、v1 の変更検出要件は [11-product-requirements.md](11-product-requirements.md) を参照)
+- kio index 完了時の auto snapshot
 - export (--to 必須)
 - time-travel search (--at / --all-history / --include-deleted)
 - ベースライン index (deterministic 抽出 + FTS。API キーなしで init→index→search→open が成立 — [01-positioning.md §3](01-positioning.md))
 - 初回スキャン preview + 明示承認
 - budget guardrail (cost ceiling / kill switch)
 - purge 最小形 (tombstone + commit_type=purged + 検索除外 + ログスクラブ。M3-3 の完了条件)
-- kio evidence verify <pointer> / kio evidence verify --batch <pointers.jsonl> (Phase 4 milestone 6 の implemented target/current)
+- kio evidence verify <pointer> / kio evidence verify --batch <pointers.jsonl>
 ```
+
+変更検出と watch の要件は [11-product-requirements.md](11-product-requirements.md) を参照する。
 
 ## 1.2 v1 automatic-child implementation boundary
 
@@ -48,10 +47,7 @@
 identity 不一致、symlink / junction / reparse point は採用しない。child の管理開始は device-private egress
 grant、trust、ledger authority を作成・継承しない。
 
-# 2. 将来ロードマップ（historical。製品境界は 11 を参照）
-
-直前の RC matrix は RC.3 時点の制約であり、v1 の実装境界や acceptance 結果を表明しない。特に Windows の
-自動 child mutation 未対応という RC の制約は現行実装には適用しない。
+# 2. 将来の検討項目
 
 以下は実装を許可せず、CLI syntax、schema、error code、default、互換性を定めない名称だけの記録である。
 
@@ -72,8 +68,6 @@ grant、trust、ledger authority を作成・継承しない。
 - semantic diff / perceptual reuse
 - Summary / Classification adapters
 
-`tasks/` には現在の計画、任意の検証手順、v1 後の設計と履歴がある。現在の工程は [v1 plan](../tasks/v1-plan.md) を参照する。
-
 v2 は GUI で CLI の全機能を提供し、履歴の選択と最新版への復元を含む。v3 は cloud sharing、
 collaboration、複数利用者を扱う。revert の transaction、CLI、線形履歴 schema は未決の提案であり、
 この文書は実装詳細を課さない。v1 で user/group ACL は要求しない。外部送信への consent は
@@ -81,20 +75,10 @@ multiuser ACL ではない。
 
 ---
 
-# 3. 実装 Step とコード規模・構造の上限
+# 3. コード規模・構造の上限
 
 embedding は既定 local の EG2 と Gemini がともに画像を扱う。統一実行契約は
 [04-pipeline.md §5](04-pipeline.md)、Adapter 条件は [07-adapter-spec.md §5.3](07-adapter-spec.md) を参照する。
-
-```text
-Step 1: kio-core + kio-cli で init / status / snapshot / log / diff / inspect / tag
-Step 2: kio-pipeline + kio-adapter (ベースライン抽出、opt-in の AI 強化、batch / budget)
-Step 3: kio-index + kio-search (hybrid + Evidence Pointer)
-Step 4: export + --at + time-travel + purge 最小形 (tombstone) + evidence verify (単発)
-```
-
-Step は Phase 1〜3 の実装順序の記録である。現在の v1 工程は
-[v1 plan](../tasks/v1-plan.md) を参照する。
 
 **前提: OS 共通ロジックと OS 固有層の分離**
 
@@ -153,58 +137,56 @@ symbolic link、UTF-8 でない file、`platform/` の規定外の file、この
 - 上限は設計肥大化の検知に使う。行数を減らすために必要な検証、エラー処理、回復処理を削らない。
   行数削減を目的に型付き response を汎用 JSON 値へ置き換えない。
 
-## 3.1 機能 × Step 割当表
+## 3.1 機能と仕様の参照先
 
-05/06/08 の契約機能がどの Step / Phase で実装されるかの **正本は本表**。各契約 spec の記述は「契約の内容」を定め、本表は「実装時期」を定める。本表にない機能を実装したくなったら、まず本表への追加 (と北極星シナリオとの対応確認) を行う。
+| 機能 | 正本 |
+| --- | --- |
+| CAS raw object store + snapshot DAG (tree / commit) | [03-data-model.md](03-data-model.md) |
+| `init` / `status` / `snapshot create` / `snapshot auto` / `log` / `diff` / `inspect` / `tag` | [06-cli-spec.md §1](06-cli-spec.md) |
+| `gc_policy` × `commit_type` 対応の schema | [05-runtime.md §2.2](05-runtime.md) |
+| JSON Schema validation | [06-cli-spec.md §10](06-cli-spec.md) |
+| 観測ログ `events.jsonl` / `errors.jsonl` | [06-cli-spec.md §12](06-cli-spec.md) |
+| 初回スキャン preview + 明示承認 / `.kioignore` | [06-cli-spec.md §2](06-cli-spec.md) / [10-operations.md §1](10-operations.md) |
+| preview のコスト概算・budget 超過警告 | [06-cli-spec.md §2](06-cli-spec.md) / [10-operations.md §1](10-operations.md) |
+| Prepare / Markdownize (full + incremental) / Adapter 実行 | [07-adapter-spec.md](07-adapter-spec.md) / [04-pipeline.md §3](04-pipeline.md) |
+| 同梱 deterministic Adapter によるベースライン抽出 (normalized まで) | [07-adapter-spec.md §2.1](07-adapter-spec.md) |
+| Mistral OCR 系標準 Markdownize Adapter + embedded image 抽出・image object 保存 | [07-adapter-spec.md §5.2](07-adapter-spec.md) / [03-data-model.md §2](03-data-model.md) |
+| batch / retry / resume / budget guardrail | [04-pipeline.md §5](04-pipeline.md) |
+| `kio index` 完了時の auto snapshot (no-op 条件・HEAD 更新 — §1.1 の MVP 項目) | [05-runtime.md §8](05-runtime.md) |
+| `kio adapter revoke` (network 承認の取り消し) | [07-adapter-spec.md §3](07-adapter-spec.md) / [06-cli-spec.md §1](06-cli-spec.md) |
+| `kio repair registry-prune` (恒久到達不能 registry 行の確認付き退役) | [10-operations.md §3](10-operations.md) |
+| 構造化 task/artifact descriptor (Adapter 境界の内部 API) | [06-cli-spec.md §9](06-cli-spec.md) |
+| secrets Tier A/B 除外 + quarantine + `--yes` 制約 + `approval_method` 記録 | [10-operations.md §1.1](10-operations.md) / [06-cli-spec.md §2](06-cli-spec.md) |
+| chunk / Embedding / FTS5 / sqlite-vec | [04-pipeline.md §4](04-pipeline.md) |
+| hybrid search (RRF / MMR / paging / cursor) | [05-runtime.md §1](05-runtime.md) |
+| Evidence Pointer 発行・解決 / `kio open` / `kio view` | [08-evidence-pointer-spec.md §2-3](08-evidence-pointer-spec.md) |
+| `kio search --json` (外部 Agent 向け最小契約) + `index_status` | [05-runtime.md §1.7](05-runtime.md) |
+| `kio reindex` (gen+1 の再 Markdownize / 再 index) | [07-adapter-spec.md §9](07-adapter-spec.md) / [03-data-model.md §6](03-data-model.md) |
+| 観測ログ `metrics.jsonl` / `access.jsonl` (M3 の latency 計測に必要) | [06-cli-spec.md §12](06-cli-spec.md) / [05-runtime.md §7](05-runtime.md) |
+| `export --to` / `--at` / `--all-history` / `--include-deleted` | [05-runtime.md §4](05-runtime.md) |
+| purge 最小形 (tombstone + `commit_type=purged` + 検索除外 + `--erase-tombstone` + ログスクラブ [10-operations.md §7](10-operations.md)) | [05-runtime.md §3](05-runtime.md) / [08-evidence-pointer-spec.md §4.1](08-evidence-pointer-spec.md) |
+| `kio repair rebuild-db` (SQLite index 再構築 — 破損時の復旧経路) | [10-operations.md §7.5.3](10-operations.md) |
+| `kio repair verify-objects` (CAS object 整合性検証) / `--prune-orphans` (orphan prepared/image 削除 — 法務 purge の完結手段) | [10-operations.md §7.5](10-operations.md) |
+| `kio evidence verify <pointer>` (単発) | [08-evidence-pointer-spec.md §4.3](08-evidence-pointer-spec.md) |
+| retention shallow 候補の read-only planner (`kio gc --dry-run`) | [06-cli-spec.md §6.1](06-cli-spec.md) / [05-runtime.md §2.2-2.4](05-runtime.md) |
+| receipt先行・crash recovery付きの on-demand tree-only shallow sweep (`kio gc [--yes]`) | [06-cli-spec.md §6.1](06-cli-spec.md) / [05-runtime.md §2.2-2.3](05-runtime.md) |
+| 明示opt-inのbounded tiered retention hook (`gc.mode="after_index"`、successful index/manual snapshot後) | [06-cli-spec.md §6.1](06-cli-spec.md) / [05-runtime.md §2.3-2.5](05-runtime.md) |
+| 定期 auto snapshot (OS スケジューラ委譲、常駐なし) | [05-runtime.md §8](05-runtime.md) |
+| Rust-only on_idle GC (OS scheduler が起動する `kio snapshot auto` に限定、常駐なし) | [05-runtime.md §2.3](05-runtime.md) |
+| `kio evidence verify --batch` | [08-evidence-pointer-spec.md §4.3](08-evidence-pointer-spec.md) |
+| `kio evidence retarget <pointer> --at <commit>` | [08-evidence-pointer-spec.md §5](08-evidence-pointer-spec.md) |
+| Rust-only unreachable-object read-only inventory (`kio gc --dry-run --prune-unreachable`) | [06-cli-spec.md §6.2](06-cli-spec.md) / [05-runtime.md §2.7](05-runtime.md) |
 
-| 機能 | 正本 | 実装 |
-| --- | --- | --- |
-| CAS raw object store + snapshot DAG (tree / commit) | [03-data-model.md](03-data-model.md) | Step 1 |
-| `init` / `status` / `snapshot create` / `snapshot auto` / `log` / `diff` / `inspect` / `tag` | [06-cli-spec.md §1](06-cli-spec.md) | Step 1 + Phase 4 milestones 4–5 |
-| `gc_policy` × `commit_type` 対応の schema 遵守 (GC 実行はしない) | [05-runtime.md §2.2](05-runtime.md) | Step 1 |
-| JSON Schema validation (Step 1 は scope / manifest / config。以後各 Step で対象 schema を追加) | [06-cli-spec.md §10](06-cli-spec.md) | Step 1〜 |
-| 観測ログ `events.jsonl` / `errors.jsonl` | [06-cli-spec.md §12](06-cli-spec.md) | Step 1 |
-| 初回スキャン preview + 明示承認 / `.kioignore` | [06-cli-spec.md §2](06-cli-spec.md) / [10-operations.md §1](10-operations.md) | Step 2 |
-| preview のコスト概算・budget 超過警告 | [06-cli-spec.md §2](06-cli-spec.md) / [10-operations.md §1](10-operations.md) | Step 2 |
-| Prepare / Markdownize (full + incremental) / Adapter 実行 | [07-adapter-spec.md](07-adapter-spec.md) / [04-pipeline.md §3](04-pipeline.md) | Step 2 |
-| 同梱 deterministic Adapter によるベースライン抽出 (normalized まで — 検索成立は Step 3 の index/search と合わせて) | [07-adapter-spec.md §2.1](07-adapter-spec.md) | Step 2 |
-| Mistral OCR 系標準 Markdownize Adapter + embedded image 抽出・image object 保存 | [07-adapter-spec.md §5.2](07-adapter-spec.md) / [03-data-model.md §2](03-data-model.md) | Step 2 |
-| batch / retry / resume / budget guardrail | [04-pipeline.md §5](04-pipeline.md) | Step 2 |
-| `kio index` 完了時の auto snapshot (no-op 条件・HEAD 更新 — §1.1 の MVP 項目) | [05-runtime.md §8](05-runtime.md) | Step 2 |
-| `kio adapter revoke` (network 承認の取り消し — opt-in 系と同時) | [07-adapter-spec.md §3](07-adapter-spec.md) / [06-cli-spec.md §1](06-cli-spec.md) | Step 2 |
-| `kio repair registry-prune` (恒久到達不能 registry 行の確認付き退役) | [10-operations.md §3](10-operations.md) | Step 3 |
-| 構造化 task/artifact descriptor (Adapter 境界の内部 API) | [06-cli-spec.md §9](06-cli-spec.md) | Step 2 |
-| secrets Tier A/B 除外 + quarantine + `--yes` 制約 + `approval_method` 記録 | [10-operations.md §1.1](10-operations.md) / [06-cli-spec.md §2](06-cli-spec.md) | Step 2 |
-| chunk / Embedding / FTS5 / sqlite-vec | [04-pipeline.md §4](04-pipeline.md) | Step 3 |
-| hybrid search (RRF / MMR / paging / cursor) | [05-runtime.md §1](05-runtime.md) | Step 3 |
-| Evidence Pointer 発行・解決 / `kio open` / `kio view` | [08-evidence-pointer-spec.md §2-3](08-evidence-pointer-spec.md) | Step 3 |
-| `kio search --json` (外部 Agent 向け最小契約) + `index_status` | [05-runtime.md §1.7](05-runtime.md) | Step 3 |
-| `kio reindex` (gen+1 の再 Markdownize / 再 index) | [07-adapter-spec.md §9](07-adapter-spec.md) / [03-data-model.md §6](03-data-model.md) | Step 3 |
-| 観測ログ `metrics.jsonl` / `access.jsonl` (M3 の latency 計測に必要) | [06-cli-spec.md §12](06-cli-spec.md) / [05-runtime.md §7](05-runtime.md) | Step 3 |
-| `export --to` / `--at` / `--all-history` / `--include-deleted` | [05-runtime.md §4](05-runtime.md) | Step 4 |
-| purge 最小形 (tombstone + `commit_type=purged` + 検索除外 + `--erase-tombstone` + ログスクラブ [10-operations.md §7](10-operations.md)) | [05-runtime.md §3](05-runtime.md) / [08-evidence-pointer-spec.md §4.1](08-evidence-pointer-spec.md) | Step 4 |
-| `kio repair rebuild-db` (SQLite index 再構築 — 破損時の復旧経路) | [10-operations.md §7.5.3](10-operations.md) | Step 3 |
-| `kio repair verify-objects` (CAS object 整合性検証) / `--prune-orphans` (orphan prepared/image 削除 — 法務 purge の完結手段) | [10-operations.md §7.5](10-operations.md) | Step 4 |
-| `kio evidence verify <pointer>` (単発) | [08-evidence-pointer-spec.md §4.3](08-evidence-pointer-spec.md) | Step 4 |
-| retention shallow 候補の read-only planner (`kio gc --dry-run`) | [06-cli-spec.md §6.1](06-cli-spec.md) / [05-runtime.md §2.2-2.4](05-runtime.md) | Phase 4 milestone 1 |
-| receipt先行・crash recovery付きの on-demand tree-only shallow sweep (`kio gc [--yes]`) | [06-cli-spec.md §6.1](06-cli-spec.md) / [05-runtime.md §2.2-2.3](05-runtime.md) | Phase 4 milestone 2 |
-| 明示opt-inのbounded tiered retention hook (`gc.mode="after_index"`、successful index/manual snapshot後) | [06-cli-spec.md §6.1](06-cli-spec.md) / [05-runtime.md §2.3-2.5](05-runtime.md) | Phase 4 milestone 3 |
-| 定期 auto snapshot (OS スケジューラ委譲、常駐なし) | [05-runtime.md §8](05-runtime.md) | Phase 4 milestone 4 |
-| Rust-only on_idle GC (OS scheduler が起動する `kio snapshot auto` に限定、常駐なし) | [05-runtime.md §2.3](05-runtime.md) | Phase 4 milestone 5 |
-| `kio evidence verify --batch` | [08-evidence-pointer-spec.md §4.3](08-evidence-pointer-spec.md) | Phase 4 milestone 6 (implemented target/current) |
-| `kio evidence retarget <pointer> --at <commit>` | [08-evidence-pointer-spec.md §5](08-evidence-pointer-spec.md) | Phase 4 milestone 7 (implemented current) |
-| Rust-only unreachable-object read-only inventory (`kio gc --dry-run --prune-unreachable`) | [06-cli-spec.md §6.2](06-cli-spec.md) / [05-runtime.md §2.7](05-runtime.md) | Phase 4 milestone 8 (implemented current) |
-
-注: milestone 1–5 は各 current spec の実装済み契約、milestone 6 の batch verify、milestone 7 の exact-only retarget、milestone 8 の read-only inventory は implemented current である。milestone 8 は物理 prune、non-tree CAS sweep、CoW GC を承認しない。これらは Phase 4 全体の実装済み表明ではない。
+read-only inventory の範囲は到達不能 object の列挙までである。物理 prune、non-tree CAS sweep、CoW GC は §2 の検討項目に含む。
 
 ---
 
-# 4. 北極星シナリオ (Phase 3 完成時の Done 条件)
+# 4. 北極星シナリオと評価基準
 
 この節の PersonaScope/personaCorpus による性能・品質評価は v1 の nonblocking とし、準備後に行う。
 これは機能、security、recovery の受入を不要にするものではなく、v1 の定義を上書きしない。
 
-実装中の機能追加判断は「**3 シナリオのどれに resp するか**」で評価する。該当しないなら Phase 4-5 へ送る。
+機能追加は、次の 3 シナリオのどの課題を解決するかで評価する。
 
 ## M3-1: 「3ヶ月前に書いた結論の根拠 PDF を 5 秒以内に出す」
 
@@ -357,7 +339,7 @@ Done 条件 = synthetic で各シナリオ Recall@10 >= 0.8
 
 # 5. 決定済みの設計論点
 
-Phase 1 着手前に確定した論点の結論と正本である。
+設計論点の結論と仕様の参照先を示す。
 
 | 論点 | 結論 | 正本 |
 | --- | --- | --- |

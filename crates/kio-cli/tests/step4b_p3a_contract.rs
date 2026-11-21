@@ -3,9 +3,9 @@
 //! approval wiring — main.rs exit-code/error/log/config cross-cutting areas
 //! are P3-B's, tested in `step4b_p3b_contract.rs`).
 //!
-//! Source: `tasks/step4b-contract-tests-p3a.md` (QA1-QA71, §W arbitration
-//! 1-8). Test names carry their QA number so a failure maps directly back to
-//! the contract text. Most of the markdownize-response (§K/§L/§M),
+//! See docs/04-pipeline.md §5, docs/07-adapter-spec.md §§3–4, and
+//! docs/10-operations.md §1. QA1-QA71 and §W arbitration 1-8 are recorded at
+//! `1b46cbb5:tasks/step4b-contract-tests-p3a.md`. Most of the markdownize-response (§K/§L/§M),
 //! adapter-type (§F), and identity (§J) contracts are pure functions and are
 //! covered by inline `#[cfg(test)]` unit tests in `kio-pipeline`/`kio-adapter`
 //! instead of duplicated here — this file covers the CLI-process-level
@@ -229,7 +229,7 @@ fn online_markdownize_task(status: &Value) -> Value {
         .unwrap_or_else(|| panic!("no online markdownize task in {status}"))
 }
 
-/// QA2 (step4b-contract-tests-p3a.md §A, 04 §5.2 L679-683): an auth_error
+/// QA2 (docs/04-pipeline.md §5.2): an auth_error
 /// online-markdownize send lands `paused` with `hold_reason="auth"` — never
 /// `failed` — and does not consume the retry budget (`attempts` stays 0, so a
 /// later revival is not budget-exhausted, and `next_retry_at` stays unset).
@@ -276,7 +276,7 @@ fn qa2_auth_error_send_lands_paused_hold_reason_auth() {
     );
 }
 
-/// QA3 (step4b-contract-tests-p3a.md §A, 04 §5.3): rate_limit WITH a provider
+/// QA3 (docs/04-pipeline.md §5.3): rate_limit WITH a provider
 /// `Retry-After` header lands `pending` + `next_retry_at` set EXACTLY
 /// `retry_after_ms` in the future — the `retry_after_ms -> next_retry_at`
 /// wiring's proof (the `rate_limit_after` seam supplies 30_000ms). `attempts`
@@ -577,7 +577,7 @@ fn qa11_status_budget_report_has_no_folder_per_adapter_key() {
 // detection remain deferred, see this file's header note)
 // ===========================================================================
 
-/// QA13 (step4b-contract-tests-p3a.md §E, 04 §5.5 L880): a sync markdownize
+/// QA13 (docs/04-pipeline.md §5.5): a sync markdownize
 /// send under the `require_idempotency_token` seam SUCCEEDS — the seam's
 /// adapter declares `ProviderIdempotency::HttpHeader` and fails closed with
 /// `ContractViolation` on a missing token, so a completed task proves the
@@ -662,7 +662,7 @@ fn qa13_embedding_sync_send_threads_intent_token_to_adapter() {
 // retains role schema checks and preview/scan_approval cost estimates.
 // ===========================================================================
 
-/// QA19 (step4b-contract-tests-p3a.md §F, 03 §11 L832-837): the spec's
+/// QA19 (docs/03-data-model.md §11): the spec's
 /// literal `[<kind>.<tool_id>.pricing]` example is accepted by `tools.toml`
 /// schema validation when that role is selected (docs14 Operation-specific
 /// prerequisites); unrelated local status does not consume this declaration.
@@ -1050,7 +1050,7 @@ fn qa21_config_only_requires_explicit_approval_and_read_gate_is_immutable() {
     assert_eq!(scope["approvals_initialized"], true);
 }
 
-/// QA22 (step4b-contract-tests-p3a.md §G, 07 §3 L148-168, 10 §11.3): the
+/// QA22 (docs/07-adapter-spec.md §3, 10 §11.3): the
 /// persistent approval record is stored in `.kio/scope.json`'s
 /// `approvals[]` — not a device-global file — with the full required-field
 /// row shape (scope_id / tool_id / execution_mode / tool_profile_hash /
@@ -1106,7 +1106,7 @@ fn qa22_approval_row_is_stored_in_scope_json_approvals_not_a_device_global_file(
 // §H `kio adapter revoke` (U80, QA25/26/27)
 // ===========================================================================
 
-/// QA25 (step4b-contract-tests-p3a.md §H, 07 §3 L134-136): `kio adapter
+/// QA25 (docs/07-adapter-spec.md §3): `kio adapter
 /// revoke <tool_id>` with nothing ever approved is an idempotent success
 /// (exit 0, "no_target") that does NOT write the `approvals_initialized`
 /// marker — a no-op revoke must not alter portable consent state.
@@ -1209,7 +1209,7 @@ fn qa25_revoke_requires_tool_id_or_all() {
     assert_eq!(err["error_code"], "KIO-E-CONFIG-USAGE-001");
 }
 
-/// QA26 (step4b-contract-tests-p3a.md §H, 07 §3 L138-142): a concurrent
+/// QA26 (docs/07-adapter-spec.md §3): a concurrent
 /// `kio adapter revoke` that removes `approval_pending` between an
 /// approval's step (0) (pending write) and its step (2) (publish) makes the
 /// publish detect the CAS mismatch and return
@@ -1253,7 +1253,7 @@ fn qa26_publish_detects_concurrent_revoke_removing_the_pending() {
     assert_eq!(error.exit_code().code(), 5);
 }
 
-/// QA27 (step4b-contract-tests-p3a.md §H, 07 §3 L120-134): `kio adapter
+/// QA27 (docs/07-adapter-spec.md §3): `kio adapter
 /// revoke <tool_id>` removes a matching `approval_pending` regardless of
 /// whether its `execution_mode`/`tool_profile_hash` are STALE (left behind
 /// under a profile that has since changed) — matched by `(scope_id,
@@ -1381,7 +1381,7 @@ fn mock_embed_json(dir: &TempDir, args: &[&str]) -> Value {
     serde_json::from_slice(&stdout).unwrap()
 }
 
-/// QA29 (step4b-contract-tests-p3a.md §I, 06-cli-spec.md §1 L52-55,
+/// QA29 (docs/06-cli-spec.md §1,
 /// 07-adapter-spec.md §3 L220-222): `kio repair rebuild-db --online`
 /// drives the post-rebuild enrichment pass's `--online` fallback — the
 /// previously hard-coded `embedding_online_allowed(&repo, false, false,
@@ -1406,7 +1406,7 @@ fn qa29_repair_rebuild_db_online_reaches_the_post_rebuild_enrichment() {
     );
 }
 
-/// QA30 (step4b-contract-tests-p3a.md §I, 06-cli-spec.md §1 L21-30,
+/// QA30 (docs/06-cli-spec.md §1,
 /// 07-adapter-spec.md §3 L220-222): `kio batch resume --online` and `kio
 /// batch retry --online` both drive `execute_pending_tasks`'s embedding
 /// enrichment pass — the previously hard-coded
@@ -1454,7 +1454,7 @@ fn qa30_batch_resume_online_and_offline_are_mutually_exclusive() {
     assert_eq!(err["error_code"], "KIO-E-CONFIG-USAGE-001");
 }
 
-/// QA31 (step4b-contract-tests-p3a.md §I, 06-cli-spec.md §1 L77-83,
+/// QA31 (docs/06-cli-spec.md §1,
 /// 07-adapter-spec.md §3 L220-222): `kio reindex --force --online` drives
 /// the re-normalized generation's embedding enrichment — the previously
 /// hard-coded `embedding_online_allowed(&repo, false, false, false)` call

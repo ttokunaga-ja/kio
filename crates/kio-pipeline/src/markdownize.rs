@@ -443,7 +443,7 @@ pub fn choose_markdownize_mode(input: &IncrementalModeInput) -> IncrementalModeD
     }
 }
 
-/// QA44 (step4b-contract-tests-p3a.md §M): the outcome of validating an
+/// QA44 (docs/04-pipeline.md §5.3): the outcome of validating an
 /// Adapter's markdownize response (04 §3.2). `FallbackToFull` is the
 /// **control** response (04 §3.2 L358) — evaluated ahead of V1-V6, never a
 /// contract violation on an incremental response — that asks the caller to
@@ -2566,7 +2566,7 @@ fn validate_unit_shapes(
     Ok(())
 }
 
-/// QA41 (step4b-contract-tests-p3a.md §L): the machine-verifiable Normalized
+/// QA41 (docs/04-pipeline.md §3): the machine-verifiable Normalized
 /// Markdown v1 rules (07 §5.2.1) — UTF-8 with no BOM, NFC, LF-only line
 /// endings, no trailing space on any line (including inside a fence — only
 /// *syntactic* rules are fence-exempt), the file ends with exactly one LF,

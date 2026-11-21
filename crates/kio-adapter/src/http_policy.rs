@@ -216,7 +216,7 @@ pub(crate) fn read_json_bounded(
     parse_json_bytes_bounded(&body, max_bytes, context)
 }
 
-/// QA16 (step4b-contract-tests-p3a.md §F, 07 §4 L290): parse an HTTP
+/// QA16 (docs/07-adapter-spec.md §4): parse an HTTP
 /// `Retry-After` header value into milliseconds. Only the numeric
 /// delay-seconds form (RFC 9110 §9.2.3) is supported — the rarer HTTP-date
 /// form is not parsed and degrades to `None`, same as a missing header
@@ -236,7 +236,7 @@ pub(crate) fn parse_retry_after_ms(header_value: &str) -> Option<u64> {
     Some(millis as u64)
 }
 
-/// QA13 (step4b-contract-tests-p3a.md §E, 04 §5.5 L880): resolve the
+/// QA13 (docs/04-pipeline.md §5.5): resolve the
 /// idempotency header a sync provider call must carry, or fail closed.
 /// `NotProvided` never inspects `idempotency_token` — the ledger's own
 /// §5.4/§5.8 2-phase record (a `batch_requests` row) is the sole dedup guard,
@@ -628,7 +628,7 @@ mod tests {
         assert!(matches!(err, ureq::Error::Timeout(_)));
     }
 
-    // QA13 (step4b-contract-tests-p3a.md §E, 04 §5.5 L880): the pure
+    // QA13 (docs/04-pipeline.md §5.5): the pure
     // idempotency-header resolution function's 3 cases — see kio-adapter unit
     // tests (a)/(b)/(c) in the implementation report.
     #[test]
