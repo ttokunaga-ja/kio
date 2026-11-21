@@ -101,6 +101,8 @@ V1（テストが実際のホームに書き込まない）と V2（Linux の全
 
 ### 4.1 ローカル（WSL）
 
+Mac での検証の範囲と手順は [handoff.md](handoff.md) の 3 にある（D-20261121-01）。
+
 CI の Linux の job と同じ順で回す。全テストは、systemd の scope の中で、HOME と XDG を repo の `scratch/` に向けて実行する。Codex のサンドボックスの中ではテストが通らない（`/` と `/home` の所有者が別の UID に見える）ので、全テストと synthetic-history は統括がサンドボックスの外で実行する。
 
 ```bash

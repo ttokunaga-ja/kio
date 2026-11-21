@@ -260,3 +260,11 @@
 - **内容**：(1) `kio diff` の派生物だけの変化の表示（`tasks/step4b-contract-tests-p3b.md` の QB39）を v1 で実装する。(2) tree と Evidence Pointer の名前は、論理名と物理名を分けて判定する。論理名は `/`・NUL・空・単独の `.`／`..` を拒否し、それ以外は履歴に保存できる。宛先 OS で安全に作れない名前は、ファイルとして書き出すときに拒否する。Evidence Pointer の `path_at_commit` も同じ論理名の規則で検証する。(3) 明示的に選んだ HTTP embedding が未承認のときは、`docs/05-runtime.md` §1.1 のとおり auto／hybrid を全文検索に縮退させ、EG2 に切り替えない。(4) 有料 OCR の Batch の提供元（Mistral OCR）は incremental の不適用を示す制御応答（`fallback_to_full`）を返さない。Batch の制御応答の記帳と Full の開始の規定を仕様から削除し、実装しない。
 - **理由**：利用者の決定。(1) は承認済みの契約で、実装が欠けていた。(4) は当初 v1 で実装すると決めたが、Mistral は送られたページを常に OCR し、この応答を返す仕組みがないため、製品で到達しない経路になると分かり、利用者が仕様を変えると決め直した。(2) は Unix で正当なファイル名を保存できるようにするため、(3) は利用者が選んだ送信先を黙って別のモデルに替えないため、仕様を揃える。
 - **関係する資料**：`docs/06-cli-spec.md` §1、`docs/03-data-model.md` §2・§3、`docs/08-evidence-pointer-spec.md` §2、`docs/05-runtime.md` §1.1、`docs/07-adapter-spec.md` §2.1、`docs/04-pipeline.md` §5.8、`tasks/v1-plan.md` §3.2b の H1・H2。
+
+## 2026-11-21
+
+### D-20261121-01 作業場所を Mac に移す
+
+- **内容**：kio の作業場所を、個人デスクトップ WSL から Mac の `~/dev/github.com/ttokunaga-ja/kio` に移す。WSL の clone と `scratch/` は消さず、利用者が指示したら `git pull` で WSL に戻れる状態を保つ。同時に両方の環境で作業しない。役割とモデルの分担（D-20261112-01 の後半）は変えない。
+- **理由**：利用者の指示。再び WSL に戻る可能性がある。
+- **関係する資料**：`AGENTS.md`「エージェント運用」の「作業場所」、`tasks/handoff.md`（移管の時点の状態と再開の手順）。D-20261112-01 の作業場所の部分を置き換える。

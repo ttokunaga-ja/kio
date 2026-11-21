@@ -76,11 +76,11 @@
 - Push 前には GitHub の現在の公開範囲、ワークフロー、hooks、差分、送信対象コミット、ローカル検証結果を確認する。公開リポジトリへの Push 許可は、デプロイ・公開・リリース・課金資源の操作の許可を兼ねない。それらを自動実行する Push は対応する操作の許可を必要とする。
 - personaCorpus の成果物制作など、担当者の stage/commit/push を禁止する固有の権限分離は維持する。担当範囲の変更は権限を持つ調整担当が適切な単位でコミットする。
 
-## エージェント運用（2026-11-12〜、個人デスクトップ WSL）
+## エージェント運用（2026-11-12〜）
 
 この節は kio での Claude・Codex の役割とモデル指定の正本であり、`~/.codex/AGENTS.md` の一般的なモデル規定より優先する。
 
-- **作業場所**：個人デスクトップ WSL の `~/dev/github.com/ttokunaga-ja/kio` を正とする。Mac では作業しない。
+- **作業場所**：2026-11-21 から Mac の `~/dev/github.com/ttokunaga-ja/kio` を正とする（D-20261121-01）。個人デスクトップ WSL の clone は残してあり、利用者が指示したときだけ `git pull` で WSL に戻る。同時に両方の環境で作業しない。引き継ぎの状態と手順は `tasks/handoff.md`。
 - **セッション分離**：kio の Claude セッションは kio だけを扱う。personaCorpus のファイルは評価用に読むだけで、変更・commit・lease 操作をしない。personaCorpus の作業は personaCorpus のセッションが行う。
 - **役割とモデル**（effort はすべて medium）
 
