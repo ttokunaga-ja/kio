@@ -50,6 +50,7 @@ gpu_uuid=$(timeout 10 /usr/lib/wsl/lib/nvidia-smi --query-gpu=uuid --format=csv,
 for tool in /usr/sbin/visudo /usr/bin/sudo /usr/bin/flock /usr/sbin/sshd /usr/bin/ssh-keygen /usr/bin/rootlesskit /usr/bin/slirp4netns /usr/bin/newuidmap /usr/bin/newgidmap /usr/bin/getsubids /usr/bin/jq /usr/bin/setfacl; do
   [[ -x $tool ]] || die "Install prerequisite $tool before applying host configuration."
 done
+[[ -x /usr/sbin/iptables ]] || die "Install the iptables package before applying host configuration."
 
 user=kio-test
 homes=/var/lib/kio-v1-local
