@@ -273,20 +273,24 @@ function Test-HostPin([int]$Port, [string]$Address, [string]$PublicKey) {
     $key = (($PublicKey.Trim() -split '\s+')[0..1] -join ' ')
     $hostName = if ($Port -eq 22) { $Address } else { "[$Address]:$Port" }
     $pinned = [IO.Path]::GetTempFileName()
+    $stderr = "$pinned.stderr"
     try {
         [IO.File]::WriteAllText($pinned, "$hostName $key`n", [Text.UTF8Encoding]::new($false))
-        $result = Invoke-Native (Join-Path $sshBin 'ssh.exe') @(
-            '-F', 'NUL', '-p', $Port,
+        $arguments = @(
+            '-n', '-F', 'NUL', '-p', $Port,
             '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes',
-            '-o', "UserKnownHostsFile=$pinned", '-o', 'GlobalKnownHostsFile=NUL',
+            '-o', ('"UserKnownHostsFile={0}"' -f $pinned), '-o', 'GlobalKnownHostsFile=NUL',
             '-o', 'HostKeyAlgorithms=ssh-ed25519', '-o', 'KexAlgorithms=curve25519-sha256',
             '-o', 'PreferredAuthentications=none', '-o', 'ConnectTimeout=3',
             "kio-host-pin-probe@$Address", 'exit')
-        $text = $result.Output -join "`n"
+        $probe = Start-Process -FilePath (Join-Path $sshBin 'ssh.exe') -ArgumentList $arguments `
+            -RedirectStandardError $stderr -WindowStyle Hidden -PassThru
+        if (!$probe.WaitForExit(8000)) { Stop-Process -InputObject $probe -ErrorAction SilentlyContinue; return $false }
+        $text = Get-Content -Raw -LiteralPath $stderr
         # A matching key gets past host verification and is then refused authentication.
         return $text -match 'Permission denied' -and $text -notmatch 'Host key verification failed|REMOTE HOST IDENTIFICATION'
     } finally {
-        Remove-Item -LiteralPath $pinned -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $pinned,$stderr -Force -ErrorAction SilentlyContinue
     }
 }
 

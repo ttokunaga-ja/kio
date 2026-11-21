@@ -548,7 +548,7 @@ printf '%s\n' "$linger_before" > "$backup/linger"
 enabled_link="$home/.config/systemd/user/default.target.wants/$docker_unit"
 docker_enabled=false
 if $have_account && as_user test -L "$enabled_link"; then
-  [[ $(as_user readlink "$enabled_link") == "$docker_service" ]] || die "Unexpected Docker enablement link."
+  [[ $(as_user realpath -e -- "$enabled_link") == "$docker_service" ]] || die "Unexpected Docker enablement link."
   docker_enabled=true
 fi
 docker_active=false
@@ -768,7 +768,9 @@ managed=true
 loginctl enable-linger "$user"
 systemctl start "user@$uid.service"
 userctl daemon-reload
-[[ $(userctl show "$docker_unit" -p FragmentPath --value) == "$docker_service" ]]
+fragment_path=$(userctl show "$docker_unit" -p FragmentPath --value)
+# Ubuntu 24.04 may report the /etc/xdg/systemd/user alias for the same unit.
+[[ $(realpath -e -- "$fragment_path") == "$docker_service" ]]
 [[ -z $(userctl show "$docker_unit" -p DropInPaths --value) ]]
 userctl enable "$docker_unit"
 # Always reload the dedicated processes so an unchanged file cannot hide stale runtime state.
