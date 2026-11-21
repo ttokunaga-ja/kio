@@ -200,6 +200,9 @@ OpenSSH を用意する。WSL は `sudo`、`util-linux`、`rootlesskit`、`slirp
    旧構成の復元が必要なら、退避した unit と `unit-state` を使って元の登録・稼働状態に戻す。
    補助グループを戻すと共有 Docker へのアクセス権も戻るため、旧構成の管理者が必要性を確認する。
 
+   `setup-wsl.sh` と同じレビュー済み commit の `wsl-windows-mounts.py` を同じディレクトリに置き、
+   転送した両ファイルの SHA-256 を照合する。
+
    ```bash
    sudo --preserve-env=WSL_DISTRO_NAME bash scripts/v1-local-gpu/host/setup-wsl.sh \
      Ubuntu-26.04 /path/kio-ci.pub /path/toolkit-base.deb "$CUDA_SMOKE_IMAGE" "$shared_socket"
@@ -210,8 +213,9 @@ OpenSSH を用意する。WSL は `sudo`、`util-linux`、`rootlesskit`、`slirp
    WSL が生成する `nvidia.com/gpu=all` を使い、導入時に GPU が 1 台であることとコンテナ内外の
    UUID 一致を確認する。ソケットは `/run/user/<uid>/kio-v1-local-docker.sock`、data-root は
    `/var/lib/kio-v1-local/state/docker`。 `kio-test` が他グループに所属するか共有ソケットに
-   書き込める場合は適用を止める。起動中の共有 Engine の bind mount にアクセスできる場合も
-   止める。照会先は root 所有 0600 の `/etc/kio-v1-local-shared-gpu-socket` に保存する。
+   書き込める場合は適用を止める。共有 Engine の bind mount は、マスク対象に含まれるものを
+   専用名前空間で検証し、それ以外でアクセスできる場合は適用を止める。
+   照会先は root 所有 0600 の `/etc/kio-v1-local-shared-gpu-socket` に保存する。
    照会はそのソケットだけに接続し、応答不能なら失敗する。
    既存の管理者は別の管理アカウントを使う。WSL の既存 sshd は drop-in の
    `DenyUsers kio-test` を読み、稼働中は reload する。 `kio-test` のパスワードは lock し、
@@ -325,6 +329,8 @@ Windows の LAN IPv4 を `WIN_LAN_IP`、Tailscale IPv4 を `WIN_TAILNET_IP` に�
 指定の端末から TCP 接続を試す。同じ LAN の Mac から Windows の TCP 22 と WSL の TCP 2222
 （Windows の LAN IP 宛て）、許可外の tailnet 端末から Windows の TCP 22 がいずれも拒否されることを
 遮断の合格条件とする。許可外端末での TCP 22 の拒否は Tailscale の grant の検証を兼ねる。
+研究室の LAN の外にいる場合は、研究室ホストは tailnet からの試験で合否を判定し、
+同一 LAN からの試験は未実施と記録する。LAN 試験は Windows と同じ LAN にいるときに実施する。
 LAN 試験では宛先への経路が Mac の LAN IF を通ることを `route -n get "$WIN_LAN_IP"` で確認する。
 TCP の接続拒否またはタイムアウトを確認する。経路やコマンドのエラー時は試験をやり直す。
 tailnet からの TCP 2222 も失敗し、管理 Mac と許可した CI の TCP 22 は成功することを確認する。
@@ -339,7 +345,7 @@ nc -vz -w 5 "$WIN_TAILNET_IP" 2222
 nc -vz -w 5 "$WIN_TAILNET_IP" 22
 ```
 
-上記の接続試験が期待どおりで、新規の Mac 管理者 SSH ログインにも成功したら、Apply が
+対象ホストに必要な接続試験が期待どおりで、新規の Mac 管理者 SSH ログインにも成功したら、Apply が
 表示した ID を使い、昇格した PowerShell から期限内に Confirm を実行する。同じ照合済みスクリプトを使う。
 Mac で管理アカウントを `WIN_ADMIN` に設定し、既存の SSH セッションを共有せずにログインを確認する。
 
@@ -372,27 +378,51 @@ sudo -u kio-test sudo -n -- /var/lib/kio-v1-local/shared-gpu-count
 sudo -u kio-test sudo -n -- /var/lib/kio-v1-local/shared-gpu-count unexpected
 ```
 
-専用 sshd と `user@<kio-test UID>.service` に root 管理の mount namespace を使う。
-両方で `/mnt` は読み取り専用の空 tmpfs、`/init` と `/run/WSL` は不可視とし、
-`WSL_INTEROP` を削除する。専用 sshd には `/mnt` 下にある場合だけ設定したソケット 1 個を
-bind する。rootless Docker 側には共有 socket を見せない。Desktop が bind 元のソケットを再生成して
-接続不能になった場合は照会が失敗する。受入のリースを回収してから専用 sshd の bind を更新する。
+専用 sshd と `user@<kio-test UID>.service` に個別の mount namespace を使う。
+setup は systemd（PID 1）のマウント一覧から `9p`、`drvfs`、`virtiofs` などを列挙し、
+`/mnt` の外にある `/Docker/host` も対象にする。専用名前空間では該当するディレクトリを
+読み取り専用の空 tmpfs で覆う。対象がファイルならアクセスを遮断する。`/init` と `/run/WSL`
+も遮断し、`WSL_INTEROP` を削除する。ディストリビューション間で共有する `/mnt/wsl` と
+`/mnt/wslg` にもマスクを維持する。共有ソケットが覆われる場合、専用 sshd には設定した
+ソケット 1 個だけを bind する。rootless Docker には共有ソケットを見せない。
 
-setup は両名前空間を検査し、CUDA smoke のコンテナ内でも Engine から見た `/mnt` が空である
-ことを検証する。現地では管理者が保護対象 Windows パスの存在を通常の名前空間で確かめ、
-専用サービスの両名前空間では `kio-test` が書込・起動できないことを確認する。
+WSL の GPU ドライバーストアがマスクに含まれる場合、NVIDIA の CDI 生成が参照した
+root 管理のファイルだけを Linux 側の `/opt/kio-v1-local/wsl-cdi` にコピーし、専用 Engine は
+そこに保存した CDI 設定を読む。Windows の GPU ドライバー更新後は setup を再適用する。
+[WSL の Windows ドライブ実装](https://wsl.dev/technical-documentation/drvfs/) ·
+[NVIDIA Toolkit の WSL ドライバーストア参照](https://github.com/NVIDIA/nvidia-container-toolkit/blob/v1.20.1/pkg/nvcdi/driver-wsl.go)
+
+setup は列挙した対象を専用 sshd と user manager の両方で `kio-test` として検査する。
+元のファイルシステムが見えず、書き込み不可であることが合格条件。CUDA smoke の際は
+rootless Engine から見たマスクもコンテナ内で検査する。実機では通常の名前空間で Windows 側の
+マウントと共有ソケットの利用状況を構築前後で比較する。研究室では例えば次を使う。
+
+```bash
+sudo findmnt -T /Docker/host -o TARGET,FSTYPE,SOURCE
+sudo sh -c 'test -r /Docker/host && test -x /Docker/host'
+sudo curl -q --max-time 10 --fail --silent --show-error --noproxy '*' \
+  --unix-socket /run/docker.sock http://localhost/_ping
+```
+
+`/Docker/host` が引き続き Windows 側の同じマウントを指し、ソケットは `OK` を返すことを確認する。
+既存の利用者でも、構築前と同じアカウント・権限でディレクトリの読み取りと接続先 Engine ID を
+確認する。Engine ID は普段の Docker 経路で `docker info --format '{{.ID}}'` を使う。
+setup 自体も通常の名前空間の対象マウント一覧と共有 Engine ID を構築前後で照合する。
+
+専用側の確認例では、setup が表示した各 Windows マウントのパスを `probe` に設定する。
 
 ```bash
 uid=$(id -u kio-test)
-probe='/mnt/c/Users/<実在する保護対象の Windows ユーザー>'
-sudo test -e "$probe"
+probe=/Docker/host
 for unit in kio-v1-local-sshd.service "user@$uid.service"; do
   pid=$(systemctl show "$unit" -p MainPID --value)
+  sudo nsenter --target "$pid" --mount -- findmnt -n -T "$probe" -o FSTYPE
   sudo nsenter --target "$pid" --mount -- runuser -u kio-test -- test -w "$probe"
   sudo nsenter --target "$pid" --mount -- runuser -u kio-test -- test -x /init
 done
 ```
 
+`findmnt` は覆いのファイルシステムを表示するか、対象が見えなければ失敗する。
 両テストは失敗が期待値。`binfmt_misc` の `F` フラグは `/init` を固定できるため、`/init` の
 非表示だけで Windows 実行を防げたと判定しない。`/run/WSL` も遮断する。実際の PE 実行も
 確かめる場合は、同じ Windows の `cmd.exe` を管理者が一時的に Linux 側に置き、
@@ -413,7 +443,8 @@ Windows 側の `KIO_INTEROP_PROBE` が出た場合は受入を止める。終了
 通常の利用者の interop は個人機と研究室の代替手順で保持される。
 Linux カーネルや WSL 自体の隔離、後から追加する別マウント・代理ソケット、管理者が
 専用サービスの外から直接起動した同 UID のプロセスまではこの対策の対象外。
-Windows ドライブが `/mnt` 外にある状態での適用は止める。マウント変更時には再検証する。
+Windows 側のマウントの追加・移動時は再適用と再検証を行う。Desktop が bind 元のソケットを
+再生成して照会が失敗した場合は、リース回収後に専用 sshd の bind を更新する。
 [systemd のファイルシステム名前空間](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html) ·
 [binfmt の固定インタープリター](https://docs.kernel.org/admin-guide/binfmt-misc.html)
 
@@ -467,6 +498,8 @@ kio-test 専用グループの 0640。旧 0644 からの移行では旧ファイ
   に戻す。 `password-state` と `password-last-change` から元のパスワード状態を復元し、
   `authorized-keys-location` に退避した鍵がある場合は使用中のファイルを上書きせず戻す。
   ソケット設定と専用 user manager の drop-in は退避から復元する。
+  専用 CDI ディレクトリも、退避の `wsl-cdi` を `/opt/kio-v1-local/wsl-cdi` に戻す。
+  `wsl-cdi-absent` が記録されていれば、今回の CDI ディレクトリを退避先へ移す。
   元の SSH drop-in を復元後、稼働中の通常 sshd は reload する。新規アカウントを撤去する場合は
   専用データとホームを先に退避する。共有 dockerd の状態は維持する。
   `--terminate-kio-test` で終了したセッションやプロセスは復元の対象外。

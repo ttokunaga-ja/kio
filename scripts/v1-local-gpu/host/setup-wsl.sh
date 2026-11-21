@@ -55,6 +55,7 @@ source=$homes/source
 tools=/opt/kio-v1-local
 engine=$tools/docker
 toolkit=$tools/toolkit
+cdi_dir=$tools/wsl-cdi
 client=$tools/docker-cli
 ssh_unit=kio-v1-local-sshd.service
 docker_unit=kio-v1-local-docker.service
@@ -76,8 +77,10 @@ readonly rootless_path="$engine:/usr/bin:/bin"
 
 tmp=$(mktemp -d)
 maintenance_next=
+cdi_swap=
 on_exit() {
   if [[ -n $maintenance_next && -e $maintenance_next ]]; then unlink "$maintenance_next"; fi
+  if [[ -n $cdi_swap ]]; then rm -r -- "$cdi_swap"; fi
   rm -r -- "$tmp"
 }
 trap on_exit EXIT
@@ -113,7 +116,8 @@ shared_get() {
   curl -q --max-time 10 --silent --show-error --fail --noproxy '*' \
     --unix-socket "$shared_socket" "http://localhost$1"
 }
-shared_get /info | python3 -c '
+shared_info=$(shared_get /info)
+printf '%s\n' "$shared_info" | python3 -c '
 import json, sys
 info = json.load(sys.stdin)
 if not info["ID"]:
@@ -136,16 +140,25 @@ with open(sys.argv[1], "wb") as output:
 ' "$tmp/shared-bind-sources"
 printf '%s\n' "$shared_socket" > "$tmp/query-config"
 
-# Only this mount tree is shadowed below. Reject Windows drives mounted elsewhere.
-findmnt -J -l -o TARGET,FSTYPE,SOURCE,OPTIONS | /usr/bin/python3 -I -c '
-import json, re, sys
-for mount in json.load(sys.stdin)["filesystems"]:
-    target = mount["target"]
-    if (mount["fstype"] == "drvfs" or "aname=drvfs" in mount["options"]
-        or re.match(r"^[A-Za-z]:", mount["source"] or "")):
-        if not target.startswith("/mnt/") or target.startswith("/mnt/wsl/") or target == "/mnt/wsl":
-            raise SystemExit(f"Windows drive mount outside the protected mount tree: {target}")
-'
+mount_helper=$(dirname -- "${BASH_SOURCE[0]}")/wsl-windows-mounts.py
+mount_probe=$(cat -- "$mount_helper")
+read_mount_plan() { nsenter --target 1 --mount -- /usr/bin/python3 -I -c "$mount_probe" plan; }
+mount_plan=$(read_mount_plan)
+caller_mount_plan=$(/usr/bin/python3 -I -c "$mount_probe" plan)
+printf 'Windows filesystem mounts: %s\n' "$mount_plan"
+/usr/bin/python3 -I -c "$mount_probe" policy "$mount_plan" > "$tmp/windows-policy"
+for key in directories files; do
+  /usr/bin/python3 -I -c "$mount_probe" paths "$mount_plan" "$key" > "$tmp/windows-$key"
+done
+mapfile -d '' -t windows_dirs < "$tmp/windows-directories"
+mapfile -d '' -t windows_files < "$tmp/windows-files"
+masked_path() {
+  local path=$1 target
+  for target in "${windows_dirs[@]}" "${windows_files[@]}"; do
+    if [[ $path == "$target" || $path == "$target/"* ]]; then return 0; fi
+  done
+  return 1
+}
 
 [[ -e $host_key && -f $host_key.pub && ! -L $host_key ]] || die "Prepare the distro Ed25519 host key first."
 
@@ -415,19 +428,19 @@ grep -Eq '^(@|#)includedir[[:space:]]+/etc/sudoers.d/?[[:space:]]*$' /etc/sudoer
 # Root system units create these mount namespaces before running the kio-test
 # session or its user manager; the normal distro user keeps the host view.
 cat > "$tmp/interop-policy" <<'UNIT'
-TemporaryFileSystem=/mnt:ro
 InaccessiblePaths=-/init -/run/WSL
 UnsetEnvironment=WSL_INTEROP
 UNIT
+cat "$tmp/windows-policy" >> "$tmp/interop-policy"
 {
   printf '[Service]\n'
   cat "$tmp/interop-policy"
-  if [[ $shared_socket != /mnt/* ]]; then
+  if ! masked_path "$shared_socket"; then
     printf 'InaccessiblePaths=-%s\n' "$shared_socket"
   fi
 } > "$tmp/user-interop"
 ssh_socket_bind=
-if [[ $shared_socket == /mnt/* ]]; then
+if masked_path "$shared_socket"; then
   # Expose only the configured socket inside the SSH namespace.
   ssh_socket_bind="BindReadOnlyPaths=$shared_socket"
 fi
@@ -455,6 +468,13 @@ CONFIG
 "$engine/dockerd" --validate --config-file "$tmp/dockerd"
 "$tmp/nvidia/usr/bin/nvidia-ctk" cdi generate --help | grep -F -- --nvidia-cdi-hook-path >/dev/null ||
   die "Toolkit lacks the CDI hook path option."
+# CDI discovers files in WSL's driver store, which can itself be a 9p mount.
+# Stage only the driver's referenced files on Linux before hiding the store.
+mkdir -m 0755 "$tmp/cdi"
+nsenter --target 1 --mount -- "$tmp/nvidia/usr/bin/nvidia-ctk" cdi generate --format json \
+  --nvidia-cdi-hook-path="$toolkit/nvidia-cdi-hook" --output="$tmp/nvidia-cdi.json"
+nsenter --target 1 --mount -- /usr/bin/python3 -I -c "$mount_probe" stage-cdi \
+  "$mount_plan" "$tmp/cdi" "$cdi_dir" < "$tmp/nvidia-cdi.json"
 cat > "$tmp/docker-unit" <<UNIT
 [Unit]
 Description=Kio v1 local rootless Docker
@@ -466,10 +486,7 @@ Environment=DOCKERD_ROOTLESS_ROOTLESSKIT_NET=slirp4netns
 Environment=DOCKERD_ROOTLESS_ROOTLESSKIT_DISABLE_HOST_LOOPBACK=true
 Environment=DOCKERD_ROOTLESS_ROOTLESSKIT_STATE_DIR=%t/kio-v1-local-rootlesskit
 UnsetEnvironment=DOCKERD_ROOTLESS_ROOTLESSKIT_FLAGS _DOCKERD_ROOTLESS_CHILD
-RuntimeDirectory=kio-v1-local-cdi
-RuntimeDirectoryMode=0700
-ExecStartPre=$toolkit/nvidia-ctk cdi generate --nvidia-cdi-hook-path=$toolkit/nvidia-cdi-hook --output=%t/kio-v1-local-cdi/nvidia.yaml
-ExecStart=$engine/dockerd-rootless.sh --config-file=$dockerd_config --host=unix://%t/kio-v1-local-docker.sock --cdi-spec-dir=%t/kio-v1-local-cdi
+ExecStart=$engine/dockerd-rootless.sh --config-file=$dockerd_config --host=unix://%t/kio-v1-local-docker.sock --cdi-spec-dir=$cdi_dir
 Delegate=yes
 Restart=on-failure
 
@@ -479,6 +496,14 @@ UNIT
 
 backup=$(mktemp -d /var/backups/kio-v1-local.XXXXXXXX)
 printf 'Backup: %s\n' "$backup"
+printf '%s\n' "$mount_plan" > "$backup/windows-mounts.json"
+if [[ -e $cdi_dir || -L $cdi_dir ]]; then
+  trusted_path "$cdi_dir"
+  [[ -d $cdi_dir ]] || die "Expected a dedicated CDI directory: $cdi_dir"
+  cp -a -- "$cdi_dir" "$backup/wsl-cdi"
+else
+  touch "$backup/wsl-cdi-absent"
+fi
 paths=("$legacy_deny" "$query" "$query_rule" "$query_config" "$ssh_config" "$keys" "$ssh_service" "$docker_service" "$dockerd_config" "$toolkit/nvidia-ctk" "$toolkit/nvidia-cdi-hook")
 manager_policy_dir=
 manager_policy_created_dir=false
@@ -549,6 +574,7 @@ smoke_added=false
 legacy_changed=false
 password_changed=false
 maintenance_published=false
+cdi_changed=false
 saved_keys=
 changed=()
 restore_path() {
@@ -571,6 +597,11 @@ rollback() {
     fi
     userctl stop "$docker_unit" || failed=1
     if ! $docker_enabled; then userctl disable "$docker_unit" || failed=1; fi
+    systemctl stop "user@$uid.service" || failed=1
+  fi
+  if $cdi_changed; then
+    if [[ -d $cdi_dir ]]; then mv -T -- "$cdi_dir" "$cdi_swap/rejected" || failed=1; fi
+    if [[ -d $cdi_swap/previous ]]; then mv -T -- "$cdi_swap/previous" "$cdi_dir" || failed=1; fi
   fi
   if $ssh_changed; then
     systemctl stop "$ssh_unit" || failed=1
@@ -628,7 +659,7 @@ check_subids() {
   getsubids -g "$user" | awk '$NF >= 65536 {found=1} END {exit !found}'
 }
 test_shared_access() {
-  local path
+  local path resolved
   if as_user test -w "$shared_socket"; then
     printf '%s\n' 'kio-test can access the shared Docker socket.' >&2
     return 1
@@ -640,6 +671,8 @@ test_shared_access() {
     fi
   done
   while IFS= read -r -d '' path; do
+    # Covered shared bind sources are checked in the dedicated namespaces below.
+    if resolved=$(realpath -e -- "$path") && masked_path "$resolved"; then continue; fi
     if as_user test -r "$path" || as_user test -w "$path"; then
       printf 'kio-test can access a shared Docker bind mount: %s\n' "$path" >&2
       return 1
@@ -713,6 +746,12 @@ if [[ -f $backup/new-state ]]; then install -d -m 0700 -o "$user" -g "$user" "$s
 apply_file "$tmp/nvidia/usr/bin/nvidia-ctk" 0755 "$toolkit/nvidia-ctk"
 apply_file "$tmp/nvidia/usr/bin/nvidia-cdi-hook" 0755 "$toolkit/nvidia-cdi-hook"
 apply_file "$tmp/dockerd" 0644 "$dockerd_config"
+trusted_path "$tools"
+cdi_swap=$(mktemp -d "$tools/.wsl-cdi.XXXXXXXX")
+cp -a -- "$tmp/cdi" "$cdi_swap/next"
+if [[ -d $cdi_dir ]]; then mv -T -- "$cdi_dir" "$cdi_swap/previous"; fi
+cdi_changed=true
+mv -T -- "$cdi_swap/next" "$cdi_dir"
 apply_file "$tmp/docker-unit" 0644 "$docker_service"
 if ! $have_account; then
   manager_policy_dir=/etc/systemd/system/user@$uid.service.d
@@ -754,16 +793,52 @@ if [[ $shared_count != 0 ]]; then
   printf 'CUDA smoke refused: shared GPU count is not zero.\n' >&2
   rollback
 fi
-# Expand the mount probe inside the container, not on the host.
+verify_windows_namespace() {
+  local unit=$1 visible_socket=$2 pid
+  pid=$(systemctl show "$unit" -p MainPID --value)
+  [[ $pid =~ ^[1-9][0-9]*$ ]]
+  nsenter --target "$pid" --mount -- runuser -u "$user" -- \
+    /usr/bin/python3 -I -c "$mount_probe" verify "$mount_plan" "$visible_socket"
+  nsenter --target "$pid" --mount -- /usr/bin/python3 -I -c '
+import os
+if os.access("/init", os.X_OK) or (os.path.isdir("/run/WSL") and os.listdir("/run/WSL")):
+    raise SystemExit("Windows interop is available inside the acceptance namespace")
+'
+}
+die_after_apply() { printf '%s\n' "$*" >&2; rollback; }
+verify_windows_namespace "user@$uid.service" ""
+# Bind only the tested mask roots, read-only, from the rootless Engine's view.
+# CSV quotes keep whitespace, commas and quotes in source names literal to Docker.
+container_mounts=()
+for kind in dir file; do
+  if [[ $kind == dir ]]; then targets=("${windows_dirs[@]}"); else targets=("${windows_files[@]}"); fi
+  for i in "${!targets[@]}"; do
+    path=${targets[i]//\"/\"\"}
+    container_mounts+=(--mount "type=bind,\"source=$path\",target=/kio-host-mounts/$kind-$i,readonly")
+  done
+done
 # shellcheck disable=SC2016
 container_gpu=$(as_user "${docker[@]}" run --rm --pull=never --device nvidia.com/gpu=all \
-  --mount type=bind,source=/mnt,target=/kio-host-mnt,readonly \
-  --entrypoint /bin/sh "$smoke" -ec '
-    mount_entries=$(ls -A /kio-host-mnt)
-    test -z "$mount_entries"
+  "${container_mounts[@]}" --entrypoint /bin/sh "$smoke" -ec '
+    for kind in dir file; do
+      count=$1
+      shift
+      i=0
+      while [ "$i" -lt "$count" ]; do
+        path=/kio-host-mounts/$kind-$i
+        test "$(stat -f -c %T "$path")" = tmpfs
+        if [ "$kind" = dir ]; then
+          entries=$(ls -A "$path")
+          test -z "$entries"
+        else
+          test ! -r "$path" && test ! -w "$path" || exit 1
+        fi
+        i=$((i + 1))
+      done
+    done
     test ! -x /init
     exec nvidia-smi --query-gpu=uuid --format=csv,noheader
-  ')
+  ' kio-mount-probe "${#windows_dirs[@]}" "${#windows_files[@]}")
 [[ $container_gpu == "$gpu_uuid" ]]
 printf 'Rootless container GPU: %s\n' "$container_gpu"
 test_shared_access
@@ -786,22 +861,13 @@ for _ in {1..10}; do
   sleep 1
 done
 $live
-for unit in "$ssh_unit" "user@$uid.service"; do
-  pid=$(systemctl show "$unit" -p MainPID --value)
-  [[ $pid =~ ^[1-9][0-9]*$ ]]
-  nsenter --target "$pid" --mount -- /usr/bin/python3 -I -c '
-import os
-import sys
-if os.access("/init", os.X_OK) or (os.path.isdir("/run/WSL") and os.listdir("/run/WSL")):
-    raise SystemExit("Windows interop is available inside the acceptance namespace")
-visible = set(os.listdir("/mnt"))
-allowed = {sys.argv[1]} if sys.argv[1] else set()
-if visible != allowed:
-    raise SystemExit("Unexpected entries inside the acceptance /mnt namespace")
-' "$(if [[ $unit == "$ssh_unit" && $shared_socket == /mnt/* ]]; then
-    part=${shared_socket#/mnt/}; printf '%s' "${part%%/*}";
-  fi)"
-done
+verify_windows_namespace "$ssh_unit" "$shared_socket"
+[[ $(read_mount_plan) == "$mount_plan" &&
+   $(/usr/bin/python3 -I -c "$mount_probe" plan) == "$caller_mount_plan" ]] ||
+  die_after_apply "Windows filesystem mounts changed during setup."
+before_id=$(printf '%s\n' "$shared_info" | /usr/bin/python3 -I -c 'import json, sys; print(json.load(sys.stdin)["ID"])')
+after_id=$(shared_get /info | /usr/bin/python3 -I -c 'import json, sys; print(json.load(sys.stdin)["ID"])')
+[[ $before_id == "$after_id" ]] || die_after_apply "Shared Engine ID changed during setup."
 pid=$(systemctl show "$ssh_unit" -p MainPID --value)
 shared_count=$(nsenter --target "$pid" --mount -- runuser -u "$user" -- /usr/bin/sudo -n -- "$query")
 [[ $shared_count =~ ^(0|[1-9][0-9]*)$ ]]
