@@ -114,3 +114,43 @@ Assert-SshAllow 'interface type filter' 'Warn' @{ InterfaceType = 'Wireless' }
 Assert-SshAllow 'other port' 'Ignore' @{ LocalPort = '443' }
 Assert-SshAllow 'dynamic port' 'Warn' @{ LocalPort = 'RPC' }
 Assert-SshAllow 'UDP' 'Ignore' @{ Protocol = 'UDP' }
+
+foreach ($functionName in 'Get-RecoveryDisposition','Get-RecoveryArguments') {
+    $definition = $ast.Find({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $functionName
+    }, $false)
+    if (!$definition) { throw "Missing $functionName." }
+    . ([scriptblock]::Create($definition.Extent.Text))
+}
+
+function Assert-Recovery([string]$Phase, [string]$State, [long]$Now, [string]$Expected) {
+    $actual = Get-RecoveryDisposition $Phase $State 100 $Now
+    if ($actual -ne $Expected) { throw "$Phase / $State at ${Now}: expected $Expected, got $actual" }
+}
+
+Assert-Recovery Confirm Applying 50 Reject
+Assert-Recovery Confirm Pending 99 Confirm
+Assert-Recovery Confirm Pending 100 Reject
+Assert-Recovery Confirm RolledBack 101 Reject
+Assert-Recovery Confirm Confirmed 101 Cleanup
+Assert-Recovery Rollback Applying 100 Restore
+Assert-Recovery Rollback Pending 101 Restore
+Assert-Recovery Rollback Restoring 101 Restore
+Assert-Recovery Rollback Confirmed 100 Cleanup
+Assert-Recovery Rollback RolledBack 100 Cleanup
+Assert-Recovery Rollback '' 100 Reject
+
+$id = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+$backupPath = 'C:\Program Data\ssh\kio-v1-local-backup-' + $id
+$expectedArgs = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$backupPath\setup-windows.ps1`" -Phase Rollback -BackupId $id"
+if ((Get-RecoveryArguments $backupPath $id) -cne $expectedArgs) { throw 'Unexpected recovery task arguments.' }
+
+$commands = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] }, $true)
+if ($commands | Where-Object { $_.GetCommandName() -eq 'Read-Host' }) { throw 'Setup requires interactive input.' }
+if (!($commands | Where-Object { $_.GetCommandName() -eq 'New-ScheduledTaskTrigger' -and $_.Extent.Text -match '\bOnce\b' })) {
+    throw 'Missing one-time recovery trigger.'
+}
+if ($ast.ParamBlock.Extent.Text -notmatch '\$CiSource\s*=\s*''100\.64\.0\.1''') {
+    throw 'Unexpected default CI source for sshd configuration evaluation.'
+}

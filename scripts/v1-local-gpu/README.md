@@ -169,6 +169,37 @@ OpenSSH を用意する。WSL は `sudo`、`util-linux`、`rootlesskit`、`slirp
    `nvidia-container-toolkit-base` 1.20 以降の .deb と、レビュー済み CUDA smoke image の
    digest を用意する。研究室の VHD 空き容量は現地で再確認し、30〜50 GiB を見込む。
 
+   研究室に 2026-09 の旧構成が残っている場合は、旧 listener の利用が終わり、通常の管理経路で
+   WSL を操作できることを確認してから移行する。旧 unit の状態とファイルを退避して停止・無効化する。
+   `kio-test` に既存プロセスがあれば終了を確認してから、補助グループ `docker` を外す。
+
+   ```bash
+   (
+     set -euo pipefail
+     old=/etc/systemd/system/kio-sshd.service
+     backup=$(sudo mktemp -d /root/kio-sshd-2026-09.XXXXXXXX)
+     printf 'Legacy backup: %s\n' "$backup"
+     sudo systemctl show kio-sshd.service -p FragmentPath -p UnitFileState -p ActiveState |
+       sudo tee "$backup/unit-state" >/dev/null
+     id kio-test | sudo tee "$backup/kio-test-groups" >/dev/null
+     sudo cp -a "$old" "$backup/"
+     sudo systemctl disable --now kio-sshd.service
+     sudo mv "$old" "$backup/kio-sshd.service.disabled"
+     sudo systemctl daemon-reload
+     if pgrep -a -u kio-test; then
+       printf '%s\n' 'End the remaining kio-test processes before changing groups.' >&2
+       exit 1
+     fi
+     sudo gpasswd -d kio-test docker
+     id kio-test
+     sudo ss -H -ltnp 'sport = :2222'
+   )
+   ```
+
+   `id` に `docker` がなく、`ss` が空であることを確認してから次へ進む。
+   旧構成の復元が必要なら、退避した unit と `unit-state` を使って元の登録・稼働状態に戻す。
+   補助グループを戻すと共有 Docker へのアクセス権も戻るため、旧構成の管理者が必要性を確認する。
+
    ```bash
    sudo --preserve-env=WSL_DISTRO_NAME bash scripts/v1-local-gpu/host/setup-wsl.sh \
      Ubuntu-26.04 /path/kio-ci.pub /path/toolkit-base.deb "$CUDA_SMOKE_IMAGE" "$shared_socket"
@@ -192,7 +223,9 @@ OpenSSH を用意する。WSL は `sudo`、`util-linux`、`rootlesskit`、`slirp
    [NVIDIA CDI](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/cdi-support.html) ·
    [WSL の CDI デバイス名](https://github.com/NVIDIA/nvidia-container-toolkit/blob/v1.20.1/pkg/nvcdi/lib-wsl.go)
 4. Windows のローカルコンソールで WSL 登録所有者として昇格した 64-bit PowerShell を開く。
-   管理用 Mac と検証用 CI の実際の Tailscale IPv4 を渡す。
+   管理用 Mac の実際の Tailscale IPv4 を渡す。`CiSource` は OpenSSH の実効設定を検査する
+   `sshd -T -C` の入力で、既定値は tailnet の範囲を代表する `100.64.0.1`。
+   GitHub runner のアドレスは毎回変わるため、実際の接続元は Tailscale の grant で制限する。
    スクリプトは既存の portproxy、待受、広い firewall 許可を検査し、受信許可を Tailscale IF、
    宛先 Tailscale IPv4、`sshd.exe`、送信元 `100.64.0.0/10`、TCP 22 に限定する。
    この Windows Firewall 規則と既定の受信拒否は、LAN など tailnet 外からの到達を防ぐ多層防御を担う。
@@ -205,11 +238,23 @@ OpenSSH を用意する。WSL は `sudo`、`util-linux`、`rootlesskit`、`slirp
    [Tailscale の規則生成コード](https://github.com/tailscale/tailscale/blob/301e59f/wgengine/router/router_windows.go#L264-L272) ·
    [Tailscale の grant](https://tailscale.com/docs/features/access-control/grants)
 
+   レビュー済みの配布元から得た SHA-256 を使い、転送後のスクリプトを照合する。
+   `-ExecutionPolicy Bypass` は起動した PowerShell プロセスだけに効き、ホストの実行ポリシーはそのまま。
+   [PowerShell の実行ポリシー](https://learn.microsoft.com/powershell/module/microsoft.powershell.core/about/about_execution_policies)
+
    ```powershell
-   .\scripts\v1-local-gpu\host\setup-windows.ps1 -WslOwner rm2c -Distro Ubuntu-26.04 `
-       -ExistingAllowUsers 'AllowUsers rm2c' -PublicKeyFile C:\path\kio-ci.pub `
-       -AdminSource 100.102.187.14 -CiSource $ObservedCiIpv4
+   $setup = (Resolve-Path .\scripts\v1-local-gpu\host\setup-windows.ps1).Path
+   if ((Get-FileHash -Algorithm SHA256 -LiteralPath $setup).Hash -ne $ReviewedSetupSha256) {
+       throw 'setup-windows.ps1 SHA-256 mismatch'
+   }
+   powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $setup -Phase Apply `
+       -WslOwner rm2c -Distro Ubuntu-26.04 -ExistingAllowUsers 'AllowUsers rm2c' `
+       -PublicKeyFile C:\path\kio-ci.pub -AdminSource 100.102.187.14
    ```
+
+   `Apply` は設定の退避と 10 分後の一回限りの復旧タスクの登録を済ませてから、設定を適用する。
+   sshd 再起動後のローカル確認に成功すると、退避先、確認期限、確認用の ID を表示して終了する。
+   復旧タスクは構築後の接続確認を終えて `Confirm` するまで残る。接続試験の端末は Apply の前に用意する。
 
    個人機は表の値に置き換える。対応している OpenSSH オプションはインストール済みの
    `sshd.exe` で判定する。専用タスクはディストリビューションの登録所有者を S4U の principal にし、
@@ -294,8 +339,23 @@ nc -vz -w 5 "$WIN_TAILNET_IP" 2222
 nc -vz -w 5 "$WIN_TAILNET_IP" 22
 ```
 
-上記の接続試験がすべて期待どおりで、新規の Mac 管理者ログインにも成功したら、Windows コンソールに `verified` と入力する。
-確認が失敗した場合は別の入力で設定を復元する。
+上記の接続試験が期待どおりで、新規の Mac 管理者 SSH ログインにも成功したら、Apply が
+表示した ID を使い、昇格した PowerShell から期限内に Confirm を実行する。同じ照合済みスクリプトを使う。
+Mac で管理アカウントを `WIN_ADMIN` に設定し、既存の SSH セッションを共有せずにログインを確認する。
+
+```bash
+ssh -o ControlMaster=no -o ControlPath=none "$WIN_ADMIN@$WIN_TAILNET_IP" whoami
+```
+
+```powershell
+$BackupId = '<Apply が表示した 32 桁の ID>'
+powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $setup -Phase Confirm -BackupId $BackupId
+```
+
+Confirm は退避に確定状態を記録し、復旧タスクを解除する。確認に失敗したときは Confirm を実行せず、
+タスクが退避から設定を復元するまで待ち、退避の `state` が `RolledBack` になったことを確認する。
+期限後の新規 Confirm は拒否される。状態が `Restoring` のままなら退避内の `rollback-errors.txt` と
+タスクの実行結果を、Windows のローカルコンソールから確認する。
 
 WSL の管理コンソールで次を確認する。通常の SSH では `denyusers kio-test`、パスワード状態は
 `L`。通常の SSH ポートが稼働中なら、旧鍵でのログインも拒否されることを別の管理端末で確かめる。
@@ -399,8 +459,8 @@ kio-test 専用グループの 0640。旧 0644 からの移行では旧ファイ
 - Windows はローカルコンソールで退避版を `sshd.exe -t -f <backup>\sshd_config` に通す。
   `%ProgramData%\ssh\sshd_config` と鍵ファイル、保存した SDDL を復元する。元からなかった
   鍵ファイル、今回新設した `KioV1LocalGpuSshAllow` と `KioV1LocalGpuKeepalive` だけを撤去する。
-  既存のタスクが Ready から起動された場合は止める。 `created-account` のある適用に限り作成した
-  `kio-ci` を無効化・撤去する。sshd 再起動後に Mac 管理者の新規ログインを確認する。
+  既存のタスクが Ready から起動された場合は止める。退避に `account-present` がない適用では、
+  新設した `kio-ci` を無効化・撤去する。sshd 再起動後に Mac 管理者の新規ログインを確認する。
 - WSL は専用 SSH と `kio-test` の user systemd 上の専用 Docker を止める。退避ファイルを
   所有者・モード付きで復元し、`absent` に記録された今回の導入分を除く。system/user の
   unit を読み直し、保存した enabled・active・linger を復元する。既存アカウントは元の login shell
