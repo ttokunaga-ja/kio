@@ -99,7 +99,7 @@ wsl_mount_device() { stat -Lc '%Hd:%Ld' -- "$1"; }
 
 # A mask can leave an underlying record in mountinfo. Compare the effective device.
 wsl_mount_verify() (
-  local plan=$1 socket=$2 records fs dev _opts encoded decoded kind path effective
+  local plan=$1 socket=$2 resolver=${4:-} records fs dev _opts encoded decoded kind path effective
   local rest component found mount_kind mount_dev mount_options mount_path
   local -a entries
   records=$(wsl_mount_records "$3") || return 1
@@ -129,7 +129,18 @@ wsl_mount_verify() (
         done <<< "$records"
         $found || { printf 'Expected a read-only tmpfs at %s\n' "$encoded" >&2; return 1; }
         entries=("$path"/*)
-        if [[ $socket == "$path/"* ]]; then
+        if [[ -n $resolver && $path == "${resolver%/*}" ]]; then
+          [[ ${#entries[@]} == 1 && ${entries[0]} == "$resolver" &&
+            -f $resolver && ! -L $resolver && -r $resolver && ! -w $resolver ]] || return 1
+          found=false
+          while read -r mount_kind mount_dev mount_options mount_path; do
+            if [[ $mount_path == "$resolver" && ,$mount_options, == *,ro,* ]]; then
+              found=true
+              break
+            fi
+          done <<< "$records"
+          $found || { printf 'Expected a read-only resolver bind at %s\n' "$resolver" >&2; return 1; }
+        elif [[ $socket == "$path/"* ]]; then
           rest=${socket#"$path/"}
           while [[ -n $rest ]]; do
             component=${rest%%/*}

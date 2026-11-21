@@ -37,6 +37,24 @@ printf '42 1 0:40 / %s/mask ro - tmpfs none rw\n' "$tmp" > "$tmp/live"
 verify_plan=$(printf 'windows %s/mask 9p 0:30\nwindows %s/mask/nested 9p 0:31\ndirectory %s/mask\n' "$tmp" "$tmp" "$tmp")
 if [[ $EUID != 0 ]]; then
   wsl_mount_verify "$verify_plan" '' "$tmp/live"
+  chmod 0755 "$tmp/mask"
+  printf 'nameserver 10.0.0.1\n' > "$tmp/mask/resolv.conf"
+  chmod 0444 "$tmp/mask/resolv.conf"
+  printf '43 42 0:30 /resolv.conf %s/mask/resolv.conf ro - tmpfs none rw\n' "$tmp" >> "$tmp/live"
+  chmod 0555 "$tmp/mask"
+  wsl_mount_verify "$verify_plan" '' "$tmp/live" "$tmp/mask/resolv.conf"
+  sed 's@/resolv.conf ro @/resolv.conf rw @' "$tmp/live" > "$tmp/live-resolver-rw"
+  if wsl_mount_verify "$verify_plan" '' "$tmp/live-resolver-rw" "$tmp/mask/resolv.conf"; then exit 1; fi
+  chmod 0755 "$tmp/mask"
+  mkdir "$tmp/mask/shared-sockets"
+  chmod 0555 "$tmp/mask"
+  if wsl_mount_verify "$verify_plan" '' "$tmp/live" "$tmp/mask/resolv.conf"; then exit 1; fi
+  chmod 0755 "$tmp/mask"
+  rmdir "$tmp/mask/shared-sockets"
+  rm "$tmp/mask/resolv.conf"
+  sed '2d' "$tmp/live" > "$tmp/live-clean"
+  mv "$tmp/live-clean" "$tmp/live"
+  chmod 0555 "$tmp/mask"
 fi
 sed 's/ ro / rw /' "$tmp/live" > "$tmp/live-rw"
 if wsl_mount_verify "$verify_plan" '' "$tmp/live-rw"; then exit 1; fi

@@ -152,6 +152,18 @@ done
 mapfile -d '' -t windows_dirs < "$tmp/windows-directory"
 mapfile -d '' -t windows_files < "$tmp/windows-file"
 masked_path() { wsl_mount_covers "$1" "${windows_dirs[@]}" "${windows_files[@]}"; }
+resolver=
+if [[ $(realpath -e /etc/resolv.conf) == /mnt/wsl/resolv.conf ]] && masked_path /mnt/wsl/resolv.conf; then
+  resolver=/mnt/wsl/resolv.conf
+  [[ -f $resolver && ! -L $resolver ]] || die "Expected a regular WSL resolver file."
+  trusted_path /mnt
+  # WSL owns this sticky shared directory, so its root-owned file cannot be replaced by another user.
+  [[ ! -L /mnt/wsl && $(stat -c %u /mnt/wsl) == 0 && -k /mnt/wsl &&
+    $(stat -c %u "$resolver") == 0 ]] || die "Expected a root-controlled WSL resolver."
+  resolver_mode=$(stat -c %a "$resolver")
+  (( (8#$resolver_mode & 022) == 0 )) || die "The WSL resolver must not be writable by non-root."
+  [[ $shared_socket != /mnt/wsl/* ]] || die "The WSL resolver mask may expose only resolv.conf."
+fi
 
 [[ -e $host_key && -f $host_key.pub && ! -L $host_key ]] || die "Prepare the distro Ed25519 host key first."
 
@@ -415,6 +427,7 @@ InaccessiblePaths=-/init -/run/WSL
 UnsetEnvironment=WSL_INTEROP
 UNIT
 cat "$tmp/windows-policy" >> "$tmp/interop-policy"
+if [[ -n $resolver ]]; then printf 'BindReadOnlyPaths=%s\n' "$resolver" >> "$tmp/interop-policy"; fi
 {
   printf '[Service]\n'
   cat "$tmp/interop-policy"
@@ -768,10 +781,6 @@ done
 [[ ${security:-} == *'"name=rootless"'* ]]
 [[ $(as_user "${docker[@]}" info --format '{{.DockerRootDir}}') == "$state/docker" ]]
 as_user "${docker[@]}" compose version
-if ! as_user "${docker[@]}" image inspect "$smoke" >/dev/null 2>&1; then
-  as_user "${docker[@]}" pull "$smoke"
-  smoke_added=true
-fi
 shared_count=$(as_user /usr/bin/sudo -n -- "$query")
 if [[ $shared_count != 0 ]]; then
   printf 'CUDA smoke refused: shared GPU count is not zero.\n' >&2
@@ -782,7 +791,8 @@ verify_windows_namespace() {
   pid=$(systemctl show "$unit" -p MainPID --value)
   [[ $pid =~ ^[1-9][0-9]*$ ]]
   nsenter --target "$pid" --mount -- runuser -u "$user" -- \
-    /bin/bash -euo pipefail -c "$mount_probe" -- wsl_mount_verify "$mount_plan" "$visible_socket" /proc/self/mountinfo
+    /bin/bash -euo pipefail -c "$mount_probe" -- wsl_mount_verify "$mount_plan" "$visible_socket" /proc/self/mountinfo "$resolver"
+  nsenter --target "$pid" --mount -- runuser -u "$user" -- timeout 10 getent ahostsv4 registry-1.docker.io >/dev/null
   # shellcheck disable=SC2016
   nsenter --target "$pid" --mount -- /bin/bash -ec '
     shopt -s dotglob nullglob
@@ -795,12 +805,20 @@ verify_windows_namespace() {
 }
 die_after_apply() { printf '%s\n' "$*" >&2; rollback; }
 verify_windows_namespace "user@$uid.service" ""
+if ! as_user "${docker[@]}" image inspect "$smoke" >/dev/null 2>&1; then
+  as_user "${docker[@]}" pull "$smoke"
+  smoke_added=true
+fi
 # Bind only the tested mask roots, read-only, from the rootless Engine's view.
 # CSV quotes keep whitespace, commas and quotes in source names literal to Docker.
 container_mounts=()
+resolver_mount=
 for kind in dir file; do
   if [[ $kind == dir ]]; then targets=("${windows_dirs[@]}"); else targets=("${windows_files[@]}"); fi
   for i in "${!targets[@]}"; do
+    if [[ -n $resolver && ${targets[i]} == "${resolver%/*}" ]]; then
+      resolver_mount=/kio-host-mounts/$kind-$i
+    fi
     path=${targets[i]//\"/\"\"}
     container_mounts+=(--mount "type=bind,\"source=$path\",target=/kio-host-mounts/$kind-$i,readonly")
   done
@@ -808,6 +826,8 @@ done
 # shellcheck disable=SC2016
 container_gpu=$(as_user "${docker[@]}" run --rm --pull=never --device nvidia.com/gpu=all \
   "${container_mounts[@]}" --entrypoint /bin/sh "$smoke" -ec '
+    resolver_mount=$1
+    shift
     for kind in dir file; do
       count=$1
       shift
@@ -817,7 +837,12 @@ container_gpu=$(as_user "${docker[@]}" run --rm --pull=never --device nvidia.com
         test "$(stat -f -c %T "$path")" = tmpfs
         if [ "$kind" = dir ]; then
           entries=$(ls -A "$path")
-          test -z "$entries"
+          if [ "$path" = "$resolver_mount" ]; then
+            test "$entries" = resolv.conf
+            test -f "$path/resolv.conf" && test ! -w "$path/resolv.conf" || exit 1
+          else
+            test -z "$entries"
+          fi
         else
           test ! -r "$path" && test ! -w "$path" || exit 1
         fi
@@ -826,7 +851,7 @@ container_gpu=$(as_user "${docker[@]}" run --rm --pull=never --device nvidia.com
     done
     test ! -x /init
     exec nvidia-smi --query-gpu=uuid --format=csv,noheader
-  ' kio-mount-probe "${#windows_dirs[@]}" "${#windows_files[@]}")
+  ' kio-mount-probe "$resolver_mount" "${#windows_dirs[@]}" "${#windows_files[@]}")
 [[ $container_gpu == "$gpu_uuid" ]]
 printf 'Rootless container GPU: %s\n' "$container_gpu"
 test_shared_access
@@ -842,7 +867,8 @@ live=false
 for _ in {1..10}; do
   if [[ $(ss -H -ltn 'sport = :2222' | awk '{print $4}') == 127.0.0.1:2222 ]] &&
     scan=$(ssh-keyscan -T 2 -p 2222 -t ed25519 127.0.0.1 2>/dev/null) &&
-    [[ $(awk '{print $2, $3}' <<< "$scan") == "$(awk '{print $1, $2}' "$host_key.pub")" ]]; then
+    [[ $(awk '$1 == "[127.0.0.1]:2222" && $2 == "ssh-ed25519" {print $2, $3}' <<< "$scan") == \
+      "$(awk '{print $1, $2}' "$host_key.pub")" ]]; then
     live=true
     break
   fi

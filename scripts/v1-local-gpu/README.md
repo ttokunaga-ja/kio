@@ -385,7 +385,11 @@ setup は systemd（PID 1）のマウント一覧から `9p`、`drvfs`、`virtio
 `/mnt` の外にある `/Docker/host` も対象にする。専用名前空間では該当するディレクトリを
 読み取り専用の空 tmpfs で覆う。対象がファイルならアクセスを遮断する。`/init` と `/run/WSL`
 も遮断し、`WSL_INTEROP` を削除する。ディストリビューション間で共有する `/mnt/wsl` と
-`/mnt/wslg` にもマスクを維持する。共有ソケットが覆われる場合、専用 sshd には設定した
+`/mnt/wslg` にもマスクを維持する。`/etc/resolv.conf` が `/mnt/wsl/resolv.conf` を参照する場合は、
+専用 sshd と user manager にそのファイルだけを読み取り専用で bind する。
+WSL がネットワーク変更時に `resolv.conf` を差し替えた場合は、受入リースの回収後に専用の
+user manager を再起動すると新しいファイルを参照する。専用 sshd も再起動して bind を更新する。
+共有ソケットが覆われる場合、専用 sshd には設定した
 ソケット 1 個だけを bind する。rootless Docker には共有ソケットを見せない。
 
 WSL の GPU ドライバーストアがマスクに含まれる場合、NVIDIA の CDI 生成が参照した
@@ -421,11 +425,15 @@ for unit in kio-v1-local-sshd.service "user@$uid.service"; do
   sudo nsenter --target "$pid" --mount -- findmnt -n -T "$probe" -o FSTYPE
   sudo nsenter --target "$pid" --mount -- runuser -u kio-test -- test -w "$probe"
   sudo nsenter --target "$pid" --mount -- runuser -u kio-test -- test -x /init
+  sudo nsenter --target "$pid" --mount -- runuser -u kio-test -- getent ahostsv4 registry-1.docker.io
+  sudo nsenter --target "$pid" --mount -- runuser -u kio-test -- ls -A /mnt/wsl
 done
 ```
 
 `findmnt` は覆いのファイルシステムを表示するか、対象が見えなければ失敗する。
-両テストは失敗が期待値。`binfmt_misc` の `F` フラグは `/init` を固定できるため、`/init` の
+書き込み・実行権限の試験は失敗が期待値。名前解決は成功し、DNS ファイルを bind する構成では
+`/mnt/wsl` に `resolv.conf` だけが見える。`docker-desktop/shared-sockets` などの共有領域は不可視。
+`binfmt_misc` の `F` フラグは `/init` を固定できるため、`/init` の
 非表示だけで Windows 実行を防げたと判定しない。`/run/WSL` も遮断する。実際の PE 実行も
 確かめる場合は、同じ Windows の `cmd.exe` を管理者が一時的に Linux 側に置き、
 両名前空間内の `kio-test` から副作用のない終了コマンドを実行する。
