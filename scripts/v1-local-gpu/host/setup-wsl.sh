@@ -77,7 +77,7 @@ query_rule=/etc/sudoers.d/kio-v1-local-shared-gpu
 query_config=/etc/kio-v1-local-shared-gpu-socket
 maintenance=$homes/maintenance.lock
 legacy_keys=$home/.ssh/authorized_keys
-readonly rootless_path="$engine:/usr/bin:/bin"
+readonly rootless_path="$engine:/usr/sbin:/usr/bin:/sbin:/bin"
 
 tmp=$(mktemp -d)
 maintenance_next=
