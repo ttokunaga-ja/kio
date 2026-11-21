@@ -5,7 +5,7 @@
 ## 実行前の条件と順序
 
 1. 整理後の `main` の完全な 40 桁 SHA を候補にし、同じ SHA の `ci.yml` の push run が成功したことを確かめ、候補 SHA と run ID を記録する。
-2. 下記の読み取り確認で外部資源 9 件の準備状況を確認する。利用者が GPU ホストを決め、必要な設定と接続確認を済ませる。候補に対応する dispatcher と固定入力の照合・配置は [GPU コントローラの手順](../scripts/v1-local-gpu/README.md)、台帳・権限・予算の確認と初期化条件は [provider 予算台帳](acceptance/provider-budget.md) に従う。全経路の準備が揃ってから dispatch に進む。
+2. 下記の読み取り確認で外部資源 9 件の準備状況を確認する。D-20261121-05 に従って GPU ホストを選び、必要な設定と接続確認を済ませる。候補に対応する dispatcher と固定入力の照合・配置は [GPU コントローラの手順](../scripts/v1-local-gpu/README.md)、台帳・権限・予算の確認と初期化条件は [provider 予算台帳](acceptance/provider-budget.md) に従う。全経路の準備が揃ってから dispatch に進む。
 3. `main` を ref とし、[ネイティブ受入](../.github/workflows/v1-acceptance.yml) を `candidate_sha` で実行する。42 件と 3 OS の候補 package の成功後に、この run ID を外部 2 workflow の `package_run_id` に渡す。
 4. [provider 受入](../.github/workflows/v1-provider-acceptance.yml) は `operation=run`、`campaign_id`、`candidate_sha`、`package_run_id` を使う。[GPU 受入](../.github/workflows/v1-local-acceptance.yml) は同じ `candidate_sha` と `package_run_id` を使う。台帳の予約は失敗・結果不明も消費として扱う。
 5. 3 run の成功後、[最終集約](../.github/workflows/v1-acceptance-verify.yml) を同じ候補で実行する。`candidate_sha`、`ci_run_id`、`native_run_id`、`provider_run_id`、`local_run_id` を渡し、集約成功と 51 件の証跡を確認する。候補 SHA、各 run ID、パッケージと集約の証跡を記録する。
@@ -24,7 +24,7 @@
 | `v1-provider-ledger-authority` | `KIO_LEDGER_APP_PRIVATE_KEY`、`KIO_LEDGER_APP_CLIENT_ID`、`KIO_LEDGER_APP_ID`、`KIO_LEDGER_APP_SLUG`、`KIO_LEDGER_APP_INSTALLATION_ID` |
 | `v1-local-acceptance` | `KIO_LAB_SSH_PRIVATE_KEY`、`KIO_LAB_JUMP_HOST`、`KIO_LAB_JUMP_USER`、`KIO_LAB_KNOWN_HOSTS`、`KIO_TS_CLIENT_ID`、`KIO_TS_AUDIENCE` |
 
-**GPU ホストは未確定。** 2026-11-21 時点で Environment の接続先は `kio-lab-windows`（100.68.218.37）だった。個人デスクトップを使う可能性も含め、利用者が接続先を決める。2026-09 の事前調査では lab 側の Windows `kio-ci`、SSH の制限設定、WSL の専用鍵と dispatcher が未適用だった。現在の状態を利用者に確認する。2026-10 の Tailscale・OIDC・Environment の適用記録と当時の提案は `git show 1b46cbb5:tasks/v1-private-actions-route.md` で参照できる。
+**GPU ホストは研究室の RTX 4060 と個人デスクトップの RTX 4070。** 両台とも WSL 内の kio-test 専用 rootless Docker Engine と NVIDIA Container Toolkit の CDI を使う。Mac 作業中は 4060、停止中・利用不可なら 4070、4070 で作業中は 4070 を使う。両台の構築・接続確認は実行前に行う。同一の受入鍵と両台の Windows・WSL ホスト鍵を登録し、run 開始前に `KIO_LAB_JUMP_HOST` のみを手動で切り替える。3 OS の実行とリース回収が完了するまで接続先を固定する。[構築・切り替え手順](../scripts/v1-local-gpu/README.md#受入ホストの構築)
 
 ### 確かめること
 
@@ -46,12 +46,12 @@
 #### B. GPU 経由のローカル（3 件）
 
 4. **Tailscale の管理画面**
-   - Access controls の policy に `tag:kio-ci` の `tagOwners` と、`tag:kio-ci` から選んだ GPU ホストの `tcp:22` だけへ到達できる grant があるか。wildcard の grant（`src:["*"], dst:["*"]`）が残っているか。報告には該当する規則と判定根拠を書く。
+   - Access controls の policy に `tag:kio-ci` の `tagOwners` と、`tag:kio-ci` から両 GPU ホストの `tcp:22` だけへ到達できる grant があるか。wildcard の grant（`src:["*"], dst:["*"]`）が残っているか。報告には該当する規則と判定根拠を書く。
    - Settings の OAuth clients / Trust credentials（workload identity federation）に、`KIO_TS_CLIENT_ID` と同じ ID のものがあるか。GitHub の OIDC が対象 repo・Environment・main・workflow に束縛され、`tag:kio-ci` だけを要求できるか。
-   - Machines で現行 Environment の接続先と、利用者が選んだホストの最終接続日時、key の有効期限、tag を確かめる。
-5. **利用者に聞くこと**（Chrome では確かめられない）
-   - `kio-lab-windows` は今も GPU の host として使う予定か。それとも、個人デスクトップ（`ttokunaga-ja`）に移すのか。
-   - lab Windows に `kio-ci` user、`sshd_config` の `Match User kio-ci`、WSL の `kio-test` と dispatcher を設定したことがあるか。
+   - Machines で両ホストのアドレス、最終接続日時、key の有効期限、tag を確かめる。
+5. **両ホストの準備状況**
+   - Windows の `kio-ci` と制限付き転送、WSL の `kio-test`・forced command・専用 rootless Docker/GPU を両台で確認する。
+   - 接続先の WSL が稼働し、空き VRAM が 6,269 MiB 以上あり、Windows・WSL の他ワークロードが GPU を使用していないことを管理者が確認する。受入コントローラは専用 Docker 内の他コンテナ、共有 Docker の稼働中 DeviceRequests 件数、ホスト全体の VRAM を検査する。
 
 接続先の決定後は、選んだホストに対する OIDC/grant、固定 host key、Windows の制限付き forwarding と WSL の forced command、候補に束縛された deployment、既存管理者経路の維持を確かめる。GitHub の dispatch 権限を持つ主体も再確認する。main 専用 Environment の branch 制限と、dispatch できる利用者の権限は別に確かめる。整理後の候補 SHA から、移管済みの OCR 設定を含む deployment を生成する。[候補の固定入力と配置の手順](../scripts/v1-local-gpu/README.md#candidate-bound-deployment-proposal) に従う。
 

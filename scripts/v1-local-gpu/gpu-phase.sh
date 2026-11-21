@@ -5,7 +5,7 @@ umask 077
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 TOOLS="$SCRIPT_DIR/kio-acceptance-tools"
-ROOT=${KIO_GPU_ROOT:-/home/kio-test/work/kio/v1-local-gpu}
+ROOT=${KIO_GPU_ROOT:-/var/lib/kio-v1-local/state}
 OCR_PROJECT=kio-v1-local-gpu-ocr
 OCR_WEIGHT=85a479d506a11e724e7285d395c551be69f41dbc16b6342d3cacfb189aed71db
 OCR_API_IMAGE=ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-vl@sha256:6c735bdf9e758ffdd58ccc067db0c2d84e37e5e6a2cbd47156069d4d7ea5d709
@@ -46,6 +46,12 @@ lock() {
   exec 9>"$ROOT/.controller.lock"
   flock -n 9 || die "controller is busy"
   chmod 600 "$ROOT/.controller.lock"
+}
+
+docker() {
+  unset DOCKER_HOST DOCKER_CONTEXT
+  command docker --host "unix:///run/user/$(id -u)/kio-v1-local-docker.sock" \
+    --config /opt/kio-v1-local/docker-cli "$@"
 }
 
 compose() { docker compose --project-name "$1" --file "$2" "${@:3}"; }
@@ -89,20 +95,22 @@ ocr_project_gone() {
   project_gone "$OCR_PROJECT" || die "owned OCR project is not absent"
 }
 
+shared_gpu_guard() {
+  local count
+  count=$(sudo -n -- /var/lib/kio-v1-local/shared-gpu-count) ||
+    die "cannot inspect shared Docker GPU containers"
+  [[ $count =~ ^(0|[1-9][0-9]*)$ ]] || die "invalid shared Docker GPU count"
+  [[ $count == 0 ]] || die "shared Docker GPU container is running (count: $count)"
+}
+
 gpu_guard() {
-  local id requests project ids
-  ids=$(project_ids) || die "cannot enumerate GPU containers"
+  local id project ids
+  shared_gpu_guard
+  ids=$(project_ids) || die "cannot enumerate dedicated Docker containers"
   while IFS= read -r id; do
     [ -n "$id" ] || continue
-    requests=$(docker inspect -f '{{json .HostConfig.DeviceRequests}}' "$id") || die "cannot inspect container $id"
     project=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$id") || die "cannot inspect container $id"
-    case "$requests" in
-      null|'[]') continue ;;
-    esac
-    case "$project" in
-      "$OCR_PROJECT") ;;
-      *) die "unrelated GPU container is running: $id" ;;
-    esac
+    [ "$project" = "$OCR_PROJECT" ] || die "unrelated container is running on the dedicated engine: $id"
   done <<< "$ids"
 }
 
@@ -250,7 +258,8 @@ write_phase_evidence() {
 
 init() {
   local name
-  for name in docker openssl curl timeout; do command -v "$name" >/dev/null || die "missing command: $name"; done
+  type -P docker >/dev/null || die "missing command: docker"
+  for name in openssl curl timeout; do command -v "$name" >/dev/null || die "missing command: $name"; done
   [ -x "$TOOLS" ] && [ ! -L "$TOOLS" ] || die "reviewed acceptance tools binary is missing"
   gpu_command >/dev/null || die "missing nvidia-smi"
   ensure_root
@@ -311,6 +320,7 @@ start_ocr() {
 
 stop_ocr() {
   lock
+  shared_gpu_guard
   compose "$OCR_PROJECT" "$ROOT/ocr/compose.yaml" down
   wait_gone "$OCR_PROJECT" "$ROOT/ocr/compose.yaml"
   wait_vram
@@ -331,6 +341,7 @@ cleanup_project() {
 
 cleanup() {
   lock
+  shared_gpu_guard
   cleanup_project "$OCR_PROJECT" "$ROOT/ocr/compose.yaml"
   private_dir "$ROOT/state"
   wait_vram --allow-missing

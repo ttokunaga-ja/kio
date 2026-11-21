@@ -29,6 +29,7 @@ pub(crate) const FIXED_SOURCES: &[&str] = &[
     "crates/kio-eval/src/acceptance_tools/gpu_memory.rs",
     "crates/kio-eval/src/acceptance_tools/package_extract.rs",
     "scripts/v1-local-gpu/gpu-phase.sh",
+    "scripts/v1-local-gpu/host/shared-gpu-count",
     "scripts/v1-local-gpu/ocr_api_entrypoint.sh",
     "scripts/v1-local-gpu/config/backend-config.yaml",
     "scripts/v1-local-gpu/config/compose.yaml",
@@ -50,7 +51,7 @@ pub fn valid_sha(v: &str, n: usize) -> bool {
 pub fn lower_hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
-fn checked_open(path: &Path, max: u64) -> Result<fs::File, String> {
+pub(super) fn checked_open(path: &Path, max: u64) -> Result<fs::File, String> {
     if !path.is_absolute() {
         return Err("fixed path must be absolute".into());
     };
