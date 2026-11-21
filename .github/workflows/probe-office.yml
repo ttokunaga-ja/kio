@@ -59,6 +59,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends "$deb_directory"/*.deb
           bash scripts/ci/prepare-linux-confinement.sh
+          # The product refuses an Office path whose ancestors other users can write.
+          stat -c '/opt before: %U:%G %a' /opt
+          sudo chown root:root /opt
+          sudo chmod go-w /opt
           converter=/opt/libreoffice26.8/program/soffice
           test -x "$converter"
           {
@@ -114,16 +118,12 @@ jobs:
           }
           "KIO_OFFICE_CONVERTER=$converter" | Add-Content -LiteralPath $env:GITHUB_ENV
           "$(Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash" | Out-File -LiteralPath "$env:RUNNER_TEMP\kio-v1-provisioning.txt" -Encoding utf8
-          $versionOutput = Join-Path $env:RUNNER_TEMP 'kio-v1-office-version.txt'
-          $version = Start-Process -FilePath $converter -ArgumentList '--version' -PassThru -NoNewWindow -RedirectStandardOutput $versionOutput
-          try {
-            if (-not $version.WaitForExit(120000)) {
-              $version.Kill($true)
-              throw 'LibreOffice --version did not finish within 120 seconds'
-            }
-            if ($version.ExitCode -ne 0) { throw "LibreOffice --version exited with $($version.ExitCode)" }
-          } finally {
-            Get-Content -LiteralPath $versionOutput | Add-Content -LiteralPath "$env:RUNNER_TEMP\kio-v1-provisioning.txt" -Encoding utf8
+          # soffice.exe --version does not return on a headless runner; record the signed file version instead.
+          (Get-Item -LiteralPath $converter).VersionInfo.ProductVersion | Add-Content -LiteralPath "$env:RUNNER_TEMP\kio-v1-provisioning.txt" -Encoding utf8
+          foreach ($exe in @('soffice.com','soffice.exe')) {
+            $path = Join-Path (Split-Path $converter) $exe; $out = Join-Path $env:RUNNER_TEMP "$exe-version.txt"
+            $t = Get-Date; $p = Start-Process -FilePath $path -ArgumentList '--version' -PassThru -NoNewWindow -RedirectStandardOutput $out
+            if ($p.WaitForExit(60000)) { "$exe --version exit $($p.ExitCode) in $([int]((Get-Date)-$t).TotalSeconds)s: $(Get-Content -LiteralPath $out -Raw)" } else { "$exe --version HUNG 60s"; $p.Kill($true) }
           }
 
       - name: Prefetch pinned LiteRT-LM
