@@ -114,8 +114,6 @@ trusted_path "$source"
 trusted_path "$legacy_config"
 trusted_path /etc/ssh/sshd_config.d
 trusted_path /etc/sudoers.d
-trusted_path "$query_source"
-[[ -f $query_source && -x $query_source ]] || die "Missing reviewed shared GPU query."
 
 check_lease() {
   [[ ! -e $state/lease.json && ! -L $state/lease.json ]] ||
@@ -181,11 +179,12 @@ for tool in docker dockerd dockerd-rootless.sh containerd runc; do
   trusted_path "$engine/$tool"
   [[ -x $engine/$tool ]] || die "Missing rootless Docker bundle member: $tool."
 done
-[[ -x $source/scripts/v1-local-gpu/kio-acceptance-tools ]] || die "Install the reviewed candidate before enabling SSH."
-[[ -r $source/scripts/v1-local-gpu/deployment.json ]] || die "Install the candidate deployment first."
-while IFS= read -r -d '' path; do
-  trusted_path "$path"
-done < <(find "$source" -print0)
+# Begin bootstrap payload validation.
+for executable in "$source/scripts/v1-local-gpu/kio-acceptance-tools" "$query_source"; do
+  [[ -f $executable && -x $executable ]] || die "Missing reviewed bootstrap executable: $executable"
+  trusted_path "$executable"
+done
+# End bootstrap payload validation.
 if [[ -e $toolkit || -L $toolkit ]]; then trusted_path "$toolkit"; fi
 
 account_sessions() {
