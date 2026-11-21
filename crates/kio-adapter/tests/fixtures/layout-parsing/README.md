@@ -29,21 +29,30 @@ PaddleOCR-VL が実際に返したバイト列。**整形も切り詰めもし�
 
 重みの digest はコード側の pin (`local_ocr_markdownize.rs`) とも 64 桁すべて一致する。
 
-**`compose.yaml` と `.env` は「この機から消えた」と判断されたが、実際には残っていた。**
-`~/paddleocr-vl` ではなく一時ディレクトリに置かれていたので、探し方が合っていなかった。
-一時ディレクトリはいつ消えてもおかしくないため、**原本を
-[`tasks/artifacts/paddleocr-vl-compose/`](../../../../../tasks/artifacts/paddleocr-vl-compose/)
-へ保全した** (`compose.yaml` / `compose.override.yaml` / `backend-config.yaml` / `env.txt`)。
-`docker inspect` の全文も `tasks/artifacts/paddleocr-{pipeline,vllm}-inspect.json` にある。
-どちらにも資格情報は無い — `GPG_KEY` は python 公式イメージが持つ**公開**署名鍵の
-フィンガープリントで、秘密ではない。
+イメージのレジストリは `ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle`。
+両方のイメージのタグは `latest-nvidia-gpu-offline` で、起動中のコンテナから
+2026-08-09 に上表の digest を採取した。Pipeline は `VLM_BACKEND=vllm` で
+`/home/paddleocr/pipeline_config_vllm.yaml` を読み、VLM は vLLM backend で
+`PaddleOCR-VL-1.6-0.9B` を起動した。GPU は ID 0、共有メモリは両サービスとも 8 GiB。
 
-> ⚠ **この応答は上流の既定設定のものではない。**`compose.override.yaml` が
-> `backend-config.yaml` を渡しており、`gpu_memory_utilization: 0.85` /
-> `max_model_len: 16384` / `max_num_batched_tokens: 16384` / `api_server_count: 1`
-> で動いている。12 GB のカードに載せるためのサイズ調整で、既定のままでは
-> KV キャッシュが負になりエンジンが起動しない。**サンプリングにもテンプレートにも
-> 重みにも触っていない**が、「上流の既定で再現する」とは書けない。
+12 GB の RTX 4070 で KV キャッシュを確保するため、Compose override で
+`backend-config.yaml` を読み取り専用で渡した。設定は `trust_remote_code: true`、
+`gpu_memory_utilization: 0.85`、`max_model_len: 16384`、
+`max_num_batched_tokens: 16384`、`api_server_count: 1`。サンプリング、テンプレート、
+重みは上流イメージの設定を使用した。重みの SHA-256 は
+`85a479d506a11e724e7285d395c551be69f41dbc16b6342d3cacfb189aed71db`。
+
+原本は以下の Git オブジェクトを `git show <commit>:<path>` で参照できる。
+
+- `6dc109e9:tasks/artifacts/paddleocr-vl-compose/compose.yaml`
+- `6dc109e9:tasks/artifacts/paddleocr-vl-compose/compose.override.yaml`
+- `6dc109e9:tasks/artifacts/paddleocr-vl-compose/compose.pinned.yaml`
+- `6dc109e9:tasks/artifacts/paddleocr-vl-compose/backend-config.yaml`
+- `6dc109e9:tasks/artifacts/paddleocr-vl-compose/env.txt`
+- `6dc109e9:tasks/artifacts/paddleocr-pipeline-inspect.json`
+- `6dc109e9:tasks/artifacts/paddleocr-vllm-inspect.json`
+
+inspect 内の `GPG_KEY` は Python 公式イメージの公開署名鍵の指紋。
 
 リクエストボディは **Kio の `EnvLocalOcrClient` が送るものと同一**:
 

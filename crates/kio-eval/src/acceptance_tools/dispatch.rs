@@ -357,7 +357,6 @@ mod unix {
                 "PATH",
                 "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             )
-            .env("KIO_REPO", SOURCE)
             .env("KIO_GPU_ROOT", root)
             .env("HOME", "/home/kio-test")
             .stdin(Stdio::null())

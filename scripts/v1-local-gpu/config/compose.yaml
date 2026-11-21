@@ -1,0 +1,61 @@
+# RTX 4060 measurement Compose. The GPU controller stages a TLS variant.
+# Image and weight provenance and reproduction steps are in ../README.md.
+services:
+  paddleocr-vl-api:
+    image: ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-vl@sha256:6c735bdf9e758ffdd58ccc067db0c2d84e37e5e6a2cbd47156069d4d7ea5d709
+    ports:
+      - 127.0.0.1:18080:8080
+    depends_on:
+      paddleocr-vlm-server:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    # 8g, not the stock 64g: the pipeline fits within 8 GiB on WSL2.
+    shm_size: 8g
+    user: root
+    restart: "no"
+    logging:
+      driver: local
+      options:
+        max-size: 10m
+        max-file: "3"
+    environment:
+      - VLM_BACKEND=vllm
+    command: /bin/bash -c "paddlex --serve --pipeline /home/paddleocr/pipeline_config_vllm.yaml"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
+
+  paddleocr-vlm-server:
+    image: ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-genai-vllm-server@sha256:d0d32c04a2119613d25a0a4c292e165ccc107954b74580613cf59e378037f8f5
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    shm_size: 8g
+    user: root
+    restart: "no"
+    logging:
+      driver: local
+      options:
+        max-size: 10m
+        max-file: "3"
+    # Use the measured 8 GiB GPU settings for the vLLM backend.
+    volumes:
+      - ./backend-config.yaml:/cfg/backend-config.yaml:ro
+    command: >
+      /bin/bash -c "paddleocr genai_server
+      --model_name PaddleOCR-VL-1.6-0.9B
+      --host 0.0.0.0 --port 8080
+      --backend vllm
+      --backend_config /cfg/backend-config.yaml"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
+      start_period: 300s

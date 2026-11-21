@@ -30,8 +30,8 @@ pub(crate) const FIXED_SOURCES: &[&str] = &[
     "crates/kio-eval/src/acceptance_tools/package_extract.rs",
     "scripts/v1-local-gpu/gpu-phase.sh",
     "scripts/v1-local-gpu/ocr_api_entrypoint.sh",
-    "tasks/artifacts/v1-gpu-4060/ocr/backend-config.yaml",
-    "tasks/artifacts/v1-gpu-4060/ocr/compose.yaml",
+    "scripts/v1-local-gpu/config/backend-config.yaml",
+    "scripts/v1-local-gpu/config/compose.yaml",
 ];
 #[derive(Debug, ClapArgs)]
 pub struct Args {
@@ -375,7 +375,14 @@ mod tests {
     #[test]
     fn preflight_requires_the_exact_clean_candidate() {
         let (_temp, root, _git, binary, candidate) = private_fixture();
-        preflight(root.path(), &candidate, &binary).expect("clean exact candidate");
+        let proposal = preflight(root.path(), &candidate, &binary).expect("clean exact candidate");
+        let sources = proposal["deployment"]["sources"].as_object().unwrap();
+        for config in [
+            "scripts/v1-local-gpu/config/backend-config.yaml",
+            "scripts/v1-local-gpu/config/compose.yaml",
+        ] {
+            assert!(sources.contains_key(config), "missing OCR source: {config}");
+        }
         root.write_atomic(
             Path::new(FIXED_SOURCES[0]),
             b"changed\n",

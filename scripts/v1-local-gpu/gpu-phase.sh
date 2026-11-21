@@ -5,7 +5,6 @@ umask 077
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 TOOLS="$SCRIPT_DIR/kio-acceptance-tools"
-REPO=${KIO_REPO:-$(cd "$SCRIPT_DIR/../.." && pwd -P)}
 ROOT=${KIO_GPU_ROOT:-/home/kio-test/work/kio/v1-local-gpu}
 OCR_PROJECT=kio-v1-local-gpu-ocr
 OCR_WEIGHT=85a479d506a11e724e7285d395c551be69f41dbc16b6342d3cacfb189aed71db
@@ -201,7 +200,7 @@ stage_ocr_compose() {
       next
     }
     { print }
-  ' "$REPO/tasks/artifacts/v1-gpu-4060/ocr/compose.yaml" > "$target"
+  ' "$SCRIPT_DIR/config/compose.yaml" > "$target"
   chmod 600 "$target"
 }
 
@@ -278,7 +277,7 @@ init() {
   openssl verify -CAfile "$ROOT/tls-server/ca-cert.pem" "$ROOT/tls-server/server-cert.pem" >/dev/null
   openssl x509 -in "$ROOT/tls-server/server-cert.pem" -noout -ext subjectAltName | grep -Fq 'IP Address:127.0.0.1, IP Address:0:0:0:0:0:0:0:1'
 
-  copy_once "$REPO/tasks/artifacts/v1-gpu-4060/ocr/backend-config.yaml" "$ROOT/ocr/backend-config.yaml"
+  copy_once "$SCRIPT_DIR/config/backend-config.yaml" "$ROOT/ocr/backend-config.yaml"
   copy_once "$TOOLS" "$ROOT/ocr/kio-acceptance-tools" 700
   copy_once "$SCRIPT_DIR/ocr_api_entrypoint.sh" "$ROOT/ocr/ocr_api_entrypoint.sh"
   stage_ocr_compose
