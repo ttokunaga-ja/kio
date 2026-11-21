@@ -268,11 +268,26 @@ function Restore-WindowsSetup([string]$Backup) {
 }
 
 function Test-HostPin([int]$Port, [string]$Address, [string]$PublicKey) {
-    $expected = (($PublicKey.Trim() -split '\s+')[0..1] -join ' ')
-    $result = Invoke-Native (Join-Path $sshBin 'ssh-keyscan.exe') @('-T', '3', '-p', $Port, '-t', 'ed25519', $Address)
-    $actual = @($result.Output | Where-Object { $_ -match '^\S+ ssh-ed25519 [A-Za-z0-9+/]+$' })
-    return $result.Code -eq 0 -and $actual.Count -eq 1 -and
-        (($actual[0] -split '\s+')[1..2] -join ' ') -ceq $expected
+    # Windows' bundled ssh-keyscan cannot complete the key exchange that the WSL
+    # sshd selects, so verify the pin with ssh.exe against a one-entry known_hosts.
+    $key = (($PublicKey.Trim() -split '\s+')[0..1] -join ' ')
+    $hostName = if ($Port -eq 22) { $Address } else { "[$Address]:$Port" }
+    $pinned = [IO.Path]::GetTempFileName()
+    try {
+        [IO.File]::WriteAllText($pinned, "$hostName $key`n", [Text.UTF8Encoding]::new($false))
+        $result = Invoke-Native (Join-Path $sshBin 'ssh.exe') @(
+            '-F', 'NUL', '-p', $Port,
+            '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes',
+            '-o', "UserKnownHostsFile=$pinned", '-o', 'GlobalKnownHostsFile=NUL',
+            '-o', 'HostKeyAlgorithms=ssh-ed25519', '-o', 'KexAlgorithms=curve25519-sha256',
+            '-o', 'PreferredAuthentications=none', '-o', 'ConnectTimeout=3',
+            "kio-host-pin-probe@$Address", 'exit')
+        $text = $result.Output -join "`n"
+        # A matching key gets past host verification and is then refused authentication.
+        return $text -match 'Permission denied' -and $text -notmatch 'Host key verification failed|REMOTE HOST IDENTIFICATION'
+    } finally {
+        Remove-Item -LiteralPath $pinned -Force -ErrorAction SilentlyContinue
+    }
 }
 
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
