@@ -21,14 +21,18 @@ if $desktop_interop_required && [[ $1 != Ubuntu-26.04 ]]; then
   die "The Desktop interop exception is only for the dedicated Ubuntu-26.04 distro."
 fi
 if [[ $1 == Ubuntu-26.04 ]] && ! $desktop_interop_required; then
-  /usr/bin/python3 -I - <<'PYWSL'
-import configparser
-
-config = configparser.ConfigParser(interpolation=None)
-config.read("/etc/wsl.conf")
-if config.getboolean("interop", "enabled", fallback=True):
-    raise SystemExit("Disable interop in the dedicated distro and relaunch that distro before setup.")
-PYWSL
+  awk '
+    function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
+    /^[[:space:]]*[#;]/ { next }
+    /^[[:space:]]*\[/ { interop = ($0 ~ /^[[:space:]]*\[interop\][[:space:]]*$/); next }
+    interop && /^[[:space:]]*[Ee][Nn][Aa][Bb][Ll][Ee][Dd][[:space:]]*[:=]/ {
+      value = $0
+      sub(/^[^:=]*[:=]/, "", value)
+      entries++
+      disabled = tolower(trim(value)) ~ /^(false|no|off|0)$/
+    }
+    END { exit !(entries == 1 && disabled) }
+  ' /etc/wsl.conf || die "Disable interop in the dedicated distro and relaunch that distro before setup."
 fi
 [[ $5 == /* ]] || die "Supply the absolute shared Docker socket path."
 shared_socket=$(realpath -e -- "$5") || die "The selected shared Docker socket is unavailable."
@@ -43,7 +47,7 @@ gpu_uuid=$(timeout 10 /usr/lib/wsl/lib/nvidia-smi --query-gpu=uuid --format=csv,
 . /etc/os-release
 [[ $ID == ubuntu && ( $VERSION_ID == 24.04 || $VERSION_ID == 26.04 ) ]] || die "Expected Ubuntu 24.04 or 26.04."
 [[ $(ps -p 1 -o comm=) == systemd ]] || die "Enable systemd for this distro first."
-for tool in /usr/sbin/visudo /usr/bin/sudo /usr/bin/flock /usr/sbin/sshd /usr/bin/ssh-keygen /usr/bin/rootlesskit /usr/bin/slirp4netns /usr/bin/newuidmap /usr/bin/newgidmap /usr/bin/getsubids; do
+for tool in /usr/sbin/visudo /usr/bin/sudo /usr/bin/flock /usr/sbin/sshd /usr/bin/ssh-keygen /usr/bin/rootlesskit /usr/bin/slirp4netns /usr/bin/newuidmap /usr/bin/newgidmap /usr/bin/getsubids /usr/bin/jq /usr/bin/setfacl; do
   [[ -x $tool ]] || die "Install prerequisite $tool before applying host configuration."
 done
 
@@ -117,48 +121,36 @@ shared_get() {
     --unix-socket "$shared_socket" "http://localhost$1"
 }
 shared_info=$(shared_get /info)
-printf '%s\n' "$shared_info" | python3 -c '
-import json, sys
-info = json.load(sys.stdin)
-if not info["ID"]:
-    raise SystemExit("Missing shared Engine ID")
-print("Shared Engine:", info["ID"], info.get("OperatingSystem", ""))
-desktop = info.get("OperatingSystem") == "Docker Desktop"
-if desktop != (sys.argv[1] == "Ubuntu-26.04"):
-    raise SystemExit("The selected shared Engine does not match this host")
-' "$1" || die "Cannot identify the selected shared Engine. Check integration without restarting it."
-shared_get '/containers/json?all=1' |
-  python3 -c '
-import json, os, sys
-rows = json.load(sys.stdin)
-print("Shared containers:", len(rows))
-print("Running:", sum(row["State"] == "running" for row in rows))
-paths = sorted({mount["Source"] for row in rows for mount in row.get("Mounts", []) if mount["Type"] == "bind"})
-with open(sys.argv[1], "wb") as output:
-    for path in paths:
-        output.write(os.fsencode(path) + b"\0")
-' "$tmp/shared-bind-sources"
+shared_id_filter='.ID | select(type == "string" and length > 0)'
+before_id=$(jq -er "$shared_id_filter" <<< "$shared_info") || die "Cannot identify the selected shared Engine."
+shared_os=$(jq -r '.OperatingSystem // ""' <<< "$shared_info")
+printf 'Shared Engine: %s %s\n' "$before_id" "$shared_os"
+if [[ ( $1 == Ubuntu-26.04 && $shared_os != 'Docker Desktop' ) ||
+      ( $1 != Ubuntu-26.04 && $shared_os == 'Docker Desktop' ) ]]; then
+  die "The selected shared Engine does not match this host."
+fi
+shared_containers=$(shared_get '/containers/json?all=1')
+jq -er '"Shared containers: \(length)\nRunning: \([.[] | select(.State == "running")] | length)"' <<< "$shared_containers"
+jq -j '[.[] | .Mounts[]? | select(.Type == "bind") | .Source] | unique[] | ., "\u0000"' \
+  <<< "$shared_containers" > "$tmp/shared-bind-sources"
 printf '%s\n' "$shared_socket" > "$tmp/query-config"
 
-mount_helper=$(dirname -- "${BASH_SOURCE[0]}")/wsl-windows-mounts.py
-mount_probe=$(cat -- "$mount_helper")
-read_mount_plan() { nsenter --target 1 --mount -- /usr/bin/python3 -I -c "$mount_probe" plan; }
+mount_helper=$(dirname -- "${BASH_SOURCE[0]}")/wsl-windows-mounts.sh
+# shellcheck source=/dev/null
+source "$mount_helper"
+# Send the verified helper contents into namespaces that may hide its original path.
+mount_probe=$(cat -- "$mount_helper")$'\n"$@"'
+read_mount_plan() { nsenter --target 1 --mount -- /bin/bash -euo pipefail -c "$mount_probe" -- wsl_mount_plan /proc/self/mountinfo; }
 mount_plan=$(read_mount_plan)
-caller_mount_plan=$(/usr/bin/python3 -I -c "$mount_probe" plan)
-printf 'Windows filesystem mounts: %s\n' "$mount_plan"
-/usr/bin/python3 -I -c "$mount_probe" policy "$mount_plan" > "$tmp/windows-policy"
-for key in directories files; do
-  /usr/bin/python3 -I -c "$mount_probe" paths "$mount_plan" "$key" > "$tmp/windows-$key"
+caller_mount_plan=$(wsl_mount_plan /proc/self/mountinfo)
+printf 'Windows filesystem mounts:\n%s\n' "$mount_plan"
+wsl_mount_policy "$mount_plan" > "$tmp/windows-policy"
+for kind in directory file; do
+  wsl_mount_paths "$mount_plan" "$kind" > "$tmp/windows-$kind"
 done
-mapfile -d '' -t windows_dirs < "$tmp/windows-directories"
-mapfile -d '' -t windows_files < "$tmp/windows-files"
-masked_path() {
-  local path=$1 target
-  for target in "${windows_dirs[@]}" "${windows_files[@]}"; do
-    if [[ $path == "$target" || $path == "$target/"* ]]; then return 0; fi
-  done
-  return 1
-}
+mapfile -d '' -t windows_dirs < "$tmp/windows-directory"
+mapfile -d '' -t windows_files < "$tmp/windows-file"
+masked_path() { wsl_mount_covers "$1" "${windows_dirs[@]}" "${windows_files[@]}"; }
 
 [[ -e $host_key && -f $host_key.pub && ! -L $host_key ]] || die "Prepare the distro Ed25519 host key first."
 
@@ -204,17 +196,7 @@ take_maintenance_gate() {
 }
 restrict_maintenance_file() {
   # An inherited ACL could otherwise become readable when chmod enables group read.
-  /usr/bin/python3 -I - "$1" <<'PYACL'
-import errno
-import os
-import sys
-
-try:
-    os.removexattr(sys.argv[1], "system.posix_acl_access")
-except OSError as error:
-    if error.errno not in (errno.ENODATA, errno.ENOTSUP):
-        raise
-PYACL
+  /usr/bin/setfacl -b -- "$1"
   chgrp "$user" "$1"
   chmod 0640 "$1"
 }
@@ -473,8 +455,8 @@ CONFIG
 mkdir -m 0755 "$tmp/cdi"
 nsenter --target 1 --mount -- "$tmp/nvidia/usr/bin/nvidia-ctk" cdi generate --format json \
   --nvidia-cdi-hook-path="$toolkit/nvidia-cdi-hook" --output="$tmp/nvidia-cdi.json"
-nsenter --target 1 --mount -- /usr/bin/python3 -I -c "$mount_probe" stage-cdi \
-  "$mount_plan" "$tmp/cdi" "$cdi_dir" < "$tmp/nvidia-cdi.json"
+nsenter --target 1 --mount -- /bin/bash -euo pipefail -c "$mount_probe" -- wsl_stage_cdi \
+  "$mount_plan" "$tmp/nvidia-cdi.json" "$tmp/cdi" "$cdi_dir"
 cat > "$tmp/docker-unit" <<UNIT
 [Unit]
 Description=Kio v1 local rootless Docker
@@ -496,7 +478,7 @@ UNIT
 
 backup=$(mktemp -d /var/backups/kio-v1-local.XXXXXXXX)
 printf 'Backup: %s\n' "$backup"
-printf '%s\n' "$mount_plan" > "$backup/windows-mounts.json"
+printf '%s\n' "$mount_plan" > "$backup/windows-mounts"
 if [[ -e $cdi_dir || -L $cdi_dir ]]; then
   trusted_path "$cdi_dir"
   [[ -d $cdi_dir ]] || die "Expected a dedicated CDI directory: $cdi_dir"
@@ -798,12 +780,16 @@ verify_windows_namespace() {
   pid=$(systemctl show "$unit" -p MainPID --value)
   [[ $pid =~ ^[1-9][0-9]*$ ]]
   nsenter --target "$pid" --mount -- runuser -u "$user" -- \
-    /usr/bin/python3 -I -c "$mount_probe" verify "$mount_plan" "$visible_socket"
-  nsenter --target "$pid" --mount -- /usr/bin/python3 -I -c '
-import os
-if os.access("/init", os.X_OK) or (os.path.isdir("/run/WSL") and os.listdir("/run/WSL")):
-    raise SystemExit("Windows interop is available inside the acceptance namespace")
-'
+    /bin/bash -euo pipefail -c "$mount_probe" -- wsl_mount_verify "$mount_plan" "$visible_socket" /proc/self/mountinfo
+  # shellcheck disable=SC2016
+  nsenter --target "$pid" --mount -- /bin/bash -ec '
+    shopt -s dotglob nullglob
+    entries=(/run/WSL/*)
+    if [[ -x /init || ${#entries[@]} != 0 ]]; then
+      printf "%s\n" "Windows interop is available inside the acceptance namespace" >&2
+      exit 1
+    fi
+  '
 }
 die_after_apply() { printf '%s\n' "$*" >&2; rollback; }
 verify_windows_namespace "user@$uid.service" ""
@@ -863,10 +849,9 @@ done
 $live
 verify_windows_namespace "$ssh_unit" "$shared_socket"
 [[ $(read_mount_plan) == "$mount_plan" &&
-   $(/usr/bin/python3 -I -c "$mount_probe" plan) == "$caller_mount_plan" ]] ||
+   $(wsl_mount_plan /proc/self/mountinfo) == "$caller_mount_plan" ]] ||
   die_after_apply "Windows filesystem mounts changed during setup."
-before_id=$(printf '%s\n' "$shared_info" | /usr/bin/python3 -I -c 'import json, sys; print(json.load(sys.stdin)["ID"])')
-after_id=$(shared_get /info | /usr/bin/python3 -I -c 'import json, sys; print(json.load(sys.stdin)["ID"])')
+after_id=$(shared_get /info | jq -er "$shared_id_filter")
 [[ $before_id == "$after_id" ]] || die_after_apply "Shared Engine ID changed during setup."
 pid=$(systemctl show "$ssh_unit" -p MainPID --value)
 shared_count=$(nsenter --target "$pid" --mount -- runuser -u "$user" -- /usr/bin/sudo -n -- "$query")
