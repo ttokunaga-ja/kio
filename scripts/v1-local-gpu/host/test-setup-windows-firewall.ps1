@@ -59,3 +59,58 @@ Assert-TailscaleRule 'explicit TCP' $false @{ Protocol = 'TCP' }
 Assert-TailscaleRule 'explicit remote address' $false @{ RemoteAddress = '100.64.0.0/10' }
 Assert-TailscaleRule 'explicit program' $false -Program 'C:\Windows\System32\OpenSSH\sshd.exe'
 Assert-TailscaleRule 'explicit service' $false -Service 'sshd'
+
+foreach ($functionName in 'Get-Port22Scope','Get-SshAllowDisposition') {
+    $definition = $ast.Find({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $functionName
+    }, $false)
+    if (!$definition) { throw "Missing $functionName." }
+    . ([scriptblock]::Create($definition.Extent.Text))
+}
+
+function Assert-SshAllow([string]$Case, [string]$Expected, [hashtable]$Change = @{}) {
+    $rule = @{ Profile = 'Any'; RawRule = $null }
+    $port = @{ Protocol = 'TCP'; LocalPort = 'Any' }
+    $application = @{ Program = 'Any'; Package = 'Any' }
+    $service = @{ Service = 'Any' }
+    $interface = @{ InterfaceAlias = 'Any' }
+    $interfaceType = @{ InterfaceType = 'Any' }
+    foreach ($filter in @($rule, $port, $application, $service, $interface, $interfaceType)) {
+        foreach ($key in $Change.Keys) {
+            if ($filter.ContainsKey($key)) { $filter[$key] = $Change[$key] }
+        }
+    }
+    $profiles = @{ Ethernet = 'Private'; 'Office Wi-Fi' = 'Domain' }
+    $actual = Get-SshAllowDisposition $rule (Get-Port22Scope $port) $application $service $interface $interfaceType `
+        $profiles 'Tailscale' 'C:\Windows\System32\OpenSSH\sshd.exe' $rule.RawRule
+    if ($actual -ne $Expected) { throw "${Case}: expected $Expected, got $actual" }
+}
+
+Assert-SshAllow 'unrestricted TCP on LAN' 'Block'
+Assert-SshAllow 'configured sshd path' 'Block' @{ Program = 'C:\Windows\System32\OpenSSH\sshd.exe' }
+Assert-SshAllow 'port range includes TCP 22' 'Block' @{ Protocol = '6'; LocalPort = @('20-24', '443') }
+Assert-SshAllow 'domain profile on active IF' 'Block' @{ Profile = 'Domain'; InterfaceAlias = 'Office Wi-Fi' }
+Assert-SshAllow 'System program' 'Warn' @{ Program = 'System' }
+Assert-SshAllow 'System with Windows app PFN' 'Ignore' @{ Program = 'System'; Package = 'Microsoft.AAD.BrokerPlugin_cw5n1h2txyewy' }
+Assert-SshAllow 'observed Windows app with hidden PFN' 'Ignore' @{
+    Package = ''; RawRule = 'v2.33|Action=Allow|Dir=In|PFN=Microsoft.AAD.BrokerPlugin_cw5n1h2txyewy|LUOwn=S-1-5-18|'
+}
+Assert-SshAllow 'empty package with verified unrestricted local rule' 'Block' @{
+    Package = ''; RawRule = 'v2.33|Action=Allow|Dir=In|Protocol=6|'
+}
+Assert-SshAllow 'empty package without persistent metadata' 'Warn' @{ Package = '' }
+Assert-SshAllow 'owner metadata alone' 'Warn' @{ Package = ''; RawRule = 'v2.33|Action=Allow|LUOwn=S-1-5-18|' }
+Assert-SshAllow 'AppContainer SID' 'Ignore' @{ Package = 'S-1-15-2-123456789-123456789' }
+Assert-SshAllow 'another executable' 'Ignore' @{ Program = 'C:\Windows\System32\svchost.exe' }
+Assert-SshAllow 'another service' 'Ignore' @{ Service = 'upnphost' }
+Assert-SshAllow 'specific sshd service' 'Warn' @{ Service = 'sshd' }
+Assert-SshAllow 'only Tailscale alias' 'Ignore' @{ InterfaceAlias = 'Tailscale' }
+Assert-SshAllow 'Tailscale and LAN aliases' 'Block' @{ InterfaceAlias = @('Tailscale', 'Ethernet') }
+Assert-SshAllow 'inactive profile on LAN' 'Ignore' @{ InterfaceAlias = 'Ethernet'; Profile = 'Public' }
+Assert-SshAllow 'unknown interface profile' 'Warn' @{ InterfaceAlias = 'Unlisted' }
+Assert-SshAllow 'wildcard program' 'Warn' @{ Program = 'C:\Windows\*' }
+Assert-SshAllow 'interface type filter' 'Warn' @{ InterfaceType = 'Wireless' }
+Assert-SshAllow 'other port' 'Ignore' @{ LocalPort = '443' }
+Assert-SshAllow 'dynamic port' 'Warn' @{ LocalPort = 'RPC' }
+Assert-SshAllow 'UDP' 'Ignore' @{ Protocol = 'UDP' }
