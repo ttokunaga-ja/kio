@@ -1,0 +1,163 @@
+name: probe office
+on:
+  push:
+    branches: [probe/office-fix]
+permissions: { contents: read }
+env:
+  OFFICE_VERSION: "26.8.0.3"
+  OFFICE_LINUX_SHA256: d0a6031a3837e48f9854e6d2da6489b9fadbd814afa4741fa32a197741663a22
+  OFFICE_MACOS_AARCH64_SHA256: 8858d8058da4f862f47559486814e65efc27294da67c5e4bb56b006b1ee59f89
+  OFFICE_WINDOWS_X64_SHA256: 4aa6c6e1895f4055104effcb556bd3362d20c6ad707c149543304f395ef9db95
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, macos-26, windows-2025]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    defaults: { run: { shell: bash } }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
+        with:
+          components: clippy, rustfmt
+
+      # Build only the isolated bootstrap before other repository crates.
+      - name: Build pinned SDK preparation helper
+        if: runner.os == 'macOS'
+        run: cargo +1.98.0 build -p kio-ci --bin kio-prepare-macos-sdk --locked
+      - name: Prepare the pinned macOS SDK on the ephemeral runner
+        if: runner.os == 'macOS'
+        run: sudo /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin "$PWD/target/debug/kio-prepare-macos-sdk"
+
+      - name: Build pinned Linux resource preflight helper
+        if: runner.os == 'Linux'
+        run: cargo +1.98.0 build -p kio-ci --bin kio-prepare-linux-confinement --locked
+
+      # These URLs name immutable Document Foundation release artifacts. Check
+      # their pinned SHA-256 values before installation; do not accept a
+      # package-manager-selected Office build from a mutable channel.
+      - name: Provision Linux Office and user scheduler prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          office_archive="$RUNNER_TEMP/LibreOffice_${OFFICE_VERSION}_Linux_x86-64_deb.tar.gz"
+          curl --fail --location --proto '=https' --tlsv1.2 --retry 3 \
+            --output "$office_archive" \
+            "https://downloadarchive.documentfoundation.org/libreoffice/old/${OFFICE_VERSION}/deb/x86_64/LibreOffice_${OFFICE_VERSION}_Linux_x86-64_deb.tar.gz"
+          printf '%s  %s\n' "$OFFICE_LINUX_SHA256" "$office_archive" | sha256sum --check --status
+          office_unpack="$RUNNER_TEMP/kio-v1-office-unpack"
+          mkdir "$office_unpack"
+          tar -xzf "$office_archive" -C "$office_unpack"
+          deb_directory="$(find "$office_unpack" -type d -name DEBS -print -quit)"
+          test -n "$deb_directory"
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends "$deb_directory"/*.deb
+          bash scripts/ci/prepare-linux-confinement.sh
+          converter=/opt/libreoffice26.8/program/soffice
+          test -x "$converter"
+          {
+            echo "KIO_OFFICE_CONVERTER=$converter"
+          } >> "$GITHUB_ENV"
+          {
+            sha256sum "$office_archive"
+            "$converter" --version
+            dpkg-query --show bubblewrap
+          } > "$RUNNER_TEMP/kio-v1-provisioning.txt"
+
+      - name: Provision macOS Office prerequisite
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          office_dmg="$RUNNER_TEMP/LibreOffice_${OFFICE_VERSION}_MacOS_aarch64.dmg"
+          curl --fail --location --proto '=https' --tlsv1.2 --retry 3 \
+            --output "$office_dmg" \
+            "https://downloadarchive.documentfoundation.org/libreoffice/old/${OFFICE_VERSION}/mac/aarch64/LibreOffice_${OFFICE_VERSION}_MacOS_aarch64.dmg"
+          printf '%s  %s\n' "$OFFICE_MACOS_AARCH64_SHA256" "$office_dmg" | shasum -a 256 --check --status
+          office_mount="$RUNNER_TEMP/kio-v1-office-mount"
+          mkdir "$office_mount"
+          hdiutil attach -nobrowse -readonly -mountpoint "$office_mount" "$office_dmg"
+          sudo ditto "$office_mount/LibreOffice.app" /Applications/LibreOffice.app
+          hdiutil detach "$office_mount"
+          converter=/Applications/LibreOffice.app/Contents/MacOS/soffice
+          test -x "$converter"
+          echo "KIO_OFFICE_CONVERTER=$converter" >> "$GITHUB_ENV"
+          {
+            shasum -a 256 "$office_dmg"
+            PYTHONDONTWRITEBYTECODE=1 "$converter" --version
+          } > "$RUNNER_TEMP/kio-v1-provisioning.txt"
+
+      - name: Provision Windows Office prerequisite
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Join-Path $env:RUNNER_TEMP "LibreOffice_$env:OFFICE_VERSION`_Win_x86-64.msi"
+          Invoke-WebRequest -Uri "https://downloadarchive.documentfoundation.org/libreoffice/old/$env:OFFICE_VERSION/win/x86_64/LibreOffice_$env:OFFICE_VERSION`_Win_x86-64.msi" -OutFile $installer
+          if ((Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:OFFICE_WINDOWS_X64_SHA256) {
+            throw 'downloaded LibreOffice MSI hash differs from the pinned release hash'
+          }
+          # Start-Process -Wait also waits for the msiexec service (/V) that outlives the install.
+          $log = Join-Path $env:RUNNER_TEMP 'kio-v1-office-msi.log'
+          $install = Start-Process msiexec.exe -PassThru -NoNewWindow -ArgumentList @('/i', $installer, '/qn', '/norestart', '/l*v', $log)
+          if (-not $install.WaitForExit(1200000)) { Get-Content -LiteralPath $log -Tail 60; throw 'LibreOffice MSI did not finish within 20 minutes' }
+          if ($install.ExitCode -ne 0) { Get-Content -LiteralPath $log -Tail 60; throw "LibreOffice MSI exited with $($install.ExitCode)" }
+          $converter = Join-Path $env:ProgramFiles 'LibreOffice\program\soffice.exe'
+          if (-not (Test-Path -LiteralPath $converter -PathType Leaf)) {
+            throw "LibreOffice converter was not installed at $converter"
+          }
+          "KIO_OFFICE_CONVERTER=$converter" | Add-Content -LiteralPath $env:GITHUB_ENV
+          "$(Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash" | Out-File -LiteralPath "$env:RUNNER_TEMP\kio-v1-provisioning.txt" -Encoding utf8
+          $versionOutput = Join-Path $env:RUNNER_TEMP 'kio-v1-office-version.txt'
+          $version = Start-Process -FilePath $converter -ArgumentList '--version' -PassThru -NoNewWindow -RedirectStandardOutput $versionOutput
+          try {
+            if (-not $version.WaitForExit(120000)) {
+              $version.Kill($true)
+              throw 'LibreOffice --version did not finish within 120 seconds'
+            }
+            if ($version.ExitCode -ne 0) { throw "LibreOffice --version exited with $($version.ExitCode)" }
+          } finally {
+            Get-Content -LiteralPath $versionOutput | Add-Content -LiteralPath "$env:RUNNER_TEMP\kio-v1-provisioning.txt" -Encoding utf8
+          }
+
+      - name: Prefetch pinned LiteRT-LM
+        run: bash scripts/ci/fetch-litert-runtime.sh
+
+      - name: Build release kio from the pushed commit
+        run: cargo +1.98.0 build --release --locked --all-features -p kio-cli --bin kio
+
+      - name: Compare Office readiness and timings
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d "$RUNNER_TEMP/kio-office-probe.XXXXXXXX")"
+          bin="$PWD/target/release/kio"
+          extra=()
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            work="$(cygpath -am "$work")"
+            bin="${bin}.exe"
+            extra=(APPDATA="$work/cfg" LOCALAPPDATA="$work/data" USERPROFILE="$work/home"
+                   TEMP="$work/tmp" TMP="$work/tmp" SystemRoot="$SYSTEMROOT")
+          fi
+          mkdir -m 700 "$work"/{home,cfg,data,cache,tmp,scope}
+          cp crates/kio-eval/acceptance-fixtures/v1/office-public/{document.docx,presentation.pptx} "$work/scope/"
+          run_cleared() {
+            env -i HOME="$work/home" XDG_CONFIG_HOME="$work/cfg" XDG_DATA_HOME="$work/data" \
+              XDG_CACHE_HOME="$work/cache" TMPDIR="$work/tmp" ${extra[@]+"${extra[@]}"} \
+              KIO_OFFICE_CONVERTER="$KIO_OFFICE_CONVERTER" "$bin" "$@"
+          }
+          cd "$work/scope"
+          run_cleared --json init "$work/scope" > /dev/null
+
+          TIMEFORMAT='elapsed_seconds=%3R'
+          failed=0
+          echo "=== $RUNNER_OS: harness-like cleared environment ==="
+          time run_cleared --json status | jq -ce '.office_readiness // {state: "ready"}' || failed=1
+          echo "=== $RUNNER_OS: full runner environment ==="
+          time "$bin" --json status | jq -ce '.office_readiness // {state: "ready"}' || failed=1
+          exit "$failed"
