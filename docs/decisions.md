@@ -45,19 +45,19 @@
 
 - **内容**：v1 の受入の後、版ごとの状態の表示、既存の tag による引用の保持、復元の操作の表示の順で改善する。これらを v1 の完了の待ち条件にしない。保存の基盤を jj に置き換えること、分岐・rebase、内部ライブラリへの依存は、この工程に含めない。
 - **理由**：v1 を閉じつつ、保存・検索・復元の状態を分かりやすくするため。現在の CAS・Evidence Pointer・線形の履歴を保つため。
-- **関係する資料**：`tasks/knowledge-ux-implementation-plan-2026-10-03.md`、`docs/11-product-requirements.md`。
+- **関係する資料**：`tasks/post-v1/knowledge-ux.md`、`docs/11-product-requirements.md`。
 
 ### D-20261003-02 正式な受入の接続経路
 
 - **内容**：Tailscale の接続ルールの縮小、CI 用の OIDC、main に限定したローカル受入の Environment を承認した。2026-10-04 に、Windows・WSL の専用 account、SSH の経路、dispatcher を計画の対象に加えた。
 - **理由**：既存の接続を保ちながら、CI からの経路を限定するため。
-- **関係する資料**：`tasks/v1-private-actions-route.md`、`scripts/v1-local-gpu/README.md`。外部の設定の現在の状態は、正式な受入の前に確かめる。
+- **関係する資料**：`tasks/v1-acceptance.md`、`scripts/v1-local-gpu/README.md`。外部の設定の現在の状態は、正式な受入の前に確かめる。
 
 ### D-20261003-03 有料 provider の受入の予算
 
 - **内容**：正式な受入で使う有料 provider の費用は、provider ごとに累計 10 米ドルまでとする。失敗と結果不明の実行も数える。配分は 1 つの OS につき 0.10 米ドル、provider ごとに 3 つの OS で 0.30 米ドル。
 - **理由**：受入の費用に上限を置くため。
-- **関係する資料**：`scripts/v1-provider-budget/README.md`（承認済みと記載。承認の原記録と日付は未確認で、ここの日付は受入の計画を作った日である）。
+- **関係する資料**：`tasks/acceptance/provider-budget.md`（承認済みと記載。承認の原記録と日付は未確認で、ここの日付は受入の計画を作った日である）。
 - **確認**：2026-11-13、利用者がこの内容で承認済みであることを確認した。
 
 ### D-20261006-01 構造の是正と仕様書の整理を v1 に含める
@@ -95,13 +95,13 @@
 
 - **内容**：Kio が自分に課していた制約 100 件を調べ、62 件を緩和・削除すると決めた。優先度の高いものから段階的に進め、判断が要る 7 件は推奨案で進める。主な内容は次のとおり。保存の保護は Kio が作った物だけに限り、利用者のフォルダや Kio が作っていない祖先の権限は審査も修復もしない。コマンドは実際に使う設定・資格情報・CA・台帳だけを検査し、無料のローカル処理は課金の台帳なしで動く。loopback では HTTP を許し、未認証であることを表示する。固定の上限は、警告・逐次処理・資源の段階に置き換える。
 - **理由**：無関係な依存の不備や、既定の権限の違いで、自分の保存領域や検索まで使えなくなる問題をなくすため。破損・誤った引用・無断の送信・二重の課金・実行コードの乗っ取りへの保護は変えない。
-- **関係する資料**：commit `4233941`、`6656312`（仕様書の変更）。一覧は `tasks/w1-constraints.tsv`。v1 に入れる範囲は D-20261113-09。
+- **関係する資料**：commit `4233941`、`6656312`（仕様書の変更）。一覧は `tasks/post-v1/constraint-backlog.tsv`。v1 に入れる範囲は D-20261113-09。
 
 ### D-20261031-01 中断後の一時領域を識別する方式
 
 - **内容**：中断した書き込みの一時領域を、物理的な ID と 256 bit の乱数の組で識別する。乱数は、Unix では拡張属性、Windows では EA に書く。対応していない場合に、別の方法へ切り替えて続けることはしない。
 - **理由**：物理的な ID だけでは、再利用されたときに別の実体を取り違える恐れがあるため。
-- **関係する資料**：`tasks/v1-plan.md` §3.2 の R1、`~/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-relax/runs/W1/report-r33-progress-ja.md`。利用者が「推奨の方式で再開」と指示した記録は Codex の会話記録にあり、承認の文面そのものは確かめていない。main には実装されていない。
+- **関係する資料**：`1b46cbb5:tasks/v1-plan.md` §3.2 の R1、`~/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-relax/runs/W1/report-r33-progress-ja.md`。利用者が「推奨の方式で再開」と指示した記録は Codex の会話記録にあり、承認の文面そのものは確かめていない。main には実装されていない。
 - **確認**：2026-11-13、利用者がこの方式（対応していないファイルシステムでは、別の方法へ切り替えずに理由を示して失敗させる）で R1 を実装することを確認した。
 
 ## 2026-11-12
@@ -118,7 +118,7 @@
 
 - **内容**：検索結果を 1 文書 1 行に畳む変更（文書名の時点規則、`changed_at` の追加、`snippet` の廃止を含む）は v1 後に回す。v1 の検索結果は、別名を展開した後の chunk 行のままとする。
 - **理由**：2026-08-11 に方針を決めたが実装されておらず、仕様書の中で現行の契約と食い違っていた。v1 を閉じることを優先する。
-- **関係する資料**：`docs/05-runtime.md` §1.7・§1.7.1、`tasks/search-result-presentation-design.md`。
+- **関係する資料**：`docs/05-runtime.md` §1.7・§1.7.1、`tasks/post-v1/search-result-presentation.md`。
 
 ### D-20261113-02 v1 の完了条件を二段に分ける
 
@@ -128,9 +128,9 @@
 
 ### D-20261113-03 Phase 4 の手動受入契約（RC.1 用）は履歴扱い
 
-- **内容**：`tasks/phase4-manual-acceptance-contract.md` の手順は v1 の完了条件にせず、今後は実行しない。
+- **内容**：`1b46cbb5:tasks/phase4-manual-acceptance-contract.md` の手順は v1 の完了条件にせず、今後は実行しない。
 - **理由**：`v0.1.0-rc.1` に固定した手順である。M8 を必ず `blocked` と記録する規定があり、全段階の合格を求める最終条件と両立しない。
-- **関係する資料**：`tasks/phase4-manual-acceptance-contract.md`、`scripts/phase4-replay-m1-m8.sh`、`scripts/phase4-bind-rc-release.sh`。
+- **関係する資料**：`1b46cbb5:tasks/phase4-manual-acceptance-contract.md`、`1b46cbb5:scripts/phase4-replay-m1-m8.sh`、`1b46cbb5:scripts/phase4-bind-rc-release.sh`。
 
 ### D-20261113-04 ローカルにしかなかった branch 2 本を削除する
 
@@ -163,11 +163,11 @@
 
 - **内容**：W1 の残り 53 件のうち、優先度が高い 12 件（ST05、ST04、ST06、AD-14、AD-16、AD-29、AD-30、APP-26、APP-11、CLI-01、AD-17、PROC-01）を v1 に入れる。中・低の 41 件は v1 の後に回す。仕様書は戻さない。
 - **理由**：高の 12 件は、仕様書が 2026-10-22 に緩和後の内容へ書き換わっており、実装と食い違っている。中・低まで入れると v1 が閉じない。
-- **関係する資料**：`tasks/v1-plan.md` §3.2、`tasks/w1-constraints.tsv`（「今回の整理」の列が「残件候補」の 53 行のうち、優先度が「高」の 12 行が v1、「中」の 23 行と「低」の 18 行が v1 後）。
+- **関係する資料**：`1b46cbb5:tasks/v1-plan.md` §3.2、`tasks/post-v1/constraint-backlog.tsv`（「今回の整理」の列が「残件候補」の 53 行のうち、優先度が「高」の 12 行が v1、「中」の 23 行と「低」の 18 行が v1 後）。
 
 ### D-20261113-10 v1 の範囲を固定する
 
-- **内容**：v1 の範囲は `tasks/v1-plan.md` §3 の残作業で固定する。v1 に何かを足すのは、利用者が決めたときだけとする。それ以外の追加・改善・見つかった課題は、すべて「v1 後」に回して `tasks/v1-plan.md` §6 に書く。現行の仕様に対する不具合の修正は、範囲の追加ではない。
+- **内容**：v1 の範囲は当時の計画（`1b46cbb5:tasks/v1-plan.md` §3）で固定する。v1 に何かを足すのは、利用者が決めたときだけとする。それ以外の追加・改善・見つかった課題は、すべて「v1 後」に回して `tasks/v1-plan.md` §6 に書く。現行の仕様に対する不具合の修正は、範囲の追加ではない。
 - **理由**：遅れの一番の原因は、受入が閉じる前に範囲が広がったことだった（2026-10-06、10-18〜19、10-22 の 3 回）。
 - **関係する資料**：`tasks/v1-plan.md`。
 
@@ -179,7 +179,7 @@
 
 ### D-20261113-12 `tasks/` の旧資料を削除する
 
-- **内容**：`tasks/` の旧資料 109 ファイルを削除し、計画の入口を `tasks/v1-plan.md` の 1 本にした。残したのは、計画、制約の一覧、任意の高コスト検証の手順、v1 後の設計 2 本、正式な受入の経路の資料、履歴扱いの Phase 4 契約、テストが節番号で引用している試験仕様 6 本（`step4b-contract-tests-*.md`）、スクリプトとテストの説明が参照する `artifacts/` の一部、repo の `persona-corpus/` が参照する `persona-skill-corpus/` である。削除した資料を理由の出典として引用しているコメントは、`tasks/<名前>.md (git 56a6831)` と書き換え、その commit で読めるようにした。
+- **内容**：`tasks/` の旧資料 109 ファイルを削除し、計画の入口を `tasks/v1-plan.md` の 1 本にした。残したのは、計画、制約の一覧、任意の高コスト検証の手順、v1 後の設計 2 本、正式な受入の経路の資料、履歴扱いの Phase 4 契約、テストが節番号で引用している試験仕様 6 本（`1b46cbb5` の `tasks/` に保存）、スクリプトとテストの説明が参照する `artifacts/` の一部、repo の `persona-corpus/` が参照する `persona-skill-corpus/` である。削除した資料を理由の出典として引用しているコメントは、`tasks/<名前>.md (git 56a6831)` と書き換え、その commit で読めるようにした。
 - **理由**：D-20261113-06。試験仕様は約 190 か所のテストとコードから引用されており、削除すると引用先がなくなる。`persona-corpus/` と `persona-skill-corpus/` は personaCorpus の見直しで扱う。（D-20261115-02 で変更）
 - **関係する資料**：`tasks/`、`docs/README.md`。
 
@@ -193,7 +193,7 @@
 
 - **内容**：Linux の mountinfo に、隔離と関係しない種類のマウント（Docker のネットワーク名前空間など、root 欄が `net:[...]` の行）があっても、Office の renderer の隔離を設定できるようにする。この修正を v1 に足す（計画 §3.2 の OM）。隔離の要件そのものは変えない。
 - **理由**：現在は、そのような行が 1 つでもあると mountinfo 全体を拒否し、Docker を使う普通の Linux デスクトップで Office 変換が使えない。開発中も Docker が動いている間は隔離のテストが落ち、検証の妨げになる。2026-11-13 に統括が見つけ、利用者が v1 に足すと決めた（D-20261113-10 の「利用者が決めたとき」）。
-- **関係する資料**：`crates/kio-process/src/platform/linux/confinement_mounts.rs`、`tasks/v1-plan.md` §3.2。
+- **関係する資料**：`crates/kio-process/src/platform/linux/confinement_mounts.rs`、`1b46cbb5:tasks/v1-plan.md` §3.2。
 
 ### D-20261113-15 小規模以外の実装は最初から Sol に任せる
 
@@ -205,7 +205,7 @@
 
 - **内容**：D-20261031-01 の識別方式（物理的な ID と 256 bit の乱数、Unix は拡張属性、Windows は EA）は、中断後に再開・回収する大きな一時領域（原本・tree・復元・抽出の保存、台帳の backup、journal の整理。計画の S1〜S3、P0、L2、J1）だけに使う。store の小さな atomic 書き込みは、物理的な ID による今の方式のままとする。拡張属性・EA に対応しないファイルシステムでは、その大きな操作だけが理由を示して失敗する。
 - **理由**：R1 の最初の実装は store のほぼすべての atomic 書き込みを乱数付きの一時領域に通し、拡張属性・EA に対応しないファイルシステム（FAT・exFAT、一部のネットワーク共有など）上の scope では kio が何も書けなくなった。2026-11-13 に利用者が範囲を大きな書き込みに限ると決めた。
-- **関係する資料**：D-20261031-01、`tasks/v1-plan.md` §3.2 の R1、`docs/04-pipeline.md` §1.1。
+- **関係する資料**：D-20261031-01、`1b46cbb5:tasks/v1-plan.md` §3.2 の R1、`docs/04-pipeline.md` §1.1。
 
 ## 2026-11-15
 
@@ -213,13 +213,13 @@
 
 - **内容**：Kio はソースコードのファイルを索引・抽出の対象にしない。既知のソースコードの拡張子のファイルは、unsupported として理由を示して飛ばす。同梱 Adapter の対象からコードを外し、コード用の MIME の判定と整形をなくす。Markdown の中のコードブロックやインラインコードは、Markdown の一部としてこれまでどおり扱う。
 - **理由**：利用者が仕様を変えた。拡張子の判定を消すだけでは、中身がテキストのファイルは plain text として索引され続けるため、利用者が「非対応として飛ばす」を選んだ。
-- **関係する資料**：`docs/07-adapter-spec.md`（同梱 Adapter の対象）、`docs/04-pipeline.md`（unit の表）、`tasks/v1-plan.md` §3.2 の NC。
+- **関係する資料**：`docs/07-adapter-spec.md`（同梱 Adapter の対象）、`docs/04-pipeline.md`（unit の表）、`1b46cbb5:tasks/v1-plan.md` §3.2 の NC。
 
 ### D-20261115-02 kio-eval の persona 系のコマンドと persona の資料を削除する
 
 - **内容**：`kio-eval persona`（plan・schedule・render・materialize・scaffold・lease・attest と関連の module）、CI の `persona-w0-integration` の job、`persona-corpus/`、`tasks/persona-skill-corpus/` と、それらへの参照を削除する。
 - **理由**：personaCorpus がこれらを使わなくなり、利用者が残すかどうかを Kio 側で決めるとした。v1 の受入（51 件）、benchmark・scale・qhard、kio-cli はこれらに依存しない（2026-11-13 の調査）。KISS・YAGNI により残さない。`persona-corpus/` は Git では骨組みだけを管理し、確定済みの成果物を含まない。
-- **関係する資料**：D-20261113-12 の「`persona-corpus/` と `persona-skill-corpus/` は personaCorpus の見直しで扱う」はこの決定で変更。`tasks/v1-plan.md` §3.2 の PX。
+- **関係する資料**：D-20261113-12 の「`persona-corpus/` と `persona-skill-corpus/` は personaCorpus の見直しで扱う」はこの決定で変更。`1b46cbb5:tasks/v1-plan.md` §3.2 の PX。
 
 ### D-20261115-03 Kio は personaCorpus の corpus を読むだけにする
 
@@ -233,7 +233,7 @@
 
 - **内容**：次の 3 つを v1 の残作業に足す。(1) NC より前に索引したソースコードのデータが、索引し直したときに残らないようにする（NC2）。(2) index と status の working tree の走査で、使うメモリをファイル数によらず一定にする（S2b）。(3) `step3_p0_contract` の Windows での実行時間を、検証の内容を減らさずに短くする（WP）。
 - **理由**：統括は (1) を旧データの移行、(2) を仕様の有界の対象外として範囲外にしていたが、利用者が両方とも v1 で直すと決めた。(3) は残りの作業で CI を何度も回すため、利用者が v1 に入れると決めた。
-- **関係する資料**：`tasks/v1-plan.md` §3.1、§3.2b。D-20261113-10（v1 の範囲は利用者が決めたときだけ足す）。
+- **関係する資料**：`1b46cbb5:tasks/v1-plan.md` §3.1、§3.2b。D-20261113-10（v1 の範囲は利用者が決めたときだけ足す）。
 
 ## 2026-11-20
 
@@ -241,25 +241,25 @@
 
 - **内容**：EG2 の runtime（LiteRT-LM の C API の共有 library。版は D-20261120-02。Linux x64・macOS arm64・Windows x64）は、repo に binary を commit しない。公式の release の固定 URL と target ごとの SHA-256 の一覧だけを repo に置き、CI と手元の build は取得して hash を照合してから使う。推測した path、PATH、`.kio`、current directory からは探索しない（`docs/10-operations.md` §5.1）。
 - **理由**：利用者が選んだ。repo を大きくせず、版と内容は hash で固定できる。代わりに build の時にネットワークが要る。
-- **関係する資料**：`docs/10-operations.md` §5.1、`tasks/v1-plan.md` §3.4 の G1。
+- **関係する資料**：`docs/10-operations.md` §5.1、`1b46cbb5:tasks/v1-plan.md` §3.4 の G1。
 
 ### D-20261120-02 EG2 の runtime の版を LiteRT-LM v0.19.1（C API 1.0.0）に変える
 
 - **内容**：EG2 の runtime の固定を、LiteRT-LM 0.18.0 から v0.19.1 の C API 1.0.0（公式 release の `litert_lm_c_api-1.0.0.zip`、SHA-256 `1d430d80eaf536f696a4922270ba55eb3d112189ac198c3066d487a45e3b4d4c`）に変える。同梱の置き場所は `lib/litert-lm/0.19.1/<target>/`。
 - **理由**：0.18.0 の release には、Linux・Windows 向けのビルド済みの C API の library がない（Apple 向けの xcframework だけ）。v0.19.1 の C API 1.0.0 の zip には Linux x64・macOS arm64・Windows x64 の共有 library と `embedding_engine.h` があり、release の記載の hash と一致した（2026-11-20、統括が確認）。自前で 3 OS 向けに build するより単純である。利用者が選んだ。C API 1.0.0 は 0.18.0 と互換のない変更を含むが、EG2 の実装はまだない。
-- **関係する資料**：`docs/10-operations.md` §5.1、`docs/03-data-model.md` の embedding の producer の例、D-20261120-01、`tasks/v1-plan.md` §3.4 の G1。
+- **関係する資料**：`docs/10-operations.md` §5.1、`docs/03-data-model.md` の embedding の producer の例、D-20261120-01、`1b46cbb5:tasks/v1-plan.md` §3.4 の G1。
 
 ### D-20261120-03 Linux 固有コードの行数の上限
 
 - **内容**：F1 で Linux 固有コードの上限を 4,000 行から 4,500 行に一度だけ引き上げる。
 - **理由**：EG2 完了時の実測が 4,372 行だったため。利用者が 2026-11-20 に決定した。
-- **関係する資料**：`docs/09-mvp-scope.md` §3、`crates/kio-ci/src/code_limits.rs`、`tasks/v1-plan.md` §3.5 の F1。
+- **関係する資料**：`docs/09-mvp-scope.md` §3、`crates/kio-ci/src/code_limits.rs`、`1b46cbb5:tasks/v1-plan.md` §3.5 の F1。
 
 ### D-20261120-04 F2 で見つかった仕様と実装の食い違いの扱い
 
-- **内容**：(1) `kio diff` の派生物だけの変化の表示（`tasks/step4b-contract-tests-p3b.md` の QB39）を v1 で実装する。(2) tree と Evidence Pointer の名前は、論理名と物理名を分けて判定する。論理名は `/`・NUL・空・単独の `.`／`..` を拒否し、それ以外は履歴に保存できる。宛先 OS で安全に作れない名前は、ファイルとして書き出すときに拒否する。Evidence Pointer の `path_at_commit` も同じ論理名の規則で検証する。(3) 明示的に選んだ HTTP embedding が未承認のときは、`docs/05-runtime.md` §1.1 のとおり auto／hybrid を全文検索に縮退させ、EG2 に切り替えない。(4) 有料 OCR の Batch の提供元（Mistral OCR）は incremental の不適用を示す制御応答（`fallback_to_full`）を返さない。Batch の制御応答の記帳と Full の開始の規定を仕様から削除し、実装しない。
+- **内容**：(1) `kio diff` の派生物だけの変化の表示（QB39。現行契約は [CLI 仕様](06-cli-spec.md) §1、旧ケースの原文は `1b46cbb5:tasks/step4b-contract-tests-p3b.md`）を v1 で実装する。(2) tree と Evidence Pointer の名前は、論理名と物理名を分けて判定する。論理名は `/`・NUL・空・単独の `.`／`..` を拒否し、それ以外は履歴に保存できる。宛先 OS で安全に作れない名前は、ファイルとして書き出すときに拒否する。Evidence Pointer の `path_at_commit` も同じ論理名の規則で検証する。(3) 明示的に選んだ HTTP embedding が未承認のときは、`docs/05-runtime.md` §1.1 のとおり auto／hybrid を全文検索に縮退させ、EG2 に切り替えない。(4) 有料 OCR の Batch の提供元（Mistral OCR）は incremental の不適用を示す制御応答（`fallback_to_full`）を返さない。Batch の制御応答の記帳と Full の開始の規定を仕様から削除し、実装しない。
 - **理由**：利用者の決定。(1) は承認済みの契約で、実装が欠けていた。(4) は当初 v1 で実装すると決めたが、Mistral は送られたページを常に OCR し、この応答を返す仕組みがないため、製品で到達しない経路になると分かり、利用者が仕様を変えると決め直した。(2) は Unix で正当なファイル名を保存できるようにするため、(3) は利用者が選んだ送信先を黙って別のモデルに替えないため、仕様を揃える。
-- **関係する資料**：`docs/06-cli-spec.md` §1、`docs/03-data-model.md` §2・§3、`docs/08-evidence-pointer-spec.md` §2、`docs/05-runtime.md` §1.1、`docs/07-adapter-spec.md` §2.1、`docs/04-pipeline.md` §5.8、`tasks/v1-plan.md` §3.2b の H1・H2。
+- **関係する資料**：`docs/06-cli-spec.md` §1、`docs/03-data-model.md` §2・§3、`docs/08-evidence-pointer-spec.md` §2、`docs/05-runtime.md` §1.1、`docs/07-adapter-spec.md` §2.1、`docs/04-pipeline.md` §5.8、`1b46cbb5:tasks/v1-plan.md` §3.2b の H1・H2。
 
 ## 2026-11-21
 
@@ -280,3 +280,12 @@
 - **内容**：kio の運用に Claude Fable のセッションは使わない。方針・計画・仕様・運用規則の見直しと修正も、統括（Claude Opus 5.5）が受け持ち、決めたことはこのファイルに記録する。実装・検証の Codex の分担は変えない。
 - **理由**：Fable を使えなくなったため（利用者の指示）。
 - **関係する資料**：`AGENTS.md`「エージェント運用」。D-20261112-01 と D-20261113-* のうち Fable を見直しの担当とした部分を置き換える。
+
+### D-20261121-04 リポジトリの構成を整理し、正式受入は整理後に行う
+
+- **内容**：人が付ける新しいパス名は英小文字とハイフンで統一する。日本語と日付は本文に置き、文書の通し番号は製品仕様の 01〜13 に限る。ルートの慣例名、ツール既定名、コードの識別子、契約に含まれる固定入力名は維持する。
+- **構成**：`docs/` に仕様・決定と `proposals/`、`tasks/` に計画・引き継ぎ・正式受入と `acceptance/`・`agent/`・`post-v1/` を置く。固定評価入力は `eval/`、OCR 実験は `experiments/`、実行ツールと GPU 設定は `scripts/`、製品と検証の Rust コードは `crates/` に置く。`.git/` は Git の管理領域とし、`target/` は環境ごとの生成先とする。
+- **Git 管理**：コード・仕様・現行手順・雛形・固定入力は Git で管理する。資格情報、実行依存、未解決の作業記録や再取得不能な証跡は環境ごとに扱う。役目を終えた契約と再生成できる生出力は現行ツリーから外し、必要な経緯は Git 履歴でたどる。`scratch/` は作業名別の指示・報告・ログ・検証・worktree と、ツール別の runtime に分ける。必要な判断と証跡を記録した後、使い終えた一時物を片付ける。
+- **受入**：整理の A・B・C・D をすべて終えた構成で F4 の 51 件と最終集約を一度だけ回す。候補は整理後の通常 CI が成功した main の SHA に固定する。
+- **理由**：利用者の決定。現役の仕様・入力・手順を発見しやすくし、再生成物や旧資料への依存と、候補変更による正式受入の再実行を避ける。
+- **関係する資料**：[製品仕様の索引](README.md)、[正式受入](../tasks/v1-acceptance.md)、[引き継ぎ](../tasks/handoff.md)、[AGENTS.md](../AGENTS.md)「エージェント運用」。環境切替時に手で移す作業ファイルの範囲は D-20261121-02 を更新する。

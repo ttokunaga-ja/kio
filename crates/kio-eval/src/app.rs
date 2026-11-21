@@ -3705,7 +3705,7 @@ mod tests {
                 "--python",
                 "/tmp/python3",
                 "--adapter",
-                "/tmp/render_native.py",
+                "/tmp/render-native.py",
                 "--request-id",
                 "render-1",
                 "--image",

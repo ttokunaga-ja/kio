@@ -1,6 +1,6 @@
-//! Contract tests for `tasks/step4b-contract-tests-p3b.md` (CLI 横断 /
-//! exit・error 表 / log time-travel / その他, P3-B). Test names embed the QB
-//! number they lock down. Harness mirrors
+//! CLI exit, error, and history contracts from docs/06-cli-spec.md §§1 and 7.
+//! QB numbers refer to the historical cases at
+//! `1b46cbb5:tasks/step4b-contract-tests-p3b.md`. The harness mirrors
 //! `crates/kio-cli/tests/step4b_p2c_contract.rs` /
 //! `crates/kio-cli/tests/step4b_p2b_contract.rs`.
 //!

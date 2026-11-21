@@ -4,128 +4,32 @@
 
 ## 1. 現状（2026-11-21）
 
-- v1 の基本機能（保存、検索、履歴と復元、承認、変更の監視と自動管理、復旧、3 つの OS への対応）は実装済みである。
-- 構造の是正（OS 固有層の分離、`kio-app` の分解と型付き API、巨大ファイルの分割）と、embedding の経路の統一（O 段階）は main に入っている。
-- 2026-10-22 に承認された制約の緩和は、62 件のうち 9 件が先に main に入っていた（`b0906e3`、`652e6cb`、`8ff79bf`）。残り 53 件のうち、優先度が高い 12 件を v1 に入れた（D-20261113-09）。一覧は [w1-constraints.tsv](w1-constraints.tsv)。
-- 3.1・3.2・3.2b・3.3 の単位はすべて main に入っている（V1・V2・WP、R0・R1・S1〜S3・S2b・P0〜P2・L1・L2・J1・W1・A1・E1・O0〜O3・OM、NC・NC2・PX、LW1）。統合で見つかった退行の修正（S2F、MF1〜MF6、FW2〜FW5、W1F）も入っている。main は 2026-11-20 に通常の CI の 3 つの OS で全 job が成功した（run 44722796322）。
-- 3.4 の EG2 は、G0〜G3 が main に入っている（`aa93f3d` 時点）。runtime は LiteRT-LM v0.19.1 の C API 1.0.0 で、build のときに固定 URL から取得する（D-20261120-01、D-20261120-02）。
-- F1 の差分では、共通コードと Linux 固有コードの上限を更新し、CI の code-limits を必須にした。3 つの OS の CI で確認した（run 44786625755）。
-- 3.5 の F1・F2 と、3.2b の H1・H2 は main に入っている。2026-11-21 に F3 の判定を行い、main の `2c270c5` で 4.1 のローカル検証（fmt、clippy、全テスト、synthetic-history を含む CI 相当の手順、code-limits、実際のホームへの書き込みなし）と、通常の CI の 3 つの OS の全 job（run 44786625755）が成功した。2 の「実装完了」を満たしている。残りは F4（正式な受入）だけである。
-- v1 の範囲は 3 の残作業で固定されている。足すのは利用者が決めたときだけで、それ以外は 6 の「v1 後」に書く（D-20261113-10）。
+v1 の実装と F3 の判定は完了した。残る工程は F4（正式な受入）である。2026-11-21 に main の `2c270c5` でローカル検証と通常 CI の 3 OS の全 job が成功した（run 44786625755）。整理後の候補では、その SHA の通常 CI を改めて確認する。
 
 ## 2. 完了条件
 
 二段に分ける（D-20261113-02）。
 
-1. **実装完了**：3 の残作業がすべて終わり、main で 4.1 のローカル検証と通常の CI の 3 つの OS が成功している。
-2. **正式な受入**：実装完了の commit を候補として固定し、51 件（3 つの OS のネイティブ 42 件、有料 provider 6 件、GPU 経由のローカル 3 件）と最終の集約を一度だけ回す。51 件は減らさない。
+1. **実装完了**：v1 の実装がすべて終わり、main で 4.1 のローカル検証と通常の CI の 3 つの OS が成功している。
+2. **正式な受入**：整理後の通常 CI が成功した main の commit を候補として固定し、51 件（3 つの OS のネイティブ 42 件、有料 provider 6 件、GPU 経由のローカル 3 件）と最終の集約を一度だけ回す。51 件は減らさない。
 
 実装完了までは、正式な受入の workflow（`v1-acceptance*.yml`、`v1-provider-acceptance.yml`、`v1-local-acceptance.yml`）を回さない。
 
-## 3. 残作業
+## 3. 完了済みの作業と残る受入
 
-上から順に進める。番号の付いた行が、Codex に渡す 1 回分の作業である（作業量が「小」の行は Terra、それ以外は Sol。AGENTS.md）。受入条件の詳細は、挙げた仕様書の節に従う。
+- **検証基盤（V1・V2・WP）**。テストの保存先を隔離し、最適化した test profile で Linux の全テストを短縮した。Windows の `step3_p0_contract` は reconciliation に移した。
+- **制約緩和（W1）と統合**。2026-10-22 承認の 62 件のうち 9 件は先行実装済み。残り 53 件から優先度「高」の 12 件を v1 に取り込んだ（D-20261113-09）。判断の根拠は [制約一覧](post-v1/constraint-backlog.tsv) と実装当時の計画・静的見積もり（`git show 1b46cbb5:tasks/v1-plan.md`、`git show 1b46cbb5:tasks/w1-high-estimate.md`）に残る。Office の隔離初期化（OM）と統合時の退行修正も完了した。
+- **利用者の追加決定**。ソースコードの対象外化と再索引時の掃除（NC・NC2）、working tree 走査の有界化（S2b）、persona 用経路の廃止（PX）、派生差分・論理名と物理名・HTTP embedding 未承認時の仕様整合（H1・H2）を反映した。
+- **ローカル embedding（LW1・G0〜G3）**。HTTP 接続を汎用化し、EG2 を既定にした。LiteRT-LM v0.19.1 の C API 1.0.0 を固定 URL とハッシュで取得する（D-20261120-01・02）。
+- **仕上げ（F1〜F3）**。コード規模上限と CI ゲートを確定し、旧統合ドラフトの必要な契約を製品仕様へ統合した。F3 の検証結果は §1 を参照する。
 
-### 3.1 検証の土台
-
-V1（テストが実際のホームに書き込まない）と V2（Linux の全テストの job を 25 分以内にする）は完了した。V2 は `ci2_replay_history` の削除と、CI の 3 つの OS のテストを test profile の opt-level 1 で build することで、Linux の job が 19.5 分になった（`9c7fb32`）。Windows では WP で約 21 分かかる `step3_p0_contract` を reconciliation に移した。その後も remaining は run 44749317304 で 90 分の制限に達したため、remaining の制限を 120 分にした。
-
-### 3.2 制約の緩和の残り（優先度「高」12 件）
-
-12 件は、共通の仕組み 3 つを含めて 18 の作業単位に分ける。これとは別に、利用者の決定で OM（D-20261113-14）を足した。見積もりは、Codex の実装・修正が合計 28〜42 回、1 回を半日とすると 14〜21 日である（統括の確認、CI の待ち時間、環境の問題への対応は含まない）。静的な調査にもとづく幅のある数字で、単位ごとの根拠・受入条件・変更してよい範囲・過去の試作でつまずいた点は [w1-high-estimate.md](w1-high-estimate.md) にある。共通コードは、さらに 2,500〜8,500 行増える見込みである。
-
-作業量は、小＝Codex 1 回、中＝1〜2 回、大＝3 回以上または設計の判断が要る、を表す。「3 OS」の列が「必須」の単位は、その単位だけで push して CI で確かめる。
-
-| 番号 | 範囲 | 先に済ませる単位 | 作業量 | 3 OS |
-|---|---|---|---|---|
-| S2 | ST05：直下 1 万ファイルの上限を警告に変える | R0、R1、S1 | 大 | 必須 |
-| P0 | 抽出した結果を一時領域から公開する共通の経路と、資源不足のときの保留。後段の 256MiB の上限も同じ系列で直す | R0、R1、下の判断 2・6 | 大 | 必須 |
-| P1 | AD-14：PDF の page・object・展開の上限を資源の段階に置き換える | P0 | 中 | P2 とまとめて |
-| P2 | AD-16：XLSX の sheet・row・cell の上限を資源の段階に置き換える | P0 | 中 | P1 とまとめて |
-| W1 | APP-11：自分の watch service の更新を許す | R1 | 中 | 必須 |
-| O1 | AD-17：Office の renderer を、隔離の中での実際の変換で判定する | O0、A1、OM | 大 | 必須（実 renderer） |
-| O2 | AD-17：Linux で、検証できる配置の runtime を受け入れる | O1 | 中 | Linux 必須 |
-| O3 | AD-17：macOS と Windows で、販売元の固定をやめ、有効な署名と実際のコードの対応で判定する | O1 | 大 | 必須 |
-
-進める順番：R0、R1、S1、S3、L1、L2、J1、A1、E1、O0、OM は完了した。S2・W1 は統合の検証中である。P0 と O1 を進めている。P1・P2 は P0 の後、O2・O3 は O1 の後に進める。
-
-**先に決めること**（統括が、現在の仕様書とコードで確かめて決める。利用者の判断が要るものは、決める前に確認する）
-
-1. **中断後の一時領域の識別方法**（R1 で実装済み。範囲は D-20261113-16）。2026-10-31 に、物理的な ID と 256 bit の乱数を、Unix は拡張属性、Windows は EA に書く方式が選ばれている（D-20261031-01）。現在の main は物理的な ID だけで識別している。この方式を R1 で実装する。対応していないファイルシステムでの扱いが仕様書に書かれていなければ、利用者に確認する。
-2. **無料の前処理が資源不足で保留になった後の再開**（2026-11-19 に統括が決定：`docs/04-pipeline.md` §5.2 のとおり、paused にして自動の再実行をせず、資源を変えたあとの明示的な index・reindex・repair・retry で再開する。watch による自動の確かめ直しは作らない）。機械の状態による不足は次の watch で自動的に確かめ直し、入力による不足は明示的な再開を待つ、という 10 月の監督の判断と、`docs/04-pipeline.md` の「同じ条件の watch では再実行しない」の関係を揃える。
-3. **台帳の backup が元の台帳を変えないこと**（L2 で実装済み）。仕様は元の台帳の bytes と権限を変えないと定めているが、現在の実装は backup の前に WAL を切り詰めている。仕様に合わせ、元を変えない方式にする。
-4. **APP-26 の由来の記録**。仕様は必須としているが、現在の manifest にはない。確認の除去だけを先に入れず、記録の読み書きまでを A1 に含める。
-5. **journal の整理の方式**。現在の状態だけを原子的に書き直す方式を第一候補とし、分割の管理は先回りして作らない。
-6. **抽出の資源の段階と、既存の入力サイズの制限の関係**（2026-11-19 に統括が決定：原本の保存は上限なし、ローカルの抽出は `docs/07-adapter-spec.md` §5.1 の段階、外部の Adapter への入力は §7.1 の `max_input_bytes` を prepared input に適用する。原本のサイズで飛ばす現在の判定は §7.1 への違反として P0 で直す）。原本のサイズで飛ばす現在の経路が、段階を上げても手前で止める恐れがある。原本の保存、ローカルの抽出の予算、外部の Adapter への入力の制限を分けて整理する。
-7. **Office の対応範囲**（2026-11-19 に統括が確認：仕様書のとおりに進める）。検証できる runtime の配置だけを受け入れ、分からない配置は理由を示して使えないものとする。systemd と cgroup を必須とすること、段階の数値は仕様書で決まっており、決め直さない。
-
-### 3.2b 利用者の決定による変更（2026-11-15、2026-11-19、2026-11-20）
-
-| 番号 | 作業 | 受入条件 | 作業量 | 3 OS |
-|---|---|---|---|---|
-| NC | ソースコードのファイルを扱わない（D-20261115-01）。仕様書から同梱 Adapter・unit の対象としての code を外し、既知のソースコードの拡張子を unsupported として理由付きで飛ばす。`text/x-code` とコード用の整形を削除する | 既知のソースコードの拡張子は索引されず、unsupported として理由が表示される。Markdown 内のコードブロックは変わらない。仕様書・実装・テスト・fixture に code の対象が残らない | 中 | まとめて |
-| NC2 | NC より前に索引したソースコードの unit・chunk・vector が、索引し直したときに残らないようにする（D-20261119-01） | 前回は索引されていたファイルが unsupported になると、index・reindex・watch のあと検索結果に出ず、理由が表示される | 中 | まとめて |
-| S2b | index と status の working tree の走査で、使うメモリをファイル数によらず一定にする（D-20261119-01） | ファイル数を増やしても走査のメモリの上限が変わらないことをテストで確かめる。S2 の tree の有界性を崩さない | 大 | 必須 |
-| WP | `step3_p0_contract` の Windows での実行時間を減らす（D-20261119-01）。検証する内容は減らさない | Windows の CI の最長の job が短くなり、テストが確かめる契約は変わらない | 小 | Windows 必須 |
-| PX | kio-eval の persona 系コマンドと関連 CI・資料を削除する（D-20261115-02） | 削除後に workspace のビルド・テストと CI の残りの job が通る。資料に壊れた参照が残らない | 小 | まとめて |
-| H1 | `kio diff` が派生物だけの変化を差分として表示する（D-20261120-04、QB39） | 原本が同じで正規化 manifest・chunking 設定・公開 chunk 集合・tool_lock のいずれかだけが変わった commit で、対応する種別の差分が返り「差分なし」にならない。`--json` も同じ種別を持つ。必須 field の欠落はエラーになる | 中 | まとめて |
-| H2 | 名前の規則と HTTP 未承認時の扱いを揃える（D-20261120-04）。仕様の名前の規則を論理名と物理名の分離に改め、Evidence Pointer の `path_at_commit` を同じ規則で検証する。07 §2.1 を 05 §1.1 に揃える。`verify_objects` に残る `refs/heads` の扱いを削除する | 仕様書と実装の名前の規則が一致し、不正な `path_at_commit` が schema の段階で拒否される。07 と 05 が食い違わない。`refs/heads` を扱うコードが残らない | 小 | まとめて |
-
-### 3.3 ローカル接続の汎用化
-
-| 番号 | 作業 | 受入条件 |
-|---|---|---|
-| LW1 | ローカルの embedding 接続で、OpenAI 互換の input 形式と messages 形式を選べるようにする。loopback の HTTP と端末ごとの承認は実装済み（`8ff79bf`） | `docs/07-adapter-spec.md` のローカル接続の節。形式を明示して選ぶ、同じ profile で混ぜない、text だけの接続に画像を送らず理由付きで飛ばす、出力は 768 次元 |
-
-### 3.4 既定のローカル embedding（EG2）
-
-仕様は `docs/07-adapter-spec.md`（EG2 の節）、`docs/10-operations.md`（モデルの取得）、`docs/11-product-requirements.md`（受入の要求）。設計の経緯は repo の外の `~/archive/mac-20261112/home/Documents/Codex/2026-10-18/kio-embed-spec/runs/A1/` にあるが、その中の「認定外の Linux・CPU を拒否する」「旧ローカル窓を全部削除する」は後の決定で取り消されている。仕様書と食い違うときは仕様書に従う。
-
-| 番号 | 作業 | 受入条件の骨子 |
-|---|---|---|
-| G0 | モデルと runtime の用意。runtime は配布物に同梱し、モデルは明示的な取得か import だけで入れる | 状態の表示、offline での import、破損・中断・容量不足の扱い、既存の有効なモデルの保持、暗黙のダウンロードがないこと |
-| G1 | 管理された worker。同じ binary を worker として起動し、コマンドの終了時にメモリを解放する | 上限のある IPC。異常終了・EOF・不正な応答・timeout・取消しで親が生き残る。失敗した vector を公開しない |
-| G2 | prompt、窓の分割、集約、profile | 上限を超えたときだけ分割する。原文を欠かさず覆う。全部の窓が成功するまで公開しない |
-| G3 | EG2 を既定に切り替え、旧 Qwen 専用の設定・実装・テストを消す。汎用のローカル接続と共有の HTTP・trust は残す | 既定の経路が EG2 になる。回復と承認の回帰テストが通る |
-
-### 3.5 仕上げ
-
-| 番号 | 作業 | 受入条件 |
-|---|---|---|
-| F1 | 共通コードと Linux 固有コードの上限を、EG2 完了時の実測から一度だけ引き上げ、CI の code-limits を必須にする（D-20261018-01、D-20261120-03） | `kio-code-limits` が違反なしで終わり、CI が終了値 0 の場合だけ成功する |
-| F2 | 仕様書の整理。`docs/14` を対応する仕様書へ統合して削除し、実装の内部の手順と日付付きの経緯を除く（D-20261006-01） | 仕様書どうし、仕様書と実装の間に食い違いがない。リンク切れがない |
-| F3 | 実装完了の判定（H1・H2 の後）。2026-11-21 に完了（`2c270c5`） | 2 の「実装完了」 |
-| F4 | 正式な受入 | 2 の「正式な受入」 |
+**F4** は整理の全単位を統合してから [v1 正式受入](v1-acceptance.md) の手順で一度だけ実行する。v1 の範囲を追加する場合は利用者の決定を要する（D-20261113-10）。それ以外の追加は §6 に記録する。
 
 ## 4. 検証の回し方
 
 ### 4.1 ローカル
 
-今の作業環境で回す（D-20261121-02）。Mac での範囲と手順は [handoff.md](handoff.md) の 3 にある。以下は WSL で作業する期間の手順である。
-
-CI の Linux の job と同じ順で回す。全テストは、systemd の scope の中で、HOME と XDG を repo の `scratch/` に向けて実行する。Codex のサンドボックスの中ではテストが通らない（`/` と `/home` の所有者が別の UID に見える）ので、全テストと synthetic-history は統括がサンドボックスの外で実行する。
-
-```bash
-cargo +1.98.0 fmt --all -- --check
-cargo +1.98.0 clippy --workspace --all-targets --locked -- -D warnings
-
-I="$PWD/scratch/validate"; rm -rf "$I"; mkdir -p "$I"/{home,config,data,cache,state,tmp}
-export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
-HOME="$I/home" XDG_CONFIG_HOME="$I/config" XDG_DATA_HOME="$I/data" \
-XDG_CACHE_HOME="$I/cache" XDG_STATE_HOME="$I/state" TMPDIR="$I/tmp" CARGO_PROFILE_TEST_OPT_LEVEL=1 \
-systemd-run --user --scope -p Delegate=yes \
-  -E HOME -E XDG_CONFIG_HOME -E XDG_DATA_HOME -E XDG_CACHE_HOME -E XDG_STATE_HOME \
-  -E TMPDIR -E RUSTUP_HOME -E CARGO_HOME -E CARGO_PROFILE_TEST_OPT_LEVEL \
-  cargo +1.98.0 test --workspace --all-targets --locked --no-fail-fast
-
-ls -d ~/.local/share/kio ~/.local/state/kio ~/.config/kio ~/.cache/kio   # 何も出ないこと
-```
-
-- `CARGO_PROFILE_TEST_OPT_LEVEL=1` は CI の 3 つの OS のテストの手順と同じ設定である（debug_assertions は有効のまま）。
-- Windows の型と lint の誤りは、C の依存を持たない crate だけローカルで確かめられる：`rustup +1.98.0 target add x86_64-pc-windows-msvc` の上で `CARGO_TARGET_DIR=scratch/target-win cargo +1.98.0 clippy -p kio-core -p kio-process --all-targets --locked --target x86_64-pc-windows-msvc -- -D warnings`。ほかの crate（ring・libsqlite3-sys・sqlite-vec に依存）は CI でしか確かめられない。
-- 作業中は、変更した crate のテストだけを回す。全テストは、作業の区切りと push の前に回す。
-- synthetic-history は、`kio-eval`・検索・索引・履歴に触れた変更の push の前に回す。手順は `.github/workflows/ci.yml` の該当 job のとおり。
-- 最後の `ls` は、テストが実際のホームに書き込んでいないことの確認である。V1 の後は、HOME と XDG を差し替えずに全テストを回しても何も作られない（2026-11-13 に確認）。
+現在の環境で [ローカル検証スクリプト](../scripts/ci/local-checks.sh) を使う。LiteRT ZIP の準備と OS ごとの検証範囲は [引き継ぎ](handoff.md) §2〜3 を参照する。作業中は影響範囲のテスト、統合前は通常 CI 相当の検証を行う。Linux の全テストは統括がサンドボックス外で実行する。
 
 ### 4.2 CI
 
@@ -133,16 +37,16 @@ push すると通常の CI が動き、全体で約 85 分かかる（Windows �
 
 ### 4.3 高いコストの検証
 
-正式な受入（接続の経路は [v1-private-actions-route.md](v1-private-actions-route.md)）、Full 規模の性能計測、GPU を使う計測、有料 provider を使う計測は、実装完了まで回さない。手順は [manual-full-cold-gates.md](manual-full-cold-gates.md)。
+正式受入は [v1 正式受入](v1-acceptance.md) を参照する。Full 規模の性能計測、比較用の GPU・有料 provider の計測は [手動検証](manual-full-cold-gates.md) を参照する。
 
-## 5. デスクトップ単独では回せないもの
+## 5. 現在の環境だけでは回せないもの
 
-- macOS と Windows のネイティブの検証：通常の CI で確かめる。
+- 作業環境以外の OS のネイティブ動作は、通常 CI で確かめる。
 - 有料 provider の 6 件と GPU 経由の 3 件：正式な受入のときに、外部の資源（provider の鍵と予算、Tailscale、SSH、GPU の host）の準備を確かめてから回す。過去の設定の記録から、現在使えるとは判断しない。
 
 ## 6. v1 後
 
-- 文書単位の検索結果（D-20261113-01、[search-result-presentation-design.md](search-result-presentation-design.md)）。
-- 版ごとの状態の表示、tag による引用の保持、復元の操作の表示（D-20261003-01、[knowledge-ux-implementation-plan-2026-10-03.md](knowledge-ux-implementation-plan-2026-10-03.md)）。
-- 制約の緩和の中・低の 41 件（D-20261113-09。[w1-constraints.tsv](w1-constraints.tsv) の「今回の整理」が「残件候補」で、優先度が「中」「低」の行）。
-- 品質・性能の評価。評価用の corpus の原本は `~/archive/mac-20261112/home/` の `kio-dogfood/`（`corpus-v1` と最新の fixture）と `kio-baseline-corpus*` にある。使うときは repo の `scratch/` に写し、`kio-eval benchmark` の `--fixture-root`・`--baseline-corpus` で指定する。v1 のテストと受入はこれらを使わない（D-20261113-11）。
+- 文書単位の検索結果（D-20261113-01、[post-v1/search-result-presentation.md](post-v1/search-result-presentation.md)）。
+- 版ごとの状態の表示、tag による引用の保持、復元の操作の表示（D-20261003-01、[post-v1/knowledge-ux.md](post-v1/knowledge-ux.md)）。
+- 制約の緩和の中・低の 41 件（D-20261113-09。[post-v1/constraint-backlog.tsv](post-v1/constraint-backlog.tsv) の「今回の整理」が「残件候補」で、優先度が「中」「低」の行）。
+- 品質・性能の評価。評価用の corpus の原本は `~/archive/mac-20261112/home/` の `kio-dogfood/`（`corpus-v1` と最新の fixture）と `kio-baseline-corpus*` にある。使うときは repo の `scratch/validate/<作業名>/` に写し、`kio-eval benchmark` の `--fixture-root`・`--baseline-corpus` で指定する。v1 のテストと受入はこれらを使わない（D-20261113-11）。

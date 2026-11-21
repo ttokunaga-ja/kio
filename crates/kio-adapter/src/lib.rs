@@ -65,7 +65,7 @@ pub enum AdapterError {
     /// never retry a missing, unsafe, or revoked device trust anchor.
     #[error("{code}: {message}")]
     LocalPeerConfig { code: &'static str, message: String },
-    /// QA16 (step4b-contract-tests-p3a.md §F, 07 §4 L290): carries the
+    /// QA16 (docs/07-adapter-spec.md §4): carries the
     /// provider's `Retry-After` in milliseconds when the HTTP response
     /// included one (`http_policy::parse_retry_after_ms`). `None` when the
     /// header was absent or unparseable — never a fabricated value. Use
@@ -113,7 +113,7 @@ impl AdapterError {
         }
     }
 
-    /// QA16 (step4b-contract-tests-p3a.md §F, 07 §4 L286 / 06 §8): the
+    /// QA16 (docs/07-adapter-spec.md §4 / 06 §8): the
     /// machine-judgeable error code this error maps to. Mirrors exactly the
     /// code `kio_pipeline::task::retry_policy` assigns to the corresponding
     /// `RetryErrorKind` (`kio-adapter` cannot depend on `kio-pipeline`, so the
@@ -317,7 +317,7 @@ mod adapter_error_tests {
         );
     }
 
-    /// QA16 operation scenario (step4b-contract-tests-p3a.md §F): "online
+    /// QA16 operation scenario (docs/07-adapter-spec.md §4): "online
     /// Adapter 呼出が transient エラー (429相当、Retry-After ヘッダ付き) で失敗する"
     /// — the resulting `AdapterRun` carries `error_code`, `error_category` =
     /// `rate_limit`, and `retry_after_ms` as individually-queryable fields

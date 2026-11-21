@@ -1,4 +1,4 @@
-//! QA14/QA15 (step4b-contract-tests-p3a.md L307-338, 10-operations.md §7.5.2 /
+//! QA14/QA15 (docs/10-operations.md §7.5.2 /
 //! 04-pipeline.md §5.8): `cost-ledger.sqlite` restore-from-backup detection +
 //! the `kio ledger reconcile` integrity/recovery/orphan-attribution command.
 //!

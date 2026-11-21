@@ -16,7 +16,7 @@ owner = "eval"
 status = "active-manual"
 
 [[exception]]
-path = "experiments/ocr-verification/fixtures/render_native.py"
+path = "experiments/ocr-verification/render-native.py"
 reason = "Pillow and reportlab are the mature Python-native raster and PDF rendering boundary for explicit fixture inputs"
 python_runtime = "CPython 3.12"
 packages = ["pillow", "reportlab"]

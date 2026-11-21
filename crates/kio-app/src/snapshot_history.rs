@@ -183,7 +183,7 @@ pub(crate) fn run_log(ctx: &Invocation<'_>, args: commands::LogArgs) -> Result<C
     validate_repo_tool_lock(&repo)?;
     // QB5/QB6/裁定1: shared (1)+(3) preflight pair.
     let checkpoint = preflight_barrier_and_index(repo.kio_dir(), repo.control())?;
-    // QB50/QB51/QB54 (step4b-contract-tests-p3b.md §D, 裁定5): `--at
+    // QB50/QB51/QB54 (1b46cbb5:tasks/step4b-contract-tests-p3b.md §D, 裁定5): `--at
     // <commit>` resolves through the same HEAD/tag/hash operand
     // grammar `diff`/`tag`/`restore` already use
     // (`Repository::resolve_commit`) and becomes the history walk's

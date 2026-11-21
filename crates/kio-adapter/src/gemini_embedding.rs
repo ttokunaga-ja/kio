@@ -53,7 +53,7 @@ pub trait GeminiEmbeddingClient: Clone {
     fn resolve_model_pin(&self, configured_model: &str) -> Result<String>;
 
     /// Embed the batch of items, returning one vector per item (order
-    /// preserved). QA13 (step4b-contract-tests-p3a.md §E, 04 §5.5 L880):
+    /// preserved). QA13 (docs/04-pipeline.md §5.5):
     /// `idempotency_header` is the ADAPTER-resolved `(header name, token)`
     /// pair (see `crate::http_policy::resolve_idempotency_header`) to attach
     /// to the outgoing HTTP request when `Some` — `None` when the profile
@@ -224,7 +224,7 @@ impl GeminiEmbeddingClient for EnvGeminiEmbeddingClient {
             .header("x-goog-api-key", self.api_key.clone())
             .header("Content-Type", "application/json")
             .header("Accept-Encoding", "identity");
-        // QA13 (step4b-contract-tests-p3a.md §E, 04 §5.5 L880): attach the
+        // QA13 (docs/04-pipeline.md §5.5): attach the
         // provider idempotency header only when the profile resolved one —
         // dormant in production (the real Gemini embedding profile always
         // declares `ProviderIdempotency::NotProvided`), reachable via a test
@@ -269,7 +269,7 @@ fn parse_embeddings(
             "embedding response count does not match request".to_owned(),
         ));
     }
-    // QA47 (step4b-contract-tests-p3a.md §N, arbitration #5): Gemini's
+    // QA47 (1b46cbb5:tasks/step4b-contract-tests-p3a.md §N, arbitration #5): Gemini's
     // `batchEmbedContents` carries no per-item id, so each output id is
     // synthesized positionally from the matching request item below. That
     // positional synthesis is only a true bijection over the input id set
@@ -329,7 +329,7 @@ pub struct GeminiEmbeddingAdapter<C = EnvGeminiEmbeddingClient> {
     client: C,
     configured_model: String,
     dimensions: u32,
-    /// QA13 (step4b-contract-tests-p3a.md §E, 04 §5.5 L880): defaults to
+    /// QA13 (docs/04-pipeline.md §5.5): defaults to
     /// `NotProvided` (the real, shipped Gemini `:batchEmbedContents`
     /// endpoint offers no provider idempotency key) — see
     /// [`Self::with_provider_idempotency`].
@@ -369,7 +369,7 @@ impl<C> GeminiEmbeddingAdapter<C> {
         }
     }
 
-    /// QA13 (step4b-contract-tests-p3a.md §E, 04 §5.5 L880): declare the
+    /// QA13 (docs/04-pipeline.md §5.5): declare the
     /// provider's sync-call idempotency posture — see
     /// [`crate::types::ProviderIdempotency`]. The real, shipped Gemini
     /// embedding adapter never calls this (it stays at the `::new()`
@@ -476,7 +476,7 @@ impl<C: GeminiEmbeddingClient> EmbeddingAdapter for GeminiEmbeddingAdapter<C> {
     fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingOutcome> {
         validate_embedding_request_bytes(&request)?;
         wire::validate_contents(request.items.iter().map(|item| &item.content))?;
-        // QA13 (step4b-contract-tests-p3a.md §E, 04 §5.5 L880): resolve (and
+        // QA13 (docs/04-pipeline.md §5.5): resolve (and
         // fail closed on) the provider idempotency header BEFORE any network
         // call — a `HttpHeader`-declaring provider with no caller-supplied
         // token must never reach the model-pin lookup or the embed call.
@@ -897,7 +897,7 @@ mod tests {
         assert!(adapter.profile().allow_network);
     }
 
-    // QA13 (step4b-contract-tests-p3a.md §E, 04 §5.5 L880), test (d): the
+    // QA13 (docs/04-pipeline.md §5.5), test (d): the
     // real, shipped Gemini embedding adapter declares `NotProvided` — its
     // pinned `:batchEmbedContents` endpoint offers no provider idempotency
     // key.

@@ -2,7 +2,7 @@
 
 この文書は、実装・UI・運用へ落とすときに問題になりやすい点を補足する。
 
-> **NOTE (2026-05 改訂)**: ポジショニング・ターゲットユーザー・MVP 境界の考え方は **正本を [01-positioning.md](01-positioning.md) に移した** (機能 × Step 割当・実装時期の正本は [09-mvp-scope.md §3.1](09-mvp-scope.md) — README §1)。本書はその下位の運用ルールを扱う。競合分析は [01-positioning.md §4](01-positioning.md) を参照。
+> 製品のポジショニング・対象利用者は [01-positioning.md](01-positioning.md)、MVP の範囲は [09-mvp-scope.md](09-mvp-scope.md) を参照する。
 
 MVP は **「Evidence-grounded local knowledge archive」としての最小完全系** として扱う。「全部入りの Git for knowledge」を目指さない。詳細は [01-positioning.md §5](01-positioning.md)。
 

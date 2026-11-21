@@ -57,7 +57,7 @@ impl DeterministicAdapter {
             // the only way to say "this adapter does not bill".
             billable_kinds: Vec::new(),
             reject_billing: Some(crate::types::BillingDeclaration::Nonbillable),
-            // QA13 (step4b-contract-tests-p3a.md §E, 04 §5.5 L880): this
+            // QA13 (docs/04-pipeline.md §5.5): this
             // adapter is local/offline (never a sync provider call), so
             // there is no provider idempotency posture to declare beyond the
             // default.
@@ -328,7 +328,7 @@ fn default_hint(raw_hash: &str) -> PreparedUnitHint {
     }
 }
 
-/// QA41/QA42 (step4b-contract-tests-p3a.md §L): the sentinel used when there is
+/// QA41/QA42 (docs/04-pipeline.md §3): the sentinel used when there is
 /// nothing to extract for a unit (no source, or extracted text is empty/not
 /// real text). Deliberately plain text, not an HTML comment — an HTML
 /// comment is a raw-HTML block under Normalized Markdown v1 (07 §5.2.1) and
@@ -603,7 +603,7 @@ mod tests {
         assert!(!is_probably_real_text(""));
     }
 
-    // QA42 (step4b-contract-tests-p3a.md §L): the built-in deterministic
+    // QA42 (docs/04-pipeline.md §3): the built-in deterministic
     // adapter converts a Setext H1/H2 to ATX (04 §3.2 V5 / 07 §5.2.1) instead
     // of a straight passthrough.
     #[test]

@@ -35,7 +35,7 @@ pub enum AdapterRunStatus {
     Failed,
 }
 
-/// QA18 (step4b-contract-tests-p3a.md §F): the closed `usage.billable_units[].kind`
+/// QA18 (docs/07-adapter-spec.md §4): the closed `usage.billable_units[].kind`
 /// enum (07 §4 L294) — extension is a spec revision, not adapter-declared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -55,7 +55,7 @@ pub enum BillingDeclaration {
     Nonbillable,
 }
 
-/// QA13 (step4b-contract-tests-p3a.md §E, 04 §5.5 L880): whether this
+/// QA13 (docs/04-pipeline.md §5.5): whether this
 /// adapter's provider offers a request-level idempotency mechanism for a
 /// SYNC call. `HttpHeader(name)` names the HTTP header a caller must set to
 /// request it; `NotProvided` is the common case — neither built-in adapter's
@@ -92,14 +92,14 @@ pub struct AdapterProfile {
     /// `billable_kinds`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reject_billing: Option<BillingDeclaration>,
-    /// QA13 (step4b-contract-tests-p3a.md §E, 04 §5.5 L880): sync-call
+    /// QA13 (docs/04-pipeline.md §5.5): sync-call
     /// provider idempotency declaration — see [`ProviderIdempotency`].
     /// Output-inert (not part of `tool_profile_hash`, `identity::PROFILE_FIELDS`),
     /// same posture as `billable_kinds`/`reject_billing` above.
     pub provider_idempotency: ProviderIdempotency,
 }
 
-/// QA16 (step4b-contract-tests-p3a.md §F): `transient | permanent | rate_limit`
+/// QA16 (docs/07-adapter-spec.md §4): `transient | permanent | rate_limit`
 /// (07 §4 L287) — the coarse retry-classification input for 04-pipeline.md
 /// §5.3's table. `error_code` carries the fine-grained machine code; this
 /// field is only the coarse bucket the retry table keys off.
@@ -286,7 +286,7 @@ pub struct MarkdownizeRequest {
     pub bbox_annotation_enabled: bool,
     pub tool_profile_hash: String,
     pub spec_version: u64,
-    /// QA13 (step4b-contract-tests-p3a.md §E, 04 §5.5 L880): the ledger
+    /// QA13 (docs/04-pipeline.md §5.5): the ledger
     /// phase-1 `intent_token` (04 §5.8 相 1, UUIDv7) — stable across a
     /// crash-window resend because `reserve_or_reuse_task_charge` returns the
     /// SAME token while the row stays open, which is exactly the dedup
@@ -299,7 +299,7 @@ pub struct MarkdownizeRequest {
     pub idempotency_token: Option<String>,
 }
 
-/// QA36 (step4b-contract-tests-p3a.md §K): one partially-failed unit (04 §3
+/// QA36 (docs/04-pipeline.md §3): one partially-failed unit (04 §3
 /// L295, 07 §5.2 L345-348). `error_kind` must be a member of
 /// `kio_pipeline::task::RetryErrorKind`'s closed enum (04 §3.2 V6) — checked
 /// by the pipeline crate's `validate_markdownize_response` (this crate has no
@@ -328,7 +328,7 @@ pub struct MarkdownizeResponse {
     pub failed_units: Vec<FailedUnit>,
     pub fallback_to_full: bool,
     pub reason: Option<String>,
-    /// QA17 (step4b-contract-tests-p3a.md §F, 07 §4 L291-307): this request's
+    /// QA17 (docs/07-adapter-spec.md §4): this request's
     /// self-reported billing usage, when the concrete Adapter can determine
     /// one from the provider's own response (e.g. Mistral OCR's processed
     /// page count). `None` when no real signal is available — the caller
@@ -435,7 +435,7 @@ pub fn validate_embedding_request_bytes(request: &EmbeddingRequest) -> Result<()
 pub struct EmbeddingRequest {
     pub input_type: EmbeddingInputType,
     pub items: Vec<EmbeddingItem>,
-    /// QA13 (step4b-contract-tests-p3a.md §E, 04 §5.5 L880): see
+    /// QA13 (docs/04-pipeline.md §5.5): see
     /// `MarkdownizeRequest::idempotency_token`'s doc — same semantics,
     /// carried only when the executing adapter's profile declares
     /// `ProviderIdempotency::HttpHeader`.

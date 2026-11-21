@@ -340,7 +340,7 @@ pub(super) fn publish_network_approval_in_directory(
     overwrite_bound_scope_json_value(directory, &value)
 }
 
-/// QA25/26/27 (step4b-contract-tests-p3a.md §H, 07 §3 L118-211): `kio adapter
+/// QA25/26/27 (docs/07-adapter-spec.md §3): `kio adapter
 /// revoke (<tool_id> | --all)`'s scope.json mutation. `tool_id = None` means
 /// `--all`.
 ///

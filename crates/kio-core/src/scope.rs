@@ -920,7 +920,7 @@ pub fn enforce_config_semantics(config: &Value) -> Result<()> {
             }
         }
     }
-    // QA61 (step4b-contract-tests-p3a.md §R, arbitration #7): `include_neighbors`
+    // QA61 (1b46cbb5:tasks/step4b-contract-tests-p3a.md §R, arbitration #7): `include_neighbors`
     // was removed from `config.schema.json` entirely (it disappeared from the
     // documented config example with no implementation concept, R12-1) — an
     // unknown key is now a schema error at the JSON-schema layer
@@ -1153,7 +1153,7 @@ fn data_home(control: &crate::control::ControlHandle) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// QA7 (step4b-contract-tests-p3a.md §B, arbitration #1): the built-in Tier A
+/// QA7 (1b46cbb5:tasks/step4b-contract-tests-p3a.md §B, arbitration #1): the built-in Tier A
 /// pattern set as data, not just imperative comparisons — the single source
 /// both [`is_tier_a_secret_name`] and [`tier_a_template_text`] (10 §1.1's
 /// `effective_ignore_hash` input) consult, so a pattern-list edit is
@@ -1966,8 +1966,8 @@ pub fn parse_utc_seconds(value: &str) -> Option<i64> {
 }
 
 // ===========================================================================
-// QA21/22/23/24/25/26/27 (step4b-contract-tests-p3a.md §G/§H, 07-adapter-spec.md
-// §3 L85-249, 10-operations.md §11.3): the adapter-level network opt-in gate's
+// QA21/22/23/24/25/26/27 (docs/07-adapter-spec.md §3,
+// docs/10-operations.md §11.3): the adapter-level network opt-in gate's
 // persistent storage — `.kio/scope.json`'s `approvals[]` / `approval_pending` /
 // `approvals_initialized`. This is the sole persistent source of truth the
 // send gate reads (QA22 — device-global `consents.jsonl` is untouched by this

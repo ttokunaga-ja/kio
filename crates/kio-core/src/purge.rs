@@ -37,7 +37,7 @@ pub const MAX_PURGE_TARGETS: usize = 100_000;
 /// one element per retire/re-purge (LC4).
 pub const MAX_PURGE_RECORD_BYTES: u64 = 64 * 1024;
 pub const MAX_PURGE_JOURNAL_BYTES: u64 = 8 * 1024 * 1024;
-/// Bound on the `.kio/purge/journal-closure` sidecar (step4b-contract-tests-p2a.md
+/// Bound on the `.kio/purge/journal-closure` sidecar (1b46cbb5:tasks/step4b-contract-tests-p2a.md
 /// PA43-46, §R ruling #2). Kept separate from and larger than
 /// `MAX_PURGE_JOURNAL_BYTES` — a scope with a large fan-out of chunk/prepared/
 /// image objects destined for deletion can have a closure item enumeration far
@@ -487,7 +487,7 @@ pub fn canonical_final_event(
 /// (`hash` is a `chunk_id`, which is itself a canonical `sha256:` hash — see
 /// `crate::cas::is_hash`). The full enumeration — including the
 /// shared-derived live-reference resolution result for `prepared`/`image` —
-/// lives in the [`PurgeClosure`] sidecar (step4b-contract-tests-p2a.md
+/// lives in the [`PurgeClosure`] sidecar (1b46cbb5:tasks/step4b-contract-tests-p2a.md
 /// PA43-46, §R ruling #2), not inline in the journal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

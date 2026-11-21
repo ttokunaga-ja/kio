@@ -1,5 +1,5 @@
 //! QA15 (`kio ledger reconcile`'s orphan/unknown job-attribution walk,
-//! 10-operations.md §7.5.2, step4b-contract-tests-p3a.md L323-338): a
+//! 10-operations.md §7.5.2, 1b46cbb5:tasks/step4b-contract-tests-p3a.md L323-338): a
 //! provider-side Batch job/upload inventory seam.
 //!
 //! Historical note (§O): until the Batch send lane landed, no real Adapter

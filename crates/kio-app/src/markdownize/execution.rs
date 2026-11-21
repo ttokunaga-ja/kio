@@ -100,7 +100,7 @@ pub(crate) struct OnlineExecutionOutcome {
     pub(crate) previous_raw_hash: Option<String>,
     pub(crate) parent_run_id: Option<String>,
     pub(crate) changed_unit_keys: Vec<String>,
-    /// QA17 (step4b-contract-tests-p3a.md §F): the adapter's self-reported
+    /// QA17 (docs/07-adapter-spec.md §4): the adapter's self-reported
     /// billing usage for the send that produced this outcome (07 §4),
     /// forwarded from the `MarkdownizeResponse` the adapter returned. `None`
     /// when nothing was sent (a 0-change incremental) or the concrete
@@ -189,7 +189,7 @@ impl OnlineExecutionOutcome {
 pub(crate) struct TaskExecutionFailure {
     pub(crate) resource_limit: Option<kio_core::error::ResourceLimit>,
     pub(crate) retry_kind: RetryErrorKind,
-    // QA3 (step4b-contract-tests-p3a.md §A, 04 §5.3): the provider's
+    // QA3 (docs/04-pipeline.md §5.3): the provider's
     // `Retry-After` in milliseconds, carried from `AdapterError::RateLimit`
     // through to the send handler so `next_retry_at` can honor it
     // (`rate_limit_retry_at`). `None` for every non-adapter construction
@@ -1077,7 +1077,7 @@ pub(crate) fn execute_online_markdownize_task(
     repo: &Repository,
     task: &TaskDescriptor,
     prepared_input: PreparedOnlineMarkdownizeInput,
-    // QA13 (step4b-contract-tests-p3a.md §E, 04 §5.5 L880): the caller's
+    // QA13 (docs/04-pipeline.md §5.5): the caller's
     // ledger `intent_token` for this send, threaded into every
     // `MarkdownizeRequest` this call builds (both the incremental and Full
     // paths below) — see `MarkdownizeRequest::idempotency_token`'s doc.
@@ -1299,7 +1299,7 @@ pub(crate) fn materialize_online_markdownize_response(
                 retry_after_ms: None,
             })?;
     }
-    // QA17 (step4b-contract-tests-p3a.md §F): carry the adapter's
+    // QA17 (docs/07-adapter-spec.md §4): carry the adapter's
     // self-reported billing usage (Mistral OCR's real processed-page count)
     // through to the caller's settle call, instead of discarding it here.
     let usage = response.usage.clone();
@@ -1442,7 +1442,7 @@ fn try_online_incremental_markdownize(
     media_type: &str,
     path: &Path,
     verified_raw_bytes: &[u8],
-    // QA13 (step4b-contract-tests-p3a.md §E, 04 §5.5 L880): forwarded from
+    // QA13 (docs/04-pipeline.md §5.5): forwarded from
     // `execute_online_markdownize_task` — see its doc.
     idempotency_token: Option<String>,
 ) -> std::result::Result<Option<OnlineExecutionOutcome>, TaskExecutionFailure> {
@@ -1839,7 +1839,7 @@ pub(crate) fn task_descriptor(
         fallback_reason: fallback_reason.map(str::to_owned),
         created_at: created_at.to_owned(),
         bbox_annotation_enabled: None,
-        // QA1 (step4b-contract-tests-p3a.md §A): derive the closed hold_reason
+        // QA1 (docs/04-pipeline.md §5.2–5.3): derive the closed hold_reason
         // from `fallback_reason` whenever this descriptor is Paused; `None`
         // for any other status or an unrecognized reason.
         hold_reason: (status == TaskStatus::Paused)

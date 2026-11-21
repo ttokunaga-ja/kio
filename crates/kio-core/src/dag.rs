@@ -46,7 +46,7 @@ pub struct NormalizeRef {
     /// Generation is part of the normalized-instance identity. It is required
     /// whenever `normalize` is present; raw-only entries omit `normalize`.
     pub r#gen: u64,
-    /// PB04 (step4b-contract-tests-p2b.md §B; 03-data-model.md §8, tree
+    /// PB04 (docs/03-data-model.md §8, tree
     /// schema v2): content hash of this (raw_hash, tool_profile_hash,
     /// gen)'s normalized-instance manifest.json canonical JCS bytes
     /// (`objects/manifests/` — 03-data-model.md §2.1). Required: an entry

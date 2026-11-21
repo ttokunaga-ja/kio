@@ -186,7 +186,7 @@ pub struct CostPreview {
     pub estimated_usd: f64,
     pub budget_cap_usd: Option<f64>,
     pub budget_warning: Option<String>,
-    /// QA19 (step4b-contract-tests-p3a.md §F, 10 §1 L48-53): `tools.toml`'s
+    /// QA19 (docs/10-operations.md §1): `tools.toml`'s
     /// `[markdown.*.pricing]` unit price × an estimated page count derived
     /// from non-text-native candidate bytes. `0.0` when no `pricing` is
     /// declared for the markdownize role — an honest "unknown" rather than a
@@ -1376,7 +1376,7 @@ pub fn load_index_vcs_repos(scope_path: &Path) -> Result<bool> {
     })
 }
 
-/// QA19 (step4b-contract-tests-p3a.md §F, 10 §1 L48-53, 07 §4 L298-303):
+/// QA19 (docs/10-operations.md §1, 07 §4):
 /// "コスト概算は…tools.toml の [pricing] 単価表 × 推定ページ数/トークン数から算出
 /// する桁の目安" — the declared unit price (`markdownize_pricing`/
 /// `embedding_pricing`, sourced by the caller from `kio-adapter`'s
@@ -2285,7 +2285,7 @@ fn read_bound_optional_regular_text(dir: &File, name: &str) -> Result<Option<Str
         .map_err(|error| crate::PipelineError::Schema(error.to_string()))
 }
 
-/// QA7 (step4b-contract-tests-p3a.md §B): the Tier B needle set, exposed so
+/// QA7 (docs/10-operations.md §1.1): the Tier B needle set, exposed so
 /// `kio_core::scope::tier_a_template_text`'s `effective_ignore_hash` input
 /// (10 §1.1) can include it — kept in this one place so [`classify_secret`]
 /// and the hash template can never drift.
@@ -2805,7 +2805,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // QA19 (step4b-contract-tests-p3a.md §F): preview cost estimate wired to
+    // QA19 (docs/07-adapter-spec.md §4): preview cost estimate wired to
     // tools.toml's declared [pricing].
     // ------------------------------------------------------------------
 

@@ -99,7 +99,7 @@ pub fn portable_tag_leaf(logical_name: &str) -> String {
 
 /// The bare 64-hex-character digest half of [`portable_tag_leaf`] (without
 /// the `tag-` prefix) — the `digest64` value `names.jsonl` records alongside
-/// `logical_name` (03-data-model.md §2 L140-152, step4b-contract-tests-p2b.md
+/// `logical_name` (03-data-model.md §2 L140-152, 1b46cbb5:tasks/step4b-contract-tests-p2b.md
 /// PB07). Shared by the tag-creation writer and fsck's names.jsonl reader so
 /// the two can never independently drift on the hash construction.
 #[must_use]

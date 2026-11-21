@@ -1111,7 +1111,7 @@ fn view_degrades_view_fields_to_null_when_the_normalized_instance_is_unreadable(
 
 #[test]
 fn ct3_open_003_scope_unreachable_returns_exit_3() {
-    // QB1 (step4b-contract-tests-p3b.md §A, 06 §7 L370 / 10 §11.2 L931):
+    // QB1 (docs/06-cli-spec.md §7 / 10 §11.2):
     // scope_unreachable is retryable (exit 3), distinct from a dead pointer
     // (tombstoned/not_found) within a reachable scope, which stays exit 4.
     let dir = indexed_scope();
@@ -2010,7 +2010,7 @@ fn ct3_cursor_006_end_of_stream_has_null_next_cursor() {
     assert!(search["paging"]["next_cursor"].is_null());
 }
 
-/// PC11 (step4b-contract-tests-p2c.md §C; 05-runtime.md §1.3 L95-97): a
+/// PC11 (docs/05-runtime.md §1.3): a
 /// single short (< 3 Unicode scalar) CJK token no longer forces zero results
 /// — trigram MATCH can't carry it (0 rows) so the text backend falls back to
 /// a bounded `instr` scan of `chunks.text`, which finds it. Supersedes the
@@ -5373,7 +5373,7 @@ fn pointer_for_path<'a>(search: &'a Value, path: &str) -> &'a Value {
 }
 
 #[test]
-// QA3 (step4b-contract-tests-p3a.md §A, 04 §5.2 L682-683): rate_limit lands
+// QA3 (docs/04-pipeline.md §5.2): rate_limit lands
 // `pending` + `next_retry_at`, never `failed`, and `attempts` is NOT consumed
 // (max_attempts=∞, 04 §5.3) — this test used to find the tasks via
 // `status=="failed"` with `attempts>0`.
@@ -5437,7 +5437,7 @@ fn ct3_embed_009_batch_retry_and_resume_execute_pending_embedding_tasks() {
 // rate_limit failure must still land that task with reason "rate_limit" and a
 // scheduled retry, while later groups remain unsent (the paused-side reason
 // "budget_exceeded" is covered by ct3_l2).
-// QA3 (step4b-contract-tests-p3a.md §A, 04 §5.2): the landing status is
+// QA3 (docs/04-pipeline.md §5.2): the landing status is
 // `pending`, not `failed` — this test used to assert `status=="failed"`.
 #[test]
 fn r11_5_aggregated_writeback_preserves_embedding_fallback_reason() {
@@ -5486,7 +5486,7 @@ fn r11_5_aggregated_writeback_preserves_embedding_fallback_reason() {
 // `index_status.pending_enrichment_tasks` — otherwise the scope reports
 // enriched_ratio<1.0 with pending=0 and budget_paused=false, a dead end an
 // Agent can't act on (the dual of R9-4's "Partial counts as incomplete").
-// QA3 (step4b-contract-tests-p3a.md §A, 04 §5.2): rate_limit now lands
+// QA3 (docs/04-pipeline.md §5.2): rate_limit now lands
 // `pending` (not `failed`), so it is counted by `compute_index_status`'s
 // plain `TaskStatus::Pending` arm rather than by the `TaskStatus::Failed if
 // task_retry_allowed(..)` arm this test originally exercised (that arm now
@@ -5515,7 +5515,7 @@ fn r11_8_retryable_failed_enrichment_counts_as_pending_in_index_status() {
     assert_eq!(index_status["budget_paused"], false);
 }
 
-// QA3 (step4b-contract-tests-p3a.md §A, 04 §5.2): the rate-limited task is
+// QA3 (docs/04-pipeline.md §5.2): the rate-limited task is
 // read from the PENDING task (never `failed`) — this test used to find it
 // via `status=="failed"`.
 #[test]
@@ -5635,7 +5635,7 @@ fn ct3_l1_reindex_enriches_new_generation_embeddings() {
 
     // Force a genuine re-split so the new chunks have text unseen by the embedding
     // store (otherwise the DB rebuild would reuse content vectors by text_hash).
-    // QA21 (step4b-contract-tests-p3a.md §G, 07-adapter-spec.md §3): the
+    // QA21 (docs/07-adapter-spec.md §3): the
     // network-approval gate's positive condition needs
     // `[adapter.policy].allow_network = true` to remain SET after this
     // wholesale config.toml rewrite (unset/lost = gate not established) —
@@ -5765,7 +5765,7 @@ fn ct4_deleted_historical_chunk_embedding_stays_pending() {
 // reported exit 0 with no embedding keys — a silent enrichment failure. It must now
 // exit 5 (docs/04 §5.6, user re-auth) with the full result JSON on stdout: local
 // index succeeded (`status: indexed`), embedding failures disclosed, and the failure
-// visible in `status` as well. QA2 (step4b-contract-tests-p3a.md §A, 04 §5.2): the
+// visible in `status` as well. QA2 (docs/04-pipeline.md §5.2): the
 // task lands `paused` with `hold_reason="auth"`, never `failed` — this test used to
 // assert `status=="failed"`.
 #[test]
@@ -6798,7 +6798,7 @@ fn pc60_search_at_with_descendants_is_invalid_usage() {
     assert_eq!(err["error_code"], "KIO-E-CONFIG-USAGE-001");
 }
 
-// step4b-contract-tests-p2b.md PB21/22: a scope_id registered against two
+// PB21/22 (docs/10-operations.md §3): a scope_id registered against two
 // distinct .kio is fail-closed (KIO-E-REGISTRY-DUP-001), regardless of
 // last_seen_at — this fixture happens to also share the newest timestamp,
 // which used to be the ONLY duplicate shape the old
@@ -7289,7 +7289,7 @@ fn o6_short_sha256_operand_is_usage_error() {
 
 // (g) / O7: a scope_id collision (a wholesale `.kio` copy) makes a cursor replay
 // ambiguous — detected the same way the Evidence path is
-// (KIO-E-REGISTRY-DUP-001, step4b-contract-tests-p2b.md PB21/22), not
+// (KIO-E-REGISTRY-DUP-001, PB21/22, docs/10-operations.md §3), not
 // silently pinned to one copy. R23-25 (05 §1.8 L425 / 06 §7 L361 "DUP →
 // exit 3"): the search-domain occurrence of this code is retryable exit 3
 // (dedupe, then retry) — distinct from the Evidence-resolution path's own
@@ -8860,7 +8860,7 @@ fn r12_1_multi_scope_config_is_wired_and_bounded() {
     assert_eq!(error["error_code"], "KIO-E-CONFIG-SCHEMA-001");
 }
 
-// QA61 (step4b-contract-tests-p3a.md §R, arbitration #7): `include_neighbors`
+// QA61 (1b46cbb5:tasks/step4b-contract-tests-p3a.md §R, arbitration #7): `include_neighbors`
 // was removed from config.schema.json entirely (it dropped out of the
 // documented config example with no implementation concept ever assigned,
 // R12-1) — ANY value (including the old documented default, 1) is now an
@@ -12228,7 +12228,7 @@ fn markdown_ledger_rows(dir: &TempDir) -> usize {
 }
 
 // Discriminator (a): rate_limit ×N retry keeps the online markdownize charge row at 1.
-// Before R16-7 each resend re-reserved the full cost. QA3 (step4b-contract-tests-p3a.md
+// Before R16-7 each resend re-reserved the full cost. QA3 (1b46cbb5:tasks/step4b-contract-tests-p3a.md
 // §A, 04 §5.2/§5.3): the charge-stays-1 core is UNCHANGED by QA3 (ledger reuse keys on
 // the still-open row, not on task status) — but the task itself now stays `pending`
 // (never `failed`) throughout, and `attempts` is NOT consumed (max_attempts=∞) —
@@ -13211,7 +13211,7 @@ fn r19_8_lowered_max_input_bytes_blocks_queued_online_send() {
     // Enqueue the online markdownize task under the default (generous) cap.
     run_markdownize_seam(&dir, "mock", None, &["index"]);
     // Tighten the cap below the file size in the scope config. QA21
-    // (step4b-contract-tests-p3a.md §G, 07-adapter-spec.md §3): `--approve`
+    // (docs/07-adapter-spec.md §3): `--approve`
     // already wrote `[adapter.policy]\nallow_network = true` (the network
     // -approval gate's positive condition — unset/lost = gate not
     // established), so this can no longer blindly APPEND a second
@@ -13378,8 +13378,8 @@ fn r21_4_uppercase_and_octet_stream_text_enqueue_no_online_ocr() {
 }
 
 /// CAND-013/R21-6: AuthError revival requires explicit `batch resume`; ordinary indexing
-/// must not silently revive a failed online operation. QA2 (step4b-contract-tests-p3a.md
-/// §A, 04 §5.2): the precondition task now lands `paused` (hold_reason=auth), never
+/// must not silently revive a failed online operation. QA2
+/// (docs/04-pipeline.md §5.2): the precondition task now lands `paused` (hold_reason=auth), never
 /// `failed` — this test used to assert `status=="failed"`.
 #[test]
 fn r21_6_auth_error_live_task_recovers_after_credentials_fixed() {
@@ -14070,7 +14070,7 @@ fn r22_5_missing_online_bbox_stamp_is_rejected_before_send() {
     );
 }
 
-/// R22-6 [major], UPDATED for QA2 (step4b-contract-tests-p3a.md §A, 04 §5.2):
+/// R22-6 [major], UPDATED for QA2 (docs/04-pipeline.md §5.2):
 /// R21-6's AuthError live-stuck revive must extend to the MARKDOWNIZE pipeline. A
 /// 401/403 now leaves the online task `Paused(hold_reason=auth)` — never `Failed` —
 /// so `batch retry` (CT2-TASK-005: `max_attempts=0` is that command's contract, and

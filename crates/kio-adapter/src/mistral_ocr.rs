@@ -102,7 +102,7 @@ impl std::error::Error for BatchOcrMaterializationError {}
 pub trait MistralOcrClient: Clone {
     fn resolve_model_pin(&self, configured_model: &str) -> Result<String>;
 
-    /// QA13 (step4b-contract-tests-p3a.md §E, 04 §5.5 L880): `idempotency_header`
+    /// QA13 (docs/04-pipeline.md §5.5): `idempotency_header`
     /// is the ADAPTER-resolved `(header name, token)` pair (see
     /// `crate::http_policy::resolve_idempotency_header`) to attach to the
     /// outgoing HTTP request when `Some` — `None` when the profile declares
@@ -250,7 +250,7 @@ impl MistralOcrClient for EnvMistralOcrClient {
             .header("Authorization", &format!("Bearer {api_key}"))
             .header("Content-Type", "application/json")
             .header("Accept-Encoding", "identity");
-        // QA13 (step4b-contract-tests-p3a.md §E, 04 §5.5 L880): attach the
+        // QA13 (docs/04-pipeline.md §5.5): attach the
         // provider idempotency header only when the profile resolved one —
         // dormant in production (the real Mistral OCR profile always declares
         // `ProviderIdempotency::NotProvided`), reachable via a test profile.
@@ -493,7 +493,7 @@ pub struct MistralOcrMarkdownizeAdapter<C = EnvMistralOcrClient> {
     image_store_dir: Option<kio_core::cas::ImageStore>,
     verified_raw_bytes: Option<Vec<u8>>,
     bbox_annotation_enabled: bool,
-    /// QA13 (step4b-contract-tests-p3a.md §E, 04 §5.5 L880): defaults to
+    /// QA13 (docs/04-pipeline.md §5.5): defaults to
     /// `NotProvided` (the real, shipped Mistral OCR `/v1/ocr` endpoint offers
     /// no provider idempotency key) — see `with_provider_idempotency`.
     provider_idempotency: crate::types::ProviderIdempotency,
@@ -534,7 +534,7 @@ impl<C> MistralOcrMarkdownizeAdapter<C> {
         self
     }
 
-    /// QA13 (step4b-contract-tests-p3a.md §E, 04 §5.5 L880): declare the
+    /// QA13 (docs/04-pipeline.md §5.5): declare the
     /// provider's sync-call idempotency posture — see
     /// [`crate::types::ProviderIdempotency`]. The real, shipped Mistral OCR
     /// adapter never calls this (it stays at the `::new()` default,
@@ -676,7 +676,7 @@ impl<C: MistralOcrClient> MarkdownizeAdapter for MistralOcrMarkdownizeAdapter<C>
                 request.raw.raw_hash
             )));
         }
-        // QA13 (step4b-contract-tests-p3a.md §E, 04 §5.5 L880): resolve (and
+        // QA13 (docs/04-pipeline.md §5.5): resolve (and
         // fail closed on) the provider idempotency header BEFORE any network
         // call — a `HttpHeader`-declaring provider with no caller-supplied
         // token must never reach the model-pin lookup or the OCR upload.
@@ -837,7 +837,7 @@ fn build_markdownize_response_from_ocr(
     images_will_persist: bool,
 ) -> Result<MarkdownizeResponse> {
     let pages_by_index = verified_pages_by_index(&ocr.pages, hints)?;
-    // QA17 (step4b-contract-tests-p3a.md §F, 07 §4 L291-307): Mistral OCR
+    // QA17 (docs/07-adapter-spec.md §4): Mistral OCR
     // bills per page processed, and `hints` is exactly the set of pages
     // this request asked for AND that `pages_by_index` (above) confirmed
     // the response actually returned — a real, provider-response-derived
@@ -1860,7 +1860,7 @@ mod tests {
         assert_eq!(profile.adapter_id, "mistral_ocr_markdownize");
     }
 
-    // QA13 (step4b-contract-tests-p3a.md §E, 04 §5.5 L880), test (d): the
+    // QA13 (docs/04-pipeline.md §5.5), test (d): the
     // real, shipped Mistral OCR adapter declares `NotProvided` — its pinned
     // `/v1/ocr` endpoint offers no provider idempotency key.
     #[test]
@@ -2778,7 +2778,7 @@ mod tests {
         assert!(captured.lock().unwrap().is_empty());
     }
 
-    // QA13 (step4b-contract-tests-p3a.md §E, 04 §5.5 L880): `markdownize()`'s
+    // QA13 (docs/04-pipeline.md §5.5): `markdownize()`'s
     // generic idempotency gate (shared by every `C: MistralOcrClient`, real or
     // test) — a `HttpHeader`-declaring profile rejects a request with no
     // token BEFORE the client is ever reached (fail closed, no upload/bill),

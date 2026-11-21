@@ -1,6 +1,6 @@
 //! Does the text a page declares actually come back?
 //!
-//! `experiments/ocr-verification/fixtures/generated-images/ground-truth.json`
+//! `experiments/ocr-verification/fixtures/images/ground-truth.json`
 //! states, per input image, a token printed on it. Nothing checked whether that
 //! token survives OCR until 2026-08-09, and by then a capture had been shipped
 //! that loses its own token — `code-editor-no-crops.json`, whose
@@ -57,7 +57,7 @@ fn fixtures() -> PathBuf {
 /// that the declaration and the measurement are not allowed to drift.
 fn ground_truth_file() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../experiments/ocr-verification/fixtures/generated-images/ground-truth.json")
+        .join("../../experiments/ocr-verification/fixtures/images/ground-truth.json")
 }
 
 fn read_json(path: &Path) -> Value {

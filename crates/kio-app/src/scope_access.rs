@@ -482,7 +482,7 @@ pub(crate) fn scope_id(kio_dir: &Path) -> Result<String> {
 /// `scope_path` hint and the scope-registry are both non-authoritative caches
 /// (05 §1.7 truth vs cache).
 ///
-/// PB21 (step4b-contract-tests-p2b.md §H, 10 §3 L284-285 / 08 §3.1 step 1b
+/// PB21 (docs/10-operations.md §3 / 08 §3.1 step 1b
 /// L152-155): fail-closed on ANY live scope_id duplicate, not only a
 /// `last_seen_at` tie — the old tie-only check left a silent "newest wins"
 /// auto-selection live whenever two clones' timestamps merely differed,
@@ -504,7 +504,7 @@ pub(crate) fn resolve_scope_id_in_registry(
     )
 }
 
-/// QA67 (step4b-contract-tests-p3a.md §T, PB24, 10 §3 L297-299): fail-closed
+/// QA67 (docs/10-operations.md §3, PB24): fail-closed
 /// (`KIO-E-REGISTRY-DUP-001`) when `scope_id` resolves to more than one live
 /// `.kio` clone, for a write path that is about to touch a device-global
 /// ledger row keyed by this `scope_id`. A no-op for the reserved
@@ -848,7 +848,7 @@ fn resolve_scope_target_with_mode(
     {
         return Ok(target);
     }
-    // QB6 (step4b-contract-tests-p3b.md §A, 10 §3 L300-305): every path above
+    // QB6 (docs/10-operations.md §3): every path above
     // resolves a candidate through `scope_target` / `Repository::open_current`,
     // which FULLY validates the store (`kio_format_version` included) — so a
     // scope that exists but is format-incompatible is indistinguishable from
@@ -1151,7 +1151,7 @@ pub(crate) fn maybe_wait_at_test_search_final_consent_barrier(control: &ControlH
 #[cfg(not(debug_assertions))]
 pub(crate) fn maybe_wait_at_test_search_final_consent_barrier(_control: &ControlHandle) {}
 
-/// QB5/QB6/QB7 §Z1 / 裁定1 (step4b-contract-tests-p3b.md, 10-operations.md §3
+/// QB5/QB6/QB7 §Z1 / 裁定1 (1b46cbb5:tasks/step4b-contract-tests-p3b.md, 10-operations.md §3
 /// L300-311): the shared (1)+(3) read-path preflight pair — §I checkpoint 1
 /// (purge journal / epoch, LC53) immediately followed by index (sqlite.db)
 /// availability (LC45) — as ONE implementation every read-path command calls,
@@ -1418,7 +1418,7 @@ pub(crate) fn unresolvable_shallow_tree_pointer_error(pointer: &EvidencePointer)
 }
 
 /// 08 §3.2 — scope `.kio` unreachable (scope_path unreachable and scope_id not
-/// registered). QB1 (step4b-contract-tests-p3b.md §A, 06 §7 L370 / 10 §11.2
+/// registered). QB1 (docs/06-cli-spec.md §7 / 10 §11.2
 /// L931): dead pointers (tombstoned / not_found) are exit 4, but
 /// scope_unreachable alone is retryable (the scope may simply be unmounted) —
 /// exit 3 (`PartialFailure`), not 4. This is the single shared helper behind
@@ -1433,7 +1433,7 @@ fn scope_unreachable_error(scope_id: &str) -> KioError {
     )
 }
 
-/// PB21/22 (step4b-contract-tests-p2b.md §H, 10 §3 L284-287): a scope_id
+/// PB21/22 (docs/10-operations.md §3): a scope_id
 /// resolves to more than one LIVE registered `.kio` — fail-closed, dedupe
 /// required. `KIO-E-REGISTRY-DUP-001` (namespace REGISTRY) replaces the old
 /// `KIO-E-EVIDENCE-SCOPE-AMBIGUOUS-001` (PB22's "実装時に確定が必要" resolved:

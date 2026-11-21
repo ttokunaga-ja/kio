@@ -188,7 +188,7 @@ kio evidence verify --batch <pointers.jsonl> [--strict]  # <pointer> と --batch
 kio evidence retarget <pointer> --at <commit> # exact-only read-only retarget。--at は full canonical sha256 commit 必須。--latest/default/alias/fallback はない (08 §5)
 ```
 
-本表はコマンド全量の spec である。MVP での採否・実装 Step の正本は [09-mvp-scope.md §1 / §3.1](09-mvp-scope.md)。
+本表はコマンド全量の spec である。MVP の対象は [09-mvp-scope.md §1](09-mvp-scope.md) を参照する。
 
 `tag --delete` への commit 指定は
 `KIO-E-CONFIG-USAGE-001` / exit 2で拒否する。存在しないtagは

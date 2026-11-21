@@ -5,59 +5,59 @@
   "captures": [
     {
       "capture": "infographic-two-charts.json",
-      "source_image": "g5_infographic_high_01.png",
+      "source_image": "infographic-high.png",
       "token_in_markdown": true,
       "measured": "2026-08-03"
     },
     {
       "capture": "infographic-two-charts-as-pdf.json",
-      "source_image": "g5_infographic_high_01.png",
+      "source_image": "infographic-high.png",
       "token_in_markdown": true,
       "measured": "2026-08-05",
       "note": "Same image wrapped in a PDF and sent as fileType 0."
     },
     {
       "capture": "invoice-table.json",
-      "source_image": "g4_invoice_photo_03.png",
+      "source_image": "invoice-photo.png",
       "token_in_markdown": true,
       "measured": "2026-08-03"
     },
     {
       "capture": "slide-single-figure.json",
-      "source_image": "g2_slide_dense_02.png",
+      "source_image": "slide-dense.png",
       "token_in_markdown": true,
       "measured": "2026-08-03"
     },
     {
       "capture": "code-editor-no-crops.json",
-      "source_image": "g1_code_editor_01.png",
+      "source_image": "code-editor.png",
       "token_in_markdown": false,
       "measured": "2026-08-09",
       "note": "The only false in this table, and it is a defect being recorded, not a result being blessed. G1-01-TOKEN-4827 is absent from markdown.text AND from every block_content in the 613 KB response, on a page ground-truth calls text-dominant whose token is set in large monospace across most of the frame. The whole window came back as a single `content` block spanning 99.6% x 92% of the page. Not the dark background: terminal-dark-no-crops.json is equally dark, splits into seven blocks, and keeps its token."
     },
     {
       "capture": "terminal-dark-no-crops.json",
-      "source_image": "g1_terminal_02.png",
+      "source_image": "terminal.png",
       "token_in_markdown": true,
       "measured": "2026-08-09",
       "note": "The dark-background control for the row above."
     },
     {
       "capture": "chat-light-avatar-crops.json",
-      "source_image": "g1_chat_03.png",
+      "source_image": "chat.png",
       "token_in_markdown": true,
       "measured": "2026-08-09",
       "note": "The light-background control for the same."
     },
     {
       "capture": "whiteboard-no-crops.json",
-      "source_image": "g3_whiteboard_flow_02.png",
+      "source_image": "whiteboard-flow.png",
       "token_in_markdown": true,
       "measured": "2026-08-09"
     },
     {
       "capture": "seal-crop-uncited.json",
-      "source_image": "g4_circular_photo_02.png",
+      "source_image": "circular-photo.png",
       "token_in_markdown": true,
       "measured": "2026-08-09",
       "note": "The token comes back. Two other strings on the page do not: 回覧 was cropped as a header_image the Markdown never cites, and 期限 7/10 sits in a `number` block that markdown.text drops."

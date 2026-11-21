@@ -1564,7 +1564,7 @@ fn ensure_schema_on_connection(conn: &Connection, config: FtsSchemaConfig) -> Re
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS chunks (
-            -- QB29 (step4b-contract-tests-p3b.md §C, 04 §4.1 L385-386 /
+            -- QB29 (docs/04-pipeline.md §4.1 /
             -- 03-data-model.md §8, U98): a rowid table's `TEXT PRIMARY KEY`
             -- does NOT imply NOT NULL by itself — spelled out explicitly.
             chunk_id TEXT NOT NULL PRIMARY KEY,

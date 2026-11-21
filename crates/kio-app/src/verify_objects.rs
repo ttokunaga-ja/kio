@@ -2180,8 +2180,8 @@ fn commit_roots(repo: &Repository, state: &mut State) -> Result<BTreeSet<String>
 }
 
 // ===========================================================================
-// `kio repair verify-objects --prune-orphans` (step4b-contract-tests-p2b.md
-// §E, U43, 10-operations.md §7.5.1 L586-626).
+// `kio repair verify-objects --prune-orphans`
+// (U43, docs/10-operations.md §7.5.1).
 // ===========================================================================
 
 mod prune_orphans;
@@ -2192,7 +2192,7 @@ pub use prune_orphans::{
 };
 
 // ===========================================================================
-// `kio repair registry-prune` (step4b-contract-tests-p2b.md §H, U46,
+// `kio repair registry-prune` (docs/10-operations.md §3, U46,
 // 10-operations.md §3 L291-293).
 // ===========================================================================
 

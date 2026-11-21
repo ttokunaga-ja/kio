@@ -2340,7 +2340,7 @@ fn build_sqlite_index_at(
     )?;
     embedding_store::rebuild_image_vec(fts.connection(), expected_embedding_profile.as_ref())
         .map_err(index_to_kio)?;
-    // PB28 (step4b-contract-tests-p2b.md §J, §Z ruling 4; 04-pipeline.md §5.7
+    // PB28 (1b46cbb5:tasks/step4b-contract-tests-p2b.md §J, §Z ruling 4; 04-pipeline.md §5.7
     // L913 / 05-runtime.md §3.5 L760-761): mint a fresh `index_generation` and
     // initialize `last_lifecycle_epoch` to the CURRENT counter value, in the
     // SAME transaction as the rest of this rebuild — not a separate step

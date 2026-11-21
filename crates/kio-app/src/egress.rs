@@ -575,7 +575,7 @@ pub(crate) fn quarantine_status_records(repo: &Repository) -> Result<Vec<Value>>
         .collect())
 }
 
-/// QA7 (step4b-contract-tests-p3a.md §B, arbitration #1, 10 §1.1 L128-130):
+/// QA7 (1b46cbb5:tasks/step4b-contract-tests-p3a.md §B, arbitration #1, 10 §1.1 L128-130):
 /// `effective_ignore_hash` hashes the ACTUAL Tier A/B pattern content (via
 /// `kio_core::scope::tier_a_template_text`), not a hand-maintained version
 /// literal — a pattern-list edit changes this hash automatically.
@@ -588,12 +588,12 @@ pub(crate) fn write_approval_record(
     preview: &ScanPreview,
     approval_method: &str,
 ) -> Result<()> {
-    // QA5 (step4b-contract-tests-p3a.md §B, 10 §1 L97-113): the one-time
+    // QA5 (docs/10-operations.md §1): the one-time
     // scope-level scan approval, distinct from the adapter-level opt-in rows
     // below (`approvals.jsonl`/`consents.jsonl`) — `record_scan_approval` is
     // idempotent, so calling it again on a later `index --approve` with no
     // NEW adapter to opt in (the `pending.is_empty()` early return below) is
-    // harmless. QA19 (step4b-contract-tests-p3a.md §F, 10 §1 L48-53): cost
+    // harmless. QA19 (docs/10-operations.md §1): cost
     // estimates come from `preview.estimated_cost` (`kio-pipeline`'s
     // `build_scan_preview`, now wired to `tools.toml`'s declared `[pricing]`)
     // — `0.0` only when no `pricing` is declared for that role, an honest

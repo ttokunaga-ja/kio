@@ -328,7 +328,7 @@ pub(crate) fn reconcile_committed_embedding_tasks(
         }
         let budget_paused = task.status == TaskStatus::Paused
             && task.fallback_reason.as_deref() == Some("budget_exceeded");
-        // QA2 (step4b-contract-tests-p3a.md §A): an auth failure now lands
+        // QA2 (docs/04-pipeline.md §5.2–5.3): an auth failure now lands
         // Paused (never Failed) — admit it here the SAME way `budget_paused`
         // is admitted, otherwise a Paused(auth) task on a non-live chunk
         // strands its open reservation forever (the R18-1/R22-3 bug class).
@@ -650,7 +650,7 @@ pub(crate) fn hold_secret_embedding_tasks(
             fallback_reason: Some(SECRETS_TIER_B_HOLD.to_owned()),
             created_at: now.to_owned(),
             bbox_annotation_enabled: None,
-            // QA1 (step4b-contract-tests-p3a.md §A): the closed hold_reason
+            // QA1 (docs/04-pipeline.md §5.2–5.3): the closed hold_reason
             // enum accompanies every Paused task.
             hold_reason: Some(HoldReason::TierBApproval),
             reserved_usd: None,
@@ -895,7 +895,7 @@ pub(crate) fn enqueue_embedding_tasks(
 /// L2(ii)/L7 target selection: drop chunks whose embedding task must not run in
 /// this pass — a sticky budget-Paused task (unless `override_budget`), a Failed
 /// task that is not retry-eligible (unelapsed `next_retry_at`, or non-retryable /
-/// attempts exhausted), or (QA3, step4b-contract-tests-p3a.md §A) a rate-limited
+/// attempts exhausted), or (QA3, docs/04-pipeline.md §5.2–5.3) a rate-limited
 /// Pending task whose `next_retry_at` backoff has not yet elapsed. Failed
 /// retry-eligible tasks are left in; `batch retry` resets them to Pending before
 /// the pass so they flow through normally.
@@ -951,7 +951,7 @@ fn embeddable_task_state(
             // the R21-1 JOIN dedup so the hold cannot be bypassed even if a same
             // output_ref collision re-appears from another source.
             Some(SECRETS_TIER_B_HOLD) => false,
-            // QA2 (step4b-contract-tests-p3a.md §A): an auth hold is released
+            // QA2 (docs/04-pipeline.md §5.2–5.3): an auth hold is released
             // only by the dedicated revive pre-pass
             // (`reconcile_committed_embedding_tasks`'s `auth_revive_candidate`,
             // gated on `batch resume`'s `allow_auth_revive`) — never by being
@@ -963,7 +963,7 @@ fn embeddable_task_state(
         // Failed embeddings are owned by `batch retry` (L7): skip unless the
         // backoff has elapsed AND the error is still retryable.
         TaskStatus::Failed => task_retry_due(task, control) && task_retry_allowed(task),
-        // QA3 (step4b-contract-tests-p3a.md §A, 04 §876): a rate-limited
+        // QA3 (docs/04-pipeline.md §5.3): a rate-limited
         // Pending chunk (`next_retry_at` in the future) must not be re-driven
         // before its backoff elapses — "next_retry_at 未来 … の embedding
         // タスクを持つ chunk は enrichment 対象から除外する". Mirrors the
