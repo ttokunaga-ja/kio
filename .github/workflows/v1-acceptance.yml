@@ -294,7 +294,17 @@ jobs:
           }
           "KIO_OFFICE_CONVERTER=$converter" | Add-Content -LiteralPath $env:GITHUB_ENV
           "$(Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash" | Out-File -LiteralPath "$env:RUNNER_TEMP\kio-v1-provisioning.txt" -Encoding utf8
-          & $converter '--version' | Add-Content -LiteralPath "$env:RUNNER_TEMP\kio-v1-provisioning.txt" -Encoding utf8
+          $versionOutput = Join-Path $env:RUNNER_TEMP 'kio-v1-office-version.txt'
+          $version = Start-Process -FilePath $converter -ArgumentList '--version' -PassThru -NoNewWindow -RedirectStandardOutput $versionOutput
+          try {
+            if (-not $version.WaitForExit(120000)) {
+              $version.Kill($true)
+              throw 'LibreOffice --version did not finish within 120 seconds'
+            }
+            if ($version.ExitCode -ne 0) { throw "LibreOffice --version exited with $($version.ExitCode)" }
+          } finally {
+            Get-Content -LiteralPath $versionOutput | Add-Content -LiteralPath "$env:RUNNER_TEMP\kio-v1-provisioning.txt" -Encoding utf8
+          }
 
       - name: Prefetch pinned LiteRT-LM
         run: bash scripts/ci/fetch-litert-runtime.sh

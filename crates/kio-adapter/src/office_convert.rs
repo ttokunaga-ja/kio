@@ -50,7 +50,8 @@ pub const TEST_OFFICE_CONVERT_ENV: &str = "KIO_TEST_OFFICE_CONVERT";
 pub const OFFICE_CONVERTER_ENV: &str = "KIO_OFFICE_CONVERTER";
 pub(crate) const MAX_OFFICE_PROBE_PDF_BYTES: usize = 2 * 1024 * 1024;
 const MAX_OFFICE_PROBE_SCRATCH_BYTES: u64 = 8 * 1024 * 1024;
-const OFFICE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+// One budget for runtime verification and both fixture conversions on cold CI hosts.
+const OFFICE_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 const OFFICE_CONVERT_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_OFFICE_INPUT_BYTES: usize = 100 * 1024 * 1024;
 const MAX_OFFICE_PDF_BYTES: usize = 250 * 1024 * 1024;
@@ -2395,7 +2396,7 @@ mod tests {
     }
 
     fn required_real_office_converter() -> Option<OfficeConverter> {
-        let deadline = test_deadline();
+        let deadline = Instant::now() + OFFICE_PROBE_TIMEOUT;
         let program = required_real_office_program(deadline)?;
         let _clear_seam = kio_core::test_control::TestEnvGuard::remove(TEST_OFFICE_CONVERT_ENV);
         let converter =
