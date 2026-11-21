@@ -79,6 +79,31 @@ function Test-FirewallScope($Rule) {
         [Environment]::ExpandEnvironmentVariables($application.Program) -ieq $sshd
 }
 
+function Test-TailscaleInboundRule($Rule, $Port, $Address, $Interface, [string]$Program, [string]$Service, [string[]]$AdapterAddresses) {
+    # tailscaled adds one local host destination per rule through netsh.
+    # netsh does not set a vendor group, owner, or explicit interface alias.
+    $profile = ([string]$Rule.Profile) -replace '\s', ''
+    if ($Rule.DisplayName -cne 'Tailscale-In' -or $Rule.PolicyStoreSourceType -ne 'Local' -or
+        $Rule.PolicyStoreSource -ne 'PersistentStore' -or $Rule.Group -or $Rule.Owner -or
+        $profile -notin 'Private','Domain,Private','Private,Domain' -or $Rule.EdgeTraversalPolicy -ne 'Block' -or
+        [string]$Port.Protocol -notin 'Any','256' -or ($Port.LocalPort -join ',') -ne 'Any' -or
+        ($Port.RemotePort -join ',') -ne 'Any' -or ($Address.RemoteAddress -join ',') -ne 'Any' -or
+        ($Interface.InterfaceAlias -join ',') -ne 'Any' -or $Program -ne 'Any' -or $Service -ne 'Any') {
+        return $false
+    }
+    $local = $Address.LocalAddress -join ','
+    if ($local -notmatch '^([0-9a-f:.]+)(?:/([0-9.]+))?$') { return $false }
+    $destination = $Matches[1]
+    $prefix = $Matches[2]
+    $parsed = $null
+    if (![ipaddress]::TryParse($destination, [ref]$parsed)) { return $false }
+    if ($prefix) {
+        if ($parsed.AddressFamily -eq 'InterNetwork' -and $prefix -notin '32','255.255.255.255') { return $false }
+        if ($parsed.AddressFamily -eq 'InterNetworkV6' -and $prefix -ne '128') { return $false }
+    }
+    return $parsed.ToString() -in $AdapterAddresses
+}
+
 function Set-AtomicFile([string]$From, [string]$To) {
     if ([IO.File]::Exists($To)) {
         [IO.File]::Replace($From, $To, $noBackup)
@@ -109,10 +134,15 @@ $keyBlob = $Matches[1]
 Invoke-Checked (Join-Path $sshBin 'ssh-keygen.exe') @('-l', '-f', (Resolve-Path -LiteralPath $PublicKeyFile).Path) | Out-Host
 $adapter = Get-NetAdapter -Name $TailscaleInterface
 if ($adapter.Status -ne 'Up' -or $adapter.InterfaceDescription -notlike '*Tailscale*') { throw 'Expected an active Tailscale adapter.' }
-$tailIps = @(Get-NetIPAddress -InterfaceIndex $adapter.InterfaceIndex -AddressFamily IPv4 |
+$adapterAddresses = Get-NetIPAddress -InterfaceIndex $adapter.InterfaceIndex
+$tailIps = @($adapterAddresses |
     Where-Object { Test-TailIPv4 $_.IPAddress } | Select-Object -ExpandProperty IPAddress)
 if ($tailIps.Count -ne 1) { throw 'Expected exactly one Tailscale IPv4.' }
 $tailIp = $tailIps[0]
+$tailAddresses = @($tailIp)
+$tailAddresses += @($adapterAddresses |
+    Where-Object { $_.IPAddress -match '^fd7a:115c:a1e0:' } |
+    ForEach-Object { ([ipaddress]$_.IPAddress).ToString() })
 if (Get-NetFirewallProfile -PolicyStore ActiveStore |
     Where-Object { $_.Enabled -ne 'True' -or $_.DefaultInboundAction -eq 'Allow' -or $_.AllowLocalFirewallRules -eq 'False' }) {
     throw 'Active firewall policy must allow local rules and block unsolicited inbound traffic.'
@@ -120,13 +150,20 @@ if (Get-NetFirewallProfile -PolicyStore ActiveStore |
 
 $priorRule = Get-NetFirewallRule -Name $ruleName -PolicyStore PersistentStore -ErrorAction SilentlyContinue
 if ($priorRule -and !(Test-FirewallScope $priorRule)) { throw "Existing $ruleName has a different scope. Review it before applying." }
-$overlaps = foreach ($rule in Get-NetFirewallRule -PolicyStore ActiveStore -Enabled True -Direction Inbound -Action Allow) {
-    if (!(Test-Port22 ($rule | Get-NetFirewallPortFilter))) { continue }
+$overlaps = foreach ($rule in Get-NetFirewallRule -PolicyStore ActiveStore -TracePolicyStore -Enabled True -Direction Inbound -Action Allow) {
+    $port = $rule | Get-NetFirewallPortFilter
+    if (!(Test-Port22 $port)) { continue }
     if ($rule.Name -eq $ruleName -and $priorRule -and (Test-FirewallScope $rule)) { continue }
     $program = [Environment]::ExpandEnvironmentVariables(($rule | Get-NetFirewallApplicationFilter).Program)
     if ($program -notin 'Any','System',$sshd -and $program -notmatch '(?i)sshd\.exe$|[*?]') { continue }
-    $iface = ($rule | Get-NetFirewallInterfaceFilter).InterfaceAlias -join ','
-    $remote = ($rule | Get-NetFirewallAddressFilter).RemoteAddress -join ','
+    $interface = $rule | Get-NetFirewallInterfaceFilter
+    $address = $rule | Get-NetFirewallAddressFilter
+    if ($rule.DisplayName -ceq 'Tailscale-In' -and
+        (Test-TailscaleInboundRule $rule $port $address $interface $program ($rule | Get-NetFirewallServiceFilter).Service $tailAddresses)) {
+        continue
+    }
+    $iface = $interface.InterfaceAlias -join ','
+    $remote = $address.RemoteAddress -join ','
     if ($iface -eq $adapter.Name -and $remote -in $AdminSource,"$AdminSource/32") { continue }
     $rule.Name
 }
