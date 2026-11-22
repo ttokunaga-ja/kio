@@ -129,9 +129,7 @@ impl PrivateOfficeScratch {
         let plan =
             PlannedDirectoryRemoval::capture(&self.parent, &self.leaf, &mut RemovalBudget::new())
                 .map_err(|error| {
-                    AdapterError::ContractViolation(format!(
-                        "cannot capture Office scratch cleanup: {error}"
-                    ))
+                    self.cleanup_error("cannot capture Office scratch cleanup", error)
                 })?
                 .ok_or_else(|| {
                     AdapterError::ContractViolation(
@@ -142,14 +140,44 @@ impl PrivateOfficeScratch {
         drop(original);
         // DELETE mutator opens must not overlap our no-delete-sharing pin.
         drop(self.pin.take());
-        if !plan.remove().map_err(|error| {
-            AdapterError::ContractViolation(format!("Office scratch cleanup refused: {error}"))
-        })? {
+        if !plan
+            .remove_private_scratch()
+            .map_err(|error| self.cleanup_error("Office scratch cleanup refused", error))?
+        {
             return Err(AdapterError::ContractViolation(
                 "Office scratch identity changed before retirement".to_owned(),
             ));
         }
         Ok(())
+    }
+    fn cleanup_error(&self, message: &str, error: kio_core::KioError) -> AdapterError {
+        let context = error.context();
+        let context = context.get("removal_detail").unwrap_or(context);
+        let entry = context
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|path| {
+                Path::new(path)
+                    .strip_prefix(&self.path)
+                    .or_else(|_| Path::new(path).strip_prefix(&self.leaf))
+                    .ok()
+            });
+        let name = match entry {
+            Some(path) if path.as_os_str().is_empty() => ".".to_owned(),
+            Some(path) => path.to_string_lossy().chars().take(240).collect(),
+            None => "<outside scratch or unavailable>".to_owned(),
+        };
+        let operation = context
+            .get("removal_operation")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("validate removal plan");
+        let attributes = context
+            .get("file_attributes")
+            .and_then(serde_json::Value::as_u64)
+            .map_or_else(|| "unavailable".to_owned(), |bits| format!("0x{bits:08X}"));
+        AdapterError::ContractViolation(format!(
+            "{message}: {error}; operation: {operation}; scratch entry: {name:?}; attributes: {attributes}"
+        ))
     }
     pub(crate) fn close(mut self) -> Result<()> {
         self.cleanup = false;
@@ -592,6 +620,62 @@ pub(crate) fn office_package_launch_roots(roots: &[PathBuf]) -> &[PathBuf] {
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scratch_cleanup_retires_a_read_only_profile_file() {
+        let scratch = private_temp_dir().unwrap();
+        let path = scratch.path().to_path_buf();
+        let root = crate::office_convert::bind_private_scratch(&path).unwrap();
+        drop(root.create_directory(Path::new("lo-profile")).unwrap());
+        drop(
+            root.create_private_file(Path::new("lo-profile/settings"))
+                .unwrap(),
+        );
+        let settings = path.join("lo-profile/settings");
+        let mut permissions = std::fs::metadata(&settings).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&settings, permissions).unwrap();
+        assert!(
+            std::fs::metadata(&settings)
+                .unwrap()
+                .permissions()
+                .readonly()
+        );
+
+        drop(root);
+        scratch.close().unwrap();
+        assert!(!path.exists());
+        assert!(
+            !path
+                .with_file_name(format!(
+                    ".kio-prune-directory-{}",
+                    path.file_name().unwrap().to_str().unwrap(),
+                ))
+                .exists()
+        );
+    }
+
+    #[test]
+    fn scratch_cleanup_diagnostic_shows_relative_entry_and_attributes() {
+        let scratch = private_temp_dir().unwrap();
+        let path = scratch.path().join(r"lo-profile\settings");
+        let error = kio_core::KioError::new(
+            "KIO-E-STORE-IO-001",
+            "Access is denied. (os error 5)",
+            serde_json::json!({
+                "path": path,
+                "removal_operation": "set delete disposition",
+                "file_attributes": 0x21,
+            }),
+            kio_core::ExitCode::Failure,
+        );
+        let message = scratch.cleanup_error("cleanup refused", error).to_string();
+        assert!(message.contains(r#"scratch entry: "lo-profile\\settings""#));
+        assert!(message.contains("operation: set delete disposition"));
+        assert!(message.contains("attributes: 0x00000021"));
+        assert!(!message.contains(&*scratch.path().to_string_lossy()));
+        scratch.close().unwrap();
+    }
 
     #[test]
     fn file_url_percent_encodes_drive_paths_without_the_verbatim_prefix() {

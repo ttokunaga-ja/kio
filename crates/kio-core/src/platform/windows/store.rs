@@ -432,6 +432,7 @@ fn open_gc_mutation_retained(root: &File, relative: &Path, max: u64, label: &Pat
 }
 
 pub(crate) fn retire_gc_handle_retained(file: &File, label: &Path) -> Result<()> {
+    use super::removal_semantics::{annotate, attributes};
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
         FILE_DISPOSITION_INFO_EX, FileDispositionInfoEx, SetFileInformationByHandle,
@@ -439,6 +440,7 @@ pub(crate) fn retire_gc_handle_retained(file: &File, label: &Path) -> Result<()>
     let expected = crate::platform::regular_file_handle_identity(file)
         .ok_or_else(|| err(label, "GC retirement requires a single-link regular handle"))?
         .atomic_recovery_components();
+    let failure = |operation, error| annotate(ioerr(label, error), operation, attributes(file));
     let disposition = FILE_DISPOSITION_INFO_EX {
         Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
     };
@@ -451,11 +453,17 @@ pub(crate) fn retire_gc_handle_retained(file: &File, label: &Path) -> Result<()>
         )
     } == 0
     {
-        return Err(ioerr(label, std::io::Error::last_os_error()));
+        return Err(failure(
+            "set delete disposition",
+            std::io::Error::last_os_error(),
+        ));
     }
     let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
     if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut information) } == 0 {
-        return Err(ioerr(label, std::io::Error::last_os_error()));
+        return Err(failure(
+            "inspect retired file",
+            std::io::Error::last_os_error(),
+        ));
     }
     let actual = (
         information.dwVolumeSerialNumber,
@@ -467,10 +475,15 @@ pub(crate) fn retire_gc_handle_retained(file: &File, label: &Path) -> Result<()>
             "GC retirement did not preserve identity with zero links",
         ));
     }
-    file.set_len(0).map_err(|e| ioerr(label, e))?;
-    file.sync_all().map_err(|e| ioerr(label, e))?;
+    file.set_len(0)
+        .map_err(|e| failure("truncate retired file", e))?;
+    file.sync_all()
+        .map_err(|e| failure("flush retired file", e))?;
     if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut information) } == 0 {
-        return Err(ioerr(label, std::io::Error::last_os_error()));
+        return Err(failure(
+            "inspect reclaimed file",
+            std::io::Error::last_os_error(),
+        ));
     }
     let after = (
         information.dwVolumeSerialNumber,

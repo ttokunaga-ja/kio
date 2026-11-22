@@ -1,4 +1,5 @@
 use crate::Result;
+use crate::store_dir::planned_removal::{RemovalAccess, Retirement};
 use crate::store_dir::{err, ioerr};
 use cap_primitives::fs as cap_fs;
 use std::{ffi::OsStr, fs::File, path::Path};
@@ -40,10 +41,10 @@ pub(crate) fn open(
     parent: &File,
     leaf: &OsStr,
     directory: bool,
-    mutation: bool,
+    access: RemovalAccess,
     label: &Path,
 ) -> Result<File> {
-    if directory && !mutation {
+    if directory && access == RemovalAccess::Inspect {
         let file =
             cap_fs::open_dir_nofollow(parent, Path::new(leaf)).map_err(|e| ioerr(label, e))?;
         identity(&file, true, label)?;
@@ -61,7 +62,6 @@ pub(crate) fn open(
             flags |= libc::O_DIRECTORY;
         }
         options.custom_flags(flags);
-        let _ = mutation;
     }
     let file = cap_fs::open(parent, Path::new(leaf), &options).map_err(|e| ioerr(label, e))?;
     identity(&file, directory, label)?;
@@ -74,13 +74,17 @@ pub(crate) fn retire_leaf(
     leaf: &OsStr,
     held: &File,
     mutator: &File,
-    directory: bool,
-    expected: &Identity,
+    retirement: Retirement<'_>,
     label: &Path,
 ) -> Result<()> {
     // A retained root quarantine is the Unix reserved namespace boundary; no
     // final unlink claims a portable atomic compare-and-delete syscall.
-    let named = open(parent, leaf, directory, false, label)?;
+    let Retirement {
+        directory,
+        expected,
+        access: _access,
+    } = retirement;
+    let named = open(parent, leaf, directory, RemovalAccess::Inspect, label)?;
     if identity(&named, directory, label)? != *expected
         || identity(held, directory, label)? != *expected
     {
@@ -95,3 +99,5 @@ pub(crate) fn retire_leaf(
     let _ = mutator;
     Ok(())
 }
+
+pub(crate) use crate::platform::store::sync_directory;
