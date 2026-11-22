@@ -1,7 +1,6 @@
 //! Invocation-only scratch ACL lease. This policy must never be used for stores.
 use super::*;
 use std::rc::Rc;
-use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_DELETE_PENDING};
 use windows_sys::Win32::Security::Authorization::GetSecurityInfo;
 use windows_sys::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACE_HEADER, EqualSid, GetAce, GetSecurityDescriptorControl,
@@ -47,32 +46,6 @@ pub(super) fn scratch_step<T>(
             format!("{operation} (scratch entry: {name:?}): {error}"),
         )
     })
-}
-
-pub(super) fn retry_live_scratch_open<T>(
-    deadline: Option<Instant>,
-    mut open: impl FnMut() -> std::io::Result<T>,
-) -> std::io::Result<T> {
-    let now = Instant::now();
-    let deadline = deadline.unwrap_or(now).min(now + Duration::from_millis(50));
-    let pause = Duration::from_millis(5);
-    loop {
-        // On Windows, CreateFile can report ACCESS_DENIED while a temporary
-        // file is pending deletion. Reopen with identical access.
-        match open() {
-            Err(error)
-                if error.raw_os_error().is_some_and(|code| {
-                    code == ERROR_ACCESS_DENIED as i32 || code == ERROR_DELETE_PENDING as i32
-                }) && Instant::now() + pause < deadline =>
-            {
-                std::thread::sleep(pause);
-                if Instant::now() >= deadline {
-                    return Err(error);
-                }
-            }
-            result => return result,
-        }
-    }
 }
 
 pub(super) struct CurrentUser(Vec<usize>);
@@ -530,57 +503,5 @@ impl Drop for ScratchGrant {
         if self.stopped && !self.retired {
             let _ = self.retire();
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn live_scratch_open_reobserves_a_delete_pending_file() {
-        use windows_sys::Win32::{
-            Foundation::ERROR_ACCESS_DENIED, Storage::FileSystem::DeleteFileW,
-        };
-
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("temporary");
-        let mut held = Some(File::create(&path).unwrap());
-        assert_ne!(unsafe { DeleteFileW(wide(path.as_os_str()).as_ptr()) }, 0);
-        let mut attempts = 0;
-        let error = retry_live_scratch_open(Some(Instant::now() + Duration::from_secs(1)), || {
-            attempts += 1;
-            let result = open_scratch_entry(
-                &path,
-                FILE_READ_ATTRIBUTES | READ_CONTROL,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-            );
-            if attempts == 1 {
-                assert_eq!(
-                    result.as_ref().err().and_then(std::io::Error::raw_os_error),
-                    Some(ERROR_ACCESS_DENIED as i32)
-                );
-                drop(held.take());
-            }
-            result
-        })
-        .err()
-        .expect("temporary entry should disappear");
-        assert_eq!(attempts, 2);
-        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
-    }
-
-    #[test]
-    fn live_scratch_open_preserves_a_persistent_win32_denial() {
-        use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
-
-        let error =
-            retry_live_scratch_open(Some(Instant::now() + Duration::from_millis(10)), || {
-                Err::<(), _>(std::io::Error::from_raw_os_error(
-                    ERROR_ACCESS_DENIED as i32,
-                ))
-            })
-            .unwrap_err();
-        assert_eq!(error.raw_os_error(), Some(ERROR_ACCESS_DENIED as i32));
     }
 }

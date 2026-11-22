@@ -266,11 +266,7 @@ impl ScratchInventory {
         for name in names {
             check_time(self.deadline)?;
             let child_path = path.join(&name);
-            let opened = scratch_access::retry_live_scratch_open(
-                (self.mode == ScanMode::LiveOffice).then_some(self.deadline),
-                || open_at(&guard, &name, metadata, share | FILE_SHARE_WRITE),
-            );
-            let child = match opened {
+            let child = match open_at(&guard, &name, metadata, share | FILE_SHARE_WRITE) {
                 Ok(child) => child,
                 Err(error)
                     if !matches!(
