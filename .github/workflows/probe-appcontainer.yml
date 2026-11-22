@@ -1,0 +1,327 @@
+name: Probe Windows Office AppContainer
+
+on:
+  push:
+    branches: [probe/appcontainer]
+
+permissions:
+  contents: read
+
+env:
+  OFFICE_VERSION: "26.8.0.3"
+  OFFICE_WINDOWS_X64_SHA256: 4aa6c6e1895f4055104effcb556bd3362d20c6ad707c149543304f395ef9db95
+
+jobs:
+  probe:
+    runs-on: windows-2025
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
+        with:
+          components: clippy, rustfmt
+
+      - name: Provision Windows Office prerequisite
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Join-Path $env:RUNNER_TEMP "LibreOffice_$env:OFFICE_VERSION`_Win_x86-64.msi"
+          Invoke-WebRequest -Uri "https://downloadarchive.documentfoundation.org/libreoffice/old/$env:OFFICE_VERSION/win/x86_64/LibreOffice_$env:OFFICE_VERSION`_Win_x86-64.msi" -OutFile $installer
+          if ((Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:OFFICE_WINDOWS_X64_SHA256) {
+            throw 'downloaded LibreOffice MSI hash differs from the pinned release hash'
+          }
+          # Start-Process -Wait also waits for the msiexec service (/V) that outlives the install.
+          $log = Join-Path $env:RUNNER_TEMP 'kio-v1-office-msi.log'
+          $install = Start-Process msiexec.exe -PassThru -NoNewWindow -ArgumentList @('/i', $installer, '/qn', '/norestart', '/l*v', $log)
+          if (-not $install.WaitForExit(1200000)) { Get-Content -LiteralPath $log -Tail 60; throw 'LibreOffice MSI did not finish within 20 minutes' }
+          if ($install.ExitCode -ne 0) { Get-Content -LiteralPath $log -Tail 60; throw "LibreOffice MSI exited with $($install.ExitCode)" }
+          $converter = Join-Path $env:ProgramFiles 'LibreOffice\program\soffice.exe'
+          if (-not (Test-Path -LiteralPath $converter -PathType Leaf)) {
+            throw "LibreOffice converter was not installed at $converter"
+          }
+          "KIO_OFFICE_CONVERTER=$converter" | Add-Content -LiteralPath $env:GITHUB_ENV
+          "$(Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash" | Out-File -LiteralPath "$env:RUNNER_TEMP\kio-v1-provisioning.txt" -Encoding utf8
+          $versionProgram = Join-Path (Split-Path $converter) 'soffice.com'
+          $versionOutput = Join-Path $env:RUNNER_TEMP 'kio-v1-office-version.txt'
+          $version = Start-Process -FilePath $versionProgram -ArgumentList '--version' -PassThru -NoNewWindow -RedirectStandardOutput $versionOutput
+          try {
+            if (-not $version.WaitForExit(60000)) {
+              $version.Kill($true)
+              throw 'LibreOffice soffice.com --version did not finish within 60 seconds'
+            }
+            if ($version.ExitCode -ne 0) { throw "LibreOffice soffice.com --version exited with $($version.ExitCode)" }
+          } finally {
+            Get-Content -LiteralPath $versionOutput | Add-Content -LiteralPath "$env:RUNNER_TEMP\kio-v1-provisioning.txt" -Encoding utf8
+          }
+
+      - name: Prefetch pinned LiteRT-LM
+        shell: bash
+        run: bash scripts/ci/fetch-litert-runtime.sh
+
+      - name: Build release kio from the pushed commit
+        shell: bash
+        run: cargo +1.98.0 build --release --locked --all-features -p kio-cli --bin kio
+
+      - name: Run kio status and sample the live process tree
+        id: status
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $work = Join-Path $env:RUNNER_TEMP 'kio-appcontainer-work'
+          $evidence = Join-Path $env:RUNNER_TEMP 'kio-appcontainer-evidence'
+          New-Item -ItemType Directory -Path $evidence -Force | Out-Null
+          foreach ($leaf in 'scope', 'home', 'cfg', 'data', 'cache', 'tmp') {
+            New-Item -ItemType Directory -Path (Join-Path $work $leaf) -Force | Out-Null
+          }
+          $scope = Join-Path $work 'scope'
+          $binary = Join-Path $env:GITHUB_WORKSPACE 'target\release\kio.exe'
+          Get-Content -LiteralPath "$env:RUNNER_TEMP\kio-v1-provisioning.txt" |
+            Set-Content -LiteralPath "$evidence\provisioning.txt"
+
+          # Match the isolated environment of probe-office.yml. In particular,
+          # keep all renderer scratch for the synthetic fixtures under one root.
+          function Start-Kio([string[]] $arguments, [string] $label) {
+            $info = [System.Diagnostics.ProcessStartInfo]::new($binary)
+            $info.UseShellExecute = $false
+            $info.WorkingDirectory = $scope
+            $info.Environment.Clear()
+            $info.Environment['SystemRoot'] = $env:SystemRoot
+            $info.Environment['KIO_OFFICE_CONVERTER'] = $env:KIO_OFFICE_CONVERTER
+            $paths = @{
+              HOME = 'home'; USERPROFILE = 'home'; APPDATA = 'cfg'; XDG_CONFIG_HOME = 'cfg'
+              LOCALAPPDATA = 'data'; XDG_DATA_HOME = 'data'; XDG_CACHE_HOME = 'cache'
+              TEMP = 'tmp'; TMP = 'tmp'; TMPDIR = 'tmp'
+            }
+            foreach ($entry in $paths.GetEnumerator()) {
+              $info.Environment[$entry.Key] = Join-Path $work $entry.Value
+            }
+            foreach ($argument in $arguments) { $info.ArgumentList.Add($argument) }
+
+            # File redirects can persist stdout/stderr even when a process has
+            # to be killed. Drain both streams concurrently.
+            $info.RedirectStandardOutput = $true
+            $info.RedirectStandardError = $true
+            $process = [System.Diagnostics.Process]::Start($info)
+            $stdout = [System.IO.File]::Create("$evidence\$label.json")
+            $stderr = [System.IO.File]::Create("$evidence\$label.stderr.txt")
+            @{
+              Process = $process; Stdout = $stdout; Stderr = $stderr
+              Copy = @($process.StandardOutput.BaseStream.CopyToAsync($stdout),
+                       $process.StandardError.BaseStream.CopyToAsync($stderr))
+            }
+          }
+
+          function Close-Kio($run) {
+            try {
+              if (-not $run.Process.HasExited) {
+                $run.Process.Kill($true)
+                $null = $run.Process.WaitForExit(5000)
+              }
+              $tasks = [System.Threading.Tasks.Task[]]$run.Copy
+              $null = [System.Threading.Tasks.Task]::WaitAll($tasks, 5000)
+            } finally {
+              $run.Stdout.Dispose()
+              $run.Stderr.Dispose()
+            }
+          }
+
+          $init = Start-Kio -arguments @('--json', 'init', $scope) -label init
+          try {
+            if (-not $init.Process.WaitForExit(20000)) { throw 'kio init timed out' }
+            if ($init.Process.ExitCode -ne 0) { throw "kio init exited $($init.Process.ExitCode)" }
+          } finally {
+            Close-Kio $init
+          }
+
+          # The runner is ephemeral. Global resource SACLs apply only to this
+          # runner user's failed accesses and do not modify resource DACLs.
+          $auditLog = "$evidence\audit-setup.txt"
+          $auditBackup = Join-Path $work 'audit-before.csv'
+          $auditUser = '{' + [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value + '}'
+          $auditTargets = @(
+            @{ Type = 'File'; Subcategory = '{0CCE921D-69AE-11D9-BED3-505054503030}'; Mask = 'FA' }
+            @{ Type = 'Key'; Subcategory = '{0CCE921E-69AE-11D9-BED3-505054503030}'; Mask = 'KA' }
+          )
+          function Invoke-Audit([string[]] $arguments) {
+            ('auditpol ' + ($arguments -join ' ')) | Add-Content -LiteralPath $auditLog
+            & auditpol.exe @arguments 2>&1 | Add-Content -LiteralPath $auditLog
+            "exit=$LASTEXITCODE" | Add-Content -LiteralPath $auditLog
+            return ($LASTEXITCODE -eq 0)
+          }
+          $auditSaved = Invoke-Audit -arguments @('/backup', "/file:$auditBackup")
+          $enabledSacls = @()
+          try {
+            if ($auditSaved) {
+              # Capture launches/exits that occur between CIM snapshots. Leave
+              # process command-line auditing to the runner's existing policy.
+              $null = Invoke-Audit -arguments @('/set',
+                '/subcategory:{0CCE922B-69AE-11D9-BED3-505054503030},{0CCE922C-69AE-11D9-BED3-505054503030}',
+                '/success:enable')
+              foreach ($target in $auditTargets) {
+                $policy = Invoke-Audit -arguments @('/set', "/subcategory:$($target.Subcategory)", '/failure:enable')
+                if ($policy -and (Invoke-Audit -arguments @('/resourceSACL', '/set',
+                    "/type:$($target.Type)", "/user:$auditUser", '/failure', "/access:$($target.Mask)"))) {
+                  $enabledSacls += $target.Type
+                }
+              }
+            }
+
+            [DateTime]::UtcNow.ToString('o') | Set-Content -LiteralPath "$evidence\started-utc.txt"
+            $status = Start-Kio -arguments @('--json', 'status') -label status
+            $clock = [System.Diagnostics.Stopwatch]::StartNew()
+            try {
+              while (-not $status.Process.HasExited -and $clock.Elapsed.TotalSeconds -lt 125) {
+                try {
+                  $utc = [DateTime]::UtcNow.ToString('o')
+                  $all = @(Get-CimInstance -ClassName Win32_Process -OperationTimeoutSec 3)
+                  $tree = @($all | Where-Object ProcessId -eq $status.Process.Id)
+                  $seen = [System.Collections.Generic.HashSet[uint32]]::new()
+                  $null = $seen.Add([uint32]$status.Process.Id)
+                  for ($i = 0; $i -lt $tree.Count; $i++) {
+                    $parentId = $tree[$i].ProcessId
+                    foreach ($child in ($all | Where-Object ParentProcessId -eq $parentId)) {
+                      if ($seen.Add($child.ProcessId)) { $tree += $child }
+                    }
+                  }
+                  # Include Office processes even if a short-lived parent was
+                  # already gone when CIM took the snapshot.
+                  $office = $all | Where-Object Name -in 'soffice.exe', 'soffice.bin', 'soffice.com', 'WerFault.exe'
+                  $selected = $tree + @($office | Where-Object { $_ -and $seen.Add($_.ProcessId) })
+                  @{
+                    utc = $utc; kio_pid = $status.Process.Id
+                    processes = @($selected | Select-Object Name, ProcessId, ParentProcessId, CreationDate,
+                      SessionId, CommandLine, ExecutablePath, ThreadCount, HandleCount, UserModeTime, KernelModeTime)
+                  } | ConvertTo-Json -Depth 5 -Compress | Add-Content -LiteralPath "$evidence\process-tree.jsonl"
+                } catch {
+                  "$([DateTime]::UtcNow.ToString('o')) $_" | Add-Content -LiteralPath "$evidence\sampling-errors.txt"
+                }
+                $null = $status.Process.WaitForExit(1000)
+              }
+              if (-not $status.Process.HasExited) { throw 'Outer kio status watchdog expired (125 s)' }
+              if ($status.Process.ExitCode -ne 0) { throw "kio status exited $($status.Process.ExitCode)" }
+            } finally {
+              Close-Kio $status
+              [DateTime]::UtcNow.ToString('o') | Set-Content -LiteralPath "$evidence\ended-utc.txt"
+            }
+          } finally {
+            foreach ($type in $enabledSacls) {
+              $null = Invoke-Audit -arguments @('/resourceSACL', '/remove', "/type:$type", "/user:$auditUser")
+            }
+            if ($auditSaved) { $null = Invoke-Audit -arguments @('/restore', "/file:$auditBackup") }
+          }
+
+          $result = Get-Content -Raw -LiteralPath "$evidence\status.json" | ConvertFrom-Json
+          if (-not $result.scope_path) { throw 'kio status did not return a scope' }
+          if ($null -ne $result.office_readiness) {
+            $result.office_readiness | ConvertTo-Json -Compress | Write-Host
+          } else {
+            Write-Host 'Office readiness: ready'
+          }
+
+      - name: Collect scratch, ACLs, and Windows events
+        if: always() && steps.status.outcome != 'skipped'
+        timeout-minutes: 4
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $evidence = Join-Path $env:RUNNER_TEMP 'kio-appcontainer-evidence'
+          $scratch = Join-Path $env:RUNNER_TEMP 'kio-appcontainer-work\tmp'
+          $notes = "$evidence\collection.txt"
+          New-Item -ItemType Directory -Path "$evidence\recovery" -Force | Out-Null
+          $pending = [System.Collections.Generic.Queue[string]]::new()
+          if (Test-Path -LiteralPath $scratch -PathType Container) { $pending.Enqueue($scratch) }
+          $total = 0L
+          $count = 0
+          while ($pending.Count -gt 0 -and $count -lt 10000) {
+            $parent = $pending.Dequeue()
+            foreach ($item in (Get-ChildItem -LiteralPath $parent -Force -ErrorAction Continue)) {
+              if ($count -ge 10000) { break }
+              $count++
+              $relative = [System.IO.Path]::GetRelativePath($scratch, $item.FullName)
+              if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+                "Skipped reparse point: $relative" | Add-Content -LiteralPath $notes
+                continue
+              }
+              $destination = Join-Path "$evidence\recovery" $relative
+              if ($item.PSIsContainer) {
+                New-Item -ItemType Directory -Path $destination -Force | Out-Null
+                $pending.Enqueue($item.FullName)
+              } elseif ($total + $item.Length -le 128MB) {
+                Copy-Item -LiteralPath $item.FullName -Destination $destination -Force -ErrorAction Continue
+                $total += $item.Length
+              } else {
+                "Skipped over copy budget: $relative" | Add-Content -LiteralPath $notes
+              }
+              "$($item.LastWriteTimeUtc.ToString('o')) $($item.Length) $relative" |
+                Add-Content -LiteralPath "$evidence\scratch-files.txt"
+            }
+          }
+          "Scratch entries inspected: $count; file bytes selected: $total" | Add-Content -LiteralPath $notes
+          if ($count -ge 10000) { 'Scratch entry limit reached' | Add-Content -LiteralPath $notes }
+
+          $program = Split-Path -Parent $env:KIO_OFFICE_CONVERTER
+          $package = Split-Path -Parent $program
+          $paths = @($package, $program, $env:KIO_OFFICE_CONVERTER, "$program\soffice.bin",
+            "$program\fundamental.ini", "$package\share", "$env:SystemRoot\Fonts",
+            'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts', "$env:SystemRoot\Temp", $scratch)
+          $paths += @(Get-ChildItem -LiteralPath $scratch -Directory -ErrorAction SilentlyContinue |
+            Where-Object { -not ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) } |
+            Select-Object -First 8 | ForEach-Object {
+              $_.FullName; "$($_.FullName)\lo-profile"; "$($_.FullName)\out"; "$($_.FullName)\input.docx"
+            })
+          foreach ($path in $paths) {
+            try {
+              "$path $((Get-Acl -LiteralPath $path).Sddl)" | Add-Content -LiteralPath "$evidence\acl.txt"
+            } catch {
+              "$path $_" | Add-Content -LiteralPath "$evidence\acl.txt"
+            }
+          }
+
+          if (-not (Test-Path -LiteralPath "$evidence\started-utc.txt")) { exit 0 }
+          $since = [DateTime]::Parse((Get-Content -LiteralPath "$evidence\started-utc.txt"))
+          $until = [DateTime]::Now
+          if (Test-Path -LiteralPath "$evidence\ended-utc.txt") {
+            $until = [DateTime]::Parse((Get-Content -LiteralPath "$evidence\ended-utc.txt")).AddSeconds(5)
+          }
+          $officeName = '(?i)soffice\.(exe|bin|com)\b'
+          $auditFailure = [long][System.Diagnostics.Eventing.Reader.StandardEventKeywords]::AuditFailure
+          $queries = @(
+            @{ Filter = @{ LogName = 'Security'; Id = 4656; Keywords = $auditFailure }; File = 'access-denied.jsonl'; Limit = 4096 }
+            @{ Filter = @{ LogName = 'Security'; Id = 4688, 4689 }; File = 'office-lifecycle.jsonl'; Limit = 2048 }
+            @{ Filter = @{ LogName = 'Application'; Id = 1000, 1001, 1002 }; File = 'office-crashes.jsonl'; Limit = 128 }
+          )
+          foreach ($query in $queries) {
+            try {
+              $query.Filter.StartTime = $since
+              $query.Filter.EndTime = $until
+              $events = @(Get-WinEvent -FilterHashtable $query.Filter -MaxEvents $query.Limit)
+              $matched = 0
+              foreach ($event in $events) {
+                $xml = $event.ToXml()
+                if ($xml -match $officeName) {
+                  @{ utc = $event.TimeCreated.ToUniversalTime().ToString('o'); event_id = $event.Id; xml = $xml } |
+                    ConvertTo-Json -Compress | Add-Content -LiteralPath "$evidence\$($query.File)"
+                  $matched++
+                }
+              }
+              "$($query.File): $matched Office events from $($events.Count) records (limit $($query.Limit))" |
+                Add-Content -LiteralPath $notes
+            } catch {
+              "$($query.File): $_" | Add-Content -LiteralPath $notes
+            }
+          }
+
+      - name: Upload Windows AppContainer evidence
+        if: always() && steps.status.outcome != 'skipped'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: office-appcontainer-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kio-appcontainer-evidence/
+          include-hidden-files: true
+          retention-days: 1
+          if-no-files-found: error
