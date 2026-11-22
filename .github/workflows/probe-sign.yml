@@ -1,0 +1,25 @@
+name: probe sign
+on:
+  push:
+    branches: [probe/office-fix]
+permissions: { contents: read }
+jobs:
+  sign:
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $i = Join-Path $env:RUNNER_TEMP 'lo.msi'
+          Invoke-WebRequest -Uri 'https://downloadarchive.documentfoundation.org/libreoffice/old/26.8.0.3/win/x86_64/LibreOffice_26.8.0.3_Win_x86-64.msi' -OutFile $i
+          if ((Get-FileHash $i -Algorithm SHA256).Hash.ToLowerInvariant() -ne '4aa6c6e1895f4055104effcb556bd3362d20c6ad707c149543304f395ef9db95') { throw 'hash' }
+          $p = Start-Process msiexec.exe -PassThru -NoNewWindow -ArgumentList @('/i', $i, '/qn', '/norestart')
+          if (-not $p.WaitForExit(1200000) -or $p.ExitCode -ne 0) { throw 'msi' }
+          $root = Join-Path $env:ProgramFiles 'LibreOffice'
+          $pe = Get-ChildItem -LiteralPath $root -Recurse -File | Where-Object { $_.Extension -in '.dll','.exe','.com','.pyd' }
+          $sig = $pe | ForEach-Object { [pscustomobject]@{ Path = $_.FullName.Substring($root.Length + 1); Status = (Get-AuthenticodeSignature -LiteralPath $_.FullName).Status } }
+          "total PE files: $($sig.Count)"
+          $sig | Group-Object Status | ForEach-Object { "$($_.Name): $($_.Count)" }
+          "--- not Valid:"
+          $sig | Where-Object Status -ne 'Valid' | ForEach-Object { "$($_.Status)  $($_.Path)" }
