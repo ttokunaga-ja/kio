@@ -32,44 +32,6 @@ pub(crate) fn office_conversion_paths(outdir: &Path, input: &Path) -> (OsString,
     )
 }
 
-pub(crate) fn office_probe_output_failure_note(
-    scratch: &kio_core::store_dir::StoreDirectory,
-    out: &kio_core::store_dir::StoreDirectory,
-    status: &std::process::ExitStatus,
-) -> String {
-    fn entry_names(directory: &kio_core::store_dir::StoreDirectory) -> String {
-        const MAX_NAMES: usize = 16;
-        // The completed job's last scratch scan already bounds the entry count.
-        let Ok(entries) = directory.entries(Path::new("")) else {
-            return "unavailable".to_owned();
-        };
-        let names = entries
-            .iter()
-            .take(MAX_NAMES)
-            .map(|entry| {
-                entry
-                    .name
-                    .to_string_lossy()
-                    .chars()
-                    .take(80)
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>();
-        let suffix = if entries.len() > MAX_NAMES {
-            " (truncated)"
-        } else {
-            ""
-        };
-        format!("{names:?}{suffix}")
-    }
-
-    format!(
-        "; renderer status: {status}; scratch entries: {}; out entries: {}",
-        entry_names(scratch),
-        entry_names(out),
-    )
-}
-
 pub(crate) struct PrivateOfficeScratch {
     original: std::sync::Arc<std::fs::File>,
     pin: Option<std::fs::File>,
@@ -740,18 +702,26 @@ mod tests {
                 .unwrap();
         drop(root.create_private_file(Path::new("input.docx")).unwrap());
         drop(out.create_private_file(Path::new("other.pdf")).unwrap());
-        let status = std::process::ExitStatus::from_raw(0);
-        let note = office_probe_output_failure_note(&root, &out, &status);
-        assert!(note.contains(&format!("renderer status: {status}")));
+        let output = kio_process::BoundedProcessOutput {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: "convert input.docx -> out/input.pdf\n".to_owned(),
+            stderr: format!("a{}hidden-tail", "é".repeat(1024)),
+            duration: std::time::Duration::ZERO,
+        };
+        let note = crate::office_convert::office_probe_output_failure_note(&root, &out, &output);
+        assert!(note.contains(&format!("renderer status: {}", output.status)));
         assert!(note.contains(r#"scratch entries: ["input.docx", "out"]"#));
         assert!(note.contains(r#"out entries: ["other.pdf"]"#));
+        assert!(note.contains(r#"renderer stdout: "convert input.docx -> out/input.pdf\n""#));
+        assert!(note.ends_with(" (truncated)"));
+        assert!(!note.contains("hidden-tail"));
 
         for index in 0..17 {
             let name = format!("{index:02}.pdf");
             drop(out.create_private_file(Path::new(&name)).unwrap());
         }
-        let note = office_probe_output_failure_note(&root, &out, &status);
-        assert!(note.contains("(truncated)"));
+        let note = crate::office_convert::office_probe_output_failure_note(&root, &out, &output);
+        assert!(note.contains(" (truncated); renderer stdout"));
         assert!(!note.contains("other.pdf"));
         drop(out);
         drop(root);

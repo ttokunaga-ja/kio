@@ -35,9 +35,8 @@ use crate::office_runtime_identity::{
 };
 use crate::platform::{
     DEFAULT_OFFICE_CONVERTER_PROGRAM, OFFICE_LAUNCH_PROFILE, OfficeRuntime, file_url,
-    finish_scratch, office_conversion_paths, office_probe_output_failure_note,
-    office_render_sandbox, private_temp_dir, restrict_renderer_state_directory,
-    scratch_recovery_note,
+    finish_scratch, office_conversion_paths, office_render_sandbox, private_temp_dir,
+    restrict_renderer_state_directory, scratch_recovery_note,
 };
 use crate::{AdapterError, Result};
 
@@ -735,6 +734,13 @@ impl RealRenderer {
                 )));
             }
         };
+        let probe_failure_note = || {
+            if output_limit == MAX_OFFICE_PROBE_PDF_BYTES {
+                office_probe_output_failure_note(&scratch_directory, &output_directory, &output)
+            } else {
+                String::new()
+            }
+        };
         if !output.status.success() {
             #[cfg(test)]
             if self.native_acceptance_diagnostics {
@@ -748,9 +754,10 @@ impl RealRenderer {
                 )));
             }
             return Err(AdapterError::ContractViolation(format!(
-                "office converter {} exited with {}",
+                "office converter {} exited with {}{}",
                 program.display(),
-                output.status
+                output.status,
+                probe_failure_note(),
             )));
         }
 
@@ -769,19 +776,16 @@ impl RealRenderer {
             deadline,
         )
         .map_err(|error| {
-            let note = if output_limit == MAX_OFFICE_PROBE_PDF_BYTES {
-                office_probe_output_failure_note(&scratch_directory, &output_directory, &output.status)
-            } else {
-                String::new()
-            };
+            let note = probe_failure_note();
             AdapterError::ContractViolation(format!(
                 "office converter output is absent, unsafe, or exceeded the {output_limit} byte limit: {error}{note}",
             ))
         })?;
         if !pdf_bytes.starts_with(b"%PDF") {
-            return Err(AdapterError::ContractViolation(
-                "office converter output is not a PDF (missing %PDF magic)".to_owned(),
-            ));
+            return Err(AdapterError::ContractViolation(format!(
+                "office converter output is not a PDF (missing %PDF magic){}",
+                probe_failure_note(),
+            )));
         }
         drop(output_directory);
         drop(scratch_directory);
@@ -790,6 +794,52 @@ impl RealRenderer {
             .map_err(verification_error)?;
         Ok(pdf_bytes)
     }
+}
+
+pub(crate) fn office_probe_output_failure_note(
+    scratch: &kio_core::store_dir::StoreDirectory,
+    out: &kio_core::store_dir::StoreDirectory,
+    output: &kio_process::BoundedProcessOutput,
+) -> String {
+    fn entry_names(directory: &kio_core::store_dir::StoreDirectory) -> String {
+        const MAX_NAMES: usize = 16;
+        let Ok(entries) = directory.entries(Path::new("")) else {
+            return "unavailable".to_owned();
+        };
+        let names = entries
+            .iter()
+            .take(MAX_NAMES)
+            .map(|entry| {
+                entry
+                    .name
+                    .to_string_lossy()
+                    .chars()
+                    .take(80)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let suffix = if entries.len() > MAX_NAMES {
+            " (truncated)"
+        } else {
+            ""
+        };
+        format!("{names:?}{suffix}")
+    }
+
+    fn log_excerpt(log: &str) -> String {
+        const MAX_LOG_BYTES: usize = 2 * 1024;
+        let end = log.floor_char_boundary(MAX_LOG_BYTES);
+        let suffix = if end < log.len() { " (truncated)" } else { "" };
+        format!("{:?}{suffix}", &log[..end])
+    }
+    format!(
+        "; renderer status: {}; scratch entries: {}; out entries: {}; renderer stdout: {}; renderer stderr: {}",
+        output.status,
+        entry_names(scratch),
+        entry_names(out),
+        log_excerpt(&output.stdout),
+        log_excerpt(&output.stderr),
+    )
 }
 
 /// Deterministically normalize a converter's raw PDF output (07 §5.1):

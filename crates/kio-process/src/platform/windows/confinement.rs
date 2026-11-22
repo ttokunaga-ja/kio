@@ -75,6 +75,8 @@ use std::collections::BTreeSet;
 mod child_token;
 #[path = "scratch_access.rs"]
 mod scratch_access;
+#[path = "scratch_observation.rs"]
+mod scratch_observation;
 use scratch_access::ScratchGrant;
 
 fn profile_operation(operation: &str, error: std::io::Error) -> ConfinementError {
@@ -82,6 +84,10 @@ fn profile_operation(operation: &str, error: std::io::Error) -> ConfinementError
         error.kind(),
         format!("{operation} (scratch entry: <none>): {error}"),
     ))
+}
+
+fn profile_last_error(operation: &str) -> ConfinementError {
+    profile_operation(operation, std::io::Error::last_os_error())
 }
 
 pub(crate) const RENDER_ADDRESS_SPACE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -185,110 +191,18 @@ impl Drop for OwnedHandle {
 /// renderer-controlled bytes are staged in it. The caller must invoke this
 /// immediately after exclusive creation; non-empty or symlink paths fail.
 pub fn protect_owner_private_scratch(path: &Path) -> Result<(), ConfinementError> {
-    let wide_path = wide(path.as_os_str());
-    let raw_directory = unsafe {
-        CreateFileW(
-            wide_path.as_ptr(),
-            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC,
-            FILE_SHARE_NONE,
-            std::ptr::null(),
-            OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-            std::ptr::null_mut(),
-        )
-    };
-    if raw_directory == INVALID_HANDLE_VALUE {
-        return Err(ConfinementError::Profile(std::io::Error::last_os_error()));
-    }
-    let directory = OwnedHandle(raw_directory);
-    let mut info = BY_HANDLE_FILE_INFORMATION::default();
-    if unsafe { GetFileInformationByHandle(directory.0, &mut info) } == 0
-        || info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)
-            != FILE_ATTRIBUTE_DIRECTORY
-    {
+    let (directory, info) = open_scratch_entry(
+        path,
+        FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC,
+        FILE_SHARE_NONE,
+    )
+    .map_err(ConfinementError::Profile)?;
+    if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
         return Err(ConfinementError::Profile(std::io::Error::other(
             "scratch must be a newly-created empty non-symlink directory",
         )));
     }
-    // FILE_ID_BOTH_DIR_INFO records require eight-byte alignment. The Win32
-    // buffer length is in bytes, not the number of backing allocation elements.
-    #[repr(align(8))]
-    struct DirectoryEntries([u8; 4096]);
-    let mut entries = DirectoryEntries([0; 4096]);
-    let buffer_bytes = entries.0.len();
-    let name_offset = std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
-    let invalid_records = || {
-        ConfinementError::Profile(std::io::Error::other(
-            "invalid scratch directory enumeration",
-        ))
-    };
-    let mut seen_dot = false;
-    let mut seen_dot_dot = false;
-    loop {
-        entries.0.fill(0);
-        if unsafe {
-            GetFileInformationByHandleEx(
-                directory.0,
-                FileIdBothDirectoryInfo,
-                entries.0.as_mut_ptr().cast(),
-                buffer_bytes as u32,
-            )
-        } == 0
-        {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
-                break;
-            }
-            return Err(ConfinementError::Profile(error));
-        }
-        let bytes = &entries.0;
-        let mut offset = 0;
-        loop {
-            let record = bytes.get(offset..).ok_or_else(&invalid_records)?;
-            if record.len() < name_offset {
-                return Err(invalid_records());
-            }
-            // Read only the fixed header fields; a short final filename need
-            // not occupy the tail padding of the Rust structure.
-            let next = u32::from_ne_bytes(record[..4].try_into().unwrap()) as usize;
-            let length_offset = std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileNameLength);
-            let name_bytes =
-                u32::from_ne_bytes(record[length_offset..length_offset + 4].try_into().unwrap())
-                    as usize;
-            if name_bytes == 0 || !name_bytes.is_multiple_of(2) {
-                return Err(invalid_records());
-            }
-            let record_end = name_offset
-                .checked_add(name_bytes)
-                .filter(|end| *end <= record.len())
-                .ok_or_else(&invalid_records)?;
-            if next != 0 && (!next.is_multiple_of(8) || next < record_end || next >= record.len()) {
-                return Err(invalid_records());
-            }
-            let name = &record[name_offset..record_end];
-            let dot = [b'.', 0];
-            let dot_dot = [b'.', 0, b'.', 0];
-            let seen = if name == dot {
-                &mut seen_dot
-            } else if name == dot_dot {
-                &mut seen_dot_dot
-            } else {
-                return Err(ConfinementError::Profile(std::io::Error::other(
-                    "scratch must be empty before staging",
-                )));
-            };
-            // At most two pseudoentries can be skipped across all batches.
-            // Reject repeats so even a malformed enumerator is bounded.
-            if *seen {
-                return Err(invalid_records());
-            }
-            *seen = true;
-            if next == 0 {
-                break;
-            }
-            offset = offset.checked_add(next).ok_or_else(&invalid_records)?;
-        }
-    }
+    scratch_observation::require_empty(&directory).map_err(ConfinementError::Profile)?;
     scratch_access::protect_empty(directory.0).map_err(ConfinementError::Profile)?;
     Ok(())
 }
@@ -401,10 +315,15 @@ where
                 while let Ok((stream, result)) = receiver.try_recv() {
                     output[usize::from(stream == "stderr")] = Some(result?);
                 }
-                grant
-                    .verify_active(deadline)
-                    .map_err(ConfinementError::Profile)?;
-                observe_scratch_until(sandbox, deadline, options)?;
+                match sandbox.access {
+                    RendererAccess::OfficeJobOnly => grant
+                        .observe_office_live(deadline, sandbox.limits().max_file_bytes)
+                        .map_err(ConfinementError::Profile)?,
+                    RendererAccess::AppContainer => {
+                        grant.verify_active().map_err(ConfinementError::Profile)?;
+                        observe_scratch_until(sandbox, deadline, options)?;
+                    }
+                }
                 if status.is_none() {
                     match unsafe { WaitForSingleObject(primary.0, 0) } {
                         WAIT_TIMEOUT => {}
@@ -499,13 +418,10 @@ fn observe_scratch_until(
     options: BoundedProcessOptions,
 ) -> Result<(), ConfinementError> {
     check_renderer_deadline(deadline, options)?;
-    let started = Instant::now();
-    let budget = SCRATCH_SCAN_BUDGET.min(deadline.saturating_duration_since(started));
-    let result = enforce_scratch_limit_with_budget(
+    let result = scan_scratch_limits(
         sandbox.scratch(),
+        deadline.min(Instant::now() + SCRATCH_SCAN_BUDGET),
         sandbox.limits().max_file_bytes,
-        budget,
-        &mut || started.elapsed(),
     );
     // Command timeout takes precedence when its deadline clipped the scan.
     check_renderer_deadline(deadline, options)?;
@@ -579,6 +495,11 @@ fn open_scratch_entry(
         return Err(std::io::Error::last_os_error());
     }
     let handle = OwnedHandle(raw);
+    let info = scratch_entry_information(&handle)?;
+    Ok((handle, info))
+}
+
+fn scratch_entry_information(handle: &OwnedHandle) -> std::io::Result<BY_HANDLE_FILE_INFORMATION> {
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
     if unsafe { GetFileInformationByHandle(handle.0, &mut info) } == 0 {
         return Err(std::io::Error::last_os_error());
@@ -593,153 +514,21 @@ fn open_scratch_entry(
             "renderer scratch contains a non-regular file",
         ));
     }
-    Ok((handle, info))
+    Ok(info)
 }
 
-fn pin_scratch_directory(
-    path: &Path,
-    observed: Option<&BY_HANDLE_FILE_INFORMATION>,
-) -> Result<OwnedHandle, std::io::Error> {
-    // Deny write and delete sharing while this directory and its descendants
-    // are observed. Attribute access alone would not establish this pin.
-    let (handle, info) = open_scratch_entry(
-        path,
+fn scan_scratch_limits(root: &Path, deadline: Instant, max_bytes: u64) -> std::io::Result<()> {
+    let (root, _) = open_scratch_entry(
+        root,
         FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ,
     )?;
-    if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
-        return Err(std::io::Error::other(
-            "renderer scratch directory changed type",
-        ));
-    }
-    if observed.is_some_and(|previous| {
-        previous.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
-            || previous.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
-            || previous.dwVolumeSerialNumber != info.dwVolumeSerialNumber
-            || previous.nFileIndexHigh != info.nFileIndexHigh
-            || previous.nFileIndexLow != info.nFileIndexLow
-    }) {
-        return Err(std::io::Error::other(
-            "renderer scratch directory changed identity before pinning",
-        ));
-    }
-    Ok(handle)
-}
-
-#[cfg(test)]
-fn enforce_scratch_limit_with_clock(
-    root: &Path,
-    max_file_bytes: u64,
-    elapsed: &mut impl FnMut() -> Duration,
-) -> Result<(), std::io::Error> {
-    enforce_scratch_limit_with_budget(root, max_file_bytes, SCRATCH_SCAN_BUDGET, elapsed)
-}
-
-fn enforce_scratch_limit_with_budget(
-    root: &Path,
-    max_file_bytes: u64,
-    budget: Duration,
-    elapsed: &mut impl FnMut() -> Duration,
-) -> Result<(), std::io::Error> {
-    fn check_deadline(
-        budget: Duration,
-        elapsed: &mut impl FnMut() -> Duration,
-    ) -> Result<(), std::io::Error> {
-        if elapsed() > budget {
-            return Err(std::io::Error::other(
-                "renderer scratch scan exceeded observation budget",
-            ));
-        }
-        Ok(())
-    }
-
-    fn visit(
-        path: &Path,
-        observed: Option<&BY_HANDLE_FILE_INFORMATION>,
-        depth: usize,
-        max: u64,
-        counts: (&mut u64, &mut usize),
-        budget: Duration,
-        elapsed: &mut impl FnMut() -> Duration,
-    ) -> Result<(), std::io::Error> {
-        let (total, entries) = counts;
-        if depth > MAX_SCRATCH_SCAN_DEPTH {
-            return Err(std::io::Error::other(
-                "renderer scratch scan exceeded depth limit",
-            ));
-        }
-        check_deadline(budget, elapsed)?;
-        let _directory = pin_scratch_directory(path, observed)?;
-        check_deadline(budget, elapsed)?;
-        // read_dir streams entries. _directory and every caller's guard remain
-        // alive throughout iteration, including while each child is visited.
-        let mut directory = std::fs::read_dir(path)?;
-        loop {
-            check_deadline(budget, elapsed)?;
-            let next = directory.next();
-            check_deadline(budget, elapsed)?;
-            let Some(entry) = next else { break };
-            let entry = entry?;
-            *entries = entries
-                .checked_add(1)
-                .ok_or_else(|| std::io::Error::other("renderer scratch entry count overflow"))?;
-            if *entries > MAX_SCRATCH_SCAN_ENTRIES {
-                return Err(std::io::Error::other(
-                    "renderer scratch scan exceeded entry limit",
-                ));
-            }
-            let child_path = entry.path();
-            let (_entry, info) = match open_scratch_entry(
-                &child_path,
-                FILE_READ_ATTRIBUTES,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-            ) {
-                Ok(entry) => entry,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error),
-            };
-            check_deadline(budget, elapsed)?;
-            if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
-                // The metadata handle does not pin the name. Retain it and
-                // require the stronger directory open to identify the same
-                // object before resolving any descendants through its path.
-                visit(
-                    &child_path,
-                    Some(&info),
-                    depth + 1,
-                    max,
-                    (total, entries),
-                    budget,
-                    elapsed,
-                )?;
-            } else {
-                let size = (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow);
-                if size > max {
-                    return Err(std::io::Error::other(
-                        "renderer scratch file exceeds configured limit",
-                    ));
-                }
-                *total = total
-                    .checked_add(size)
-                    .ok_or_else(|| std::io::Error::other("renderer scratch size overflow"))?;
-                if *total > max {
-                    return Err(std::io::Error::other(
-                        "renderer scratch total exceeds configured limit",
-                    ));
-                }
-            }
-        }
-        check_deadline(budget, elapsed)
-    }
-    check_deadline(budget, elapsed)?;
-    visit(
-        root,
-        None,
-        0,
-        max_file_bytes,
-        (&mut 0, &mut 0),
-        budget,
-        elapsed,
+    scratch_observation::observe(
+        std::rc::Rc::new(root),
+        scratch_observation::ScanMode::Limits,
+        deadline,
+        max_bytes,
+        |_, _, _| Ok(()),
     )
 }
 
@@ -946,10 +735,7 @@ impl Attributes {
         let mut memory = vec![0_usize; words].into_boxed_slice();
         let list = memory.as_mut_ptr().cast();
         if unsafe { InitializeProcThreadAttributeList(list, count, 0, &mut size) } == 0 {
-            return Err(profile_operation(
-                "InitializeProcThreadAttributeList",
-                std::io::Error::last_os_error(),
-            ));
+            return Err(profile_last_error("InitializeProcThreadAttributeList"));
         }
         // Attribute values must outlive CreateProcessW. Keep this allocation
         // boxed so references supplied to UpdateProcThreadAttribute remain
@@ -980,9 +766,8 @@ impl Attributes {
                 )
             } == 0
         {
-            return Err(profile_operation(
+            return Err(profile_last_error(
                 "set renderer AppContainer process attribute",
-                std::io::Error::last_os_error(),
             ));
         }
         if unsafe {
@@ -997,10 +782,7 @@ impl Attributes {
             )
         } == 0
         {
-            return Err(profile_operation(
-                "set renderer inherited handle list",
-                std::io::Error::last_os_error(),
-            ));
+            return Err(profile_last_error("set renderer inherited handle list"));
         }
         Ok(attributes)
     }
@@ -1051,10 +833,7 @@ impl Pipes {
                 || SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT, 0) == 0
                 || SetHandleInformation(stderr_read, HANDLE_FLAG_INHERIT, 0) == 0
             {
-                return Err(profile_operation(
-                    "configure renderer standard I/O pipes",
-                    std::io::Error::last_os_error(),
-                ));
+                return Err(profile_last_error("configure renderer standard I/O pipes"));
             }
             Ok(Self {
                 stdin_read,
@@ -1304,7 +1083,7 @@ mod scratch_scan_tests {
     use super::*;
 
     fn scan(root: &Path, max: u64) -> Result<(), std::io::Error> {
-        enforce_scratch_limit_with_clock(root, max, &mut || Duration::ZERO)
+        scan_scratch_limits(root, Instant::now() + Duration::from_secs(60), max)
     }
 
     fn final_scan_sandbox(root: &Path, max: u64) -> NativeRenderSandbox {
@@ -1398,12 +1177,7 @@ mod scratch_scan_tests {
     #[test]
     fn scratch_scan_honors_a_shorter_remaining_command_budget() {
         let root = tempfile::tempdir().unwrap();
-        let budget = Duration::from_millis(5);
-        enforce_scratch_limit_with_budget(root.path(), 0, budget, &mut || budget).unwrap();
-        let error = enforce_scratch_limit_with_budget(root.path(), 0, budget, &mut || {
-            budget + Duration::from_nanos(1)
-        })
-        .unwrap_err();
+        let error = scan_scratch_limits(root.path(), Instant::now(), 0).unwrap_err();
         assert!(error.to_string().contains("observation budget"));
     }
 
@@ -1475,48 +1249,6 @@ mod scratch_scan_tests {
     }
 
     #[test]
-    fn scratch_observation_deadline_is_deterministic() {
-        let root = tempfile::tempdir().unwrap();
-        enforce_scratch_limit_with_clock(root.path(), 0, &mut || SCRATCH_SCAN_BUDGET).unwrap();
-        let mut ticks = 0;
-        let error = enforce_scratch_limit_with_clock(root.path(), 0, &mut || {
-            ticks += 1;
-            if ticks < 5 {
-                Duration::ZERO
-            } else {
-                SCRATCH_SCAN_BUDGET + Duration::from_nanos(1)
-            }
-        })
-        .unwrap_err();
-        assert!(error.to_string().contains("observation budget"));
-        assert_eq!(ticks, 5);
-    }
-
-    #[test]
-    fn scratch_directory_pin_rejects_a_replaced_observed_directory() {
-        let parent = tempfile::tempdir().unwrap();
-        let child = parent.path().join("child");
-        std::fs::create_dir(&child).unwrap();
-        let (_metadata, observed) = open_scratch_entry(
-            &child,
-            FILE_READ_ATTRIBUTES,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-        )
-        .unwrap();
-        drop(pin_scratch_directory(&child, Some(&observed)).unwrap());
-        // Attribute-only observations permit a name swap. A later strong open
-        // must reject the replacement even though it is also a regular directory.
-        std::fs::rename(&child, parent.path().join("moved-child")).unwrap();
-        std::fs::create_dir(&child).unwrap();
-        let error = pin_scratch_directory(&child, Some(&observed))
-            .err()
-            .expect("replacement must not inherit the observed directory identity");
-        assert!(error.to_string().contains("changed identity"));
-        // The rejected strong open releases its handle on the error path.
-        std::fs::rename(&child, parent.path().join("replacement")).unwrap();
-    }
-
-    #[test]
     fn scratch_pinned_ancestors_block_directory_swap() {
         use std::os::windows::fs::OpenOptionsExt;
 
@@ -1524,29 +1256,35 @@ mod scratch_scan_tests {
         let root = parent.path().join("scratch");
         let child = root.join("child");
         std::fs::create_dir_all(&child).unwrap();
-        let mut ticks = 0;
+        let (handle, _) = open_scratch_entry(
+            &root,
+            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ,
+        )
+        .unwrap();
         let mut attempted_swap = false;
-        enforce_scratch_limit_with_clock(&root, 0, &mut || {
-            ticks += 1;
-            // Root and child have both acquired their retained directory
-            // guards at this checkpoint, before the child's read_dir call.
-            if ticks == 8 {
-                attempted_swap = true;
-                assert!(std::fs::rename(&root, parent.path().join("moved-root")).is_err());
-                assert!(std::fs::rename(&child, root.join("moved-child")).is_err());
-                assert!(std::fs::remove_dir(&child).is_err());
-                // FSCTL_SET_REPARSE_POINT needs a write-capable handle. The
-                // guard must also prevent acquiring that access in place.
-                assert!(
-                    std::fs::OpenOptions::new()
-                        .access_mode(windows_sys::Win32::Foundation::GENERIC_WRITE)
-                        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-                        .open(&child)
-                        .is_err()
-                );
-            }
-            Duration::ZERO
-        })
+        scratch_observation::observe(
+            std::rc::Rc::new(handle),
+            scratch_observation::ScanMode::Limits,
+            Instant::now() + SCRATCH_SCAN_BUDGET,
+            0,
+            |_, _, path| {
+                if path == Path::new("child") {
+                    attempted_swap = true;
+                    assert!(std::fs::rename(&root, parent.path().join("moved-root")).is_err());
+                    assert!(std::fs::rename(&child, root.join("moved-child")).is_err());
+                    assert!(std::fs::remove_dir(&child).is_err());
+                    assert!(
+                        std::fs::OpenOptions::new()
+                            .access_mode(windows_sys::Win32::Foundation::GENERIC_WRITE)
+                            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                            .open(&child)
+                            .is_err()
+                    );
+                }
+                Ok(())
+            },
+        )
         .unwrap();
         assert!(attempted_swap);
         // RAII releases every guard after the observation.
@@ -1841,7 +1579,7 @@ mod scratch_invocation_grant_tests {
             .share_mode(0)
             .open(&generated)
             .unwrap();
-        let observation = grant.verify_active(Instant::now() + Duration::from_secs(1));
+        let observation = grant.verify_active();
         assert!(
             observation.is_ok(),
             "metadata and ACL observation must permit a renderer's exclusive output writer: {observation:?}"

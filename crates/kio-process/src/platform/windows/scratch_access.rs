@@ -1,5 +1,6 @@
 //! Invocation-only scratch ACL lease. This policy must never be used for stores.
 use super::*;
+use std::rc::Rc;
 use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_DELETE_PENDING};
 use windows_sys::Win32::Security::Authorization::GetSecurityInfo;
 use windows_sys::Win32::Security::{
@@ -29,7 +30,7 @@ fn denied(message: &'static str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::PermissionDenied, message)
 }
 
-fn scratch_step<T>(
+pub(super) fn scratch_step<T>(
     root: &Path,
     path: &Path,
     operation: &str,
@@ -39,11 +40,8 @@ fn scratch_step<T>(
         let relative = path
             .strip_prefix(root)
             .unwrap_or(Path::new("<unavailable>"));
-        let name = if relative.as_os_str().is_empty() {
-            ".".to_owned()
-        } else {
-            relative.to_string_lossy().chars().take(240).collect()
-        };
+        let name: String = relative.to_string_lossy().chars().take(240).collect();
+        let name = if name.is_empty() { "." } else { &name };
         std::io::Error::new(
             error.kind(),
             format!("{operation} (scratch entry: {name:?}): {error}"),
@@ -51,36 +49,28 @@ fn scratch_step<T>(
     })
 }
 
-fn retry_live_scratch_open<T>(
+pub(super) fn retry_live_scratch_open<T>(
     deadline: Option<Instant>,
     mut open: impl FnMut() -> std::io::Result<T>,
 ) -> std::io::Result<T> {
-    let Some(deadline) = deadline else {
-        return open();
-    };
-    let deadline = deadline.min(Instant::now() + Duration::from_millis(50));
+    let now = Instant::now();
+    let deadline = deadline.unwrap_or(now).min(now + Duration::from_millis(50));
+    let pause = Duration::from_millis(5);
     loop {
-        let result = open();
         // On Windows, CreateFile can report ACCESS_DENIED while a temporary
-        // file is pending deletion. Reopen with identical access; only normal
-        // success or a confirmed NotFound can clear the observation failure.
-        if !result
-            .as_ref()
-            .err()
-            .and_then(std::io::Error::raw_os_error)
-            .is_some_and(|code| {
-                code == ERROR_ACCESS_DENIED as i32 || code == ERROR_DELETE_PENDING as i32
-            })
-        {
-            return result;
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return result;
-        }
-        std::thread::sleep(remaining.min(Duration::from_millis(5)));
-        if Instant::now() >= deadline {
-            return result;
+        // file is pending deletion. Reopen with identical access.
+        match open() {
+            Err(error)
+                if error.raw_os_error().is_some_and(|code| {
+                    code == ERROR_ACCESS_DENIED as i32 || code == ERROR_DELETE_PENDING as i32
+                }) && Instant::now() + pause < deadline =>
+            {
+                std::thread::sleep(pause);
+                if Instant::now() >= deadline {
+                    return Err(error);
+                }
+            }
+            result => return result,
         }
     }
 }
@@ -320,7 +310,7 @@ fn set_acl(
 
 struct Entry {
     path: PathBuf,
-    handle: OwnedHandle,
+    handle: Rc<OwnedHandle>,
     info: BY_HANDLE_FILE_INFORMATION,
 }
 
@@ -342,21 +332,35 @@ fn same_identity(a: &BY_HANDLE_FILE_INFORMATION, b: &BY_HANDLE_FILE_INFORMATION)
 }
 
 impl Entry {
-    fn acl_writer(&self, root: &Path) -> std::io::Result<OwnedHandle> {
+    fn reopen(&self, access: u32, share: u32) -> std::io::Result<OwnedHandle> {
+        let (handle, info) =
+            open_scratch_entry(&self.path, scratch_observation::METADATA | access, share)?;
+        if !same_identity(&self.info, &info) {
+            return Err(denied("staged scratch entry changed identity"));
+        }
+        Ok(handle)
+    }
+
+    fn transition(
+        &self,
+        grant: &ScratchGrant,
+        from: ScratchAcl,
+        to: ScratchAcl,
+        inherited: bool,
+    ) -> std::io::Result<()> {
         scratch_step(
-            root,
+            &grant.root,
             &self.path,
-            "open scratch entry for ACL update",
+            "update scratch ACL",
             (|| {
-                let (handle, info) = open_scratch_entry(
-                    &self.path,
-                    FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE,
-                )?;
-                if !same_identity(&self.info, &info) {
-                    return Err(denied("scratch ACL mutation target changed identity"));
-                }
-                Ok(handle)
+                let writer = self.reopen(WRITE_DAC, FILE_SHARE_READ | FILE_SHARE_WRITE)?;
+                verify_acl(writer.0, &grant.owner, from, inherited)?;
+                set_acl(
+                    writer.0,
+                    &grant.owner,
+                    to,
+                    self.info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0,
+                )
             })(),
         )
     }
@@ -364,14 +368,10 @@ impl Entry {
 
 impl ScratchGrant {
     pub(super) fn new(root: &Path, app: Option<PSID>) -> std::io::Result<Self> {
+        let owner = scratch_step(root, root, "query scratch owner", CurrentUser::new())?;
         let mut value = Self {
             root: root.to_owned(),
-            owner: scratch_step(
-                root,
-                root,
-                "query scratch owner identity",
-                CurrentUser::new(),
-            )?,
+            owner,
             // Without an AppContainer SID, only the owner's ACE inherits.
             // This keeps renderer-created files out of the token's default DACL.
             active_acl: ScratchAcl::Invocation(app),
@@ -382,165 +382,126 @@ impl ScratchGrant {
         // Validate the whole staged tree before changing any object.
         let entries = value.collect(false, None)?;
         for (granted, entry) in entries.iter().enumerate() {
-            let writer = entry.acl_writer(root)?;
-            scratch_step(
-                root,
-                &entry.path,
-                "verify private scratch ACL",
-                verify_acl(writer.0, &value.owner, ScratchAcl::Private, false),
-            )?;
-            if let Err(error) = scratch_step(
-                root,
-                &entry.path,
-                "apply invocation scratch ACL",
-                set_acl(
-                    writer.0,
-                    &value.owner,
-                    value.active_acl,
-                    entry.info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0,
-                ),
-            ) {
+            if let Err(error) =
+                entry.transition(&value, ScratchAcl::Private, value.active_acl, false)
+            {
                 for previous in entries.iter().take(granted) {
-                    let rollback = previous.acl_writer(root)?;
-                    scratch_step(
-                        root,
-                        &previous.path,
-                        "roll back invocation scratch ACL",
-                        (|| {
-                            verify_acl(rollback.0, &value.owner, value.active_acl, false)?;
-                            set_acl(rollback.0, &value.owner, ScratchAcl::Private, false)
-                        })(),
-                    )?;
+                    previous.transition(&value, value.active_acl, ScratchAcl::Private, false)?;
                 }
                 return Err(error);
             }
         }
         value.initial = entries;
+        if app.is_none() {
+            // The old pins remain until every staged identity has a fully
+            // shared, metadata-only replacement.
+            value.initial = value
+                .initial
+                .iter()
+                .map(|entry| {
+                    let handle = scratch_step(
+                        root,
+                        &entry.path,
+                        "retain shared scratch identity",
+                        entry.reopen(0, scratch_observation::SHARED),
+                    )?;
+                    Ok(Entry {
+                        path: entry.path.clone(),
+                        handle: Rc::new(handle),
+                        info: entry.info,
+                    })
+                })
+                .collect::<std::io::Result<Vec<_>>>()?;
+        }
         Ok(value)
     }
 
-    fn collect(&self, active: bool, live_until: Option<Instant>) -> std::io::Result<Vec<Entry>> {
-        fn visit(
-            value: &ScratchGrant,
-            path: &Path,
-            depth: usize,
-            active: bool,
-            result: &mut Vec<Entry>,
-            timing: (Instant, Option<Instant>),
-        ) -> std::io::Result<()> {
-            let (start, live_until) = timing;
-            let root = &value.root;
-            if depth > MAX_SCRATCH_SCAN_DEPTH
-                || result.len() > MAX_SCRATCH_SCAN_ENTRIES
-                || start.elapsed() > SCRATCH_SCAN_BUDGET
-            {
-                return Err(denied("scratch ACL scan exceeded its bound"));
-            }
-            let (handle, info) = scratch_step(
-                root,
-                path,
-                "open scratch entry for inspection",
-                retry_live_scratch_open(live_until, || {
-                    open_scratch_entry(
-                        path,
-                        FILE_READ_ATTRIBUTES | READ_CONTROL,
-                        FILE_SHARE_READ | FILE_SHARE_WRITE,
-                    )
-                }),
-            )?;
-            let directory = info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
-            let (handle, info) = if directory {
-                let (pin, pinned) = scratch_step(
-                    root,
-                    path,
-                    "pin scratch directory for inspection",
-                    retry_live_scratch_open(live_until, || {
-                        open_scratch_entry(
-                            path,
-                            FILE_READ_ATTRIBUTES | READ_CONTROL | FILE_LIST_DIRECTORY,
-                            FILE_SHARE_READ | FILE_SHARE_WRITE,
-                        )
-                    }),
-                )?;
-                if !same_identity(&info, &pinned) {
-                    return Err(denied("scratch directory changed identity before pinning"));
-                }
-                (pin, pinned)
-            } else {
-                (handle, info)
-            };
-            if !directory && info.nNumberOfLinks != 1 {
-                return Err(denied("scratch contains a multiply-linked file"));
-            }
-            let layout = if active {
-                value.active_acl
-            } else {
-                ScratchAcl::Private
-            };
+    fn collect(&self, active: bool, live: Option<(Instant, u64)>) -> std::io::Result<Vec<Entry>> {
+        use scratch_observation::{METADATA, ScanMode};
+        let budget = Instant::now() + SCRATCH_SCAN_BUDGET;
+        let (root, mode, deadline, max_bytes) = if let Some((deadline, max_bytes)) = live {
+            let root = self
+                .initial
+                .first()
+                .ok_or_else(|| denied("scratch has no staged root"))?;
+            (
+                Rc::clone(&root.handle),
+                ScanMode::LiveOffice,
+                deadline.min(budget),
+                max_bytes,
+            )
+        } else {
+            let (handle, _) =
+                open_scratch_entry(&self.root, METADATA, FILE_SHARE_READ | FILE_SHARE_WRITE)?;
+            (
+                Rc::new(handle),
+                ScanMode::Acl {
+                    allow_missing: active,
+                },
+                budget,
+                u64::MAX,
+            )
+        };
+        let layout = if active {
+            self.active_acl
+        } else {
+            ScratchAcl::Private
+        };
+        let mut entries = Vec::new();
+        let mut pending = self
+            .initial
+            .iter()
+            .map(|entry| (entry.path.as_path(), &entry.info))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        scratch_observation::observe(root, mode, deadline, max_bytes, |handle, info, relative| {
+            let path = self.root.join(relative);
+            let original = pending.remove(path.as_path());
             scratch_step(
-                root,
-                path,
-                "verify scratch entry ACL",
-                verify_acl(handle.0, &value.owner, layout, active),
-            )?;
-            result.push(Entry {
-                path: path.to_owned(),
-                handle,
-                info,
-            });
-            if directory {
-                for entry in scratch_step(
-                    root,
-                    path,
-                    "enumerate scratch directory",
-                    std::fs::read_dir(path),
-                )? {
-                    let child =
-                        scratch_step(root, path, "read scratch directory entry", entry)?.path();
-                    match visit(value, &child, depth + 1, active, result, timing) {
-                        Err(error) if active && error.kind() == std::io::ErrorKind::NotFound => {}
-                        other => other?,
+                &self.root,
+                &path,
+                "verify scratch entry ACL and identity",
+                (|| {
+                    if original.is_some_and(|old| !same_identity(old, info)) {
+                        return Err(denied("staged scratch entry changed identity"));
                     }
-                }
+                    if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
+                        && info.nNumberOfLinks != 1
+                    {
+                        return Err(denied("scratch contains a multiply-linked file"));
+                    }
+                    verify_acl(handle.0, &self.owner, layout, active && original.is_none())
+                })(),
+            )?;
+            if live.is_none() {
+                entries.push(Entry {
+                    path,
+                    handle: Rc::clone(handle),
+                    info: *info,
+                });
             }
             Ok(())
-        }
-        let mut entries = Vec::new();
-        let start = Instant::now();
-        let live_until = live_until.map(|deadline| deadline.min(start + SCRATCH_SCAN_BUDGET));
-        visit(
-            self,
-            &self.root,
-            0,
-            active,
-            &mut entries,
-            (start, live_until),
-        )?;
-        for original in &self.initial {
-            let Some(current) = entries.iter().find(|entry| entry.path == original.path) else {
-                return Err(denied("staged scratch entry disappeared"));
-            };
-            if !same_identity(&original.info, &current.info) {
-                return Err(denied("staged scratch entry changed identity"));
-            }
-            if active {
-                // Pre-staged objects must retain their protected DACL; only
-                // newly generated descendants may still carry inherited ACEs.
-                scratch_step(
-                    &self.root,
-                    &current.path,
-                    "verify staged scratch entry ACL",
-                    verify_acl(current.handle.0, &self.owner, self.active_acl, false),
-                )?;
-            }
+        })?;
+        if let Some(path) = pending.keys().next() {
+            return scratch_step(
+                &self.root,
+                path,
+                "verify staged scratch entry",
+                Err(denied("staged scratch entry disappeared")),
+            );
         }
         Ok(entries)
     }
 
-    pub(super) fn verify_active(&self, deadline: Instant) -> std::io::Result<()> {
-        let live_until =
-            matches!(self.active_acl, ScratchAcl::Invocation(None)).then_some(deadline);
-        self.collect(true, live_until).map(|_| ())
+    pub(super) fn verify_active(&self) -> std::io::Result<()> {
+        self.collect(true, None).map(|_| ())
+    }
+
+    pub(super) fn observe_office_live(
+        &self,
+        deadline: Instant,
+        max_bytes: u64,
+    ) -> std::io::Result<()> {
+        self.collect(true, Some((deadline, max_bytes))).map(|_| ())
     }
 
     pub(super) fn retire(&mut self) -> std::io::Result<()> {
@@ -553,19 +514,9 @@ impl ScratchGrant {
             ));
         }
         let entries = self.collect(true, None)?;
-        // Every entry is pinned while all grants are retired; reverse order
-        // prevents parent ACL changes from altering unprocessed descendants.
+        // Retire child ACLs first to avoid altering unprocessed descendants.
         for entry in entries.iter().rev() {
-            let writer = entry.acl_writer(&self.root)?;
-            scratch_step(
-                &self.root,
-                &entry.path,
-                "restore private scratch ACL",
-                (|| {
-                    verify_acl(writer.0, &self.owner, self.active_acl, true)?;
-                    set_acl(writer.0, &self.owner, ScratchAcl::Private, false)
-                })(),
-            )?;
+            entry.transition(self, self.active_acl, ScratchAcl::Private, true)?;
         }
         self.retired = true;
         Ok(())
