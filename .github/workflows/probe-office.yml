@@ -118,12 +118,17 @@ jobs:
           }
           "KIO_OFFICE_CONVERTER=$converter" | Add-Content -LiteralPath $env:GITHUB_ENV
           "$(Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash" | Out-File -LiteralPath "$env:RUNNER_TEMP\kio-v1-provisioning.txt" -Encoding utf8
-          # soffice.exe --version does not return on a headless runner; record the signed file version instead.
-          (Get-Item -LiteralPath $converter).VersionInfo.ProductVersion | Add-Content -LiteralPath "$env:RUNNER_TEMP\kio-v1-provisioning.txt" -Encoding utf8
-          foreach ($exe in @('soffice.com','soffice.exe')) {
-            $path = Join-Path (Split-Path $converter) $exe; $out = Join-Path $env:RUNNER_TEMP "$exe-version.txt"
-            $t = Get-Date; $p = Start-Process -FilePath $path -ArgumentList '--version' -PassThru -NoNewWindow -RedirectStandardOutput $out
-            if ($p.WaitForExit(60000)) { "$exe --version exit $($p.ExitCode) in $([int]((Get-Date)-$t).TotalSeconds)s: $(Get-Content -LiteralPath $out -Raw)" } else { "$exe --version HUNG 60s"; $p.Kill($true) }
+          $versionProgram = Join-Path (Split-Path $converter) 'soffice.com'
+          $versionOutput = Join-Path $env:RUNNER_TEMP 'kio-v1-office-version.txt'
+          $version = Start-Process -FilePath $versionProgram -ArgumentList '--version' -PassThru -NoNewWindow -RedirectStandardOutput $versionOutput
+          try {
+            if (-not $version.WaitForExit(60000)) {
+              $version.Kill($true)
+              throw 'LibreOffice soffice.com --version did not finish within 60 seconds'
+            }
+            if ($version.ExitCode -ne 0) { throw "LibreOffice soffice.com --version exited with $($version.ExitCode)" }
+          } finally {
+            Get-Content -LiteralPath $versionOutput | Add-Content -LiteralPath "$env:RUNNER_TEMP\kio-v1-provisioning.txt" -Encoding utf8
           }
 
       - name: Prefetch pinned LiteRT-LM
@@ -138,13 +143,15 @@ jobs:
           work="$(mktemp -d "$RUNNER_TEMP/kio-office-probe.XXXXXXXX")"
           bin="$PWD/target/release/kio"
           extra=()
+          mkdir_mode=(-m 700)
           if [[ "$RUNNER_OS" == Windows ]]; then
+            mkdir_mode=()
             work="$(cygpath -am "$work")"
             bin="${bin}.exe"
             extra=(APPDATA="$work/cfg" LOCALAPPDATA="$work/data" USERPROFILE="$work/home"
                    TEMP="$work/tmp" TMP="$work/tmp" SystemRoot="$SYSTEMROOT")
           fi
-          mkdir -m 700 "$work"/{home,cfg,data,cache,tmp,scope}
+          mkdir ${mkdir_mode[@]+"${mkdir_mode[@]}"} "$work"/{home,cfg,data,cache,tmp,scope}
           cp crates/kio-eval/acceptance-fixtures/v1/office-public/{document.docx,presentation.pptx} "$work/scope/"
           run_cleared() {
             env -i HOME="$work/home" XDG_CONFIG_HOME="$work/cfg" XDG_DATA_HOME="$work/data" \

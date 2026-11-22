@@ -5,6 +5,7 @@
 //! ambient environment.  A passing preflight is not an acceptance receipt.
 
 use std::{
+    borrow::Cow,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -118,7 +119,8 @@ pub fn run(options: &PreflightOptions) -> Result<PreflightOutcome, PreflightErro
                 resolved: display_path(&resolved)?,
                 sha256,
             });
-            let check = command_record(&resolved, &["--version"]);
+            let program = office_version_program(&resolved, cfg!(windows));
+            let check = command_record(&program, &["--version"]);
             require(
                 &check,
                 "Office converter did not run successfully",
@@ -146,6 +148,15 @@ fn host_matches(runner_os: NativeOs) -> bool {
         (runner_os, std::env::consts::OS),
         (NativeOs::Linux, "linux") | (NativeOs::Macos, "macos") | (NativeOs::Windows, "windows")
     )
+}
+
+pub(crate) fn office_version_program(converter: &Path, windows: bool) -> Cow<'_, Path> {
+    // LibreOffice's Windows console launcher returns the version on stdout.
+    if windows {
+        Cow::Owned(converter.with_file_name("soffice.com"))
+    } else {
+        Cow::Borrowed(converter)
+    }
 }
 
 fn validated_converter(path: &Path) -> Result<(String, PathBuf, String), PreflightError> {
@@ -182,8 +193,8 @@ fn is_executable(metadata: &fs::Metadata) -> bool {
 
 #[cfg(not(unix))]
 fn is_executable(_metadata: &fs::Metadata) -> bool {
-    // Windows has no executable permission bit.  The bounded `--version`
-    // invocation is the authoritative executable check on that platform.
+    // Windows has no executable permission bit. A07 exercises the bound
+    // executable itself through the product's renderer validation.
     true
 }
 
@@ -376,7 +387,9 @@ fn write_create_only(path: &Path, report: &PreflightReport) -> Result<(), Prefli
 
 #[cfg(test)]
 mod tests {
-    use super::host_matches;
+    use std::path::Path;
+
+    use super::{host_matches, office_version_program};
     use crate::acceptance::NativeOs;
 
     #[test]
@@ -388,5 +401,20 @@ mod tests {
             _ => return,
         };
         assert!(host_matches(expected));
+    }
+
+    #[test]
+    fn office_version_uses_the_sibling_console_launcher_on_windows() {
+        let program_dir = Path::new("LibreOffice").join("program");
+        let converter = program_dir.join("soffice.exe");
+        assert_eq!(
+            office_version_program(&converter, true).as_ref(),
+            program_dir.join("soffice.com")
+        );
+        let converter = program_dir.join("soffice");
+        assert_eq!(
+            office_version_program(&converter, false).as_ref(),
+            converter
+        );
     }
 }
