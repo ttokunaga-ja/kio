@@ -135,18 +135,25 @@ jobs:
         run: |
           set -euo pipefail
           binary="$PWD/target/release/kio.exe"
-          work="$(mktemp -d "$RUNNER_TEMP/kio-office-readiness.XXXXXXXX")"
-          work="$(cygpath -am "$work")"
-          mkdir "$work"/{scope,home,cfg,data,cache,tmp}
           run_kio() {
             env -i SystemRoot="$SYSTEMROOT" KIO_OFFICE_CONVERTER="$KIO_OFFICE_CONVERTER" \
               HOME="$work/home" USERPROFILE="$work/home" APPDATA="$work/cfg" LOCALAPPDATA="$work/data" \
               XDG_CONFIG_HOME="$work/cfg" XDG_DATA_HOME="$work/data" XDG_CACHE_HOME="$work/cache" \
               TEMP="$work/tmp" TMP="$work/tmp" TMPDIR="$work/tmp" "$binary" "$@"
           }
-          cd "$work/scope"
-          run_kio --json init "$work/scope" >/dev/null
-          TIMEFORMAT='elapsed_seconds=%3R'
-          time run_kio --json status > "$work/status.json"
-          jq -ce 'if has("scope_path") then .office_readiness // {state: "ready"} else error("missing status scope") end' "$work/status.json"
-          jq -e '.office_readiness == null' "$work/status.json" >/dev/null
+          failed=0
+          for attempt in 1 2 3; do
+            printf 'readiness_attempt=%s\n' "$attempt"
+            (
+              work="$(mktemp -d "$RUNNER_TEMP/kio-office-readiness.XXXXXXXX")" || exit 1
+              work="$(cygpath -am "$work")" || exit 1
+              mkdir "$work"/{scope,home,cfg,data,cache,tmp} || exit 1
+              cd "$work/scope" || exit 1
+              run_kio --json init "$work/scope" >/dev/null || exit 1
+              TIMEFORMAT='elapsed_seconds=%3R'
+              time run_kio --json status > "$work/status.json" || exit 1
+              jq -ce 'if has("scope_path") then .office_readiness // {state: "ready"} else error("missing status scope") end' "$work/status.json" || exit 1
+              jq -e '.office_readiness == null' "$work/status.json" >/dev/null
+            ) || failed=1
+          done
+          exit "$failed"
