@@ -522,9 +522,36 @@ pub(crate) fn file_url(path: &Path) -> Result<String> {
     let text = path.to_str().ok_or_else(|| {
         AdapterError::ContractViolation("office scratch path is not valid Unicode".to_owned())
     })?;
+    let unsupported = || {
+        AdapterError::ContractViolation(
+            "Windows Office profile path must have a safe absolute drive spelling".to_owned(),
+        )
+    };
+    // LibreOffice expects a drive-rooted file URL. The verbatim namespace is
+    // only for the host's Windows filesystem operations.
+    let drive_path = if let Some(plain) = text.strip_prefix(r"\\?\") {
+        if plain.contains('/') {
+            return Err(unsupported());
+        }
+        plain
+    } else {
+        text
+    };
+    let normalized = drive_path.replace('\\', "/");
+    if !matches!(normalized.as_bytes(), [drive, b':', b'/', ..] if drive.is_ascii_alphabetic()) {
+        return Err(unsupported());
+    }
+    let relative = &normalized[3..];
+    if !relative.is_empty()
+        && relative
+            .split('/')
+            .any(|leaf| kio_core::portable::portable_leaf_error(leaf).is_some())
+    {
+        return Err(unsupported());
+    }
     Ok(format!(
         "file:///{}",
-        crate::office_convert::encode_file_url_path(&text.replace('\\', "/"))
+        crate::office_convert::encode_file_url_path(&normalized)
     ))
 }
 
@@ -565,6 +592,56 @@ pub(crate) fn office_package_launch_roots(roots: &[PathBuf]) -> &[PathBuf] {
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_url_percent_encodes_drive_paths_without_the_verbatim_prefix() {
+        for path in [
+            r"C:\private\kio office#%研究.profile",
+            r"\\?\C:\private\kio office#%研究.profile",
+            "C:/private/kio office#%研究.profile",
+        ] {
+            assert_eq!(
+                file_url(Path::new(path)).unwrap(),
+                "file:///C:/private/kio%20office%23%25%E7%A0%94%E7%A9%B6.profile",
+                "{path:?}",
+            );
+        }
+        assert_eq!(file_url(Path::new(r"\\?\D:\")).unwrap(), "file:///D:/");
+    }
+
+    #[test]
+    fn file_url_rejects_paths_without_a_safe_absolute_drive_spelling() {
+        use std::os::windows::ffi::OsStringExt as _;
+
+        for path in [
+            r"\\?\UNC\host\share\profile",
+            r"\\host\share\profile",
+            r"\\?\Volume{00000000-0000-0000-0000-000000000000}\profile",
+            r"\\.\C:\profile",
+            r"C:profile",
+            r"\profile",
+            "profile",
+            r"\\?\C:\parent.\profile",
+            r"\\?\C:\parent \profile",
+            r"\\?\C:\CON.txt\profile",
+            r"\\?\C:\parent\..\profile",
+            r"\\?\C:\profile:ads",
+            r"\\?\C:\parent/profile",
+        ] {
+            assert!(
+                matches!(
+                    file_url(Path::new(path)),
+                    Err(AdapterError::ContractViolation(_))
+                ),
+                "{path:?}",
+            );
+        }
+        let invalid_unicode = OsString::from_wide(&[67, 58, 92, 0xd800]);
+        assert!(matches!(
+            file_url(Path::new(&invalid_unicode)),
+            Err(AdapterError::ContractViolation(_)),
+        ));
+    }
 
     #[test]
     fn output_failure_names_the_exit_status_and_both_scratch_levels() {
