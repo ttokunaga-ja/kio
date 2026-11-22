@@ -493,8 +493,7 @@ pub(crate) fn finish_scratch(scratch: PrivateOfficeScratch) -> Result<()> {
 }
 
 pub(crate) fn office_package_launch_roots(roots: &[PathBuf]) -> &[PathBuf] {
-    // The launcher checks these roots exist. The AppContainer still
-    // depends on the package's pre-existing ACLs.
+    // Bind the installed package as part of the verified renderer runtime.
     roots
 }
 

@@ -307,3 +307,11 @@
 - **理由**：利用者の決定。固定した公式 LibreOffice 26.8.0.3 の Windows 配布物で、`program/intl/fbintl.dll` と Python の pip・setuptools 用 launcher stub 14 個に署名がなかった（CI run 44966483976 の調査）。いずれも Windows が既定で DLL を探す実行ファイルのディレクトリ `program/` の直下にない。[Windows の DLL 検索順序](https://learn.microsoft.com/en-us/windows/win32/dlls/dynamic-link-library-search-order)
 - **保護と残るリスク**：実行ファイルの digest と配置全体の identity snapshot、変換直前の再確認、reparse point と複数 hard link の拒否、AppContainer、ローカル情報による信頼判定を維持する。publisher 名による許可リストは設けない。署名なしで許容した PE image の配布元や snapshot 採取前の内容は署名で保証できず、Office が明示したパスから読み込む場合もある。
 - **関係する資料**：[Adapter 仕様 §5.1](07-adapter-spec.md#51-prepare)、`crates/kio-adapter/src/platform/windows/office.rs`。
+
+### D-20261122-02 Windows Office renderer を Job で制限する
+
+- **内容**：D-20261122-01 の AppContainer に関する判断を更新する。利用者の承認により、Windows Office の readiness probe、version 照会、実変換は AppContainer を使わず、専用 Job で起動する。Linux・macOS とその他の Windows 呼出し元には既存の隔離を適用する。
+- **理由**：固定版 LibreOffice 26.8.0.3 は単一インスタンス IPC の名前を `\\.\pipe\OSL_PIPE_…` に固定しており、AppContainer 向けの `\\.\pipe\LOCAL\` を使わない。IPC を開始できないと 10 ms 間隔で再試行を続ける。run 45013605420 では親子が profile 初期化後も PDF を生成せず締切まで残った。run 45015126905 では 20 秒と 40 秒の本体ダンプの同一スレッドで 10 ms の相対待機を確認した。［[LibreOffice のパイプ実装](https://github.com/LibreOffice/core/blob/libreoffice-26.8.0.3/sal/osl/w32/pipe.cxx#L31-L35)・[IPC の再試行](https://github.com/LibreOffice/core/blob/libreoffice-26.8.0.3/desktop/source/app/officeipcthread.cxx#L702-L734)］
+- **保護と残るリスク**：プロセス数・メモリ・CPU 時間・Job close 時の終了、`CREATE_NO_WINDOW`、時間と出力を制限した I/O、呼出しごとの private profile と scratch、実行ファイルの同一性・digest・D-20261122-01 の署名検証を維持する。Office は呼出し元ユーザーの権限でファイル、レジストリ、IPC、ネットワークにアクセスできる。Job はそれらのアクセスを制限しない。
+- **v1 後の対応**：許可を限定したホスト側のパイプ仲介、または LibreOffice 上流での AppContainer 対応を検討し、AppContainer を復元する。
+- **関係する資料**：[Adapter 仕様 §5.1](07-adapter-spec.md#51-prepare)、[運用 §4.3](10-operations.md#43-kio-created-object-boundary)。

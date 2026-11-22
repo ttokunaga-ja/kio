@@ -1,10 +1,10 @@
-//! Windows AppContainer launcher for [`RenderSandbox`](crate::confinement::RenderSandbox).
+//! Windows renderer launcher for [`RenderSandbox`](crate::confinement::RenderSandbox).
 //!
 //! This intentionally does not use `std::process::Command`: stable Rust cannot
-//! attach `SECURITY_CAPABILITIES` to `STARTUPINFOEXW`.  The renderer receives an
-//! AppContainer token with *zero* capabilities (in particular no internet or
-//! private-network capability), an explicit environment, and only the three
-//! standard handles in its inherited-handle list.
+//! set the AppContainer and explicit handle-list attributes on
+//! `STARTUPINFOEXW`. All renderers use a Job, an explicit environment, and
+//! only inherit the three standard handles. The default is a zero-capability
+//! AppContainer. Windows Office selects the Job without AppContainer.
 
 use std::{
     ffi::{OsStr, OsString},
@@ -84,6 +84,13 @@ pub(crate) struct NativeRenderSandbox {
     scratch: PathBuf,
     runtime_roots: Vec<PathBuf>,
     limits: RenderResourceLimits,
+    access: RendererAccess,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RendererAccess {
+    AppContainer,
+    OfficeJobOnly,
 }
 
 impl NativeRenderSandbox {
@@ -106,8 +113,15 @@ impl NativeRenderSandbox {
             scratch,
             runtime_roots: roots.into_iter().collect(),
             limits,
+            access: RendererAccess::AppContainer,
         }
     }
+
+    pub(crate) fn with_office_job_only(mut self) -> Self {
+        self.access = RendererAccess::OfficeJobOnly;
+        self
+    }
+
     pub(crate) fn run<I, S>(
         &self,
         args: I,
@@ -261,9 +275,7 @@ pub fn protect_owner_private_scratch(path: &Path) -> Result<(), ConfinementError
     Ok(())
 }
 
-/// Launch through `CreateProcessW` with a new AppContainer profile.  The
-/// profile's zero capability count is deliberate: adding internetClient or
-/// privateNetworkClientServer would turn network access back on.
+/// Launch suspended, configure the Job and scratch authority, then resume.
 pub(crate) fn run_windows_renderer<I, S>(
     sandbox: &NativeRenderSandbox,
     args: I,
@@ -281,19 +293,21 @@ where
     };
     let deadline = timing.deadline;
     start.remaining()?;
-    let profile = AppContainerProfile::create()?;
-    let mut grant = grant_scratch_access(sandbox.scratch(), profile.sid)?;
+    let profile = match sandbox.access {
+        RendererAccess::AppContainer => Some(AppContainerProfile::create()?),
+        RendererAccess::OfficeJobOnly => None,
+    };
+    let app_sid = profile.as_ref().map(|profile| profile.sid);
+    let mut grant = grant_scratch_access(sandbox.scratch(), app_sid)?;
     let result = (|| {
-        // We never relax ACLs on a renderer installation. A package must already
-        // be executable/readable by AppContainers (normally through the Windows
-        // All Application Packages ACE); otherwise CreateProcessW fails closed.
+        // The install must already be readable/executable by the selected token.
         for root in sandbox.runtime_roots() {
             verify_runtime_root(root)?;
         }
 
         let mut pipes = Pipes::new()?;
         let job = Job::new(sandbox.limits())?;
-        let attributes = Attributes::new(profile.sid, pipes.child_handles())?;
+        let attributes = Attributes::new(app_sid, pipes.child_handles())?;
         let application = wide(sandbox.program().as_os_str());
         let mut command_line = windows_command_line(sandbox.program().as_os_str(), args);
         let environment = environment_block(environment)?;
@@ -349,7 +363,7 @@ where
         // All failures after assignment go through whole-Job cleanup, including
         // resume, pipe setup, wait/accounting, output, and scratch failures.
         let result = (|| {
-            child_token::prepare_suspended_renderer_token(primary.0, profile.sid)
+            child_token::prepare_suspended_renderer_token(primary.0, app_sid)
                 .map_err(ConfinementError::Profile)?;
             start.verify()?;
             resume(thread.0).map_err(ConfinementError::Resource)?;
@@ -897,19 +911,20 @@ struct Attributes {
     list: windows_sys::Win32::System::Threading::LPPROC_THREAD_ATTRIBUTE_LIST,
     #[allow(dead_code)]
     memory: Box<[usize]>,
-    security: Box<SECURITY_CAPABILITIES>,
+    security: Option<Box<SECURITY_CAPABILITIES>>,
     handles: Box<[HANDLE; 3]>,
 }
 impl Attributes {
-    fn new(sid: PSID, handles: [HANDLE; 3]) -> Result<Box<Self>, ConfinementError> {
+    fn new(app_sid: Option<PSID>, handles: [HANDLE; 3]) -> Result<Box<Self>, ConfinementError> {
+        let count = 1 + u32::from(app_sid.is_some());
         let mut size = 0;
         unsafe {
-            InitializeProcThreadAttributeList(std::ptr::null_mut(), 2, 0, &mut size);
+            InitializeProcThreadAttributeList(std::ptr::null_mut(), count, 0, &mut size);
         }
         let words = size.div_ceil(std::mem::size_of::<usize>());
         let mut memory = vec![0_usize; words].into_boxed_slice();
         let list = memory.as_mut_ptr().cast();
-        if unsafe { InitializeProcThreadAttributeList(list, 2, 0, &mut size) } == 0 {
+        if unsafe { InitializeProcThreadAttributeList(list, count, 0, &mut size) } == 0 {
             return Err(ConfinementError::Profile(std::io::Error::last_os_error()));
         }
         // Attribute values must outlive CreateProcessW. Keep this allocation
@@ -918,40 +933,43 @@ impl Attributes {
         let mut attributes = Box::new(Self {
             list,
             memory,
-            security: Box::new(SECURITY_CAPABILITIES {
-                AppContainerSid: sid,
-                Capabilities: std::ptr::null_mut(),
-                CapabilityCount: 0,
-                Reserved: 0,
+            security: app_sid.map(|sid| {
+                Box::new(SECURITY_CAPABILITIES {
+                    AppContainerSid: sid,
+                    Capabilities: std::ptr::null_mut(),
+                    CapabilityCount: 0,
+                    Reserved: 0,
+                })
             }),
             handles: Box::new(handles),
         });
+        if let Some(security) = attributes.security.as_deref_mut()
+            && unsafe {
+                UpdateProcThreadAttribute(
+                    attributes.list,
+                    0,
+                    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
+                    (security as *mut SECURITY_CAPABILITIES).cast(),
+                    std::mem::size_of::<SECURITY_CAPABILITIES>(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            } == 0
+        {
+            return Err(ConfinementError::Profile(std::io::Error::last_os_error()));
+        }
         if unsafe {
             UpdateProcThreadAttribute(
                 attributes.list,
                 0,
-                PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
-                (&raw mut *attributes.security).cast(),
-                std::mem::size_of_val(&*attributes.security),
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                attributes.handles.as_ptr().cast(),
+                std::mem::size_of_val(&*attributes.handles),
                 std::ptr::null_mut(),
-                std::ptr::null(),
+                std::ptr::null_mut(),
             )
         } == 0
-            || unsafe {
-                UpdateProcThreadAttribute(
-                    attributes.list,
-                    0,
-                    PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
-                    attributes.handles.as_ptr().cast(),
-                    std::mem::size_of_val(&*attributes.handles),
-                    std::ptr::null_mut(),
-                    std::ptr::null(),
-                )
-            } == 0
         {
-            unsafe {
-                DeleteProcThreadAttributeList(attributes.list);
-            }
             return Err(ConfinementError::Profile(std::io::Error::last_os_error()));
         }
         Ok(attributes)
@@ -1070,7 +1088,10 @@ impl Drop for Pipes {
     }
 }
 
-fn grant_scratch_access(path: &Path, app_sid: PSID) -> Result<ScratchGrant, ConfinementError> {
+fn grant_scratch_access(
+    path: &Path,
+    app_sid: Option<PSID>,
+) -> Result<ScratchGrant, ConfinementError> {
     ScratchGrant::new(path, app_sid).map_err(ConfinementError::Profile)
 }
 
@@ -1711,9 +1732,9 @@ mod scratch_invocation_grant_tests {
         protect_owner_private_scratch(&scratch).unwrap();
         let first = AppContainerProfile::create().unwrap();
         let second = AppContainerProfile::create().unwrap();
-        let _grant = grant_scratch_access(&scratch, first.sid).unwrap();
+        let _grant = grant_scratch_access(&scratch, Some(first.sid)).unwrap();
         assert!(
-            grant_scratch_access(&scratch, second.sid).is_err(),
+            grant_scratch_access(&scratch, Some(second.sid)).is_err(),
             "a fresh invocation must not accept or preserve another invocation SID"
         );
         assert!(!contains_sid(&scratch, second.sid));
@@ -1727,7 +1748,7 @@ mod scratch_invocation_grant_tests {
         assert!(create_current_user_fixture(&child, true).is_none());
         protect_owner_private_scratch(&child).unwrap();
         let profile = AppContainerProfile::create().unwrap();
-        let _grant = grant_scratch_access(&scratch, profile.sid).unwrap();
+        let _grant = grant_scratch_access(&scratch, Some(profile.sid)).unwrap();
         assert!(
             contains_sid(&child, profile.sid),
             "root inheritance cannot grant access through a protected child DACL"
@@ -1741,7 +1762,7 @@ mod scratch_invocation_grant_tests {
         assert!(create_current_user_fixture(&child, true).is_none());
         protect_owner_private_scratch(&child).unwrap();
         let profile = AppContainerProfile::create().unwrap();
-        let mut grant = grant_scratch_access(&scratch, profile.sid).unwrap();
+        let mut grant = grant_scratch_access(&scratch, Some(profile.sid)).unwrap();
         assert_eq!(
             access_for_sid(&child, profile.sid),
             Some(
@@ -1767,7 +1788,7 @@ mod scratch_invocation_grant_tests {
         assert!(!contains_sid(&child, profile.sid));
         assert!(!contains_sid(&generated, profile.sid));
         let other = AppContainerProfile::create().unwrap();
-        let _next = grant_scratch_access(&scratch, other.sid).unwrap();
+        let _next = grant_scratch_access(&scratch, Some(other.sid)).unwrap();
     }
     #[test]
     fn scratch_acl_observation_allows_an_exclusively_open_renderer_output() {
@@ -1775,7 +1796,7 @@ mod scratch_invocation_grant_tests {
         let (_holder, scratch) = current_user_scratch();
         protect_owner_private_scratch(&scratch).unwrap();
         let profile = AppContainerProfile::create().unwrap();
-        let mut grant = grant_scratch_access(&scratch, profile.sid).unwrap();
+        let mut grant = grant_scratch_access(&scratch, Some(profile.sid)).unwrap();
         let generated = scratch.join("exclusive-output.pdf");
         drop(create_current_user_fixture(&generated, false).unwrap());
         assert!(
@@ -1796,7 +1817,7 @@ mod scratch_invocation_grant_tests {
         grant.retire().unwrap();
         assert!(!contains_sid(&generated, profile.sid));
         let next = AppContainerProfile::create().unwrap();
-        let _next_grant = grant_scratch_access(&scratch, next.sid)
+        let _next_grant = grant_scratch_access(&scratch, Some(next.sid))
             .expect("closed output and entire retired tree must be protected owner-only");
     }
 }

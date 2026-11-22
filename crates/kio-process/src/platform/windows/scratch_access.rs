@@ -9,6 +9,21 @@ use windows_sys::Win32::Storage::FileSystem::WRITE_OWNER;
 
 const APP_ACCESS: u32 = FILE_ALL_ACCESS & !(WRITE_DAC | WRITE_OWNER);
 
+#[derive(Clone, Copy)]
+enum ScratchAcl {
+    Private,
+    Invocation(Option<PSID>),
+}
+
+impl ScratchAcl {
+    fn app(self) -> Option<PSID> {
+        match self {
+            Self::Private => None,
+            Self::Invocation(app) => app,
+        }
+    }
+}
+
 fn denied(message: &'static str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::PermissionDenied, message)
 }
@@ -98,16 +113,17 @@ pub(super) fn protect_empty(handle: HANDLE) -> std::io::Result<()> {
         LocalFree(value);
     }
     result?;
-    set_acl(handle, &owner, None, false)
+    set_acl(handle, &owner, ScratchAcl::Private, false)
 }
 
 fn verify_acl(
     handle: HANDLE,
     owner: &CurrentUser,
-    app: Option<PSID>,
+    layout: ScratchAcl,
     inherited: bool,
 ) -> std::io::Result<()> {
     use windows_sys::Win32::Security::GetSecurityDescriptorDacl;
+    let app = layout.app();
     let value = descriptor(handle)?;
     let result = (|| {
         verify_owner(value, owner)?;
@@ -144,7 +160,7 @@ fn verify_acl(
                 || usize::from(header.AceSize) < offset + 8
                 || u32::from(header.AceFlags) & !(OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE | 0x10)
                     != 0
-                || (app.is_none() && header.AceFlags != 0)
+                || (matches!(layout, ScratchAcl::Private) && header.AceFlags != 0)
             {
                 return Err(denied("unsupported scratch ACE"));
             }
@@ -188,10 +204,11 @@ fn verify_acl(
 fn set_acl(
     handle: HANDLE,
     owner: &CurrentUser,
-    app: Option<PSID>,
+    layout: ScratchAcl,
     directory: bool,
 ) -> std::io::Result<()> {
-    let flags = if app.is_some() && directory {
+    let app = layout.app();
+    let flags = if matches!(layout, ScratchAcl::Invocation(_)) && directory {
         OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
     } else {
         0
@@ -241,7 +258,7 @@ fn set_acl(
     if code != 0 {
         return Err(std::io::Error::from_raw_os_error(code as i32));
     }
-    verify_acl(handle, owner, app, false)
+    verify_acl(handle, owner, layout, false)
 }
 
 struct Entry {
@@ -253,7 +270,7 @@ struct Entry {
 pub(super) struct ScratchGrant {
     root: PathBuf,
     owner: CurrentUser,
-    app: PSID,
+    active_acl: ScratchAcl,
     initial: Vec<Entry>,
     pub(super) stopped: bool,
     retired: bool,
@@ -282,11 +299,13 @@ impl Entry {
 }
 
 impl ScratchGrant {
-    pub(super) fn new(root: &Path, app: PSID) -> std::io::Result<Self> {
+    pub(super) fn new(root: &Path, app: Option<PSID>) -> std::io::Result<Self> {
         let mut value = Self {
             root: root.to_owned(),
             owner: CurrentUser::new()?,
-            app,
+            // Without an AppContainer SID, only the owner's ACE inherits.
+            // This keeps renderer-created files out of the token's default DACL.
+            active_acl: ScratchAcl::Invocation(app),
             initial: Vec::new(),
             stopped: true,
             retired: false,
@@ -295,17 +314,17 @@ impl ScratchGrant {
         let entries = value.collect(false)?;
         for (granted, entry) in entries.iter().enumerate() {
             let writer = entry.acl_writer()?;
-            verify_acl(writer.0, &value.owner, None, false)?;
+            verify_acl(writer.0, &value.owner, ScratchAcl::Private, false)?;
             if let Err(error) = set_acl(
                 writer.0,
                 &value.owner,
-                Some(app),
+                value.active_acl,
                 entry.info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0,
             ) {
                 for previous in entries.iter().take(granted) {
                     let rollback = previous.acl_writer()?;
-                    verify_acl(rollback.0, &value.owner, Some(app), false)?;
-                    set_acl(rollback.0, &value.owner, None, false)?;
+                    verify_acl(rollback.0, &value.owner, value.active_acl, false)?;
+                    set_acl(rollback.0, &value.owner, ScratchAcl::Private, false)?;
                 }
                 return Err(error);
             }
@@ -351,7 +370,12 @@ impl ScratchGrant {
             if !directory && info.nNumberOfLinks != 1 {
                 return Err(denied("scratch contains a multiply-linked file"));
             }
-            verify_acl(handle.0, &value.owner, active.then_some(value.app), active)?;
+            let layout = if active {
+                value.active_acl
+            } else {
+                ScratchAcl::Private
+            };
+            verify_acl(handle.0, &value.owner, layout, active)?;
             result.push(Entry {
                 path: path.to_owned(),
                 handle,
@@ -379,7 +403,7 @@ impl ScratchGrant {
             if active {
                 // Pre-staged objects must retain their protected DACL; only
                 // newly generated descendants may still carry inherited ACEs.
-                verify_acl(current.handle.0, &self.owner, Some(self.app), false)?;
+                verify_acl(current.handle.0, &self.owner, self.active_acl, false)?;
             }
         }
         Ok(entries)
@@ -403,8 +427,8 @@ impl ScratchGrant {
         // prevents parent ACL changes from altering unprocessed descendants.
         for entry in entries.iter().rev() {
             let writer = entry.acl_writer()?;
-            verify_acl(writer.0, &self.owner, Some(self.app), true)?;
-            set_acl(writer.0, &self.owner, None, false)?;
+            verify_acl(writer.0, &self.owner, self.active_acl, true)?;
+            set_acl(writer.0, &self.owner, ScratchAcl::Private, false)?;
         }
         self.retired = true;
         Ok(())
