@@ -65,7 +65,9 @@ use windows_sys::Win32::{
     },
 };
 
-use crate::confinement::{ConfinementError, RenderResourceLimits, RenderSources, RendererStart};
+use crate::confinement::{
+    ConfinementError, RenderResourceLimits, RenderSandbox, RenderSources, RendererStart,
+};
 use crate::{BoundedProcessError, BoundedProcessOptions, BoundedProcessOutput};
 use std::collections::BTreeSet;
 
@@ -93,6 +95,20 @@ enum RendererAccess {
     OfficeJobOnly,
 }
 
+impl RenderSandbox {
+    /// Windows Office only (D-20261122-02). A Job bounds the process tree and
+    /// its resource use. Office runs with the invoking user's OS access.
+    pub fn for_windows_office(
+        sources: &RenderSources,
+        scratch: &Path,
+        limits: RenderResourceLimits,
+    ) -> Result<Self, ConfinementError> {
+        let mut sandbox = Self::from_sources(sources, scratch, limits)?;
+        sandbox.native.access = RendererAccess::OfficeJobOnly;
+        Ok(sandbox)
+    }
+}
+
 impl NativeRenderSandbox {
     pub(crate) fn new(
         sources: &RenderSources,
@@ -115,11 +131,6 @@ impl NativeRenderSandbox {
             limits,
             access: RendererAccess::AppContainer,
         }
-    }
-
-    pub(crate) fn with_office_job_only(mut self) -> Self {
-        self.access = RendererAccess::OfficeJobOnly;
-        self
     }
 
     pub(crate) fn run<I, S>(

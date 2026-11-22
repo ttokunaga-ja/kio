@@ -98,19 +98,6 @@ impl RenderSandbox {
         })
     }
 
-    /// Windows Office only (D-20261122-02). A Job bounds resource use and the
-    /// process tree. The renderer has the invoking user's OS access.
-    #[cfg(windows)]
-    pub fn for_windows_office(
-        sources: &RenderSources,
-        scratch: &Path,
-        limits: RenderResourceLimits,
-    ) -> Result<Self, ConfinementError> {
-        let mut sandbox = Self::from_sources(sources, scratch, limits)?;
-        sandbox.native = sandbox.native.with_office_job_only();
-        Ok(sandbox)
-    }
-
     #[must_use]
     pub fn limits(&self) -> RenderResourceLimits {
         self.limits

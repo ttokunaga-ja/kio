@@ -442,8 +442,12 @@ fn read_private_leaf(
     options
         .read(true)
         ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
-    let mut file = cap_fs::open(parent, Path::new(leaf), &options)
-        .map_err(|_| unsafe_file("cannot open private trust file", Some(path)))?;
+    let mut file = cap_fs::open(parent, Path::new(leaf), &options).map_err(|error| {
+        unsafe_file(
+            &format!("cannot open private trust file: {error}"),
+            Some(path),
+        )
+    })?;
     let before_identity =
         crate::platform::regular_file_handle_identity(&file).ok_or_else(|| {
             unsafe_file(

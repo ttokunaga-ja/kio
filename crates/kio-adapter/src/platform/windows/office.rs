@@ -1,10 +1,37 @@
 use crate::office_runtime_identity::RuntimeSnapshot;
 use crate::{AdapterError, Result};
+use kio_process::confinement::{
+    ConfinementError, RenderResourceLimits, RenderSandbox, RenderSources,
+};
 use std::{
     ffi::OsString,
     path::{Path, PathBuf},
 };
 use tempfile::Builder;
+
+pub(crate) const OFFICE_LAUNCH_PROFILE: &[u8] = b"windows-office-job-only\0";
+
+pub(crate) fn office_render_sandbox(
+    sources: &RenderSources,
+    scratch: &Path,
+    limits: RenderResourceLimits,
+) -> std::result::Result<RenderSandbox, ConfinementError> {
+    RenderSandbox::for_windows_office(sources, scratch, limits)
+}
+
+pub(crate) fn office_conversion_paths(outdir: &Path, input: &Path) -> (OsString, OsString) {
+    // The launcher binds its CWD to the invocation scratch. These two staged
+    // children are direct leaves. Keep the Win32 verbatim prefix out of
+    // LibreOffice's wildcard expansion and subsequent URL resolution.
+    (
+        outdir
+            .file_name()
+            .expect("staged output directory")
+            .to_owned(),
+        input.file_name().expect("staged input file").to_owned(),
+    )
+}
+
 pub(crate) struct PrivateOfficeScratch {
     original: std::sync::Arc<std::fs::File>,
     pin: Option<std::fs::File>,
@@ -500,6 +527,60 @@ pub(crate) fn office_package_launch_roots(roots: &[PathBuf]) -> &[PathBuf] {
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conversion_paths_use_the_retained_scratch_working_directory() {
+        let scratch = Path::new(r"\\?\D:\a\_temp\kio office#%\kio-test");
+        let paths = office_conversion_paths(&scratch.join("out"), &scratch.join("input.docx"));
+        assert_eq!(paths, (OsString::from("out"), OsString::from("input.docx")));
+    }
+
+    #[test]
+    fn job_output_renamed_into_out_passes_the_strict_private_reader() {
+        use kio_core::private_fs::{read_private_file_at_until, verify_private_directory_handle};
+        use kio_core::store_dir::StoreDirectory;
+        use kio_process::BoundedProcessOptions;
+        use std::time::{Duration, Instant};
+
+        let scratch = private_temp_dir().unwrap();
+        let root = crate::office_convert::bind_private_scratch(scratch.path()).unwrap();
+        let out = root.create_directory(Path::new("out")).unwrap();
+        let out = StoreDirectory::from_retained(out, scratch.path().join("out")).unwrap();
+        let windows = windows_directory().unwrap();
+        let program = windows.join("System32").join("cmd.exe");
+        let sources = RenderSources::resolve(&program, []).unwrap();
+        let sandbox =
+            office_render_sandbox(&sources, scratch.path(), RenderResourceLimits::default())
+                .unwrap();
+        let result = sandbox
+            .run(
+                [
+                    "/d",
+                    "/c",
+                    r"echo pdf fixture>out\temporary && move /y out\temporary out\input.pdf",
+                ],
+                &renderer_environment(&windows, Some(scratch.path())),
+                BoundedProcessOptions {
+                    timeout: Duration::from_secs(15),
+                    max_stdout_bytes: 4096,
+                    max_stderr_bytes: 4096,
+                },
+            )
+            .unwrap();
+        assert!(result.status.success(), "{result:?}");
+        verify_private_directory_handle(&out).unwrap();
+        let bytes = read_private_file_at_until(
+            &out,
+            "input.pdf",
+            32,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(bytes.starts_with(b"pdf fixture"));
+        drop(out);
+        drop(root);
+        scratch.close().unwrap();
+    }
 
     #[test]
     fn authenticode_accepts_the_system_pe_and_rejects_modified_code() {

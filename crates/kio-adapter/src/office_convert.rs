@@ -26,7 +26,7 @@ use std::{
 
 use kio_process::{
     BoundedProcessError, BoundedProcessOptions, BoundedProcessOutput,
-    confinement::{ConfinementError, RenderResourceLimits, RenderSandbox, RenderSources},
+    confinement::{ConfinementError, RenderResourceLimits, RenderSources},
 };
 use sha2::{Digest, Sha256};
 
@@ -34,7 +34,8 @@ use crate::office_runtime_identity::{
     ExecutableFingerprint, RuntimeSnapshot, check_verification_deadline,
 };
 use crate::platform::{
-    DEFAULT_OFFICE_CONVERTER_PROGRAM, OfficeRuntime, file_url, finish_scratch, private_temp_dir,
+    DEFAULT_OFFICE_CONVERTER_PROGRAM, OFFICE_LAUNCH_PROFILE, OfficeRuntime, file_url,
+    finish_scratch, office_conversion_paths, office_render_sandbox, private_temp_dir,
     restrict_renderer_state_directory, scratch_recovery_note,
 };
 use crate::{AdapterError, Result};
@@ -144,8 +145,7 @@ impl OfficeConverter {
                 digest.update(fixture_path.as_os_str().as_encoded_bytes())
             }
             ConverterBackend::Real(renderer) => {
-                #[cfg(windows)]
-                digest.update(b"windows-office-job-only\0");
+                digest.update(OFFICE_LAUNCH_PROFILE);
                 let RealRenderer {
                     sources,
                     program_fingerprint,
@@ -388,18 +388,6 @@ impl RealRenderer {
         )
     }
 
-    fn render_sandbox(
-        &self,
-        scratch: &Path,
-        limits: RenderResourceLimits,
-    ) -> std::result::Result<RenderSandbox, ConfinementError> {
-        #[cfg(windows)]
-        let launch_policy = RenderSandbox::for_windows_office;
-        #[cfg(not(windows))]
-        let launch_policy = RenderSandbox::from_sources;
-        launch_policy(&self.sources, scratch, limits)
-    }
-
     fn renderer_version(&self, deadline: Instant) -> Result<String> {
         if Instant::now() >= deadline {
             return Ok(String::new());
@@ -407,13 +395,16 @@ impl RealRenderer {
         let scratch = private_temp_dir()?;
         let profile_dir = create_private_renderer_state(scratch.path(), "probe")?;
         let profile_url = file_url(&profile_dir)?;
-        let sandbox = self
-            .render_sandbox(scratch.path(), RenderResourceLimits::default())
-            .map_err(|error| {
-                AdapterError::ContractViolation(format!(
-                    "office converter confinement setup failed: {error}"
-                ))
-            })?;
+        let sandbox = office_render_sandbox(
+            &self.sources,
+            scratch.path(),
+            RenderResourceLimits::default(),
+        )
+        .map_err(|error| {
+            AdapterError::ContractViolation(format!(
+                "office converter confinement setup failed: {error}"
+            ))
+        })?;
         let mut environment = self
             .runtime
             .environment(self.sources.program(), Some(&profile_dir));
@@ -696,19 +687,20 @@ impl RealRenderer {
         if output_limit == MAX_OFFICE_PROBE_PDF_BYTES {
             limits.max_file_bytes = MAX_OFFICE_PROBE_SCRATCH_BYTES;
         }
-        let sandbox = self.render_sandbox(workdir, limits).map_err(|err| {
+        let sandbox = office_render_sandbox(&self.sources, workdir, limits).map_err(|err| {
             AdapterError::ContractViolation(format!(
                 "office converter confinement is unavailable: {err}"
             ))
         })?;
+        let (outdir_arg, input_arg) = office_conversion_paths(&outdir, &input_path);
         let arguments = vec![
             OsString::from("--headless"),
             OsString::from(format!("-env:UserInstallation={profile_url}")),
             OsString::from("--convert-to"),
             OsString::from("pdf"),
             OsString::from("--outdir"),
-            outdir.as_os_str().to_owned(),
-            input_path.as_os_str().to_owned(),
+            outdir_arg,
+            input_arg,
         ];
         let mut environment = runtime.environment(program, Some(&profile_dir));
         #[cfg(test)]
