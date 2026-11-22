@@ -159,6 +159,23 @@ jobs:
                   SafeProcessHandle process, uint pid, SafeFileHandle file, uint flags,
                   IntPtr exception, IntPtr userStreams, IntPtr callback);
 
+              [DllImport("kernel32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+              private static extern IntPtr GetModuleHandleW(string module);
+
+              [DllImport("kernel32.dll", ExactSpelling = true, SetLastError = true)]
+              private static extern IntPtr GetProcAddress(IntPtr module, string name);
+
+              public static long ExportRva(string module, string export)
+              {
+                  var baseAddress = GetModuleHandleW(module);
+                  if (baseAddress == IntPtr.Zero)
+                      throw new Win32Exception(Marshal.GetLastWin32Error());
+                  var address = GetProcAddress(baseAddress, export);
+                  if (address == IntPtr.Zero)
+                      throw new Win32Exception(Marshal.GetLastWin32Error());
+                  return address.ToInt64() - baseAddress.ToInt64();
+              }
+
               public static void Write(uint pid, string path)
               {
                   using var process = OpenProcess(0x0410, false, pid); // query information and read
@@ -183,7 +200,50 @@ jobs:
             (Join-Path (Split-Path -Parent $env:KIO_OFFICE_CONVERTER) 'soffice.bin'))
           $officeImages += @($officeImages | ForEach-Object { '\\?\' + $_ })
 
-          # File create and operation-end providers can expose pipe
+          $gdb = (Get-Command gdb.exe -CommandType Application -ErrorAction SilentlyContinue |
+            Select-Object -First 1).Source
+          if (-not $gdb) {
+            $gdb = @('C:\mingw64\bin\gdb.exe', 'C:\msys64\mingw64\bin\gdb.exe',
+              'C:\msys64\ucrt64\bin\gdb.exe') | Where-Object { Test-Path -LiteralPath $_ } |
+              Select-Object -First 1
+          }
+          $debugNotes = "$evidence\pipe-api-setup.txt"
+          $debugger = $null
+          if (-not $gdb) { 'Runner did not expose gdb.exe' | Set-Content -LiteralPath $debugNotes }
+
+          function Start-PipeProbe([int] $officePid) {
+            # Local and renderer KERNELBASE are the runner's x64 system DLL.
+            # Use export RVAs so GDB need not resolve any PDBs to set the stops.
+            $moduleName = 'KERNELBASE.dll'
+            $module = (Get-Process -Id $officePid).Modules |
+              Where-Object ModuleName -eq $moduleName | Select-Object -First 1
+            if (-not $module) { throw 'Could not find KERNELBASE in soffice.bin' }
+            $breakpoints = foreach ($api in 'CreateNamedPipeW', 'WaitNamedPipeW') {
+              $rva = [OfficeStackSample]::ExportRva($moduleName, $api)
+              if ($rva -lt 0 -or $rva -ge $module.ModuleMemorySize) { throw "Export outside KERNELBASE: $api" }
+              $address = '0x{0:x}' -f ($module.BaseAddress.ToInt64() + $rva)
+              "PID=$officePid $api=$address" | Add-Content -LiteralPath $debugNotes
+              "tbreak *$address"
+            }
+            $commands = Join-Path $work 'pipe-api.gdb'
+            @('set confirm off', 'set pagination off', 'set auto-load off', 'set language c',
+              "attach $officePid") + $breakpoints + @(
+              'continue', 'printf "PIPE entry PC=%p thread=%d\n", $pc, $_thread',
+              'set $pipe_thread = $_thread', 'x /hs $rcx', 'bt 12', 'delete breakpoints',
+              'tbreak *(*(void **)$rsp)', 'continue',
+              'printf "PIPE return RAX=0x%llx thread=%d\n", $rax, $_thread',
+              # Windows Server 2025 x64 TEB.LastErrorValue. Read the stopped
+              # thread's memory instead of calling into the inferior.
+              'if $_thread == $pipe_thread && $_tlb != 0',
+              '  printf "PIPE last error=%u\n", *(unsigned int *)((char *)$_tlb + 0x68)',
+              'end',
+              'detach'
+            ) | Set-Content -LiteralPath $commands -Encoding ascii
+            # Pass a correctly quoted absolute script path, including spaces.
+            Start-Process -FilePath $gdb -ArgumentList @('-nx', '-batch', '-x', ('"' + $commands + '"')) -PassThru -NoNewWindow -RedirectStandardOutput "$evidence\pipe-api-gdb.txt" -RedirectStandardError "$evidence\pipe-api-gdb.stderr.txt"
+          }
+
+          # File create and operation-end events can expose pipe
           # activity or sharing violations even with no Security 4656 event.
           $traceName = "kio-office-file-$PID"
           $traceLog = "$evidence\file-trace.txt"
@@ -223,7 +283,7 @@ jobs:
               }
             }
 
-            & logman.exe create trace $traceName -ets -o $tracePath -f bincirc -max 64 -p Microsoft-Windows-Kernel-File 0x10C0 0x4 2>&1 |
+            & logman.exe create trace $traceName -ets -o $tracePath -f bincirc -max 64 -p Microsoft-Windows-Kernel-File 0x10E0 0x4 2>&1 |
               Add-Content -LiteralPath $traceLog
             $traceStarted = $LASTEXITCODE -eq 0
             "ETW started: $traceStarted" | Add-Content -LiteralPath $traceLog
@@ -271,6 +331,18 @@ jobs:
                         "$utc $($target.Name) $($target.ProcessId): $_" | Add-Content -LiteralPath $dumpLog
                       }
                     }
+                    # Capture the uninstrumented stack first, then attach once
+                    # to the known renderer child for the pipe call and return.
+                    if ($seconds -eq 20 -and $gdb) {
+                      $child = $targets | Where-Object Name -eq 'soffice.bin' | Select-Object -First 1
+                      if ($child) {
+                        try {
+                          $debugger = Start-PipeProbe $child.ProcessId
+                        } catch {
+                          "GDB setup failed: $_" | Add-Content -LiteralPath $debugNotes
+                        }
+                      }
+                    }
                   }
                 } catch {
                   "$([DateTime]::UtcNow.ToString('o')) $_" | Add-Content -LiteralPath "$evidence\sampling-errors.txt"
@@ -284,6 +356,19 @@ jobs:
               [DateTime]::UtcNow.ToString('o') | Set-Content -LiteralPath "$evidence\ended-utc.txt"
             }
           } finally {
+            if ($debugger) {
+              try {
+                if ($debugger.WaitForExit(5000)) {
+                  "GDB exit=$($debugger.ExitCode)" | Add-Content -LiteralPath $debugNotes
+                } else {
+                  $debugger.Kill()
+                  $null = $debugger.WaitForExit(5000)
+                  'Stopped GDB after status ended' | Add-Content -LiteralPath $debugNotes
+                }
+              } catch {
+                "GDB cleanup error: $_" | Add-Content -LiteralPath $debugNotes
+              }
+            }
             if ($traceStarted) {
               & logman.exe stop $traceName -ets 2>&1 | Add-Content -LiteralPath $traceLog
               "ETW stop exit=$LASTEXITCODE" | Add-Content -LiteralPath $traceLog
@@ -432,9 +517,10 @@ jobs:
           $output = [System.IO.StreamWriter]::new("$evidence\office-file-etw.jsonl")
           try {
             Get-WinEvent -FilterHashtable @{
-              Path = $trace.FullName; ProviderName = 'Microsoft-Windows-Kernel-File'; Id = 12, 24, 30
+              Path = $trace.FullName; Id = 12, 24, 30
             } -Oldest -MaxEvents 250000 | ForEach-Object {
               $event = $_
+              if ($event.ProviderId -ne [guid]'edd08927-9cc4-4e65-b970-c2560fb5c289') { return }
               $total++
               $isOffice = $officePids.Contains([int]$event.ProcessId)
               if ($pending.Count -gt 0 -or $isOffice) {
