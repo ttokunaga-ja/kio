@@ -32,6 +32,44 @@ pub(crate) fn office_conversion_paths(outdir: &Path, input: &Path) -> (OsString,
     )
 }
 
+pub(crate) fn office_probe_output_failure_note(
+    scratch: &kio_core::store_dir::StoreDirectory,
+    out: &kio_core::store_dir::StoreDirectory,
+    status: &std::process::ExitStatus,
+) -> String {
+    fn entry_names(directory: &kio_core::store_dir::StoreDirectory) -> String {
+        const MAX_NAMES: usize = 16;
+        // The completed job's last scratch scan already bounds the entry count.
+        let Ok(entries) = directory.entries(Path::new("")) else {
+            return "unavailable".to_owned();
+        };
+        let names = entries
+            .iter()
+            .take(MAX_NAMES)
+            .map(|entry| {
+                entry
+                    .name
+                    .to_string_lossy()
+                    .chars()
+                    .take(80)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let suffix = if entries.len() > MAX_NAMES {
+            " (truncated)"
+        } else {
+            ""
+        };
+        format!("{names:?}{suffix}")
+    }
+
+    format!(
+        "; renderer status: {status}; scratch entries: {}; out entries: {}",
+        entry_names(scratch),
+        entry_names(out),
+    )
+}
+
 pub(crate) struct PrivateOfficeScratch {
     original: std::sync::Arc<std::fs::File>,
     pin: Option<std::fs::File>,
@@ -527,6 +565,36 @@ pub(crate) fn office_package_launch_roots(roots: &[PathBuf]) -> &[PathBuf] {
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_failure_names_the_exit_status_and_both_scratch_levels() {
+        use std::os::windows::process::ExitStatusExt as _;
+
+        let scratch = private_temp_dir().unwrap();
+        let root = crate::office_convert::bind_private_scratch(scratch.path()).unwrap();
+        let out = root.create_directory(Path::new("out")).unwrap();
+        let out =
+            kio_core::store_dir::StoreDirectory::from_retained(out, scratch.path().join("out"))
+                .unwrap();
+        drop(root.create_private_file(Path::new("input.docx")).unwrap());
+        drop(out.create_private_file(Path::new("other.pdf")).unwrap());
+        let status = std::process::ExitStatus::from_raw(0);
+        let note = office_probe_output_failure_note(&root, &out, &status);
+        assert!(note.contains(&format!("renderer status: {status}")));
+        assert!(note.contains(r#"scratch entries: ["input.docx", "out"]"#));
+        assert!(note.contains(r#"out entries: ["other.pdf"]"#));
+
+        for index in 0..17 {
+            let name = format!("{index:02}.pdf");
+            drop(out.create_private_file(Path::new(&name)).unwrap());
+        }
+        let note = office_probe_output_failure_note(&root, &out, &status);
+        assert!(note.contains("(truncated)"));
+        assert!(!note.contains("other.pdf"));
+        drop(out);
+        drop(root);
+        scratch.close().unwrap();
+    }
 
     #[test]
     fn conversion_paths_use_the_retained_scratch_working_directory() {

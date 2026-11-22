@@ -18,6 +18,14 @@ pub(crate) fn office_conversion_paths(outdir: &Path, input: &Path) -> (OsString,
     (outdir.as_os_str().to_owned(), input.as_os_str().to_owned())
 }
 
+pub(crate) fn office_probe_output_failure_note(
+    _scratch: &kio_core::store_dir::StoreDirectory,
+    _out: &kio_core::store_dir::StoreDirectory,
+    _status: &std::process::ExitStatus,
+) -> String {
+    String::new()
+}
+
 pub(crate) fn private_office_scratch(
     directory: std::io::Result<tempfile::TempDir>,
 ) -> Result<tempfile::TempDir> {

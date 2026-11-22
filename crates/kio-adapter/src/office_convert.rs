@@ -35,8 +35,9 @@ use crate::office_runtime_identity::{
 };
 use crate::platform::{
     DEFAULT_OFFICE_CONVERTER_PROGRAM, OFFICE_LAUNCH_PROFILE, OfficeRuntime, file_url,
-    finish_scratch, office_conversion_paths, office_render_sandbox, private_temp_dir,
-    restrict_renderer_state_directory, scratch_recovery_note,
+    finish_scratch, office_conversion_paths, office_probe_output_failure_note,
+    office_render_sandbox, private_temp_dir, restrict_renderer_state_directory,
+    scratch_recovery_note,
 };
 use crate::{AdapterError, Result};
 
@@ -768,8 +769,13 @@ impl RealRenderer {
             deadline,
         )
         .map_err(|error| {
+            let note = if output_limit == MAX_OFFICE_PROBE_PDF_BYTES {
+                office_probe_output_failure_note(&scratch_directory, &output_directory, &output.status)
+            } else {
+                String::new()
+            };
             AdapterError::ContractViolation(format!(
-                "office converter output is absent, unsafe, or exceeded the {output_limit} byte limit: {error}",
+                "office converter output is absent, unsafe, or exceeded the {output_limit} byte limit: {error}{note}",
             ))
         })?;
         if !pdf_bytes.starts_with(b"%PDF") {
