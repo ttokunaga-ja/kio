@@ -626,12 +626,12 @@ mod tests {
         let scratch = private_temp_dir().unwrap();
         let path = scratch.path().to_path_buf();
         let root = crate::office_convert::bind_private_scratch(&path).unwrap();
-        drop(root.create_directory(Path::new("lo-profile")).unwrap());
-        drop(
-            root.create_private_file(Path::new("lo-profile/settings"))
-                .unwrap(),
-        );
-        let settings = path.join("lo-profile/settings");
+        let profile = root.create_directory(Path::new("lo-profile")).unwrap();
+        let profile =
+            kio_core::store_dir::StoreDirectory::from_retained(profile, path.join("lo-profile"))
+                .unwrap();
+        drop(profile.create_private_file(Path::new("settings")).unwrap());
+        let settings = profile.path().join("settings");
         let mut permissions = std::fs::metadata(&settings).unwrap().permissions();
         permissions.set_readonly(true);
         std::fs::set_permissions(&settings, permissions).unwrap();
@@ -642,6 +642,7 @@ mod tests {
                 .readonly()
         );
 
+        drop(profile);
         drop(root);
         scratch.close().unwrap();
         assert!(!path.exists());

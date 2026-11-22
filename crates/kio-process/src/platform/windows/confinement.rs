@@ -77,6 +77,13 @@ mod child_token;
 mod scratch_access;
 use scratch_access::ScratchGrant;
 
+fn profile_operation(operation: &str, error: std::io::Error) -> ConfinementError {
+    ConfinementError::Profile(std::io::Error::new(
+        error.kind(),
+        format!("{operation} (scratch entry: <none>): {error}"),
+    ))
+}
+
 pub(crate) const RENDER_ADDRESS_SPACE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub(crate) const RENDER_PHYSICAL_MEMORY_BYTES: u64 = 0;
 
@@ -375,7 +382,7 @@ where
         // resume, pipe setup, wait/accounting, output, and scratch failures.
         let result = (|| {
             child_token::prepare_suspended_renderer_token(primary.0, app_sid)
-                .map_err(ConfinementError::Profile)?;
+                .map_err(|error| profile_operation("prepare suspended renderer token", error))?;
             start.verify()?;
             resume(thread.0).map_err(ConfinementError::Resource)?;
             drop(thread);
@@ -394,7 +401,9 @@ where
                 while let Ok((stream, result)) = receiver.try_recv() {
                     output[usize::from(stream == "stderr")] = Some(result?);
                 }
-                grant.verify_active().map_err(ConfinementError::Profile)?;
+                grant
+                    .verify_active(deadline)
+                    .map_err(ConfinementError::Profile)?;
                 observe_scratch_until(sandbox, deadline, options)?;
                 if status.is_none() {
                     match unsafe { WaitForSingleObject(primary.0, 0) } {
@@ -805,7 +814,8 @@ impl AppContainerProfile {
             )
         };
         if hr < 0 {
-            return Err(ConfinementError::Profile(
+            return Err(profile_operation(
+                "CreateAppContainerProfile",
                 std::io::Error::from_raw_os_error(hr),
             ));
         }
@@ -936,7 +946,10 @@ impl Attributes {
         let mut memory = vec![0_usize; words].into_boxed_slice();
         let list = memory.as_mut_ptr().cast();
         if unsafe { InitializeProcThreadAttributeList(list, count, 0, &mut size) } == 0 {
-            return Err(ConfinementError::Profile(std::io::Error::last_os_error()));
+            return Err(profile_operation(
+                "InitializeProcThreadAttributeList",
+                std::io::Error::last_os_error(),
+            ));
         }
         // Attribute values must outlive CreateProcessW. Keep this allocation
         // boxed so references supplied to UpdateProcThreadAttribute remain
@@ -967,7 +980,10 @@ impl Attributes {
                 )
             } == 0
         {
-            return Err(ConfinementError::Profile(std::io::Error::last_os_error()));
+            return Err(profile_operation(
+                "set renderer AppContainer process attribute",
+                std::io::Error::last_os_error(),
+            ));
         }
         if unsafe {
             UpdateProcThreadAttribute(
@@ -981,7 +997,10 @@ impl Attributes {
             )
         } == 0
         {
-            return Err(ConfinementError::Profile(std::io::Error::last_os_error()));
+            return Err(profile_operation(
+                "set renderer inherited handle list",
+                std::io::Error::last_os_error(),
+            ));
         }
         Ok(attributes)
     }
@@ -1032,7 +1051,10 @@ impl Pipes {
                 || SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT, 0) == 0
                 || SetHandleInformation(stderr_read, HANDLE_FLAG_INHERIT, 0) == 0
             {
-                return Err(ConfinementError::Profile(std::io::Error::last_os_error()));
+                return Err(profile_operation(
+                    "configure renderer standard I/O pipes",
+                    std::io::Error::last_os_error(),
+                ));
             }
             Ok(Self {
                 stdin_read,
@@ -1819,7 +1841,7 @@ mod scratch_invocation_grant_tests {
             .share_mode(0)
             .open(&generated)
             .unwrap();
-        let observation = grant.verify_active();
+        let observation = grant.verify_active(Instant::now() + Duration::from_secs(1));
         assert!(
             observation.is_ok(),
             "metadata and ACL observation must permit a renderer's exclusive output writer: {observation:?}"
