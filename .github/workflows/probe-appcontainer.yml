@@ -53,19 +53,18 @@ jobs:
         run: cargo +1.98.0 build --release --locked --all-features -p kio-cli --bin kio
 
       - name: Compare direct LibreOffice conversions
-        timeout-minutes: 8
+        timeout-minutes: 12
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $fixture = Join-Path $env:GITHUB_WORKSPACE 'crates/kio-adapter/fixtures/office-probe.docx'
           $program = Split-Path -Parent $env:KIO_OFFICE_CONVERTER
 
-          function Invoke-OfficeConversion($launcher, [switch]$MatchKio) {
+          function Invoke-OfficeConversion($launcher, [switch]$KioEnvironment, [switch]$VerbatimUri) {
             $work = [IO.Directory]::CreateTempSubdirectory('kio-office-direct-').FullName
             try {
               Copy-Item -LiteralPath $fixture -Destination (Join-Path $work 'input.docx')
-              $profileName = if ($MatchKio) { 'lo-profile' } else { 'profile' }
-              $profile = [IO.Directory]::CreateDirectory((Join-Path $work $profileName)).FullName
+              $profile = [IO.Directory]::CreateDirectory((Join-Path $work 'lo-profile')).FullName
               [void][IO.Directory]::CreateDirectory((Join-Path $work 'out'))
               $profileUri = ([Uri]$profile).AbsoluteUri
               $start = [Diagnostics.ProcessStartInfo]::new((Join-Path $program $launcher))
@@ -75,9 +74,10 @@ jobs:
               $start.RedirectStandardOutput = $true
               $start.RedirectStandardError = $true
               $start.ArgumentList.Add('--headless')
-              if ($MatchKio) {
-                # Match kio's Windows child environment and verbatim profile path.
+              if ($VerbatimUri) {
                 $profileUri = 'file://///%3F/' + $profileUri.Substring('file:///'.Length)
+              }
+              if ($KioEnvironment) {
                 $start.Environment.Clear()
                 $start.Environment['SystemRoot'] = $env:SystemRoot
                 $start.Environment['WINDIR'] = $env:SystemRoot
@@ -85,14 +85,12 @@ jobs:
                 foreach ($key in 'HOME', 'USERPROFILE', 'LOCALAPPDATA') {
                   $start.Environment[$key] = '\\?\' + $profile
                 }
-              } else {
-                $start.ArgumentList.Add('--norestore')
               }
               foreach ($arg in "-env:UserInstallation=$profileUri", '--convert-to', 'pdf', '--outdir', 'out', 'input.docx') {
                 $start.ArgumentList.Add($arg)
               }
 
-              Write-Host "$launcher matching_kio=$MatchKio cwd=$work"
+              Write-Host "$launcher kio_environment=$KioEnvironment verbatim_uri=$VerbatimUri cwd=$work"
               Write-Host ($start.ArgumentList -join ' ')
               $child = [Diagnostics.Process]::Start($start)
               try {
@@ -127,7 +125,9 @@ jobs:
 
           Invoke-OfficeConversion 'soffice.com'
           Invoke-OfficeConversion 'soffice.exe'
-          Invoke-OfficeConversion 'soffice.exe' -MatchKio
+          Invoke-OfficeConversion 'soffice.exe' -KioEnvironment -VerbatimUri
+          Invoke-OfficeConversion 'soffice.exe' -KioEnvironment
+          Invoke-OfficeConversion 'soffice.exe' -VerbatimUri
 
       - name: Check Windows Office readiness
         timeout-minutes: 5
