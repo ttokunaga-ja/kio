@@ -298,3 +298,12 @@
 - **関係する資料**：[正式受入](../tasks/v1-acceptance.md)、[受入ホストの構築と切り替え](../scripts/v1-local-gpu/README.md#受入ホストの構築)。
 - **TCP 22 の到達制御**：Windows Firewall の限定規則と既定の受信拒否を、LAN など tailnet 外からの到達に対する多層防御とする。tailnet 内の送信元の制限は Tailscale の ACL・grant が担う。Windows 構築時は、Tailscale が生成する条件に合う `Tailscale-In` だけを広い受信許可の事前検査から除外する。許可対象外の tailnet 端末からの TCP 22 の拒否は grant の実機検証とする。
 - **共有 GPU と Windows 権限**：研究室は Docker Desktop WSL integration のソケット、個人機は native `/run/docker.sock` に管理者の件数照会を向ける。接続できなければ受入を止める。研究室の Ubuntu-26.04 では、interop を無効にすると Docker Desktop の integration（`/run/docker.sock`、`/Docker/host`）が戻らないことを 2026-11-21 に実機で確かめたため、interop は有効のまま `--desktop-interop-required` で構築し、受入専用サービスの mount namespace で制限する。個人機では通常の interop を維持し、受入専用 SSH と rootless Docker に同じ制限を適用する。通常の管理者プロセス、追加のマウントや代理ソケット、WSL とカーネル実装に由来するリスクは残る。研究室の Docker Desktop を支える対話セッションを維持し、S4U はその状態で検証する。
+
+## 2026-11-22
+
+### D-20261122-01 Windows Office の program 配下で署名なしの PE image を許容する
+
+- **内容**：`program/soffice.exe`、`program/soffice.bin`、および `program/` 直下のすべての PE image に有効な Authenticode 署名を要求する。`program/` の下位ディレクトリの PE image は、署名なしと確認できた場合に限り署名なしで許容する。署名の破損や信頼エラーは拒否する。署名なしを許容する範囲はこの下位ディレクトリに限る。
+- **理由**：利用者の決定。固定した公式 LibreOffice 26.8.0.3 の Windows 配布物で、`program/intl/fbintl.dll` と Python の pip・setuptools 用 launcher stub 14 個に署名がなかった（CI run 44966483976 の調査）。いずれも Windows が既定で DLL を探す実行ファイルのディレクトリ `program/` の直下にない。[Windows の DLL 検索順序](https://learn.microsoft.com/en-us/windows/win32/dlls/dynamic-link-library-search-order)
+- **保護と残るリスク**：実行ファイルの digest と配置全体の identity snapshot、変換直前の再確認、reparse point と複数 hard link の拒否、AppContainer、ローカル情報による信頼判定を維持する。publisher 名による許可リストは設けない。署名なしで許容した PE image の配布元や snapshot 採取前の内容は署名で保証できず、Office が明示したパスから読み込む場合もある。
+- **関係する資料**：[Adapter 仕様 §5.1](07-adapter-spec.md#51-prepare)、`crates/kio-adapter/src/platform/windows/office.rs`。

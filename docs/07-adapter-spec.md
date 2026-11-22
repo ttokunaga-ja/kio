@@ -299,10 +299,14 @@ macOS は app bundle の Apple 発行コード署名と seal を全 architecture
 `KIO_OFFICE_CONVERTER` に bundle 内の実行ファイルを指定できる。特定の Team ID や bundle ID の
 指定、追加の notarization ticket 照会は行わない。Windows は `program/soffice.exe` と同じ
 `program/` 内に `soffice.bin`・`fundamental.ini` があり、隣に `share/` がある配置を検証する。
-launcher・renderer 本体・配置内の PE image の Authenticode 署名を実ファイル上で確認する。
-Windows の trust 判定はローカル情報で行い、publisher 名やインストーラの署名は判定に使わない。
+Windows は launcher と renderer 本体を PE image として確認し、`program/` 直下のすべての PE image に
+有効な Authenticode 署名を要求する。`program/` の下位ディレクトリの PE image は、署名があれば
+実ファイル上で検証し、署名の破損や信頼エラーがあれば拒否する。署名がないことを確認できた場合は
+許容する。配置内の `program/` 外の PE image には引き続き有効な署名を要求する。
+trust 判定はローカル情報で行い、publisher 名やインストーラの署名は判定に使わない。
 両 OS とも検証した runtime の配置と実体を probe・変換に結び付ける。macOS の bundle 内のリンクは
-bundle の内側に閉じる。Windows の配置内では reparse point と複数の hard link を持つファイルを拒否する。
+bundle の内側に閉じる。Windows は署名を持たない下位の PE image も配置全体の同一性検証に含め、
+配置内の reparse point と複数の hard link を持つファイルを拒否する。
 Windows の AppContainer のアクセス制御は OS の ACL に従う。
 version 応答の形式差だけを「未導入」と扱わず、検出済みだが利用不能なら具体的な理由を表示する。
 CI の配布物 SHA pin は再現性のため維持し、製品の一般的な版許可リストにはしない。
