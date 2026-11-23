@@ -129,6 +129,13 @@ jobs:
           Invoke-OfficeConversion 'soffice.exe' -KioEnvironment
           Invoke-OfficeConversion 'soffice.exe' -VerbatimUri
 
+      - name: Record Office readiness start
+        id: readiness-start
+        shell: pwsh
+        run: |
+          "KIO_OFFICE_READINESS_START_UTC=$([DateTime]::UtcNow.ToString('o'))" |
+            Add-Content -LiteralPath $env:GITHUB_ENV
+
       - name: Check Windows Office readiness
         timeout-minutes: 5
         shell: bash
@@ -157,3 +164,21 @@ jobs:
             ) || failed=1
           done
           exit "$failed"
+
+      - name: List LibreOffice install entries updated during readiness
+        if: ${{ !cancelled() && steps.readiness-start.outcome == 'success' }}
+        timeout-minutes: 2
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Split-Path -Parent (Split-Path -Parent $env:KIO_OFFICE_CONVERTER)
+          $start = [DateTimeOffset]::Parse($env:KIO_OFFICE_READINESS_START_UTC).UtcDateTime
+          Write-Host "Listing install-relative entries with LastWriteTimeUtc after $($start.ToString('o'))"
+          $changed = @(Get-ChildItem -LiteralPath $root -Recurse -Force |
+            Where-Object { $_.LastWriteTimeUtc -gt $start } | Select-Object -First 101)
+          if ($changed.Count -eq 0) { Write-Host 'No newer install entries found' }
+          $changed | Select-Object -First 100 | ForEach-Object {
+            $relative = [IO.Path]::GetRelativePath($root, $_.FullName)
+            Write-Host ('{0:o} {1}' -f $_.LastWriteTimeUtc, $relative)
+          }
+          if ($changed.Count -gt 100) { Write-Host 'Listing truncated after 100 entries' }
