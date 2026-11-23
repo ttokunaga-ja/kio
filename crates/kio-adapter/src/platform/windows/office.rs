@@ -9,7 +9,9 @@ use std::{
 };
 use tempfile::Builder;
 
-pub(crate) const OFFICE_LAUNCH_PROFILE: &[u8] = b"windows-office-job-only\0";
+pub(crate) const OFFICE_LAUNCH_PROFILE: &[u8] =
+    b"windows-office-job-only-private-shared-package-cache\0";
+pub(crate) const OFFICE_REDIRECT_SHARED_CACHE: bool = true;
 
 pub(crate) fn office_render_sandbox(
     sources: &RenderSources,

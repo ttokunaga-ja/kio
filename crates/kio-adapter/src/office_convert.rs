@@ -34,9 +34,9 @@ use crate::office_runtime_identity::{
     ExecutableFingerprint, RuntimeSnapshot, check_verification_deadline,
 };
 use crate::platform::{
-    DEFAULT_OFFICE_CONVERTER_PROGRAM, OFFICE_LAUNCH_PROFILE, OfficeRuntime, file_url,
-    finish_scratch, office_conversion_paths, office_render_sandbox, private_temp_dir,
-    restrict_renderer_state_directory, scratch_recovery_note,
+    DEFAULT_OFFICE_CONVERTER_PROGRAM, OFFICE_LAUNCH_PROFILE, OFFICE_REDIRECT_SHARED_CACHE,
+    OfficeRuntime, file_url, finish_scratch, office_conversion_paths, office_render_sandbox,
+    private_temp_dir, restrict_renderer_state_directory, scratch_recovery_note,
 };
 use crate::{AdapterError, Result};
 
@@ -58,6 +58,7 @@ const MAX_OFFICE_INPUT_BYTES: usize = 100 * 1024 * 1024;
 const MAX_OFFICE_PDF_BYTES: usize = 250 * 1024 * 1024;
 pub(crate) const MAX_OFFICE_LOG_BYTES: usize = 64 * 1024;
 const OFFICE_NORMALIZATION_PROFILE: &str = "pdf-volatile-fields-v1";
+const OFFICE_SCRATCH_CACHE: &str = "cache";
 const MACOS_UNO_FILTER_VERSION: &str = "macos-spell-component-v1";
 
 const DOCX_MEDIA_TYPE: &str =
@@ -394,7 +395,11 @@ impl RealRenderer {
         }
         let scratch = private_temp_dir()?;
         let profile_dir = create_private_renderer_state(scratch.path(), "probe")?;
-        let profile_url = file_url(&profile_dir)?;
+        let bootstrap = renderer_bootstrap_arguments(
+            scratch.path(),
+            &profile_dir,
+            OFFICE_REDIRECT_SHARED_CACHE,
+        )?;
         let sandbox = office_render_sandbox(
             &self.sources,
             scratch.path(),
@@ -415,12 +420,10 @@ impl RealRenderer {
             .pin_before_launch(deadline)
             .map_err(verification_error)?;
         let result = sandbox.run_checked_until(
-            [
-                OsString::from("--headless"),
-                OsString::from("--norestore"),
-                OsString::from(format!("-env:UserInstallation={profile_url}")),
-                OsString::from("--version"),
-            ],
+            [OsString::from("--headless"), OsString::from("--norestore")]
+                .into_iter()
+                .chain(bootstrap)
+                .chain([OsString::from("--version")]),
             &environment,
             renderer_process_options(OFFICE_PROBE_TIMEOUT),
             deadline,
@@ -590,7 +593,7 @@ fn create_private_renderer_state(scratch: &Path, purpose: &str) -> Result<PathBu
     })?;
     for (name, label) in [
         ("lo-profile", "LibreOffice profile"),
-        ("cache", "renderer cache"),
+        (OFFICE_SCRATCH_CACHE, "renderer cache"),
         ("config", "renderer configuration"),
     ] {
         directory
@@ -603,6 +606,19 @@ fn create_private_renderer_state(scratch: &Path, purpose: &str) -> Result<PathBu
         restrict_renderer_state_directory(&directory, name, purpose, label)?;
     }
     Ok(profile)
+}
+
+fn renderer_bootstrap_arguments(
+    scratch: &Path,
+    profile: &Path,
+    redirect_shared_cache: bool,
+) -> Result<Vec<OsString>> {
+    let mut arguments = vec![format!("-env:UserInstallation={}", file_url(profile)?).into()];
+    if redirect_shared_cache {
+        let cache = file_url(&scratch.join(OFFICE_SCRATCH_CACHE))?;
+        arguments.push(format!("-env:UNO_SHARED_PACKAGES_CACHE={cache}").into());
+    }
+    Ok(arguments)
 }
 
 pub(crate) fn hex_digest(bytes: &[u8]) -> String {
@@ -682,7 +698,8 @@ impl RealRenderer {
         })?;
         let profile_dir = create_private_renderer_state(workdir, "conversion")?;
 
-        let profile_url = file_url(&profile_dir)?;
+        let bootstrap =
+            renderer_bootstrap_arguments(workdir, &profile_dir, OFFICE_REDIRECT_SHARED_CACHE)?;
         let mut limits = RenderResourceLimits::default();
         if output_limit == MAX_OFFICE_PROBE_PDF_BYTES {
             limits.max_file_bytes = MAX_OFFICE_PROBE_SCRATCH_BYTES;
@@ -693,15 +710,16 @@ impl RealRenderer {
             ))
         })?;
         let (outdir_arg, input_arg) = office_conversion_paths(&outdir, &input_path);
-        let arguments = vec![
-            OsString::from("--headless"),
-            OsString::from(format!("-env:UserInstallation={profile_url}")),
-            OsString::from("--convert-to"),
-            OsString::from("pdf"),
-            OsString::from("--outdir"),
-            outdir_arg,
-            input_arg,
-        ];
+        let arguments = [OsString::from("--headless")]
+            .into_iter()
+            .chain(bootstrap)
+            .chain([
+                OsString::from("--convert-to"),
+                OsString::from("pdf"),
+                OsString::from("--outdir"),
+                outdir_arg,
+                input_arg,
+            ]);
         let mut environment = runtime.environment(program, Some(&profile_dir));
         #[cfg(test)]
         if self.native_acceptance_diagnostics {
@@ -1103,6 +1121,42 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renderer_bootstrap_redirects_the_shared_cache_when_requested() {
+        let scratch = private_temp_dir().unwrap();
+        let profile = create_private_renderer_state(scratch.path(), "test").unwrap();
+        let profile_arg = format!("-env:UserInstallation={}", file_url(&profile).unwrap());
+        let cache_arg = format!(
+            "-env:UNO_SHARED_PACKAGES_CACHE={}",
+            file_url(&scratch.path().join("cache")).unwrap()
+        );
+        assert_eq!(
+            renderer_bootstrap_arguments(scratch.path(), &profile, false).unwrap(),
+            [OsString::from(&profile_arg)]
+        );
+        assert_eq!(
+            renderer_bootstrap_arguments(scratch.path(), &profile, true).unwrap(),
+            [OsString::from(profile_arg), OsString::from(cache_arg)]
+        );
+        finish_scratch(scratch).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_bootstrap_uses_safe_file_urls_for_profile_and_shared_cache() {
+        let scratch = Path::new(r"\\?\C:\kio scratch#%");
+        let profile = scratch.join("lo-profile");
+        assert_eq!(
+            renderer_bootstrap_arguments(scratch, &profile, OFFICE_REDIRECT_SHARED_CACHE).unwrap(),
+            [
+                OsString::from("-env:UserInstallation=file:///C:/kio%20scratch%23%25/lo-profile"),
+                OsString::from(
+                    "-env:UNO_SHARED_PACKAGES_CACHE=file:///C:/kio%20scratch%23%25/cache"
+                ),
+            ],
+        );
+    }
     use crate::platform::*;
 
     #[cfg(unix)]

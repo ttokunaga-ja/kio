@@ -339,6 +339,8 @@ Office 入力は 100 MiB、PDF 出力は 250 MiB とする。変換の wall-cloc
 Windows では renderer を `CREATE_NO_WINDOW` 付きで起動し、Job に最大 8 プロセス、2 GiB のメモリ、
 300 秒の CPU 時間の上限を適用する。標準入出力のハンドルだけを渡し、stdout と stderr の採取量を制限する。
 入出力の CLI 引数は invocation の scratch を基準にした名前にし、PDF は保持済みの出力ディレクトリから読む。
+起動ごとに `-env:UNO_SHARED_PACKAGES_CACHE` へ private scratch 内の空の `cache` の file URL を渡す。
+変換ではこのキャッシュを共有拡張の検索先として使う。インストール先の `share/uno_packages/cache` は配置の同一性検証に含める。
 Job の全プロセスが終了した後の最終 scratch 検証を
 通った場合だけ出力を確定する。Job の監視・pipe drain・最終検査はすべて元の実行期限に含む。
 失敗時は Job 全体の終了を要求し、後始末の確認は残り時間内に限る。timeout 時点で終了完了は保証しない。
