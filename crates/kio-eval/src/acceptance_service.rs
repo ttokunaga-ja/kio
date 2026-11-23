@@ -516,12 +516,28 @@ fn search_has(
         Some(root),
         &["search", marker, "--mode", "text", "--offline"],
     )?;
-    Ok(value
-        .get("results")
-        .or_else(|| value.get("result"))
-        .and_then(Value::as_array)
-        .is_some_and(|items| !items.is_empty()))
+    search_contains_marker(&value, marker)
 }
+
+fn search_contains_marker(value: &Value, marker: &str) -> Result<bool, AcceptanceError> {
+    let hits = value
+        .get("results")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid("text search omitted its results array"))?;
+    // Text search ORs the query units, so unrelated chunks can hit shared
+    // terms such as SERVICE or NATIVE. Verify the full marker in the chunk.
+    for hit in hits {
+        let snippet = hit
+            .get("snippet")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid("text search hit omitted its snippet"))?;
+        if snippet.contains(marker) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn assert_not_searchable(
     binary: &Path,
     private: &Path,
@@ -625,6 +641,26 @@ impl Drop for Cleanup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overlapping_search_hits_do_not_prove_a_marker_was_indexed() {
+        let stopped = "KIO_NATIVE_SERVICE_STOPPED_CHANGE";
+        let mut result = serde_json::json!({
+            "results": [
+                {"snippet": "kio v1 A03 native service fixture"},
+                {"snippet": "KIO_NATIVE_SERVICE_LIVE_CHANGE"}
+            ]
+        });
+        assert!(!search_contains_marker(&result, stopped).unwrap());
+        result["results"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "snippet": format!("```txt\n{stopped}\n```")
+            }));
+        assert!(search_contains_marker(&result, stopped).unwrap());
+        assert!(search_contains_marker(&Value::Null, stopped).is_err());
+    }
 
     #[test]
     fn identical_install_must_preserve_the_same_registration() {
