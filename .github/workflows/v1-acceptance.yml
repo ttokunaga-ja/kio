@@ -379,7 +379,8 @@ jobs:
           extract_dir="$RUNNER_TEMP/kio-v1-extract"
           mkdir "$extract_dir"
           # release verify rejects unsafe archive entries before this extraction.
-          tar -xzf "$archive" -C "$extract_dir"
+          # Read from stdin: GNU tar on Windows parses "D:..." in -f as a remote host.
+          tar -xzf - -C "$extract_dir" < "$archive"
           roots=()
           while IFS= read -r root; do roots+=("$root"); done < <(
             find "$extract_dir" -mindepth 1 -maxdepth 1 -type d -print
