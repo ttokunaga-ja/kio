@@ -310,20 +310,27 @@ impl PrivateGrantStore {
         } else {
             None
         };
+        self.add_scoped_records(&network, secret.as_ref())?;
+        Ok((network, secret))
+    }
+
+    fn add_scoped_records(
+        &mut self,
+        network: &GrantRecord,
+        secret: Option<&GrantRecord>,
+    ) -> Result<()> {
         let old_len = self.records.len();
         self.records.push(network.clone());
-        if let Some(record) = &secret {
+        if let Some(record) = secret {
             self.records.push(record.clone());
         }
-        if let Err(error) = ensure_terminal_capacity(&self.records) {
+        if let Err(error) = validate_records(&self.device_instance_id, &self.records)
+            .and_then(|_| self.persist(Publication::Upsert))
+        {
             self.records.truncate(old_len);
             return Err(error);
         }
-        if let Err(error) = self.persist(Publication::Upsert) {
-            self.records.truncate(old_len);
-            return Err(error);
-        }
-        Ok((network, secret))
+        Ok(())
     }
 
     pub fn activate_approval(
@@ -1249,6 +1256,34 @@ mod tests {
         let error = decode_store(&canonical_json_bytes(&changed).unwrap())
             .expect_err("a paired network record cannot make an aliased secret approval valid");
         assert_eq!(error.error_code(), "KIO-E-GRANT-CORRUPT-001");
+    }
+
+    #[test]
+    fn duplicate_scoped_grant_id_does_not_replace_the_store() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let path = root.join("grants/grants.json");
+        let control = kio_core::control::ControlHandle::default();
+        let mut store = PrivateGrantStore::open_or_create(&path, &root, &control).unwrap();
+        let (network, _) = store
+            .begin_pending_approval(binding(&root), false, "2026-09-08T00:00:00Z".into())
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let mut duplicate = network.clone();
+        duplicate.approval_id = new_ulid(&path);
+        let mut other_binding = binding(&root);
+        other_binding.tool_id = "adapter-other".into();
+        duplicate.binding = GrantBinding::Scoped(other_binding);
+
+        assert_eq!(
+            store
+                .add_scoped_records(&duplicate, None)
+                .unwrap_err()
+                .error_code(),
+            "KIO-E-GRANT-CORRUPT-001"
+        );
+        assert_eq!(store.records(), &[network]);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
     #[test]

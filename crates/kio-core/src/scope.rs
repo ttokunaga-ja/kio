@@ -7,7 +7,8 @@ use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -1810,6 +1811,12 @@ pub fn new_ulid(path: &Path) -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
+    new_ulid_at(path, now)
+}
+
+fn new_ulid_at(path: &Path, now: Duration) -> String {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
     let timestamp_ms = now.as_millis() as u64;
     let mut bytes = [0_u8; 16];
     bytes[0] = ((timestamp_ms >> 40) & 0xff) as u8;
@@ -1820,10 +1827,11 @@ pub fn new_ulid(path: &Path) -> String {
     bytes[5] = (timestamp_ms & 0xff) as u8;
 
     let seed = format!(
-        "{}:{}:{}",
+        "{}:{}:{}:{}",
         path.display(),
         std::process::id(),
-        now.as_nanos()
+        now.as_nanos(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
     );
     let digest = Sha256::digest(seed.as_bytes());
     bytes[6..].copy_from_slice(&digest[..10]);
@@ -2032,6 +2040,21 @@ mod tests {
     use std::path::Path;
     #[cfg(windows)]
     use std::path::PathBuf;
+
+    #[test]
+    fn ulids_are_distinct_with_a_fixed_clock() {
+        let now = std::time::Duration::from_nanos(1_789_000_000_123_456_000);
+        let ids: Vec<_> = (0..8)
+            .map(|_| super::new_ulid_at(Path::new("same-path"), now))
+            .collect();
+
+        assert!(ids.iter().all(|id| super::is_ulid(id)));
+        assert!(ids.iter().all(|id| id[..10] == ids[0][..10]));
+        assert_eq!(
+            ids.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            ids.len()
+        );
+    }
 
     #[test]
     fn planned_store_gate_is_required_empty_and_read_only_validation_never_repairs_it() {
