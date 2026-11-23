@@ -31,6 +31,8 @@ const TIMEOUT: Duration = Duration::from_secs(45);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_OUTPUT: usize = 128 * 1024;
 
+mod platform;
+
 /// Inputs for a real native scheduler case.  `required_allow_native_service`
 /// is intentionally not inferred from environment: the CLI boundary must
 /// receive an explicit affirmative option from its workflow wiring.
@@ -128,7 +130,22 @@ fn run(
         .to_owned();
     cleanup.created_id = Some(id.clone());
     assert_status(&options.binary, &private, &root, true, false, "stopped")?;
-    expect_failure(
+    let conflict = cli(
+        &options.binary,
+        &private,
+        Some(&root),
+        &[
+            "watch",
+            "--root",
+            path_arg(&root)?,
+            "service",
+            "install",
+            "--reconcile-interval-seconds",
+            "2",
+        ],
+    )?;
+    check_install_conflict(conflict.status.success(), &conflict.stderr)?;
+    let repeated = cli_json(
         &options.binary,
         &private,
         Some(&root),
@@ -142,6 +159,8 @@ fn run(
             "1",
         ],
     )?;
+    check_unchanged_install(&repeated, &id)?;
+    assert_status(&options.binary, &private, &root, true, false, "stopped")?;
 
     cli_json(
         &options.binary,
@@ -150,6 +169,7 @@ fn run(
         &["watch", "--root", path_arg(&root)?, "service", "start"],
     )?;
     let first_pid = wait_running(&options.binary, &private, &root)?;
+    let native_definition = platform::registered_definition(&private, &id)?;
     wait_search(
         &options.binary,
         &private,
@@ -175,7 +195,7 @@ fn run(
         &["watch", "--root", path_arg(&root)?, "service", "stop"],
     )?;
     wait_stopped(&options.binary, &private, &root)?;
-    assert_pid_absent(first_pid)?;
+    platform::assert_pid_absent(first_pid)?;
     let stopped = "KIO_NATIVE_SERVICE_STOPPED_CHANGE";
     fs::write(root.join("stopped-change.txt"), stopped).map_err(io)?;
     assert_not_searchable(&options.binary, &private, &root, stopped)?;
@@ -198,7 +218,7 @@ fn run(
         &["watch", "--root", path_arg(&root)?, "service", "stop"],
     )?;
     wait_stopped(&options.binary, &private, &root)?;
-    assert_pid_absent(second_pid)?;
+    platform::assert_pid_absent(second_pid)?;
     cli_json(
         &options.binary,
         &private,
@@ -212,7 +232,12 @@ fn run(
         Some(&root),
         &["watch", "--root", path_arg(&root)?, "service", "status"],
     )?;
-    assert_native_unregistered(&private, &id)?;
+    match native_definition.symlink_metadata() {
+        Ok(_) => return Err(invalid("native service definition remains after uninstall")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io(error)),
+    }
+    platform::assert_native_unregistered(&id)?;
 
     if sha256_regular_file(&options.binary, MAX_BINARY_BYTES)?
         != options.expected.candidate.binary_sha256
@@ -319,10 +344,42 @@ fn expect_failure(
     args: &[&str],
 ) -> Result<(), AcceptanceError> {
     if cli(binary, private, root, args)?.status.success() {
-        Err(invalid("native service operation unexpectedly succeeded"))
+        Err(invalid(format!(
+            "native service operation unexpectedly succeeded: {}",
+            args.join(" ")
+        )))
     } else {
         Ok(())
     }
+}
+
+fn check_install_conflict(succeeded: bool, stderr: &str) -> Result<(), AcceptanceError> {
+    let error: Value = serde_json::from_str(stderr).unwrap_or(Value::Null);
+    if succeeded
+        || error.get("error_code").and_then(Value::as_str) != Some("KIO-E-WATCH-SERVICE-001")
+        || !error
+            .get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| {
+                message.starts_with("watch service definition differs; use install --replace")
+            })
+    {
+        return Err(invalid(
+            "unapproved watch service definition change was not rejected as a conflict",
+        ));
+    }
+    Ok(())
+}
+
+fn check_unchanged_install(install: &Value, id: &str) -> Result<(), AcceptanceError> {
+    if install.get("service_id").and_then(Value::as_str) != Some(id)
+        || install.get("native_registration").and_then(Value::as_str) != Some("unchanged")
+    {
+        return Err(invalid(
+            "identical watch service install did not preserve the registration",
+        ));
+    }
+    Ok(())
 }
 fn cli(
     binary: &Path,
@@ -511,116 +568,6 @@ fn private_dir(_path: &Path) -> Result<(), AcceptanceError> {
     Ok(())
 }
 
-fn assert_pid_absent(pid: u32) -> Result<(), AcceptanceError> {
-    #[cfg(unix)]
-    {
-        if unsafe { libc::kill(pid as i32, 0) } == 0 {
-            return Err(invalid("watcher process remains after stop"));
-        }
-    }
-    #[cfg(windows)]
-    {
-        let mut command = Command::new("tasklist.exe");
-        command.args(["/FI", &format!("PID eq {pid}"), "/NH"]);
-        let output = run_bounded_command(
-            &mut command,
-            BoundedProcessOptions {
-                timeout: COMMAND_TIMEOUT,
-                max_stdout_bytes: MAX_OUTPUT,
-                max_stderr_bytes: MAX_OUTPUT,
-            },
-            None,
-        )
-        .map_err(|e| AcceptanceError::Command(e.to_string()))?;
-        if output.status.success() && output.stdout.contains(&pid.to_string()) {
-            return Err(invalid("watcher process remains after stop"));
-        }
-    }
-    Ok(())
-}
-fn assert_native_unregistered(private: &Path, id: &str) -> Result<(), AcceptanceError> {
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        let unit = private
-            .join("xdg-config/systemd/user")
-            .join(format!("{id}.service"));
-        if unit.exists() {
-            return Err(invalid("systemd unit remains after uninstall"));
-        }
-        let mut command = Command::new("/usr/bin/systemctl");
-        command.args(["--user", "is-enabled", id]);
-        if run_bounded_command(
-            &mut command,
-            BoundedProcessOptions {
-                timeout: COMMAND_TIMEOUT,
-                max_stdout_bytes: MAX_OUTPUT,
-                max_stderr_bytes: MAX_OUTPUT,
-            },
-            None,
-        )
-        .map_err(|e| AcceptanceError::Command(e.to_string()))?
-        .status
-        .success()
-        {
-            return Err(invalid("systemd still enables service after uninstall"));
-        }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let plist = private
-            .join("Library/LaunchAgents")
-            .join(format!("{id}.plist"));
-        if plist.exists() {
-            return Err(invalid("launchd plist remains after uninstall"));
-        }
-        let target = format!("gui/{}/{}", unsafe { libc::geteuid() }, id);
-        let mut command = Command::new("/bin/launchctl");
-        command.args(["print", &target]);
-        if run_bounded_command(
-            &mut command,
-            BoundedProcessOptions {
-                timeout: COMMAND_TIMEOUT,
-                max_stdout_bytes: MAX_OUTPUT,
-                max_stderr_bytes: MAX_OUTPUT,
-            },
-            None,
-        )
-        .map_err(|e| AcceptanceError::Command(e.to_string()))?
-        .status
-        .success()
-        {
-            return Err(invalid("launchd still has service after uninstall"));
-        }
-    }
-    #[cfg(windows)]
-    {
-        let xml = private
-            .join("xdg-data/kio/watch-services-native")
-            .join(format!("{id}.xml"));
-        if xml.exists() {
-            return Err(invalid("Task Scheduler XML remains after uninstall"));
-        }
-        let mut command = Command::new("schtasks.exe");
-        command.args(["/query", "/tn", id]);
-        if run_bounded_command(
-            &mut command,
-            BoundedProcessOptions {
-                timeout: COMMAND_TIMEOUT,
-                max_stdout_bytes: MAX_OUTPUT,
-                max_stderr_bytes: MAX_OUTPUT,
-            },
-            None,
-        )
-        .map_err(|e| AcceptanceError::Command(e.to_string()))?
-        .status
-        .success()
-        {
-            return Err(invalid("Task Scheduler still has service after uninstall"));
-        }
-    }
-    Ok(())
-}
-
 struct Cleanup {
     binary: PathBuf,
     private: PathBuf,
@@ -659,5 +606,34 @@ impl Drop for Cleanup {
                 &["watch", "--root", root, "service", "uninstall"],
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identical_install_must_preserve_the_same_registration() {
+        let result = serde_json::json!({
+            "service_id": "same-id",
+            "native_registration": "unchanged",
+        });
+        assert!(check_unchanged_install(&result, "same-id").is_ok());
+        assert!(check_unchanged_install(&result, "different-id").is_err());
+        let mut result = result;
+        result["native_registration"] = Value::from("enabled_not_started");
+        assert!(check_unchanged_install(&result, "same-id").is_err());
+    }
+
+    #[test]
+    fn changed_install_requires_the_definition_conflict_error() {
+        let conflict = r#"{"error_code":"KIO-E-WATCH-SERVICE-001","message":"watch service definition differs; use install --replace to review and confirm the update"}"#;
+        assert!(check_install_conflict(false, conflict).is_ok());
+        assert!(check_install_conflict(true, conflict).is_err());
+        assert!(check_install_conflict(false, "scheduler was not available").is_err());
+        assert!(
+            check_install_conflict(false, r#"{"error_code":"KIO-E-WATCH-SERVICE-001"}"#).is_err()
+        );
     }
 }
