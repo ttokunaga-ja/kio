@@ -34,9 +34,10 @@ use crate::office_runtime_identity::{
     ExecutableFingerprint, RuntimeSnapshot, check_verification_deadline,
 };
 use crate::platform::{
-    DEFAULT_OFFICE_CONVERTER_PROGRAM, OFFICE_LAUNCH_PROFILE, OFFICE_REDIRECT_SHARED_CACHE,
-    OfficeRuntime, file_url, finish_scratch, office_conversion_paths, office_render_sandbox,
-    private_temp_dir, restrict_renderer_state_directory, scratch_recovery_note,
+    DEFAULT_OFFICE_CONVERTER_PROGRAM, OFFICE_LAUNCH_PROFILE, OFFICE_QUERY_VERSION,
+    OFFICE_REDIRECT_SHARED_CACHE, OfficeRuntime, file_url, finish_scratch, office_conversion_paths,
+    office_render_sandbox, private_temp_dir, restrict_renderer_state_directory,
+    scratch_recovery_note,
 };
 use crate::{AdapterError, Result};
 
@@ -329,7 +330,9 @@ fn probe_real_converter_diagnostic(
     )?;
     renderer.verify_initial_runtime(deadline)?;
     let version = probe_renderer_capability(
-        || renderer.renderer_version(deadline),
+        // The Windows GUI launcher opens a separate console for --version
+        // and waits for input. Conversion readiness does not use that query.
+        OFFICE_QUERY_VERSION.then_some(|| renderer.renderer_version(deadline)),
         |fixture, media_type| {
             renderer.render_pdf(fixture, media_type, MAX_OFFICE_PROBE_PDF_BYTES, deadline)
         },
@@ -474,7 +477,7 @@ fn advisory_version_output(
 }
 
 fn probe_renderer_capability(
-    query_version: impl FnOnce() -> Result<String>,
+    query_version: Option<impl FnOnce() -> Result<String>>,
     mut convert_fixture: impl FnMut(&[u8], &str) -> Result<Vec<u8>>,
     deadline: Instant,
 ) -> Result<String> {
@@ -504,7 +507,10 @@ fn probe_renderer_capability(
             )));
         }
     }
-    let stdout = query_version()?;
+    let stdout = query_version
+        .map(|query| query())
+        .transpose()?
+        .unwrap_or_default();
     Ok(stdout
         .lines()
         .map(str::trim)
@@ -2066,7 +2072,7 @@ mod tests {
     fn probe_requires_both_fixture_conversions_without_a_version_line() {
         let mut media_types = Vec::new();
         let version = probe_renderer_capability(
-            || Ok("  \r\n".to_owned()),
+            Some(|| Ok("  \r\n".to_owned())),
             |bytes, media_type| {
                 crate::ooxml_package::validate_real_office_package(bytes, media_type)?;
                 media_types.push(media_type.to_owned());
@@ -2091,7 +2097,7 @@ mod tests {
 
     fn probe_captured_libreoffice_pdfs(presentation: &[u8]) -> Result<String> {
         probe_renderer_capability(
-            || Ok("LibreOffice 24.2".to_owned()),
+            Some(|| Ok("LibreOffice 24.2".to_owned())),
             |_, media_type| match media_type {
                 DOCX_MEDIA_TYPE => Ok(LIBREOFFICE_DOCX_PROBE_PDF.to_vec()),
                 PPTX_MEDIA_TYPE => Ok(presentation.to_vec()),
@@ -2256,7 +2262,7 @@ mod tests {
     #[test]
     fn probe_refuses_large_renderer_output_before_decoding() {
         let result = probe_renderer_capability(
-            || panic!("version queried with oversized PDF"),
+            Some(|| panic!("version queried with oversized PDF")),
             |_, media| {
                 let mut pdf = rendered_probe_fixture(media);
                 pdf.resize(MAX_OFFICE_PROBE_PDF_BYTES + 1, b' ');
@@ -2275,7 +2281,7 @@ mod tests {
     #[test]
     fn probe_rejects_unreachable_page_with_pdf_markers() {
         let result = probe_renderer_capability(
-            || Ok("test renderer".to_owned()),
+            Some(|| Ok("test renderer".to_owned())),
             |_, _| Ok(b"%PDF-1.4\n1 0 obj\n<< /Type /Page >>\nendobj\n%%EOF\n".to_vec()),
             test_deadline(),
         );
@@ -2309,6 +2315,22 @@ mod tests {
     }
 
     #[test]
+    fn probe_without_version_query_still_requires_both_conversions() {
+        let mut converted = Vec::new();
+        let version = probe_renderer_capability(
+            None::<fn() -> Result<String>>,
+            |_, media_type| {
+                converted.push(media_type.to_owned());
+                Ok(rendered_probe_fixture(media_type))
+            },
+            test_deadline(),
+        )
+        .unwrap();
+        assert_eq!(converted, [DOCX_MEDIA_TYPE, PPTX_MEDIA_TYPE]);
+        assert_eq!(version, "unknown");
+    }
+
+    #[test]
     fn probe_preserves_capability_after_clean_version_timeout_or_output_limit() {
         for error in [
             BoundedProcessError::Timeout { timeout_ms: 10 },
@@ -2318,10 +2340,10 @@ mod tests {
             },
         ] {
             let version = probe_renderer_capability(
-                || {
+                Some(|| {
                     advisory_version_output(Err(error.into()))
                         .map_err(|error| AdapterError::ContractViolation(error.to_string()))
-                },
+                }),
                 |_, media_type| Ok(rendered_probe_fixture(media_type)),
                 test_deadline(),
             );
@@ -2334,7 +2356,7 @@ mod tests {
     #[test]
     fn probe_rejects_pptx_pdf_with_docx_content_even_with_a_version_line() {
         let error = probe_renderer_capability(
-            || Ok("LibreOffice 26.8.0.3".to_owned()),
+            Some(|| Ok("LibreOffice 26.8.0.3".to_owned())),
             |_, _| Ok(probe_pdf(DOCX_PROBE_TEXT, false)),
             test_deadline(),
         )
@@ -2360,7 +2382,7 @@ mod tests {
     #[test]
     fn probe_rejects_an_expired_budget_before_rendering() {
         let result = probe_renderer_capability(
-            || panic!("version queried after the deadline"),
+            Some(|| panic!("version queried after the deadline")),
             |_, _| panic!("renderer invoked after the deadline"),
             Instant::now(),
         );
@@ -2371,7 +2393,7 @@ mod tests {
     fn probe_checks_remaining_budget_again_after_reading_output() {
         let deadline = Instant::now() + Duration::from_millis(50);
         let result = probe_renderer_capability(
-            || panic!("version queried after the deadline"),
+            Some(|| panic!("version queried after the deadline")),
             |_, _| {
                 std::thread::sleep(
                     deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(1),

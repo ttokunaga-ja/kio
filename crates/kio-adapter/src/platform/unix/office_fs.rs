@@ -6,6 +6,7 @@ use std::{ffi::OsString, path::Path};
 
 pub(crate) const OFFICE_LAUNCH_PROFILE: &[u8] = b"";
 pub(crate) const OFFICE_REDIRECT_SHARED_CACHE: bool = false;
+pub(crate) const OFFICE_QUERY_VERSION: bool = true;
 
 pub(crate) fn office_render_sandbox(
     sources: &RenderSources,

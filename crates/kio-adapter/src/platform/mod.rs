@@ -18,16 +18,16 @@ pub(crate) use macos::office::{
 };
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) use unix::office_fs::{
-    OFFICE_LAUNCH_PROFILE, OFFICE_REDIRECT_SHARED_CACHE, file_url, finish_scratch,
-    office_conversion_paths, office_render_sandbox, restrict_renderer_state_directory,
-    scratch_recovery_note,
+    OFFICE_LAUNCH_PROFILE, OFFICE_QUERY_VERSION, OFFICE_REDIRECT_SHARED_CACHE, file_url,
+    finish_scratch, office_conversion_paths, office_render_sandbox,
+    restrict_renderer_state_directory, scratch_recovery_note,
 };
 #[cfg(all(test, target_os = "windows"))]
 pub(crate) use windows::office::renderer_environment;
 #[cfg(target_os = "windows")]
 pub(crate) use windows::office::{
-    OFFICE_LAUNCH_PROFILE, OFFICE_REDIRECT_SHARED_CACHE, OfficeRuntime, file_url, finish_scratch,
-    office_conversion_paths, office_render_sandbox, private_temp_dir,
+    OFFICE_LAUNCH_PROFILE, OFFICE_QUERY_VERSION, OFFICE_REDIRECT_SHARED_CACHE, OfficeRuntime,
+    file_url, finish_scratch, office_conversion_paths, office_render_sandbox, private_temp_dir,
     restrict_renderer_state_directory, scratch_recovery_note,
 };
 

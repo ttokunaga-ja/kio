@@ -307,10 +307,12 @@ trust 判定はローカル情報で行い、publisher 名やインストーラ�
 両 OS とも検証した runtime の配置と実体を probe・変換に結び付ける。macOS の bundle 内のリンクは
 bundle の内側に閉じる。Windows は署名を持たない下位の PE image も配置全体の同一性検証に含め、
 配置内の reparse point と複数の hard link を持つファイルを拒否する。
-Windows の Office renderer は AppContainer を使わず、専用の Job で readiness probe、version 照会、
+Windows の Office renderer は AppContainer を使わず、専用の Job で readiness probe と
 実変換を実行する（D-20261122-02）。Office は呼出し元ユーザーの権限でファイル、レジストリ、IPC、
 ネットワークにアクセスできる。Job はそれらのアクセスを制限しない。この実行条件を Windows Office の
 準備 profile に結び付ける。
+Windows は、GUI launcher の `--version` がコンソール入力を待つため、別プロセスでの version 照会を省略し、
+provenance の version を `unknown` とする。DOCX と PPTX の両方の実変換で readiness を判定する。
 version 応答の形式差だけを「未導入」と扱わず、検出済みだが利用不能なら具体的な理由を表示する。
 CI の配布物 SHA pin は再現性のため維持し、製品の一般的な版許可リストにはしない。
 
