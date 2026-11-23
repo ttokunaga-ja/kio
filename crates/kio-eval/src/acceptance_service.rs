@@ -544,7 +544,9 @@ fn assert_not_searchable(
     root: &Path,
     marker: &str,
 ) -> Result<(), AcceptanceError> {
-    if search_has(binary, private, root, marker)? {
+    // A just-stopped watcher can leave the search replica rebuilding; wait
+    // until search answers, then require the marker to be absent.
+    if wait_until(|| search_has(binary, private, root, marker))? {
         Err(invalid(
             "content changed while stopped was indexed before restart",
         ))

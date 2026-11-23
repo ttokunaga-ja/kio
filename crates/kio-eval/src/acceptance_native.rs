@@ -1193,13 +1193,11 @@ fn create_boundary_link(link: &Path, target: &Path) -> Result<(), AcceptanceErro
     }
     let link = drive_spelling(link, "path")?;
     let target = drive_spelling(target, "target")?;
+    // `args` would escape the inner quotes as `\"`, which cmd does not parse;
+    // pass the command line verbatim (`/S` strips the outer quotes).
+    use std::os::windows::process::CommandExt as _;
     let output = Command::new("cmd")
-        .args([
-            "/D",
-            "/S",
-            "/C",
-            &format!("mklink /J \"{link}\" \"{target}\""),
-        ])
+        .raw_arg(format!("/D /S /C \"mklink /J \"{link}\" \"{target}\"\""))
         .output()
         .map_err(io)?;
     if output.status.success() {
