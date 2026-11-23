@@ -20,12 +20,19 @@ use thiserror::Error;
 
 use crate::{
     acceptance::NativeOs,
-    runner::{BoundedProcessOptions, run_bounded_command},
+    runner::{BoundedProcessError, BoundedProcessOptions, run_bounded_command},
 };
 
 const MAX_CAPTURE_BYTES: usize = 16 * 1024;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_CONVERTER_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const TASK_SCHEDULER_PROBE: &str = r#"
+$ErrorActionPreference = 'Stop'
+$service = New-Object -ComObject 'Schedule.Service'
+$service.Connect()
+$folder = $service.GetFolder('\')
+if ($folder.Path -ne '\') { throw 'Task Scheduler root folder is unavailable' }
+"#;
 
 #[derive(Debug, Clone)]
 pub struct PreflightOptions {
@@ -294,17 +301,42 @@ fn check_windows(report: &mut PreflightReport) {
     let system_root = std::env::var_os("SystemRoot")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"C:\\Windows"));
-    let schtasks = system_root.join("System32").join("schtasks.exe");
-    let sc = system_root.join("System32").join("sc.exe");
-    if schtasks.is_file() {
-        let check = command_record(&schtasks, &["/query", "/fo", "LIST"]);
-        require(&check, "Task Scheduler query failed", &mut report.failures);
+    check_windows_scheduler(report, &system_root.join("System32"), command_record);
+}
+
+fn check_windows_scheduler(
+    report: &mut PreflightReport,
+    system_dir: &Path,
+    mut query: impl FnMut(&Path, &[&str]) -> CommandRecord,
+) {
+    // Reach the same service and root folder used by watch registration
+    // without enumerating tasks or requiring any particular task to exist.
+    let powershell = system_dir.join("WindowsPowerShell/v1.0/powershell.exe");
+    let sc = system_dir.join("sc.exe");
+    if powershell.is_file() {
+        let check = query(
+            &powershell,
+            &[
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                TASK_SCHEDULER_PROBE,
+            ],
+        );
+        require(
+            &check,
+            "Task Scheduler COM root query failed",
+            &mut report.failures,
+        );
         report.checks.push(check);
     } else {
-        report.failures.push("schtasks.exe is unavailable".into());
+        report
+            .failures
+            .push("Windows PowerShell is unavailable for the Task Scheduler COM query".into());
     }
     if sc.is_file() {
-        let check = command_record(&sc, &["query", "Schedule"]);
+        let check = query(&sc, &["query", "Schedule"]);
         require(
             &check,
             "Task Scheduler service query failed",
@@ -352,13 +384,19 @@ fn command_record(program: &Path, args: &[&str]) -> CommandRecord {
             stderr: Some(output.stderr),
             error: None,
         },
-        Err(_) => CommandRecord {
+        Err(error) => CommandRecord {
             argv,
             ok: false,
             returncode: None,
             stdout: None,
             stderr: None,
-            error: Some("bounded command did not complete"),
+            error: Some(match error {
+                BoundedProcessError::OutputLimit { .. } => {
+                    "bounded command exceeded its output limit"
+                }
+                BoundedProcessError::Timeout { .. } => "bounded command timed out",
+                _ => "bounded command did not complete",
+            }),
         },
     }
 }
@@ -389,8 +427,78 @@ fn write_create_only(path: &Path, report: &PreflightReport) -> Result<(), Prefli
 mod tests {
     use std::path::Path;
 
-    use super::{host_matches, office_version_program, sha256_file};
-    use crate::acceptance::NativeOs;
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn preflight_distinguishes_output_overflow_from_timeout() {
+        let check = command_record(Path::new("/usr/bin/yes"), &[]);
+        assert!(!check.ok);
+        assert_eq!(
+            check.error,
+            Some("bounded command exceeded its output limit")
+        );
+    }
+
+    #[test]
+    fn scheduler_preflight_requires_both_com_root_access_and_running_service() {
+        let system_dir = tempfile::tempdir().unwrap();
+        let powershell = system_dir
+            .path()
+            .join("WindowsPowerShell/v1.0/powershell.exe");
+        let sc = system_dir.path().join("sc.exe");
+        fs::create_dir_all(powershell.parent().unwrap()).unwrap();
+        File::create(&powershell).unwrap();
+        File::create(&sc).unwrap();
+        for (com_ok, service_running, passed) in [
+            (true, true, true),
+            (false, true, false),
+            (true, false, false),
+        ] {
+            let mut report = PreflightReport {
+                schema: "",
+                runner_os: NativeOs::Windows,
+                host_os: std::env::consts::OS,
+                checks: Vec::new(),
+                failures: Vec::new(),
+                office_converter: None,
+                status: "failed",
+            };
+            check_windows_scheduler(&mut report, system_dir.path(), |program, args| {
+                let (ok, stdout) = if program == powershell {
+                    assert_eq!(
+                        &args[..4],
+                        &["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]
+                    );
+                    assert!(args[4].contains("$service.Connect()"));
+                    assert!(args[4].contains(r"$service.GetFolder('\')"));
+                    assert!(!args[4].contains("GetTasks"));
+                    (com_ok, "")
+                } else {
+                    assert_eq!(program, sc);
+                    assert_eq!(args, &["query", "Schedule"]);
+                    (
+                        true,
+                        if service_running {
+                            "STATE : 4 RUNNING"
+                        } else {
+                            "STATE : 1 STOPPED"
+                        },
+                    )
+                };
+                CommandRecord {
+                    argv: Vec::new(),
+                    ok,
+                    returncode: None,
+                    stdout: Some(stdout.into()),
+                    stderr: None,
+                    error: None,
+                }
+            });
+            assert_eq!(report.checks.len(), 2);
+            assert_eq!(report.failures.is_empty(), passed);
+        }
+    }
 
     #[test]
     fn converter_hash_streams_with_stack_headroom() {
