@@ -1,17 +1,17 @@
 //! Complete systemd source comparison, shared with the scheduler fixtures.
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use kio_core::Result;
 use serde::Deserialize;
 
-use crate::watch_service::{service_error, validate_argument_path};
+use crate::watch_service::service_error;
 
-pub(crate) fn persistent_unit_path(unit_path_json: &str, name: &str) -> Result<PathBuf> {
+pub(crate) fn persistent_unit_directory(unit_path_json: &str) -> Result<String> {
     #[derive(Deserialize)]
     struct UnitPath {
         #[serde(rename = "type")]
         signature: String,
-        data: Vec<PathBuf>,
+        data: Vec<String>,
     }
 
     let paths: UnitPath = serde_json::from_str(unit_path_json).map_err(service_error)?;
@@ -24,19 +24,17 @@ pub(crate) fn persistent_unit_path(unit_path_json: &str, name: &str) -> Result<P
     let mut candidates = paths
         .data
         .iter()
-        .filter(|path| path.is_absolute() && path.ends_with("systemd/user.control"))
-        .filter(|path| !paths.data.contains(&path.with_file_name("transient")))
-        .map(|path| path.with_file_name("user"))
+        .filter(|path| path.starts_with('/'))
+        .filter_map(|path| path.strip_suffix("/systemd/user.control"))
+        .filter(|base| !paths.data.contains(&format!("{base}/systemd/transient")))
+        .map(|base| format!("{base}/systemd/user"))
         .filter(|path| paths.data.contains(path));
-    let directory = candidates
+    candidates
         .next()
         .filter(|_| candidates.next().is_none())
         .ok_or_else(|| {
             service_error("systemd did not expose a unique persistent user unit directory")
-        })?;
-    let path = directory.join(name);
-    validate_argument_path(&path)?;
-    Ok(path)
+        })
 }
 
 pub(crate) fn unit_definition_matches(observed: &str, path: &Path, definition: &str) -> bool {
@@ -55,8 +53,8 @@ mod tests {
             "/home/Runner Account/.config/systemd/user","/etc/systemd/user",
             "/run/user/1001/systemd/user","/usr/lib/systemd/user"]}"#;
         assert_eq!(
-            persistent_unit_path(json, "io.kio.watch.example.service").unwrap(),
-            Path::new("/home/Runner Account/.config/systemd/user/io.kio.watch.example.service")
+            persistent_unit_directory(json).unwrap(),
+            "/home/Runner Account/.config/systemd/user"
         );
     }
 
@@ -64,10 +62,17 @@ mod tests {
     fn rejects_runtime_only_and_ambiguous_manager_paths() {
         let runtime = r#"{"type":"as","data":["/run/user/1001/systemd/user.control",
             "/run/user/1001/systemd/transient","/run/user/1001/systemd/user"]}"#;
-        assert!(persistent_unit_path(runtime, "example.service").is_err());
+        assert!(persistent_unit_directory(runtime).is_err());
         let ambiguous = r#"{"type":"as","data":["/a/systemd/user.control",
             "/a/systemd/user","/b/systemd/user.control","/b/systemd/user"]}"#;
-        assert!(persistent_unit_path(ambiguous, "example.service").is_err());
+        assert!(persistent_unit_directory(ambiguous).is_err());
+    }
+
+    #[test]
+    fn rejects_drive_absolute_paths_as_non_posix() {
+        let json =
+            r#"{"type":"as","data":["C:/home/systemd/user.control","C:/home/systemd/user"]}"#;
+        assert!(persistent_unit_directory(json).is_err());
     }
 
     #[test]

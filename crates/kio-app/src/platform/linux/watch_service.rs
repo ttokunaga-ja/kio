@@ -186,10 +186,10 @@ pub(crate) fn native_definition_path(
         ]
         .map(str::to_owned),
     )?;
-    super::watch_systemd_unit::persistent_unit_path(
-        &output.stdout,
-        &format!("{id}.{NATIVE_DEFINITION_EXTENSION}"),
-    )
+    let directory = super::watch_systemd_unit::persistent_unit_directory(&output.stdout)?;
+    let path = PathBuf::from(directory).join(format!("{id}.{NATIVE_DEFINITION_EXTENSION}"));
+    crate::watch_service::validate_argument_path(&path)?;
+    Ok(path)
 }
 
 pub(crate) fn render_definition(

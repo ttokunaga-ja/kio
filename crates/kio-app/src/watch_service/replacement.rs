@@ -462,7 +462,11 @@ mod tests {
             xdg_cache_home: base.join("cache"),
         };
         old.id = stable_id(&old.scope_id, &old.root);
-        old.native_path = base.join(format!("{}.{NATIVE_DEFINITION_EXTENSION}", old.id));
+        // Keep the fixture private while retaining the Task Scheduler cache anchor.
+        old.native_path = crate::platform::watch_task_definition::native_task_cache_path(
+            &old.environment.xdg_data_home,
+            &format!("{}.{NATIVE_DEFINITION_EXTENSION}", old.id),
+        );
         old.definition = render_definition(
             &old.id,
             &old.binary,

@@ -45,10 +45,10 @@ pub(crate) fn native_definition_path(
     id: &str,
     environment: &ServiceEnvironment,
 ) -> Result<PathBuf> {
-    Ok(environment
-        .xdg_data_home
-        .join("kio/watch-services-native")
-        .join(format!("{id}.{NATIVE_DEFINITION_EXTENSION}")))
+    Ok(super::watch_task_definition::native_task_cache_path(
+        &environment.xdg_data_home,
+        &format!("{id}.{NATIVE_DEFINITION_EXTENSION}"),
+    ))
 }
 
 pub(crate) fn render_definition(

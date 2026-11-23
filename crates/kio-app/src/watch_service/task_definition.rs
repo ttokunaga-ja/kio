@@ -35,6 +35,13 @@ pub(crate) fn task_lookup(hresult: u32) -> Result<bool> {
     }
 }
 
+pub(crate) fn native_task_cache_path(
+    data_home: &std::path::Path,
+    name: &str,
+) -> std::path::PathBuf {
+    data_home.join("kio/watch-services-native").join(name)
+}
+
 pub(crate) fn manifest_anchor_from_cache(
     id: &str,
     cache: &std::path::Path,
@@ -97,14 +104,17 @@ mod tests {
 
     #[test]
     fn manifest_anchor_is_independent_of_the_watcher_environment() {
-        let root = std::env::current_dir().unwrap().join("old-data/kio");
+        let data_home = std::env::current_dir().unwrap().join("old-data");
         let id = "io.kio.watch.abc";
-        let cache = root.join("watch-services-native").join(format!("{id}.xml"));
+        let cache = native_task_cache_path(&data_home, &format!("{id}.xml"));
         assert_eq!(
             manifest_anchor_from_cache(id, &cache).unwrap(),
-            root.join("watch-services").join(format!("{id}.json"))
+            data_home
+                .join("kio/watch-services")
+                .join(format!("{id}.json"))
         );
         assert!(manifest_anchor_from_cache("io.kio.watch.foreign", &cache).is_err());
+        assert!(manifest_anchor_from_cache(id, &data_home.join(format!("{id}.xml"))).is_err());
     }
 
     #[test]
