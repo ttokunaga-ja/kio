@@ -735,9 +735,7 @@ fn run_ledger_experiments(options: &FaultOptions, work: &Path) -> Result<(), Acc
         let device = Device::create_named(work, name)?;
         run_release(options, &device, &["--json", "init"])?;
         run_release(options, &device, &["--json", "ledger", "init"])?;
-        let backup = device.home.join("ledger-backup");
-        fs::create_dir(&backup).map_err(io)?;
-        private_dir(&backup)?;
+        let backup = device.create_ledger_backup_directory()?;
         if is_ledger_write_fault(point) {
             fs::write(
                 device.root.join("document.pdf"),
@@ -1177,6 +1175,16 @@ struct Device {
 }
 
 impl Device {
+    fn create_ledger_backup_directory(&self) -> Result<PathBuf, AcceptanceError> {
+        // Backup and restore check the destination itself, not just its parent.
+        let home = kio_core::store_dir::StoreDirectory::open(&self.home)
+            .map_err(|error| AcceptanceError::Io(error.to_string()))?;
+        let leaf = Path::new("ledger-backup");
+        home.create_directory(leaf)
+            .map_err(|error| AcceptanceError::Io(error.to_string()))?;
+        Ok(self.home.join(leaf))
+    }
+
     fn create_named(work: &Path, name: &str) -> Result<Self, AcceptanceError> {
         let base = work.join(name);
         let home = base.join("owner-private-home");
@@ -1326,6 +1334,17 @@ fn io(error: std::io::Error) -> AcceptanceError {
 mod publication_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn ledger_backup_fixture_is_an_empty_owner_private_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().canonicalize().unwrap();
+        let device = Device::create_named(&work, "ledger").unwrap();
+        let backup = device.create_ledger_backup_directory().unwrap();
+        kio_core::private_fs::verify_private_directory(&backup).unwrap();
+        assert!(fs::read_dir(&backup).unwrap().next().is_none());
+        assert!(device.create_ledger_backup_directory().is_err());
+    }
 
     #[test]
     fn publication_intent_rejects_wrong_authority_and_unknown_fields() {

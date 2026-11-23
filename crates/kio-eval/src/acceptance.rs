@@ -1804,7 +1804,15 @@ pub fn run_a06(options: &A06Options) -> Result<AcceptanceReceipt, AcceptanceErro
         if index == 0 {
             fs::remove_file(&sqlite).map_err(io_error)?;
         } else {
-            fs::write(&sqlite, b"A06 corrupted SQLite projection\n").map_err(io_error)?;
+            // Keep the product-created SQLite leaf and its private ACL.
+            // A missing projection is exercised separately above.
+            OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&sqlite)
+                .map_err(io_error)?
+                .write_all(b"A06 corrupted SQLite projection\n")
+                .map_err(io_error)?;
         }
     }
     let aggregator = isolated.join("xdg-data/cache/kio/aggregator.sqlite");

@@ -19,6 +19,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use kio_core::store_dir::{Publication, StoreDirectory};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
 
@@ -263,17 +264,26 @@ fn create_private_layout(work: &Path) -> Result<PathBuf, AcceptanceError> {
 }
 
 fn configure(private: &Path, endpoint: &str) -> Result<(), AcceptanceError> {
-    let config = private.join("xdg-config/kio");
-    if !config.exists() {
-        fs::create_dir(&config).map_err(io)?;
-        private_dir(&config)?;
+    let config_base = StoreDirectory::open(&private.join("xdg-config")).map_err(store_error)?;
+    let leaf = Path::new("kio");
+    let handle = if config_base.contains_entry(leaf).map_err(store_error)? {
+        config_base.open_directory(leaf)
+    } else {
+        config_base.create_directory(leaf)
     }
-    let tools = config.join("tools.toml");
+    .map_err(store_error)?;
+    let config = StoreDirectory::from_retained(handle, config_base.path().join(leaf))
+        .map_err(store_error)?;
     let body = format!(
         "[embedding.{TOOL_ID}]\nkind = \"offline_api\"\nurl = \"{endpoint}\"\nmodel = \"test-embedding\"\nwire_format = 'messages'\nmodel_version_pin = 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\nchat_template_hash = 'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'\ninstruction = ''\n"
     );
-    fs::write(&tools, body).map_err(io)?;
-    private_file(&tools)
+    config
+        .write_atomic(
+            Path::new("tools.toml"),
+            body.as_bytes(),
+            Publication::Upsert,
+        )
+        .map_err(store_error)
 }
 
 /// For the untrusted certificate case, prove the product attempted TLS rather
@@ -625,8 +635,22 @@ fn path_arg(path: &Path) -> Result<&str, AcceptanceError> {
         .ok_or_else(|| invalid("A04 path is not UTF-8"))
 }
 fn write_private(path: &Path, bytes: &[u8]) -> Result<(), AcceptanceError> {
-    fs::write(path, bytes).map_err(io)?;
-    private_file(path)
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid("private fixture has no parent"))?;
+    let leaf = path
+        .file_name()
+        .ok_or_else(|| invalid("private fixture has no filename"))?;
+    let store = StoreDirectory::open(parent).map_err(store_error)?;
+    let mut file = store
+        .create_private_file(Path::new(leaf))
+        .map_err(store_error)?;
+    file.write_all(bytes).map_err(|error| {
+        AcceptanceError::Io(format!(
+            "write private fixture '{}': {error}",
+            path.display()
+        ))
+    })
 }
 #[cfg(unix)]
 fn private_dir(path: &Path) -> Result<(), AcceptanceError> {
@@ -637,18 +661,38 @@ fn private_dir(path: &Path) -> Result<(), AcceptanceError> {
 fn private_dir(_: &Path) -> Result<(), AcceptanceError> {
     Ok(())
 }
-#[cfg(unix)]
-fn private_file(path: &Path) -> Result<(), AcceptanceError> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(io)
-}
-#[cfg(not(unix))]
-fn private_file(_: &Path) -> Result<(), AcceptanceError> {
-    Ok(())
+fn store_error(error: kio_core::KioError) -> AcceptanceError {
+    AcceptanceError::Io(error.to_string())
 }
 fn invalid(message: impl Into<String>) -> AcceptanceError {
     AcceptanceError::Invalid(message.into())
 }
 fn io(error: std::io::Error) -> AcceptanceError {
     AcceptanceError::Io(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kio_core::private_fs::{read_private_file_at, verify_private_directory};
+
+    #[test]
+    fn local_trust_inputs_are_private_from_creation_through_reconfiguration() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().canonicalize().unwrap();
+        let parent = StoreDirectory::open(&work).unwrap();
+        for (leaf, bytes) in [("ca-a.pem", b"ca-a"), ("ca-b.pem", b"ca-b")] {
+            write_private(&work.join(leaf), bytes).unwrap();
+            assert_eq!(read_private_file_at(&parent, leaf, 64).unwrap(), bytes);
+            assert!(write_private(&work.join(leaf), b"replacement").is_err());
+        }
+
+        let device = create_private_layout(&work).unwrap();
+        for endpoint in ["https://localhost:10001", "https://localhost:10002"] {
+            configure(&device, endpoint).unwrap();
+            let config = verify_private_directory(&device.join("xdg-config/kio")).unwrap();
+            let tools = read_private_file_at(&config, "tools.toml", 4096).unwrap();
+            assert!(std::str::from_utf8(&tools).unwrap().contains(endpoint));
+        }
+    }
 }
