@@ -194,7 +194,7 @@ fn run(
         Some(&root),
         &["watch", "--root", path_arg(&root)?, "service", "stop"],
     )?;
-    wait_stopped(&options.binary, &private, &root)?;
+    wait_stopped(&options.binary, &private, &root, &id)?;
     platform::assert_pid_absent(first_pid)?;
     let stopped = "KIO_NATIVE_SERVICE_STOPPED_CHANGE";
     fs::write(root.join("stopped-change.txt"), stopped).map_err(io)?;
@@ -217,7 +217,7 @@ fn run(
         Some(&root),
         &["watch", "--root", path_arg(&root)?, "service", "stop"],
     )?;
-    wait_stopped(&options.binary, &private, &root)?;
+    wait_stopped(&options.binary, &private, &root, &id)?;
     platform::assert_pid_absent(second_pid)?;
     cli_json(
         &options.binary,
@@ -461,8 +461,21 @@ fn wait_running(binary: &Path, private: &Path, root: &Path) -> Result<u32, Accep
             .ok_or_else(|| invalid("running service omitted its PID"))
     })
 }
-fn wait_stopped(binary: &Path, private: &Path, root: &Path) -> Result<(), AcceptanceError> {
-    wait_until(|| assert_status(binary, private, root, true, false, "stopped").map(|_| ()))
+fn wait_stopped(
+    binary: &Path,
+    private: &Path,
+    root: &Path,
+    _id: &str,
+) -> Result<(), AcceptanceError> {
+    wait_until(|| {
+        // Linux reports enabling at login through this flag. The unit file
+        // remains installed after stop, with UnitFileState=disabled.
+        let registered = !cfg!(target_os = "linux");
+        assert_status(binary, private, root, registered, false, "stopped")?;
+        #[cfg(target_os = "linux")]
+        platform::assert_disabled(_id)?;
+        Ok(())
+    })
 }
 fn wait_search(
     binary: &Path,

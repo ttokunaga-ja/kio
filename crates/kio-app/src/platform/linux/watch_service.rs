@@ -33,21 +33,8 @@ pub(crate) fn native_registration_absent(manifest: &ServiceManifest) -> Result<b
 }
 
 fn complete_source(manifest: &ServiceManifest) -> Result<String> {
-    let output = run_native_output(
-        systemctl_path()?,
-        [
-            "--user".into(),
-            "cat".into(),
-            "--no-pager".into(),
-            manifest.id.clone(),
-        ],
-    )?;
-    if !output.status.success() {
-        return Err(service_error(
-            "systemd could not read the complete service definition",
-        ));
-    }
-    Ok(output.stdout)
+    run_systemctl(["cat".into(), "--no-pager".into(), manifest.id.clone()])
+        .map(|output| output.stdout)
 }
 
 pub(crate) fn native_loaded_definition_matches(manifest: &ServiceManifest) -> Result<bool> {
@@ -55,22 +42,13 @@ pub(crate) fn native_loaded_definition_matches(manifest: &ServiceManifest) -> Re
         if query == "cat" {
             return complete_source(manifest);
         }
-        let output = run_native_output(
-            systemctl_path()?,
-            [
-                "--user".into(),
-                "show".into(),
-                "--property=NeedDaemonReload".into(),
-                "--value".into(),
-                manifest.id.clone(),
-            ],
-        )?;
-        if !output.status.success() {
-            return Err(service_error(
-                "systemd could not verify its loaded definition",
-            ));
-        }
-        Ok(output.stdout)
+        run_systemctl([
+            "show".into(),
+            "--property=NeedDaemonReload".into(),
+            "--value".into(),
+            manifest.id.clone(),
+        ])
+        .map(|output| output.stdout)
     })
 }
 
@@ -187,14 +165,31 @@ fn systemd_words(value: &str) -> Result<Vec<String>> {
     Ok(words)
 }
 
+pub(crate) const NATIVE_DEFINITION_EXTENSION: &str = "service";
+
 pub(crate) fn native_definition_path(
     id: &str,
-    environment: &ServiceEnvironment,
+    _environment: &ServiceEnvironment,
 ) -> Result<PathBuf> {
-    Ok(environment
-        .xdg_config_home
-        .join("systemd/user")
-        .join(format!("{id}.service")))
+    // The running user manager has its own XDG unit search path. The
+    // watcher's captured XDG config directory is only child configuration.
+    let output = run_native(
+        "/usr/bin/busctl",
+        [
+            "--user",
+            "--json=short",
+            "get-property",
+            "org.freedesktop.systemd1",
+            "/org/freedesktop/systemd1",
+            "org.freedesktop.systemd1.Manager",
+            "UnitPath",
+        ]
+        .map(str::to_owned),
+    )?;
+    super::watch_systemd_unit::persistent_unit_path(
+        &output.stdout,
+        &format!("{id}.{NATIVE_DEFINITION_EXTENSION}"),
+    )
 }
 
 pub(crate) fn render_definition(

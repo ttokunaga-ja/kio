@@ -45,10 +45,10 @@ mod watch_service;
 #[path = "windows/watch_service.rs"]
 mod watch_service;
 pub(crate) use watch_service::{
-    native_after_remove, native_definition_path, native_enable, native_loaded_definition_matches,
-    native_manifest_anchor, native_manifest_locator, native_prepare_replacement,
-    native_registration_absent, native_start, native_state, native_stop, native_uninstall,
-    render_definition,
+    NATIVE_DEFINITION_EXTENSION, native_after_remove, native_definition_path, native_enable,
+    native_loaded_definition_matches, native_manifest_anchor, native_manifest_locator,
+    native_prepare_replacement, native_registration_absent, native_start, native_state,
+    native_stop, native_uninstall, render_definition,
 };
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]

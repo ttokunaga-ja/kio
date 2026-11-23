@@ -228,6 +228,8 @@ pub(crate) fn native_loaded_definition_matches(manifest: &ServiceManifest) -> Re
         && observed.as_deref() == Some(expected.as_slice()))
 }
 
+pub(crate) const NATIVE_DEFINITION_EXTENSION: &str = "plist";
+
 pub(crate) fn native_definition_path(
     id: &str,
     _environment: &ServiceEnvironment,

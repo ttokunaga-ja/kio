@@ -25,6 +25,7 @@ OS のログインユーザー service への登録・起動は実装済みだ�
 `service install` は明示初期化済みの root だけを対象とし、現在のログインユーザーの scheduler に
 device-private manifest とともに登録する。登録時点での絶対・UTF-8 の `HOME`、`USERPROFILE`、
 `XDG_CONFIG_HOME`、`XDG_DATA_HOME`、`XDG_CACHE_HOME` を固定して watcher に適用する。
+Linux の unit は systemd ユーザーマネージャーが検索する永続設定ディレクトリに置く。
 Windows の scheduler 定義には環境値を格納せず、絶対 manifest locator を runner に渡す。
 runner は manifest、実行ファイル、managed root/scope、scheduler 定義を照合してから、
 子 watcher に限って環境を設定する。scheduler が runner を終了したときは watcher の孤立を防ぐ。
@@ -39,7 +40,9 @@ service ID ごとの private OS lock で install/start/stop/uninstall と manife
 `start` は watcher の OS instance lock が稼働中なら同じ scheduler 登録の再起動も拒否する。
 `start` と `stop` は scheduler の登録状態を変えてから開始／停止する。`stop` は再起動を無効にし、
 foreground の停止要求とは別に扱う。`status` は scheduler の登録状態と watcher の OS lock による
-稼働を別々に表示し、root が失われても稼働を確認する。`uninstall` は manifest と完全一致する登録だけを削除し、
+稼働を別々に表示し、root が失われても稼働を確認する。Linux の `native_registration.registered` は
+systemd の有効化状態を示す。停止中は無効になっても unit ファイルは残る。
+`uninstall` は manifest と完全一致する登録だけを削除し、
 queue を保持する。外部の登録や外部から変更された service 名・定義への lifecycle 操作は拒否する。
 
 service は `watch run` と同じ offline 照合を行い、egress・予算・秘密送信の承認を付与しない。

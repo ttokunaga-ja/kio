@@ -1,8 +1,6 @@
 use crate::platform::{runner_argv, watch_task_definition::xml_escape};
 use crate::response::watch::NativeServiceState;
-use crate::watch_service::{
-    ServiceEnvironment, ServiceManifest, invalid, service_error, validate_argument_path,
-};
+use crate::watch_service::{ServiceEnvironment, ServiceManifest, invalid, service_error};
 use kio_core::Result;
 use std::path::{Path, PathBuf};
 
@@ -41,16 +39,16 @@ pub(crate) fn native_manifest_locator(id: &str) -> Result<Option<PathBuf>> {
     super::watch_task_definition::manifest_from_arguments(&args).map(Some)
 }
 
+pub(crate) const NATIVE_DEFINITION_EXTENSION: &str = "xml";
+
 pub(crate) fn native_definition_path(
     id: &str,
     environment: &ServiceEnvironment,
 ) -> Result<PathBuf> {
-    let path = environment
+    Ok(environment
         .xdg_data_home
         .join("kio/watch-services-native")
-        .join(format!("{id}.xml"));
-    validate_argument_path(&path)?;
-    Ok(path)
+        .join(format!("{id}.{NATIVE_DEFINITION_EXTENSION}")))
 }
 
 pub(crate) fn render_definition(

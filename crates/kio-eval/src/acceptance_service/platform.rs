@@ -8,29 +8,15 @@ pub(super) use macos::*;
 mod windows;
 #[cfg(windows)]
 pub(super) use windows::*;
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+pub(super) use linux::*;
 
 #[cfg(unix)]
 pub(super) fn assert_pid_absent(pid: u32) -> Result<(), AcceptanceError> {
     if unsafe { libc::kill(pid as i32, 0) } == 0 {
         return Err(invalid("watcher process remains after stop"));
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-pub(super) fn registered_definition(private: &Path, id: &str) -> Result<PathBuf, AcceptanceError> {
-    Ok(private
-        .join("xdg-config/systemd/user")
-        .join(format!("{id}.service")))
-}
-
-#[cfg(target_os = "linux")]
-pub(super) fn assert_native_unregistered(id: &str) -> Result<(), AcceptanceError> {
-    if scheduler_query("/usr/bin/systemctl", &["--user", "is-enabled", id])?
-        .status
-        .success()
-    {
-        return Err(invalid("systemd still enables service after uninstall"));
     }
     Ok(())
 }

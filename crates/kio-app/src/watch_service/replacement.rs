@@ -462,7 +462,7 @@ mod tests {
             xdg_cache_home: base.join("cache"),
         };
         old.id = stable_id(&old.scope_id, &old.root);
-        old.native_path = native_definition_path(&old.id, &old.environment).unwrap();
+        old.native_path = base.join(format!("{}.{NATIVE_DEFINITION_EXTENSION}", old.id));
         old.definition = render_definition(
             &old.id,
             &old.binary,

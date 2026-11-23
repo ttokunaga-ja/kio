@@ -28,10 +28,10 @@ use sha2::{Digest, Sha256};
 use crate::commands::WatchServiceCommand;
 use crate::management::{binding_for_repo, open_existing_managed_root};
 use crate::platform::{
-    native_after_remove, native_definition_path, native_enable, native_loaded_definition_matches,
-    native_manifest_anchor, native_manifest_locator, native_prepare_replacement,
-    native_registration_absent, native_start, native_state, native_stop, native_uninstall,
-    render_definition, run_watch_service_runner,
+    NATIVE_DEFINITION_EXTENSION, native_after_remove, native_definition_path, native_enable,
+    native_loaded_definition_matches, native_manifest_anchor, native_manifest_locator,
+    native_prepare_replacement, native_registration_absent, native_start, native_state,
+    native_stop, native_uninstall, render_definition, run_watch_service_runner,
 };
 
 mod locator;
@@ -157,10 +157,10 @@ fn install(
     } else {
         manifest_locator(&id, &environment)?
     };
-    let native_path = located
-        .as_ref()
-        .map(|(_, _, m)| m.native_path.clone())
-        .unwrap_or(native_definition_path(&id, &environment)?);
+    let native_path = match &located {
+        Some((_, _, manifest)) => manifest.native_path.clone(),
+        None => native_definition_path(&id, &environment)?,
+    };
     let definition =
         render_definition(&id, &binary, &root, interval, &environment, &manifest_path)?;
     let manifest = ServiceManifest {
@@ -641,9 +641,9 @@ pub(crate) fn validate_manifest(manifest: &ServiceManifest) -> Result<()> {
     if manifest.definition.len() > 16_384 || manifest.definition.contains('\0') {
         return Err(service_error("watch service definition is invalid"));
     }
+    let native_name = format!("{}.{NATIVE_DEFINITION_EXTENSION}", manifest.id);
     if manifest.id != stable_id(&manifest.scope_id, &manifest.root)
-        || manifest.native_path.file_name()
-            != native_definition_path(&manifest.id, &manifest.environment)?.file_name()
+        || manifest.native_path.file_name() != Some(std::ffi::OsStr::new(&native_name))
         || manifest.definition
             != render_definition(
                 &manifest.id,
