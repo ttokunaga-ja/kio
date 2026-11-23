@@ -1,10 +1,10 @@
-//! Windows AppContainer launcher for [`RenderSandbox`](crate::confinement::RenderSandbox).
+//! Windows renderer launcher for [`RenderSandbox`](crate::confinement::RenderSandbox).
 //!
 //! This intentionally does not use `std::process::Command`: stable Rust cannot
-//! attach `SECURITY_CAPABILITIES` to `STARTUPINFOEXW`.  The renderer receives an
-//! AppContainer token with *zero* capabilities (in particular no internet or
-//! private-network capability), an explicit environment, and only the three
-//! standard handles in its inherited-handle list.
+//! set the AppContainer and explicit handle-list attributes on
+//! `STARTUPINFOEXW`. All renderers use a Job, an explicit environment, and
+//! only inherit the three standard handles. The default is a zero-capability
+//! AppContainer. Windows Office selects the Job without AppContainer.
 
 use std::{
     ffi::{OsStr, OsString},
@@ -65,7 +65,9 @@ use windows_sys::Win32::{
     },
 };
 
-use crate::confinement::{ConfinementError, RenderResourceLimits, RenderSources, RendererStart};
+use crate::confinement::{
+    ConfinementError, RenderResourceLimits, RenderSandbox, RenderSources, RendererStart,
+};
 use crate::{BoundedProcessError, BoundedProcessOptions, BoundedProcessOutput};
 use std::collections::BTreeSet;
 
@@ -73,7 +75,20 @@ use std::collections::BTreeSet;
 mod child_token;
 #[path = "scratch_access.rs"]
 mod scratch_access;
+#[path = "scratch_observation.rs"]
+mod scratch_observation;
 use scratch_access::ScratchGrant;
+
+fn profile_operation(operation: &str, error: std::io::Error) -> ConfinementError {
+    ConfinementError::Profile(std::io::Error::new(
+        error.kind(),
+        format!("{operation} (scratch entry: <none>): {error}"),
+    ))
+}
+
+fn profile_last_error(operation: &str) -> ConfinementError {
+    profile_operation(operation, std::io::Error::last_os_error())
+}
 
 pub(crate) const RENDER_ADDRESS_SPACE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub(crate) const RENDER_PHYSICAL_MEMORY_BYTES: u64 = 0;
@@ -84,6 +99,27 @@ pub(crate) struct NativeRenderSandbox {
     scratch: PathBuf,
     runtime_roots: Vec<PathBuf>,
     limits: RenderResourceLimits,
+    access: RendererAccess,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RendererAccess {
+    AppContainer,
+    OfficeJobOnly,
+}
+
+impl RenderSandbox {
+    /// Windows Office only (D-20261122-02). A Job bounds the process tree and
+    /// its resource use. Office runs with the invoking user's OS access.
+    pub fn for_windows_office(
+        sources: &RenderSources,
+        scratch: &Path,
+        limits: RenderResourceLimits,
+    ) -> Result<Self, ConfinementError> {
+        let mut sandbox = Self::from_sources(sources, scratch, limits)?;
+        sandbox.native.access = RendererAccess::OfficeJobOnly;
+        Ok(sandbox)
+    }
 }
 
 impl NativeRenderSandbox {
@@ -106,8 +142,10 @@ impl NativeRenderSandbox {
             scratch,
             runtime_roots: roots.into_iter().collect(),
             limits,
+            access: RendererAccess::AppContainer,
         }
     }
+
     pub(crate) fn run<I, S>(
         &self,
         args: I,
@@ -153,117 +191,23 @@ impl Drop for OwnedHandle {
 /// renderer-controlled bytes are staged in it. The caller must invoke this
 /// immediately after exclusive creation; non-empty or symlink paths fail.
 pub fn protect_owner_private_scratch(path: &Path) -> Result<(), ConfinementError> {
-    let wide_path = wide(path.as_os_str());
-    let raw_directory = unsafe {
-        CreateFileW(
-            wide_path.as_ptr(),
-            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC,
-            FILE_SHARE_NONE,
-            std::ptr::null(),
-            OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-            std::ptr::null_mut(),
-        )
-    };
-    if raw_directory == INVALID_HANDLE_VALUE {
-        return Err(ConfinementError::Profile(std::io::Error::last_os_error()));
-    }
-    let directory = OwnedHandle(raw_directory);
-    let mut info = BY_HANDLE_FILE_INFORMATION::default();
-    if unsafe { GetFileInformationByHandle(directory.0, &mut info) } == 0
-        || info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)
-            != FILE_ATTRIBUTE_DIRECTORY
-    {
+    let (directory, info) = open_scratch_entry(
+        path,
+        FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC,
+        FILE_SHARE_NONE,
+    )
+    .map_err(ConfinementError::Profile)?;
+    if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
         return Err(ConfinementError::Profile(std::io::Error::other(
             "scratch must be a newly-created empty non-symlink directory",
         )));
     }
-    // FILE_ID_BOTH_DIR_INFO records require eight-byte alignment. The Win32
-    // buffer length is in bytes, not the number of backing allocation elements.
-    #[repr(align(8))]
-    struct DirectoryEntries([u8; 4096]);
-    let mut entries = DirectoryEntries([0; 4096]);
-    let buffer_bytes = entries.0.len();
-    let name_offset = std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
-    let invalid_records = || {
-        ConfinementError::Profile(std::io::Error::other(
-            "invalid scratch directory enumeration",
-        ))
-    };
-    let mut seen_dot = false;
-    let mut seen_dot_dot = false;
-    loop {
-        entries.0.fill(0);
-        if unsafe {
-            GetFileInformationByHandleEx(
-                directory.0,
-                FileIdBothDirectoryInfo,
-                entries.0.as_mut_ptr().cast(),
-                buffer_bytes as u32,
-            )
-        } == 0
-        {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
-                break;
-            }
-            return Err(ConfinementError::Profile(error));
-        }
-        let bytes = &entries.0;
-        let mut offset = 0;
-        loop {
-            let record = bytes.get(offset..).ok_or_else(&invalid_records)?;
-            if record.len() < name_offset {
-                return Err(invalid_records());
-            }
-            // Read only the fixed header fields; a short final filename need
-            // not occupy the tail padding of the Rust structure.
-            let next = u32::from_ne_bytes(record[..4].try_into().unwrap()) as usize;
-            let length_offset = std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileNameLength);
-            let name_bytes =
-                u32::from_ne_bytes(record[length_offset..length_offset + 4].try_into().unwrap())
-                    as usize;
-            if name_bytes == 0 || !name_bytes.is_multiple_of(2) {
-                return Err(invalid_records());
-            }
-            let record_end = name_offset
-                .checked_add(name_bytes)
-                .filter(|end| *end <= record.len())
-                .ok_or_else(&invalid_records)?;
-            if next != 0 && (!next.is_multiple_of(8) || next < record_end || next >= record.len()) {
-                return Err(invalid_records());
-            }
-            let name = &record[name_offset..record_end];
-            let dot = [b'.', 0];
-            let dot_dot = [b'.', 0, b'.', 0];
-            let seen = if name == dot {
-                &mut seen_dot
-            } else if name == dot_dot {
-                &mut seen_dot_dot
-            } else {
-                return Err(ConfinementError::Profile(std::io::Error::other(
-                    "scratch must be empty before staging",
-                )));
-            };
-            // At most two pseudoentries can be skipped across all batches.
-            // Reject repeats so even a malformed enumerator is bounded.
-            if *seen {
-                return Err(invalid_records());
-            }
-            *seen = true;
-            if next == 0 {
-                break;
-            }
-            offset = offset.checked_add(next).ok_or_else(&invalid_records)?;
-        }
-    }
+    scratch_observation::require_empty(&directory).map_err(ConfinementError::Profile)?;
     scratch_access::protect_empty(directory.0).map_err(ConfinementError::Profile)?;
     Ok(())
 }
 
-/// Launch through `CreateProcessW` with a new AppContainer profile.  The
-/// profile's zero capability count is deliberate: adding internetClient or
-/// privateNetworkClientServer would turn network access back on.
+/// Launch suspended, configure the Job and scratch authority, then resume.
 pub(crate) fn run_windows_renderer<I, S>(
     sandbox: &NativeRenderSandbox,
     args: I,
@@ -281,19 +225,21 @@ where
     };
     let deadline = timing.deadline;
     start.remaining()?;
-    let profile = AppContainerProfile::create()?;
-    let mut grant = grant_scratch_access(sandbox.scratch(), profile.sid)?;
+    let profile = match sandbox.access {
+        RendererAccess::AppContainer => Some(AppContainerProfile::create()?),
+        RendererAccess::OfficeJobOnly => None,
+    };
+    let app_sid = profile.as_ref().map(|profile| profile.sid);
+    let mut grant = grant_scratch_access(sandbox.scratch(), app_sid)?;
     let result = (|| {
-        // We never relax ACLs on a renderer installation. A package must already
-        // be executable/readable by AppContainers (normally through the Windows
-        // All Application Packages ACE); otherwise CreateProcessW fails closed.
+        // The install must already be readable/executable by the selected token.
         for root in sandbox.runtime_roots() {
             verify_runtime_root(root)?;
         }
 
         let mut pipes = Pipes::new()?;
         let job = Job::new(sandbox.limits())?;
-        let attributes = Attributes::new(profile.sid, pipes.child_handles())?;
+        let attributes = Attributes::new(app_sid, pipes.child_handles())?;
         let application = wide(sandbox.program().as_os_str());
         let mut command_line = windows_command_line(sandbox.program().as_os_str(), args);
         let environment = environment_block(environment)?;
@@ -349,8 +295,8 @@ where
         // All failures after assignment go through whole-Job cleanup, including
         // resume, pipe setup, wait/accounting, output, and scratch failures.
         let result = (|| {
-            child_token::prepare_suspended_renderer_token(primary.0, profile.sid)
-                .map_err(ConfinementError::Profile)?;
+            child_token::prepare_suspended_renderer_token(primary.0, app_sid)
+                .map_err(|error| profile_operation("prepare suspended renderer token", error))?;
             start.verify()?;
             resume(thread.0).map_err(ConfinementError::Resource)?;
             drop(thread);
@@ -369,8 +315,15 @@ where
                 while let Ok((stream, result)) = receiver.try_recv() {
                     output[usize::from(stream == "stderr")] = Some(result?);
                 }
-                grant.verify_active().map_err(ConfinementError::Profile)?;
-                observe_scratch_until(sandbox, deadline, options)?;
+                match sandbox.access {
+                    RendererAccess::OfficeJobOnly => grant
+                        .observe_office_live(deadline, sandbox.limits().max_file_bytes)
+                        .map_err(ConfinementError::Profile)?,
+                    RendererAccess::AppContainer => {
+                        grant.verify_active().map_err(ConfinementError::Profile)?;
+                        observe_scratch_until(sandbox, deadline, options, true)?;
+                    }
+                }
                 if status.is_none() {
                     match unsafe { WaitForSingleObject(primary.0, 0) } {
                         WAIT_TIMEOUT => {}
@@ -463,15 +416,14 @@ fn observe_scratch_until(
     sandbox: &NativeRenderSandbox,
     deadline: Instant,
     options: BoundedProcessOptions,
+    allow_missing: bool,
 ) -> Result<(), ConfinementError> {
     check_renderer_deadline(deadline, options)?;
-    let started = Instant::now();
-    let budget = SCRATCH_SCAN_BUDGET.min(deadline.saturating_duration_since(started));
-    let result = enforce_scratch_limit_with_budget(
+    let result = scan_scratch_limits(
         sandbox.scratch(),
+        deadline.min(Instant::now() + SCRATCH_SCAN_BUDGET),
         sandbox.limits().max_file_bytes,
-        budget,
-        &mut || started.elapsed(),
+        allow_missing,
     );
     // Command timeout takes precedence when its deadline clipped the scan.
     check_renderer_deadline(deadline, options)?;
@@ -496,7 +448,7 @@ fn finish_renderer_output(
     mut output: [Option<String>; 2],
 ) -> Result<BoundedProcessOutput, ConfinementError> {
     let RendererTiming { started, deadline } = timing;
-    observe_scratch_until(sandbox, deadline, options)?;
+    observe_scratch_until(sandbox, deadline, options, false)?;
     while output.iter().any(Option::is_none) {
         check_renderer_deadline(deadline, options)?;
         match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
@@ -545,6 +497,11 @@ fn open_scratch_entry(
         return Err(std::io::Error::last_os_error());
     }
     let handle = OwnedHandle(raw);
+    let info = scratch_entry_information(&handle)?;
+    Ok((handle, info))
+}
+
+fn scratch_entry_information(handle: &OwnedHandle) -> std::io::Result<BY_HANDLE_FILE_INFORMATION> {
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
     if unsafe { GetFileInformationByHandle(handle.0, &mut info) } == 0 {
         return Err(std::io::Error::last_os_error());
@@ -559,153 +516,22 @@ fn open_scratch_entry(
             "renderer scratch contains a non-regular file",
         ));
     }
-    Ok((handle, info))
+    Ok(info)
 }
 
-fn pin_scratch_directory(
-    path: &Path,
-    observed: Option<&BY_HANDLE_FILE_INFORMATION>,
-) -> Result<OwnedHandle, std::io::Error> {
-    // Deny write and delete sharing while this directory and its descendants
-    // are observed. Attribute access alone would not establish this pin.
-    let (handle, info) = open_scratch_entry(
-        path,
-        FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
-        FILE_SHARE_READ,
-    )?;
-    if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
-        return Err(std::io::Error::other(
-            "renderer scratch directory changed type",
-        ));
-    }
-    if observed.is_some_and(|previous| {
-        previous.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
-            || previous.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
-            || previous.dwVolumeSerialNumber != info.dwVolumeSerialNumber
-            || previous.nFileIndexHigh != info.nFileIndexHigh
-            || previous.nFileIndexLow != info.nFileIndexLow
-    }) {
-        return Err(std::io::Error::other(
-            "renderer scratch directory changed identity before pinning",
-        ));
-    }
-    Ok(handle)
-}
-
-#[cfg(test)]
-fn enforce_scratch_limit_with_clock(
+fn scan_scratch_limits(
     root: &Path,
-    max_file_bytes: u64,
-    elapsed: &mut impl FnMut() -> Duration,
-) -> Result<(), std::io::Error> {
-    enforce_scratch_limit_with_budget(root, max_file_bytes, SCRATCH_SCAN_BUDGET, elapsed)
-}
-
-fn enforce_scratch_limit_with_budget(
-    root: &Path,
-    max_file_bytes: u64,
-    budget: Duration,
-    elapsed: &mut impl FnMut() -> Duration,
-) -> Result<(), std::io::Error> {
-    fn check_deadline(
-        budget: Duration,
-        elapsed: &mut impl FnMut() -> Duration,
-    ) -> Result<(), std::io::Error> {
-        if elapsed() > budget {
-            return Err(std::io::Error::other(
-                "renderer scratch scan exceeded observation budget",
-            ));
-        }
-        Ok(())
-    }
-
-    fn visit(
-        path: &Path,
-        observed: Option<&BY_HANDLE_FILE_INFORMATION>,
-        depth: usize,
-        max: u64,
-        counts: (&mut u64, &mut usize),
-        budget: Duration,
-        elapsed: &mut impl FnMut() -> Duration,
-    ) -> Result<(), std::io::Error> {
-        let (total, entries) = counts;
-        if depth > MAX_SCRATCH_SCAN_DEPTH {
-            return Err(std::io::Error::other(
-                "renderer scratch scan exceeded depth limit",
-            ));
-        }
-        check_deadline(budget, elapsed)?;
-        let _directory = pin_scratch_directory(path, observed)?;
-        check_deadline(budget, elapsed)?;
-        // read_dir streams entries. _directory and every caller's guard remain
-        // alive throughout iteration, including while each child is visited.
-        let mut directory = std::fs::read_dir(path)?;
-        loop {
-            check_deadline(budget, elapsed)?;
-            let next = directory.next();
-            check_deadline(budget, elapsed)?;
-            let Some(entry) = next else { break };
-            let entry = entry?;
-            *entries = entries
-                .checked_add(1)
-                .ok_or_else(|| std::io::Error::other("renderer scratch entry count overflow"))?;
-            if *entries > MAX_SCRATCH_SCAN_ENTRIES {
-                return Err(std::io::Error::other(
-                    "renderer scratch scan exceeded entry limit",
-                ));
-            }
-            let child_path = entry.path();
-            let (_entry, info) = match open_scratch_entry(
-                &child_path,
-                FILE_READ_ATTRIBUTES,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-            ) {
-                Ok(entry) => entry,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error),
-            };
-            check_deadline(budget, elapsed)?;
-            if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
-                // The metadata handle does not pin the name. Retain it and
-                // require the stronger directory open to identify the same
-                // object before resolving any descendants through its path.
-                visit(
-                    &child_path,
-                    Some(&info),
-                    depth + 1,
-                    max,
-                    (total, entries),
-                    budget,
-                    elapsed,
-                )?;
-            } else {
-                let size = (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow);
-                if size > max {
-                    return Err(std::io::Error::other(
-                        "renderer scratch file exceeds configured limit",
-                    ));
-                }
-                *total = total
-                    .checked_add(size)
-                    .ok_or_else(|| std::io::Error::other("renderer scratch size overflow"))?;
-                if *total > max {
-                    return Err(std::io::Error::other(
-                        "renderer scratch total exceeds configured limit",
-                    ));
-                }
-            }
-        }
-        check_deadline(budget, elapsed)
-    }
-    check_deadline(budget, elapsed)?;
-    visit(
-        root,
-        None,
-        0,
-        max_file_bytes,
-        (&mut 0, &mut 0),
-        budget,
-        elapsed,
+    deadline: Instant,
+    max_bytes: u64,
+    allow_missing: bool,
+) -> std::io::Result<()> {
+    let (root, _) = open_scratch_entry(root, FILE_READ_ATTRIBUTES, FILE_SHARE_READ)?;
+    scratch_observation::observe(
+        std::rc::Rc::new(root),
+        scratch_observation::ScanMode::Limits(allow_missing),
+        deadline,
+        max_bytes,
+        |_, _, _| Ok(()),
     )
 }
 
@@ -780,7 +606,8 @@ impl AppContainerProfile {
             )
         };
         if hr < 0 {
-            return Err(ConfinementError::Profile(
+            return Err(profile_operation(
+                "CreateAppContainerProfile",
                 std::io::Error::from_raw_os_error(hr),
             ));
         }
@@ -897,20 +724,21 @@ struct Attributes {
     list: windows_sys::Win32::System::Threading::LPPROC_THREAD_ATTRIBUTE_LIST,
     #[allow(dead_code)]
     memory: Box<[usize]>,
-    security: Box<SECURITY_CAPABILITIES>,
+    security: Option<Box<SECURITY_CAPABILITIES>>,
     handles: Box<[HANDLE; 3]>,
 }
 impl Attributes {
-    fn new(sid: PSID, handles: [HANDLE; 3]) -> Result<Box<Self>, ConfinementError> {
+    fn new(app_sid: Option<PSID>, handles: [HANDLE; 3]) -> Result<Box<Self>, ConfinementError> {
+        let count = 1 + u32::from(app_sid.is_some());
         let mut size = 0;
         unsafe {
-            InitializeProcThreadAttributeList(std::ptr::null_mut(), 2, 0, &mut size);
+            InitializeProcThreadAttributeList(std::ptr::null_mut(), count, 0, &mut size);
         }
         let words = size.div_ceil(std::mem::size_of::<usize>());
         let mut memory = vec![0_usize; words].into_boxed_slice();
         let list = memory.as_mut_ptr().cast();
-        if unsafe { InitializeProcThreadAttributeList(list, 2, 0, &mut size) } == 0 {
-            return Err(ConfinementError::Profile(std::io::Error::last_os_error()));
+        if unsafe { InitializeProcThreadAttributeList(list, count, 0, &mut size) } == 0 {
+            return Err(profile_last_error("InitializeProcThreadAttributeList"));
         }
         // Attribute values must outlive CreateProcessW. Keep this allocation
         // boxed so references supplied to UpdateProcThreadAttribute remain
@@ -918,41 +746,46 @@ impl Attributes {
         let mut attributes = Box::new(Self {
             list,
             memory,
-            security: Box::new(SECURITY_CAPABILITIES {
-                AppContainerSid: sid,
-                Capabilities: std::ptr::null_mut(),
-                CapabilityCount: 0,
-                Reserved: 0,
+            security: app_sid.map(|sid| {
+                Box::new(SECURITY_CAPABILITIES {
+                    AppContainerSid: sid,
+                    Capabilities: std::ptr::null_mut(),
+                    CapabilityCount: 0,
+                    Reserved: 0,
+                })
             }),
             handles: Box::new(handles),
         });
+        if let Some(security) = attributes.security.as_deref_mut()
+            && unsafe {
+                UpdateProcThreadAttribute(
+                    attributes.list,
+                    0,
+                    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
+                    (security as *mut SECURITY_CAPABILITIES).cast(),
+                    std::mem::size_of::<SECURITY_CAPABILITIES>(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            } == 0
+        {
+            return Err(profile_last_error(
+                "set renderer AppContainer process attribute",
+            ));
+        }
         if unsafe {
             UpdateProcThreadAttribute(
                 attributes.list,
                 0,
-                PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
-                (&raw mut *attributes.security).cast(),
-                std::mem::size_of_val(&*attributes.security),
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                attributes.handles.as_ptr().cast(),
+                std::mem::size_of_val(&*attributes.handles),
                 std::ptr::null_mut(),
-                std::ptr::null(),
+                std::ptr::null_mut(),
             )
         } == 0
-            || unsafe {
-                UpdateProcThreadAttribute(
-                    attributes.list,
-                    0,
-                    PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
-                    attributes.handles.as_ptr().cast(),
-                    std::mem::size_of_val(&*attributes.handles),
-                    std::ptr::null_mut(),
-                    std::ptr::null(),
-                )
-            } == 0
         {
-            unsafe {
-                DeleteProcThreadAttributeList(attributes.list);
-            }
-            return Err(ConfinementError::Profile(std::io::Error::last_os_error()));
+            return Err(profile_last_error("set renderer inherited handle list"));
         }
         Ok(attributes)
     }
@@ -1003,7 +836,7 @@ impl Pipes {
                 || SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT, 0) == 0
                 || SetHandleInformation(stderr_read, HANDLE_FLAG_INHERIT, 0) == 0
             {
-                return Err(ConfinementError::Profile(std::io::Error::last_os_error()));
+                return Err(profile_last_error("configure renderer standard I/O pipes"));
             }
             Ok(Self {
                 stdin_read,
@@ -1070,7 +903,10 @@ impl Drop for Pipes {
     }
 }
 
-fn grant_scratch_access(path: &Path, app_sid: PSID) -> Result<ScratchGrant, ConfinementError> {
+fn grant_scratch_access(
+    path: &Path,
+    app_sid: Option<PSID>,
+) -> Result<ScratchGrant, ConfinementError> {
     ScratchGrant::new(path, app_sid).map_err(ConfinementError::Profile)
 }
 
@@ -1250,7 +1086,7 @@ mod scratch_scan_tests {
     use super::*;
 
     fn scan(root: &Path, max: u64) -> Result<(), std::io::Error> {
-        enforce_scratch_limit_with_clock(root, max, &mut || Duration::ZERO)
+        scan_scratch_limits(root, Instant::now() + Duration::from_secs(60), max, false)
     }
 
     fn final_scan_sandbox(root: &Path, max: u64) -> NativeRenderSandbox {
@@ -1344,12 +1180,7 @@ mod scratch_scan_tests {
     #[test]
     fn scratch_scan_honors_a_shorter_remaining_command_budget() {
         let root = tempfile::tempdir().unwrap();
-        let budget = Duration::from_millis(5);
-        enforce_scratch_limit_with_budget(root.path(), 0, budget, &mut || budget).unwrap();
-        let error = enforce_scratch_limit_with_budget(root.path(), 0, budget, &mut || {
-            budget + Duration::from_nanos(1)
-        })
-        .unwrap_err();
+        let error = scan_scratch_limits(root.path(), Instant::now(), 0, false).unwrap_err();
         assert!(error.to_string().contains("observation budget"));
     }
 
@@ -1421,48 +1252,6 @@ mod scratch_scan_tests {
     }
 
     #[test]
-    fn scratch_observation_deadline_is_deterministic() {
-        let root = tempfile::tempdir().unwrap();
-        enforce_scratch_limit_with_clock(root.path(), 0, &mut || SCRATCH_SCAN_BUDGET).unwrap();
-        let mut ticks = 0;
-        let error = enforce_scratch_limit_with_clock(root.path(), 0, &mut || {
-            ticks += 1;
-            if ticks < 5 {
-                Duration::ZERO
-            } else {
-                SCRATCH_SCAN_BUDGET + Duration::from_nanos(1)
-            }
-        })
-        .unwrap_err();
-        assert!(error.to_string().contains("observation budget"));
-        assert_eq!(ticks, 5);
-    }
-
-    #[test]
-    fn scratch_directory_pin_rejects_a_replaced_observed_directory() {
-        let parent = tempfile::tempdir().unwrap();
-        let child = parent.path().join("child");
-        std::fs::create_dir(&child).unwrap();
-        let (_metadata, observed) = open_scratch_entry(
-            &child,
-            FILE_READ_ATTRIBUTES,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-        )
-        .unwrap();
-        drop(pin_scratch_directory(&child, Some(&observed)).unwrap());
-        // Attribute-only observations permit a name swap. A later strong open
-        // must reject the replacement even though it is also a regular directory.
-        std::fs::rename(&child, parent.path().join("moved-child")).unwrap();
-        std::fs::create_dir(&child).unwrap();
-        let error = pin_scratch_directory(&child, Some(&observed))
-            .err()
-            .expect("replacement must not inherit the observed directory identity");
-        assert!(error.to_string().contains("changed identity"));
-        // The rejected strong open releases its handle on the error path.
-        std::fs::rename(&child, parent.path().join("replacement")).unwrap();
-    }
-
-    #[test]
     fn scratch_pinned_ancestors_block_directory_swap() {
         use std::os::windows::fs::OpenOptionsExt;
 
@@ -1470,29 +1259,35 @@ mod scratch_scan_tests {
         let root = parent.path().join("scratch");
         let child = root.join("child");
         std::fs::create_dir_all(&child).unwrap();
-        let mut ticks = 0;
+        let (handle, _) = open_scratch_entry(
+            &root,
+            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ,
+        )
+        .unwrap();
         let mut attempted_swap = false;
-        enforce_scratch_limit_with_clock(&root, 0, &mut || {
-            ticks += 1;
-            // Root and child have both acquired their retained directory
-            // guards at this checkpoint, before the child's read_dir call.
-            if ticks == 8 {
-                attempted_swap = true;
-                assert!(std::fs::rename(&root, parent.path().join("moved-root")).is_err());
-                assert!(std::fs::rename(&child, root.join("moved-child")).is_err());
-                assert!(std::fs::remove_dir(&child).is_err());
-                // FSCTL_SET_REPARSE_POINT needs a write-capable handle. The
-                // guard must also prevent acquiring that access in place.
-                assert!(
-                    std::fs::OpenOptions::new()
-                        .access_mode(windows_sys::Win32::Foundation::GENERIC_WRITE)
-                        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-                        .open(&child)
-                        .is_err()
-                );
-            }
-            Duration::ZERO
-        })
+        scratch_observation::observe(
+            std::rc::Rc::new(handle),
+            scratch_observation::ScanMode::Limits(false),
+            Instant::now() + SCRATCH_SCAN_BUDGET,
+            0,
+            |_, _, path| {
+                if path == Path::new("child") {
+                    attempted_swap = true;
+                    assert!(std::fs::rename(&root, parent.path().join("moved-root")).is_err());
+                    assert!(std::fs::rename(&child, root.join("moved-child")).is_err());
+                    assert!(std::fs::remove_dir(&child).is_err());
+                    assert!(
+                        std::fs::OpenOptions::new()
+                            .access_mode(windows_sys::Win32::Foundation::GENERIC_WRITE)
+                            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                            .open(&child)
+                            .is_err()
+                    );
+                }
+                Ok(())
+            },
+        )
         .unwrap();
         assert!(attempted_swap);
         // RAII releases every guard after the observation.
@@ -1711,9 +1506,9 @@ mod scratch_invocation_grant_tests {
         protect_owner_private_scratch(&scratch).unwrap();
         let first = AppContainerProfile::create().unwrap();
         let second = AppContainerProfile::create().unwrap();
-        let _grant = grant_scratch_access(&scratch, first.sid).unwrap();
+        let _grant = grant_scratch_access(&scratch, Some(first.sid)).unwrap();
         assert!(
-            grant_scratch_access(&scratch, second.sid).is_err(),
+            grant_scratch_access(&scratch, Some(second.sid)).is_err(),
             "a fresh invocation must not accept or preserve another invocation SID"
         );
         assert!(!contains_sid(&scratch, second.sid));
@@ -1727,7 +1522,7 @@ mod scratch_invocation_grant_tests {
         assert!(create_current_user_fixture(&child, true).is_none());
         protect_owner_private_scratch(&child).unwrap();
         let profile = AppContainerProfile::create().unwrap();
-        let _grant = grant_scratch_access(&scratch, profile.sid).unwrap();
+        let _grant = grant_scratch_access(&scratch, Some(profile.sid)).unwrap();
         assert!(
             contains_sid(&child, profile.sid),
             "root inheritance cannot grant access through a protected child DACL"
@@ -1741,7 +1536,7 @@ mod scratch_invocation_grant_tests {
         assert!(create_current_user_fixture(&child, true).is_none());
         protect_owner_private_scratch(&child).unwrap();
         let profile = AppContainerProfile::create().unwrap();
-        let mut grant = grant_scratch_access(&scratch, profile.sid).unwrap();
+        let mut grant = grant_scratch_access(&scratch, Some(profile.sid)).unwrap();
         assert_eq!(
             access_for_sid(&child, profile.sid),
             Some(
@@ -1767,7 +1562,7 @@ mod scratch_invocation_grant_tests {
         assert!(!contains_sid(&child, profile.sid));
         assert!(!contains_sid(&generated, profile.sid));
         let other = AppContainerProfile::create().unwrap();
-        let _next = grant_scratch_access(&scratch, other.sid).unwrap();
+        let _next = grant_scratch_access(&scratch, Some(other.sid)).unwrap();
     }
     #[test]
     fn scratch_acl_observation_allows_an_exclusively_open_renderer_output() {
@@ -1775,7 +1570,7 @@ mod scratch_invocation_grant_tests {
         let (_holder, scratch) = current_user_scratch();
         protect_owner_private_scratch(&scratch).unwrap();
         let profile = AppContainerProfile::create().unwrap();
-        let mut grant = grant_scratch_access(&scratch, profile.sid).unwrap();
+        let mut grant = grant_scratch_access(&scratch, Some(profile.sid)).unwrap();
         let generated = scratch.join("exclusive-output.pdf");
         drop(create_current_user_fixture(&generated, false).unwrap());
         assert!(
@@ -1796,7 +1591,7 @@ mod scratch_invocation_grant_tests {
         grant.retire().unwrap();
         assert!(!contains_sid(&generated, profile.sid));
         let next = AppContainerProfile::create().unwrap();
-        let _next_grant = grant_scratch_access(&scratch, next.sid)
+        let _next_grant = grant_scratch_access(&scratch, Some(next.sid))
             .expect("closed output and entire retired tree must be protected owner-only");
     }
 }

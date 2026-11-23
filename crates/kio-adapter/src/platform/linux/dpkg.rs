@@ -149,7 +149,9 @@ impl DpkgCatalog {
                 .take_while(|line| line.starts_with(' '))
             {
                 let (path, hash) = parse_conffile(line, &status_path)?;
-                merge_checksum(&mut sums, path, hash)?;
+                if let Some(hash) = hash {
+                    merge_checksum(&mut sums, path, hash)?;
+                }
             }
             let mut members = BTreeMap::new();
             for line in list.lines().filter(|line| *line != "/." && *line != "/") {
@@ -270,7 +272,7 @@ fn package_path(path: &Path) -> io::Result<PathBuf> {
         .into())
 }
 
-fn parse_conffile(line: &str, record: &Path) -> io::Result<(PathBuf, Checksum)> {
+fn parse_conffile(line: &str, record: &Path) -> io::Result<(PathBuf, Option<Checksum>)> {
     let line = line.strip_prefix(' ').expect("conffile continuation");
     // dpkg writes the path verbatim, then the digest and any flags.
     let line = line.strip_suffix(" remove-on-upgrade").unwrap_or(line);
@@ -278,10 +280,13 @@ fn parse_conffile(line: &str, record: &Path) -> io::Result<(PathBuf, Checksum)> 
     let (path, hash) = line
         .rsplit_once(' ')
         .ok_or_else(|| invalid(record, "invalid dpkg conffile entry"))?;
-    Ok((
-        package_path(Path::new(path))?,
-        parse_checksum(hash, record)?,
-    ))
+    let path = package_path(Path::new(path))?;
+    // These dpkg conffile markers carry no digest and cannot override one.
+    let digest = match hash {
+        "newconffile" | "nonexistent" | "-" => None,
+        _ => Some(parse_checksum(hash, record)?),
+    };
+    Ok((path, digest))
 }
 
 fn parse_checksum(hash: &str, record: &Path) -> io::Result<Checksum> {
@@ -489,6 +494,92 @@ mod tests {
             "{error}"
         );
     }
+
+    #[test]
+    fn dpkg_conffile_placeholders_do_not_supply_or_override_a_checksum() {
+        let scratch = tempfile::tempdir().unwrap();
+        let root = scratch.path();
+        records(root).unwrap();
+        let dpkg = root.join("var/lib/dpkg");
+        let pending = "/etc/libreoffice/pending.conf";
+        fs::write(
+            dpkg.join("status"),
+            format!(
+                "{INSTALLED}Version: 4:24.2.7-0ubuntu0.24.04.5\n\
+                 Conffiles:\n {pending} newconffile\n {TEMPLATE} newconffile\n\
+                 {}\n",
+                concat!(
+                    " /etc/libreoffice/old.conf newconffile obsolete remove-on-upgrade\n",
+                    " /etc/libreoffice/unreadable.conf - obsolete\n",
+                    " /etc/libreoffice/missing.conf nonexistent\n",
+                    "\nPackage: unrelated-package\nStatus: install ok unpacked\n",
+                    "Architecture: amd64\nConffiles:\n /etc/unrelated.conf not-an-md5\n",
+                ),
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dpkg.join(format!("info/{PACKAGE}.list")),
+            format!("{TEMPLATE}\n{CONFIG}\n{pending}\n"),
+        )
+        .unwrap();
+        let catalog = read(root, || {}).unwrap();
+        let verify = |path: &Path| {
+            catalog.verify(
+                path,
+                &fs::metadata(path).unwrap(),
+                Instant::now() + Duration::from_secs(10),
+            )
+        };
+        let pending = root.join(&pending[1..]);
+        fs::create_dir_all(pending.parent().unwrap()).unwrap();
+        fs::write(&pending, b"abc").unwrap();
+        let error = verify(&pending).unwrap_err();
+        assert!(
+            error.to_string().contains("missing dpkg checksum"),
+            "{error}"
+        );
+
+        let template = root.join(&TEMPLATE[1..]);
+        fs::create_dir_all(template.parent().unwrap()).unwrap();
+        fs::write(&template, b"abc").unwrap();
+        verify(&template).unwrap();
+        fs::write(&template, b"changed").unwrap();
+        let error = verify(&template).unwrap_err();
+        assert!(
+            error.to_string().contains("dpkg checksum mismatch"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn dpkg_rejects_unknown_conffile_hashes_and_placeholders_in_md5sums() {
+        let scratch = tempfile::tempdir().unwrap();
+        let root = scratch.path();
+        records(root).unwrap();
+        let dpkg = root.join("var/lib/dpkg");
+        let status = dpkg.join("status");
+        fs::write(
+            &status,
+            format!("{INSTALLED}Conffiles:\n {CONFIG} unknown obsolete\n"),
+        )
+        .unwrap();
+        let error = read(root, || {}).err().expect("invalid conffile checksum");
+        assert!(
+            error.to_string().contains("invalid dpkg MD5 checksum"),
+            "{error}"
+        );
+
+        fs::write(&status, INSTALLED).unwrap();
+        let sums = dpkg.join(format!("info/{PACKAGE}.md5sums"));
+        fs::write(&sums, format!("newconffile  {}\n", &TEMPLATE[1..])).unwrap();
+        let error = read(root, || {}).err().expect("invalid md5sums entry");
+        assert!(
+            error.to_string().contains("invalid dpkg MD5 checksum"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn dpkg_merges_the_full_spaced_conffile_path_with_ucf() {
         let scratch = tempfile::tempdir().unwrap();

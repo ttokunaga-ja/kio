@@ -1809,6 +1809,8 @@ mod tests {
 
     #[test]
     fn generic_local_embedding_identity_and_capabilities_follow_the_declaration() {
+        // Reads the process-wide evaluator selector, which other tests set.
+        let _env_lock = kio_core::test_control::test_env_lock().lock().unwrap();
         use crate::tool_lock::{declared_adapter_for_role, validate_tools_toml};
 
         let descriptor = |source: &str| {

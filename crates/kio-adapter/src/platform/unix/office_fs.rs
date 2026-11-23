@@ -1,5 +1,25 @@
 use crate::{AdapterError, Result};
+use kio_process::confinement::{
+    ConfinementError, RenderResourceLimits, RenderSandbox, RenderSources,
+};
 use std::{ffi::OsString, path::Path};
+
+pub(crate) const OFFICE_LAUNCH_PROFILE: &[u8] = b"";
+pub(crate) const OFFICE_REDIRECT_SHARED_CACHE: bool = false;
+pub(crate) const OFFICE_QUERY_VERSION: bool = true;
+
+pub(crate) fn office_render_sandbox(
+    sources: &RenderSources,
+    scratch: &Path,
+    limits: RenderResourceLimits,
+) -> std::result::Result<RenderSandbox, ConfinementError> {
+    RenderSandbox::from_sources(sources, scratch, limits)
+}
+
+pub(crate) fn office_conversion_paths(outdir: &Path, input: &Path) -> (OsString, OsString) {
+    (outdir.as_os_str().to_owned(), input.as_os_str().to_owned())
+}
+
 pub(crate) fn private_office_scratch(
     directory: std::io::Result<tempfile::TempDir>,
 ) -> Result<tempfile::TempDir> {

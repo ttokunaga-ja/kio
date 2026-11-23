@@ -1,12 +1,13 @@
 use crate::office_convert::{MAX_OFFICE_LOG_BYTES, hex_digest};
-use crate::office_runtime_identity::RuntimeSnapshot;
+use crate::office_runtime_identity::{RuntimeSnapshot, check_verification_deadline};
 use crate::{AdapterError, Result};
-use kio_process::BoundedProcessOptions;
+use kio_process::{BoundedProcessError, BoundedProcessOptions};
 use quick_xml::{Reader, events::Event};
 use sha2::{Digest, Sha256};
 use std::time::Instant;
 use std::{
     ffi::OsString,
+    io,
     path::{Path, PathBuf},
 };
 use tempfile::{Builder, TempDir};
@@ -27,7 +28,7 @@ pub(crate) fn verify_macos_office_bundle(
     bundle: &Path,
     program: &Path,
     deadline: Instant,
-) -> Result<()> {
+) -> io::Result<()> {
     // A valid bundle can contain more than one executable. Its sealed
     // Info.plist determines which executable the bundle signature authorizes.
     let main = run_signature_tool(
@@ -49,8 +50,8 @@ pub(crate) fn verify_macos_office_bundle(
     if macos_office_bundle_candidate(program).as_deref() != Some(bundle)
         || program.file_name() != Some(std::ffi::OsStr::new(&main))
     {
-        return Err(AdapterError::ContractViolation(
-            "Office renderer is not the bundle's main executable".to_owned(),
+        return Err(io::Error::other(
+            "Office renderer is not the bundle's main executable",
         ));
     }
     run_signature_tool(
@@ -73,16 +74,15 @@ fn verify_macos_nested_code<'a>(
     bundle: &Path,
     seals: impl IntoIterator<Item = &'a Path>,
     deadline: Instant,
-) -> Result<()> {
+) -> io::Result<()> {
     use std::collections::BTreeSet;
 
     let mut nested = BTreeSet::new();
     let mut main_seal = false;
     for seal in seals {
+        check_verification_deadline(deadline)?;
         if !std::fs::symlink_metadata(seal).is_ok_and(|metadata| metadata.is_file()) {
-            return Err(AdapterError::ContractViolation(
-                "unsafe macOS code resource seal".to_owned(),
-            ));
+            return Err(io::Error::other("unsafe macOS code resource seal"));
         }
         let base = seal
             .parent()
@@ -108,13 +108,13 @@ fn verify_macos_nested_code<'a>(
             deadline,
             16 * 1024 * 1024,
         )?;
-        let paths = crate::platform::office_macos_seal::nested_code_paths(&files)
-            .map_err(|error| AdapterError::ContractViolation(error.to_string()))?;
+        let paths = crate::platform::office_macos_seal::nested_code_paths(&files)?;
         nested.extend(paths.into_iter().map(|path| base.join(path)));
     }
+    check_verification_deadline(deadline)?;
     if !main_seal {
-        return Err(AdapterError::ContractViolation(
-            "Office bundle lacks a modern code resource seal".to_owned(),
+        return Err(io::Error::other(
+            "Office bundle lacks a modern code resource seal",
         ));
     }
     // --deep validated the seal's own nested requirements. Each path here
@@ -141,7 +141,7 @@ fn run_signature_tool(
     command: &mut std::process::Command,
     failure: &str,
     deadline: Instant,
-) -> Result<String> {
+) -> io::Result<String> {
     run_signature_tool_with_limit(command, failure, deadline, MAX_OFFICE_LOG_BYTES)
 }
 
@@ -150,9 +150,9 @@ fn run_signature_tool_with_limit(
     failure: &str,
     deadline: Instant,
     max_stdout_bytes: usize,
-) -> Result<String> {
+) -> io::Result<String> {
     command.env_clear().current_dir("/");
-    crate::office_convert::check_renderer_deadline(deadline)?;
+    check_verification_deadline(deadline)?;
     let output = kio_process::run_bounded_command(
         command,
         BoundedProcessOptions {
@@ -161,13 +161,18 @@ fn run_signature_tool_with_limit(
             max_stderr_bytes: MAX_OFFICE_LOG_BYTES,
         },
         None,
-    )
-    .map_err(|_| AdapterError::ContractViolation(failure.to_owned()))?;
-    crate::office_convert::check_renderer_deadline(deadline)?;
-    if !output.status.success() {
-        return Err(AdapterError::ContractViolation(failure.to_owned()));
+    );
+    if let Err(error @ BoundedProcessError::Timeout { .. }) = output {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("Office verification tool timed out: {error}"),
+        ));
     }
-    Ok(output.stdout)
+    check_verification_deadline(deadline)?;
+    match output {
+        Ok(output) if output.status.success() => Ok(output.stdout),
+        _ => Err(io::Error::other(failure.to_owned())),
+    }
 }
 
 pub(crate) fn office_bundle_path_snapshot(
@@ -511,9 +516,8 @@ impl OfficeRuntime {
         program: &Path,
         snapshot: &RuntimeSnapshot,
         deadline: Instant,
-    ) -> std::io::Result<()> {
+    ) -> io::Result<()> {
         self.verify_runtime_signature(program, snapshot, deadline)
-            .map_err(std::io::Error::other)
     }
 
     pub(crate) fn new(program: &Path, deadline: Instant) -> Result<Self> {
@@ -526,10 +530,11 @@ impl OfficeRuntime {
         program: &Path,
         snapshot: &crate::office_runtime_identity::RuntimeSnapshot,
         deadline: Instant,
-    ) -> Result<()> {
-        let catalog = self.catalog.as_ref().ok_or_else(|| {
-            AdapterError::ContractViolation("unsupported macOS Office runtime placement".to_owned())
-        })?;
+    ) -> io::Result<()> {
+        let catalog = self
+            .catalog
+            .as_ref()
+            .ok_or_else(|| io::Error::other("unsupported macOS Office runtime placement"))?;
         verify_macos_office_bundle(&catalog.bundle, program, deadline)?;
         verify_macos_nested_code(&catalog.bundle, snapshot.macos_code_resources(), deadline)
     }
@@ -613,6 +618,32 @@ pub(crate) fn renderer_environment(
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signature_tool_timeout_reports_the_deadline() {
+        let error = run_signature_tool(
+            std::process::Command::new("/bin/sleep").arg("10"),
+            "invalid signature",
+            Instant::now() + std::time::Duration::from_millis(500),
+        )
+        .unwrap_err();
+        let reason = error.to_string();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(reason.contains("timed out"), "{reason}");
+        assert!(!reason.contains("invalid signature"), "{reason}");
+    }
+
+    #[test]
+    fn unsuccessful_signature_tool_reports_the_verification_failure() {
+        let error = run_signature_tool(
+            &mut std::process::Command::new("/usr/bin/false"),
+            "invalid signature",
+            Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(error.to_string().contains("invalid signature"), "{error}");
+    }
 
     #[test]
     fn macos_outer_requirement_does_not_authorize_an_ad_hoc_helper() {

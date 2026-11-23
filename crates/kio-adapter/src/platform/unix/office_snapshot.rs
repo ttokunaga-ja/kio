@@ -78,6 +78,27 @@ pub(crate) struct EntryIdentity {
     change: (i64, i64),
 }
 
+impl EntryIdentity {
+    pub(crate) fn differing_field(&self, current: &Self) -> &'static str {
+        [
+            (self.device != current.device, "device"),
+            (self.inode != current.inode, "inode"),
+            (self.mode != current.mode, "file mode"),
+            (self.uid != current.uid, "owner ID"),
+            (self.gid != current.gid, "group ID"),
+            (self.len != current.len, "file size"),
+            (
+                self.modification != current.modification,
+                "modification time",
+            ),
+            (self.change != current.change, "change time"),
+        ]
+        .into_iter()
+        .find_map(|(changed, field)| changed.then_some(field))
+        .unwrap_or("entry identity")
+    }
+}
+
 pub(crate) fn entry_identity(_path: &Path, metadata: &Metadata) -> io::Result<EntryIdentity> {
     use std::os::unix::fs::MetadataExt;
     let kind = metadata.file_type();

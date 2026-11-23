@@ -16,6 +16,33 @@ pub(crate) struct EntryIdentity {
     changed: i64,
 }
 
+impl EntryIdentity {
+    pub(crate) fn differing_field(&self, current: &Self) -> &'static str {
+        let (old, new) = (self.information, current.information);
+        [
+            (
+                old.volume_serial_number != new.volume_serial_number,
+                "volume serial number",
+            ),
+            (old.file_index != new.file_index, "file index"),
+            (old.number_of_links != new.number_of_links, "link count"),
+            (
+                old.file_attributes != new.file_attributes,
+                "file attributes",
+            ),
+            (old.file_size != new.file_size, "file size"),
+            (
+                old.last_write_time != new.last_write_time,
+                "last write time",
+            ),
+            (self.changed != current.changed, "change time"),
+        ]
+        .into_iter()
+        .find_map(|(changed, field)| changed.then_some(field))
+        .unwrap_or("entry identity")
+    }
+}
+
 pub(crate) fn entry_identity(path: &Path, metadata: &Metadata) -> io::Result<EntryIdentity> {
     use kio_core::platform::open_metadata_nofollow;
     use windows_sys::Win32::Storage::FileSystem::{
@@ -84,8 +111,13 @@ impl RuntimeSnapshot {
                 let file = options
                     .open(path)
                     .map_err(|error| path_error(path, error))?;
-                if windows_entry_identity(&file)? != *expected {
-                    return Err(path_error(path, io::Error::other("Office runtime changed")));
+                let current = windows_entry_identity(&file)?;
+                if current != *expected {
+                    return Err(self.changed_error(
+                        "while pinning the runtime",
+                        Some(path),
+                        expected.differing_field(&current),
+                    ));
                 }
                 Ok((path.as_path(), file))
             })

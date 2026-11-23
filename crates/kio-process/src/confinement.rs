@@ -2,8 +2,8 @@
 //!
 //! A bounded process group alone cannot stop a compromised renderer from
 //! reading the invoking user's files or using the network.  This module
-//! constructs a fail-closed OS boundary for the renderer's immutable binary,
-//! explicitly selected runtime roots, and one private scratch directory.
+//! configures the renderer's launch and resource limits. The default policy
+//! requires OS access isolation. Windows Office explicitly selects Job limits.
 
 use std::{
     ffi::OsString,
@@ -64,8 +64,7 @@ pub enum ConfinementError {
     Process(#[from] BoundedProcessError),
 }
 
-/// Immutable renderer boundary. All path values are canonicalized before the
-/// child is created, and no ambient home or filesystem root is admitted.
+/// Immutable renderer launch policy with canonical paths and resource limits.
 #[derive(Debug, Clone)]
 pub struct RenderSandbox {
     limits: RenderResourceLimits,
@@ -104,8 +103,7 @@ impl RenderSandbox {
         self.limits
     }
 
-    /// Run the only command production rendering may execute. Missing OS
-    /// confinement is an error rather than a fallback to a normal process.
+    /// Run with the selected renderer policy. Failure to establish it is an error.
     pub fn run<I, S>(
         &self,
         args: I,

@@ -1,7 +1,7 @@
 //! One-shot maintenance deletion authority, captured before confirmation.
 //! Quarantine names identify candidates for a *new* preview after interruption;
 //! they never persist authority to delete without current caller proofs.
-use super::{StoreDirectory, err, ioerr, platform, relative_components};
+use super::{StoreDirectory, err, ioerr, relative_components};
 use crate::Result;
 use crate::cas::CasReadAccess;
 use crate::platform::planned_removal::rename;
@@ -62,6 +62,19 @@ impl RemovalBudget {
 
 use crate::platform::removal_semantics::open;
 pub(crate) use crate::platform::removal_semantics::{Identity, identity, require_same_filesystem};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemovalAccess {
+    Inspect,
+    Retire,
+    RetireReadOnlyScratch,
+}
+
+pub(crate) struct Retirement<'a> {
+    pub(crate) directory: bool,
+    pub(crate) expected: &'a Identity,
+    pub(crate) access: RemovalAccess,
+}
 
 #[derive(Debug)]
 struct Node {
@@ -194,7 +207,7 @@ fn capture_node(
     if role.is_content() {
         verify_content_parent(parent, label)?;
     }
-    let held = open(parent, leaf, directory, false, label)?;
+    let held = open(parent, leaf, directory, RemovalAccess::Inspect, label)?;
     if role.is_content() {
         crate::private_fs::verify_private_regular_file_handle(&held)?;
     }
@@ -247,7 +260,7 @@ fn validate_named_identity(parent: &File, leaf: &OsStr, node: &Node, label: &Pat
         verify_content_parent(parent, label)?;
         crate::private_fs::verify_private_regular_file_handle(&node.held)?;
     }
-    let named = open(parent, leaf, node.is_dir(), false, label)?;
+    let named = open(parent, leaf, node.is_dir(), RemovalAccess::Inspect, label)?;
     if node.private_content {
         crate::private_fs::verify_private_regular_file_handle(&named)?;
     }
@@ -356,7 +369,7 @@ impl Target {
             node,
         }))
     }
-    fn revalidate(&self) -> Result<bool> {
+    fn revalidate(&self, label: &Path) -> Result<bool> {
         if self.node.private_content {
             crate::private_fs::verify_private_directory_handle(&self.parent)?;
         }
@@ -377,11 +390,20 @@ impl Target {
         if !exists(&root, source, self.parent.path())? {
             return Ok(false);
         }
-        validate_named(&root, source, &self.node, self.parent.path())?;
+        validate_named(&root, source, &self.node, label)?;
         Ok(true)
     }
-    fn remove(self) -> Result<bool> {
-        if !self.revalidate()? {
+    fn remove(self, private_scratch: bool) -> Result<bool> {
+        let scratch_path = self.parent.path().join(&self.canonical);
+        let label = if private_scratch {
+            &scratch_path
+        } else {
+            self.parent.path()
+        };
+        if private_scratch {
+            verify_content_parent(&self.node.held, label)?;
+        }
+        if !self.revalidate(label)? {
             return Ok(false);
         }
         let parent = self.parent.root_handle();
@@ -390,18 +412,10 @@ impl Target {
         } else {
             &self.canonical
         };
-        let mutator = open(
-            &parent,
-            source,
-            self.node.is_dir(),
-            true,
-            self.parent.path(),
-        )?;
+        let access = retirement_access(&self.node, private_scratch, label)?;
+        let mutator = open(&parent, source, self.node.is_dir(), access, label)?;
         if identity(&mutator, self.node.is_dir(), self.parent.path())? != self.node.identity {
-            return Err(err(
-                self.parent.path(),
-                "planned mutation handle was substituted",
-            ));
+            return Err(err(label, "planned mutation handle was substituted"));
         }
         if self.node.private_content {
             crate::private_fs::verify_private_directory_handle(&self.parent)?;
@@ -409,26 +423,12 @@ impl Target {
             crate::private_fs::verify_private_regular_file_handle(&self.node.held)?;
         }
         if !self.quarantined {
-            rename(
-                &parent,
-                &self.canonical,
-                &self.quarantine,
-                &mutator,
-                self.parent.path(),
-            )?;
-            if let Err(error) =
-                validate_named(&parent, &self.quarantine, &self.node, self.parent.path())
-            {
+            rename(&parent, &self.canonical, &self.quarantine, &mutator, label)?;
+            if let Err(error) = validate_named(&parent, &self.quarantine, &self.node, label) {
                 // Only a no-replace restoration is permitted. If another leaf
                 // occupies the original name, preserve the captured quarantine.
-                let restored = rename(
-                    &parent,
-                    &self.quarantine,
-                    &self.canonical,
-                    &mutator,
-                    self.parent.path(),
-                )
-                .is_ok();
+                let restored =
+                    rename(&parent, &self.quarantine, &self.canonical, &mutator, label).is_ok();
                 let disposition = if restored {
                     "restored to original name".to_owned()
                 } else {
@@ -438,24 +438,40 @@ impl Target {
                     )
                 };
                 return Err(err(
-                    self.parent.path(),
+                    label,
                     format!("capture validation failed ({error}); {disposition}"),
-                ));
+                )
+                .with_context_field("removal_detail", error.context().clone()));
             }
-            platform::sync_directory(&parent, self.parent.path())?;
+            crate::platform::removal_semantics::sync_directory(&parent, self.parent.path())?;
         }
         // Revalidate the whole frozen subtree before the first byte/name deletion.
-        validate_node(&self.node, self.parent.path())?;
+        validate_node(&self.node, label)?;
         remove_node(
             &parent,
             &self.quarantine,
             &self.node,
             Some(mutator),
-            self.parent.path(),
+            private_scratch,
+            label,
         )?;
-        platform::sync_directory(&parent, self.parent.path())?;
+        crate::platform::removal_semantics::sync_directory(&parent, self.parent.path())?;
         Ok(true)
     }
+}
+
+fn retirement_access(node: &Node, private_scratch: bool, label: &Path) -> Result<RemovalAccess> {
+    if private_scratch
+        && node
+            .held
+            .metadata()
+            .map_err(|e| ioerr(label, e))?
+            .permissions()
+            .readonly()
+    {
+        return Ok(RemovalAccess::RetireReadOnlyScratch);
+    }
+    Ok(RemovalAccess::Retire)
 }
 
 fn remove_node(
@@ -463,15 +479,17 @@ fn remove_node(
     leaf: &OsStr,
     node: &Node,
     mutator: Option<File>,
+    private_scratch: bool,
     label: &Path,
 ) -> Result<()> {
     validate_named_identity(parent, leaf, node, label)?;
     if !node.is_dir() {
         validate_node(node, label)?;
     }
+    let access = retirement_access(node, private_scratch, label)?;
     let mutator = match mutator {
         Some(file) => file,
-        None => open(parent, leaf, node.is_dir(), true, label)?,
+        None => open(parent, leaf, node.is_dir(), access, label)?,
     };
     if identity(&mutator, node.is_dir(), label)? != node.identity {
         return Err(err(label, "planned child mutation handle changed"));
@@ -483,7 +501,14 @@ fn remove_node(
     }
     if let NodeKind::Directory(children) = &node.kind {
         for (name, child) in children {
-            remove_node(&node.held, name, child, None, &label.join(name))?;
+            remove_node(
+                &node.held,
+                name,
+                child,
+                None,
+                private_scratch,
+                &label.join(name),
+            )?;
         }
         if cap_fs::read_base_dir(&node.held)
             .map_err(|e| ioerr(label, e))?
@@ -501,12 +526,20 @@ fn remove_node(
         leaf,
         &node.held,
         &mutator,
-        node.is_dir(),
-        &node.identity,
+        Retirement {
+            directory: node.is_dir(),
+            expected: &node.identity,
+            access,
+        },
         label,
     )?;
     drop(mutator);
-    platform::sync_directory(parent, label)
+    let sync_label = if private_scratch {
+        label.parent().unwrap_or(label)
+    } else {
+        label
+    };
+    crate::platform::removal_semantics::sync_directory(parent, sync_label)
 }
 
 #[derive(Debug)]
@@ -529,10 +562,14 @@ impl PlannedDirectoryRemoval {
         .map(|target| target.map(Self))
     }
     pub fn revalidate(&self) -> Result<bool> {
-        self.0.revalidate()
+        self.0.revalidate(self.0.parent.path())
     }
     pub fn remove(self) -> Result<bool> {
-        self.0.remove()
+        self.0.remove(false)
+    }
+    /// Retire an owner-private scratch tree, allowing deletion of read-only members.
+    pub fn remove_private_scratch(self) -> Result<bool> {
+        self.0.remove(true)
     }
 }
 
@@ -564,10 +601,10 @@ impl PlannedFileRemoval {
         }
     }
     pub fn revalidate(&self) -> Result<bool> {
-        self.0.revalidate()
+        self.0.revalidate(self.0.parent.path())
     }
     pub fn remove(self) -> Result<bool> {
-        self.0.remove()
+        self.0.remove(false)
     }
 }
 
@@ -963,7 +1000,7 @@ mod tests {
             &parent.handle,
             OsStr::new("child"),
             false,
-            false,
+            RemovalAccess::Inspect,
             temp.path(),
         )
         .unwrap();
@@ -984,7 +1021,7 @@ mod tests {
             &parent.handle,
             OsStr::new("child"),
             false,
-            false,
+            RemovalAccess::Inspect,
             temp.path(),
         )
         .unwrap();
@@ -992,7 +1029,7 @@ mod tests {
             &parent.handle,
             OsStr::new("child"),
             false,
-            true,
+            RemovalAccess::Retire,
             temp.path(),
         )
         .unwrap();

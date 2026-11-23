@@ -83,14 +83,18 @@ fn token_id(token: HANDLE) -> io::Result<(u32, i32)> {
     }
     Ok((stats.TokenId.LowPart, stats.TokenId.HighPart))
 }
-fn isolated(token: HANDLE, user_sid: &[u8], expected_app: PSID) -> io::Result<()> {
+fn verify_access(token: HANDLE, user_sid: &[u8], expected_app: Option<PSID>) -> io::Result<()> {
     if user(token)? != user_sid
-        || *Information::query(token, TokenIsAppContainer)?.value::<u32>()? != 1
+        || *Information::query(token, TokenIsAppContainer)?.value::<u32>()?
+            != u32::from(expected_app.is_some())
     {
         return Err(unsafe_token(
-            "renderer token is not the invoking user's AppContainer",
+            "renderer token does not match the invoking user and required AppContainer state",
         ));
     }
+    let Some(expected_app) = expected_app else {
+        return Ok(());
+    };
     let app = Information::query(token, TokenAppContainerSid)?;
     let actual = app.sid(
         app.value::<TOKEN_APPCONTAINER_INFORMATION>()?
@@ -113,7 +117,10 @@ fn isolated(token: HANDLE, user_sid: &[u8], expected_app: PSID) -> io::Result<()
     Ok(())
 }
 
-pub(super) fn prepare_suspended_renderer_token(process: HANDLE, app_sid: PSID) -> io::Result<()> {
+pub(super) fn prepare_suspended_renderer_token(
+    process: HANDLE,
+    app_sid: Option<PSID>,
+) -> io::Result<()> {
     let mut parent = ptr::null_mut();
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut parent) } == 0 {
         return Err(io::Error::last_os_error());
@@ -133,7 +140,7 @@ pub(super) fn prepare_suspended_renderer_token(process: HANDLE, app_sid: PSID) -
             "renderer unexpectedly shares the host token object",
         ));
     }
-    isolated(child.0, &parent_user, app_sid)?;
+    verify_access(child.0, &parent_user, app_sid)?;
     let child_user = Information::query(child.0, TokenUser)?;
     let desired = TOKEN_OWNER {
         Owner: child_user.value::<TOKEN_USER>()?.User.Sid,
@@ -159,5 +166,5 @@ pub(super) fn prepare_suspended_renderer_token(process: HANDLE, app_sid: PSID) -
             "renderer owner adjustment changed unexpected token state",
         ));
     }
-    isolated(child.0, &parent_user, app_sid)
+    verify_access(child.0, &parent_user, app_sid)
 }

@@ -3,7 +3,7 @@
 use kio_process::platform::protect_owner_private_scratch;
 use kio_process::{
     BoundedProcessError, BoundedProcessOptions,
-    confinement::{ConfinementError, RenderResourceLimits, RenderSandbox},
+    confinement::{ConfinementError, RenderResourceLimits, RenderSandbox, RenderSources},
 };
 use std::{
     ffi::OsString,
@@ -719,6 +719,114 @@ fn appcontainer_cannot_send_loopback_tcp_body() {
         .accept()
         .expect_err("forbidden loopback connection accepted");
     assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+}
+
+#[test]
+fn windows_office_uses_job_only_and_retires_private_scratch() {
+    let scratch = tempfile::tempdir().expect("scratch");
+    let out = scratch.path().join("out");
+    std::fs::create_dir(&out).unwrap();
+    prepare_private_fixture_tree(scratch.path());
+    let sources = RenderSources::resolve(&std::env::current_exe().unwrap(), []).unwrap();
+    let limits = RenderResourceLimits {
+        cpu_seconds: 37,
+        max_aggregate_memory_bytes: 512 * 1024 * 1024,
+        ..RenderResourceLimits::default()
+    };
+    let sandbox = RenderSandbox::for_windows_office(&sources, scratch.path(), limits).unwrap();
+    let owner_before = current_process_default_owner();
+    let result = sandbox
+        .run(
+            [
+                "--exact",
+                "windows_office_job_actor",
+                "--ignored",
+                "--nocapture",
+            ],
+            &environment(std::env::var_os("SystemRoot").unwrap(), scratch.path()),
+            options(Duration::from_secs(15), 4096),
+        )
+        .expect("run Job-only actor");
+    assert!(result.status.success(), "{result:?}");
+    assert!(result.stdout.contains("KIO_OFFICE_JOB_ACTOR_COMPLETED"));
+    assert_eq!(current_process_default_owner(), owner_before);
+
+    let token_user = current_user_token_buffer();
+    let sid = unsafe {
+        (&*token_user
+            .as_ptr()
+            .cast::<windows_sys::Win32::Security::TOKEN_USER>())
+            .User
+            .Sid
+    };
+    let output = out.join("nested").join("output.txt");
+    assert_eq!(std::fs::read(&output).unwrap(), b"renderer output");
+    for path in [scratch.path(), &out, output.parent().unwrap(), &output] {
+        assert_current_user_scratch(path, sid, true);
+    }
+}
+
+#[test]
+#[ignore = "invoked by the Windows Office Job-only test"]
+fn windows_office_job_actor() {
+    use windows_sys::Win32::{
+        Foundation::CloseHandle,
+        Security::{GetTokenInformation, TOKEN_QUERY, TokenIsAppContainer},
+        System::{
+            JobObjects::{
+                JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_JOB_MEMORY,
+                JOB_OBJECT_LIMIT_JOB_TIME, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+                QueryInformationJobObject,
+            },
+            Threading::{GetCurrentProcess, OpenProcessToken},
+        },
+    };
+    let mut token = std::ptr::null_mut();
+    assert_ne!(
+        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) },
+        0
+    );
+    let mut is_appcontainer = 1_u32;
+    let mut returned = 0;
+    let queried = unsafe {
+        GetTokenInformation(
+            token,
+            TokenIsAppContainer,
+            (&raw mut is_appcontainer).cast(),
+            std::mem::size_of_val(&is_appcontainer) as u32,
+            &mut returned,
+        )
+    };
+    unsafe { CloseHandle(token) };
+    assert_ne!(queried, 0);
+    assert_eq!(is_appcontainer, 0);
+
+    let mut job = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    assert_ne!(
+        unsafe {
+            QueryInformationJobObject(
+                std::ptr::null_mut(),
+                JobObjectExtendedLimitInformation,
+                (&raw mut job).cast(),
+                std::mem::size_of_val(&job) as u32,
+                std::ptr::null_mut(),
+            )
+        },
+        0,
+        "renderer must be in the resource Job"
+    );
+    let required = JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+        | JOB_OBJECT_LIMIT_JOB_MEMORY
+        | JOB_OBJECT_LIMIT_JOB_TIME
+        | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    assert_eq!(job.BasicLimitInformation.LimitFlags & required, required);
+    assert_eq!(job.BasicLimitInformation.ActiveProcessLimit, 8);
+    assert_eq!(job.BasicLimitInformation.PerJobUserTimeLimit, 370_000_000);
+    assert_eq!(job.JobMemoryLimit, 512 * 1024 * 1024);
+    std::fs::create_dir("out/nested").unwrap();
+    std::fs::write("out/nested/output.txt", b"renderer output").unwrap();
+    println!("KIO_OFFICE_JOB_ACTOR_COMPLETED");
 }
 
 #[test]

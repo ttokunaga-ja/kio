@@ -452,9 +452,11 @@ Kio が作成する `.kio` とその内容、device data・cache・state、crede
 一時ファイル・query cache・renderer scratch は、現在の利用者が所有する private storage とする。
 Unix では作成時にディレクトリを `0700`、ファイルを `0600` とし、検証時にも owner-only を要求する。
 追加の ACL でこの保護を弱めない。OS 管理者の権限を理由に別所有者の Kio 作成物を受理しない。
-Windows では owner-only の保護された DACL を要求する。隔離した renderer の一時領域に限り、
-当該 invocation の AppContainer SID へのアクセスをその寿命中に許可する。
-owner、DACL、SID、対象の identity を検証し、終了・回復時にこの追加権限を退役させる。
+Windows では owner-only の保護された DACL を要求する。AppContainer で起動する renderer の一時領域に限り、
+当該 invocation の SID へのアクセスをその寿命中に許可する。owner、DACL、SID、対象の identity を検証し、
+終了・回復時に追加権限を退役させる。Windows Office の一時領域では owner の ACE だけを実行中の子ファイルへ
+継承させ、Job 停止後に保護された owner-only DACL に戻す。Office 自体は呼出し元ユーザーのアクセス権で動作する。
+Windows Office の Job 制限と残余リスクは [Adapter 仕様 §5.1](07-adapter-spec.md#51-prepare) を参照。
 
 読み取り専用操作も、使用前に所有者・アクセス権・実体を検証する。別の所有者、他の利用者に書込み・
 削除・権限変更を許すアクセス、symlink / reparse point、検出したすり替えは拒否する。private file は

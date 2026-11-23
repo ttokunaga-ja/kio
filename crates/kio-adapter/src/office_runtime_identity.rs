@@ -224,33 +224,79 @@ impl RuntimeSnapshot {
         stage: &str,
         deadline: Instant,
     ) -> Result<()> {
-        let changed = || {
-            io::Error::other(format!(
-                "Office runtime changed {stage}; resolve a fresh converter before retrying"
-            ))
-        };
         let check_entry = |path: &Path, metadata: &Metadata| {
-            if self.entries.get(path) != Some(&entry_identity(path, metadata)?) {
-                return Err(changed());
+            let current = entry_identity(path, metadata)?;
+            match self.entries.get(path) {
+                None => Err(self.changed_error(stage, Some(path), "entry added")),
+                Some(expected) if *expected != current => {
+                    Err(self.changed_error(stage, Some(path), expected.differing_field(&current)))
+                }
+                Some(_) => Ok(()),
             }
-            Ok(())
         };
         if sources.masked_runtime_directory() != self.excluded.as_deref() {
-            return Err(changed());
+            return Err(self.changed_error(stage, None, "excluded runtime directory"));
         }
-        if mount_identities(sources, deadline)? != self.mounts
-            || Self::read(
-                &self.roots,
-                sources,
-                self.excluded.as_deref(),
-                &check_entry,
-                deadline,
-            )? != self.entries
+        let mounts = mount_identities(sources, deadline)?;
+        for ((_, path), (expected, current)) in
+            sources.roots().iter().zip(self.mounts.iter().zip(&mounts))
         {
-            return Err(changed());
+            if expected != current {
+                return Err(self.changed_error(
+                    stage,
+                    Some(path),
+                    expected.differing_field(current),
+                ));
+            }
+        }
+        if mounts.len() != self.mounts.len() {
+            return Err(self.changed_error(stage, None, "runtime mount count"));
+        }
+        let entries = Self::read(
+            &self.roots,
+            sources,
+            self.excluded.as_deref(),
+            &check_entry,
+            deadline,
+        )?;
+        if entries != self.entries {
+            for (path, expected) in &self.entries {
+                let field = match entries.get(path) {
+                    None => "entry removed",
+                    Some(current) if expected != current => expected.differing_field(current),
+                    Some(_) => continue,
+                };
+                return Err(self.changed_error(stage, Some(path), field));
+            }
+            let added = entries
+                .keys()
+                .find(|path| !self.entries.contains_key(*path));
+            return Err(self.changed_error(stage, added.map(PathBuf::as_path), "entry added"));
         }
         self.records.verify(deadline)?;
         check_verification_deadline(deadline)
+    }
+
+    pub(crate) fn changed_error(&self, stage: &str, path: Option<&Path>, field: &str) -> io::Error {
+        let label = match path {
+            Some(path) => match self
+                .roots
+                .iter()
+                .find_map(|root| path.strip_prefix(root).ok())
+            {
+                Some(relative) if relative.as_os_str().is_empty() => ".".to_owned(),
+                Some(relative) => relative.to_string_lossy().into_owned(),
+                None => format!(
+                    "<external runtime>/{}",
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                ),
+            },
+            None => "<runtime layout>".to_owned(),
+        };
+        let bounded: String = label.chars().take(240).collect();
+        io::Error::other(format!(
+            "Office runtime changed {stage}; entry: {bounded:?}; differing field: {field}; resolve a fresh converter before retrying"
+        ))
     }
 }
 
@@ -331,12 +377,16 @@ mod tests {
                 b"modified configuration with a different size",
             )
             .unwrap();
+            let error = snapshot
+                .verify(&sources, "before launch", deadline())
+                .unwrap_err()
+                .to_string();
             assert!(
-                snapshot
-                    .verify(&sources, "before launch", deadline())
-                    .is_err(),
-                "{relative}"
+                error.contains(configuration.file_name().unwrap().to_str().unwrap()),
+                "{error}"
             );
+            assert!(error.contains("file size"), "{error}");
+            assert!(!error.contains(&*package.to_string_lossy()), "{error}");
         }
     }
 

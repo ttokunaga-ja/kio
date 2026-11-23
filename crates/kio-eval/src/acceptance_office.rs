@@ -25,6 +25,7 @@ use crate::{
         sha256_bytes, sha256_regular_file, validate_expected, write_receipt_create_only,
     },
     acceptance_environment::IsolatedChildEnvironment,
+    acceptance_preflight::office_version_program,
     runner::{BoundedProcessOptions, run_bounded_command},
 };
 
@@ -477,7 +478,8 @@ fn command_status(
 }
 
 fn converter_version(path: &Path) -> Result<String, AcceptanceError> {
-    let mut cmd = Command::new(path);
+    let program = office_version_program(path, cfg!(windows));
+    let mut cmd = Command::new(program.as_os_str());
     cmd.arg("--version");
     let out = run_bounded_command(
         &mut cmd,
@@ -540,4 +542,26 @@ fn invalid(message: &str) -> AcceptanceError {
 }
 fn io(error: std::io::Error) -> AcceptanceError {
     AcceptanceError::Io(error.to_string())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::converter_version;
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    #[test]
+    fn a07_reads_version_from_the_bound_converter_on_unix() {
+        let scratch = tempfile::tempdir().unwrap();
+        let converter = scratch.path().join("test soffice");
+        fs::write(
+            &converter,
+            b"#!/bin/sh\n[ \"$1\" = --version ] || exit 1\nprintf 'LibreOffice test version\\n'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&converter, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            converter_version(&converter).unwrap(),
+            "LibreOffice test version\n"
+        );
+    }
 }

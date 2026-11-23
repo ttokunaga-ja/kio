@@ -26,7 +26,7 @@ use std::{
 
 use kio_process::{
     BoundedProcessError, BoundedProcessOptions, BoundedProcessOutput,
-    confinement::{ConfinementError, RenderResourceLimits, RenderSandbox, RenderSources},
+    confinement::{ConfinementError, RenderResourceLimits, RenderSources},
 };
 use sha2::{Digest, Sha256};
 
@@ -34,8 +34,10 @@ use crate::office_runtime_identity::{
     ExecutableFingerprint, RuntimeSnapshot, check_verification_deadline,
 };
 use crate::platform::{
-    DEFAULT_OFFICE_CONVERTER_PROGRAM, OfficeRuntime, file_url, finish_scratch, private_temp_dir,
-    restrict_renderer_state_directory, scratch_recovery_note,
+    DEFAULT_OFFICE_CONVERTER_PROGRAM, OFFICE_LAUNCH_PROFILE, OFFICE_QUERY_VERSION,
+    OFFICE_REDIRECT_SHARED_CACHE, OfficeRuntime, file_url, finish_scratch, office_conversion_paths,
+    office_render_sandbox, private_temp_dir, restrict_renderer_state_directory,
+    scratch_recovery_note,
 };
 use crate::{AdapterError, Result};
 
@@ -50,12 +52,14 @@ pub const TEST_OFFICE_CONVERT_ENV: &str = "KIO_TEST_OFFICE_CONVERT";
 pub const OFFICE_CONVERTER_ENV: &str = "KIO_OFFICE_CONVERTER";
 pub(crate) const MAX_OFFICE_PROBE_PDF_BYTES: usize = 2 * 1024 * 1024;
 const MAX_OFFICE_PROBE_SCRATCH_BYTES: u64 = 8 * 1024 * 1024;
-const OFFICE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+// One budget for runtime verification and both fixture conversions on cold CI hosts.
+const OFFICE_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 const OFFICE_CONVERT_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_OFFICE_INPUT_BYTES: usize = 100 * 1024 * 1024;
 const MAX_OFFICE_PDF_BYTES: usize = 250 * 1024 * 1024;
 pub(crate) const MAX_OFFICE_LOG_BYTES: usize = 64 * 1024;
 const OFFICE_NORMALIZATION_PROFILE: &str = "pdf-volatile-fields-v1";
+const OFFICE_SCRATCH_CACHE: &str = "cache";
 const MACOS_UNO_FILTER_VERSION: &str = "macos-spell-component-v1";
 
 const DOCX_MEDIA_TYPE: &str =
@@ -143,6 +147,7 @@ impl OfficeConverter {
                 digest.update(fixture_path.as_os_str().as_encoded_bytes())
             }
             ConverterBackend::Real(renderer) => {
+                digest.update(OFFICE_LAUNCH_PROFILE);
                 let RealRenderer {
                     sources,
                     program_fingerprint,
@@ -325,7 +330,9 @@ fn probe_real_converter_diagnostic(
     )?;
     renderer.verify_initial_runtime(deadline)?;
     let version = probe_renderer_capability(
-        || renderer.renderer_version(deadline),
+        // The Windows GUI launcher opens a separate console for --version
+        // and waits for input. Conversion readiness does not use that query.
+        OFFICE_QUERY_VERSION.then_some(|| renderer.renderer_version(deadline)),
         |fixture, media_type| {
             renderer.render_pdf(fixture, media_type, MAX_OFFICE_PROBE_PDF_BYTES, deadline)
         },
@@ -391,8 +398,12 @@ impl RealRenderer {
         }
         let scratch = private_temp_dir()?;
         let profile_dir = create_private_renderer_state(scratch.path(), "probe")?;
-        let profile_url = file_url(&profile_dir)?;
-        let sandbox = RenderSandbox::from_sources(
+        let bootstrap = renderer_bootstrap_arguments(
+            scratch.path(),
+            &profile_dir,
+            OFFICE_REDIRECT_SHARED_CACHE,
+        )?;
+        let sandbox = office_render_sandbox(
             &self.sources,
             scratch.path(),
             RenderResourceLimits::default(),
@@ -412,12 +423,10 @@ impl RealRenderer {
             .pin_before_launch(deadline)
             .map_err(verification_error)?;
         let result = sandbox.run_checked_until(
-            [
-                OsString::from("--headless"),
-                OsString::from("--norestore"),
-                OsString::from(format!("-env:UserInstallation={profile_url}")),
-                OsString::from("--version"),
-            ],
+            [OsString::from("--headless"), OsString::from("--norestore")]
+                .into_iter()
+                .chain(bootstrap)
+                .chain([OsString::from("--version")]),
             &environment,
             renderer_process_options(OFFICE_PROBE_TIMEOUT),
             deadline,
@@ -468,7 +477,7 @@ fn advisory_version_output(
 }
 
 fn probe_renderer_capability(
-    query_version: impl FnOnce() -> Result<String>,
+    query_version: Option<impl FnOnce() -> Result<String>>,
     mut convert_fixture: impl FnMut(&[u8], &str) -> Result<Vec<u8>>,
     deadline: Instant,
 ) -> Result<String> {
@@ -498,7 +507,10 @@ fn probe_renderer_capability(
             )));
         }
     }
-    let stdout = query_version()?;
+    let stdout = query_version
+        .map(|query| query())
+        .transpose()?
+        .unwrap_or_default();
     Ok(stdout
         .lines()
         .map(str::trim)
@@ -587,7 +599,7 @@ fn create_private_renderer_state(scratch: &Path, purpose: &str) -> Result<PathBu
     })?;
     for (name, label) in [
         ("lo-profile", "LibreOffice profile"),
-        ("cache", "renderer cache"),
+        (OFFICE_SCRATCH_CACHE, "renderer cache"),
         ("config", "renderer configuration"),
     ] {
         directory
@@ -600,6 +612,19 @@ fn create_private_renderer_state(scratch: &Path, purpose: &str) -> Result<PathBu
         restrict_renderer_state_directory(&directory, name, purpose, label)?;
     }
     Ok(profile)
+}
+
+fn renderer_bootstrap_arguments(
+    scratch: &Path,
+    profile: &Path,
+    redirect_shared_cache: bool,
+) -> Result<Vec<OsString>> {
+    let mut arguments = vec![format!("-env:UserInstallation={}", file_url(profile)?).into()];
+    if redirect_shared_cache {
+        let cache = file_url(&scratch.join(OFFICE_SCRATCH_CACHE))?;
+        arguments.push(format!("-env:UNO_SHARED_PACKAGES_CACHE={cache}").into());
+    }
+    Ok(arguments)
 }
 
 pub(crate) fn hex_digest(bytes: &[u8]) -> String {
@@ -679,26 +704,28 @@ impl RealRenderer {
         })?;
         let profile_dir = create_private_renderer_state(workdir, "conversion")?;
 
-        let profile_url = file_url(&profile_dir)?;
+        let bootstrap =
+            renderer_bootstrap_arguments(workdir, &profile_dir, OFFICE_REDIRECT_SHARED_CACHE)?;
         let mut limits = RenderResourceLimits::default();
         if output_limit == MAX_OFFICE_PROBE_PDF_BYTES {
             limits.max_file_bytes = MAX_OFFICE_PROBE_SCRATCH_BYTES;
         }
-        let sandbox =
-            RenderSandbox::from_sources(&self.sources, workdir, limits).map_err(|err| {
-                AdapterError::ContractViolation(format!(
-                    "office converter confinement is unavailable: {err}"
-                ))
-            })?;
-        let arguments = vec![
-            OsString::from("--headless"),
-            OsString::from(format!("-env:UserInstallation={profile_url}")),
-            OsString::from("--convert-to"),
-            OsString::from("pdf"),
-            OsString::from("--outdir"),
-            outdir.as_os_str().to_owned(),
-            input_path.as_os_str().to_owned(),
-        ];
+        let sandbox = office_render_sandbox(&self.sources, workdir, limits).map_err(|err| {
+            AdapterError::ContractViolation(format!(
+                "office converter confinement is unavailable: {err}"
+            ))
+        })?;
+        let (outdir_arg, input_arg) = office_conversion_paths(&outdir, &input_path);
+        let arguments = [OsString::from("--headless")]
+            .into_iter()
+            .chain(bootstrap)
+            .chain([
+                OsString::from("--convert-to"),
+                OsString::from("pdf"),
+                OsString::from("--outdir"),
+                outdir_arg,
+                input_arg,
+            ]);
         let mut environment = runtime.environment(program, Some(&profile_dir));
         #[cfg(test)]
         if self.native_acceptance_diagnostics {
@@ -731,6 +758,13 @@ impl RealRenderer {
                 )));
             }
         };
+        let probe_failure_note = || {
+            if output_limit == MAX_OFFICE_PROBE_PDF_BYTES {
+                office_probe_output_failure_note(&scratch_directory, &output_directory, &output)
+            } else {
+                String::new()
+            }
+        };
         if !output.status.success() {
             #[cfg(test)]
             if self.native_acceptance_diagnostics {
@@ -744,9 +778,10 @@ impl RealRenderer {
                 )));
             }
             return Err(AdapterError::ContractViolation(format!(
-                "office converter {} exited with {}",
+                "office converter {} exited with {}{}",
                 program.display(),
-                output.status
+                output.status,
+                probe_failure_note(),
             )));
         }
 
@@ -765,14 +800,16 @@ impl RealRenderer {
             deadline,
         )
         .map_err(|error| {
+            let note = probe_failure_note();
             AdapterError::ContractViolation(format!(
-                "office converter output is absent, unsafe, or exceeded the {output_limit} byte limit: {error}",
+                "office converter output is absent, unsafe, or exceeded the {output_limit} byte limit: {error}{note}",
             ))
         })?;
         if !pdf_bytes.starts_with(b"%PDF") {
-            return Err(AdapterError::ContractViolation(
-                "office converter output is not a PDF (missing %PDF magic)".to_owned(),
-            ));
+            return Err(AdapterError::ContractViolation(format!(
+                "office converter output is not a PDF (missing %PDF magic){}",
+                probe_failure_note(),
+            )));
         }
         drop(output_directory);
         drop(scratch_directory);
@@ -781,6 +818,52 @@ impl RealRenderer {
             .map_err(verification_error)?;
         Ok(pdf_bytes)
     }
+}
+
+pub(crate) fn office_probe_output_failure_note(
+    scratch: &kio_core::store_dir::StoreDirectory,
+    out: &kio_core::store_dir::StoreDirectory,
+    output: &kio_process::BoundedProcessOutput,
+) -> String {
+    fn entry_names(directory: &kio_core::store_dir::StoreDirectory) -> String {
+        const MAX_NAMES: usize = 16;
+        let Ok(entries) = directory.entries(Path::new("")) else {
+            return "unavailable".to_owned();
+        };
+        let names = entries
+            .iter()
+            .take(MAX_NAMES)
+            .map(|entry| {
+                entry
+                    .name
+                    .to_string_lossy()
+                    .chars()
+                    .take(80)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let suffix = if entries.len() > MAX_NAMES {
+            " (truncated)"
+        } else {
+            ""
+        };
+        format!("{names:?}{suffix}")
+    }
+
+    fn log_excerpt(log: &str) -> String {
+        const MAX_LOG_BYTES: usize = 2 * 1024;
+        let end = log.floor_char_boundary(MAX_LOG_BYTES);
+        let suffix = if end < log.len() { " (truncated)" } else { "" };
+        format!("{:?}{suffix}", &log[..end])
+    }
+    format!(
+        "; renderer status: {}; scratch entries: {}; out entries: {}; renderer stdout: {}; renderer stderr: {}",
+        output.status,
+        entry_names(scratch),
+        entry_names(out),
+        log_excerpt(&output.stdout),
+        log_excerpt(&output.stderr),
+    )
 }
 
 /// Deterministically normalize a converter's raw PDF output (07 §5.1):
@@ -1044,6 +1127,42 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renderer_bootstrap_redirects_the_shared_cache_when_requested() {
+        let scratch = private_temp_dir().unwrap();
+        let profile = create_private_renderer_state(scratch.path(), "test").unwrap();
+        let profile_arg = format!("-env:UserInstallation={}", file_url(&profile).unwrap());
+        let cache_arg = format!(
+            "-env:UNO_SHARED_PACKAGES_CACHE={}",
+            file_url(&scratch.path().join("cache")).unwrap()
+        );
+        assert_eq!(
+            renderer_bootstrap_arguments(scratch.path(), &profile, false).unwrap(),
+            [OsString::from(&profile_arg)]
+        );
+        assert_eq!(
+            renderer_bootstrap_arguments(scratch.path(), &profile, true).unwrap(),
+            [OsString::from(profile_arg), OsString::from(cache_arg)]
+        );
+        finish_scratch(scratch).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_bootstrap_uses_safe_file_urls_for_profile_and_shared_cache() {
+        let scratch = Path::new(r"\\?\C:\kio scratch#%");
+        let profile = scratch.join("lo-profile");
+        assert_eq!(
+            renderer_bootstrap_arguments(scratch, &profile, OFFICE_REDIRECT_SHARED_CACHE).unwrap(),
+            [
+                OsString::from("-env:UserInstallation=file:///C:/kio%20scratch%23%25/lo-profile"),
+                OsString::from(
+                    "-env:UNO_SHARED_PACKAGES_CACHE=file:///C:/kio%20scratch%23%25/cache"
+                ),
+            ],
+        );
+    }
     use crate::platform::*;
 
     #[cfg(unix)]
@@ -1449,17 +1568,12 @@ mod tests {
         assert!(!message.contains("private fixture bytes"));
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn file_url_percent_encodes_reserved_characters() {
-        #[cfg(not(windows))]
         let path = Path::new("/private/kio office#?%.profile");
-        #[cfg(windows)]
-        let path = Path::new(r"C:\private\kio office#?%.profile");
         let url = file_url(path).expect("Unicode fixture path");
-        #[cfg(not(windows))]
         assert_eq!(url, "file:///private/kio%20office%23%3F%25.profile");
-        #[cfg(windows)]
-        assert_eq!(url, "file:///C:/private/kio%20office%23%3F%25.profile");
     }
 
     #[cfg(target_os = "macos")]
@@ -1958,7 +2072,7 @@ mod tests {
     fn probe_requires_both_fixture_conversions_without_a_version_line() {
         let mut media_types = Vec::new();
         let version = probe_renderer_capability(
-            || Ok("  \r\n".to_owned()),
+            Some(|| Ok("  \r\n".to_owned())),
             |bytes, media_type| {
                 crate::ooxml_package::validate_real_office_package(bytes, media_type)?;
                 media_types.push(media_type.to_owned());
@@ -1983,7 +2097,7 @@ mod tests {
 
     fn probe_captured_libreoffice_pdfs(presentation: &[u8]) -> Result<String> {
         probe_renderer_capability(
-            || Ok("LibreOffice 24.2".to_owned()),
+            Some(|| Ok("LibreOffice 24.2".to_owned())),
             |_, media_type| match media_type {
                 DOCX_MEDIA_TYPE => Ok(LIBREOFFICE_DOCX_PROBE_PDF.to_vec()),
                 PPTX_MEDIA_TYPE => Ok(presentation.to_vec()),
@@ -2148,7 +2262,7 @@ mod tests {
     #[test]
     fn probe_refuses_large_renderer_output_before_decoding() {
         let result = probe_renderer_capability(
-            || panic!("version queried with oversized PDF"),
+            Some(|| panic!("version queried with oversized PDF")),
             |_, media| {
                 let mut pdf = rendered_probe_fixture(media);
                 pdf.resize(MAX_OFFICE_PROBE_PDF_BYTES + 1, b' ');
@@ -2167,7 +2281,7 @@ mod tests {
     #[test]
     fn probe_rejects_unreachable_page_with_pdf_markers() {
         let result = probe_renderer_capability(
-            || Ok("test renderer".to_owned()),
+            Some(|| Ok("test renderer".to_owned())),
             |_, _| Ok(b"%PDF-1.4\n1 0 obj\n<< /Type /Page >>\nendobj\n%%EOF\n".to_vec()),
             test_deadline(),
         );
@@ -2201,6 +2315,22 @@ mod tests {
     }
 
     #[test]
+    fn probe_without_version_query_still_requires_both_conversions() {
+        let mut converted = Vec::new();
+        let version = probe_renderer_capability(
+            None::<fn() -> Result<String>>,
+            |_, media_type| {
+                converted.push(media_type.to_owned());
+                Ok(rendered_probe_fixture(media_type))
+            },
+            test_deadline(),
+        )
+        .unwrap();
+        assert_eq!(converted, [DOCX_MEDIA_TYPE, PPTX_MEDIA_TYPE]);
+        assert_eq!(version, "unknown");
+    }
+
+    #[test]
     fn probe_preserves_capability_after_clean_version_timeout_or_output_limit() {
         for error in [
             BoundedProcessError::Timeout { timeout_ms: 10 },
@@ -2210,10 +2340,10 @@ mod tests {
             },
         ] {
             let version = probe_renderer_capability(
-                || {
+                Some(|| {
                     advisory_version_output(Err(error.into()))
                         .map_err(|error| AdapterError::ContractViolation(error.to_string()))
-                },
+                }),
                 |_, media_type| Ok(rendered_probe_fixture(media_type)),
                 test_deadline(),
             );
@@ -2226,7 +2356,7 @@ mod tests {
     #[test]
     fn probe_rejects_pptx_pdf_with_docx_content_even_with_a_version_line() {
         let error = probe_renderer_capability(
-            || Ok("LibreOffice 26.8.0.3".to_owned()),
+            Some(|| Ok("LibreOffice 26.8.0.3".to_owned())),
             |_, _| Ok(probe_pdf(DOCX_PROBE_TEXT, false)),
             test_deadline(),
         )
@@ -2252,7 +2382,7 @@ mod tests {
     #[test]
     fn probe_rejects_an_expired_budget_before_rendering() {
         let result = probe_renderer_capability(
-            || panic!("version queried after the deadline"),
+            Some(|| panic!("version queried after the deadline")),
             |_, _| panic!("renderer invoked after the deadline"),
             Instant::now(),
         );
@@ -2263,7 +2393,7 @@ mod tests {
     fn probe_checks_remaining_budget_again_after_reading_output() {
         let deadline = Instant::now() + Duration::from_millis(50);
         let result = probe_renderer_capability(
-            || panic!("version queried after the deadline"),
+            Some(|| panic!("version queried after the deadline")),
             |_, _| {
                 std::thread::sleep(
                     deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
@@ -2395,7 +2525,7 @@ mod tests {
     }
 
     fn required_real_office_converter() -> Option<OfficeConverter> {
-        let deadline = test_deadline();
+        let deadline = Instant::now() + OFFICE_PROBE_TIMEOUT;
         let program = required_real_office_program(deadline)?;
         let _clear_seam = kio_core::test_control::TestEnvGuard::remove(TEST_OFFICE_CONVERT_ENV);
         let converter =

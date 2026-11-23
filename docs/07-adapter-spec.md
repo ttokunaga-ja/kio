@@ -276,7 +276,7 @@ metadata:
 
 PDF page image、Office intermediate、抽出済み image など、後続 Markdownize / Embedding が扱いやすい単位を作る。
 
-**Office の準備 (DOCX / PPTX)** は、隔離された LibreOffice の PDF 変換を使用する。
+**Office の準備 (DOCX / PPTX)** は、実行範囲を制限した LibreOffice の PDF 変換を使用する。
 変換 PDF の `/CreationDate`・`/ModDate`・`/ID` 等の揮発 metadata は、xref offset を保つ同長の固定値に
 正規化してから hash する。DOCX は PDF のページを `page:N`、PPTX は一スライド一ページの対応で
 `slide:N` として列挙する。選択した renderer と変換条件は
@@ -288,7 +288,7 @@ PDF page image、Office intermediate、抽出済み image など、後続 Markdo
 
 renderer は `KIO_OFFICE_CONVERTER` で指定できる。未指定時は PATH の `soffice` を調べる。
 配布元名、固定 install prefix、最低 version の文字列だけで可否を決めない。
-実 executable identity と必要 runtime resource を特定・検証し、隔離内の bounded な実変換 probe で
+実 executable identity と必要 runtime resource を特定・検証し、同じ実行条件で時間・資源を制限した実変換 probe で
 headless PDF 出力 capability を確認する。名称・version・配布物 digest は provenance と診断に残す。
 実変換 probe は Office 入力の索引・処理と、明示的な診断コマンド `kio status` で行う。
 `kio search` は renderer の解決や probe を行わず、`index_status.office_conversion_unavailable` に
@@ -299,11 +299,20 @@ macOS は app bundle の Apple 発行コード署名と seal を全 architecture
 `KIO_OFFICE_CONVERTER` に bundle 内の実行ファイルを指定できる。特定の Team ID や bundle ID の
 指定、追加の notarization ticket 照会は行わない。Windows は `program/soffice.exe` と同じ
 `program/` 内に `soffice.bin`・`fundamental.ini` があり、隣に `share/` がある配置を検証する。
-launcher・renderer 本体・配置内の PE image の Authenticode 署名を実ファイル上で確認する。
-Windows の trust 判定はローカル情報で行い、publisher 名やインストーラの署名は判定に使わない。
+Windows は launcher と renderer 本体を PE image として確認し、`program/` 直下のすべての PE image に
+有効な Authenticode 署名を要求する。`program/` の下位ディレクトリの PE image は、署名があれば
+実ファイル上で検証し、署名の破損や信頼エラーがあれば拒否する。署名がないことを確認できた場合は
+許容する。配置内の `program/` 外の PE image には引き続き有効な署名を要求する。
+trust 判定はローカル情報で行い、publisher 名やインストーラの署名は判定に使わない。
 両 OS とも検証した runtime の配置と実体を probe・変換に結び付ける。macOS の bundle 内のリンクは
-bundle の内側に閉じる。Windows の配置内では reparse point と複数の hard link を持つファイルを拒否する。
-Windows の AppContainer のアクセス制御は OS の ACL に従う。
+bundle の内側に閉じる。Windows は署名を持たない下位の PE image も配置全体の同一性検証に含め、
+配置内の reparse point と複数の hard link を持つファイルを拒否する。
+Windows の Office renderer は AppContainer を使わず、専用の Job で readiness probe と
+実変換を実行する（D-20261122-02）。Office は呼出し元ユーザーの権限でファイル、レジストリ、IPC、
+ネットワークにアクセスできる。Job はそれらのアクセスを制限しない。この実行条件を Windows Office の
+準備 profile に結び付ける。
+Windows は、GUI launcher の `--version` がコンソール入力を待つため、別プロセスでの version 照会を省略し、
+provenance の version を `unknown` とする。DOCX と PPTX の両方の実変換で readiness を判定する。
 version 応答の形式差だけを「未導入」と扱わず、検出済みだが利用不能なら具体的な理由を表示する。
 CI の配布物 SHA pin は再現性のため維持し、製品の一般的な版許可リストにはしない。
 
@@ -311,7 +320,7 @@ CI の配布物 SHA pin は再現性のため維持し、製品の一般的な�
 Linux の distro / TDF / portable の配置は実際に必要な read-only runtime root の検証で受け入れ、
 固定 `/opt/libreoffice<major>.<minor>` と sibling 名だけで決めない。runtime 内の symlink は
 解決した対象を同じ許可済み runtime closure に固定できる場合だけ許可し、任意の host path へ
-読み取り権限を広げない。network / unrelated private files / write の隔離を弱めて probe を通さない。
+読み取り権限を広げない。Linux の network / unrelated private files / write の隔離を保った状態で probe を実行する。
 Debian・Ubuntu のパッケージと標準の `/opt/libreoffice<major>.<minor>` に配置された TDF の DEB は、
 構成済みの dpkg 台帳で所属と内容を照合する。この配置では `SHA256SUMS` があっても dpkg の照合を必須とする。
 portable では、信頼できる配布物のファイル一覧を展開先直下の `SHA256SUMS` として用意する。
@@ -323,13 +332,18 @@ portable では、信頼できる配布物のファイル一覧を展開先直�
 
 renderer scratch は [Kio 作成物の保護](10-operations.md#43-kio-created-object-boundary) に従う。
 
-変換は利用者の LibreOffice profile や導入済みの配布物を変更せず、隔離した実行環境、明示的に指定した環境変数だけの環境、
-private scratch を使う。関連のない private file とネットワークへのアクセスを禁止する。隔離できなければ変換を拒否する。
+変換には呼出しごとの private scratch と LibreOffice profile を用意し、環境変数は明示した値だけを渡す。
+Linux と macOS は関連のない private file とネットワークへのアクセスを隔離し、隔離できなければ変換を拒否する。
 Office 入力は 100 MiB、PDF 出力は 250 MiB とする。変換の wall-clock と CPU 時間の上限は各 300 秒、
 対応環境のアドレス空間・Job メモリの上限は 2 GiB とする。scratch 増加の監視はカーネルの disk quota を
 提供しない。終了時はプロセスツリーを後始末する。
 
-Windows では Job に 2 GiB のメモリ上限を適用する。Job の全プロセスが終了した後の最終 scratch 検証を
+Windows では renderer を `CREATE_NO_WINDOW` 付きで起動し、Job に最大 8 プロセス、2 GiB のメモリ、
+300 秒の CPU 時間の上限を適用する。標準入出力のハンドルだけを渡し、stdout と stderr の採取量を制限する。
+入出力の CLI 引数は invocation の scratch を基準にした名前にし、PDF は保持済みの出力ディレクトリから読む。
+起動ごとに `-env:UNO_SHARED_PACKAGES_CACHE` へ private scratch 内の空の `cache` の file URL を渡す。
+変換ではこのキャッシュを共有拡張の検索先として使う。インストール先の `share/uno_packages/cache` は配置の同一性検証に含める。
+Job の全プロセスが終了した後の最終 scratch 検証を
 通った場合だけ出力を確定する。Job の監視・pipe drain・最終検査はすべて元の実行期限に含む。
 失敗時は Job 全体の終了を要求し、後始末の確認は残り時間内に限る。timeout 時点で終了完了は保証しない。
 Job の close 時にも全プロセスを終了させる。
