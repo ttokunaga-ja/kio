@@ -4,8 +4,9 @@
 use std::{
     collections::BTreeMap,
     fs::{self, File, FileTimes},
+    io::Read,
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, Command, Output, Stdio},
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -22,9 +23,11 @@ use kio_app::watch::{
 use crate::acceptance::{
     AcceptanceCase, AcceptanceError, AcceptanceLane, AcceptanceReceipt, AcceptanceSubcase,
     ExpectedReceipt, MAX_BINARY_BYTES, MAX_FIXTURE_BYTES, current_evaluator_sha256_matches,
-    empty_runtime, sha256_bytes, sha256_regular_file, validate_expected, write_receipt_create_only,
+    empty_runtime, sha256_bytes, validate_expected, write_receipt_create_only,
 };
 use crate::acceptance_environment::IsolatedChildEnvironment;
+
+mod platform;
 
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_WATCH_OUTPUT_BYTES: u64 = 256 * 1024;
@@ -69,19 +72,23 @@ pub fn run_a02(options: &NativeOptions) -> Result<AcceptanceReceipt, AcceptanceE
     validate_expected(&options.expected)?;
     current_evaluator_sha256_matches(&options.expected.evaluator_sha256)?;
     verify_inputs(options)?;
-    if options.work_dir.exists() || options.receipt.exists() {
+    if path_exists(&options.work_dir)? || path_exists(&options.receipt)? {
         return Err(AcceptanceError::Invalid(
             "native work directory and receipt must be create-only".into(),
         ));
     }
 
-    fs::create_dir_all(&options.work_dir).map_err(io)?;
+    fs::create_dir_all(&options.work_dir)
+        .map_err(io_at("create work directory", &options.work_dir))?;
     private_dir(&options.work_dir)?;
-    let work = options.work_dir.canonicalize().map_err(io)?;
+    let work = options
+        .work_dir
+        .canonicalize()
+        .map_err(io_at("canonicalize work directory", &options.work_dir))?;
     let watched = create_device_root(&work, "watched")?;
     let manual = create_device_root(&work, "manual")?;
     let outside = work.join("outside-sentinel");
-    fs::create_dir(&outside).map_err(io)?;
+    fs::create_dir(&outside).map_err(io_at("create outside sentinel directory", &outside))?;
     private_dir(&outside)?;
     write_file(
         &outside.join("sentinel.txt"),
@@ -149,7 +156,7 @@ pub fn run_a02(options: &NativeOptions) -> Result<AcceptanceReceipt, AcceptanceE
         runtime: empty_runtime(),
         passed: true,
     };
-    write_receipt_create_only(&options.receipt, &receipt)?;
+    publish_receipt(&options.receipt, &receipt)?;
     Ok(receipt)
 }
 
@@ -169,14 +176,18 @@ pub fn run_a03(options: &NativeOptions) -> Result<AcceptanceReceipt, AcceptanceE
     validate_expected(&options.expected)?;
     current_evaluator_sha256_matches(&options.expected.evaluator_sha256)?;
     verify_inputs(options)?;
-    if options.work_dir.exists() || options.receipt.exists() {
+    if path_exists(&options.work_dir)? || path_exists(&options.receipt)? {
         return Err(AcceptanceError::Invalid(
             "native work directory and receipt must be create-only".into(),
         ));
     }
-    fs::create_dir_all(&options.work_dir).map_err(io)?;
+    fs::create_dir_all(&options.work_dir)
+        .map_err(io_at("create work directory", &options.work_dir))?;
     private_dir(&options.work_dir)?;
-    let work = options.work_dir.canonicalize().map_err(io)?;
+    let work = options
+        .work_dir
+        .canonicalize()
+        .map_err(io_at("canonicalize work directory", &options.work_dir))?;
     let watched = create_device_root(&work, "watched")?;
     let manual = create_device_root(&work, "manual")?;
     let seed = bounded_regular_bytes(&options.fixture, MAX_FIXTURE_BYTES)?;
@@ -259,10 +270,12 @@ pub fn run_a03(options: &NativeOptions) -> Result<AcceptanceReceipt, AcceptanceE
     let ignored_identity_and_head = scope_identity_and_heads(&watched.root, &ignored_scopes)?;
     let ignored_store = ignored_child.join(".kio");
     let store_before = ignored_store_fingerprint(&ignored_store)?;
-    let denied_output = base(&options.binary, &watched.device, Some(&ignored_child))?
-        .args(["--json", "index", "--offline"])
-        .output()
-        .map_err(io)?;
+    let denied_output = command_output(
+        &options.binary,
+        &watched.device,
+        Some(&ignored_child),
+        &["--json", "index", "--offline"],
+    )?;
     validate_ignored_index_denial(
         denied_output.status.code(),
         &denied_output.stdout,
@@ -327,7 +340,7 @@ pub fn run_a03(options: &NativeOptions) -> Result<AcceptanceReceipt, AcceptanceE
         runtime: empty_runtime(),
         passed: true,
     };
-    write_receipt_create_only(&options.receipt, &receipt)?;
+    publish_receipt(&options.receipt, &receipt)?;
     Ok(receipt)
 }
 
@@ -408,10 +421,7 @@ fn assert_effective_search_includes(
     expected_pointer: &serde_json::Value,
 ) -> Result<(), AcceptanceError> {
     for (args, label) in ignored_child_search_commands(PRE_IGNORED_SEARCH_TOKEN) {
-        let output = base(&options.binary, &watched.device, Some(&watched.root))?
-            .args(&args)
-            .output()
-            .map_err(io)?;
+        let output = command_output(&options.binary, &watched.device, Some(&watched.root), &args)?;
         validate_included_search_output(
             output.status.code(),
             &output.stdout,
@@ -499,10 +509,7 @@ fn assert_effective_search_excludes(
     expected_exclusions: &serde_json::Value,
 ) -> Result<(), AcceptanceError> {
     for (args, label) in ignored_child_search_commands(query) {
-        let output = base(&options.binary, &watched.device, Some(&watched.root))?
-            .args(&args)
-            .output()
-            .map_err(io)?;
+        let output = command_output(&options.binary, &watched.device, Some(&watched.root), &args)?;
         validate_excluded_search_output(
             output.status.code(),
             &output.stdout,
@@ -614,8 +621,8 @@ fn verify_moved_root_replacement_fails_closed(
 ) -> Result<(), AcceptanceError> {
     let managed_before = collect_scope_manifests(&watched.root)?;
     let moved = watched.device.join("moved-root");
-    fs::rename(&watched.root, &moved).map_err(io)?;
-    fs::create_dir(&watched.root).map_err(io)?;
+    rename(&watched.root, &moved)?;
+    fs::create_dir(&watched.root).map_err(io_at("create replacement root", &watched.root))?;
     private_dir(&watched.root)?;
 
     watch_run_must_fail(
@@ -764,8 +771,10 @@ fn assert_global_search_rebound_from_old_root(
 }
 
 fn replace_same_length_preserving_mtime(path: &Path) -> Result<(), AcceptanceError> {
-    let before = fs::metadata(path).map_err(io)?;
-    let old_time = before.modified().map_err(io)?;
+    let before = fs::metadata(path).map_err(io_at("read file metadata", path))?;
+    let old_time = before
+        .modified()
+        .map_err(io_at("read original modification time", path))?;
     let bytes = bounded_regular_bytes(path, MAX_FIXTURE_BYTES)?;
     let replacement = vec![b'B'; bytes.len()];
     if replacement.len() != bytes.len() || replacement == bytes {
@@ -773,13 +782,22 @@ fn replace_same_length_preserving_mtime(path: &Path) -> Result<(), AcceptanceErr
             "same-length A03 fixture is not replaceable".into(),
         ));
     }
-    fs::write(path, replacement).map_err(io)?;
-    File::open(path)
-        .map_err(io)?
+    fs::write(path, replacement).map_err(io_at("write same-length fixture", path))?;
+    // SetFileTime requires write attributes on Windows. Close the data writer
+    // first so the write's final timestamp cannot overwrite the restored time.
+    File::options()
+        .write(true)
+        .open(path)
+        .map_err(io_at("open fixture for timestamp update", path))?
         .set_times(FileTimes::new().set_modified(old_time))
-        .map_err(io)?;
-    let after = fs::metadata(path).map_err(io)?;
-    if after.len() != before.len() || after.modified().map_err(io)? != old_time {
+        .map_err(io_at("restore fixture modification time", path))?;
+    let after = fs::metadata(path).map_err(io_at("read file metadata", path))?;
+    if after.len() != before.len()
+        || after
+            .modified()
+            .map_err(io_at("read restored modification time", path))?
+            != old_time
+    {
         return Err(AcceptanceError::Command(
             "same-length preserved-mtime mutation was not retained".into(),
         ));
@@ -1101,7 +1119,7 @@ struct DeviceRoot {
 fn create_device_root(work: &Path, name: &str) -> Result<DeviceRoot, AcceptanceError> {
     let device = work.join(name);
     let root = device.join("root");
-    fs::create_dir_all(&device).map_err(io)?;
+    fs::create_dir_all(&device).map_err(io_at("create device directory", &device))?;
     private_dir(&device)?;
     for path in [
         &root,
@@ -1110,13 +1128,13 @@ fn create_device_root(work: &Path, name: &str) -> Result<DeviceRoot, AcceptanceE
         &device.join("cache"),
         &device.join("tmp"),
     ] {
-        fs::create_dir_all(path).map_err(io)?;
+        fs::create_dir_all(path).map_err(io_at("create device subdirectory", path))?;
         private_dir(path)?;
     }
     Ok(DeviceRoot {
-        device: device.canonicalize().map_err(io)?,
-        root: root.canonicalize().map_err(io)?,
-        tmp: device.join("tmp").canonicalize().map_err(io)?,
+        device: canonicalize(&device)?,
+        root: canonicalize(&root)?,
+        tmp: canonicalize(&device.join("tmp"))?,
     })
 }
 
@@ -1130,7 +1148,7 @@ fn populate_initial(root: &Path, seed: &[u8]) -> Result<(), AcceptanceError> {
 fn apply_mutations(root: &Path, seed: &[u8]) -> Result<(), AcceptanceError> {
     // Empty, newly-created, and more-than-32-level-deep folders must all be
     // discovered. The leaf file gives the deepest scope a byte assertion too.
-    fs::create_dir_all(root.join("unmanaged-empty")).map_err(io)?;
+    create_dir_all(&root.join("unmanaged-empty"))?;
     let mut deep = root.join("deep");
     for level in 0..33 {
         deep.push(format!("level-{level:02}"));
@@ -1141,14 +1159,14 @@ fn apply_mutations(root: &Path, seed: &[u8]) -> Result<(), AcceptanceError> {
         b"new native watcher bytes\n",
     )?;
     write_file(&root.join("seed.md"), &[seed, b"updated by A02\n"].concat())?;
-    fs::remove_file(root.join("delete-me.txt")).map_err(io)?;
-    fs::rename(root.join("rename-me.txt"), root.join("renamed.txt")).map_err(io)?;
-    fs::create_dir_all(root.join("move-destination")).map_err(io)?;
-    fs::rename(
-        root.join("move-source/move-me.txt"),
-        root.join("move-destination/moved.txt"),
-    )
-    .map_err(io)?;
+    let deleted = root.join("delete-me.txt");
+    fs::remove_file(&deleted).map_err(io_at("remove fixture file", &deleted))?;
+    rename(&root.join("rename-me.txt"), &root.join("renamed.txt"))?;
+    create_dir_all(&root.join("move-destination"))?;
+    rename(
+        &root.join("move-source/move-me.txt"),
+        &root.join("move-destination/moved.txt"),
+    )?;
     // This is both a content exclusion and a child-scope exclusion; neither
     // side of the comparison may contain an ignored scope or path.
     write_file(&root.join(".kioignore"), b"ignored/\n")?;
@@ -1159,8 +1177,8 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<(), AcceptanceError> {
     let parent = path
         .parent()
         .ok_or_else(|| AcceptanceError::Invalid("fixture path has no parent".into()))?;
-    fs::create_dir_all(parent).map_err(io)?;
-    fs::write(path, bytes).map_err(io)
+    create_dir_all(parent)?;
+    fs::write(path, bytes).map_err(io_at("write fixture file", path))
 }
 
 /// Build a real native link boundary. This is an acceptance prerequisite, not
@@ -1168,7 +1186,7 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<(), AcceptanceError> {
 /// on an OS where the test runner could not create the boundary.
 #[cfg(unix)]
 fn create_boundary_link(link: &Path, target: &Path) -> Result<(), AcceptanceError> {
-    std::os::unix::fs::symlink(target, link).map_err(io)
+    std::os::unix::fs::symlink(target, link).map_err(io_at("create boundary symlink", link))
 }
 
 /// Directory junctions do not require Developer Mode or a symlink privilege,
@@ -1199,7 +1217,7 @@ fn create_boundary_link(link: &Path, target: &Path) -> Result<(), AcceptanceErro
     let output = Command::new("cmd")
         .raw_arg(format!("/D /S /C \"mklink /J \"{link}\" \"{target}\"\""))
         .output()
-        .map_err(io)?;
+        .map_err(io_at("run mklink /J", Path::new(link)))?;
     if output.status.success() {
         Ok(())
     } else {
@@ -1214,6 +1232,13 @@ fn create_boundary_link(link: &Path, target: &Path) -> Result<(), AcceptanceErro
 /// links. The acceptance fixture is bounded so this remains a precise guard,
 /// rather than an unbounded filesystem walk.
 fn tree_fingerprint(root: &Path) -> Result<BTreeMap<PathBuf, String>, AcceptanceError> {
+    let metadata = fs::symlink_metadata(root).map_err(io_at("inspect sentinel root", root))?;
+    if !metadata.is_dir() || platform::is_link(&metadata) {
+        return Err(AcceptanceError::Invalid(format!(
+            "sentinel root '{}' must be a plain directory",
+            root.display()
+        )));
+    }
     let mut entries = BTreeMap::new();
     tree_fingerprint_at(root, root, &mut entries)?;
     Ok(entries)
@@ -1224,19 +1249,20 @@ fn tree_fingerprint_at(
     current: &Path,
     entries: &mut BTreeMap<PathBuf, String>,
 ) -> Result<(), AcceptanceError> {
-    if entries.len() >= MAX_DIRECTORY_ENTRIES {
-        return Err(AcceptanceError::Invalid(
-            "outside-root sentinel exceeds entry bound".into(),
-        ));
-    }
-    for entry in fs::read_dir(current).map_err(io)? {
-        let entry = entry.map_err(io)?;
+    for entry in fs::read_dir(current).map_err(io_at("list sentinel directory", current))? {
+        if entries.len() >= MAX_DIRECTORY_ENTRIES {
+            return Err(AcceptanceError::Invalid(format!(
+                "sentinel tree '{}' exceeds entry bound",
+                root.display()
+            )));
+        }
+        let entry = entry.map_err(io_at("read sentinel directory entry", current))?;
         let path = entry.path();
         let relative = path.strip_prefix(root).map_err(|_| {
             AcceptanceError::Invalid("outside-root sentinel path escaped its root".into())
         })?;
-        let metadata = fs::symlink_metadata(&path).map_err(io)?;
-        if metadata.file_type().is_symlink() {
+        let metadata = fs::symlink_metadata(&path).map_err(io_at("read entry metadata", &path))?;
+        if platform::is_link(&metadata) {
             entries.insert(relative.to_path_buf(), "symlink".into());
         } else if metadata.is_dir() {
             entries.insert(relative.to_path_buf(), "directory".into());
@@ -1260,6 +1286,7 @@ fn tree_fingerprint_at(
 
 struct WatchChild {
     child: Child,
+    root: PathBuf,
     stdout: PathBuf,
     stderr: PathBuf,
 }
@@ -1278,10 +1305,17 @@ impl WatchChild {
                 NATIVE_ACCEPTANCE_RECONCILE_INTERVAL_SECONDS,
             ])
             .stdin(Stdio::null())
-            .stdout(Stdio::from(File::create(&stdout).map_err(io)?))
-            .stderr(Stdio::from(File::create(&stderr).map_err(io)?));
+            .stdout(Stdio::from(
+                File::create(&stdout).map_err(io_at("create watcher stdout", &stdout))?,
+            ))
+            .stderr(Stdio::from(
+                File::create(&stderr).map_err(io_at("create watcher stderr", &stderr))?,
+            ));
         Ok(Self {
-            child: command.spawn().map_err(io)?,
+            child: command
+                .spawn()
+                .map_err(io_at("spawn watcher in root", root))?,
+            root: root.to_path_buf(),
             stdout,
             stderr,
         })
@@ -1289,7 +1323,11 @@ impl WatchChild {
 
     fn check(&mut self) -> Result<(), AcceptanceError> {
         self.check_output_size()?;
-        if let Some(status) = self.child.try_wait().map_err(io)? {
+        if let Some(status) = self
+            .child
+            .try_wait()
+            .map_err(io_at("poll watcher in root", &self.root))?
+        {
             return Err(AcceptanceError::Command(format!(
                 "native watcher exited unexpectedly with {status}"
             )));
@@ -1302,12 +1340,15 @@ impl WatchChild {
         let deadline = Instant::now() + WATCH_TIMEOUT;
         loop {
             self.check_output_size()?;
-            if let Some(status) = self.child.try_wait().map_err(io)? {
+            if let Some(status) = self
+                .child
+                .try_wait()
+                .map_err(io_at("poll watcher in root", &self.root))?
+            {
                 return validate_watch_stop_exit(status.code());
             }
             if Instant::now() >= deadline {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
+                terminate_child(&mut self.child, &self.root)?;
                 return Err(AcceptanceError::Command(
                     "native watcher did not stop".into(),
                 ));
@@ -1318,7 +1359,11 @@ impl WatchChild {
 
     fn check_output_size(&self) -> Result<(), AcceptanceError> {
         for path in [&self.stdout, &self.stderr] {
-            if fs::metadata(path).map_err(io)?.len() > MAX_WATCH_OUTPUT_BYTES {
+            if fs::metadata(path)
+                .map_err(io_at("read file metadata", path))?
+                .len()
+                > MAX_WATCH_OUTPUT_BYTES
+            {
                 return Err(AcceptanceError::Command(
                     "native watcher exceeded bounded output budget".into(),
                 ));
@@ -1339,9 +1384,8 @@ fn validate_watch_stop_exit(exit_code: Option<i32>) -> Result<(), AcceptanceErro
 
 impl Drop for WatchChild {
     fn drop(&mut self) {
-        if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+        if let Err(error) = terminate_child(&mut self.child, &self.root) {
+            eprintln!("native watcher cleanup failed: {error}");
         }
     }
 }
@@ -1450,8 +1494,19 @@ fn collect_scope_manifests_at(
     directory: &Path,
     manifests: &mut ScopeManifests,
 ) -> Result<(), AcceptanceError> {
-    let manifest = directory.join(".kio/manifest.json");
-    if manifest.is_file() {
+    let store = directory.join(".kio");
+    let manifest = store.join("manifest.json");
+    if path_exists(&store)? {
+        let metadata =
+            fs::symlink_metadata(&store).map_err(io_at("inspect scope store", &store))?;
+        if !metadata.is_dir() || platform::is_link(&metadata) {
+            return Err(AcceptanceError::Invalid(format!(
+                "scope store '{}' must be a plain directory",
+                store.display()
+            )));
+        }
+    }
+    if path_exists(&manifest)? {
         let relative = relative_directory(root, directory)?;
         if manifests
             .insert(relative, parse_manifest(&manifest)?)
@@ -1463,17 +1518,18 @@ fn collect_scope_manifests_at(
         }
     }
     let mut entries = 0usize;
-    for entry in fs::read_dir(directory).map_err(io)? {
+    for entry in fs::read_dir(directory).map_err(io_at("list scope directory", directory))? {
         entries += 1;
         if entries > MAX_DIRECTORY_ENTRIES {
             return Err(AcceptanceError::Invalid(
                 "native fixture directory exceeds entry bound".into(),
             ));
         }
-        let entry = entry.map_err(io)?;
-        let kind = entry.file_type().map_err(io)?;
-        if kind.is_dir() && entry.file_name() != ".kio" {
-            collect_scope_manifests_at(root, &entry.path(), manifests)?;
+        let entry = entry.map_err(io_at("read scope directory entry", directory))?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path).map_err(io_at("inspect scope entry", &path))?;
+        if metadata.is_dir() && !platform::is_link(&metadata) && entry.file_name() != ".kio" {
+            collect_scope_manifests_at(root, &path, manifests)?;
         }
     }
     Ok(())
@@ -1645,7 +1701,7 @@ fn is_raw_hash(value: &str) -> bool {
 }
 
 fn verify_inputs(options: &NativeOptions) -> Result<(), AcceptanceError> {
-    if sha256_regular_file(&options.binary, MAX_BINARY_BYTES)?
+    if sha256_bytes(&bounded_regular_bytes(&options.binary, MAX_BINARY_BYTES)?)
         != options.expected.candidate.binary_sha256
     {
         return Err(AcceptanceError::Invalid(
@@ -1662,13 +1718,26 @@ fn verify_inputs(options: &NativeOptions) -> Result<(), AcceptanceError> {
 }
 
 fn bounded_regular_bytes(path: &Path, maximum: u64) -> Result<Vec<u8>, AcceptanceError> {
-    let metadata = fs::symlink_metadata(path).map_err(io)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > maximum {
-        return Err(AcceptanceError::Invalid(
-            "native acceptance input must be a bounded regular file".into(),
-        ));
+    let metadata = fs::symlink_metadata(path).map_err(io_at("inspect bounded input", path))?;
+    let invalid_input = || {
+        AcceptanceError::Invalid(format!(
+            "native acceptance input '{}' must be a regular file of at most {maximum} bytes",
+            path.display()
+        ))
+    };
+    if platform::is_link(&metadata) || !metadata.is_file() || metadata.len() > maximum {
+        return Err(invalid_input());
     }
-    fs::read(path).map_err(io)
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    File::open(path)
+        .map_err(io_at("open bounded input", path))?
+        .take(maximum.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(io_at("read bounded input", path))?;
+    if bytes.len() as u64 > maximum {
+        return Err(invalid_input());
+    }
+    Ok(bytes)
 }
 
 fn json(
@@ -1687,10 +1756,7 @@ fn command(
     root: Option<&Path>,
     args: &[&str],
 ) -> Result<Vec<u8>, AcceptanceError> {
-    let output = base(binary, isolated, root)?
-        .args(args)
-        .output()
-        .map_err(io)?;
+    let output = command_output(binary, isolated, root, args)?;
     if !output.status.success() {
         return Err(AcceptanceError::Command(format!(
             "{} failed with {}: {}",
@@ -1746,19 +1812,12 @@ fn ignored_store_fingerprint(root: &Path) -> Result<BTreeMap<PathBuf, String>, A
                 "ignored store exceeds entry bound".into(),
             ));
         }
-        let metadata = fs::symlink_metadata(&path).map_err(io)?;
-        #[cfg(windows)]
-        let is_link = {
-            use std::os::windows::fs::MetadataExt;
-            metadata.file_attributes() & 0x400 != 0 // FILE_ATTRIBUTE_REPARSE_POINT
-        };
-        #[cfg(not(windows))]
-        let is_link = metadata.file_type().is_symlink();
+        let metadata = fs::symlink_metadata(&path).map_err(io_at("read entry metadata", &path))?;
         let relative = path
             .strip_prefix(root)
             .map_err(|_| AcceptanceError::Invalid("ignored store path escaped its root".into()))?
             .to_path_buf();
-        if is_link
+        if platform::is_link(&metadata)
             || (!metadata.is_dir() && !metadata.is_file())
             || (relative.as_os_str().is_empty() && !metadata.is_dir())
         {
@@ -1768,13 +1827,19 @@ fn ignored_store_fingerprint(root: &Path) -> Result<BTreeMap<PathBuf, String>, A
         }
         if metadata.is_dir() {
             fingerprint.insert(relative, "directory".into());
-            for entry in fs::read_dir(&path).map_err(io)? {
+            for entry in
+                fs::read_dir(&path).map_err(io_at("list ignored store directory", &path))?
+            {
                 if fingerprint.len() + pending.len() >= MAX_DIRECTORY_ENTRIES {
                     return Err(AcceptanceError::Invalid(
                         "ignored store exceeds entry bound".into(),
                     ));
                 }
-                pending.push(entry.map_err(io)?.path());
+                pending.push(
+                    entry
+                        .map_err(io_at("read ignored store directory entry", &path))?
+                        .path(),
+                );
             }
         } else {
             // A store may exceed the 1 MiB input-fixture bound. Cap the entire
@@ -1789,7 +1854,10 @@ fn ignored_store_fingerprint(root: &Path) -> Result<BTreeMap<PathBuf, String>, A
             }
             fingerprint.insert(
                 relative,
-                format!("file:{}", sha256_regular_file(&path, metadata.len())?),
+                format!(
+                    "file:{}",
+                    sha256_bytes(&bounded_regular_bytes(&path, metadata.len())?)
+                ),
             );
         }
     }
@@ -1803,10 +1871,7 @@ fn command_must_fail(
     args: &[&str],
     success_message: &str,
 ) -> Result<(), AcceptanceError> {
-    let output = base(binary, isolated, Some(root))?
-        .args(args)
-        .output()
-        .map_err(io)?;
+    let output = command_output(binary, isolated, Some(root), args)?;
     if output.status.success() {
         return Err(AcceptanceError::Command(success_message.into()));
     }
@@ -1831,18 +1896,22 @@ fn watch_run_must_fail(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let mut child = command.spawn().map_err(io)?;
+    let mut child = command
+        .spawn()
+        .map_err(io_at("spawn denied watcher in root", root))?;
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        if let Some(status) = child.try_wait().map_err(io)? {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(io_at("poll denied watcher in root", root))?
+        {
             if status.success() {
                 return Err(AcceptanceError::Command(success_message.into()));
             }
             return Ok(());
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_child(&mut child, root)?;
             return Err(AcceptanceError::Command(success_message.into()));
         }
         thread::sleep(Duration::from_millis(50));
@@ -1868,7 +1937,8 @@ fn base(binary: &Path, isolated: &Path, root: Option<&Path>) -> Result<Command, 
 #[cfg(unix)]
 fn private_dir(path: &Path) -> Result<(), AcceptanceError> {
     use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(io)
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .map_err(io_at("set private directory permissions", path))
 }
 
 #[cfg(not(unix))]
@@ -1876,14 +1946,148 @@ fn private_dir(_path: &Path) -> Result<(), AcceptanceError> {
     Ok(())
 }
 
-fn io(error: std::io::Error) -> AcceptanceError {
-    AcceptanceError::Io(error.to_string())
+fn publish_receipt(path: &Path, receipt: &AcceptanceReceipt) -> Result<(), AcceptanceError> {
+    write_receipt_create_only(path, receipt).map_err(|error| match error {
+        AcceptanceError::Io(detail) => AcceptanceError::Io(format!(
+            "write create-only receipt '{}': {detail}",
+            path.display()
+        )),
+        other => other,
+    })
+}
+
+fn path_exists(path: &Path) -> Result<bool, AcceptanceError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(io_at("check path existence", path)(error)),
+    }
+}
+
+fn create_dir_all(path: &Path) -> Result<(), AcceptanceError> {
+    fs::create_dir_all(path).map_err(io_at("create directory", path))
+}
+
+fn canonicalize(path: &Path) -> Result<PathBuf, AcceptanceError> {
+    path.canonicalize()
+        .map_err(io_at("canonicalize directory", path))
+}
+
+fn rename(source: &Path, destination: &Path) -> Result<(), AcceptanceError> {
+    fs::rename(source, destination).map_err(|error| {
+        AcceptanceError::Io(format!(
+            "rename '{}' to '{}': {error}",
+            source.display(),
+            destination.display()
+        ))
+    })
+}
+
+fn command_output(
+    binary: &Path,
+    isolated: &Path,
+    root: Option<&Path>,
+    args: &[&str],
+) -> Result<Output, AcceptanceError> {
+    base(binary, isolated, root)?
+        .args(args)
+        .output()
+        .map_err(|error| {
+            AcceptanceError::Io(format!(
+                "run '{}' {} in '{}': {error}",
+                binary.display(),
+                args.join(" "),
+                root.unwrap_or(isolated).display()
+            ))
+        })
+}
+
+fn terminate_child(child: &mut Child, root: &Path) -> Result<(), AcceptanceError> {
+    let status = child.try_wait();
+    if matches!(status, Ok(Some(_))) {
+        return Ok(());
+    }
+    if let Err(error) = child.kill()
+        && !matches!(child.try_wait(), Ok(Some(_)))
+    {
+        return Err(io_at("terminate watcher during cleanup", root)(error));
+    }
+    child
+        .wait()
+        .map_err(io_at("reap watcher during cleanup", root))?;
+    status
+        .map(|_| ())
+        .map_err(io_at("poll watcher during cleanup", root))
+}
+
+fn io_at<'a>(
+    operation: &'a str,
+    path: &'a Path,
+) -> impl FnOnce(std::io::Error) -> AcceptanceError + 'a {
+    move |error| AcceptanceError::Io(format!("{operation} '{}': {error}", path.display()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::{Value, json};
+
+    #[test]
+    fn same_length_mutation_preserves_mtime_and_changes_bytes() {
+        let work = tempfile::tempdir().unwrap();
+        let path = work.path().join("same-length.txt");
+        fs::write(&path, b"AAAA").unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(
+                FileTimes::new()
+                    .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+            )
+            .unwrap();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+
+        replace_same_length_preserving_mtime(&path).unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"BBBB");
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+    }
+
+    #[test]
+    fn fixture_walks_do_not_enter_a_native_directory_link() {
+        let work = tempfile::tempdir().unwrap();
+        let work = work.path().canonicalize().unwrap();
+        let root = work.join("root");
+        let outside = work.join("outside");
+        let link = root.join("boundary");
+        fs::create_dir(&root).unwrap();
+        // If manifest collection follows the boundary it will try to parse
+        // this invalid manifest and fail.
+        write_file(&outside.join(".kio/manifest.json"), b"not a manifest").unwrap();
+        create_boundary_link(&link, &outside).unwrap();
+
+        assert_eq!(
+            tree_fingerprint(&root).unwrap(),
+            BTreeMap::from([("boundary".into(), "symlink".into())])
+        );
+        assert!(tree_fingerprint(&link).is_err());
+        let mut manifests = BTreeMap::new();
+        collect_scope_manifests_at(&root, &root, &mut manifests).unwrap();
+        assert!(manifests.is_empty());
+    }
+
+    #[test]
+    fn bounded_input_errors_include_operation_and_path() {
+        let work = tempfile::tempdir().unwrap();
+        let missing = work.path().join("missing-input");
+        let error = bounded_regular_bytes(&missing, 10).unwrap_err().to_string();
+        assert!(error.contains("inspect bounded input"));
+        assert!(error.contains(&missing.display().to_string()));
+        fs::write(&missing, b"too long").unwrap();
+        let error = bounded_regular_bytes(&missing, 3).unwrap_err().to_string();
+        assert!(error.contains(&missing.display().to_string()));
+    }
 
     #[test]
     fn periodic_quiescence_observation_does_not_dispatch_overdue_work() {

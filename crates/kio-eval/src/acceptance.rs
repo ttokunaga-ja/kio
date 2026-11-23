@@ -3870,8 +3870,18 @@ pub(crate) fn sha256_regular_file(path: &Path, maximum: u64) -> Result<String, A
 }
 
 pub(crate) fn current_evaluator_sha256() -> Result<String, AcceptanceError> {
-    let executable = std::env::current_exe().map_err(io_error)?;
-    sha256_regular_file(&executable, MAX_BINARY_BYTES)
+    let executable = std::env::current_exe().map_err(|error| {
+        AcceptanceError::Io(format!(
+            "resolve current evaluator executable path: {error}"
+        ))
+    })?;
+    sha256_regular_file(&executable, MAX_BINARY_BYTES).map_err(|error| match error {
+        AcceptanceError::Io(detail) => AcceptanceError::Io(format!(
+            "hash current evaluator executable '{}': {detail}",
+            executable.display()
+        )),
+        other => other,
+    })
 }
 
 pub(crate) fn current_evaluator_sha256_matches(
