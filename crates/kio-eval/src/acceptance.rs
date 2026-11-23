@@ -2338,7 +2338,7 @@ pub fn run_a09(options: &A09Options) -> Result<AcceptanceReceipt, AcceptanceErro
 fn assert_a09_public_gc(binary: &Path, isolated: &Path) -> Result<(), AcceptanceError> {
     use kio_core::cas::{ObjectKind, ObjectStore};
     use kio_core::gc::read_shallow_receipts;
-    use kio_core::portable::{PORTABLE_TAGS_DIRECTORY, portable_tag_leaf};
+    use kio_core::portable::PORTABLE_TAGS_DIRECTORY;
 
     const OLD: &[u8] = b"# A09 public GC seed v1\n\nHistorical public acceptance text.\n";
     const CURRENT: &[u8] = b"# A09 public GC seed v2\n\nCurrent public acceptance text.\n";
@@ -2438,29 +2438,13 @@ fn assert_a09_public_gc(binary: &Path, isolated: &Path) -> Result<(), Acceptance
         &scope,
         &["--json", "tag", "a09-gc-retained", current_commit],
     )?;
-    let old_ref = PathBuf::from(required_json_string(&old_tag, "/path", "A09 GC old tag")?);
-    let retained_ref = PathBuf::from(required_json_string(
-        &retained_tag,
-        "/path",
-        "A09 GC retained tag",
-    )?);
     let tags_path = kio.join("refs").join(PORTABLE_TAGS_DIRECTORY);
+    let old_ref = verify_a09_gc_tag(&tags_path, &old_tag, OLD_TAG, old_commit)?;
+    let retained_ref =
+        verify_a09_gc_tag(&tags_path, &retained_tag, "a09-gc-retained", current_commit)?;
     let names_path = tags_path.join("names.jsonl");
     let names_before = fs::read(&names_path).map_err(io_error)?;
     let retained_ref_before = fs::read(&retained_ref).map_err(io_error)?;
-    if old_tag["tag"] != OLD_TAG
-        || old_tag["commit_hash"] != *old_commit
-        || retained_tag["tag"] != "a09-gc-retained"
-        || retained_tag["commit_hash"] != *current_commit
-        || old_ref != tags_path.join(portable_tag_leaf(OLD_TAG))
-        || retained_ref != tags_path.join(portable_tag_leaf("a09-gc-retained"))
-        || fs::read(&old_ref).map_err(io_error)? != old_commit.as_bytes()
-        || retained_ref_before != current_commit.as_bytes()
-    {
-        return Err(AcceptanceError::Command(
-            "A09 GC tag setup did not bind the intended commits and refs".into(),
-        ));
-    }
     let protected = command_json(binary, isolated, &scope, &["--json", "gc", "--dry-run"])?;
     if protected["candidate_count"] != 0 || protected["candidates"] != serde_json::json!([]) {
         return Err(AcceptanceError::Command(format!(
@@ -2613,6 +2597,37 @@ fn assert_a09_public_gc(binary: &Path, isolated: &Path) -> Result<(), Acceptance
 /// Exercise the shipped scheduled writer using real time. The change threshold
 /// makes publication immediate while the one-year interval keeps an unchanged
 /// repeat ineligible without sleeps or an instrumented binary.
+fn verify_a09_gc_tag(
+    tags: &Path,
+    response: &serde_json::Value,
+    tag: &str,
+    commit: &str,
+) -> Result<PathBuf, AcceptanceError> {
+    // The CLI reports refs under the canonical repository path, including
+    // Windows' verbatim prefix. Canonicalize only the expected directory.
+    let expected = tags
+        .canonicalize()
+        .map_err(io_error)?
+        .join(kio_core::portable::portable_tag_leaf(tag));
+    let reported = required_json_string(response, "/path", "A09 GC tag")?;
+    if response["tag"] != tag
+        || response["commit_hash"] != commit
+        || Path::new(&reported) != expected
+    {
+        return Err(AcceptanceError::Command(format!(
+            "A09 GC tag {tag:?} did not bind commit {commit} and ref '{}': {response}",
+            expected.display()
+        )));
+    }
+    if bounded_regular_bytes(&expected, commit.len() as u64)? != commit.as_bytes() {
+        return Err(AcceptanceError::Command(format!(
+            "A09 GC ref '{}' did not contain the exact commit {commit}",
+            expected.display()
+        )));
+    }
+    Ok(expected)
+}
+
 fn assert_a09_scheduled_snapshot(
     binary: &Path,
     isolated: &Path,
@@ -4139,6 +4154,30 @@ esac
     }
 
     #[cfg(unix)]
+    #[test]
+    fn a09_gc_tag_requires_canonical_ref_path_and_exact_ref_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().canonicalize().unwrap();
+        let tag = "a09-gc-Σ";
+        let commit = format!("sha256:{}", "a".repeat(64));
+        let path = dir.join(kio_core::portable::portable_tag_leaf(tag));
+        fs::write(&path, &commit).unwrap();
+        let response = serde_json::json!({"tag": tag, "commit_hash": commit, "path": path});
+        // On Windows the temp path can be a drive path while the CLI
+        // reports the canonical, verbatim spelling of this same directory.
+        assert_eq!(
+            verify_a09_gc_tag(temp.path(), &response, tag, &commit).unwrap(),
+            path
+        );
+
+        let mut foreign = response.clone();
+        foreign["path"] = serde_json::json!(dir.join("foreign-ref"));
+        assert!(verify_a09_gc_tag(&dir, &foreign, tag, &commit).is_err());
+        assert!(verify_a09_gc_tag(&dir, &response, "other-tag", &commit).is_err());
+        fs::write(&path, format!("{commit}\r\n")).unwrap();
+        assert!(verify_a09_gc_tag(&dir, &response, tag, &commit).is_err());
+    }
+
     #[test]
     fn native_embedding_acceptance_a05_initializes_ledger_before_index() {
         assert_native_ledger_bootstrap(AcceptanceCase::A05, "initialized");
