@@ -30,15 +30,11 @@ fn denied(message: &'static str) -> std::io::Error {
 }
 
 pub(super) fn scratch_step<T>(
-    root: &Path,
-    path: &Path,
+    relative: &Path,
     operation: &str,
     result: std::io::Result<T>,
 ) -> std::io::Result<T> {
     result.map_err(|error| {
-        let relative = path
-            .strip_prefix(root)
-            .unwrap_or(Path::new("<unavailable>"));
         let name: String = relative.to_string_lossy().chars().take(240).collect();
         let name = if name.is_empty() { "." } else { &name };
         std::io::Error::new(
@@ -305,9 +301,10 @@ fn same_identity(a: &BY_HANDLE_FILE_INFORMATION, b: &BY_HANDLE_FILE_INFORMATION)
 }
 
 impl Entry {
-    fn reopen(&self, access: u32, share: u32) -> std::io::Result<OwnedHandle> {
+    fn reopen(&self, root: &Path, access: u32, share: u32) -> std::io::Result<OwnedHandle> {
+        let path = root.join(&self.path);
         let (handle, info) =
-            open_scratch_entry(&self.path, scratch_observation::METADATA | access, share)?;
+            open_scratch_entry(&path, scratch_observation::METADATA | access, share)?;
         if !same_identity(&self.info, &info) {
             return Err(denied("staged scratch entry changed identity"));
         }
@@ -322,11 +319,11 @@ impl Entry {
         inherited: bool,
     ) -> std::io::Result<()> {
         scratch_step(
-            &grant.root,
             &self.path,
             "update scratch ACL",
             (|| {
-                let writer = self.reopen(WRITE_DAC, FILE_SHARE_READ | FILE_SHARE_WRITE)?;
+                let writer =
+                    self.reopen(&grant.root, WRITE_DAC, FILE_SHARE_READ | FILE_SHARE_WRITE)?;
                 verify_acl(writer.0, &grant.owner, from, inherited)?;
                 set_acl(
                     writer.0,
@@ -341,7 +338,7 @@ impl Entry {
 
 impl ScratchGrant {
     pub(super) fn new(root: &Path, app: Option<PSID>) -> std::io::Result<Self> {
-        let owner = scratch_step(root, root, "query scratch owner", CurrentUser::new())?;
+        let owner = scratch_step(Path::new(""), "query scratch owner", CurrentUser::new())?;
         let mut value = Self {
             root: root.to_owned(),
             owner,
@@ -373,10 +370,9 @@ impl ScratchGrant {
                 .iter()
                 .map(|entry| {
                     let handle = scratch_step(
-                        root,
                         &entry.path,
                         "retain shared scratch identity",
-                        entry.reopen(0, scratch_observation::SHARED),
+                        entry.reopen(root, 0, scratch_observation::SHARED),
                     )?;
                     Ok(Entry {
                         path: entry.path.clone(),
@@ -408,9 +404,7 @@ impl ScratchGrant {
                 open_scratch_entry(&self.root, METADATA, FILE_SHARE_READ | FILE_SHARE_WRITE)?;
             (
                 Rc::new(handle),
-                ScanMode::Acl {
-                    allow_missing: active,
-                },
+                ScanMode::Acl(active && !self.stopped),
                 budget,
                 u64::MAX,
             )
@@ -427,11 +421,9 @@ impl ScratchGrant {
             .map(|entry| (entry.path.as_path(), &entry.info))
             .collect::<std::collections::BTreeMap<_, _>>();
         scratch_observation::observe(root, mode, deadline, max_bytes, |handle, info, relative| {
-            let path = self.root.join(relative);
-            let original = pending.remove(path.as_path());
+            let original = pending.remove(relative);
             scratch_step(
-                &self.root,
-                &path,
+                relative,
                 "verify scratch entry ACL and identity",
                 (|| {
                     if original.is_some_and(|old| !same_identity(old, info)) {
@@ -447,7 +439,7 @@ impl ScratchGrant {
             )?;
             if live.is_none() {
                 entries.push(Entry {
-                    path,
+                    path: relative.to_path_buf(),
                     handle: Rc::clone(handle),
                     info: *info,
                 });
@@ -456,7 +448,6 @@ impl ScratchGrant {
         })?;
         if let Some(path) = pending.keys().next() {
             return scratch_step(
-                &self.root,
                 path,
                 "verify staged scratch entry",
                 Err(denied("staged scratch entry disappeared")),

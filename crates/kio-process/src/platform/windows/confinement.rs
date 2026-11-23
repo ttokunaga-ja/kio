@@ -321,7 +321,7 @@ where
                         .map_err(ConfinementError::Profile)?,
                     RendererAccess::AppContainer => {
                         grant.verify_active().map_err(ConfinementError::Profile)?;
-                        observe_scratch_until(sandbox, deadline, options)?;
+                        observe_scratch_until(sandbox, deadline, options, true)?;
                     }
                 }
                 if status.is_none() {
@@ -416,12 +416,14 @@ fn observe_scratch_until(
     sandbox: &NativeRenderSandbox,
     deadline: Instant,
     options: BoundedProcessOptions,
+    allow_missing: bool,
 ) -> Result<(), ConfinementError> {
     check_renderer_deadline(deadline, options)?;
     let result = scan_scratch_limits(
         sandbox.scratch(),
         deadline.min(Instant::now() + SCRATCH_SCAN_BUDGET),
         sandbox.limits().max_file_bytes,
+        allow_missing,
     );
     // Command timeout takes precedence when its deadline clipped the scan.
     check_renderer_deadline(deadline, options)?;
@@ -446,7 +448,7 @@ fn finish_renderer_output(
     mut output: [Option<String>; 2],
 ) -> Result<BoundedProcessOutput, ConfinementError> {
     let RendererTiming { started, deadline } = timing;
-    observe_scratch_until(sandbox, deadline, options)?;
+    observe_scratch_until(sandbox, deadline, options, false)?;
     while output.iter().any(Option::is_none) {
         check_renderer_deadline(deadline, options)?;
         match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
@@ -517,15 +519,16 @@ fn scratch_entry_information(handle: &OwnedHandle) -> std::io::Result<BY_HANDLE_
     Ok(info)
 }
 
-fn scan_scratch_limits(root: &Path, deadline: Instant, max_bytes: u64) -> std::io::Result<()> {
-    let (root, _) = open_scratch_entry(
-        root,
-        FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
-        FILE_SHARE_READ,
-    )?;
+fn scan_scratch_limits(
+    root: &Path,
+    deadline: Instant,
+    max_bytes: u64,
+    allow_missing: bool,
+) -> std::io::Result<()> {
+    let (root, _) = open_scratch_entry(root, FILE_READ_ATTRIBUTES, FILE_SHARE_READ)?;
     scratch_observation::observe(
         std::rc::Rc::new(root),
-        scratch_observation::ScanMode::Limits,
+        scratch_observation::ScanMode::Limits(allow_missing),
         deadline,
         max_bytes,
         |_, _, _| Ok(()),
@@ -1083,7 +1086,7 @@ mod scratch_scan_tests {
     use super::*;
 
     fn scan(root: &Path, max: u64) -> Result<(), std::io::Error> {
-        scan_scratch_limits(root, Instant::now() + Duration::from_secs(60), max)
+        scan_scratch_limits(root, Instant::now() + Duration::from_secs(60), max, false)
     }
 
     fn final_scan_sandbox(root: &Path, max: u64) -> NativeRenderSandbox {
@@ -1177,7 +1180,7 @@ mod scratch_scan_tests {
     #[test]
     fn scratch_scan_honors_a_shorter_remaining_command_budget() {
         let root = tempfile::tempdir().unwrap();
-        let error = scan_scratch_limits(root.path(), Instant::now(), 0).unwrap_err();
+        let error = scan_scratch_limits(root.path(), Instant::now(), 0, false).unwrap_err();
         assert!(error.to_string().contains("observation budget"));
     }
 
@@ -1265,7 +1268,7 @@ mod scratch_scan_tests {
         let mut attempted_swap = false;
         scratch_observation::observe(
             std::rc::Rc::new(handle),
-            scratch_observation::ScanMode::Limits,
+            scratch_observation::ScanMode::Limits(false),
             Instant::now() + SCRATCH_SCAN_BUDGET,
             0,
             |_, _, path| {

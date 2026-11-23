@@ -1,12 +1,16 @@
 //! Read-only, fully shared, handle-relative inventory for a live Office job.
 use super::*;
+use scratch_access::scratch_step;
 use std::{io, os::windows::ffi::OsStringExt as _, rc::Rc};
 use windows_sys::Wdk::{
     Foundation::OBJECT_ATTRIBUTES,
     Storage::FileSystem::{FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, NtOpenFile},
 };
 use windows_sys::Win32::{
-    Foundation::{RtlNtStatusToDosError, UNICODE_STRING},
+    Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, RtlNtStatusToDosError, STATUS_DELETE_PENDING,
+        UNICODE_STRING,
+    },
     Storage::FileSystem::SYNCHRONIZE,
     System::IO::IO_STATUS_BLOCK,
 };
@@ -17,20 +21,17 @@ pub(super) const METADATA: u32 = FILE_READ_ATTRIBUTES | READ_CONTROL;
 // Empty name reopens the exact directory. Non-empty names are a single leaf
 // from the kernel directory stream, never an ambient path.
 fn open_at(parent: &OwnedHandle, name: &OsStr, access: u32, share: u32) -> io::Result<OwnedHandle> {
-    let mut name = name.encode_wide().collect::<Vec<_>>();
-    if name.iter().any(|unit| matches!(*unit, 0 | 47 | 58 | 92)) {
+    let mut name = wide(name);
+    let units = &name[..name.len() - 1];
+    if units.iter().any(|unit| matches!(*unit, 0 | 47 | 58 | 92)) {
         return Err(io::Error::other("invalid scratch directory entry name"));
     }
-    let size = u16::try_from(name.len().saturating_mul(2))
+    let size = u16::try_from(units.len().saturating_mul(2))
         .map_err(|_| io::Error::other("scratch directory entry name is too long"))?;
     let mut unicode = UNICODE_STRING {
         Length: size,
         MaximumLength: size,
-        Buffer: if name.is_empty() {
-            std::ptr::null_mut()
-        } else {
-            name.as_mut_ptr()
-        },
+        Buffer: name.as_mut_ptr(),
     };
     let attributes = OBJECT_ATTRIBUTES {
         Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
@@ -51,9 +52,13 @@ fn open_at(parent: &OwnedHandle, name: &OsStr, access: u32, share: u32) -> io::R
         )
     };
     if status < 0 {
-        return Err(io::Error::from_raw_os_error(
-            unsafe { RtlNtStatusToDosError(status) } as i32,
-        ));
+        // Only the fully shared live Office walk treats native delete-pending
+        // as missing. Classify it before converting the status to Win32.
+        let code = match status {
+            STATUS_DELETE_PENDING if share == SHARED => ERROR_FILE_NOT_FOUND,
+            _ => unsafe { RtlNtStatusToDosError(status) },
+        };
+        return Err(io::Error::from_raw_os_error(code as i32));
     }
     Ok(OwnedHandle(handle))
 }
@@ -151,61 +156,56 @@ pub(super) fn require_empty(directory: &OwnedHandle) -> io::Result<()> {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum ScanMode {
-    Acl { allow_missing: bool },
-    Limits,
+    Acl(bool),
+    Limits(bool),
     LiveOffice,
 }
 
 impl ScanMode {
     fn access_and_share(self) -> (u32, u32) {
         match self {
-            Self::Acl { .. } => (METADATA, FILE_SHARE_READ | FILE_SHARE_WRITE),
-            Self::Limits => (FILE_READ_ATTRIBUTES, FILE_SHARE_READ),
+            Self::Acl(_) => (METADATA, FILE_SHARE_READ | FILE_SHARE_WRITE),
+            Self::Limits(_) => (FILE_READ_ATTRIBUTES, FILE_SHARE_READ),
             Self::LiveOffice => (METADATA, SHARED),
         }
+    }
+
+    fn allows_missing(self) -> bool {
+        match self {
+            Self::Acl(allow_missing) | Self::Limits(allow_missing) => allow_missing,
+            Self::LiveOffice => true,
+        }
+    }
+}
+
+fn reobserve_denied<T>(
+    deadline: Instant,
+    mut open: impl FnMut() -> io::Result<T>,
+) -> io::Result<T> {
+    match open() {
+        Err(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
+            check_time(deadline)?;
+            open()
+        }
+        result => result,
     }
 }
 
 struct ScratchInventory {
     mode: ScanMode,
     entries: usize,
-    bytes: u64,
+    remaining_bytes: u64,
     limit: u64,
     deadline: Instant,
 }
 
 fn check_time(deadline: Instant) -> io::Result<()> {
-    if Instant::now() >= deadline {
-        return Err(io::Error::other(
-            "renderer scratch scan exceeded observation budget",
-        ));
-    }
-    Ok(())
+    (Instant::now() < deadline)
+        .then_some(())
+        .ok_or_else(|| io::Error::other("renderer scratch scan exceeded observation budget"))
 }
 
 impl ScratchInventory {
-    fn directory_names(&mut self, listing: &OwnedHandle) -> io::Result<Vec<OsString>> {
-        let mut names = Vec::new();
-        let deadline = self.deadline;
-        enumerate(
-            listing,
-            || check_time(deadline),
-            |name| {
-                if name != "." && name != ".." {
-                    self.entries += 1;
-                    if self.entries > MAX_SCRATCH_SCAN_ENTRIES {
-                        return Err(io::Error::other(
-                            "renderer scratch scan exceeded entry limit",
-                        ));
-                    }
-                    names.push(name);
-                }
-                Ok(())
-            },
-        )?;
-        Ok(names)
-    }
-
     fn visit(
         &mut self,
         handle: Rc<OwnedHandle>,
@@ -222,13 +222,10 @@ impl ScratchInventory {
                     "renderer scratch file exceeds configured limit",
                 ));
             }
-            self.bytes = self
-                .bytes
-                .checked_add(size)
-                .filter(|total| *total <= self.limit)
-                .ok_or_else(|| {
-                    io::Error::other("renderer scratch total exceeds configured limit")
-                })?;
+            let remaining = self.remaining_bytes.checked_sub(size);
+            self.remaining_bytes = remaining.ok_or_else(|| {
+                io::Error::other("renderer scratch total exceeds configured limit")
+            })?;
             return Ok(());
         }
         if path.components().count() > MAX_SCRATCH_SCAN_DEPTH {
@@ -237,26 +234,52 @@ impl ScratchInventory {
             ));
         }
         let (metadata, share) = self.mode.access_and_share();
-        let listing = scratch_access::scratch_step(
-            Path::new(""),
-            path,
-            "open retained scratch directory for enumeration",
-            open_at(
-                &handle,
-                OsStr::new(""),
-                FILE_LIST_DIRECTORY | metadata,
-                share,
-            ),
-        )?;
-        let names = scratch_access::scratch_step(
-            Path::new(""),
-            path,
-            "enumerate retained scratch directory",
-            self.directory_names(&listing),
-        )?;
+        let live = self.mode == ScanMode::LiveOffice;
+        let deadline = self.deadline;
+        let open = |parent: &OwnedHandle, name: &OsStr, access, share| {
+            let attempt = || open_at(parent, name, access, share);
+            if live {
+                reobserve_denied(deadline, attempt)
+            } else {
+                attempt()
+            }
+        };
+        let listing = match open(
+            &handle,
+            OsStr::new(""),
+            FILE_LIST_DIRECTORY | metadata,
+            share,
+        ) {
+            Err(error)
+                if live
+                    && error.kind() == io::ErrorKind::NotFound
+                    && !path.as_os_str().is_empty() =>
+            {
+                return Ok(());
+            }
+            result => scratch_step(path, "open scratch directory for enumeration", result)?,
+        };
+        let mut names = Vec::new();
+        let enumeration = enumerate(
+            &listing,
+            || check_time(deadline),
+            |name| {
+                if name != "." && name != ".." {
+                    self.entries += 1;
+                    if self.entries > MAX_SCRATCH_SCAN_ENTRIES {
+                        return Err(io::Error::other(
+                            "renderer scratch scan exceeded entry limit",
+                        ));
+                    }
+                    names.push(name);
+                }
+                Ok(())
+            },
+        );
+        scratch_step(path, "enumerate retained scratch directory", enumeration)?;
         // Strong observations keep the directory pin; live Office drops list
         // access before inspecting any children or calling the verifier.
-        let guard = if self.mode == ScanMode::LiveOffice {
+        let guard = if live {
             drop(listing);
             handle
         } else {
@@ -266,29 +289,15 @@ impl ScratchInventory {
         for name in names {
             check_time(self.deadline)?;
             let child_path = path.join(&name);
-            let child = match open_at(&guard, &name, metadata, share | FILE_SHARE_WRITE) {
-                Ok(child) => child,
+            let child = match open(&guard, &name, metadata, share | FILE_SHARE_WRITE) {
                 Err(error)
-                    if !matches!(
-                        self.mode,
-                        ScanMode::Acl {
-                            allow_missing: false
-                        }
-                    ) && error.kind() == io::ErrorKind::NotFound =>
+                    if self.mode.allows_missing() && error.kind() == io::ErrorKind::NotFound =>
                 {
                     continue;
                 }
-                Err(error) => {
-                    return scratch_access::scratch_step(
-                        Path::new(""),
-                        &child_path,
-                        "open scratch entry for inspection",
-                        Err(error),
-                    );
-                }
+                result => scratch_step(&child_path, "open scratch entry for inspection", result)?,
             };
-            let info = scratch_access::scratch_step(
-                Path::new(""),
+            let info = scratch_step(
                 &child_path,
                 "check scratch entry type",
                 scratch_entry_information(&child),
@@ -309,7 +318,7 @@ pub(super) fn observe(
     let mut inventory = ScratchInventory {
         mode,
         entries: 0,
-        bytes: 0,
+        remaining_bytes: max_bytes,
         limit: max_bytes,
         deadline,
     };
@@ -325,6 +334,73 @@ pub(super) fn observe(
 mod tests {
     use super::*;
     use std::os::windows::fs::OpenOptionsExt as _;
+    use std::os::windows::io::AsRawHandle as _;
+
+    #[test]
+    fn reobservation_requires_evidence_before_disregarding_an_access_denial() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        for second in [io::ErrorKind::PermissionDenied, io::ErrorKind::NotFound] {
+            let mut attempts = 0;
+            let error = reobserve_denied(deadline, || {
+                attempts += 1;
+                Err::<(), _>(if attempts == 1 {
+                    io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32)
+                } else {
+                    second.into()
+                })
+            })
+            .unwrap_err();
+            assert_eq!(attempts, 2);
+            assert_eq!(error.kind(), second);
+        }
+    }
+
+    #[test]
+    fn live_office_skips_a_directory_marked_delete_pending_after_enumeration() {
+        use windows_sys::Win32::Storage::FileSystem::{
+            DELETE, FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+        };
+
+        for mode in [ScanMode::LiveOffice, ScanMode::Acl(false)] {
+            let scratch = tempfile::tempdir().unwrap();
+            let child = scratch.path().join("registry");
+            std::fs::create_dir(&child).unwrap();
+            let pending = std::fs::OpenOptions::new()
+                .access_mode(DELETE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .share_mode(SHARED)
+                .open(&child)
+                .unwrap();
+            let (root, _) = open_scratch_entry(scratch.path(), METADATA, SHARED).unwrap();
+            let result = observe(
+                Rc::new(root),
+                mode,
+                Instant::now() + Duration::from_secs(5),
+                0,
+                |_, _, path| {
+                    assert_eq!(path, Path::new(""), "delete-pending entry reached verifier");
+                    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+                    assert_ne!(
+                        unsafe {
+                            SetFileInformationByHandle(
+                                pending.as_raw_handle(),
+                                FileDispositionInfo,
+                                (&raw const disposition).cast(),
+                                std::mem::size_of_val(&disposition) as u32,
+                            )
+                        },
+                        0,
+                        "{}",
+                        io::Error::last_os_error()
+                    );
+                    Ok(())
+                },
+            );
+            assert_eq!(result.is_ok(), mode == ScanMode::LiveOffice, "{result:?}");
+            drop(pending);
+            assert!(!child.exists());
+        }
+    }
 
     #[test]
     fn live_observation_allows_mutation_and_keeps_traversal_on_the_open_directory() {
