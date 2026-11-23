@@ -207,7 +207,7 @@ fn display_path(path: &Path) -> Result<String, PreflightError> {
 fn sha256_file(path: &Path) -> Result<String, PreflightError> {
     let mut input = File::open(path)?;
     let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 1024 * 1024];
+    let mut buffer = [0_u8; 64 * 1024];
     loop {
         let count = input.read(&mut buffer)?;
         if count == 0 {
@@ -389,8 +389,24 @@ fn write_create_only(path: &Path, report: &PreflightReport) -> Result<(), Prefli
 mod tests {
     use std::path::Path;
 
-    use super::{host_matches, office_version_program};
+    use super::{host_matches, office_version_program, sha256_file};
     use crate::acceptance::NativeOs;
+
+    #[test]
+    fn converter_hash_streams_with_stack_headroom() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let payload = vec![42; 1024 * 1024 + 1];
+        std::fs::write(file.path(), &payload).unwrap();
+        let path = file.path().to_path_buf();
+        // Leave headroom for the callers on Windows' 1 MiB main stack.
+        let hash = std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(move || sha256_file(&path).unwrap())
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(hash, crate::acceptance::sha256_bytes(&payload));
+    }
 
     #[test]
     fn host_mapping_requires_the_selected_native_target() {
