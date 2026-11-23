@@ -4,7 +4,8 @@
 //! offline policy and device-grant state transitions.
 
 use std::{
-    fs,
+    fs::{self, File},
+    io::{Read, copy as copy_bytes},
     path::{Path, PathBuf},
     process::Command,
 };
@@ -309,8 +310,9 @@ fn command_error_code(
         .map_err(|parse| failure(format!("{context} did not emit JSON error: {parse}")))?;
     if error.get("error_code").and_then(Value::as_str) != Some(expected) {
         return Err(failure(format!(
-            "{context} returned {:?}, expected {expected}",
-            error.get("error_code")
+            "{context} returned {:?}, expected {expected}: {}",
+            error.get("error_code"),
+            output.stderr.chars().take(1024).collect::<String>()
         )));
     }
     Ok(())
@@ -499,7 +501,20 @@ fn copy_tree(source: &Path, clone_root: &Path) -> Result<(), AcceptanceError> {
             if *files > MAX_CLONE_FILES || *bytes > MAX_CLONE_BYTES {
                 return Err(invalid("A04 clone exceeds bound"));
             }
-            fs::copy(source, parent.path().join(name)).map_err(io)?;
+            // The Windows directory ACL is protected and has no inheritable
+            // ACEs. A plain copy does not establish a private leaf descriptor.
+            let input = File::open(source).map_err(io)?;
+            let mut output = parent
+                .create_private_file(name)
+                .map_err(|error| failure(error.to_string()))?;
+            let copied =
+                copy_bytes(&mut input.take(metadata.len() + 1), &mut output).map_err(io)?;
+            if copied != metadata.len() {
+                return Err(invalid(format!(
+                    "A04 clone source '{}' changed size during copy",
+                    source.display()
+                )));
+            }
         } else {
             return Err(invalid("A04 clone contains non-regular entry"));
         }
@@ -525,7 +540,7 @@ fn io(error: std::io::Error) -> AcceptanceError {
 mod tests {
     use super::*;
     use kio_core::{
-        management::{ManagementBinding, validate_live_chain},
+        management::{ManagementBinding, initialize_root, validate_live_chain},
         scope::Repository,
     };
 
@@ -536,21 +551,37 @@ mod tests {
         let original = device.join("original");
         fs::create_dir(&original).unwrap();
         drop(Repository::init(&original).unwrap());
+        let original_store = original.join(".kio");
+        let scope: Value =
+            serde_json::from_slice(&fs::read(original_store.join("scope.json")).unwrap()).unwrap();
+        let binding = ManagementBinding::bind(&original).unwrap();
+        initialize_root(&binding, scope["scope_id"].as_str().unwrap(), false).unwrap();
+        validate_live_chain(&binding).unwrap();
+        drop(binding);
 
         let clone = device.join("clone");
         fs::create_dir(&clone).unwrap();
-        copy_tree(&original.join(".kio"), &clone).unwrap();
+        copy_tree(&original_store, &clone).unwrap();
+        let clone_store = StoreDirectory::open(&clone.join(".kio")).unwrap();
+        for name in ["management.json", "scope.json"] {
+            clone_store.ensure_owner_private(Path::new(name)).unwrap();
+            assert_eq!(
+                fs::read(original_store.join(name)).unwrap(),
+                fs::read(clone_store.path().join(name)).unwrap(),
+            );
+        }
+        drop(clone_store);
 
         let moved = device.join("moved");
         fs::rename(&original, &moved).unwrap();
-        let results = [clone, moved].map(|scope| {
-            ManagementBinding::bind(&scope)
-                .and_then(|binding| validate_live_chain(&binding))
-                .unwrap_err()
-                .error_code()
-                .to_owned()
-        });
-
-        assert_eq!(results, [MANAGEMENT_AUTHORITY_ERROR; 2]);
+        for scope in [clone, moved] {
+            let binding = ManagementBinding::bind(&scope).unwrap();
+            let error = validate_live_chain(&binding).unwrap_err();
+            assert_eq!(error.error_code(), MANAGEMENT_AUTHORITY_ERROR);
+            assert_eq!(
+                error.message(),
+                "management creation binding differs from live scope"
+            );
+        }
     }
 }
