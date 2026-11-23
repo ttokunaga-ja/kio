@@ -10,6 +10,7 @@ use crate::watch_service::{
     ServiceEnvironment, ServiceManifest, service_environment_pairs, service_error,
 };
 use kio_core::Result;
+use kio_process::BoundedProcessOutput;
 use std::path::PathBuf;
 
 pub(crate) fn native_registration_absent(manifest: &ServiceManifest) -> Result<bool> {
@@ -23,15 +24,16 @@ pub(crate) fn native_registration_absent(manifest: &ServiceManifest) -> Result<b
     if output.status.success() {
         return Ok(false);
     }
-    if output.status.code() == Some(113)
-        && (output.stderr.contains("Could not find service")
-            || output.stderr.contains("Bad request"))
-    {
+    if service_absent(&output) {
         return Ok(true);
     }
     Err(service_error(
         "launchctl could not inspect native watch registration",
     ))
+}
+
+fn service_absent(output: &BoundedProcessOutput) -> bool {
+    output.status.code() == Some(113) && output.stderr.contains("Could not find service")
 }
 
 pub(crate) fn native_prepare_replacement(_manifest: &ServiceManifest) -> Result<()> {
@@ -64,7 +66,7 @@ pub(crate) fn native_manifest_locator(id: &str) -> Result<Option<PathBuf>> {
             registered_agent_data_home_with(&paths, id, decode_agent_data_home)?
                 .ok_or_else(|| service_error("loaded LaunchAgent source disappeared"))
         })?)
-    } else if output.status.code() == Some(113) {
+    } else if service_absent(&output) {
         unloaded_agent_data_home(id)?
     } else {
         return Err(service_error(
@@ -178,10 +180,7 @@ pub(crate) fn native_loaded_definition_matches(manifest: &ServiceManifest) -> Re
     if !output.status.success() {
         // `launchctl print` uses exit 113 for a genuinely unloaded service.
         // Other failures are an ambiguous manager error and must fail closed.
-        if output.status.code() == Some(113)
-            && (output.stderr.contains("Could not find service")
-                || output.stderr.contains("Bad request"))
-        {
+        if service_absent(&output) {
             return Ok(true);
         }
         return Err(service_error(
@@ -245,19 +244,40 @@ pub(crate) fn native_enable(manifest: &ServiceManifest) -> Result<()> {
 }
 
 pub(crate) fn native_start(manifest: &ServiceManifest) -> Result<()> {
-    let target = format!("gui/{}/{}", unsafe { libc::geteuid() }, manifest.id);
-    let printed = run_native_output("/bin/launchctl", ["print".into(), target.clone()])?;
-    if !printed.status.success() {
-        run_native(
-            "/bin/launchctl",
-            [
-                "bootstrap".into(),
-                format!("gui/{}", unsafe { libc::geteuid() }),
-                manifest.native_path.display().to_string(),
-            ],
-        )?;
+    let domain = format!("gui/{}", unsafe { libc::geteuid() });
+    let target = format!("{domain}/{}", manifest.id);
+    let printed = run_native_output("/bin/launchctl", ["print".into(), target.clone()])
+        .map_err(|error| service_error(format!("launchctl print: {}", error.message())))?;
+    start_launch_agent(&printed, domain, target, &manifest.native_path, |args| {
+        let verb = &args[0];
+        run_native("/bin/launchctl", args.iter().cloned())
+            .map(|_| ())
+            .map_err(|error| service_error(format!("launchctl {verb}: {}", error.message())))
+    })
+}
+
+fn start_launch_agent(
+    printed: &BoundedProcessOutput,
+    domain: String,
+    target: String,
+    plist: &std::path::Path,
+    run: impl FnOnce(Vec<String>) -> Result<()>,
+) -> Result<()> {
+    if printed.status.success() {
+        run(vec!["kickstart".into(), target])
+    } else if service_absent(printed) {
+        // RunAtLoad starts the watcher on bootstrap. Forcing a restart here
+        // kills that instance and waits for launchd's restart throttle.
+        run(vec![
+            "bootstrap".into(),
+            domain,
+            plist.display().to_string(),
+        ])
+    } else {
+        Err(service_error(
+            "launchctl print could not identify the LaunchAgent before start",
+        ))
     }
-    run_native("/bin/launchctl", ["kickstart".into(), "-k".into(), target]).map(|_| ())
 }
 
 pub(crate) fn native_stop(manifest: &ServiceManifest) -> Result<()> {
@@ -283,10 +303,7 @@ pub(crate) fn native_uninstall(manifest: &ServiceManifest) -> Result<()> {
     let printed = run_native_output("/bin/launchctl", ["print".into(), target])?;
     if printed.status.success() {
         native_stop(manifest)
-    } else if printed.status.code() == Some(113)
-        && (printed.stderr.contains("Could not find service")
-            || printed.stderr.contains("Bad request"))
-    {
+    } else if service_absent(&printed) {
         Ok(())
     } else {
         Err(service_error(
@@ -313,4 +330,46 @@ pub(crate) fn native_state(manifest: &ServiceManifest) -> Result<NativeServiceSt
         registered: true,
         active,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{os::unix::process::ExitStatusExt, path::Path, process::ExitStatus};
+
+    #[test]
+    fn start_bootstraps_an_unloaded_agent_once_and_never_forces_a_restart() {
+        for (status, stderr, expected) in [
+            (
+                113,
+                "Bad request.\nCould not find service",
+                Some(vec!["bootstrap", "gui/501", "/tmp/probe.plist"]),
+            ),
+            (0, "", Some(vec!["kickstart", "gui/501/io.kio.watch.probe"])),
+            (113, "Bad request.", None),
+        ] {
+            let printed = BoundedProcessOutput {
+                status: ExitStatus::from_raw(status << 8),
+                stdout: String::new(),
+                stderr: stderr.into(),
+                duration: std::time::Duration::ZERO,
+            };
+            let mut called = None;
+            let result = start_launch_agent(
+                &printed,
+                "gui/501".into(),
+                "gui/501/io.kio.watch.probe".into(),
+                Path::new("/tmp/probe.plist"),
+                |args| {
+                    called = Some(args);
+                    Ok(())
+                },
+            );
+            assert_eq!(result.is_ok(), expected.is_some());
+            assert_eq!(
+                called,
+                expected.map(|args| args.into_iter().map(String::from).collect())
+            );
+        }
+    }
 }
