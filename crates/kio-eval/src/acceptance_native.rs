@@ -1176,12 +1176,23 @@ fn create_boundary_link(link: &Path, target: &Path) -> Result<(), AcceptanceErro
 /// used to exercise the same reparse-point boundary on the hosted runner.
 #[cfg(windows)]
 fn create_boundary_link(link: &Path, target: &Path) -> Result<(), AcceptanceError> {
-    let link = link
-        .to_str()
-        .ok_or_else(|| AcceptanceError::Invalid("junction path is not UTF-8".into()))?;
-    let target = target
-        .to_str()
-        .ok_or_else(|| AcceptanceError::Invalid("junction target is not UTF-8".into()))?;
+    // `mklink /J` rejects verbatim (`\\?\`) paths, which `canonicalize` returns,
+    // with "Local volumes are required"; pass the plain drive spelling.
+    fn drive_spelling<'a>(path: &'a Path, what: &str) -> Result<&'a str, AcceptanceError> {
+        let text = path
+            .to_str()
+            .ok_or_else(|| AcceptanceError::Invalid(format!("junction {what} is not UTF-8")))?;
+        let plain = text.strip_prefix(r"\\?\").unwrap_or(text);
+        if matches!(plain.as_bytes(), [drive, b':', b'\\', ..] if drive.is_ascii_alphabetic()) {
+            Ok(plain)
+        } else {
+            Err(AcceptanceError::Invalid(format!(
+                "junction {what} is not a local drive path"
+            )))
+        }
+    }
+    let link = drive_spelling(link, "path")?;
+    let target = drive_spelling(target, "target")?;
     let output = Command::new("cmd")
         .args([
             "/D",
