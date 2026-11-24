@@ -377,6 +377,15 @@ jobs:
             --expected-lock-sha256 "$lock_sha256" \
             | tee "$RUNNER_TEMP/kio-v1-release-verify.json"
           extract_dir="$RUNNER_TEMP/kio-v1-extract"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            # The scheduled watcher's executable must sit under ancestors no
+            # untrusted principal can mutate (kio rejects the hosted D:\a
+            # tree); the runner account's profile is owner/SYSTEM/Administrators.
+            extract_dir="$LOCALAPPDATA\\kio-v1-extract"
+            for acl_path in "${RUNNER_TEMP%%\\*}\\" "$RUNNER_TEMP" "$LOCALAPPDATA"; do
+              icacls "$acl_path" || true
+            done
+          fi
           mkdir "$extract_dir"
           # release verify rejects unsafe archive entries before this extraction.
           # Use stdin and the working directory: GNU tar on Windows misparses
