@@ -6,6 +6,7 @@ function Error-Code($errorRecord) {
     return ([long]$exception.HResult -band 4294967295L)
 }
 try {
+    $request = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::In.ReadLine())) | ConvertFrom-Json
     $service = New-Object -ComObject 'Schedule.Service'
     $service.Connect()
     $folder = $service.GetFolder('\')
@@ -16,17 +17,6 @@ try {
         $document.PreserveWhitespace = $false
         $document.LoadXml($definition.XmlText)
         return $document.OuterXml
-    }
-    $expected = @{}
-    $definition = $null
-    if ($request.template) {
-        $definition = $service.NewTask(0)
-        $definition.XmlText = $request.template
-        $definition.Principal.UserId = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-        $definition.Settings.Enabled = $true
-        $expected['true'] = Canonical $definition.XmlText
-        $definition.Settings.Enabled = $false
-        $expected['false'] = Canonical $definition.XmlText
     }
     $script:lookupCode = 0
     function Get-Registered {
@@ -55,6 +45,17 @@ try {
         }
     }
     $task = Get-Registered
+    $expected = @{}
+    $definition = $null
+    if ($request.template -and ($null -ne $task -or $request.operation -eq 'create')) {
+        $definition = $service.NewTask(0)
+        $definition.XmlText = $request.template
+        $definition.Principal.UserId = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $definition.Settings.Enabled = $true
+        $expected['true'] = Canonical $definition.XmlText
+        $definition.Settings.Enabled = $false
+        $expected['false'] = Canonical $definition.XmlText
+    }
     switch ($request.operation) {
         'query' { }
         'create' {
@@ -85,7 +86,7 @@ try {
         }
         default { throw 'Unknown native task operation' }
     }
-    $task = Get-Registered
+    if ($request.operation -ne 'query') { $task = Get-Registered }
     $result = @{ hresult = 0; lookup_hresult = $script:lookupCode; present = ($null -ne $task); actual = $null; enabled_xml = $expected['true']; disabled_xml = $expected['false']; state = 0; arguments = $null }
     if ($null -ne $task) {
         $result.actual = Canonical $task.Definition.XmlText

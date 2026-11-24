@@ -1,17 +1,17 @@
 //! Language-independent Task Scheduler automation through the OS COM API.
 //! The script is embedded program code; request data is JSON, never script text.
 use super::watch_task_registration::{
-    TaskQuery, TaskRecord, matches_enabled, matches_record, validate_query,
+    TaskQuery, TaskRecord, automation_command, automation_request, matches_enabled, matches_record,
+    validate_query,
 };
 use crate::watch_service::{ServiceManifest, service_error};
-use base64::Engine;
 use kio_core::{
     Result,
     control::ControlHandle,
     store_dir::{Publication, StoreDirectory},
 };
 use sha2::{Digest, Sha256};
-use std::{path::PathBuf, process::Command, time::Duration};
+use std::{path::PathBuf, time::Duration};
 
 pub(crate) fn query(id: &str, manifest: Option<&ServiceManifest>) -> Result<TaskQuery> {
     invoke("query", id, manifest, &[])
@@ -23,44 +23,23 @@ fn invoke(
     manifest: Option<&ServiceManifest>,
     allowed: &[&str],
 ) -> Result<TaskQuery> {
-    let request = serde_json::to_vec(&serde_json::json!({"operation": operation, "id": id,
-        "template": manifest.map(|m| m.definition.as_str()).unwrap_or(""), "allowed": allowed}))
-    .map_err(service_error)?;
-    let payload = base64::engine::general_purpose::STANDARD.encode(request);
-    let script = concat!(
-        "$request = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::In.ReadToEnd())) | ConvertFrom-Json\n",
-        include_str!("watch_task.ps1")
-    );
-    let encoded = base64::engine::general_purpose::STANDARD.encode(
-        script
-            .encode_utf16()
-            .flat_map(u16::to_le_bytes)
-            .collect::<Vec<_>>(),
-    );
+    let payload = automation_request(
+        operation,
+        id,
+        manifest.map_or("", |m| &m.definition),
+        allowed,
+    )?;
     let directory = system_directory()?;
-    let program = directory.join("WindowsPowerShell/v1.0/powershell.exe");
-    let program = kio_core::private_fs::verify_trusted_system_tool(&program)?;
-    let mut command = Command::new(&program);
-    command
-        .args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-EncodedCommand",
-            &encoded,
-        ])
-        .current_dir(
-            program
-                .parent()
-                .ok_or_else(|| service_error("OS tool has no installation directory"))?,
-        )
-        .env_clear()
-        .env(
-            "SystemRoot",
-            directory
-                .parent()
-                .ok_or_else(|| service_error("OS system directory has no parent"))?,
-        );
+    let program = kio_core::private_fs::verify_trusted_system_tool(
+        &directory.join("WindowsPowerShell/v1.0/powershell.exe"),
+    )?;
+    let windows = directory
+        .parent()
+        .ok_or_else(|| service_error("OS system directory has no parent"))?;
+    let mut command = automation_command(&program, windows, include_str!("watch_task.ps1"))?;
+    let failed = |error: &dyn std::fmt::Display| {
+        service_error(format!("Task Scheduler {operation} for {id}: {error}"))
+    };
     let output = kio_process::run_bounded_command(
         &mut command,
         kio_process::BoundedProcessOptions {
@@ -68,19 +47,16 @@ fn invoke(
             max_stdout_bytes: 256 * 1024,
             max_stderr_bytes: 4096,
         },
-        Some(kio_process::BoundedStdin::new(
-            payload.into_bytes(),
-            128 * 1024,
-        )),
+        Some(kio_process::BoundedStdin::new(payload, 128 * 1024)),
     )
-    .map_err(service_error)?;
+    .map_err(|error| failed(&error))?;
     if !output.status.success() {
-        return Err(service_error("Task Scheduler automation failed"));
+        return Err(failed(&output.status));
     }
     let result: TaskQuery =
         serde_json::from_str(output.stdout.trim_start_matches('\u{feff}').trim())
-            .map_err(service_error)?;
-    validate_query(result)
+            .map_err(|error| failed(&error))?;
+    validate_query(result).map_err(|error| failed(&error))
 }
 
 fn system_directory() -> Result<PathBuf> {
@@ -174,7 +150,8 @@ pub(crate) fn enable(m: &ServiceManifest) -> Result<()> {
         let mut record = existing.unwrap_or_else(|| initial_record(m));
         record.pending_enabled = Some(true);
         save_record(m, &record, publication)?;
-        invoke("create", &m.id, Some(m), &record.allowed())?;
+        let actual = invoke("create", &m.id, Some(m), &record.allowed())?;
+        return commit_enabled(m, record, &actual, true);
     }
     transition(m, true, "enable")
 }
@@ -193,7 +170,16 @@ fn transition(m: &ServiceManifest, enabled: bool, operation: &str) -> Result<()>
     record.pending_enabled = Some(enabled);
     save_record(m, &record, publication)?;
     let actual = invoke(operation, &m.id, Some(m), &record.allowed())?;
-    if !matches_enabled(&actual, enabled) {
+    commit_enabled(m, record, &actual, enabled)
+}
+
+fn commit_enabled(
+    m: &ServiceManifest,
+    mut record: TaskRecord,
+    actual: &TaskQuery,
+    enabled: bool,
+) -> Result<()> {
+    if !matches_enabled(actual, enabled) {
         return Err(service_error(
             "task did not commit the requested full definition",
         ));

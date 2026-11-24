@@ -1,7 +1,114 @@
 use super::watch_task_definition::{task_definition_matches, task_lookup};
 use crate::watch_service::service_error;
+use base64::Engine;
 use kio_core::Result;
 use serde::{Deserialize, Serialize};
+
+pub(crate) fn automation_command(
+    program: &std::path::Path,
+    windows: &std::path::Path,
+    script: &str,
+) -> Result<std::process::Command> {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(
+        script
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>(),
+    );
+    let mut command = std::process::Command::new(program);
+    command
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-EncodedCommand",
+            &encoded,
+        ])
+        .current_dir(
+            program
+                .parent()
+                .ok_or_else(|| service_error("OS tool has no installation directory"))?,
+        )
+        .env_clear()
+        .env("SystemRoot", windows);
+    Ok(command)
+}
+
+pub(crate) fn automation_request(
+    operation: &str,
+    id: &str,
+    template: &str,
+    allowed: &[&str],
+) -> Result<Vec<u8>> {
+    let request = serde_json::to_vec(&serde_json::json!({
+        "operation": operation, "id": id, "template": template, "allowed": allowed,
+    }))
+    .map_err(service_error)?;
+    let mut frame = base64::engine::general_purpose::STANDARD
+        .encode(request)
+        .into_bytes();
+    // ReadLine can complete on the delimiter even if stdin remains open.
+    frame.push(b'\n');
+    Ok(frame)
+}
+
+#[cfg(test)]
+#[test]
+fn automation_uses_fixed_noninteractive_arguments_and_a_framed_data_request() {
+    use std::path::Path;
+
+    let program = Path::new("Windows/System32/WindowsPowerShell/v1.0/powershell.exe");
+    let script = include_str!("../platform/windows/watch_task.ps1");
+    let command = automation_command(program, Path::new("Windows"), script).unwrap();
+    assert_eq!(command.get_program(), program);
+    let args = command
+        .get_args()
+        .map(|arg| arg.to_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        &args[..4],
+        &[
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-EncodedCommand"
+        ]
+    );
+    assert_eq!(args.len(), 5);
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(args[4])
+        .unwrap();
+    let (units, trailing) = decoded.as_chunks::<2>();
+    assert!(trailing.is_empty());
+    let units = units
+        .iter()
+        .copied()
+        .map(u16::from_le_bytes)
+        .collect::<Vec<_>>();
+    assert_eq!(String::from_utf16(&units).unwrap(), script);
+    assert!(script.contains("[Console]::In.ReadLine()"));
+    assert!(script.contains("$folder.GetTask($request.id)"));
+    assert!(!script.contains("GetTasks("));
+    assert!(
+        script
+            .contains("RegisterTaskDefinition($request.id, $definition, 2, $sid, $null, 3, $null)")
+    );
+
+    let id = "kio-test";
+    let template = "<xml>日本語</xml>";
+    for operation in ["query", "create", "enable"] {
+        let frame = automation_request(operation, id, template, &["true"]).unwrap();
+        let line = frame.strip_suffix(b"\n").unwrap();
+        assert!(!line.contains(&b'\n'));
+        let json = base64::engine::general_purpose::STANDARD
+            .decode(line)
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&json).unwrap(),
+            serde_json::json!({"operation":operation,"id":id,"template":template,"allowed":["true"]})
+        );
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
