@@ -2,7 +2,7 @@
 //! The script is embedded program code; request data is JSON, never script text.
 use super::watch_task_registration::{
     TASK_SCRIPT, TaskQuery, TaskRecord, automation_command, automation_request, record_mismatch,
-    validate_query,
+    scheduler_operation_error, validate_query,
 };
 use crate::watch_service::{ServiceManifest, service_error};
 use kio_core::{
@@ -59,7 +59,7 @@ fn invoke(
     let result: TaskQuery =
         serde_json::from_str(output.stdout.trim_start_matches('\u{feff}').trim())
             .map_err(|error| failed(&error))?;
-    validate_query(result).map_err(|error| failed(&error))
+    validate_query(result).map_err(|error| scheduler_operation_error(error, operation, id))
 }
 
 fn system_directory() -> Result<PathBuf> {
@@ -139,9 +139,7 @@ pub(crate) fn matches(m: &ServiceManifest, allow_absent: bool) -> Result<bool> {
         return Ok(allow_absent);
     }
     let record = read_record(m)?.unwrap_or_else(|| initial_record(m));
-    record_mismatch(&query, &record).map_or(Ok(true), |field| {
-        Err(service_error(format!("registered task differs at {field}")))
-    })
+    record_mismatch(&query, &record).map_or(Ok(true), |fields| Err(query.mismatch_error(fields)))
 }
 pub(crate) fn enable(m: &ServiceManifest) -> Result<()> {
     let query = query(&m.id, Some(m))?;
@@ -169,8 +167,9 @@ fn transition(m: &ServiceManifest, enabled: bool, operation: &str) -> Result<()>
         Publication::CreateOnly
     };
     let mut record = existing.unwrap_or_else(|| initial_record(m));
-    if let Some(field) = record_mismatch(&query(&m.id, Some(m))?, &record) {
-        return Err(service_error(format!("registered task differs at {field}")));
+    let query = query(&m.id, Some(m))?;
+    if let Some(fields) = record_mismatch(&query, &record) {
+        return Err(query.mismatch_error(fields));
     }
     record.pending_enabled = Some(enabled);
     save_record(m, &record, publication)?;
@@ -184,8 +183,8 @@ fn commit_enabled(
     actual: &TaskQuery,
     enabled: bool,
 ) -> Result<()> {
-    if let Some(field) = actual.definition_mismatch(enabled) {
-        return Err(service_error(format!("task differs at {field}")));
+    if let Some(fields) = actual.definition_mismatch(enabled) {
+        return Err(actual.mismatch_error(fields));
     }
     record.enabled = enabled;
     record.pending_enabled = None;

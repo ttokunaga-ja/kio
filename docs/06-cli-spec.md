@@ -31,7 +31,9 @@ Windows の Task Scheduler 操作は非対話 PowerShell の起動と COM 呼び
 60 秒で打ち切る。タイムアウトは対象 task と操作名を報告する。
 登録済み task は名前と URI、実行コマンド、principal の SID、trigger、実行設定を private 定義と照合する。
 許容する差は XML の表現差、明示的に列挙した既定値、scheduler が補う作成者と登録日時に限る。
-他の値や未承認の要素・属性が異なる場合は操作を拒否し、相違箇所を報告する。
+定義で指定していない場合、`UseUnifiedSchedulingEngine` は Windows が書き込む有効な真偽値を許容する。
+他の値や未承認の要素・属性が異なる場合は操作を拒否する。照合エラーは相違箇所を最大 10 件と
+登録済み XML の先頭最大 8 KiB を JSON context に返す。
 runner は manifest、実行ファイル、managed root/scope、scheduler 定義を照合してから、
 子 watcher に限って環境を設定する。scheduler が runner を終了したときは watcher の孤立を防ぐ。
 登録はログイン時に有効になり、登録操作自体では起動しない。

@@ -108,7 +108,8 @@ function Convert-TaskField([string]$key, [string]$value, [string]$default) {
     } catch { return $null }
 }
 function Compare-TaskDefinition($actual, $expected, [string]$registeredPath, [string]$taskId) {
-    if ($registeredPath -cne ('\' + $taskId)) { return 'RegisteredTask/Path' }
+    $count = 0
+    if ($registeredPath -cne ('\' + $taskId)) { 'RegisteredTask/Path'; $count++ }
     $keys = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $keys.UnionWith($actual.Keys)
     $keys.UnionWith($expected.Keys)
@@ -123,12 +124,31 @@ function Compare-TaskDefinition($actual, $expected, [string]$registeredPath, [st
         if (!$hasExpected -and $key -cin @('Task/RegistrationInfo/Author', 'Task/RegistrationInfo/Date')) { continue }
         if ($key -ceq 'Task/RegistrationInfo/URI' -and !$hasActual -and
             $expected[$key] -ceq $registeredPath) { continue }
+        # The host can materialize either engine selector when the template
+        # leaves it unspecified. This exception applies only to this one field.
+        if (!$hasExpected -and $key -ceq 'Task/Settings/UseUnifiedSchedulingEngine' -and
+            $null -ne (Convert-TaskField $key $actual[$key] 'false')) { continue }
         if ($taskDefaults.Keys -ccontains $key) {
             $default = $taskDefaults[$key]
             $left = if ($hasActual) { Convert-TaskField $key $actual[$key] $default } else { Convert-TaskField $key $default $default }
             $right = if ($hasExpected) { Convert-TaskField $key $expected[$key] $default } else { Convert-TaskField $key $default $default }
-            if ($null -eq $left -or $null -eq $right -or $left -cne $right) { return $key }
-        } elseif ($hasActual -ne $hasExpected -or $actual[$key] -cne $expected[$key]) { return $key }
+            $different = $null -eq $left -or $null -eq $right -or $left -cne $right
+        } else {
+            $different = $hasActual -ne $hasExpected -or $actual[$key] -cne $expected[$key]
+        }
+        if ($different) {
+            $key
+            $count++
+            if ($count -ge 10) { break }
+        }
     }
-    return ''
+}
+
+function Limit-RegisteredXml([string]$xml) {
+    if (!$xml) { return $null }
+    $bytes = [Text.Encoding]::UTF8.GetBytes($xml)
+    if ($bytes.Length -le 8192) { return $xml }
+    $end = 8192
+    while (($bytes[$end] -band 192) -eq 128) { $end-- }
+    return [Text.Encoding]::UTF8.GetString($bytes, 0, $end)
 }

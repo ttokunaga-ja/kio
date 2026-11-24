@@ -109,8 +109,10 @@ pub(crate) struct TaskQuery {
     exceptions: Vec<SchedulerException>,
     lookup_hresult: u32,
     pub(crate) present: bool,
-    enabled_mismatch: Option<String>,
-    disabled_mismatch: Option<String>,
+    enabled_mismatch: Option<Vec<String>>,
+    disabled_mismatch: Option<Vec<String>>,
+    differing_fields: Option<Vec<String>>,
+    registered_xml: Option<String>,
     pub(crate) state: u32,
     pub(crate) arguments: Option<String>,
 }
@@ -142,6 +144,19 @@ impl TaskRecord {
     }
 }
 
+pub(crate) fn scheduler_operation_error(
+    error: kio_core::KioError,
+    operation: &str,
+    id: &str,
+) -> kio_core::KioError {
+    kio_core::KioError::new(
+        error.error_code(),
+        format!("Task Scheduler {operation} for {id}: {}", error.message()),
+        error.context().clone(),
+        error.exit_code(),
+    )
+}
+
 pub(crate) fn validate_query(result: TaskQuery) -> Result<TaskQuery> {
     // A missing COM component or a failed connection is never task absence.
     // Only the HRESULT returned by GetTask itself may establish absence.
@@ -153,8 +168,8 @@ pub(crate) fn validate_query(result: TaskQuery) -> Result<TaskQuery> {
                 .collect::<String>()
         };
         let mut detail = format!("Task Scheduler API HRESULT 0x{:08x}", result.hresult);
-        if let Some(phase) = result.phase {
-            detail.push_str(&format!(" during {}", bounded(&phase, 64)));
+        if let Some(phase) = &result.phase {
+            detail.push_str(&format!(" during {}", bounded(phase, 64)));
         }
         for exception in result.exceptions.iter().take(6) {
             detail.push_str(&format!(
@@ -163,15 +178,27 @@ pub(crate) fn validate_query(result: TaskQuery) -> Result<TaskQuery> {
                 bounded(&exception.message, 384)
             ));
         }
-        return Err(service_error(detail));
+        return Err(result.diagnostic(
+            detail,
+            result.differing_fields.as_deref().unwrap_or_default(),
+        ));
     }
     if task_lookup(result.lookup_hresult)? != result.present
         || result.enabled_mismatch.is_some() != result.disabled_mismatch.is_some()
         || (!result.present && result.enabled_mismatch.is_some())
-        || [&result.enabled_mismatch, &result.disabled_mismatch]
-            .into_iter()
-            .flatten()
-            .any(|field| field.len() > 256 || field.chars().any(char::is_control))
+        || [
+            &result.enabled_mismatch,
+            &result.disabled_mismatch,
+            &result.differing_fields,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|fields| {
+            fields.len() > 10
+                || fields
+                    .iter()
+                    .any(|field| field.len() > 1024 || field.chars().any(char::is_control))
+        })
     {
         return Err(service_error("inconsistent Task Scheduler response"));
     }
@@ -179,16 +206,52 @@ pub(crate) fn validate_query(result: TaskQuery) -> Result<TaskQuery> {
 }
 
 impl TaskQuery {
-    pub(crate) fn definition_mismatch(&self, enabled: bool) -> Option<&str> {
+    fn diagnostic(&self, mut message: String, fields: &[String]) -> kio_core::KioError {
+        let fields: Vec<_> = fields
+            .iter()
+            .take(10)
+            .map(|field| {
+                field
+                    .chars()
+                    .filter(|ch| !ch.is_control())
+                    .take(256)
+                    .collect::<String>()
+            })
+            .collect();
+        if !fields.is_empty() {
+            message.push_str(" at ");
+            message.push_str(&fields.join(", "));
+        }
+        let mut error = service_error(message)
+            .with_context_field("differing_fields", serde_json::json!(fields));
+        if let Some(xml) = &self.registered_xml {
+            error = error.with_context_field(
+                "registered_xml",
+                serde_json::json!(&xml[..xml.floor_char_boundary(8192)]),
+            );
+        }
+        error
+    }
+
+    pub(crate) fn mismatch_error(&self, fields: &[String]) -> kio_core::KioError {
+        let message = if fields.is_empty() {
+            "missing definition comparison"
+        } else {
+            "registered task definition differs"
+        };
+        self.diagnostic(message.to_owned(), fields)
+    }
+
+    pub(crate) fn definition_mismatch(&self, enabled: bool) -> Option<&[String]> {
         let mismatch = if enabled {
             &self.enabled_mismatch
         } else {
             &self.disabled_mismatch
         };
         match mismatch.as_deref() {
-            Some("") if self.present => None,
-            Some(field) if !field.is_empty() => Some(field),
-            _ => Some("missing definition comparison"),
+            Some([]) if self.present => None,
+            Some(fields) => Some(fields),
+            None => Some(&[]),
         }
     }
 }
@@ -196,7 +259,10 @@ impl TaskQuery {
 fn matches_enabled(query: &TaskQuery, enabled: bool) -> bool {
     query.definition_mismatch(enabled).is_none()
 }
-pub(crate) fn record_mismatch<'a>(query: &'a TaskQuery, record: &TaskRecord) -> Option<&'a str> {
+pub(crate) fn record_mismatch<'a>(
+    query: &'a TaskQuery,
+    record: &TaskRecord,
+) -> Option<&'a [String]> {
     if record
         .pending_enabled
         .is_some_and(|enabled| matches_enabled(query, enabled))
@@ -218,8 +284,10 @@ mod tests {
             exceptions: Vec::new(),
             lookup_hresult: 0,
             present: true,
-            enabled_mismatch: Some(String::new()),
-            disabled_mismatch: Some("Task/Settings/Enabled".into()),
+            enabled_mismatch: Some(Vec::new()),
+            disabled_mismatch: Some(vec!["Task/Settings/Enabled".into()]),
+            differing_fields: None,
+            registered_xml: None,
             state: 3,
             arguments: None,
         }
@@ -269,6 +337,44 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_mismatch_errors_carry_multiple_fields_and_bounded_xml() {
+        let mut result = reply();
+        result.registered_xml = Some(format!("{}界suffix", "a".repeat(8191)));
+        let fields = vec![
+            "Task/Settings/Hidden".to_owned(),
+            "Task/Settings/Priority".to_owned(),
+        ];
+        let error = result.mismatch_error(&fields);
+        assert!(
+            error
+                .message()
+                .ends_with("Task/Settings/Hidden, Task/Settings/Priority")
+        );
+        assert_eq!(
+            error.context()["differing_fields"],
+            serde_json::json!(fields)
+        );
+        assert_eq!(
+            error.context()["registered_xml"].as_str().unwrap(),
+            "a".repeat(8191)
+        );
+        result.hresult = 0x80131501;
+        result.differing_fields = Some(fields.clone());
+        let error =
+            scheduler_operation_error(validate_query(result).err().unwrap(), "create", "fixture");
+        assert!(
+            error
+                .message()
+                .starts_with("Task Scheduler create for fixture")
+        );
+        assert_eq!(
+            error.context()["differing_fields"],
+            serde_json::json!(fields)
+        );
+        assert!(error.context()["registered_xml"].is_string());
+    }
+
+    #[test]
     fn scheduler_connection_failure_cannot_masquerade_as_absence() {
         let mut result = reply();
         assert_eq!(result.state, 3);
@@ -296,7 +402,7 @@ mod tests {
         };
         assert!(record_mismatch(&reply(), &record).is_none());
         let mut foreign = reply();
-        foreign.enabled_mismatch = Some("Task/Actions/Exec/WorkingDirectory".into());
+        foreign.enabled_mismatch = Some(vec!["Task/Actions/Exec/WorkingDirectory".into()]);
         assert!(record_mismatch(&foreign, &record).is_some());
         let mut disabled = reply();
         std::mem::swap(

@@ -21,18 +21,25 @@ try {
             throw
         }
     }
+    function Read-RegisteredFields($registered) {
+        $xml = $registered.Definition.XmlText
+        $script:registeredXml = Limit-RegisteredXml $xml
+        $script:differingFields = $null
+        Read-TaskFields $xml ${function:Resolve-TaskSid}
+    }
     function Assert-Owned($registered) {
         if ($null -eq $registered) { throw 'Registered task disappeared' }
-        $fields = Read-TaskFields $registered.Definition.XmlText ${function:Resolve-TaskSid}
+        $fields = Read-RegisteredFields $registered
         $firstDifference = $null
         foreach ($enabled in $request.allowed) {
             $expected['Task/Settings/Enabled'] = [string]$enabled
-            $difference = Compare-TaskDefinition $fields $expected $registered.Path $request.id
-            if (!$difference) { return }
+            $difference = @(Compare-TaskDefinition $fields $expected $registered.Path $request.id)
+            if (!$difference) { $script:registeredXml = $null; return }
             if ($null -eq $firstDifference) { $firstDifference = $difference }
         }
         if (!$firstDifference) { throw 'No authorized task enable state' }
-        throw ('Registered task differs at ' + $firstDifference)
+        $script:differingFields = $firstDifference
+        throw 'Registered task definition differs'
     }
     function Stop-Registered($registered) {
         try { $registered.Stop(0) }
@@ -95,11 +102,12 @@ try {
     $result = @{ hresult = 0; lookup_hresult = $script:lookupCode; present = ($null -ne $task); enabled_mismatch = $null; disabled_mismatch = $null; state = 0; arguments = $null }
     if ($null -ne $task) {
         if ($null -ne $expected) {
-            $fields = Read-TaskFields $task.Definition.XmlText ${function:Resolve-TaskSid}
+            $fields = Read-RegisteredFields $task
             $expected['Task/Settings/Enabled'] = 'true'
-            $result.enabled_mismatch = Compare-TaskDefinition $fields $expected $task.Path $request.id
+            $result.enabled_mismatch = @(Compare-TaskDefinition $fields $expected $task.Path $request.id)
             $expected['Task/Settings/Enabled'] = 'false'
-            $result.disabled_mismatch = Compare-TaskDefinition $fields $expected $task.Path $request.id
+            $result.disabled_mismatch = @(Compare-TaskDefinition $fields $expected $task.Path $request.id)
+            if ($result.enabled_mismatch -or $result.disabled_mismatch) { $result.registered_xml = $script:registeredXml }
         }
         $result.state = [int]$task.State
         if ($task.Definition.Actions.Count -eq 1 -and $task.Definition.Actions.Item(1).Type -eq 0) {
@@ -116,5 +124,5 @@ try {
         @{ hresult = ([long]$exception.HResult -band 4294967295L); message = $message }
         $exception = $exception.InnerException
     })
-    @{ phase = $phase; exceptions = $chain; hresult = (Error-Code $errorRecord); lookup_hresult = 0; present = $false; enabled_mismatch = $null; disabled_mismatch = $null; state = 0; arguments = $null } | ConvertTo-Json -Depth 4 -Compress
+    @{ phase = $phase; exceptions = $chain; registered_xml = $script:registeredXml; differing_fields = $script:differingFields; hresult = (Error-Code $errorRecord); lookup_hresult = 0; present = $false; enabled_mismatch = $null; disabled_mismatch = $null; state = 0; arguments = $null } | ConvertTo-Json -Depth 4 -Compress
 }
