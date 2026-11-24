@@ -12,14 +12,6 @@ try {
     $service = New-Object -ComObject 'Schedule.Service'
     $service.Connect()
     $folder = $service.GetFolder('\')
-    function Canonical($xml) {
-        $definition = $service.NewTask(0)
-        $definition.XmlText = $xml
-        $document = New-Object System.Xml.XmlDocument
-        $document.PreserveWhitespace = $false
-        $document.LoadXml($definition.XmlText)
-        return $document.OuterXml
-    }
     $script:lookupCode = 0
     function Get-Registered {
         try { $registered = $folder.GetTask($request.id); $script:lookupCode = 0; return $registered }
@@ -31,11 +23,16 @@ try {
     }
     function Assert-Owned($registered) {
         if ($null -eq $registered) { throw 'Registered task disappeared' }
-        $actual = Canonical $registered.Definition.XmlText
+        $fields = Read-TaskFields $registered.Definition.XmlText ${function:Resolve-TaskSid}
+        $firstDifference = $null
         foreach ($enabled in $request.allowed) {
-            if ($actual -ceq $expected[[string]$enabled]) { return }
+            $expected['Task/Settings/Enabled'] = [string]$enabled
+            $difference = Compare-TaskDefinition $fields $expected $registered.Path $request.id
+            if (!$difference) { return }
+            if ($null -eq $firstDifference) { $firstDifference = $difference }
         }
-        throw 'Registered task differs from the private definition'
+        if (!$firstDifference) { throw 'No authorized task enable state' }
+        throw ('Registered task differs at ' + $firstDifference)
     }
     function Stop-Registered($registered) {
         try { $registered.Stop(0) }
@@ -49,16 +46,17 @@ try {
     $phase = 'look up task'
     $task = Get-Registered
     $phase = 'prepare expected definition'
-    $expected = @{}
+    $expected = $null
     $definition = $null
     if ($request.template -and ($null -ne $task -or $request.operation -eq 'create')) {
-        $definition = $service.NewTask(0)
-        $definition.XmlText = $request.template
-        $definition.Principal.UserId = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-        $definition.Settings.Enabled = $true
-        $expected['true'] = Canonical $definition.XmlText
-        $definition.Settings.Enabled = $false
-        $expected['false'] = Canonical $definition.XmlText
+        $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $expected = Read-TaskFields $request.template ${function:Resolve-TaskSid}
+        $expected['Task/Principals/Principal/UserId'] = $sid
+        if ($request.operation -eq 'create') {
+            $definition = $service.NewTask(0)
+            $definition.XmlText = $request.template
+            $definition.Principal.UserId = $sid
+        }
     }
     $phase = 'apply operation'
     switch ($request.operation) {
@@ -66,7 +64,6 @@ try {
         'create' {
             if ($null -ne $task) { throw 'Refusing to overwrite an existing task' }
             $definition.Settings.Enabled = $true
-            $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
             $phase = 'RegisterTaskDefinition'
             $task = $folder.RegisterTaskDefinition($request.id, $definition, 2, $sid, $null, 3, $null)
             $phase = 'verify created definition'
@@ -95,9 +92,15 @@ try {
     }
     $phase = 'read resulting definition'
     if ($request.operation -ne 'query') { $task = Get-Registered }
-    $result = @{ hresult = 0; lookup_hresult = $script:lookupCode; present = ($null -ne $task); actual = $null; enabled_xml = $expected['true']; disabled_xml = $expected['false']; state = 0; arguments = $null }
+    $result = @{ hresult = 0; lookup_hresult = $script:lookupCode; present = ($null -ne $task); enabled_mismatch = $null; disabled_mismatch = $null; state = 0; arguments = $null }
     if ($null -ne $task) {
-        $result.actual = Canonical $task.Definition.XmlText
+        if ($null -ne $expected) {
+            $fields = Read-TaskFields $task.Definition.XmlText ${function:Resolve-TaskSid}
+            $expected['Task/Settings/Enabled'] = 'true'
+            $result.enabled_mismatch = Compare-TaskDefinition $fields $expected $task.Path $request.id
+            $expected['Task/Settings/Enabled'] = 'false'
+            $result.disabled_mismatch = Compare-TaskDefinition $fields $expected $task.Path $request.id
+        }
         $result.state = [int]$task.State
         if ($task.Definition.Actions.Count -eq 1 -and $task.Definition.Actions.Item(1).Type -eq 0) {
             $result.arguments = [string]$task.Definition.Actions.Item(1).Arguments
@@ -113,5 +116,5 @@ try {
         @{ hresult = ([long]$exception.HResult -band 4294967295L); message = $message }
         $exception = $exception.InnerException
     })
-    @{ phase = $phase; exceptions = $chain; hresult = (Error-Code $errorRecord); lookup_hresult = 0; present = $false; actual = $null; enabled_xml = $null; disabled_xml = $null; state = 0; arguments = $null } | ConvertTo-Json -Depth 4 -Compress
+    @{ phase = $phase; exceptions = $chain; hresult = (Error-Code $errorRecord); lookup_hresult = 0; present = $false; enabled_mismatch = $null; disabled_mismatch = $null; state = 0; arguments = $null } | ConvertTo-Json -Depth 4 -Compress
 }

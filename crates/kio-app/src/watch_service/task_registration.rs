@@ -1,8 +1,13 @@
-use super::watch_task_definition::{task_definition_matches, task_lookup};
+use super::watch_task_definition::task_lookup;
 use crate::watch_service::service_error;
 use base64::Engine;
 use kio_core::Result;
 use serde::{Deserialize, Serialize};
+
+pub(crate) const TASK_SCRIPT: &str = concat!(
+    include_str!("../platform/windows/watch_task_compare.ps1"),
+    include_str!("../platform/windows/watch_task.ps1"),
+);
 
 pub(crate) fn automation_command(
     program: &std::path::Path,
@@ -52,7 +57,7 @@ fn automation_uses_fixed_noninteractive_arguments_and_a_framed_data_request() {
     use std::path::Path;
 
     let program = Path::new("Windows/System32/WindowsPowerShell/v1.0/powershell.exe");
-    let script = include_str!("../platform/windows/watch_task.ps1");
+    let script = TASK_SCRIPT;
     let command = automation_command(program, Path::new("Windows"), script).unwrap();
     assert_eq!(command.get_program(), program);
     let args = command
@@ -104,9 +109,8 @@ pub(crate) struct TaskQuery {
     exceptions: Vec<SchedulerException>,
     lookup_hresult: u32,
     pub(crate) present: bool,
-    actual: Option<String>,
-    enabled_xml: Option<String>,
-    disabled_xml: Option<String>,
+    enabled_mismatch: Option<String>,
+    disabled_mismatch: Option<String>,
     pub(crate) state: u32,
     pub(crate) arguments: Option<String>,
 }
@@ -162,29 +166,45 @@ pub(crate) fn validate_query(result: TaskQuery) -> Result<TaskQuery> {
         return Err(service_error(detail));
     }
     if task_lookup(result.lookup_hresult)? != result.present
-        || (result.present && result.actual.is_none())
+        || result.enabled_mismatch.is_some() != result.disabled_mismatch.is_some()
+        || (!result.present && result.enabled_mismatch.is_some())
+        || [&result.enabled_mismatch, &result.disabled_mismatch]
+            .into_iter()
+            .flatten()
+            .any(|field| field.len() > 256 || field.chars().any(char::is_control))
     {
         return Err(service_error("inconsistent Task Scheduler response"));
     }
     Ok(result)
 }
 
-pub(crate) fn matches_enabled(query: &TaskQuery, enabled: bool) -> bool {
-    let Some(actual) = query.actual.as_deref() else {
-        return false;
-    };
-    let expected = if enabled {
-        query.enabled_xml.as_deref()
-    } else {
-        query.disabled_xml.as_deref()
-    };
-    expected.is_some_and(|xml| task_definition_matches(actual, xml))
+impl TaskQuery {
+    pub(crate) fn definition_mismatch(&self, enabled: bool) -> Option<&str> {
+        let mismatch = if enabled {
+            &self.enabled_mismatch
+        } else {
+            &self.disabled_mismatch
+        };
+        match mismatch.as_deref() {
+            Some("") if self.present => None,
+            Some(field) if !field.is_empty() => Some(field),
+            _ => Some("missing definition comparison"),
+        }
+    }
 }
-pub(crate) fn matches_record(query: &TaskQuery, record: &TaskRecord) -> bool {
-    matches_enabled(query, record.enabled)
-        || record
-            .pending_enabled
-            .is_some_and(|enabled| matches_enabled(query, enabled))
+
+fn matches_enabled(query: &TaskQuery, enabled: bool) -> bool {
+    query.definition_mismatch(enabled).is_none()
+}
+pub(crate) fn record_mismatch<'a>(query: &'a TaskQuery, record: &TaskRecord) -> Option<&'a str> {
+    if record
+        .pending_enabled
+        .is_some_and(|enabled| matches_enabled(query, enabled))
+    {
+        None
+    } else {
+        query.definition_mismatch(record.enabled)
+    }
 }
 
 #[cfg(test)]
@@ -192,11 +212,43 @@ mod tests {
     use super::*;
 
     fn reply() -> TaskQuery {
-        TaskQuery { hresult: 0, phase: None, exceptions: Vec::new(), lookup_hresult: 0, present: true,
-            actual: Some("<Task><Settings><Enabled>true</Enabled></Settings><Actions><Exec><Command>kio</Command></Exec></Actions></Task>".into()),
-            enabled_xml: Some("<Task><Settings><Enabled>true</Enabled></Settings><Actions><Exec><Command>kio</Command></Exec></Actions></Task>".into()),
-            disabled_xml: Some("<Task><Settings><Enabled>false</Enabled></Settings><Actions><Exec><Command>kio</Command></Exec></Actions></Task>".into()), state: 3, arguments: None }
+        TaskQuery {
+            hresult: 0,
+            phase: None,
+            exceptions: Vec::new(),
+            lookup_hresult: 0,
+            present: true,
+            enabled_mismatch: Some(String::new()),
+            disabled_mismatch: Some("Task/Settings/Enabled".into()),
+            state: 3,
+            arguments: None,
+        }
     }
+    #[test]
+    fn windows_scheduler_semantic_comparison_fixtures() {
+        if std::env::consts::OS != "windows" {
+            return;
+        }
+        let windows = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap());
+        let program = windows.join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        let fixtures =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/platform/windows");
+        let script = "& ([ScriptBlock]::Create([IO.File]::ReadAllText((Join-Path (Get-Location).Path 'watch_task_compare_test.ps1')))) (Get-Location).Path";
+        let mut command = automation_command(&program, &windows, script).unwrap();
+        command.current_dir(fixtures);
+        let output = kio_process::run_bounded_command(
+            &mut command,
+            kio_process::BoundedProcessOptions {
+                timeout: std::time::Duration::from_secs(30),
+                max_stdout_bytes: 8192,
+                max_stderr_bytes: 8192,
+            },
+            None,
+        )
+        .unwrap();
+        assert!(output.status.success(), "{}", output.stderr);
+    }
+
     #[test]
     fn reports_bounded_scheduler_exception_chain_with_the_operation_phase() {
         let result = serde_json::from_value(serde_json::json!({
@@ -205,8 +257,8 @@ mod tests {
                 {"hresult": 0x80131501_u32, "message": "wrapper"},
                 {"hresult": 0x80070005_u32, "message": format!("access denied\n{}", "x".repeat(512))}
             ],
-            "lookup_hresult": 0, "present": false, "actual": null,
-            "enabled_xml": null, "disabled_xml": null, "state": 0, "arguments": null
+            "lookup_hresult": 0, "present": false,
+            "enabled_mismatch": null, "disabled_mismatch": null, "state": 0, "arguments": null
         })).unwrap();
         let error = validate_query(result).err().unwrap().to_string();
         assert!(error.contains("during RegisterTaskDefinition"));
@@ -227,7 +279,8 @@ mod tests {
         let mut result = reply();
         result.lookup_hresult = 0x80070002;
         result.present = false;
-        result.actual = None;
+        result.enabled_mismatch = None;
+        result.disabled_mismatch = None;
         assert!(!validate_query(result).unwrap().present);
         let mut result = reply();
         result.lookup_hresult = 0x80070005;
@@ -241,24 +294,22 @@ mod tests {
             enabled: true,
             pending_enabled: None,
         };
-        assert!(matches_record(&reply(), &record));
+        assert!(record_mismatch(&reply(), &record).is_none());
         let mut foreign = reply();
-        foreign.actual = foreign.actual.map(|xml| {
-            xml.replace(
-                "</Exec>",
-                "<WorkingDirectory>foreign</WorkingDirectory></Exec>",
-            )
-        });
-        assert!(!matches_record(&foreign, &record));
+        foreign.enabled_mismatch = Some("Task/Actions/Exec/WorkingDirectory".into());
+        assert!(record_mismatch(&foreign, &record).is_some());
         let mut disabled = reply();
-        disabled.actual = disabled.disabled_xml.clone();
-        assert!(!matches_record(&disabled, &record));
+        std::mem::swap(
+            &mut disabled.enabled_mismatch,
+            &mut disabled.disabled_mismatch,
+        );
+        assert!(record_mismatch(&disabled, &record).is_some());
         let pending = TaskRecord {
             pending_enabled: Some(false),
             ..record
         };
         assert_eq!(pending.allowed(), ["true", "false"]);
-        assert!(matches_record(&disabled, &pending));
+        assert!(record_mismatch(&disabled, &pending).is_none());
         assert!(!matches_enabled(&reply(), false));
         assert!(matches_enabled(&disabled, false));
     }

@@ -18,9 +18,8 @@ pub(crate) fn xml_escape(value: &str) -> Result<String> {
         .replace('\'', "&apos;"))
 }
 
-/// Both strings come from the same Task Scheduler XML serializer. Compare
-/// the complete definition, including principals, triggers, actions, settings
-/// and extensions. There is no field whitelist or ignored execution option.
+// Exact definition identity for the fake scheduler, which does not rewrite XML.
+#[cfg(test)]
 pub(crate) fn task_definition_matches(actual: &str, expected: &str) -> bool {
     actual == expected
 }

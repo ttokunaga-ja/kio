@@ -1,7 +1,7 @@
 //! Language-independent Task Scheduler automation through the OS COM API.
 //! The script is embedded program code; request data is JSON, never script text.
 use super::watch_task_registration::{
-    TaskQuery, TaskRecord, automation_command, automation_request, matches_enabled, matches_record,
+    TASK_SCRIPT, TaskQuery, TaskRecord, automation_command, automation_request, record_mismatch,
     validate_query,
 };
 use crate::watch_service::{ServiceManifest, service_error};
@@ -39,7 +39,7 @@ fn invoke(
     let windows = directory
         .parent()
         .ok_or_else(|| service_error("OS system directory has no parent"))?;
-    let mut command = automation_command(&program, windows, include_str!("watch_task.ps1"))?;
+    let mut command = automation_command(&program, windows, TASK_SCRIPT)?;
     let failed = |error: &dyn std::fmt::Display| {
         service_error(format!("Task Scheduler {operation} for {id}: {error}"))
     };
@@ -139,7 +139,9 @@ pub(crate) fn matches(m: &ServiceManifest, allow_absent: bool) -> Result<bool> {
         return Ok(allow_absent);
     }
     let record = read_record(m)?.unwrap_or_else(|| initial_record(m));
-    Ok(matches_record(&query, &record))
+    record_mismatch(&query, &record).map_or(Ok(true), |field| {
+        Err(service_error(format!("registered task differs at {field}")))
+    })
 }
 pub(crate) fn enable(m: &ServiceManifest) -> Result<()> {
     let query = query(&m.id, Some(m))?;
@@ -167,8 +169,8 @@ fn transition(m: &ServiceManifest, enabled: bool, operation: &str) -> Result<()>
         Publication::CreateOnly
     };
     let mut record = existing.unwrap_or_else(|| initial_record(m));
-    if !matches_record(&query(&m.id, Some(m))?, &record) {
-        return Err(service_error("foreign Task Scheduler definition"));
+    if let Some(field) = record_mismatch(&query(&m.id, Some(m))?, &record) {
+        return Err(service_error(format!("registered task differs at {field}")));
     }
     record.pending_enabled = Some(enabled);
     save_record(m, &record, publication)?;
@@ -182,10 +184,8 @@ fn commit_enabled(
     actual: &TaskQuery,
     enabled: bool,
 ) -> Result<()> {
-    if !matches_enabled(actual, enabled) {
-        return Err(service_error(
-            "task did not commit the requested full definition",
-        ));
+    if let Some(field) = actual.definition_mismatch(enabled) {
+        return Err(service_error(format!("task differs at {field}")));
     }
     record.enabled = enabled;
     record.pending_enabled = None;
