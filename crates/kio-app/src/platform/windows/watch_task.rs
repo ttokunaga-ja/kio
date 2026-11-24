@@ -13,6 +13,9 @@ use kio_core::{
 use sha2::{Digest, Sha256};
 use std::{path::PathBuf, time::Duration};
 
+// Includes Windows PowerShell startup, COM work, and subprocess I/O.
+const SCHEDULER_OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
+
 pub(crate) fn query(id: &str, manifest: Option<&ServiceManifest>) -> Result<TaskQuery> {
     invoke("query", id, manifest, &[])
 }
@@ -43,7 +46,7 @@ fn invoke(
     let output = kio_process::run_bounded_command(
         &mut command,
         kio_process::BoundedProcessOptions {
-            timeout: Duration::from_secs(15),
+            timeout: SCHEDULER_OPERATION_TIMEOUT,
             max_stdout_bytes: 256 * 1024,
             max_stderr_bytes: 4096,
         },

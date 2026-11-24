@@ -9,20 +9,14 @@ pub(crate) fn automation_command(
     windows: &std::path::Path,
     script: &str,
 ) -> Result<std::process::Command> {
-    let encoded = base64::engine::general_purpose::STANDARD.encode(
-        script
-            .encode_utf16()
-            .flat_map(u16::to_le_bytes)
-            .collect::<Vec<_>>(),
-    );
     let mut command = std::process::Command::new(program);
     command
         .args([
             "-NoLogo",
             "-NoProfile",
             "-NonInteractive",
-            "-EncodedCommand",
-            &encoded,
+            "-Command",
+            script,
         ])
         .current_dir(
             program
@@ -66,26 +60,17 @@ fn automation_uses_fixed_noninteractive_arguments_and_a_framed_data_request() {
         .map(|arg| arg.to_str().unwrap())
         .collect::<Vec<_>>();
     assert_eq!(
-        &args[..4],
-        &[
+        args,
+        [
             "-NoLogo",
             "-NoProfile",
             "-NonInteractive",
-            "-EncodedCommand"
+            "-Command",
+            script
         ]
     );
-    assert_eq!(args.len(), 5);
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(args[4])
-        .unwrap();
-    let (units, trailing) = decoded.as_chunks::<2>();
-    assert!(trailing.is_empty());
-    let units = units
-        .iter()
-        .copied()
-        .map(u16::from_le_bytes)
-        .collect::<Vec<_>>();
-    assert_eq!(String::from_utf16(&units).unwrap(), script);
+    // Windows PowerShell receives fixed script text as a single command argument.
+    assert!(!script.contains('"'));
     assert!(script.contains("[Console]::In.ReadLine()"));
     assert!(script.contains("$folder.GetTask($request.id)"));
     assert!(!script.contains("GetTasks("));

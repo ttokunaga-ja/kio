@@ -30,6 +30,17 @@ use crate::{
 
 const TIMEOUT: Duration = Duration::from_secs(45);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
+// A single Windows lifecycle command can invoke several individually bounded
+// PowerShell workers. Leave room to get the product's operation-specific error.
+const WINDOWS_SERVICE_COMMAND_TIMEOUT: Duration = Duration::from_secs(300);
+
+fn command_timeout(windows: bool, args: &[&str]) -> Duration {
+    if windows && matches!(args, ["watch", "--root", _, "service", ..]) {
+        WINDOWS_SERVICE_COMMAND_TIMEOUT
+    } else {
+        COMMAND_TIMEOUT
+    }
+}
 const MAX_OUTPUT: usize = 128 * 1024;
 
 mod platform;
@@ -425,7 +436,7 @@ fn cli(
     run_bounded_command(
         &mut command,
         BoundedProcessOptions {
-            timeout: COMMAND_TIMEOUT,
+            timeout: command_timeout(cfg!(windows), args),
             max_stdout_bytes: MAX_OUTPUT,
             max_stderr_bytes: MAX_OUTPUT,
         },
@@ -694,6 +705,20 @@ impl Drop for Cleanup {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_windows_scheduler_commands_get_the_larger_outer_budget() {
+        let service = ["watch", "--root", "fixture", "service", "install"];
+        assert_eq!(
+            command_timeout(true, &service),
+            WINDOWS_SERVICE_COMMAND_TIMEOUT
+        );
+        assert_eq!(command_timeout(false, &service), COMMAND_TIMEOUT);
+        assert_eq!(
+            command_timeout(true, &["search", "marker"]),
+            COMMAND_TIMEOUT
+        );
+    }
+
     #[test]
     fn restart_waits_for_a_new_pid_and_instance() {
         let observation = |pid, instance| {
