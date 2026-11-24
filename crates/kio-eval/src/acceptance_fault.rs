@@ -20,7 +20,6 @@ use kio_core::{
     dag::CommitType,
     scope::Repository,
 };
-use rusqlite::{Connection, OpenFlags};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -954,29 +953,27 @@ fn ledger_observation(device: &Device) -> Result<LedgerObservation, AcceptanceEr
     let checkpoint_sequence = checkpoint["seq"].as_i64().ok_or_else(|| {
         AcceptanceError::Command("ledger checkpoint lacks an integer sequence".into())
     })?;
-    let connection = Connection::open_with_flags(
-        device.home.join("data/kio/cost-ledger.sqlite"),
-        OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .map_err(|error| {
-        AcceptanceError::Command(format!("open checkpoint ledger read-only: {error}"))
-    })?;
-    let database_sequence = connection
-        .query_row(
-            "SELECT sequence FROM ledger_metadata WHERE singleton=1",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|error| {
-            AcceptanceError::Command(format!("read checkpoint ledger sequence: {error}"))
-        })?;
-    let requests = connection
-        .query_row("SELECT COUNT(*) FROM batch_requests", [], |row| row.get(0))
-        .map_err(|error| AcceptanceError::Command(format!("read ledger requests: {error}")))?;
-    let costs = connection
-        .query_row("SELECT COUNT(*) FROM cost_ledger", [], |row| row.get(0))
-        .map_err(|error| AcceptanceError::Command(format!("read ledger costs: {error}")))?;
-    let pending_reservations = connection
+    crate::acceptance_ledger_observation::with_snapshot(
+        &device.home.join("data/kio/cost-ledger.sqlite"),
+        |connection| {
+            let database_sequence = connection
+                .query_row(
+                    "SELECT sequence FROM ledger_metadata WHERE singleton=1",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|error| {
+                    AcceptanceError::Command(format!("read checkpoint ledger sequence: {error}"))
+                })?;
+            let requests = connection
+                .query_row("SELECT COUNT(*) FROM batch_requests", [], |row| row.get(0))
+                .map_err(|error| {
+                    AcceptanceError::Command(format!("read ledger requests: {error}"))
+                })?;
+            let costs = connection
+                .query_row("SELECT COUNT(*) FROM cost_ledger", [], |row| row.get(0))
+                .map_err(|error| AcceptanceError::Command(format!("read ledger costs: {error}")))?;
+            let pending_reservations = connection
         .query_row(
             "SELECT COUNT(*) FROM batch_requests WHERE state=0 AND intent_token IS NOT NULL AND batch_job_id IS NULL",
             [],
@@ -985,13 +982,15 @@ fn ledger_observation(device: &Device) -> Result<LedgerObservation, AcceptanceEr
         .map_err(|error| {
             AcceptanceError::Command(format!("read pending ledger reservations: {error}"))
         })?;
-    Ok(LedgerObservation {
-        checkpoint_sequence,
-        database_sequence,
-        requests,
-        costs,
-        pending_reservations,
-    })
+            Ok(LedgerObservation {
+                checkpoint_sequence,
+                database_sequence,
+                requests,
+                costs,
+                pending_reservations,
+            })
+        },
+    )
 }
 
 fn run_replica_experiment(options: &FaultOptions, work: &Path) -> Result<(), AcceptanceError> {

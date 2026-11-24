@@ -6,6 +6,7 @@ pub mod acceptance_distribution;
 pub(crate) mod acceptance_environment;
 pub mod acceptance_failure;
 pub mod acceptance_fault;
+mod acceptance_ledger_observation;
 pub mod acceptance_local_trust;
 pub mod acceptance_native;
 pub mod acceptance_office;

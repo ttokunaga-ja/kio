@@ -11,7 +11,6 @@ use std::{
     time::Duration,
 };
 
-use rusqlite::Connection;
 use serde_json::{Value, json};
 
 use crate::{
@@ -708,18 +707,18 @@ fn online_task(status: &Value) -> Result<&Value, AcceptanceError> {
         .ok_or_else(|| invalid("status contains no online markdownize task"))
 }
 fn ledger_counts(device: &Device) -> Result<(i64, i64), AcceptanceError> {
-    let conn = Connection::open_with_flags(
-        device.private.join("xdg-data/kio/cost-ledger.sqlite"),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    crate::acceptance_ledger_observation::with_snapshot(
+        &device.private.join("xdg-data/kio/cost-ledger.sqlite"),
+        |conn| {
+            let requests = conn
+                .query_row("SELECT COUNT(*) FROM batch_requests", [], |row| row.get(0))
+                .map_err(|e| invalid(format!("read batch requests: {e}")))?;
+            let charges = conn
+                .query_row("SELECT COUNT(*) FROM cost_ledger", [], |row| row.get(0))
+                .map_err(|e| invalid(format!("read ledger charges: {e}")))?;
+            Ok((requests, charges))
+        },
     )
-    .map_err(|e| invalid(format!("open ledger: {e}")))?;
-    let requests = conn
-        .query_row("SELECT COUNT(*) FROM batch_requests", [], |row| row.get(0))
-        .map_err(|e| invalid(format!("read batch requests: {e}")))?;
-    let charges = conn
-        .query_row("SELECT COUNT(*) FROM cost_ledger", [], |row| row.get(0))
-        .map_err(|e| invalid(format!("read ledger charges: {e}")))?;
-    Ok((requests, charges))
 }
 
 /// A structured auth rejection is a known pre-bill provider result. Its
@@ -753,54 +752,54 @@ struct AuthChargeRow {
 }
 
 fn auth_ledger_observation(device: &Device) -> Result<AuthLedgerObservation, AcceptanceError> {
-    let conn = Connection::open_with_flags(
-        device.private.join("xdg-data/kio/cost-ledger.sqlite"),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .map_err(|e| invalid(format!("open ledger: {e}")))?;
-    let mut request_stmt = conn
+    crate::acceptance_ledger_observation::with_snapshot(
+        &device.private.join("xdg-data/kio/cost-ledger.sqlite"),
+        |conn| {
+            let mut request_stmt = conn
         .prepare(
             "SELECT input_hash, tool_profile_hash, state, request_kind, intent_token, batch_job_id, \
                     estimated_usd, error, submission_seq \
              FROM batch_requests ORDER BY created_at, submission_seq",
         )
         .map_err(|e| invalid(format!("read auth requests: {e}")))?;
-    let requests = request_stmt
-        .query_map([], |row| {
-            Ok(AuthRequestRow {
-                input_hash: row.get(0)?,
-                tool_profile_hash: row.get(1)?,
-                state: row.get(2)?,
-                request_kind: row.get(3)?,
-                intent_token: row.get(4)?,
-                batch_job_id: row.get(5)?,
-                estimated_usd: row.get(6)?,
-                error: row.get(7)?,
-                submission_seq: row.get(8)?,
-            })
-        })
-        .map_err(|e| invalid(format!("read auth requests: {e}")))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| invalid(format!("decode auth requests: {e}")))?;
-    let mut charge_stmt = conn
-        .prepare(
-            "SELECT submission_seq, usd, estimated, outcome FROM cost_ledger \
+            let requests = request_stmt
+                .query_map([], |row| {
+                    Ok(AuthRequestRow {
+                        input_hash: row.get(0)?,
+                        tool_profile_hash: row.get(1)?,
+                        state: row.get(2)?,
+                        request_kind: row.get(3)?,
+                        intent_token: row.get(4)?,
+                        batch_job_id: row.get(5)?,
+                        estimated_usd: row.get(6)?,
+                        error: row.get(7)?,
+                        submission_seq: row.get(8)?,
+                    })
+                })
+                .map_err(|e| invalid(format!("read auth requests: {e}")))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| invalid(format!("decode auth requests: {e}")))?;
+            let mut charge_stmt = conn
+                .prepare(
+                    "SELECT submission_seq, usd, estimated, outcome FROM cost_ledger \
              ORDER BY submission_seq",
-        )
-        .map_err(|e| invalid(format!("read auth charges: {e}")))?;
-    let charges = charge_stmt
-        .query_map([], |row| {
-            Ok(AuthChargeRow {
-                submission_seq: row.get(0)?,
-                usd: row.get(1)?,
-                estimated: row.get(2)?,
-                outcome: row.get(3)?,
-            })
-        })
-        .map_err(|e| invalid(format!("read auth charges: {e}")))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| invalid(format!("decode auth charges: {e}")))?;
-    Ok(AuthLedgerObservation { requests, charges })
+                )
+                .map_err(|e| invalid(format!("read auth charges: {e}")))?;
+            let charges = charge_stmt
+                .query_map([], |row| {
+                    Ok(AuthChargeRow {
+                        submission_seq: row.get(0)?,
+                        usd: row.get(1)?,
+                        estimated: row.get(2)?,
+                        outcome: row.get(3)?,
+                    })
+                })
+                .map_err(|e| invalid(format!("read auth charges: {e}")))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| invalid(format!("decode auth charges: {e}")))?;
+            Ok(AuthLedgerObservation { requests, charges })
+        },
+    )
 }
 
 fn assert_known_sync_rejection(
@@ -860,12 +859,10 @@ struct BatchRequestRow {
 }
 
 fn batch_row(device: &Device) -> Result<BatchRequestRow, AcceptanceError> {
-    let conn = Connection::open_with_flags(
-        device.private.join("xdg-data/kio/cost-ledger.sqlite"),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .map_err(|e| invalid(format!("open ledger: {e}")))?;
-    conn.query_row(
+    crate::acceptance_ledger_observation::with_snapshot(
+        &device.private.join("xdg-data/kio/cost-ledger.sqlite"),
+        |conn| {
+            conn.query_row(
         "SELECT intent_token, batch_job_id, job_create_started_at, input_hash, tool_profile_hash FROM batch_requests ORDER BY created_at DESC LIMIT 1",
         [],
         |row| Ok(BatchRequestRow {
@@ -876,6 +873,8 @@ fn batch_row(device: &Device) -> Result<BatchRequestRow, AcceptanceError> {
             tool_profile_hash: row.get(4)?,
         }),
     ).map_err(|e| invalid(format!("read batch request: {e}")))
+        },
+    )
 }
 fn scope_id(device: &Device) -> Result<String, AcceptanceError> {
     let value: Value =
