@@ -137,14 +137,23 @@ pub fn run_a07(options: &A07OfficeOptions) -> Result<AcceptanceReceipt, Acceptan
         &converter,
         &["--json", "init", path_arg(&scope)?],
     )?;
-    command(
+    let index_output = command(
         &options.binary,
         &isolated,
         Some(&scope),
         &converter,
         &["--json", "index", "--offline"],
     )?;
-    assert_units(&scope)?;
+    assert_units(&scope, |file| {
+        let query =
+            |args: &[&str]| diagnostic_json(&options.binary, &isolated, &scope, &converter, args);
+        let index: Value = serde_json::from_str(&index_output).unwrap_or(Value::Null);
+        let status = query(&["--json", "status"]);
+        let tree = index["tree_hash"]
+            .as_str()
+            .map(|hash| query(&["--json", "inspect", hash]));
+        office_unit_diagnostics(file, &index, &status, tree.as_ref())
+    })?;
     assert_search(
         &options.binary,
         &isolated,
@@ -311,11 +320,15 @@ fn fixture_digest(root: &Path) -> Result<String, AcceptanceError> {
     Ok(sha256_bytes(&bytes))
 }
 
-fn assert_units(scope: &Path) -> Result<(), AcceptanceError> {
+fn assert_units(scope: &Path, diagnose: impl FnOnce(&str) -> Value) -> Result<(), AcceptanceError> {
     let mut manifests = Vec::new();
-    collect_manifests(&scope.join(".kio/objects/normalized_units"), &mut manifests)?;
+    let normalized = scope.join(".kio/objects/normalized_units");
+    if normalized.try_exists().map_err(io)? {
+        collect_manifests(&normalized, &mut manifests)?;
+    }
     let mut found = BTreeMap::new();
     let mut markers = BTreeMap::new();
+    let mut incomplete = Vec::new();
     for manifest in manifests {
         let value: Value = read_json(&manifest, 2 * 1024 * 1024)?;
         for unit in value
@@ -343,20 +356,47 @@ fn assert_units(scope: &Path) -> Result<(), AcceptanceError> {
                         markers.insert(marker, true);
                     }
                 }
+            } else if incomplete.len() < 12 {
+                incomplete.push(diagnostic_fields(
+                    unit,
+                    &["unit_key", "status", "error_kind", "error_code"],
+                ));
             }
         }
     }
-    for key in ["page:1", "slide:1"] {
-        if !found.contains_key(key) {
+    for (file, key) in [
+        ("document.docx", "page:1"),
+        ("presentation.pptx", "slide:1"),
+        ("table.xlsx", "sheet:"),
+    ] {
+        let present = if key == "sheet:" {
+            found.keys().any(|unit| unit.starts_with(key))
+        } else {
+            found.contains_key(key)
+        };
+        if !present {
+            let mut diagnostic = diagnose(file);
+            diagnostic["item"]["incomplete_units"] = serde_json::json!(
+                incomplete
+                    .iter()
+                    .filter(|unit| unit["unit_key"].as_str().is_some_and(|name| {
+                        if key == "sheet:" {
+                            name.starts_with(key)
+                        } else {
+                            name == key
+                        }
+                    }))
+                    .collect::<Vec<_>>()
+            );
+            let serialized = diagnostic.to_string();
+            let mut summary = serialized.chars().take(8192).collect::<String>();
+            if summary.len() < serialized.len() {
+                summary.push_str(" [truncated]");
+            }
             return Err(invalid(&format!(
-                "A07 did not persist required Office unit {key}"
+                "A07 did not persist required Office unit {key} for {file}. Diagnostics: {summary}"
             )));
         }
-    }
-    if !found.keys().any(|key| key.starts_with("sheet:")) {
-        return Err(invalid(
-            "A07 did not persist an XLSX direct-table sheet unit",
-        ));
     }
     for marker in [DOCX_MARKER, PPTX_MARKER, XLSX_MARKER] {
         if !markers.contains_key(marker) {
@@ -366,6 +406,124 @@ fn assert_units(scope: &Path) -> Result<(), AcceptanceError> {
         }
     }
     Ok(())
+}
+
+// Only run the extra commands on failure. Keep a failed diagnostic command
+// distinguishable from a successful status that omits office_readiness.
+fn diagnostic_json(
+    binary: &Path,
+    isolated: &Path,
+    scope: &Path,
+    converter: &Path,
+    args: &[&str],
+) -> Value {
+    match command_status(binary, isolated, Some(scope), converter, args) {
+        Ok(output) if output.status.success() => serde_json::from_str(&output.stdout)
+            .unwrap_or_else(|_| serde_json::json!({"diagnostic_error": "invalid JSON response"})),
+        Ok(output) => {
+            let error: Value = serde_json::from_str(&output.stderr).unwrap_or(Value::Null);
+            let mut diagnostic = diagnostic_fields(&error, &["error_code", "message"]);
+            diagnostic["diagnostic_error"] = Value::from(output.status.to_string());
+            diagnostic
+        }
+        Err(error) => {
+            serde_json::json!({"diagnostic_error": bounded_diagnostic_text(&error.to_string())})
+        }
+    }
+}
+
+fn office_unit_diagnostics(
+    file: &str,
+    index: &Value,
+    status: &Value,
+    tree: Option<&Value>,
+) -> Value {
+    let readiness = if let Some(error) = status.get("diagnostic_error") {
+        serde_json::json!({
+            "state": "not_observed", "error": error,
+            "error_code": status.get("error_code"), "message": status.get("message"),
+        })
+    } else if let Some(readiness) = status.get("office_readiness") {
+        diagnostic_fields(readiness, &["state", "reason", "error_code"])
+    } else if status["scope_path"].is_string() {
+        serde_json::json!({"state": "ready"})
+    } else {
+        serde_json::json!({"state": "not_observed", "error": "status omitted scope_path"})
+    };
+    let matching_rows = |array: &Value, path_key: &str, fields: &[&str]| {
+        array
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|row| row[path_key].as_str() == Some(file))
+            .take(3)
+            .map(|row| diagnostic_fields(row, fields))
+            .collect::<Vec<_>>()
+    };
+    let tasks = matching_rows(
+        &status["tasks"],
+        "input_path",
+        &[
+            "type",
+            "status",
+            "fallback_reason",
+            "hold_reason",
+            "error_code",
+            "resource_limit",
+        ],
+    );
+    let tree_entry = tree
+        .and_then(|tree| tree["entries"].as_array())
+        .and_then(|entries| {
+            entries
+                .iter()
+                .find(|entry| entry["path"].as_str() == Some(file))
+        })
+        .map(|entry| {
+            let mut row = diagnostic_fields(entry, &["raw_hash"]);
+            row["normalized"] =
+                Value::from(entry.get("normalize").is_some_and(|value| !value.is_null()));
+            row
+        });
+    serde_json::json!({
+        "office_readiness": readiness,
+        "index": diagnostic_fields(index, &["status", "error_code", "failed_files", "normalized_files", "pending_files"]),
+        "item": {
+            "file": file,
+            "tree_entry": tree_entry,
+            "tree_inspect_error": tree
+                .filter(|tree| tree.get("diagnostic_error").is_some())
+                .map(|tree| diagnostic_fields(tree, &["diagnostic_error", "error_code", "message"])),
+            "working_state": matching_rows(&status["files"], "relative_path", &["status", "raw_hash"]),
+            "tasks": tasks,
+            "unsupported": matching_rows(&status["unsupported_inputs"], "path", &["reason", "media_type", "error_code"]),
+            "deferred": matching_rows(&index["deferred_inputs"], "path", &["reason", "error_code"]),
+        }
+    })
+}
+
+fn diagnostic_fields(value: &Value, fields: &[&str]) -> Value {
+    Value::Object(
+        fields
+            .iter()
+            .filter_map(|key| {
+                let value = match value.get(*key)? {
+                    Value::String(text) => Value::from(bounded_diagnostic_text(text)),
+                    value @ (Value::Null | Value::Bool(_) | Value::Number(_)) => value.clone(),
+                    value @ Value::Object(_) if *key == "resource_limit" => diagnostic_fields(
+                        value,
+                        &["resource", "stage", "limit", "observed", "resource_tier"],
+                    ),
+                    _ => return None,
+                };
+                Some(((*key).into(), value))
+            })
+            .collect(),
+    )
+}
+
+fn bounded_diagnostic_text(text: &str) -> String {
+    text.chars().take(512).collect()
 }
 
 fn validate_normalized_markdown(markdown: &str) -> Result<(), AcceptanceError> {
@@ -544,13 +702,53 @@ fn io(error: std::io::Error) -> AcceptanceError {
     AcceptanceError::Io(error.to_string())
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
-    use super::converter_version;
-    use std::{fs, os::unix::fs::PermissionsExt};
+    use super::*;
 
     #[test]
+    fn missing_unit_reports_the_fixture_and_bounded_product_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let units = temp.path().join(".kio/objects/normalized_units");
+        fs::create_dir_all(&units).unwrap();
+        fs::write(units.join("manifest.json"), br#"{"units":[{"unit_key":"page:1","status":"failed","error_kind":"contract_violation"}]}"#).unwrap();
+        let error = assert_units(temp.path(), |file| {
+            assert_eq!(file, "document.docx");
+            office_unit_diagnostics(
+                file,
+                &serde_json::json!({"status":"complete","error_code":"KIO-E-INDEX-PARTIAL-001"}),
+                &serde_json::json!({
+                    "office_readiness":{"state":"unusable","reason":"x".repeat(1024)},
+                    "files":[{"relative_path":file,"status":"unchanged"}],
+                    "tasks":[
+                        {"input_path":"presentation.pptx","status":"other-document"},
+                        {"input_path":file,"type":"extract","status":"paused","hold_reason":"resource_limit","error_code":"KIO-E-RESOURCE-LIMIT-001","resource_limit":{"stage":"office_convert","limit":10,"observed":11}}
+                    ]
+                }),
+                Some(&serde_json::json!({"entries":[{"path":file,"raw_hash":"sha256:demo"}]})),
+            )
+        }).unwrap_err().to_string();
+        for expected in [
+            "page:1",
+            "document.docx",
+            "unusable",
+            "paused",
+            "contract_violation",
+            "KIO-E-INDEX-PARTIAL-001",
+            "KIO-E-RESOURCE-LIMIT-001",
+            "office_convert",
+            "\"normalized\":false",
+        ] {
+            assert!(error.contains(expected), "missing {expected} in {error}");
+        }
+        assert!(!error.contains("other-document"));
+        assert!(!error.contains(&"x".repeat(513)));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a07_reads_version_from_the_bound_converter_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
         let scratch = tempfile::tempdir().unwrap();
         let converter = scratch.path().join("test soffice");
         fs::write(
