@@ -1614,6 +1614,7 @@ mod tests {
                     "SystemRoot",
                     "WINDIR",
                     "PATH",
+                    "PYTHONDONTWRITEBYTECODE",
                     "HOME",
                     "USERPROFILE",
                     "LOCALAPPDATA",
@@ -1623,6 +1624,11 @@ mod tests {
                 "unexpected renderer environment key: {key:?}"
             );
         }
+        assert!(
+            environment
+                .iter()
+                .any(|(key, value)| key == "PYTHONDONTWRITEBYTECODE" && value == "1")
+        );
         let without_home = renderer_environment(windows, None);
         assert!(without_home.iter().all(|(key, _)| {
             !["HOME", "USERPROFILE", "LOCALAPPDATA"]

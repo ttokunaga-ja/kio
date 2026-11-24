@@ -558,6 +558,12 @@ pub(crate) fn renderer_environment(
     if let Ok(path) = std::env::join_paths([windows.join("System32"), windows.to_path_buf()]) {
         environment.push((OsString::from("PATH"), path));
     }
+    // LibreOffice's bundled Python would otherwise write bytecode caches into
+    // extension `pythonpath` directories of the verified install.
+    environment.push((
+        OsString::from("PYTHONDONTWRITEBYTECODE"),
+        OsString::from("1"),
+    ));
     if let Some(home) = home {
         environment.push((OsString::from("HOME"), home.as_os_str().to_owned()));
         for name in ["USERPROFILE", "LOCALAPPDATA"] {
