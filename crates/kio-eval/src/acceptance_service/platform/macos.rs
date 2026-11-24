@@ -1,10 +1,11 @@
 use super::*;
 
 pub(in crate::acceptance_service) fn registered_definition(
+    deadline: Instant,
     _private: &Path,
     id: &str,
 ) -> Result<PathBuf, AcceptanceError> {
-    let output = print_agent(id)?;
+    let output = print_agent(deadline, id)?;
     if !output.status.success() {
         return Err(invalid("launchd could not inspect the running LaunchAgent"));
     }
@@ -37,9 +38,10 @@ fn agent_source(printed: &str, id: &str) -> Result<PathBuf, AcceptanceError> {
 }
 
 pub(in crate::acceptance_service) fn assert_native_unregistered(
+    deadline: Instant,
     id: &str,
 ) -> Result<(), AcceptanceError> {
-    let output = print_agent(id)?;
+    let output = print_agent(deadline, id)?;
     if output.status.code() != Some(113) || !output.stderr.contains("Could not find service") {
         return Err(invalid(
             "launchd did not confirm the service is absent after uninstall",
@@ -48,9 +50,12 @@ pub(in crate::acceptance_service) fn assert_native_unregistered(
     Ok(())
 }
 
-fn print_agent(id: &str) -> Result<crate::runner::BoundedProcessOutput, AcceptanceError> {
+fn print_agent(
+    deadline: Instant,
+    id: &str,
+) -> Result<crate::runner::BoundedProcessOutput, AcceptanceError> {
     let target = format!("gui/{}/{}", unsafe { libc::geteuid() }, id);
-    scheduler_query("/bin/launchctl", &["print", &target])
+    scheduler_query(deadline, "/bin/launchctl", &["print", &target])
 }
 
 #[cfg(test)]

@@ -700,6 +700,7 @@ jobs:
             > "$RUNNER_TEMP/kio-v1-a07-summary.json"
 
       - name: Collect A03 and A11 native scheduler receipts
+        timeout-minutes: 25
         run: |
           set -euo pipefail
           eval_bin=target/debug/kio-eval

@@ -9,8 +9,8 @@ pub mod confinement;
 pub mod platform;
 
 use platform::{
-    ProcessTree, StdinPump, child_has_exited, configure_process_isolation, read_stream,
-    terminate_process_tree,
+    ProcessTree, StdinPump, cancel_pipe_io, child_has_exited, configure_process_isolation,
+    read_stream, terminate_process_tree,
 };
 use std::{
     process::{Child, Command, ExitStatus, Stdio},
@@ -127,6 +127,75 @@ pub enum BoundedProcessError {
     NonUtf8 { stream: &'static str },
 }
 
+const PROCESS_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn wait_for_cleanup<T>(
+    timeout: Duration,
+    phase: &str,
+    mut ready: impl FnMut() -> std::io::Result<Option<T>>,
+) -> Result<T, BoundedProcessError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(value) = ready().map_err(BoundedProcessError::Wait)? {
+            return Ok(value);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(BoundedProcessError::Wait(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("{phase} exceeded its cleanup deadline"),
+            )));
+        }
+        thread::sleep(remaining.min(Duration::from_millis(10)));
+    }
+}
+
+fn reap_terminated_child(child: &mut Child) -> Result<ExitStatus, BoundedProcessError> {
+    wait_for_cleanup(PROCESS_CLEANUP_TIMEOUT, "subprocess exit", || {
+        child.try_wait()
+    })
+}
+
+fn finish_pipe_thread<T>(
+    worker: thread::JoinHandle<T>,
+    phase: &str,
+    cancel: bool,
+) -> Result<T, BoundedProcessError> {
+    // A pipe can outlive the Job if an external process holds the other
+    // endpoint. Never block on its thread after the child has been terminated.
+    wait_for_cleanup(PROCESS_CLEANUP_TIMEOUT, phase, || {
+        if worker.is_finished() {
+            return Ok(Some(()));
+        }
+        if cancel {
+            cancel_pipe_io(&worker);
+        }
+        Ok(None)
+    })?;
+    worker.join().map_err(|_| {
+        BoundedProcessError::Wait(std::io::Error::other(format!("{phase} worker panicked")))
+    })
+}
+
+#[test]
+fn bounded_cleanup_reports_a_stuck_pipe_worker() {
+    let (release, wait) = mpsc::channel::<()>();
+    let worker = thread::spawn(move || wait.recv());
+    let error = wait_for_cleanup(Duration::ZERO, "stdout pipe", || {
+        Ok(worker.is_finished().then_some(()))
+    })
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("stdout pipe exceeded its cleanup deadline")
+    );
+    release.send(()).unwrap();
+    finish_pipe_thread(worker, "stdout pipe", false)
+        .unwrap()
+        .unwrap();
+}
+
 enum StreamEvent {
     Data(&'static str, Vec<u8>),
     End,
@@ -201,7 +270,7 @@ impl SupervisedChild {
         if let Err(error) = process_tree.attach_supervised_and_resume(&child) {
             process_tree.terminate_attached();
             terminate_process_tree(&mut child);
-            let _ = child.wait();
+            reap_terminated_child(&mut child)?;
             return Err(BoundedProcessError::Isolation(error));
         }
         Ok(Self {
@@ -243,7 +312,8 @@ impl SupervisedChild {
         // Reaping first could allow a later Drop to signal a reused PID.
         self.process_tree.terminate_attached();
         terminate_process_tree(&mut self.child);
-        let status = self.child.wait().map_err(BoundedProcessError::Wait)?;
+        self.process_tree.close_before_join();
+        let status = reap_terminated_child(&mut self.child)?;
         self.terminal_status = Some(status);
         Ok(status)
     }
@@ -256,7 +326,8 @@ impl Drop for SupervisedChild {
         }
         self.process_tree.terminate_attached();
         terminate_process_tree(&mut self.child);
-        let _ = self.child.wait();
+        self.process_tree.close_before_join();
+        let _ = reap_terminated_child(&mut self.child);
     }
 }
 
@@ -302,7 +373,7 @@ trait BoundedProcessMonitor {
         Ok(())
     }
     fn reap(&mut self, child: &mut Child) -> Result<ExitStatus, BoundedProcessError> {
-        child.wait().map_err(BoundedProcessError::Wait)
+        reap_terminated_child(child)
     }
 }
 
@@ -345,7 +416,7 @@ fn run_bounded_command_inner_impl<M: BoundedProcessMonitor>(
         process_tree.terminate_attached();
         terminate_process_tree(&mut child);
         process_tree.close_before_join();
-        let _ = child.wait();
+        reap_terminated_child(&mut child)?;
         return Err(BoundedProcessError::Isolation(error));
     }
     if let Err(error) = monitor.on_spawn(&mut child) {
@@ -525,14 +596,26 @@ fn run_bounded_command_inner_impl<M: BoundedProcessMonitor>(
     }
     let waited = monitor.reap(&mut child);
     let stdin_result = stdin_pump.finish();
-    let _ = stdout_reader.join();
-    let _ = stderr_reader.join();
+    let stdout_join = finish_pipe_thread(
+        stdout_reader,
+        "stdout pipe",
+        result.is_err() || cleanup.is_err(),
+    );
+    let stderr_join = finish_pipe_thread(
+        stderr_reader,
+        "stderr pipe",
+        result.is_err() || cleanup.is_err(),
+    );
     cleanup?;
     // Reaping must be verified before an advisory caller can ignore a pipe
     // limit or timeout from an otherwise retired renderer.
     let status = waited?;
-    result?;
-    stdin_result?;
+    stdout_join?;
+    stderr_join?;
+    match (result, stdin_result) {
+        (_, Err(error @ BoundedProcessError::Wait(_))) | (Err(error), _) => Err(error),
+        (Ok(()), stdin_result) => stdin_result,
+    }?;
     let stdout = String::from_utf8(stdout.expect("stdout reader completed"))
         .map_err(|_| BoundedProcessError::NonUtf8 { stream: "stdout" })?;
     let stderr = String::from_utf8(stderr.expect("stderr reader completed"))

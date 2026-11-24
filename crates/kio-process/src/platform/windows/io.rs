@@ -21,16 +21,22 @@ pub(crate) fn read_stream(
 
 use std::thread::{self, JoinHandle};
 
+pub(crate) fn cancel_pipe_io<T>(worker: &JoinHandle<T>) {
+    use std::os::windows::io::AsRawHandle;
+    // A request racing with the next ReadFile/WriteFile can miss it.
+    unsafe { windows_sys::Win32::System::IO::CancelSynchronousIo(worker.as_raw_handle()) };
+}
+
 fn read_stream_inner<R: Read + Send + 'static>(
     mut reader: R,
     stream: &'static str,
     limit: usize,
     sender: mpsc::Sender<StreamEvent>,
-    _cancelled: Arc<AtomicBool>,
+    cancelled: Arc<AtomicBool>,
 ) {
     let mut bytes = Vec::new();
     let mut chunk = [0_u8; 8192];
-    loop {
+    while !cancelled.load(std::sync::atomic::Ordering::Acquire) {
         match reader.read(&mut chunk) {
             Ok(0) => {
                 let _ = sender.send(StreamEvent::Data(stream, bytes));
@@ -103,11 +109,7 @@ impl StdinPump {
         self.writer
             .take()
             .map(|writer| {
-                writer
-                    .join()
-                    .map_err(|_| {
-                        BoundedProcessError::Write(std::io::Error::other("stdin writer panicked"))
-                    })?
+                crate::finish_pipe_thread(writer, "stdin pipe", true)?
                     .map_err(BoundedProcessError::Write)
             })
             .unwrap_or(Ok(()))

@@ -44,9 +44,9 @@ try {
     function Stop-Registered($registered) {
         try { $registered.Stop(0) }
         catch { if ((Error-Code $_) -ne 2147750667L) { throw } }
-        $deadline = [DateTime]::UtcNow.AddSeconds(8)
+        $timer = [Diagnostics.Stopwatch]::StartNew()
         while ($registered.GetInstances(0).Count -ne 0) {
-            if ([DateTime]::UtcNow -ge $deadline) { throw 'Task instances did not stop' }
+            if ($timer.Elapsed.TotalSeconds -ge 8) { throw 'Task instances did not stop within eight seconds' }
             Start-Sleep -Milliseconds 25
         }
     }

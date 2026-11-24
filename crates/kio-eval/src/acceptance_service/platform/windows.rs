@@ -31,6 +31,7 @@ pub(in crate::acceptance_service) fn assert_pid_absent(pid: u32) -> Result<(), A
 }
 
 pub(in crate::acceptance_service) fn registered_definition(
+    _deadline: Instant,
     private: &Path,
     id: &str,
 ) -> Result<PathBuf, AcceptanceError> {
@@ -49,6 +50,7 @@ pub(in crate::acceptance_service) fn registered_definition(
 }
 
 pub(in crate::acceptance_service) fn assert_native_unregistered(
+    deadline: Instant,
     id: &str,
 ) -> Result<(), AcceptanceError> {
     let identity = id.strip_prefix("io.kio.watch.").unwrap_or_default();
@@ -77,6 +79,7 @@ catch {{
 throw 'Task Scheduler still has service after uninstall'"#
     );
     let output = scheduler_query(
+        deadline,
         path_arg(&powershell)?,
         &[
             "-NoLogo",

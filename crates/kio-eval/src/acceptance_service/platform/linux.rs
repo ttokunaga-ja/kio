@@ -1,10 +1,14 @@
 use super::*;
 
 pub(in crate::acceptance_service) fn registered_definition(
+    deadline: Instant,
     _private: &Path,
     id: &str,
 ) -> Result<PathBuf, AcceptanceError> {
-    let output = systemctl(&["show", "--property=FragmentPath", "--value", id])?;
+    let output = systemctl(
+        deadline,
+        &["show", "--property=FragmentPath", "--value", id],
+    )?;
     let path = PathBuf::from(output.stdout.trim_end_matches('\n'));
     let expected_name = format!("{id}.service");
     if !output.status.success()
@@ -21,8 +25,14 @@ pub(in crate::acceptance_service) fn registered_definition(
     Ok(path)
 }
 
-pub(in crate::acceptance_service) fn assert_disabled(id: &str) -> Result<(), AcceptanceError> {
-    let output = systemctl(&["show", "--property=UnitFileState", "--value", id])?;
+pub(in crate::acceptance_service) fn assert_disabled(
+    deadline: Instant,
+    id: &str,
+) -> Result<(), AcceptanceError> {
+    let output = systemctl(
+        deadline,
+        &["show", "--property=UnitFileState", "--value", id],
+    )?;
     if !output.status.success() || output.stdout.trim() != "disabled" {
         return Err(invalid(
             "systemd unit is not installed and disabled after stop",
@@ -32,10 +42,13 @@ pub(in crate::acceptance_service) fn assert_disabled(id: &str) -> Result<(), Acc
 }
 
 pub(in crate::acceptance_service) fn assert_native_unregistered(
+    deadline: Instant,
     id: &str,
 ) -> Result<(), AcceptanceError> {
-    let output = systemctl(&["show", "--property=LoadState", "--value", id])?;
-    if output.stdout.trim() != "not-found" || systemctl(&["is-enabled", id])?.status.success() {
+    let output = systemctl(deadline, &["show", "--property=LoadState", "--value", id])?;
+    if output.stdout.trim() != "not-found"
+        || systemctl(deadline, &["is-enabled", id])?.status.success()
+    {
         return Err(invalid(
             "systemd did not confirm the service is absent after uninstall",
         ));
@@ -43,6 +56,13 @@ pub(in crate::acceptance_service) fn assert_native_unregistered(
     Ok(())
 }
 
-fn systemctl(args: &[&str]) -> Result<crate::runner::BoundedProcessOutput, AcceptanceError> {
-    scheduler_query("/usr/bin/systemctl", &[&["--user"], args].concat())
+fn systemctl(
+    deadline: Instant,
+    args: &[&str],
+) -> Result<crate::runner::BoundedProcessOutput, AcceptanceError> {
+    scheduler_query(
+        deadline,
+        "/usr/bin/systemctl",
+        &[&["--user"], args].concat(),
+    )
 }

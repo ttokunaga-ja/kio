@@ -22,17 +22,26 @@ pub(super) fn assert_pid_absent(pid: u32) -> Result<(), AcceptanceError> {
 }
 
 fn scheduler_query(
+    deadline: Instant,
     program: &str,
     args: &[&str],
 ) -> Result<crate::runner::BoundedProcessOutput, AcceptanceError> {
     run_bounded_command(
         Command::new(program).args(args),
         BoundedProcessOptions {
-            timeout: COMMAND_TIMEOUT,
+            timeout: remaining_budget(
+                deadline,
+                if cfg!(windows) {
+                    Duration::from_secs(60)
+                } else {
+                    COMMAND_TIMEOUT
+                },
+                "native scheduler observation",
+            )?,
             max_stdout_bytes: MAX_OUTPUT,
             max_stderr_bytes: MAX_OUTPUT,
         },
         None,
     )
-    .map_err(|e| AcceptanceError::Command(e.to_string()))
+    .map_err(|e| AcceptanceError::Command(format!("native scheduler observation failed: {e}")))
 }

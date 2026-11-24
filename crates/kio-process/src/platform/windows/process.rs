@@ -193,6 +193,10 @@ fn wait_supervised_child_inner(
     control: ProcessControl,
 ) -> Result<ExitStatus, BoundedProcessError> {
     configure_process_isolation(command);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     let mut process_tree =
         ProcessTree::new_with_control(control).map_err(BoundedProcessError::Isolation)?;
     let mut child = command.spawn().map_err(BoundedProcessError::Spawn)?;
@@ -203,7 +207,7 @@ fn wait_supervised_child_inner(
         process_tree.terminate_attached();
         terminate_process_tree(&mut child);
         process_tree.close_before_join();
-        let _ = child.wait();
+        reap_terminated_child(&mut child)?;
         return Err(BoundedProcessError::Isolation(error));
     }
     // The job remains owned by this supervisor until the child has exited.

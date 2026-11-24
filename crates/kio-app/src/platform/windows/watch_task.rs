@@ -138,8 +138,11 @@ pub(crate) fn matches(m: &ServiceManifest, allow_absent: bool) -> Result<bool> {
     if !query.present {
         return Ok(allow_absent);
     }
+    verify_current(m, &query).map(|()| true)
+}
+pub(crate) fn verify_current(m: &ServiceManifest, query: &TaskQuery) -> Result<()> {
     let record = read_record(m)?.unwrap_or_else(|| initial_record(m));
-    record_mismatch(&query, &record).map_or(Ok(true), |fields| Err(query.mismatch_error(fields)))
+    record_mismatch(query, &record).map_or(Ok(()), |fields| Err(query.mismatch_error(fields)))
 }
 pub(crate) fn enable(m: &ServiceManifest) -> Result<()> {
     let query = query(&m.id, Some(m))?;
@@ -156,10 +159,15 @@ pub(crate) fn enable(m: &ServiceManifest) -> Result<()> {
         let actual = invoke("create", &m.id, Some(m), &record.allowed())?;
         return commit_enabled(m, record, &actual, true);
     }
-    transition(m, true, "enable")
+    transition(m, &query, true, "enable")
 }
 
-fn transition(m: &ServiceManifest, enabled: bool, operation: &str) -> Result<()> {
+fn transition(
+    m: &ServiceManifest,
+    query: &TaskQuery,
+    enabled: bool,
+    operation: &str,
+) -> Result<()> {
     let existing = read_record(m)?;
     let publication = if existing.is_some() {
         Publication::Replace
@@ -167,9 +175,11 @@ fn transition(m: &ServiceManifest, enabled: bool, operation: &str) -> Result<()>
         Publication::CreateOnly
     };
     let mut record = existing.unwrap_or_else(|| initial_record(m));
-    let query = query(&m.id, Some(m))?;
-    if let Some(fields) = record_mismatch(&query, &record) {
+    if let Some(fields) = record_mismatch(query, &record) {
         return Err(query.mismatch_error(fields));
+    }
+    if enabled && record.enabled && record.pending_enabled.is_none() {
+        return Ok(());
     }
     record.pending_enabled = Some(enabled);
     save_record(m, &record, publication)?;
@@ -196,16 +206,18 @@ pub(crate) fn start(m: &ServiceManifest) -> Result<()> {
     invoke("start", &m.id, Some(m), &record.allowed()).map(|_| ())
 }
 pub(crate) fn stop(m: &ServiceManifest) -> Result<()> {
-    if !query(&m.id, Some(m))?.present {
+    let task = query(&m.id, Some(m))?;
+    if !task.present {
         return Ok(());
     }
-    transition(m, false, "stop")
+    transition(m, &task, false, "stop")
 }
 pub(crate) fn uninstall(m: &ServiceManifest) -> Result<()> {
     let (store, leaf) = record_location(m)?;
     store.recover_atomic(&[&store])?;
-    if query(&m.id, Some(m))?.present {
-        stop(m)?;
+    let task = query(&m.id, Some(m))?;
+    if task.present {
+        transition(m, &task, false, "stop")?;
         let record = read_record(m)?.unwrap_or_else(|| initial_record(m));
         invoke("delete", &m.id, Some(m), &record.allowed())?;
     }

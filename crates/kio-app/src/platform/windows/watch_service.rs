@@ -87,9 +87,7 @@ pub(crate) fn native_after_remove() -> Result<()> {
 }
 pub(crate) fn native_state(manifest: &ServiceManifest) -> Result<NativeServiceState> {
     let task = super::watch_task::query(&manifest.id, Some(manifest))?;
-    if !task.present || !super::watch_task::matches(manifest, false)? {
-        return Err(service_error("absent or foreign native task"));
-    }
+    super::watch_task::verify_current(manifest, &task)?;
     Ok(NativeServiceState {
         registered: true,
         active: matches!(task.state, 2 | 4),

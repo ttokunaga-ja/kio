@@ -10,6 +10,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+// The Unix readers already observe the cancellation flag while polling.
+pub(crate) fn cancel_pipe_io<T>(_: &std::thread::JoinHandle<T>) {}
+
 pub(crate) fn read_stream(
     reader: OutputPipe,
     stream: &'static str,

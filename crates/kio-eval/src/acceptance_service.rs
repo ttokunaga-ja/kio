@@ -42,6 +42,49 @@ fn command_timeout(windows: bool, args: &[&str]) -> Duration {
     }
 }
 const MAX_OUTPUT: usize = 128 * 1024;
+const CASE_TIMEOUT: Duration = Duration::from_secs(510);
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(90);
+
+struct Phase {
+    label: String,
+    started: Instant,
+}
+impl Phase {
+    fn begin(label: impl Into<String>) -> Self {
+        let label = label.into();
+        eprintln!("native service {label}: begin");
+        Self {
+            label,
+            started: Instant::now(),
+        }
+    }
+}
+impl Drop for Phase {
+    fn drop(&mut self) {
+        eprintln!(
+            "native service {}: end after {:.2}s",
+            self.label,
+            self.started.elapsed().as_secs_f64()
+        );
+    }
+}
+
+fn remaining_budget(
+    deadline: Instant,
+    limit: Duration,
+    phase: &str,
+) -> Result<Duration, AcceptanceError> {
+    let remaining = deadline
+        .saturating_duration_since(Instant::now())
+        .min(limit);
+    if remaining.is_zero() {
+        Err(invalid(format!(
+            "native service deadline expired before {phase}"
+        )))
+    } else {
+        Ok(remaining)
+    }
+}
 
 mod platform;
 
@@ -87,6 +130,8 @@ fn run(
     options: &ServiceOptions,
     case: AcceptanceCase,
 ) -> Result<AcceptanceReceipt, AcceptanceError> {
+    let _case_phase = Phase::begin(format!("{case:?}"));
+    let deadline = Instant::now() + CASE_TIMEOUT;
     validate_options(options, case)?;
     if options.work_dir.exists() || options.receipt.exists() {
         return Err(invalid(
@@ -119,8 +164,15 @@ fn run(
     fs::copy(&options.fixture, &initial).map_err(io)?;
     let mut cleanup = Cleanup::new(options.binary.clone(), private.clone(), root.clone());
 
-    cli_json(&options.binary, &private, None, &["init", path_arg(&root)?])?;
+    cli_json(
+        deadline,
+        &options.binary,
+        &private,
+        None,
+        &["init", path_arg(&root)?],
+    )?;
     let install = cli_json(
+        deadline,
         &options.binary,
         &private,
         Some(&root),
@@ -141,8 +193,17 @@ fn run(
         .ok_or_else(|| invalid("service install did not report a service_id"))?
         .to_owned();
     cleanup.created_id = Some(id.clone());
-    assert_status(&options.binary, &private, &root, true, false, "stopped")?;
+    assert_status(
+        deadline,
+        &options.binary,
+        &private,
+        &root,
+        true,
+        false,
+        "stopped",
+    )?;
     let conflict = cli(
+        deadline,
         &options.binary,
         &private,
         Some(&root),
@@ -158,6 +219,7 @@ fn run(
     )?;
     check_install_conflict(conflict.status.success(), &conflict.stderr)?;
     let repeated = cli_json(
+        deadline,
         &options.binary,
         &private,
         Some(&root),
@@ -172,18 +234,28 @@ fn run(
         ],
     )?;
     check_unchanged_install(&repeated, &id)?;
-    assert_status(&options.binary, &private, &root, true, false, "stopped")?;
+    assert_status(
+        deadline,
+        &options.binary,
+        &private,
+        &root,
+        true,
+        false,
+        "stopped",
+    )?;
 
     cli_json(
+        deadline,
         &options.binary,
         &private,
         Some(&root),
         &["watch", "--root", path_arg(&root)?, "service", "start"],
     )?;
-    let first = wait_running(&options.binary, &private, &root, None)?;
+    let first = wait_running(deadline, &options.binary, &private, &root, None)?;
     let first_pid = first.0;
-    let native_definition = platform::registered_definition(&private, &id)?;
+    let native_definition = platform::registered_definition(deadline, &private, &id)?;
     wait_search(
+        deadline,
         &options.binary,
         &private,
         &root,
@@ -191,45 +263,50 @@ fn run(
     )?;
     let live = "KIO_NATIVE_SERVICE_LIVE_CHANGE";
     fs::write(root.join("live-change.txt"), live).map_err(io)?;
-    wait_search(&options.binary, &private, &root, live)?;
+    wait_search(deadline, &options.binary, &private, &root, live)?;
     // A running instance must reject an additional scheduler start rather
     // than producing a second watcher.
     expect_failure(
+        deadline,
         &options.binary,
         &private,
         Some(&root),
         &["watch", "--root", path_arg(&root)?, "service", "start"],
+        "watcher is already running",
     )?;
 
     cli_json(
+        deadline,
         &options.binary,
         &private,
         Some(&root),
         &["watch", "--root", path_arg(&root)?, "service", "stop"],
     )?;
-    wait_stopped(&options.binary, &private, &root, &id)?;
+    wait_stopped(deadline, &options.binary, &private, &root, &id)?;
     platform::assert_pid_absent(first_pid)?;
     let stopped = "KIO_NATIVE_SERVICE_STOPPED_CHANGE";
     let stopped_path = "stopped-change.txt";
+    eprintln!("native service verify stopped file is absent from HEAD");
     fs::write(root.join(stopped_path), stopped).map_err(io)?;
     assert_not_committed(&root, stopped_path)?;
 
     cli_json(
+        deadline,
         &options.binary,
         &private,
         Some(&root),
         &["watch", "--root", path_arg(&root)?, "service", "start"],
     )?;
-    let (second_pid, _) = wait_running(&options.binary, &private, &root, Some(&first))?;
+    let (second_pid, _) = wait_running(deadline, &options.binary, &private, &root, Some(&first))?;
     let expected_raw = hash_bytes(stopped.as_bytes());
-    wait_until(|| {
+    wait_until(deadline, "restart convergence", |deadline| {
         let entry = committed_entry(&root, stopped_path)?;
         if !entry.is_some_and(|entry| entry.raw_hash == expected_raw && entry.normalize.is_some()) {
             return Err(invalid(
                 "restarted watcher has not published the normalized stopped change",
             ));
         }
-        if !search_has(&options.binary, &private, &root, stopped)? {
+        if !search_has(deadline, &options.binary, &private, &root, stopped)? {
             return Err(invalid(
                 "search has not published the stopped change after restart",
             ));
@@ -237,14 +314,16 @@ fn run(
         Ok(())
     })?;
     cli_json(
+        deadline,
         &options.binary,
         &private,
         Some(&root),
         &["watch", "--root", path_arg(&root)?, "service", "stop"],
     )?;
-    wait_stopped(&options.binary, &private, &root, &id)?;
+    wait_stopped(deadline, &options.binary, &private, &root, &id)?;
     platform::assert_pid_absent(second_pid)?;
     cli_json(
+        deadline,
         &options.binary,
         &private,
         Some(&root),
@@ -252,17 +331,23 @@ fn run(
     )?;
     cleanup.created_id = None;
     expect_failure(
+        deadline,
         &options.binary,
         &private,
         Some(&root),
         &["watch", "--root", path_arg(&root)?, "service", "status"],
+        "no watch service is installed for this root",
     )?;
     match native_definition.symlink_metadata() {
         Ok(_) => return Err(invalid("native service definition remains after uninstall")),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(io(error)),
     }
-    platform::assert_native_unregistered(&id)?;
+    {
+        let _phase = Phase::begin("verify scheduler registration absence");
+        platform::assert_native_unregistered(deadline, &id)?;
+    }
+    remaining_budget(deadline, CASE_TIMEOUT, "verify receipt evidence")?;
 
     if sha256_regular_file(&options.binary, MAX_BINARY_BYTES)?
         != options.expected.candidate.binary_sha256
@@ -274,6 +359,7 @@ fn run(
         ));
     }
 
+    remaining_budget(deadline, CASE_TIMEOUT, "publish receipt")?;
     let receipt = AcceptanceReceipt {
         schema: "kio.acceptance.receipt/v4".into(),
         requirement: options.expected.requirement.clone(),
@@ -351,30 +437,47 @@ fn validate_options(options: &ServiceOptions, case: AcceptanceCase) -> Result<()
 }
 
 fn cli_json(
+    deadline: Instant,
     binary: &Path,
     private: &Path,
     root: Option<&Path>,
     args: &[&str],
 ) -> Result<Value, AcceptanceError> {
-    let output = cli(binary, private, root, args)?;
+    let output = cli(deadline, binary, private, root, args)?;
     if !output.status.success() {
         return Err(command_error(args, &output.stderr));
     }
     serde_json::from_str(&output.stdout).map_err(|e| AcceptanceError::Json(e.to_string()))
 }
 fn expect_failure(
+    deadline: Instant,
     binary: &Path,
     private: &Path,
     root: Option<&Path>,
     args: &[&str],
+    expected_message: &str,
 ) -> Result<(), AcceptanceError> {
-    if cli(binary, private, root, args)?.status.success() {
-        Err(invalid(format!(
-            "native service operation unexpectedly succeeded: {}",
-            args.join(" ")
-        )))
-    } else {
+    let output = cli(deadline, binary, private, root, args)?;
+    check_expected_failure(output.status.success(), &output.stderr, expected_message)
+        .map_err(|error| command_error(args, &error.to_string()))
+}
+
+fn check_expected_failure(
+    success: bool,
+    stderr: &str,
+    expected_message: &str,
+) -> Result<(), AcceptanceError> {
+    let error: Value = serde_json::from_str(stderr).unwrap_or(Value::Null);
+    if !success
+        && error["error_code"] == "KIO-E-WATCH-SERVICE-001"
+        && error["message"] == expected_message
+    {
         Ok(())
+    } else {
+        Err(invalid(format!(
+            "expected {expected_message:?}; observed: {}",
+            stderr.trim()
+        )))
     }
 }
 
@@ -407,11 +510,20 @@ fn check_unchanged_install(install: &Value, id: &str) -> Result<(), AcceptanceEr
     Ok(())
 }
 fn cli(
+    deadline: Instant,
     binary: &Path,
     private: &Path,
     root: Option<&Path>,
     args: &[&str],
 ) -> Result<crate::runner::BoundedProcessOutput, AcceptanceError> {
+    let label = match args {
+        ["watch", "--root", _, "service", operation, ..] => format!("scheduler {operation}"),
+        ["search", marker, ..] => format!("search {marker}"),
+        [operation, ..] => (*operation).to_owned(),
+        [] => "command".to_owned(),
+    };
+    let _phase = Phase::begin(&label);
+    let timeout = remaining_budget(deadline, command_timeout(cfg!(windows), args), &label)?;
     let mut command = Command::new(binary);
     IsolatedChildEnvironment::new(
         private,
@@ -436,16 +548,17 @@ fn cli(
     run_bounded_command(
         &mut command,
         BoundedProcessOptions {
-            timeout: command_timeout(cfg!(windows), args),
+            timeout,
             max_stdout_bytes: MAX_OUTPUT,
             max_stderr_bytes: MAX_OUTPUT,
         },
         None,
     )
-    .map_err(|e| AcceptanceError::Command(format!("bounded service command failed: {e}")))
+    .map_err(|e| AcceptanceError::Command(format!("native service {label} failed: {e}")))
 }
 
 fn assert_status(
+    deadline: Instant,
     binary: &Path,
     private: &Path,
     root: &Path,
@@ -454,6 +567,7 @@ fn assert_status(
     state: &str,
 ) -> Result<Value, AcceptanceError> {
     let value = cli_json(
+        deadline,
         binary,
         private,
         Some(root),
@@ -476,13 +590,14 @@ fn assert_status(
     Ok(value)
 }
 fn wait_running(
+    deadline: Instant,
     binary: &Path,
     private: &Path,
     root: &Path,
     stopped: Option<&(u32, String)>,
 ) -> Result<(u32, String), AcceptanceError> {
-    wait_until(|| {
-        let value = assert_status(binary, private, root, true, true, "running")?;
+    wait_until(deadline, "watcher readiness", |deadline| {
+        let value = assert_status(deadline, binary, private, root, true, true, "running")?;
         running_identity(&value, stopped)
     })
 }
@@ -510,55 +625,75 @@ fn running_identity(
     Ok((pid, instance.to_owned()))
 }
 fn wait_stopped(
+    deadline: Instant,
     binary: &Path,
     private: &Path,
     root: &Path,
     _id: &str,
 ) -> Result<(), AcceptanceError> {
-    wait_until(|| {
+    wait_until(deadline, "watcher shutdown", |deadline| {
         // Linux reports enabling at login through this flag. The unit file
         // remains installed after stop, with UnitFileState=disabled.
         let registered = !cfg!(target_os = "linux");
-        assert_status(binary, private, root, registered, false, "stopped")?;
+        assert_status(
+            deadline, binary, private, root, registered, false, "stopped",
+        )?;
         #[cfg(target_os = "linux")]
-        platform::assert_disabled(_id)?;
+        platform::assert_disabled(deadline, _id)?;
         Ok(())
     })
 }
 fn wait_search(
+    deadline: Instant,
     binary: &Path,
     private: &Path,
     root: &Path,
     marker: &str,
 ) -> Result<(), AcceptanceError> {
-    wait_until(|| {
-        if search_has(binary, private, root, marker)? {
+    wait_until(deadline, "search convergence", |deadline| {
+        if search_has(deadline, binary, private, root, marker)? {
             Ok(())
         } else {
             Err(invalid("watcher has not converged yet"))
         }
     })
 }
-fn wait_until<T>(mut f: impl FnMut() -> Result<T, AcceptanceError>) -> Result<T, AcceptanceError> {
-    let deadline = Instant::now() + TIMEOUT;
+fn wait_until<T>(
+    case_deadline: Instant,
+    phase: &str,
+    mut f: impl FnMut(Instant) -> Result<T, AcceptanceError>,
+) -> Result<T, AcceptanceError> {
+    let _phase = Phase::begin(phase);
+    // Hosted Windows scheduler status can require several COM round trips.
+    let timeout = if cfg!(windows) {
+        Duration::from_secs(120)
+    } else {
+        TIMEOUT
+    };
+    let deadline = case_deadline.min(Instant::now() + timeout);
+    remaining_budget(deadline, timeout, phase)?;
     loop {
-        match f() {
-            Ok(value) => return Ok(value),
-            Err(error) if Instant::now() < deadline => {
-                let _ = error;
-                thread::sleep(Duration::from_secs(1));
+        let result = f(deadline);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match result {
+            Ok(value) if !remaining.is_zero() => return Ok(value),
+            Err(error) if remaining.is_zero() => {
+                return Err(invalid(format!("{phase} exceeded its deadline: {error}")));
             }
-            Err(error) => return Err(error),
+            Ok(_) => return Err(invalid(format!("{phase} exceeded its deadline"))),
+            Err(_) => thread::sleep(remaining.min(Duration::from_secs(1))),
         }
     }
 }
 fn search_has(
+    deadline: Instant,
     binary: &Path,
     private: &Path,
     root: &Path,
     marker: &str,
 ) -> Result<bool, AcceptanceError> {
     let value = cli_json(
+        deadline,
         binary,
         private,
         Some(root),
@@ -687,24 +822,64 @@ impl Drop for Cleanup {
                 Some(value) => value,
                 None => return,
             };
-            let _ = cli(
-                &self.binary,
-                &self.private,
-                Some(&self.root),
-                &["watch", "--root", root, "service", "stop"],
-            );
-            let _ = cli(
+            let _phase = Phase::begin("failure cleanup");
+            let deadline = Instant::now() + CLEANUP_TIMEOUT;
+            match cli(
+                deadline,
                 &self.binary,
                 &self.private,
                 Some(&self.root),
                 &["watch", "--root", root, "service", "uninstall"],
-            );
+            ) {
+                Ok(output) if output.status.success() => {}
+                Ok(output) => eprintln!("native service cleanup failed: {}", output.stderr.trim()),
+                Err(error) => eprintln!("native service cleanup failed: {error}"),
+            }
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scheduler_timeout_is_not_proof_that_a_second_start_was_rejected() {
+        let expected = "watcher is already running";
+        let failure = |message| {
+            serde_json::json!({"error_code":"KIO-E-WATCH-SERVICE-001","message":message})
+                .to_string()
+        };
+        assert!(check_expected_failure(false, &failure(expected), expected).is_ok());
+        assert!(
+            check_expected_failure(
+                false,
+                &failure("bounded subprocess exceeded timeout"),
+                expected
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn convergence_expiry_does_not_accept_a_late_success() {
+        let error = wait_until(
+            Instant::now() + Duration::from_millis(10),
+            "watcher readiness",
+            |deadline| {
+                thread::sleep(
+                    deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
+                );
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("watcher readiness exceeded its deadline")
+        );
+        assert!(remaining_budget(Instant::now(), COMMAND_TIMEOUT, "scheduler status").is_err());
+    }
+
     #[test]
     fn only_windows_scheduler_commands_get_the_larger_outer_budget() {
         let service = ["watch", "--root", "fixture", "service", "install"];
