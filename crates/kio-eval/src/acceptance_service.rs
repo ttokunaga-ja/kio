@@ -13,6 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use kio_core::{cas::hash_bytes, dag::TreeEntry, scope::Repository};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -198,8 +199,9 @@ fn run(
     wait_stopped(&options.binary, &private, &root, &id)?;
     platform::assert_pid_absent(first_pid)?;
     let stopped = "KIO_NATIVE_SERVICE_STOPPED_CHANGE";
-    fs::write(root.join("stopped-change.txt"), stopped).map_err(io)?;
-    assert_not_searchable(&options.binary, &private, &root, stopped)?;
+    let stopped_path = "stopped-change.txt";
+    fs::write(root.join(stopped_path), stopped).map_err(io)?;
+    assert_not_committed(&root, stopped_path)?;
 
     cli_json(
         &options.binary,
@@ -208,7 +210,21 @@ fn run(
         &["watch", "--root", path_arg(&root)?, "service", "start"],
     )?;
     let (second_pid, _) = wait_running(&options.binary, &private, &root, Some(&first))?;
-    wait_search(&options.binary, &private, &root, stopped)?;
+    let expected_raw = hash_bytes(stopped.as_bytes());
+    wait_until(|| {
+        let entry = committed_entry(&root, stopped_path)?;
+        if !entry.is_some_and(|entry| entry.raw_hash == expected_raw && entry.normalize.is_some()) {
+            return Err(invalid(
+                "restarted watcher has not published the normalized stopped change",
+            ));
+        }
+        if !search_has(&options.binary, &private, &root, stopped)? {
+            return Err(invalid(
+                "search has not published the stopped change after restart",
+            ));
+        }
+        Ok(())
+    })?;
     cli_json(
         &options.binary,
         &private,
@@ -559,21 +575,36 @@ fn search_contains_marker(value: &Value, marker: &str) -> Result<bool, Acceptanc
     Ok(false)
 }
 
-fn assert_not_searchable(
-    binary: &Path,
-    private: &Path,
-    root: &Path,
-    marker: &str,
-) -> Result<(), AcceptanceError> {
-    // A just-stopped watcher can leave the search replica rebuilding; wait
-    // until search answers, then require the marker to be absent.
-    if wait_until(|| search_has(binary, private, root, marker))? {
-        Err(invalid(
-            "content changed while stopped was indexed before restart",
+// Search is a read-only projection and an interrupted writer can leave it
+// rebuilding. Inspect the scope authority directly without triggering repair.
+fn committed_entry(root: &Path, path: &str) -> Result<Option<TreeEntry>, AcceptanceError> {
+    let inspect = || -> kio_core::Result<Option<TreeEntry>> {
+        let repo = Repository::open_read_only(root)?;
+        let head = repo
+            .head_commit_hash()?
+            .ok_or_else(|| kio_core::KioError::schema("managed scope has no committed HEAD"))?;
+        let tree = repo.read_tree(&repo.read_commit(&head)?.tree)?;
+        let entry = tree.find_entry(path)?;
+        if repo.head_commit_hash()?.as_deref() != Some(head.as_str()) {
+            return Err(kio_core::KioError::schema("HEAD changed during inspection"));
+        }
+        Ok(entry)
+    };
+    inspect().map_err(|error| {
+        invalid(format!(
+            "inspect committed path {path} in {}: {error}",
+            root.display()
         ))
-    } else {
-        Ok(())
+    })
+}
+
+fn assert_not_committed(root: &Path, path: &str) -> Result<(), AcceptanceError> {
+    if committed_entry(root, path)?.is_some() {
+        return Err(invalid(format!(
+            "content changed while stopped was committed before restart: {path}"
+        )));
     }
+    Ok(())
 }
 fn fixture_marker(path: &Path) -> Result<String, AcceptanceError> {
     let bytes = fs::read(path).map_err(io)?;
@@ -685,6 +716,30 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn stopped_change_is_checked_against_committed_head() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let repo = Repository::init(root).unwrap();
+        let path = "stopped-change.txt";
+        assert!(
+            assert_not_committed(root, path).is_err(),
+            "a missing HEAD is not evidence"
+        );
+
+        fs::write(root.join("live-change.txt"), "already indexed").unwrap();
+        repo.snapshot(None, None).unwrap();
+        fs::write(root.join(path), "stopped edit").unwrap();
+        assert_not_committed(root, path).unwrap();
+
+        repo.snapshot(None, None).unwrap();
+        assert_eq!(
+            committed_entry(root, path).unwrap().unwrap().raw_hash,
+            hash_bytes(b"stopped edit"),
+        );
+        assert!(assert_not_committed(root, path).is_err());
+    }
 
     #[test]
     fn overlapping_search_hits_do_not_prove_a_marker_was_indexed() {
