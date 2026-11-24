@@ -699,6 +699,56 @@ jobs:
             --receipt "$RUNNER_TEMP/kio-v1-a07-receipt.json" \
             > "$RUNNER_TEMP/kio-v1-a07-summary.json"
 
+      # TEMPORARY DIAGNOSTIC: remove after the Windows scheduler startup investigation.
+      - name: Diagnose Windows PowerShell startup and named Task Scheduler lookup
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: pwsh
+        timeout-minutes: 13
+        run: |
+          $system = [Environment]::SystemDirectory
+          $program = Join-Path $system 'WindowsPowerShell/v1.0/powershell.exe'
+          $query = Get-Content -Raw 'crates/kio-app/src/platform/windows/watch_task.ps1'
+          foreach ($kind in 'startup', 'GetTask') {
+            foreach ($attempt in 1..3) {
+              $info = [Diagnostics.ProcessStartInfo]::new($program)
+              $info.UseShellExecute = $false
+              $info.WorkingDirectory = Split-Path -Parent $program
+              $info.Environment.Clear()
+              $info.Environment['SystemRoot'] = Split-Path -Parent $system
+              $info.RedirectStandardInput = $true
+              $info.RedirectStandardOutput = $true
+              $info.RedirectStandardError = $true
+              foreach ($argument in '-NoLogo', '-NoProfile', '-NonInteractive', '-Command') {
+                $info.ArgumentList.Add($argument)
+              }
+              $info.ArgumentList.Add($(if ($kind -eq 'startup') { 'exit 0' } else { $query }))
+              $timer = [Diagnostics.Stopwatch]::StartNew()
+              $process = [Diagnostics.Process]::Start($info)
+              try {
+                $stdout = $process.StandardOutput.ReadToEndAsync()
+                $stderr = $process.StandardError.ReadToEndAsync()
+                if ($kind -eq 'GetTask') {
+                  $id = 'io.kio.watch.' + [Guid]::NewGuid().ToString('N')
+                  $json = @{ operation = 'query'; id = $id; template = ''; allowed = @() } | ConvertTo-Json -Compress
+                  $process.StandardInput.WriteLine([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json)))
+                }
+                $process.StandardInput.Close()
+                if (!$process.WaitForExit(120000)) {
+                  $process.Kill($true)
+                  Write-Host ('{0} #{1}: {2:F2}s (killed at timeout)' -f $kind, $attempt, $timer.Elapsed.TotalSeconds)
+                } else {
+                  Write-Host ('{0} #{1}: {2:F2}s (exit {3})' -f $kind, $attempt, $timer.Elapsed.TotalSeconds, $process.ExitCode)
+                  if ($stdout.IsCompletedSuccessfully -and $stdout.Result) { Write-Host $stdout.Result.Trim() }
+                  if ($stderr.IsCompletedSuccessfully -and $stderr.Result) { Write-Host $stderr.Result.Trim() }
+                }
+              } finally {
+                if (!$process.HasExited) { $process.Kill($true) }
+                $process.Dispose()
+              }
+            }
+          }
+
       - name: Collect A03 and A11 native scheduler receipts
         run: |
           set -euo pipefail
