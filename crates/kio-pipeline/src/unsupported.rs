@@ -56,9 +56,16 @@ pub struct UnsupportedInputDisposition {
     pub media_type: String,
     pub size_bytes: u64,
     pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness_reason: Option<String>,
 }
 
 impl UnsupportedInputDisposition {
+    pub fn record_office_readiness_reason(&mut self, reason: &str) {
+        let end = reason.floor_char_boundary(MAX_REASON_BYTES);
+        self.readiness_reason = Some(reason[..end].to_owned());
+    }
+
     pub fn is_unsupported(&self) -> bool {
         matches!(
             self.reason.as_str(),
@@ -483,6 +490,13 @@ fn validate_disposition(
             "unsupported input reason must contain 1..={MAX_REASON_BYTES} bytes"
         ));
     }
+    if disposition.readiness_reason.as_ref().is_some_and(|reason| {
+        disposition.reason != OFFICE_CONVERSION_UNAVAILABLE_REASON
+            || reason.trim().is_empty()
+            || reason.len() > MAX_REASON_BYTES
+    }) {
+        return Err("invalid Office readiness reason in unsupported input".to_owned());
+    }
     Ok(())
 }
 
@@ -497,7 +511,22 @@ mod tests {
             media_type: "application/octet-stream".to_owned(),
             size_bytes: 2_002,
             reason: UNSUPPORTED_REASON_UNRECOGNIZED_BINARY.to_owned(),
+            readiness_reason: None,
         }
+    }
+
+    #[test]
+    fn office_readiness_reason_roundtrips_with_a_utf8_byte_bound() {
+        let mut row = disposition("report.docx", 'a');
+        row.reason = OFFICE_CONVERSION_UNAVAILABLE_REASON.to_owned();
+        let details = "あ".repeat(MAX_REASON_BYTES);
+        row.record_office_readiness_reason(&details);
+        let expected = &details[..details.floor_char_boundary(MAX_REASON_BYTES)];
+        assert_eq!(row.readiness_reason.as_deref(), Some(expected));
+        let directory = crate::test_support::PrivateTempDir::new();
+        let store = UnsupportedInputStore::new(directory.path());
+        store.record(&row).unwrap();
+        assert_eq!(store.latest_by_path().unwrap().to_vec().unwrap(), vec![row]);
     }
 
     #[test]

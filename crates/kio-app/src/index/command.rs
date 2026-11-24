@@ -1708,6 +1708,7 @@ pub(crate) fn compute_index_status(
                                 media_type: disposition.media_type,
                                 size_bytes: disposition.size_bytes,
                                 reason: disposition.reason,
+                                readiness_reason: disposition.readiness_reason,
                             }
                         }));
                         // 07 §5.1: an Office file with no resolvable converter has
@@ -1727,6 +1728,7 @@ pub(crate) fn compute_index_status(
                                     media_type: disposition.media_type,
                                     size_bytes: disposition.size_bytes,
                                     reason: disposition.reason,
+                                    readiness_reason: disposition.readiness_reason,
                                 }
                             }),
                         );

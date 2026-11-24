@@ -436,6 +436,7 @@ fn index_status_projection_preserves_empty_and_populated_finite_records() {
             media_type: "application/octet-stream".to_owned(),
             size_bytes: u64::MAX,
             reason: reason.to_owned(),
+            readiness_reason: None,
         };
         let make_error = || IndexStatusError {
             scope_path: scope_path.clone(),

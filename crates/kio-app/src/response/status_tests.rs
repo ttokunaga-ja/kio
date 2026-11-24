@@ -216,6 +216,7 @@ fn status_projection_preserves_domain_file_omission_and_unsupported_input_record
         media_type: "application/octet-stream".to_owned(),
         size_bytes: 7,
         reason: "unsupported".to_owned(),
+        readiness_reason: None,
     }]);
     legacy["unsupported_inputs"] = json!([{"path":"clip.bin","raw_hash":"hash","media_type":"application/octet-stream","size_bytes":7,"reason":"unsupported"}]);
     dto.deferred_inputs = records([kio_core::scope::DeferredInput {

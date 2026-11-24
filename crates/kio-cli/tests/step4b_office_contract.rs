@@ -587,6 +587,14 @@ fn office_offline_raw_only_results_disclose_why_and_clear_on_recovery() {
                 assert_eq!(dispositions.len(), 1, "{status}");
                 assert_eq!(dispositions[0]["path"], "report.DOCX");
                 assert_eq!(dispositions[0]["reason"], reason);
+                if fixture.as_os_str().is_empty() {
+                    assert_eq!(
+                        dispositions[0]["readiness_reason"],
+                        "Office renderer is not configured"
+                    );
+                } else {
+                    assert!(dispositions[0].get("readiness_reason").is_none());
+                }
             }
             None => assert!(dispositions.is_empty(), "{status}"),
         }

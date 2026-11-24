@@ -496,7 +496,7 @@ fn office_unit_diagnostics(
                 .map(|tree| diagnostic_fields(tree, &["diagnostic_error", "error_code", "message"])),
             "working_state": matching_rows(&status["files"], "relative_path", &["status", "raw_hash"]),
             "tasks": tasks,
-            "unsupported": matching_rows(&status["unsupported_inputs"], "path", &["reason", "media_type", "error_code"]),
+            "unsupported": matching_rows(&status["unsupported_inputs"], "path", &["reason", "readiness_reason", "media_type", "error_code"]),
             "deferred": matching_rows(&index["deferred_inputs"], "path", &["reason", "error_code"]),
         }
     })
@@ -508,6 +508,9 @@ fn diagnostic_fields(value: &Value, fields: &[&str]) -> Value {
             .iter()
             .filter_map(|key| {
                 let value = match value.get(*key)? {
+                    Value::String(text) if *key == "readiness_reason" => {
+                        Value::from(&text[..text.floor_char_boundary(1024)])
+                    }
                     Value::String(text) => Value::from(bounded_diagnostic_text(text)),
                     value @ (Value::Null | Value::Bool(_) | Value::Number(_)) => value.clone(),
                     value @ Value::Object(_) if *key == "resource_limit" => diagnostic_fields(
@@ -720,6 +723,7 @@ mod tests {
                 &serde_json::json!({
                     "office_readiness":{"state":"unusable","reason":"x".repeat(1024)},
                     "files":[{"relative_path":file,"status":"unchanged"}],
+                    "unsupported_inputs":[{"path":file,"reason":"office_conversion_unavailable","readiness_reason":"index-time renderer probe failed"}],
                     "tasks":[
                         {"input_path":"presentation.pptx","status":"other-document"},
                         {"input_path":file,"type":"extract","status":"paused","hold_reason":"resource_limit","error_code":"KIO-E-RESOURCE-LIMIT-001","resource_limit":{"stage":"office_convert","limit":10,"observed":11}}
@@ -734,6 +738,7 @@ mod tests {
             "unusable",
             "paused",
             "contract_violation",
+            "index-time renderer probe failed",
             "KIO-E-INDEX-PARTIAL-001",
             "KIO-E-RESOURCE-LIMIT-001",
             "office_convert",

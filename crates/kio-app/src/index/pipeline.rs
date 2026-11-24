@@ -717,6 +717,7 @@ fn unsupported_input(
         media_type: candidate.media_type.clone(),
         size_bytes: candidate.size_bytes,
         reason: reason.to_owned(),
+        readiness_reason: None,
     }
 }
 
@@ -733,6 +734,7 @@ fn classify_verified_unsupported(
         media_type: media_type.to_owned(),
         size_bytes: verified.size_bytes,
         reason: reason.to_owned(),
+        readiness_reason: None,
     })
 }
 
@@ -1128,14 +1130,11 @@ pub(crate) fn run_index_pipeline(
             "image/png" | "image/jpeg" | "image/webp"
         );
         let office = is_office_media(&candidate.media_type);
-        let converter = if office {
-            office_readiness
+        let readiness = office.then(|| {
+            &*office_readiness
                 .get_or_insert_with(|| resolve_office_converter_with_control(repo.control()))
-                .as_ref()
-                .ok()
-        } else {
-            None
-        };
+        });
+        let converter = readiness.and_then(|result| result.as_ref().ok());
         let staged = match prepare_staged_with_converter(
             &extraction_store,
             PrepareStageBytesRequest {
@@ -1280,10 +1279,16 @@ pub(crate) fn run_index_pipeline(
                     .as_ref()
                     .is_some_and(|row| row.reason != reason)
             {
+                let mut disposition = unsupported_input(candidate, &raw_hash, reason);
+                if let Some(Err(unavailable)) = readiness
+                    && reason == OFFICE_CONVERSION_UNAVAILABLE_REASON
+                {
+                    disposition.record_office_readiness_reason(&unavailable.reason);
+                }
                 stage_unsupported_if_changed(
                     &mut unsupported_observations,
                     &mut latest_unsupported,
-                    unsupported_input(candidate, &raw_hash, reason),
+                    disposition,
                 )?;
             }
             if markdown_planning_ready && (!office || converter.is_some()) {
@@ -1323,6 +1328,7 @@ pub(crate) fn run_index_pipeline(
                     media_type: candidate.media_type.clone(),
                     size_bytes: verified.size_bytes,
                     reason: UNSUPPORTED_REASON_RESOLVED.to_owned(),
+                    readiness_reason: None,
                 },
             )?;
         }

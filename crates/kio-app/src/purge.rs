@@ -3119,6 +3119,7 @@ mod task_retirement_tests {
             media_type: "application/octet-stream".into(),
             size_bytes: 42,
             reason: "unsupported".into(),
+            readiness_reason: None,
         };
         store.record(&row).unwrap();
         row.raw_hash = raw_b.clone();

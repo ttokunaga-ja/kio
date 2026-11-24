@@ -142,6 +142,8 @@ pub struct FileDispositionResponse {
     pub media_type: String,
     pub size_bytes: u64,
     pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub readiness_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
