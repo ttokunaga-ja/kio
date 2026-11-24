@@ -10,8 +10,6 @@ use crate::embedding::admission::effective_invocation_lane;
 use crate::embedding::admission::lane_adjusted_pricing;
 use crate::embedding::admission::realtime_lane_requested;
 use crate::embedding::executor::run_embedding_enrichment;
-use crate::index::command::OFFICE_CONVERSION_UNAVAILABLE_REASON;
-use crate::index::command::stage_unsupported_if_changed;
 use crate::index::pipeline::IndexPipelineResult;
 use crate::index::pipeline::offline_markdownize_enqueue_status;
 use crate::index::pipeline::offline_output_ref;
@@ -60,8 +58,6 @@ use crate::settings::bbox_annotation_enabled;
 use crate::settings::user_config_toml_path;
 use kio_adapter::catalog::active_local_ocr_execution_with_control;
 use kio_adapter::catalog::local_ocr_handles_media_type;
-use kio_adapter::office_convert::is_office_media;
-use kio_adapter::office_convert::resolve_office_converter_with_control;
 use kio_adapter::tool_lock::AdapterRuntimeSettings;
 use kio_adapter::traits::PreferredRequestKind;
 use kio_core::KioError;
@@ -97,8 +93,6 @@ use kio_pipeline::task::TaskStore;
 use kio_pipeline::task::TaskType;
 use kio_pipeline::task::retry_policy;
 pub(crate) use kio_pipeline::task::task_retry_allowed;
-use kio_pipeline::unsupported::UNSUPPORTED_REASON_RESOLVED;
-use kio_pipeline::unsupported::UnsupportedInputDisposition;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -1549,8 +1543,6 @@ pub(crate) fn enqueue_online_placeholder_task(
     created_at: &str,
     result: &mut IndexPipelineResult,
     ledger: Option<&LedgerDb>,
-    observations: &mut kio_core::disk_records::RecordWriter<UnsupportedInputDisposition>,
-    latest_unsupported: &mut Option<UnsupportedInputDisposition>,
 ) -> Result<()> {
     // R9-2: text-native files (Markdown / plain text) are fully handled by
     // the deterministic Adapter (07 §2.1) and must never enqueue an online OCR task
@@ -1559,46 +1551,6 @@ pub(crate) fn enqueue_online_placeholder_task(
     // billed task for a `.md` / `.txt` / code file.
     if is_text_native_media(&candidate.media_type) {
         return Ok(());
-    }
-    // 07 §5.1: an Office (DOCX/PPTX) file whose converter is not resolvable
-    // right now must NEVER get a doomed online task -- there is no converted
-    // PDF to send. Record the skip (idempotent: `stage_unsupported_if_changed`
-    // no-ops when the same disposition is already the latest row for this
-    // path) so `compute_index_status`'s `office_conversion_unavailable`
-    // discloses WHY this file has no enrichment task, instead of a silent gap.
-    // Once a converter resolves (a later `kio index`), fall through to the
-    // normal enqueue path below and record the transition back to resolved.
-    if is_office_media(&candidate.media_type) {
-        if resolve_office_converter_with_control(repo.control()).is_err() {
-            stage_unsupported_if_changed(
-                observations,
-                latest_unsupported,
-                UnsupportedInputDisposition {
-                    path: candidate.input_path.clone(),
-                    raw_hash: raw_hash.to_owned(),
-                    media_type: candidate.media_type.clone(),
-                    size_bytes: candidate.size_bytes,
-                    reason: OFFICE_CONVERSION_UNAVAILABLE_REASON.to_owned(),
-                },
-            )?;
-            return Ok(());
-        }
-        if latest_unsupported
-            .as_ref()
-            .is_some_and(|row| row.reason == OFFICE_CONVERSION_UNAVAILABLE_REASON)
-        {
-            stage_unsupported_if_changed(
-                observations,
-                latest_unsupported,
-                UnsupportedInputDisposition {
-                    path: candidate.input_path.clone(),
-                    raw_hash: raw_hash.to_owned(),
-                    media_type: candidate.media_type.clone(),
-                    size_bytes: candidate.size_bytes,
-                    reason: UNSUPPORTED_REASON_RESOLVED.to_owned(),
-                },
-            )?;
-        }
     }
     let online_profile = online_markdownize_profile_for(repo)?;
     // Stage 3: a declared `offline_api` pipeline owns this enrichment instead

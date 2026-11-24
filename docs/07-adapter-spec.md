@@ -294,6 +294,10 @@ headless PDF 出力 capability を確認する。名称・version・配布物 di
 `kio search` は renderer の解決や probe を行わず、`index_status.office_conversion_unavailable` に
 現在の公開済み HEAD に対応するファイル別の記録を返す。現在の renderer の利用可否と理由は
 `kio status` で確認する。利用不能時は同コマンドの `office_readiness` に理由を表示する。
+同じ索引実行内では DOCX/PPTX の準備とタスク計画が一つの renderer 判定を共有する。実変換時の
+runtime 検証は各入力で行う。索引時に renderer が利用不能だったファイルは `kio status` の
+`unsupported_inputs` にも表示する。変換後の PDF に抽出できるテキストがなく、OCR タスクも
+計画できないファイルには `office_conversion_without_local_text` を記録する。
 macOS は app bundle の Apple 発行コード署名と seal を全 architecture・nested code について検証し、
 署名された bundle の主実行ファイルを起動する。PATH に shell wrapper がある場合は
 `KIO_OFFICE_CONVERTER` に bundle 内の実行ファイルを指定できる。特定の Team ID や bundle ID の

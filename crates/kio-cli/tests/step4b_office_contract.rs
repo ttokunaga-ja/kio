@@ -539,6 +539,61 @@ fn office_04_converter_absent_no_doomed_task() {
 }
 
 #[test]
+fn office_offline_raw_only_results_disclose_why_and_clear_on_recovery() {
+    let dir = canonical_tempdir();
+    let fixtures = canonical_tempdir();
+    write_office_input(&dir, "report.DOCX");
+    init(&dir);
+    let config = dir.path().join(".test-config/kio");
+    fs::create_dir_all(&config).unwrap();
+    fs::write(
+        config.join("tools.toml"),
+        "[markdown]\nunknown_key = true\n",
+    )
+    .unwrap();
+
+    let blank = write_office_fixture_pdf(&fixtures, "blank.pdf", &[""]);
+    let good = write_office_fixture_pdf(&fixtures, "text.pdf", &["office recovery needle"]);
+    for (fixture, reason) in [
+        (Path::new(""), Some("office_conversion_unavailable")),
+        (
+            blank.as_path(),
+            Some("office_conversion_without_local_text"),
+        ),
+        (good.as_path(), None),
+    ] {
+        let output = kio(&dir, &["index", "--offline", "--json"])
+            .env(TEST_OFFICE_CONVERT_ENV, fixture)
+            .env(OFFICE_CONVERTER_ENV, "")
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let index: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(
+            index["normalized_files"],
+            usize::from(reason.is_none()),
+            "{index}"
+        );
+        let status = json_success(&dir, &["status"]);
+        let dispositions = status["unsupported_inputs"].as_array().unwrap();
+        match reason {
+            Some(reason) => {
+                assert!(
+                    markdownize_tasks_for(&status, "report.DOCX").is_empty(),
+                    "{status}"
+                );
+                assert_eq!(dispositions.len(), 1, "{status}");
+                assert_eq!(dispositions[0]["path"], "report.DOCX");
+                assert_eq!(dispositions[0]["reason"], reason);
+            }
+            None => assert!(dispositions.is_empty(), "{status}"),
+        }
+    }
+}
+
+#[test]
 fn office_unavailable_reports_reason_and_keeps_text_search() {
     let dir = canonical_tempdir();
     write_office_input(&dir, "report.docx");

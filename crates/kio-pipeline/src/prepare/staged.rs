@@ -10,6 +10,7 @@ use crate::extraction_stage::{
     stage_error, write_record,
 };
 use crate::{PipelineError, Result};
+use kio_adapter::office_convert::OfficeConverter;
 use kio_adapter::xlsx_extract::SheetUsage;
 #[cfg(test)]
 use kio_core::cas::MAX_CONTENT_OBJECT_BYTES;
@@ -64,7 +65,17 @@ pub fn prepare_staged(
     budget: ExtractionBudget,
 ) -> Result<StagedPreparation> {
     let converter = resolve_prepare_converter(request.media_type, root.control());
-    let profile = converter.as_ref().map_or_else(
+    prepare_staged_with_converter(root, request, budget, converter.as_ref())
+}
+
+/// Prepare with the renderer selected for this index invocation.
+pub fn prepare_staged_with_converter(
+    root: &StoreDirectory,
+    request: PrepareStageBytesRequest<'_>,
+    budget: ExtractionBudget,
+    converter: Option<&OfficeConverter>,
+) -> Result<StagedPreparation> {
+    let profile = converter.map_or_else(
         || {
             if kio_adapter::xlsx_extract::is_xlsx_media(request.media_type) {
                 xlsx_preparation_profile_hash(request.tool_profile_hash)
@@ -95,7 +106,7 @@ pub fn prepare_staged(
             })?;
         prepare_units_emitting(
             request,
-            converter.as_ref(),
+            converter,
             budget,
             completed,
             &mut XlsxExtractionProgress::default(),

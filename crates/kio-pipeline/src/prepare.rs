@@ -396,10 +396,8 @@ fn prepare_units_emitting(
     }
     // 07 §5.1 (2026-07-23 addendum): DOCX/PPTX unit-ize via a converted-PDF
     // intermediate produced by an external renderer (LibreOffice `soffice`).
-    // No renderer in this environment → stay silent/crash-free — the exact
-    // same empty shape as the R20-4 scanned-PDF route below (the CLI layer
-    // gates online enqueue/visibility separately via `index_status`, 05
-    // §1.7 — prepare itself must never enqueue a doomed task, nor crash).
+    // The index caller records unavailable rendering and decides whether
+    // empty preparation can fall back to OCR.
     // A runtime conversion failure surfaces as a prepare-stage contract
     // error (07 §5.1: "実行時の変換失敗は contract_violation に合流する" — any
     // KIO-E-PREPARE-* code the task-retry classifier does not specifically
@@ -1542,5 +1540,5 @@ mod tests {
 mod staged;
 pub use staged::{
     PreparedUnitSink, StagedPreparation, discard_prepared_stages, prepare_staged,
-    prepare_staged_with, publish_prepared_source,
+    prepare_staged_with, prepare_staged_with_converter, publish_prepared_source,
 };

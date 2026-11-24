@@ -8,7 +8,7 @@ use crate::image_ingest;
 use crate::index::command::read_repository_extraction_input;
 use crate::index::command::repository_input_display_path;
 use crate::index::command::repository_scan_policy_allows_file;
-use crate::index::command::stage_unsupported_if_changed;
+use crate::index::command::{OFFICE_CONVERSION_UNAVAILABLE_REASON, stage_unsupported_if_changed};
 use crate::index::rebuild::read_head_tree_for_rebuild;
 use crate::ledger_access::release_task_charge_if_open;
 use crate::ledger_access::task_ledger_key;
@@ -53,7 +53,7 @@ use kio_adapter::catalog::standard_online_markdownize_profile;
 use kio_adapter::catalog::standard_online_markdownize_profile_with_bbox;
 #[cfg(debug_assertions)]
 use kio_adapter::identity::tool_profile_hash;
-use kio_adapter::office_convert::is_office_media;
+use kio_adapter::office_convert::{is_office_media, resolve_office_converter_with_control};
 use kio_adapter::tool_lock::AdapterRuntimeSettings;
 use kio_adapter::traits::MarkdownizeAdapter;
 #[cfg(debug_assertions)]
@@ -94,18 +94,18 @@ use kio_pipeline::markdownize::{
 };
 use kio_pipeline::prepare::PreparedUnit;
 use kio_pipeline::prepare::map_units;
-use kio_pipeline::prepare::prepare_staged;
 use kio_pipeline::prepare::unsupported_reason_for_content;
 use kio_pipeline::prepare::{ExtractionBudget, PrepareStageBytesRequest};
+use kio_pipeline::prepare::{prepare_staged, prepare_staged_with_converter};
 use kio_pipeline::scan::ScanCandidate;
 use kio_pipeline::scan::ScanPreview;
 use kio_pipeline::task::TaskStatus;
 use kio_pipeline::task::TaskStore;
 use kio_pipeline::task::TaskType;
 use kio_pipeline::task::{EXTRACTION_HOLD_OUTPUT_REF, HoldReason, RetryErrorKind, TaskDescriptor};
-use kio_pipeline::unsupported::UNSUPPORTED_REASON_RESOLVED;
 use kio_pipeline::unsupported::UnsupportedInputDisposition;
 use kio_pipeline::unsupported::UnsupportedInputStore;
+use kio_pipeline::unsupported::{UNSUPPORTED_REASON_OFFICE_NO_TEXT, UNSUPPORTED_REASON_RESOLVED};
 
 use kio_pipeline::unsupported::unsupported_reason_for_path;
 use serde_json::json;
@@ -980,6 +980,9 @@ pub(crate) fn run_index_pipeline(
         }
     }
     let mut unsupported_observations = RecordWriter::new(&stages)?;
+    // Share readiness across Office inputs and task planning. Real conversion
+    // still verifies the selected runtime before launching each renderer.
+    let mut office_readiness = None;
     for candidate in &preview.candidates {
         let candidate = &candidate?;
         if candidate.ignored || candidate.media_type == "inode/directory" {
@@ -1124,7 +1127,16 @@ pub(crate) fn run_index_pipeline(
             candidate.media_type.as_str(),
             "image/png" | "image/jpeg" | "image/webp"
         );
-        let staged = match prepare_staged(
+        let office = is_office_media(&candidate.media_type);
+        let converter = if office {
+            office_readiness
+                .get_or_insert_with(|| resolve_office_converter_with_control(repo.control()))
+                .as_ref()
+                .ok()
+        } else {
+            None
+        };
+        let staged = match prepare_staged_with_converter(
             &extraction_store,
             PrepareStageBytesRequest {
                 raw_hash: &raw_hash,
@@ -1134,6 +1146,7 @@ pub(crate) fn run_index_pipeline(
                 bytes: &verified.bytes,
             },
             ExtractionBudget::new(args.resource_tier),
+            converter,
         )
         .and_then(|staged| {
             if !native_image {
@@ -1241,8 +1254,6 @@ pub(crate) fn run_index_pipeline(
                     &now,
                     &mut result,
                     ledger,
-                    &mut unsupported_observations,
-                    &mut latest_unsupported,
                 )?;
             }
             result.retired_extractions.push(&Retirement {
@@ -1257,24 +1268,25 @@ pub(crate) fn run_index_pipeline(
         }
 
         if prepare.prepared_units.is_empty() {
-            // Recognized media without local text may still be eligible for OCR.
-            if latest_unsupported
-                .as_ref()
-                .is_some_and(UnsupportedInputDisposition::is_unsupported)
+            let reason = if office && converter.is_none() {
+                OFFICE_CONVERSION_UNAVAILABLE_REASON
+            } else if office && !markdown_planning_ready {
+                UNSUPPORTED_REASON_OFFICE_NO_TEXT
+            } else {
+                UNSUPPORTED_REASON_RESOLVED
+            };
+            if reason != UNSUPPORTED_REASON_RESOLVED
+                || latest_unsupported
+                    .as_ref()
+                    .is_some_and(|row| row.reason != reason)
             {
                 stage_unsupported_if_changed(
                     &mut unsupported_observations,
                     &mut latest_unsupported,
-                    UnsupportedInputDisposition {
-                        path: candidate.input_path.clone(),
-                        raw_hash: raw_hash.clone(),
-                        media_type: candidate.media_type.clone(),
-                        size_bytes: verified.size_bytes,
-                        reason: UNSUPPORTED_REASON_RESOLVED.to_owned(),
-                    },
+                    unsupported_input(candidate, &raw_hash, reason),
                 )?;
             }
-            if markdown_planning_ready {
+            if markdown_planning_ready && (!office || converter.is_some()) {
                 enqueue_online_placeholder_task(
                     adapter_settings,
                     repo,
@@ -1285,8 +1297,6 @@ pub(crate) fn run_index_pipeline(
                     &now,
                     &mut result,
                     ledger,
-                    &mut unsupported_observations,
-                    &mut latest_unsupported,
                 )?;
             }
             result.retired_extractions.push(&Retirement {
@@ -1302,7 +1312,7 @@ pub(crate) fn run_index_pipeline(
 
         if latest_unsupported
             .as_ref()
-            .is_some_and(UnsupportedInputDisposition::is_unsupported)
+            .is_some_and(|row| row.reason != UNSUPPORTED_REASON_RESOLVED)
         {
             stage_unsupported_if_changed(
                 &mut unsupported_observations,
@@ -1404,8 +1414,7 @@ pub(crate) fn run_index_pipeline(
             result.normalized_files += 1;
             // R21-4: an online OCR "enhancement" task after a SUCCESSFUL local markdownize
             // is only meaningful for a real text-layer PDF (docs/07 §8) or, per 07 §5.1, an
-            // Office file whose converter resolved (the enqueue gate itself decides whether
-            // to actually enqueue -- item 1's `enqueue_online_placeholder_task` early-return).
+            // Office file whose converter resolved.
             // A non-`.md`/non-code TEXT file folded to `application/octet-stream` (a `.yaml` /
             // `.json` / `Dockerfile`, or an uppercase-extension text-native file) is already
             // fully and finally handled by the local passthrough — enqueuing an OCR task
@@ -1425,8 +1434,6 @@ pub(crate) fn run_index_pipeline(
                     &now,
                     &mut result,
                     ledger,
-                    &mut unsupported_observations,
-                    &mut latest_unsupported,
                 )?;
             }
             result.retired_extractions.push(&Retirement {
@@ -1773,8 +1780,7 @@ pub(crate) fn run_index_pipeline(
         result.normalized_files += 1;
         // R21-4: only a real text-layer PDF, or (07 §5.1) an Office file whose converter
         // resolved, warrants an online OCR "enhancement" task after a successful local
-        // markdownize -- the enqueue gate itself (item 1) decides whether to actually
-        // enqueue an Office file. A TEXT file folded to `application/octet-stream`
+        // markdownize. A TEXT file folded to `application/octet-stream`
         // (`.yaml`/`.json`/`Dockerfile`/uppercase-extension text-native) is fully handled
         // locally; enqueuing OCR sent its bytes online (R9-2 violation) or left an offline
         // phantom pending.
@@ -1791,8 +1797,6 @@ pub(crate) fn run_index_pipeline(
                 &now,
                 &mut result,
                 ledger,
-                &mut unsupported_observations,
-                &mut latest_unsupported,
             )?;
         }
         result.retired_extractions.push(&Retirement {

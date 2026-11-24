@@ -117,15 +117,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// 07-adapter-spec.md §5.1: `UnsupportedInputDisposition.reason` recorded for an
-/// Office (DOCX/PPTX) file when no converter (`KIO_OFFICE_CONVERTER` / PATH
-/// `soffice`) resolves at `kio index` time -- no online task is enqueued for it
-/// (no doomed task), and `compute_index_status`'s `office_conversion_unavailable`
-/// surfaces it. Shares the `UnsupportedInputStore` (`UNSUPPORTED_INPUTS_FILE`)
-/// used for `UNSUPPORTED_REASON_UNRECOGNIZED_BINARY` -- `reason` is a free-form
-/// `String`, not a closed enum, so this is a plain sibling value, not a change to
-/// `kio-pipeline`.
-pub(crate) const OFFICE_CONVERSION_UNAVAILABLE_REASON: &str = "office_conversion_unavailable";
+pub(super) use kio_pipeline::unsupported::OFFICE_CONVERSION_UNAVAILABLE_REASON;
 
 pub(crate) fn run_index(ctx: &Invocation<'_>, args: IndexArgs) -> Result<CommandResponse> {
     run_index_with_resource_recheck(ctx, args, true)
@@ -1925,7 +1917,7 @@ pub(crate) fn unsupported_inputs_at_head(
     let mut unsupported = RecordWriter::new(&repo.object_store().scratch_record_stages())?;
     for row in dispositions {
         let row = row?;
-        if row.is_unsupported() {
+        if row.is_unsupported() || row.reason == OFFICE_CONVERSION_UNAVAILABLE_REASON {
             unsupported.push(&row)?;
         }
     }

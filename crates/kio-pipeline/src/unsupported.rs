@@ -20,6 +20,8 @@ use crate::{IoResultExt, PipelineError, Result};
 
 pub const UNSUPPORTED_INPUTS_FILE: &str = "unsupported-inputs.jsonl";
 pub const UNSUPPORTED_REASON_UNRECOGNIZED_BINARY: &str = "unrecognized_binary_without_local_text";
+pub const UNSUPPORTED_REASON_OFFICE_NO_TEXT: &str = "office_conversion_without_local_text";
+pub const OFFICE_CONVERSION_UNAVAILABLE_REASON: &str = "office_conversion_unavailable";
 pub const UNSUPPORTED_REASON_SOURCE_CODE: &str = "source_code_is_not_supported";
 
 pub fn unsupported_reason_for_path(path: &Path) -> Option<&'static str> {
@@ -60,7 +62,9 @@ impl UnsupportedInputDisposition {
     pub fn is_unsupported(&self) -> bool {
         matches!(
             self.reason.as_str(),
-            UNSUPPORTED_REASON_UNRECOGNIZED_BINARY | UNSUPPORTED_REASON_SOURCE_CODE
+            UNSUPPORTED_REASON_UNRECOGNIZED_BINARY
+                | UNSUPPORTED_REASON_SOURCE_CODE
+                | UNSUPPORTED_REASON_OFFICE_NO_TEXT
         )
     }
 }
@@ -295,7 +299,8 @@ impl UnsupportedInputStore {
                 ProjectionKind::Latest => rows.push(&latest),
                 ProjectionKind::Published => {
                     if let Some(row) = published
-                        && (!row.is_unsupported()
+                        && (!(row.is_unsupported()
+                            || row.reason == OFFICE_CONVERSION_UNAVAILABLE_REASON)
                             || entry.is_some_and(|entry| entry.normalize.is_none()))
                     {
                         rows.push(&row)
