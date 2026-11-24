@@ -168,7 +168,8 @@ fn run(
         Some(&root),
         &["watch", "--root", path_arg(&root)?, "service", "start"],
     )?;
-    let first_pid = wait_running(&options.binary, &private, &root)?;
+    let first = wait_running(&options.binary, &private, &root, None)?;
+    let first_pid = first.0;
     let native_definition = platform::registered_definition(&private, &id)?;
     wait_search(
         &options.binary,
@@ -206,10 +207,7 @@ fn run(
         Some(&root),
         &["watch", "--root", path_arg(&root)?, "service", "start"],
     )?;
-    let second_pid = wait_running(&options.binary, &private, &root)?;
-    if second_pid == first_pid {
-        return Err(invalid("restart reused the stopped watcher PID"));
-    }
+    let (second_pid, _) = wait_running(&options.binary, &private, &root, Some(&first))?;
     wait_search(&options.binary, &private, &root, stopped)?;
     cli_json(
         &options.binary,
@@ -450,16 +448,39 @@ fn assert_status(
     }
     Ok(value)
 }
-fn wait_running(binary: &Path, private: &Path, root: &Path) -> Result<u32, AcceptanceError> {
+fn wait_running(
+    binary: &Path,
+    private: &Path,
+    root: &Path,
+    stopped: Option<&(u32, String)>,
+) -> Result<(u32, String), AcceptanceError> {
     wait_until(|| {
         let value = assert_status(binary, private, root, true, true, "running")?;
-        value
-            .pointer("/instance/last_observation/pid")
-            .and_then(Value::as_u64)
-            .filter(|pid| *pid > 0 && *pid <= u32::MAX as u64)
-            .map(|pid| pid as u32)
-            .ok_or_else(|| invalid("running service omitted its PID"))
+        running_identity(&value, stopped)
     })
+}
+
+fn running_identity(
+    value: &Value,
+    stopped: Option<&(u32, String)>,
+) -> Result<(u32, String), AcceptanceError> {
+    let observation = &value["instance"]["last_observation"];
+    let pid = observation["pid"]
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| invalid("running service omitted its PID"))?;
+    let instance = observation["instance"]
+        .as_str()
+        .filter(|instance| !instance.is_empty())
+        .ok_or_else(|| invalid("running service omitted its instance ID"))?;
+    // A new watcher holds the lock before it publishes its own observation.
+    if stopped.is_some_and(|(old_pid, old_instance)| pid == *old_pid || instance == old_instance) {
+        return Err(invalid(
+            "restart has not published a fresh watcher PID and instance ID",
+        ));
+    }
+    Ok((pid, instance.to_owned()))
 }
 fn wait_stopped(
     binary: &Path,
@@ -642,6 +663,27 @@ impl Drop for Cleanup {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn restart_waits_for_a_new_pid_and_instance() {
+        let observation = |pid, instance| {
+            serde_json::json!({
+                "instance": {"last_observation": {"pid": pid, "instance": instance}}
+            })
+        };
+        let stopped = running_identity(&observation(12, "old"), None).unwrap();
+        for value in [
+            observation(12, "old"),
+            observation(12, "new"),
+            observation(13, "old"),
+        ] {
+            assert!(running_identity(&value, Some(&stopped)).is_err());
+        }
+        assert_eq!(
+            running_identity(&observation(13, "new"), Some(&stopped)).unwrap(),
+            (13, "new".into())
+        );
+    }
+
     use super::*;
 
     #[test]
