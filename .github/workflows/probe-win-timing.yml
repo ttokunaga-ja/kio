@@ -1,0 +1,15 @@
+name: probe-win-timing
+on:
+  push:
+    branches: [probe/win-timing]
+permissions:
+  contents: read
+jobs:
+  timing:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Time scheduler COM under full and cleared environments
+        shell: pwsh
+        run: ./probe/driver.ps1
