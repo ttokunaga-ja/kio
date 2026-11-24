@@ -6,7 +6,9 @@ function Error-Code($errorRecord) {
     return ([long]$exception.HResult -band 4294967295L)
 }
 try {
+    $phase = 'decode request'
     $request = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::In.ReadLine())) | ConvertFrom-Json
+    $phase = 'connect to root folder'
     $service = New-Object -ComObject 'Schedule.Service'
     $service.Connect()
     $folder = $service.GetFolder('\')
@@ -44,7 +46,9 @@ try {
             Start-Sleep -Milliseconds 25
         }
     }
+    $phase = 'look up task'
     $task = Get-Registered
+    $phase = 'prepare expected definition'
     $expected = @{}
     $definition = $null
     if ($request.template -and ($null -ne $task -or $request.operation -eq 'create')) {
@@ -56,13 +60,16 @@ try {
         $definition.Settings.Enabled = $false
         $expected['false'] = Canonical $definition.XmlText
     }
+    $phase = 'apply operation'
     switch ($request.operation) {
         'query' { }
         'create' {
             if ($null -ne $task) { throw 'Refusing to overwrite an existing task' }
             $definition.Settings.Enabled = $true
             $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+            $phase = 'RegisterTaskDefinition'
             $task = $folder.RegisterTaskDefinition($request.id, $definition, 2, $sid, $null, 3, $null)
+            $phase = 'verify created definition'
             Assert-Owned $task
         }
         'enable' { Assert-Owned $task; $task.Enabled = $true }
@@ -86,6 +93,7 @@ try {
         }
         default { throw 'Unknown native task operation' }
     }
+    $phase = 'read resulting definition'
     if ($request.operation -ne 'query') { $task = Get-Registered }
     $result = @{ hresult = 0; lookup_hresult = $script:lookupCode; present = ($null -ne $task); actual = $null; enabled_xml = $expected['true']; disabled_xml = $expected['false']; state = 0; arguments = $null }
     if ($null -ne $task) {
@@ -97,5 +105,13 @@ try {
     }
     $result | ConvertTo-Json -Depth 4 -Compress
 } catch {
-    @{ hresult = (Error-Code $_); lookup_hresult = 0; present = $false; actual = $null; enabled_xml = $null; disabled_xml = $null; state = 0; arguments = $null } | ConvertTo-Json -Compress
+    $errorRecord = $_
+    $exception = $errorRecord.Exception
+    $chain = @(for ($i = 0; $i -lt 6 -and $null -ne $exception; $i++) {
+        $message = [string]$exception.Message
+        if ($message.Length -gt 384) { $message = $message.Substring(0, 384) }
+        @{ hresult = ([long]$exception.HResult -band 4294967295L); message = $message }
+        $exception = $exception.InnerException
+    })
+    @{ phase = $phase; exceptions = $chain; hresult = (Error-Code $errorRecord); lookup_hresult = 0; present = $false; actual = $null; enabled_xml = $null; disabled_xml = $null; state = 0; arguments = $null } | ConvertTo-Json -Depth 4 -Compress
 }

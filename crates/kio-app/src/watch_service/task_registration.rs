@@ -99,6 +99,9 @@ fn automation_uses_fixed_noninteractive_arguments_and_a_framed_data_request() {
 #[serde(deny_unknown_fields)]
 pub(crate) struct TaskQuery {
     hresult: u32,
+    phase: Option<String>,
+    #[serde(default)]
+    exceptions: Vec<SchedulerException>,
     lookup_hresult: u32,
     pub(crate) present: bool,
     actual: Option<String>,
@@ -106,6 +109,13 @@ pub(crate) struct TaskQuery {
     disabled_xml: Option<String>,
     pub(crate) state: u32,
     pub(crate) arguments: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SchedulerException {
+    hresult: u32,
+    message: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -132,10 +142,24 @@ pub(crate) fn validate_query(result: TaskQuery) -> Result<TaskQuery> {
     // A missing COM component or a failed connection is never task absence.
     // Only the HRESULT returned by GetTask itself may establish absence.
     if result.hresult != 0 {
-        return Err(service_error(format!(
-            "Task Scheduler API HRESULT 0x{:08x}",
-            result.hresult
-        )));
+        let bounded = |text: &str, limit| {
+            text.chars()
+                .take(limit)
+                .map(|ch| if ch.is_control() { ' ' } else { ch })
+                .collect::<String>()
+        };
+        let mut detail = format!("Task Scheduler API HRESULT 0x{:08x}", result.hresult);
+        if let Some(phase) = result.phase {
+            detail.push_str(&format!(" during {}", bounded(&phase, 64)));
+        }
+        for exception in result.exceptions.iter().take(6) {
+            detail.push_str(&format!(
+                "; 0x{:08x}: {}",
+                exception.hresult,
+                bounded(&exception.message, 384)
+            ));
+        }
+        return Err(service_error(detail));
     }
     if task_lookup(result.lookup_hresult)? != result.present
         || (result.present && result.actual.is_none())
@@ -168,11 +192,30 @@ mod tests {
     use super::*;
 
     fn reply() -> TaskQuery {
-        TaskQuery { hresult: 0, lookup_hresult: 0, present: true,
+        TaskQuery { hresult: 0, phase: None, exceptions: Vec::new(), lookup_hresult: 0, present: true,
             actual: Some("<Task><Settings><Enabled>true</Enabled></Settings><Actions><Exec><Command>kio</Command></Exec></Actions></Task>".into()),
             enabled_xml: Some("<Task><Settings><Enabled>true</Enabled></Settings><Actions><Exec><Command>kio</Command></Exec></Actions></Task>".into()),
             disabled_xml: Some("<Task><Settings><Enabled>false</Enabled></Settings><Actions><Exec><Command>kio</Command></Exec></Actions></Task>".into()), state: 3, arguments: None }
     }
+    #[test]
+    fn reports_bounded_scheduler_exception_chain_with_the_operation_phase() {
+        let result = serde_json::from_value(serde_json::json!({
+            "hresult": 0x80070005_u32, "phase": "RegisterTaskDefinition",
+            "exceptions": [
+                {"hresult": 0x80131501_u32, "message": "wrapper"},
+                {"hresult": 0x80070005_u32, "message": format!("access denied\n{}", "x".repeat(512))}
+            ],
+            "lookup_hresult": 0, "present": false, "actual": null,
+            "enabled_xml": null, "disabled_xml": null, "state": 0, "arguments": null
+        })).unwrap();
+        let error = validate_query(result).err().unwrap().to_string();
+        assert!(error.contains("during RegisterTaskDefinition"));
+        assert!(error.contains("0x80131501: wrapper"));
+        assert!(error.contains("0x80070005: access denied "));
+        assert!(!error.contains('\n'));
+        assert!(!error.contains(&"x".repeat(385)));
+    }
+
     #[test]
     fn scheduler_connection_failure_cannot_masquerade_as_absence() {
         let mut result = reply();
