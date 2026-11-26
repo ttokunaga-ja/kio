@@ -58,6 +58,7 @@ fn batch_resume_retry_projection_preserves_counts_flags_and_owned_codes() {
                 status: "resumed".into(),
                 recheck_budget: true,
                 override_budget: false,
+                mistral_failures: Default::default(),
                 counts: counts(),
                 error_code: error_code.map(str::to_owned),
             }),

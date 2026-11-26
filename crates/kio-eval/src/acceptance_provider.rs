@@ -13,6 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use kio_app::response::batch::MistralBatchFailure;
 use kio_process::{BoundedProcessOptions, run_bounded_command};
 use serde_json::Value;
 
@@ -624,6 +625,14 @@ fn run_child(
     }
     let status = output.status;
     let summary = format!("provider command {stage} failed ({status})");
+    if args == BATCH_RESUME_ARGS
+        && status.code() == Some(4)
+        && let Ok(report) = serde_json::from_str::<BatchFailureReport>(&output.stdout)
+        && !report.mistral_failures.is_empty()
+        && let Ok(codes) = serde_json::to_string(&report.mistral_failures)
+    {
+        return Err(invalid(format!("{summary}: mistral_failures={codes}")));
+    }
     let details = [&output.stderr, &output.stdout]
         .into_iter()
         .find_map(|stream| child_error_fields(stream, key));
@@ -631,6 +640,11 @@ fn run_child(
         Some(details) => format!("{summary}: {details}"),
         None => summary,
     }))
+}
+
+#[derive(serde::Deserialize)]
+struct BatchFailureReport {
+    mistral_failures: std::collections::BTreeSet<MistralBatchFailure>,
 }
 
 fn child_error_fields(stream: &str, key: &str) -> Option<String> {
@@ -825,11 +839,13 @@ mod child_tests {
     #[test]
     fn batch_exit_four_fails() {
         let err = poll_fake(
-            r#"echo '{"tasks_inflight":0}'; exit 4"#,
+            r#"echo '{"tasks_inflight":0,"mistral_failures":["response_model_mismatch"],"error_code":"KIO-E-BATCH-TASK-FAILED-001","message":"private provider text"}'; exit 4"#,
             std::time::Duration::from_secs(5),
         )
         .unwrap_err();
         assert!(err.to_string().contains("exit status: 4"));
+        assert!(err.to_string().contains("response_model_mismatch"));
+        assert!(!err.to_string().contains("private provider text"));
     }
 
     #[test]

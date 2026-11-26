@@ -352,7 +352,17 @@ fn b2_collect_completes_task_and_makes_output_searchable() {
         "capture_path": capture.display().to_string(),
         "output": [{
             "custom_id": input_hash,
-            "response": { "status_code": 200, "body": success_body("b2marker") },
+            "id": "batch-example-1",
+            "response": { "status_code": 200, "body": {
+                "model": "mistral-ocr-2505-completion",
+                "pages": [{
+                    "index": 0, "markdown": "b2marker scanned page text\n",
+                    "images": [], "dimensions": {"dpi": 200, "height": 490, "width": 1200}
+                }],
+                "usage_info": {"pages_processed": 1, "doc_size_bytes": 1234},
+                "document_annotation": null
+            }},
+            "error": null,
         }],
     });
 
@@ -540,6 +550,11 @@ fn b4_failed_job_settles_zero_charge_and_fails_task_permanently() {
     // The poll observes FAILED → permanent failure only → exit 4.
     let polled = run_with_batch_script(&dir, &script, &["batch", "resume"], 4);
     assert_eq!(polled["tasks_failed"], 1, "{polled}");
+    assert_eq!(
+        polled["mistral_failures"],
+        json!(["job_failed"]),
+        "{polled}"
+    );
     assert_eq!(polled["tasks_inflight"], 0, "{polled}");
 
     let status = json_success(&dir, &["status"]);

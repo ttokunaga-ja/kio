@@ -3417,18 +3417,12 @@ fn r11_2_completion_priority_batch_vs_enrichment() {
     // Batch priority: auth (5) > budget-paused (6) > some-retryable (3) >
     // all-permanent (4).
     let all = ExecOutcome {
-        resource_busy: 0,
-        model_not_ready: 0,
-        native_failure: None,
-        embedding_unavailable_reason: None,
-        resource_limit: None,
         executed: 1,
         failed: 3,
         paused: 1,
         auth_failed: 1,
         failed_retryable: 1,
-        inflight: 0,
-        held_unreadable: 0,
+        ..ExecOutcome::default()
     };
     assert_eq!(batch_completion(&all), Completion::AuthRequired);
     assert_eq!(

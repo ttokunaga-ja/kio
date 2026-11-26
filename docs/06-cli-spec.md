@@ -119,6 +119,7 @@ kio batch resume [--recheck-budget|--override-budget] [--online|--offline]
                                         # 置き換えない。--offline は外部ネットワーク dispatch を
                                         # 禁止するため、HTTP を要する照会・出力取得・cleanup も実行しない。
                                         # markdownize online タスクと embedding enrichment パスを両方駆動 (04-pipeline.md §5.4)
+                                        # --json は Mistral Batch 回収で失敗を検出した場合に mistral_failures（固定理由の配列）を返す。
 kio batch retry [--online|--offline] [--reset-violations <selector> --yes] [--resend-unknown <selector> --yes]
                                         # failed タスクの再試行 (markdownize + embedding。backoff/retry 予算を尊重)。
                                         # --reset-violations = 検証済み Adapter 更新後に contract_violation_count を 0 へ戻す

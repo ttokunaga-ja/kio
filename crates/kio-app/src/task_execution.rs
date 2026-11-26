@@ -184,6 +184,7 @@ pub(crate) struct ExecOutcome {
     /// vector ready and `tasks_inflight` simply never dropped. A non-zero value
     /// here means "stop waiting and look", not "wait longer".
     pub(crate) held_unreadable: usize,
+    pub(crate) mistral_failures: BTreeSet<crate::response::batch::MistralBatchFailure>,
 }
 
 impl ExecOutcome {
@@ -235,6 +236,7 @@ impl ExecOutcome {
         self.failed_retryable += other.failed_retryable;
         self.inflight += other.inflight;
         self.held_unreadable += other.held_unreadable;
+        self.mistral_failures.extend(other.mistral_failures);
     }
 }
 

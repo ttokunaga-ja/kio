@@ -1,4 +1,23 @@
-use serde::Serialize;
+use std::collections::BTreeSet;
+
+use serde::{Deserialize, Serialize};
+
+/// Fixed diagnostics from Mistral collection. Safe to surface in acceptance logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MistralBatchFailure {
+    JobFailed,
+    JobCancelled,
+    JobExpired,
+    MissingResult,
+    RequestFailed,
+    InputPurged,
+    InputSuperseded,
+    InvalidJobModel,
+    ResponseModelMismatch,
+    InvalidOcrResponse,
+    InvalidMarkdownizeOutput,
+}
 
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
@@ -24,6 +43,8 @@ pub struct BatchResumeResponse {
     pub status: String,
     pub recheck_budget: bool,
     pub override_budget: bool,
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    pub mistral_failures: BTreeSet<MistralBatchFailure>,
     #[serde(flatten)]
     pub counts: BatchCounts,
     #[serde(skip_serializing_if = "Option::is_none")]

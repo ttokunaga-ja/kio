@@ -85,6 +85,8 @@ pub struct OcrResponse {
 /// again; it must not be treated as a bad provider response and re-submitted.
 #[derive(Debug)]
 pub enum BatchOcrMaterializationError {
+    InvalidJobModel,
+    ResponseModelMismatch,
     Contract(AdapterError),
     Persistence(AdapterError),
 }
@@ -92,6 +94,12 @@ pub enum BatchOcrMaterializationError {
 impl fmt::Display for BatchOcrMaterializationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidJobModel => {
+                formatter.write_str("batch OCR job is missing a versioned model pin")
+            }
+            Self::ResponseModelMismatch => {
+                formatter.write_str("OCR response model does not match the requested pin")
+            }
             Self::Contract(error) | Self::Persistence(error) => error.fmt(formatter),
         }
     }
@@ -804,8 +812,17 @@ pub fn materialize_mistral_batch_ocr_body(
         })
         .transpose()
         .map_err(BatchOcrMaterializationError::Contract)?;
-    let ocr = parse_ocr_response(
-        body.clone(),
+    // The batch service can append a completion suffix to the job's model
+    // pin in the result body. Compare against that same pin after normalization.
+    if body.get("model").is_some_and(|model| {
+        let model = model.as_str();
+        model != Some(model_pin)
+            && model.and_then(|id| id.strip_suffix("-completion")) != Some(model_pin)
+    }) {
+        return Err(BatchOcrMaterializationError::ResponseModelMismatch);
+    }
+    let ocr = parse_ocr_pages(
+        body,
         model_pin,
         expected_page_indices.as_deref(),
         OcrResponsePolicy::default(),
@@ -1131,6 +1148,22 @@ fn parse_ocr_response(
             "OCR response model does not match the requested pin".to_owned(),
         ));
     }
+    parse_ocr_pages(
+        &value,
+        model_pin,
+        expected_page_indices,
+        policy,
+        bbox_annotation_enabled,
+    )
+}
+
+fn parse_ocr_pages(
+    value: &Value,
+    model_pin: &str,
+    expected_page_indices: Option<&[usize]>,
+    policy: OcrResponsePolicy,
+    bbox_annotation_enabled: bool,
+) -> Result<OcrResponse> {
     let page_values = value
         .get("pages")
         .and_then(Value::as_array)

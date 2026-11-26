@@ -318,6 +318,7 @@ pub(crate) fn run_batch(ctx: &Invocation<'_>, args: BatchArgs) -> Result<Command
                     error_code: outcome
                         .native_error_code()
                         .or_else(|| batch_error_code(completion)),
+                    mistral_failures: outcome.mistral_failures,
                 })),
                 completion,
             })

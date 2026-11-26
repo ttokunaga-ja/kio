@@ -16,6 +16,7 @@ use crate::markdownize::execution::task_failure_from_adapter;
 use crate::object_persistence::adapter_to_kio;
 use crate::object_persistence::pipeline_to_kio;
 use crate::online_task::targets_standard_online_markdownize;
+use crate::response::batch::MistralBatchFailure;
 use crate::scope_access::raw_ingest_is_purge_blocked;
 use crate::settings::batch_recovery_context;
 use crate::task_execution::ExecOutcome;
@@ -416,9 +417,7 @@ pub(crate) fn settle_batch_charge_terminal(
 pub(crate) enum BatchPollDisposition {
     Collected(ExecOutcome),
     InFlight,
-    FailedPermanent,
-    FailedRetryable,
-    Retired,
+    Failed(MistralBatchFailure, bool),
 }
 
 /// 04 §5.8 相 3 (poll + collect) for this scope's in-flight batch markdownize
@@ -461,12 +460,10 @@ pub(crate) fn poll_batch_markdownize_jobs(
             match disposition {
                 BatchPollDisposition::Collected(completion) => counts.add(completion),
                 BatchPollDisposition::InFlight => counts.inflight += 1,
-                BatchPollDisposition::FailedPermanent | BatchPollDisposition::Retired => {
+                BatchPollDisposition::Failed(reason, retryable) => {
                     counts.failed += 1;
-                }
-                BatchPollDisposition::FailedRetryable => {
-                    counts.failed += 1;
-                    counts.failed_retryable += 1;
+                    counts.failed_retryable += usize::from(retryable);
+                    counts.mistral_failures.insert(reason);
                 }
             }
         }
@@ -642,7 +639,7 @@ fn settle_failed_batch_job(
     task: &TaskDescriptor,
     status: &BatchJobStatus,
 ) -> Result<BatchPollDisposition> {
-    let (outcome, error, billed) = match status {
+    let (outcome, error, reason, billed) = match status {
         // Provider TIMEOUT_EXCEEDED: no output to read a real usage from —
         // the same unknown-cost epistemic state as a KIO-deadline expiry, so
         // it books the RESERVED estimate (04 §5.8 "expired = estimated 記帳",
@@ -650,6 +647,7 @@ fn settle_failed_batch_job(
         BatchJobStatus::TimeoutExceeded => (
             Outcome::Expired,
             "expired",
+            MistralBatchFailure::JobExpired,
             BilledAmount {
                 usd: row.estimated_usd,
                 estimated: true,
@@ -661,6 +659,7 @@ fn settle_failed_batch_job(
         BatchJobStatus::Cancelled => (
             Outcome::SubmitRejected,
             "cancelled",
+            MistralBatchFailure::JobCancelled,
             BilledAmount {
                 usd: 0.0,
                 estimated: false,
@@ -669,6 +668,7 @@ fn settle_failed_batch_job(
         _ => (
             Outcome::SubmitRejected,
             "failed",
+            MistralBatchFailure::JobFailed,
             BilledAmount {
                 usd: 0.0,
                 estimated: false,
@@ -696,7 +696,7 @@ fn settle_failed_batch_job(
         row.provider_scope_id.as_deref(),
     )?;
     mark_batch_task_failed_permanent(store, &task.task_id)?;
-    Ok(BatchPollDisposition::FailedPermanent)
+    Ok(BatchPollDisposition::Failed(reason, false))
 }
 
 /// Provider job failure → the task joins the existing PERMANENT failure
@@ -794,7 +794,10 @@ fn collect_batch_markdownize_output(
             row.provider_scope_id.as_deref(),
         )?;
         mark_batch_task_failed_permanent(store, &task.task_id)?;
-        return Ok(BatchPollDisposition::FailedPermanent);
+        return Ok(BatchPollDisposition::Failed(
+            MistralBatchFailure::MissingResult,
+            false,
+        ));
     };
     if line.status_code != 200 {
         // Per-entry provider failure inside a SUCCESS job — same reject
@@ -823,7 +826,10 @@ fn collect_batch_markdownize_output(
             row.provider_scope_id.as_deref(),
         )?;
         mark_batch_task_failed_permanent(store, &task.task_id)?;
-        return Ok(BatchPollDisposition::FailedPermanent);
+        return Ok(BatchPollDisposition::Failed(
+            MistralBatchFailure::RequestFailed,
+            false,
+        ));
     }
     // §5.8 相 3: persist 直前の tombstone 再検査 — purge 済みなら出力破棄、
     // reject 終端と同形 (error='purged')。課金は provider 報告値だが、この
@@ -851,7 +857,10 @@ fn collect_batch_markdownize_output(
             row.provider_scope_id.as_deref(),
         )?;
         retire_batch_task(store, &task.task_id)?;
-        return Ok(BatchPollDisposition::Retired);
+        return Ok(BatchPollDisposition::Failed(
+            MistralBatchFailure::InputPurged,
+            false,
+        ));
     }
     // Re-materialize the same input the submit used (the same precondition
     // gate the sync send runs): the output is persisted under the SUBMIT-time
@@ -904,7 +913,10 @@ fn collect_batch_markdownize_output(
                 row.provider_scope_id.as_deref(),
             )?;
             retire_batch_task(store, &task.task_id)?;
-            return Ok(BatchPollDisposition::Retired);
+            return Ok(BatchPollDisposition::Failed(
+                MistralBatchFailure::InputSuperseded,
+                false,
+            ));
         }
     };
     let retry_units: Option<BTreeSet<String>> = task
@@ -951,15 +963,37 @@ fn collect_batch_markdownize_output(
             task.bbox_annotation_enabled.unwrap_or(false),
         )
         .map(|converted| (converted, model_pin)),
-        None => Err(BatchOcrMaterializationError::Contract(
-            kio_adapter::AdapterError::ContractViolation(
-                "batch OCR job is missing a versioned model pin".to_owned(),
-            ),
-        )),
+        None => Err(BatchOcrMaterializationError::InvalidJobModel),
     };
     let ((response, effective_hints), model_pin) = match converted {
         Ok(converted) => converted,
-        Err(BatchOcrMaterializationError::Contract(error)) => {
+        Err(BatchOcrMaterializationError::Persistence(error)) => {
+            // The provider result was already fetched and passed all response
+            // validation. Keep the ledger reservation and collect it again;
+            // treating local image CAS trouble as a contract reject would
+            // discard a known billed result and schedule a new send.
+            repo.control().append_event_log_in_session(
+                repo.lock_session(),
+                "KIO-E-BATCH-RESULT-STORE-001",
+                "batch OCR image persistence deferred; retaining known provider result",
+                json!({ "input_path": task.input_path, "detail": error.to_string() }),
+            )?;
+            extend_batch_poll_schedule(store, &task.task_id, repo.control())?;
+            return Ok(BatchPollDisposition::InFlight);
+        }
+        Err(error) => {
+            let reason = match error {
+                BatchOcrMaterializationError::InvalidJobModel => {
+                    MistralBatchFailure::InvalidJobModel
+                }
+                BatchOcrMaterializationError::ResponseModelMismatch => {
+                    MistralBatchFailure::ResponseModelMismatch
+                }
+                BatchOcrMaterializationError::Contract(_) => {
+                    MistralBatchFailure::InvalidOcrResponse
+                }
+                BatchOcrMaterializationError::Persistence(_) => unreachable!("handled above"),
+            };
             // §3.2 acceptance reject (04 §5.8 相 3): terminal with the durable
             // contract_violation count. The provider usage report is part of
             // the very body that failed to parse, so the charge degrades to
@@ -982,21 +1016,8 @@ fn collect_batch_markdownize_output(
                 job_id,
                 task,
                 estimated,
+                reason,
             );
-        }
-        Err(BatchOcrMaterializationError::Persistence(error)) => {
-            // The provider result was already fetched and passed all response
-            // validation. Keep the ledger reservation and collect it again;
-            // treating local image CAS trouble as a contract reject would
-            // discard a known billed result and schedule a new send.
-            repo.control().append_event_log_in_session(
-                repo.lock_session(),
-                "KIO-E-BATCH-RESULT-STORE-001",
-                "batch OCR image persistence deferred; retaining known provider result",
-                json!({ "input_path": task.input_path, "detail": error.to_string() }),
-            )?;
-            extend_batch_poll_schedule(store, &task.task_id, repo.control())?;
-            return Ok(BatchPollDisposition::InFlight);
         }
     };
     let usage = response.usage.clone();
@@ -1033,6 +1054,7 @@ fn collect_batch_markdownize_output(
                 job_id,
                 task,
                 estimated,
+                MistralBatchFailure::InvalidMarkdownizeOutput,
             );
         }
         Err(_failure) => {
@@ -1119,6 +1141,7 @@ fn settle_batch_contract_reject(
     job_id: &str,
     task: &TaskDescriptor,
     estimated: BilledAmount,
+    failure: MistralBatchFailure,
 ) -> Result<BatchPollDisposition> {
     settle_batch_charge_terminal(
         ledger,
@@ -1172,11 +1195,7 @@ fn settle_batch_contract_reject(
         }
     })
     .map_err(pipeline_to_kio)?;
-    Ok(if retryable {
-        BatchPollDisposition::FailedRetryable
-    } else {
-        BatchPollDisposition::FailedPermanent
-    })
+    Ok(BatchPollDisposition::Failed(failure, retryable))
 }
 
 /// Retire a batch task whose collect-time precondition failed (superseded /

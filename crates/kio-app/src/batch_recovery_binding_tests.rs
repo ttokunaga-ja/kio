@@ -427,7 +427,13 @@ fn mistral_matching_job_fetches_output_and_matching_failure_settles_and_cleans()
             (1, usize::from(!failed), usize::from(failed))
         );
         if failed {
-            assert!(matches!(result, BatchPollDisposition::FailedPermanent));
+            assert!(matches!(
+                result,
+                BatchPollDisposition::Failed(
+                    crate::response::batch::MistralBatchFailure::JobFailed,
+                    false
+                )
+            ));
             assert!(
                 get_batch_request(&ledger, &row.key)
                     .unwrap()

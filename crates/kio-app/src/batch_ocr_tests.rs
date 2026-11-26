@@ -25,7 +25,7 @@ fn batch_ocr_image_is_owned_reopenable_and_retained_for_its_source_unit() {
     let scope_id = repo.scope_identity().unwrap().scope_id;
     let encoded = base64::engine::general_purpose::STANDARD.encode(&source);
     let body = json!({
-        "model": "mistral-ocr-2505",
+        "model": "mistral-ocr-2505-completion",
         "pages": [{
             "index": 0,
             "markdown": "![provider figure](data:image/png;base64,ignored)",
@@ -52,6 +52,23 @@ fn batch_ocr_image_is_owned_reopenable_and_retained_for_its_source_unit() {
         false,
     )
     .unwrap();
+    assert_eq!(
+        response.updated_units[0].metadata["model_version_pin"],
+        "mistral-ocr-2505"
+    );
+    assert!(matches!(
+        materialize_mistral_batch_ocr_body(
+            &body,
+            "mistral-ocr-4-1",
+            Some(std::slice::from_ref(&hint)),
+            "image/png",
+            &raw_hash,
+            &scope_id,
+            &repo.object_store().image_store().unwrap(),
+            false,
+        ),
+        Err(BatchOcrMaterializationError::ResponseModelMismatch)
+    ));
     let expected_uri = format!("kio://{scope_id}/object/image/{raw_hash}");
     assert_eq!(
         response.updated_units[0].markdown,

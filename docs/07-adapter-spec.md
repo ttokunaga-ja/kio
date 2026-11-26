@@ -810,7 +810,7 @@ Markdownize の Batch は 1 job = 1 task、custom_id = task の input_hash、job
 
 config (`~/.config/kio/tools.toml`) では `mistral-ocr-latest` のような可変 alias を指定できる。Adapter はモデル一覧で設定値と完全一致する `id` を探し、その行の `id` と `aliases` を候補とする。`-latest` で終わる名前と、`deprecation` が非 null の候補は除外する。設定 alias 自体が廃止済みの場合や、候補の行が一覧にない場合は契約違反とする。
 残った候補のうち、他の全候補をハイフン区切りの接頭辞として持つ一意の名前を選ぶ（例: `mistral-ocr-4` → `mistral-ocr-4-1`）。候補が空、または選択が曖昧な場合は契約違反とする。
-`-latest` で終わらない設定値は一覧照会せずに使う。同期リクエストと Batch job の作成には解決済みの pin を使い、OCR 処理結果と `tool_profile_hash` の `model_version_pin` にその pin を記録する ([03-data-model.md §5.1](03-data-model.md))。Batch 回収では帰属を照合した job の `model` から送信時の pin を取得する。応答本文に `model` がある場合は pin と完全一致が必要で、一覧にある alias も含めて不一致は契約違反とする。モデル更新は `tool_changed` として扱われ、再 Markdownize は first-instance-wins / gen の既存機構 (§9) に乗る。
+`-latest` で終わらない設定値は一覧照会せずに使う。同期リクエストと Batch job の作成には解決済みの pin を使い、OCR 処理結果と `tool_profile_hash` の `model_version_pin` にその pin を記録する ([03-data-model.md §5.1](03-data-model.md))。Batch 回収では帰属を照合した job の `model` から送信時の pin を取得する。応答本文に `model` がある場合は pin と完全一致が必要とする。Mistral OCR の Batch 結果では、公式出力例にある応答表記 `<pin>-completion` も同じ pin として扱う。それ以外の不一致は、一覧にある alias を含めて契約違反とする。モデル更新は `tool_changed` として扱われ、再 Markdownize は first-instance-wins / gen の既存機構 (§9) に乗る。
 
 ---
 
