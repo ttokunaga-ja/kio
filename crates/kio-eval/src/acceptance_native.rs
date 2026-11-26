@@ -1189,6 +1189,13 @@ fn create_boundary_link(link: &Path, target: &Path) -> Result<(), AcceptanceErro
     std::os::unix::fs::symlink(target, link).map_err(io_at("create boundary symlink", link))
 }
 
+#[cfg(any(windows, test))]
+fn junction_path_is_safe(path: &str) -> bool {
+    !path
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '%' | '!' | '"' | '^'))
+}
+
 /// Directory junctions do not require Developer Mode or a symlink privilege,
 /// unlike Windows symbolic links. `mklink /J` is the OS-native fixture setup
 /// used to exercise the same reparse-point boundary on the hosted runner.
@@ -1200,6 +1207,11 @@ fn create_boundary_link(link: &Path, target: &Path) -> Result<(), AcceptanceErro
         let text = path
             .to_str()
             .ok_or_else(|| AcceptanceError::Invalid(format!("junction {what} is not UTF-8")))?;
+        if !junction_path_is_safe(text) {
+            return Err(AcceptanceError::Invalid(format!(
+                "junction {what} contains a cmd metacharacter or control character"
+            )));
+        }
         let plain = text.strip_prefix(r"\\?\").unwrap_or(text);
         if matches!(plain.as_bytes(), [drive, b':', b'\\', ..] if drive.is_ascii_alphabetic()) {
             Ok(plain)
@@ -1219,6 +1231,15 @@ fn create_boundary_link(link: &Path, target: &Path) -> Result<(), AcceptanceErro
         .output()
         .map_err(io_at("run mklink /J", Path::new(link)))?;
     if output.status.success() {
+        let resolved_link =
+            fs::canonicalize(link).map_err(io_at("resolve junction", Path::new(link)))?;
+        let resolved_target = fs::canonicalize(target)
+            .map_err(io_at("resolve junction target", Path::new(target)))?;
+        if resolved_link != resolved_target {
+            return Err(AcceptanceError::Invalid(format!(
+                "junction '{link}' does not resolve to intended target '{target}'"
+            )));
+        }
         Ok(())
     } else {
         Err(AcceptanceError::Command(format!(
@@ -2031,6 +2052,15 @@ fn io_at<'a>(
 mod tests {
     use super::*;
     use serde_json::{Value, json};
+
+    #[test]
+    fn junction_paths_reject_cmd_metacharacters_and_controls() {
+        for character in ['%', '!', '"', '^', '\0', '\n', '\u{7f}', '\u{85}'] {
+            let path = format!("C:\\fixture\\before{character}after");
+            assert!(!junction_path_is_safe(&path), "accepted {character:?}");
+        }
+        assert!(junction_path_is_safe(r"C:\fixture\ordinary path-日本語"));
+    }
 
     #[test]
     fn same_length_mutation_preserves_mtime_and_changes_bytes() {
