@@ -481,6 +481,10 @@ fn poll_until_complete(
             provider,
             key,
         );
+        // A child cut short by the overall deadline means the batch is still pending.
+        if Instant::now() >= deadline {
+            break;
+        }
         let value = parse_child_json(&output?, &stage)?;
         if value.pointer("/tasks_inflight").and_then(Value::as_u64) == Some(0) {
             return Ok(value);
