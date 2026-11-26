@@ -199,36 +199,7 @@ impl MistralOcrClient for EnvMistralOcrClient {
             MODEL_CATALOG_MAX_BYTES,
             "Mistral model catalog response",
         )?;
-        let family = configured_model.trim_end_matches("-latest");
-        let models = value.get("data").and_then(Value::as_array).ok_or_else(|| {
-            AdapterError::ContractViolation("Mistral model catalog missing data".to_owned())
-        })?;
-        if models.len() > 10_000 {
-            return Err(AdapterError::ContractViolation(
-                "Mistral model catalog has too many entries".to_owned(),
-            ));
-        }
-        if models.iter().any(|model| {
-            model
-                .get("id")
-                .and_then(Value::as_str)
-                .is_some_and(|id| id.len() > 512)
-        }) {
-            return Err(AdapterError::ContractViolation(
-                "Mistral model identifier exceeds 512 bytes".to_owned(),
-            ));
-        }
-        models
-            .iter()
-            .filter_map(|model| model.get("id").and_then(Value::as_str))
-            .filter(|id| id.starts_with(family) && !id.ends_with("-latest"))
-            .max()
-            .map(str::to_owned)
-            .ok_or_else(|| {
-                AdapterError::ContractViolation(format!(
-                    "no versioned model found for {configured_model}"
-                ))
-            })
+        catalog_model_pin(&value, configured_model)
     }
 
     fn ocr_markdown(
@@ -280,6 +251,68 @@ impl MistralOcrClient for EnvMistralOcrClient {
             request.bbox_annotation_enabled,
         )
     }
+}
+
+fn catalog_model_pin(value: &Value, configured_model: &str) -> Result<String> {
+    let models = value.get("data").and_then(Value::as_array).ok_or_else(|| {
+        AdapterError::ContractViolation("Mistral model catalog missing data".to_owned())
+    })?;
+    if models.len() > 10_000 {
+        return Err(AdapterError::ContractViolation(
+            "Mistral model catalog has too many entries".to_owned(),
+        ));
+    }
+    let mut entries = BTreeMap::new();
+    for model in models {
+        let Some(id) = model.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if id.len() > 512 || entries.insert(id, model).is_some() {
+            return Err(AdapterError::ContractViolation(
+                "invalid or duplicate Mistral catalog identifier".to_owned(),
+            ));
+        }
+    }
+    let deprecated = |entry: &Value| entry.get("deprecation").is_some_and(|date| !date.is_null());
+    let unresolved = || {
+        AdapterError::ContractViolation(format!(
+            "no unique active versioned model for {configured_model}"
+        ))
+    };
+    let entry = entries.get(configured_model).ok_or_else(unresolved)?;
+    if deprecated(entry) {
+        return Err(unresolved());
+    }
+    let mut candidates = BTreeSet::new();
+    // The configured entry is a -latest id, so only its aliases can survive.
+    for alias in entry
+        .get("aliases")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let id = alias
+            .as_str()
+            .filter(|id| id.len() <= 512)
+            .ok_or_else(unresolved)?;
+        if !id.ends_with("-latest") && !deprecated(entries.get(id).ok_or_else(unresolved)?) {
+            candidates.insert(id);
+        }
+    }
+    let pin = candidates
+        .iter()
+        .copied()
+        .max_by_key(|id| id.len())
+        .ok_or_else(unresolved)?;
+    if candidates.iter().any(|id| {
+        *id != pin
+            && !pin
+                .strip_prefix(id)
+                .is_some_and(|suffix| suffix.starts_with('-'))
+    }) {
+        return Err(unresolved());
+    }
+    Ok(pin.to_owned())
 }
 
 /// Read the OCR response under the existing wire-byte ceiling, then reject a
@@ -552,7 +585,7 @@ impl<C> MistralOcrMarkdownizeAdapter<C> {
 
 /// Construct the cloud adapter profile without credentials or network access.
 #[must_use]
-pub(crate) fn mistral_ocr_profile(
+pub fn mistral_ocr_profile(
     configured_model: &str,
     bbox_annotation_enabled: bool,
     provider_idempotency: crate::types::ProviderIdempotency,
@@ -744,8 +777,10 @@ impl<C: MistralOcrClient> MarkdownizeAdapter for MistralOcrMarkdownizeAdapter<C>
 /// neither may be accepted from provider output. `None` discovers units from a
 /// fresh OCR response, while `Some` preserves the exact (possibly retry-scoped)
 /// prepared-page set that was submitted to Mistral.
+#[allow(clippy::too_many_arguments)]
 pub fn materialize_mistral_batch_ocr_body(
     body: &Value,
+    model_pin: &str,
     prepared_unit_hints: Option<&[PreparedUnitHint]>,
     media_type: &str,
     raw_hash: &str,
@@ -754,14 +789,6 @@ pub fn materialize_mistral_batch_ocr_body(
     bbox_annotation_enabled: bool,
 ) -> std::result::Result<(MarkdownizeResponse, Vec<PreparedUnitHint>), BatchOcrMaterializationError>
 {
-    // Batch output has no independently resolved model-pin lookup at collect
-    // time. Require the provider's echoed model rather than fabricating
-    // provenance from a task or job record.
-    let model_pin = body.get("model").and_then(Value::as_str).ok_or_else(|| {
-        BatchOcrMaterializationError::Contract(AdapterError::ContractViolation(
-            "batch OCR body is missing its model field".to_owned(),
-        ))
-    })?;
     let expected_page_indices = prepared_unit_hints
         .map(|hints| {
             hints
@@ -1073,6 +1100,7 @@ fn ocr_request_body(
         "model": model_pin,
         "document": document_payload(media_type, bytes),
         "include_image_base64": true,
+        "include_blocks": false,
     });
     if let (Some(pages), Some(object)) = (pages, body.as_object_mut()) {
         object.insert("pages".to_owned(), json!(pages));
@@ -1095,6 +1123,14 @@ fn parse_ocr_response(
     policy: OcrResponsePolicy,
     bbox_annotation_enabled: bool,
 ) -> Result<OcrResponse> {
+    if value
+        .get("model")
+        .is_some_and(|model| model.as_str() != Some(model_pin))
+    {
+        return Err(AdapterError::ContractViolation(
+            "OCR response model does not match the requested pin".to_owned(),
+        ));
+    }
     let page_values = value
         .get("pages")
         .and_then(Value::as_array)
@@ -1168,11 +1204,7 @@ fn parse_ocr_response(
     }
     Ok(OcrResponse {
         pages,
-        model_version_pin: value
-            .get("model")
-            .and_then(Value::as_str)
-            .unwrap_or(model_pin)
-            .to_owned(),
+        model_version_pin: model_pin.to_owned(),
     })
 }
 
@@ -1715,6 +1747,68 @@ mod tests {
     use serde_json::Value;
     use std::path::PathBuf;
 
+    #[test]
+    fn catalog_resolves_latest_to_specific_listed_pin() {
+        let catalog = json!({"data": [
+            {"id": "mistral-ocr-latest", "aliases": ["mistral-ocr-4", "mistral-ocr-4-1"]},
+            {"id": "mistral-ocr-4", "aliases": ["mistral-ocr-latest", "mistral-ocr-4-1"]},
+            {"id": "mistral-ocr-4-1", "aliases": ["mistral-ocr-latest", "mistral-ocr-4"], "deprecation": null},
+            {"id": "mistral-ocr-2512", "aliases": ["mistral-ocr-3-0", "mistral-ocr-3"], "deprecation": null},
+            {"id": "mistral-ocr-3-0", "aliases": ["mistral-ocr-2512", "mistral-ocr-3"]},
+            {"id": "mistral-ocr-3", "aliases": ["mistral-ocr-2512", "mistral-ocr-3-0"]}
+        ]});
+        assert_eq!(
+            catalog_model_pin(&catalog, "mistral-ocr-latest").unwrap(),
+            "mistral-ocr-4-1"
+        );
+    }
+
+    #[test]
+    fn catalog_rejects_unresolvable_or_oversized_aliases() {
+        for data in [
+            json!([{"id":"ocr-latest","aliases":["ocr-4-1","ocr-4-2"]},
+                   {"id":"ocr-4-1"},{"id":"ocr-4-2"}]),
+            json!([{"id":"ocr-latest","aliases":["ocr-4"]},
+                   {"id":"ocr-4","deprecation":"2026-11-26"}]),
+            json!([{"id":"ocr-latest","aliases":["ocr-4"],"deprecation":"2026-11-26"},
+                   {"id":"ocr-4"}]),
+            json!([{"id":"ocr-4"}]),
+            json!([{"id":"ocr-latest","aliases":["ocr-4"]}]),
+            json!([{"id":"ocr-latest","aliases":["x".repeat(513)]}]),
+            json!(vec![json!({"id":"ocr-4"}); 10_001]),
+        ] {
+            assert!(matches!(
+                catalog_model_pin(&json!({"data": data}), "ocr-latest"),
+                Err(AdapterError::ContractViolation(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn ocr_response_checks_model_and_records_requested_pin() {
+        let pin = "mistral-ocr-4-1";
+        for value in [json!({"pages": []}), json!({"pages": [], "model": pin})] {
+            assert_eq!(
+                parse_ocr_response(value, pin, None, OcrResponsePolicy::default(), false)
+                    .unwrap()
+                    .model_version_pin,
+                pin
+            );
+        }
+        for model in [json!("mistral-ocr-4"), Value::Null] {
+            assert!(matches!(
+                parse_ocr_response(
+                    json!({"pages": [], "model": model}),
+                    pin,
+                    None,
+                    OcrResponsePolicy::default(),
+                    false,
+                ),
+                Err(AdapterError::ContractViolation(_))
+            ));
+        }
+    }
+
     struct PrivateImageStore {
         _outer: tempfile::TempDir,
         path: PathBuf,
@@ -2123,6 +2217,7 @@ mod tests {
             "the request body must carry exactly the scoped pages"
         );
         assert_eq!(body["model"], "mistral-ocr-2505");
+        assert_eq!(body["include_blocks"], false);
         assert!(
             body.get("document").is_some(),
             "the document payload is always present"

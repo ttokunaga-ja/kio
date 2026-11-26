@@ -80,6 +80,8 @@ impl BatchJobStatus {
 pub struct BatchJobRecord {
     pub job_id: String,
     pub status: BatchJobStatus,
+    /// Model attached to the submitted job, independent of the OCR output.
+    pub model: Option<String>,
     /// Provider file id of the result JSONL once `status` is `Success`.
     pub output_file_id: Option<String>,
     /// Job metadata exactly as the provider returns it (07 §5.5: create_job
@@ -132,7 +134,7 @@ pub fn batch_input_line(custom_id: &str, body: &serde_json::Value) -> String {
 }
 
 /// The batch-input request body for one OCR task (verified shape: the sync
-/// lane's document payload + `include_image_base64`, WITHOUT the model —
+/// lane's document payload + image and block options, WITHOUT the model —
 /// the model rides the job). `pages` carries the incremental page subset
 /// exactly like the sync lane's `pages` field; `None` = mode=Full.
 /// `bbox_annotation` attaches the same A.2 `bbox_annotation_format` value
@@ -157,6 +159,7 @@ pub fn ocr_batch_body(
     let mut body = serde_json::json!({
         "document": document,
         "include_image_base64": true,
+        "include_blocks": false,
     });
     if let Some(pages) = pages {
         body["pages"] = serde_json::json!(pages);
@@ -510,6 +513,10 @@ fn parse_job_record(value: &Value) -> Result<BatchJobRecord> {
     Ok(BatchJobRecord {
         job_id: job_id.to_owned(),
         status: BatchJobStatus::parse(status_raw),
+        model: value
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
         output_file_id: value
             .get("output_file")
             .and_then(Value::as_str)
@@ -824,17 +831,21 @@ impl MockBatchClient {
 
     fn job_record(&self, status_raw: &str) -> Result<BatchJobRecord> {
         let status = BatchJobStatus::parse(status_raw);
+        let submitted = self.load_attribution()?.remove(&self.attribution_key());
         Ok(BatchJobRecord {
             job_id: self.script.job_id.clone(),
+            model: submitted
+                .as_ref()
+                .and_then(|job| job["model"].as_str())
+                .map(str::to_owned),
             output_file_id: matches!(status, BatchJobStatus::Success)
                 .then(|| format!("{}-output", self.script.job_id)),
             status,
             metadata: match &self.script.job_metadata {
                 Some(metadata) => metadata.clone(),
-                None => self
-                    .load_attribution()?
-                    .remove(&self.attribution_key())
-                    .unwrap_or(serde_json::Value::Null),
+                None => submitted
+                    .map(|job| job["metadata"].clone())
+                    .unwrap_or(Value::Null),
             },
         })
     }
@@ -869,7 +880,7 @@ impl MistralBatchClient for MockBatchClient {
             "metadata": metadata,
         }));
         self.fail_if_scripted("create_job")?;
-        self.remember_attribution(metadata.clone())?;
+        self.remember_attribution(serde_json::json!({"model": model, "metadata": metadata}))?;
         let mut record = self.job_record(
             self.script
                 .status_sequence
@@ -903,6 +914,7 @@ impl MistralBatchClient for MockBatchClient {
                 Ok(BatchJobRecord {
                     job_id: entry["job_id"].as_str().unwrap_or_default().to_owned(),
                     status: BatchJobStatus::parse(entry["status"].as_str().unwrap_or("QUEUED")),
+                    model: entry["model"].as_str().map(str::to_owned),
                     output_file_id: entry["output_file_id"].as_str().map(str::to_owned),
                     metadata: entry["metadata"].clone(),
                 })
@@ -1095,7 +1107,9 @@ mod tests {
         // A fresh client models a later CLI invocation; attribution is taken
         // from provider fixture state, never from the queried ledger row.
         let reopened = MockBatchClient::from_env_value(&script.to_string()).unwrap();
-        assert_eq!(reopened.get_job(&default_job()).unwrap().metadata, metadata);
+        let job = reopened.get_job(&default_job()).unwrap();
+        assert_eq!(job.metadata, metadata);
+        assert_eq!(job.model.as_deref(), Some("model"));
         for field in ["provider_scope_id", "job_id"] {
             let mut other = script.clone();
             other[field] = serde_json::json!("different");
@@ -1138,6 +1152,8 @@ mod tests {
         );
         let without = ocr_batch_body("application/pdf", b"%PDF", None, false);
         assert!(without.get("bbox_annotation_format").is_none());
+        assert_eq!(with["include_blocks"], false);
+        assert_eq!(without["include_blocks"], false);
     }
 
     #[test]
@@ -1383,7 +1399,7 @@ mod tests {
         let (base, server, http) = spawn_scripted_server(vec![http_response(
             "200 OK",
             &[],
-            r#"{"id":"batch-verified-1","object":"batch","status":"QUEUED","output_file":null,"metadata":{"intent_token":"echoed-by-provider"}}"#,
+            r#"{"id":"batch-verified-1","object":"batch","status":"QUEUED","model":"mistral-ocr-4-1","output_file":null,"metadata":{"intent_token":"echoed-by-provider"}}"#,
         )]);
         let client = with_test_mistral_auth(|settings| {
             let mut client =
@@ -1399,12 +1415,13 @@ mod tests {
             "tool_profile_hash": "sha256:bbbb",
         });
         let record = client
-            .create_job("file-verified-1", "mistral-ocr-2505", &sent_metadata)
+            .create_job("file-verified-1", "mistral-ocr-4-1", &sent_metadata)
             .unwrap();
 
         assert_eq!(record.job_id, "batch-verified-1");
         assert_eq!(record.status, BatchJobStatus::Queued);
         assert_eq!(record.output_file_id, None);
+        assert_eq!(record.model.as_deref(), Some("mistral-ocr-4-1"));
         // The record's metadata is the PROVIDER's returned value (07 §5.5
         // round-trip contract observes what came back, never an input echo).
         assert_eq!(
@@ -1431,7 +1448,7 @@ mod tests {
             serde_json::json!({
                 "input_files": ["file-verified-1"],
                 "endpoint": "/v1/ocr",
-                "model": "mistral-ocr-2505",
+                "model": "mistral-ocr-4-1",
                 "metadata": sent_metadata,
             })
         );

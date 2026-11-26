@@ -454,6 +454,8 @@ adapter_kind          "prepare" | "markdownize" | "embedding" | ...
 adapter_role          "text" | "image" | "multimodal"
 model_or_tool_family  "gemini-2.5-pro" | "gpt-4o" | "tesseract" の正規化名
 model_version_pin     ベンダー側 immutable tag (latest 等の可変 alias は禁止)
+                      Mistral OCR は [07-adapter-spec.md §6](07-adapter-spec.md) の解決規則で選んだ
+                      リクエストの pin を記録する。
                       **runtime_kind="local" かつ execution_mode="offline_api" または "native_library" (重みを持つ
                       ローカルモデル) では、重みファイル (GGUF / safetensors) の sha256 を
                       pin とする** — `gemma-3-4b-it-q4_k_m` 等のタグ名は量子化違いで同名に

@@ -39,7 +39,7 @@
    - embedding のモデル `gemini-embedding-2` が使えるか。予算・上限の設定（Environment の変数では 1 回の受入あたり USD 10）。
 2. **Mistral（La Plateforme の console）**
    - `MISTRAL_API_KEY` に当たる鍵が有効か（作成日 2026-09-08 前後）。
-   - workspace の課金・支払い方法が有効か。月の上限・残高。正式受入で指定する OCR モデル（`mistral-ocr-4-0`）と Batch が使える plan か。固定モデルは [受入コード](../crates/kio-eval/src/acceptance_provider.rs) を参照する。
+   - workspace の課金・支払い方法が有効か。月の上限・残高。正式受入で指定する OCR モデル（`mistral-ocr-4-1`）と Batch が使える plan か。固定モデルは [受入コード](../crates/kio-eval/src/acceptance_provider.rs) を参照する。
 3. **GitHub App（ledger 用）**
    - GitHub の Settings → Developer settings → GitHub Apps に、`KIO_LEDGER_APP_SLUG` の名前の App があるか。repo `ttokunaga-ja/kio` に install されていて、その installation の権限が Contents の read/write を含み、対象 repo が kio だけか。
    - App の秘密鍵の登録日と状態を一覧で確かめる。

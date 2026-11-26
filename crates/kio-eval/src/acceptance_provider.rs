@@ -253,7 +253,7 @@ fn write_tools_config(root: &Path, provider: Provider) -> Result<(), AcceptanceE
     let body = match provider {
         Provider::Mistral => concat!(
             "[markdown.mistral_ocr_markdownize]\n",
-            "kind = \"online_api\"\nmodel = \"mistral-ocr-4-0\"\n",
+            "kind = \"online_api\"\nmodel = \"mistral-ocr-4-1\"\n",
             "auth = \"env:MISTRAL_API_KEY\"\n",
             "[markdown.mistral_ocr_markdownize.pricing]\npages = 0.004\n"
         ),

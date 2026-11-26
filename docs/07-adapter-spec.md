@@ -496,6 +496,7 @@ incremental の詳細プロンプト規約は §8 (生成 LLM 系のみ。§8 �
 
 **標準 Adapter (非 text-native)**: PDF / DOCX / PPTX / 画像の Markdownize 第一候補は Mistral OCR 系文書処理 API (`mistral_ocr_markdownize`) とする (経緯: 旧 `research/markdown.md` — git 履歴)。規約:
 
+- 同期と Batch の OCR リクエストは `include_blocks: false` を明示する。段落ブロックは Kio の出力に使わず、profile hash の入力にも含めない。
 - 表は Markdown 本文に inline で保持する (`table_format=null` 相当)。独立 table object は作らない。
 - 文書内 embedded image は抽出して image object ([03-data-model.md §2](03-data-model.md)) として保存し、Markdown 内の参照は `kio://<scope_id>/object/image/<image_hash>` に置換する ([08-evidence-pointer-spec.md §2.3](08-evidence-pointer-spec.md))。
 - bbox / page / confidence score は unit metadata に記録する。**Evidence Pointer schema には含めない**。
@@ -807,7 +808,9 @@ Markdownize の Batch は 1 job = 1 task、custom_id = task の input_hash、job
 
 `tool_lock_hash` は **[03-data-model.md §5.2](03-data-model.md) の canonical 入力** (spec_version + 各 role の tool_id / profile_hash — embedding のみ + dimensions / distance / modality) を JCS 畳み込みした identity — **tool-lock.json 全体ではない**。`kind` / `capabilities` / `mode` は作業コピーの表示・検証用 field であり identity に含めない (toollock object へ保存されるのも §5.2 の canonical bytes)。
 
-config (`~/.config/kio/tools.toml`) では `mistral-ocr-latest` のような可変 alias を指定してよい。ただし **OCR API は応答内で alias を実バージョンに解決しない**。したがって Adapter は **API 呼び出し自体を版付きモデル名で行う**: alias が設定されている場合は、Adapter が実行開始時に提供元のモデル一覧 API から現行の版付き名を解決してから呼び出し、その版を `tool_profile_hash` の `model_version_pin` に記録する ([03-data-model.md §5.1](03-data-model.md) — 可変 alias の pin は禁止)。モデル更新は `tool_changed` として扱われ、再 Markdownize は first-instance-wins / gen の既存機構 (§9) に乗る。
+config (`~/.config/kio/tools.toml`) では `mistral-ocr-latest` のような可変 alias を指定できる。Adapter はモデル一覧で設定値と完全一致する `id` を探し、その行の `id` と `aliases` を候補とする。`-latest` で終わる名前と、`deprecation` が非 null の候補は除外する。設定 alias 自体が廃止済みの場合や、候補の行が一覧にない場合は契約違反とする。
+残った候補のうち、他の全候補をハイフン区切りの接頭辞として持つ一意の名前を選ぶ（例: `mistral-ocr-4` → `mistral-ocr-4-1`）。候補が空、または選択が曖昧な場合は契約違反とする。
+`-latest` で終わらない設定値は一覧照会せずに使う。同期リクエストと Batch job の作成には解決済みの pin を使い、OCR 処理結果と `tool_profile_hash` の `model_version_pin` にその pin を記録する ([03-data-model.md §5.1](03-data-model.md))。Batch 回収では帰属を照合した job の `model` から送信時の pin を取得する。応答本文に `model` がある場合は pin と完全一致が必要で、一覧にある alias も含めて不一致は契約違反とする。モデル更新は `tool_changed` として扱われ、再 Markdownize は first-instance-wins / gen の既存機構 (§9) に乗る。
 
 ---
 

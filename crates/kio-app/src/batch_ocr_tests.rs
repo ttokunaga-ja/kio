@@ -43,6 +43,7 @@ fn batch_ocr_image_is_owned_reopenable_and_retained_for_its_source_unit() {
     };
     let (response, _) = materialize_mistral_batch_ocr_body(
         &body,
+        "mistral-ocr-2505",
         Some(std::slice::from_ref(&hint)),
         "image/png",
         &raw_hash,
@@ -178,6 +179,7 @@ fn batch_ocr_existing_image_cas_corruption_is_recollectable_persistence_failure(
     assert!(matches!(
         materialize_mistral_batch_ocr_body(
             &body,
+            "mistral-ocr-2505",
             Some(&[hint]),
             "application/pdf",
             &hash_bytes(b"raw"),
@@ -207,6 +209,7 @@ fn batch_ocr_rejects_malformed_embedded_image_before_persistence() {
     assert!(
         materialize_mistral_batch_ocr_body(
             &body,
+            "mistral-ocr-2505",
             Some(&[hint]),
             "application/pdf",
             &hash_bytes(b"raw"),

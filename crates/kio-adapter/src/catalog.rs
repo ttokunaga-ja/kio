@@ -749,6 +749,22 @@ pub fn resolve_standard_online_markdownize_profile_with_bbox_with_control(
     bbox_annotation_enabled: bool,
     control: &ControlHandle,
 ) -> Result<AdapterProfile> {
+    resolve_standard_online_markdownize_profile_and_pin(
+        settings,
+        scope_id,
+        bbox_annotation_enabled,
+        control,
+    )
+    .map(|(profile, _)| profile)
+}
+
+/// Resolve the OCR request model and its corresponding output profile together.
+pub fn resolve_standard_online_markdownize_profile_and_pin(
+    settings: Arc<AdapterRuntimeSettings>,
+    scope_id: &str,
+    bbox_annotation_enabled: bool,
+    control: &ControlHandle,
+) -> Result<(AdapterProfile, String)> {
     settings.role_credentials_ready("markdown")?;
     let _ = control;
     #[cfg(debug_assertions)]
@@ -782,11 +798,12 @@ pub fn resolve_standard_online_markdownize_profile_with_bbox_with_control(
                 capture_sent_media: None,
             };
             let model_pin = client.resolve_model_pin("mistral-ocr-latest")?;
-            return Ok(
-                MistralOcrMarkdownizeAdapter::new(client, model_pin, scope_id)
+            return Ok((
+                MistralOcrMarkdownizeAdapter::new(client, model_pin.clone(), scope_id)
                     .with_bbox_annotation(bbox_annotation_enabled)
                     .profile(),
-            );
+                model_pin,
+            ));
         }
         // QA13: keep the seam arms in sync with `run_standard_online_markdownize`.
         Some("require_idempotency_token") => {
@@ -795,24 +812,26 @@ pub fn resolve_standard_online_markdownize_profile_with_bbox_with_control(
                 capture_sent_media: None,
             };
             let model_pin = client.resolve_model_pin("mistral-ocr-latest")?;
-            return Ok(
-                MistralOcrMarkdownizeAdapter::new(client, model_pin, scope_id)
+            return Ok((
+                MistralOcrMarkdownizeAdapter::new(client, model_pin.clone(), scope_id)
                     .with_bbox_annotation(bbox_annotation_enabled)
                     .with_provider_idempotency(ProviderIdempotency::HttpHeader(
                         "Idempotency-Key".to_owned(),
                     ))
                     .profile(),
-            );
+                model_pin,
+            ));
         }
         _ => {}
     }
     let client = EnvMistralOcrClient::new(settings.clone());
     let model_pin = client.resolve_model_pin(&declared_markdown_model(&settings)?)?;
-    Ok(
-        MistralOcrMarkdownizeAdapter::new(client, model_pin, scope_id)
+    Ok((
+        MistralOcrMarkdownizeAdapter::new(client, model_pin.clone(), scope_id)
             .with_bbox_annotation(bbox_annotation_enabled)
             .profile(),
-    )
+        model_pin,
+    ))
 }
 
 #[cfg(debug_assertions)]

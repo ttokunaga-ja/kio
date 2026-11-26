@@ -224,6 +224,7 @@ fn mistral_client(row: &BatchRequestRow) -> MistralClient {
     MistralClient {
         scope: Some("mistral:workspace".into()),
         record: BatchJobRecord {
+            model: Some("mistral-ocr-2505".into()),
             job_id: "batches/recorded".into(),
             status: BatchJobStatus::Success,
             output_file_id: Some("output-recorded".into()),

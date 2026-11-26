@@ -203,7 +203,9 @@ impl AdapterError {
     }
 }
 
-pub use mistral_ocr::{BatchOcrMaterializationError, materialize_mistral_batch_ocr_body};
+pub use mistral_ocr::{
+    BatchOcrMaterializationError, materialize_mistral_batch_ocr_body, mistral_ocr_profile,
+};
 pub use traits::{EmbeddingAdapter, MarkdownizeAdapter, PrepareAdapter};
 
 #[cfg(test)]

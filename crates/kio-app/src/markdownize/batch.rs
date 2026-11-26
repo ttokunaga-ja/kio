@@ -31,8 +31,10 @@ use kio_adapter::batch_client::batch_input_line;
 use kio_adapter::batch_client::batch_upload_filename;
 use kio_adapter::batch_client::configured_mistral_batch_client_with_control;
 use kio_adapter::batch_client::ocr_batch_body;
-use kio_adapter::catalog::resolve_standard_online_markdownize_profile_with_bbox_with_control;
+use kio_adapter::catalog::resolve_standard_online_markdownize_profile_and_pin;
+use kio_adapter::identity::is_mutable_model_alias;
 use kio_adapter::materialize_mistral_batch_ocr_body;
+use kio_adapter::mistral_ocr_profile;
 use kio_adapter::tool_lock::AdapterRuntimeSettings;
 use kio_adapter::traits::PreferredRequestKind;
 use kio_adapter::types::AdapterProfile;
@@ -185,47 +187,6 @@ pub(crate) fn markdownize_send_lane(
     }
 }
 
-/// The model string a batch job is created with (`create_job`'s second
-/// argument — the model rides the JOB, not the input line, 07 §5.5).
-fn batch_job_model(
-    adapter_settings: &Arc<AdapterRuntimeSettings>,
-    control: &ControlHandle,
-) -> String {
-    let declared = adapter_settings
-        .declared_adapter("markdown")
-        .and_then(|declared| declared.model)
-        .unwrap_or_else(|| "mistral-ocr-latest".to_owned());
-    if !declared.ends_with("-latest") {
-        return declared;
-    }
-    // A mutable alias must be resolved to a versioned pin before the call
-    // (07 §6). The alias resolver lives on the module-private sync OCR
-    // client, unreachable from this crate; under the hermetic mock seam use
-    // the same pin the KIO_TEST_MISTRAL_OCR mock resolves to so tests stay
-    // network-free and profile-consistent. The real lane's alias resolution
-    // is expected from the adapter-side EnvMistralBatchClient (in progress);
-    // until it lands `configured_mistral_batch_client()` returns None in
-    // production, so the alias fallback below can only reach a mock.
-    if mistral_batch_mock_enabled(control) {
-        "mistral-ocr-2505".to_owned()
-    } else {
-        declared
-    }
-}
-
-#[cfg(debug_assertions)]
-fn mistral_batch_mock_enabled(control: &ControlHandle) -> bool {
-    matches!(
-        control.debug().adapters.mistral_batch,
-        kio_core::test_control::Selector::Known(_)
-    )
-}
-
-#[cfg(not(debug_assertions))]
-fn mistral_batch_mock_enabled(_control: &ControlHandle) -> bool {
-    false
-}
-
 /// `next_retry_at` for the next batch poll (`now + 60s`, KIO_FIXED_NOW-aware
 /// via `now_utc_seconds`).
 pub(crate) fn batch_poll_retry_at(control: &ControlHandle) -> String {
@@ -275,6 +236,15 @@ pub(crate) fn submit_batch_markdownize_job(
         // until it is cleaned or self-described. Conservative: skip.
         return Ok(Ok(()));
     }
+    let (_, model_pin) = match resolve_standard_online_markdownize_profile_and_pin(
+        Arc::clone(adapter_settings),
+        &key.scope_id,
+        task.bbox_annotation_enabled.unwrap_or(false),
+        ledger.control(),
+    ) {
+        Ok(resolved) => resolved,
+        Err(error) => return Ok(Err(task_failure_from_adapter(error))),
+    };
     let (effective_media_type, send_bytes) = prepared_input.adapter_input();
     // A unit-scoped retry sends only the still-failed subset's pages, exactly
     // like the sync lane's `restrict_to_hint_pages` (R15-5); a full send (or
@@ -353,11 +323,7 @@ pub(crate) fn submit_batch_markdownize_job(
     if !phase2b_record_job_create_started(conn, key, intent_token).map_err(pipeline_to_kio)? {
         return Ok(Ok(()));
     }
-    let job = match client.create_job(
-        &upload_id,
-        &batch_job_model(adapter_settings, ledger.control()),
-        &metadata,
-    ) {
+    let job = match client.create_job(&upload_id, &model_pin, &metadata) {
         Ok(value) => value,
         Err(error) => return Ok(Err(task_failure_from_adapter(error))),
     };
@@ -650,6 +616,7 @@ pub(crate) fn poll_one_batch_markdownize_row(
         &job_id,
         task,
         online_profile,
+        job.model.as_deref(),
         line,
     )
 }
@@ -793,6 +760,7 @@ fn collect_batch_markdownize_output(
     job_id: &str,
     task: &TaskDescriptor,
     online_profile: &AdapterProfile,
+    job_model: Option<&str>,
     line: Option<BatchOutputLine>,
 ) -> Result<BatchPollDisposition> {
     let estimated = BilledAmount {
@@ -939,22 +907,6 @@ fn collect_batch_markdownize_output(
             return Ok(BatchPollDisposition::Retired);
         }
     };
-    // Persist identity: the resolved online profile (same resolution the sync
-    // lane records instances under — seam-aware, network-free under the OCR
-    // mock env). If resolution fails (e.g. no credentials in a passive
-    // write-command entry poll), defer — never guess an identity.
-    let resolved_profile = match resolve_standard_online_markdownize_profile_with_bbox_with_control(
-        std::sync::Arc::clone(adapter_settings),
-        &row.key.scope_id,
-        task.bbox_annotation_enabled.unwrap_or(false),
-        repo.control(),
-    ) {
-        Ok(profile) => profile,
-        Err(_) => {
-            extend_batch_poll_schedule(store, &task.task_id, repo.control())?;
-            return Ok(BatchPollDisposition::InFlight);
-        }
-    };
     let retry_units: Option<BTreeSet<String>> = task
         .unit_keys
         .as_ref()
@@ -983,16 +935,29 @@ fn collect_batch_markdownize_output(
                 .collect::<Vec<_>>(),
         )
     };
-    let converted = materialize_mistral_batch_ocr_body(
-        &line.body,
-        prepared_hints.as_deref(),
-        &prepared_input.media_type,
-        &task.input_hash,
-        &row.key.scope_id,
-        &repo.object_store().image_store()?,
-        task.bbox_annotation_enabled.unwrap_or(false),
-    );
-    let (response, effective_hints) = match converted {
+    // The attributed job carries the submission-time model even if -latest
+    // moved since submission. Reject missing or mutable job model ids.
+    let converted = match job_model
+        .filter(|pin| !pin.is_empty() && pin.len() <= 512 && !is_mutable_model_alias(pin))
+    {
+        Some(model_pin) => materialize_mistral_batch_ocr_body(
+            &line.body,
+            model_pin,
+            prepared_hints.as_deref(),
+            &prepared_input.media_type,
+            &task.input_hash,
+            &row.key.scope_id,
+            &repo.object_store().image_store()?,
+            task.bbox_annotation_enabled.unwrap_or(false),
+        )
+        .map(|converted| (converted, model_pin)),
+        None => Err(BatchOcrMaterializationError::Contract(
+            kio_adapter::AdapterError::ContractViolation(
+                "batch OCR job is missing a versioned model pin".to_owned(),
+            ),
+        )),
+    };
+    let ((response, effective_hints), model_pin) = match converted {
         Ok(converted) => converted,
         Err(BatchOcrMaterializationError::Contract(error)) => {
             // §3.2 acceptance reject (04 §5.8 相 3): terminal with the durable
@@ -1035,6 +1000,11 @@ fn collect_batch_markdownize_output(
         }
     };
     let usage = response.usage.clone();
+    let resolved_profile = mistral_ocr_profile(
+        model_pin,
+        task.bbox_annotation_enabled.unwrap_or(false),
+        online_profile.provider_idempotency.clone(),
+    );
     let materialized = materialize_online_markdownize_response(
         repo,
         task,
