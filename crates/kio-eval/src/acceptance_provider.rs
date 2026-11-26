@@ -6,15 +6,13 @@
 //! child times out or returns an indeterminate provider result.
 
 use std::{
-    env,
-    fs::{self, File},
-    io::Read,
+    env, fs,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    thread,
-    time::{Duration, Instant},
+    process::Command,
+    time::Duration,
 };
 
+use kio_process::{BoundedProcessOptions, run_bounded_command};
 use serde_json::Value;
 
 use crate::{
@@ -29,7 +27,8 @@ use crate::{
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(90);
 const POLL_LIMIT: usize = 8;
-const MAX_CHILD_OUTPUT: u64 = 256 * 1024;
+const MAX_CHILD_OUTPUT: usize = 256 * 1024;
+const MAX_DIAGNOSTIC_BYTES: usize = 512;
 const FIXTURE_MAX_BYTES: u64 = 64 * 1024;
 
 /// The provider selected by the guarded workflow.  It is intentionally not a
@@ -100,6 +99,7 @@ pub fn run_a08_provider(
         &options.binary,
         &isolated,
         &scope,
+        "init",
         &["--json", "init"],
         options.provider,
         &key,
@@ -108,6 +108,7 @@ pub fn run_a08_provider(
         &options.binary,
         &isolated,
         &scope,
+        "ledger-init",
         &["--json", "ledger", "init"],
         options.provider,
         &key,
@@ -327,6 +328,7 @@ fn run_mistral(
         &options.binary,
         root,
         scope,
+        "adapter-approve",
         &[
             "--json",
             "adapter",
@@ -341,6 +343,7 @@ fn run_mistral(
         &options.binary,
         root,
         scope,
+        "index-realtime",
         &["--json", "index", "--online", "--realtime"],
         Provider::Mistral,
         key,
@@ -350,6 +353,7 @@ fn run_mistral(
         &options.binary,
         root,
         scope,
+        "index-batch",
         &["--json", "index", "--online", "--batch"],
         Provider::Mistral,
         key,
@@ -369,6 +373,7 @@ fn run_gemini(
         &options.binary,
         root,
         scope,
+        "adapter-approve",
         &[
             "--json",
             "adapter",
@@ -383,6 +388,7 @@ fn run_gemini(
         &options.binary,
         root,
         scope,
+        "index-realtime",
         &["--json", "index", "--online", "--realtime"],
         Provider::Gemini,
         key,
@@ -392,6 +398,7 @@ fn run_gemini(
         &options.binary,
         root,
         scope,
+        "search-vector",
         &[
             "--json",
             "search",
@@ -418,6 +425,7 @@ fn run_gemini(
         &options.binary,
         root,
         scope,
+        "index-batch",
         &["--json", "index", "--online", "--batch"],
         Provider::Gemini,
         key,
@@ -434,11 +442,12 @@ fn poll_until_complete(
     provider: Provider,
     key: &str,
 ) -> Result<Value, AcceptanceError> {
-    for _ in 0..POLL_LIMIT {
+    for attempt in 1..=POLL_LIMIT {
         let value = run_json(
             binary,
             root,
             scope,
+            &format!("batch-resume#{attempt}"),
             &["--json", "batch", "resume", "--online"],
             provider,
             key,
@@ -509,26 +518,25 @@ fn run_json(
     binary: &Path,
     root: &Path,
     scope: &Path,
+    stage: &str,
     args: &[&str],
     provider: Provider,
     key: &str,
 ) -> Result<Value, AcceptanceError> {
-    let output = run_child(binary, root, scope, args, provider, key)?;
-    serde_json::from_slice(&output).map_err(|_| invalid("provider command emitted invalid JSON"))
+    let output = run_child(binary, root, scope, stage, args, provider, key)?;
+    serde_json::from_str(&output)
+        .map_err(|_| invalid(format!("provider command {stage} emitted invalid JSON")))
 }
 
 fn run_child(
     binary: &Path,
     root: &Path,
     scope: &Path,
+    stage: &str,
     args: &[&str],
     provider: Provider,
     key: &str,
-) -> Result<Vec<u8>, AcceptanceError> {
-    // A file avoids the pipe back-pressure deadlock that would otherwise let a
-    // noisy child evade the deadline before it can be killed and reaped.
-    let stdout_path = root.join("tmp").join("child-output.json");
-    let stdout = File::create(&stdout_path).map_err(io_error)?;
+) -> Result<String, AcceptanceError> {
     let mut command = Command::new(binary);
     IsolatedChildEnvironment::new(
         root,
@@ -541,36 +549,75 @@ fn run_child(
     command
         .env(provider.credential_name(), key)
         .current_dir(scope)
-        .args(args)
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::null());
-    let mut child = command.spawn().map_err(io_error)?;
-    let deadline = Instant::now() + COMMAND_TIMEOUT;
-    loop {
-        if let Some(status) = child.try_wait().map_err(io_error)? {
-            if !status.success() {
-                return Err(invalid("provider product command failed"));
-            }
-            break;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(invalid("provider product command timed out and was reaped"));
-        }
-        thread::sleep(Duration::from_millis(25));
+        .args(args);
+    let output = run_bounded_command(
+        &mut command,
+        BoundedProcessOptions {
+            timeout: COMMAND_TIMEOUT,
+            max_stdout_bytes: MAX_CHILD_OUTPUT,
+            max_stderr_bytes: MAX_CHILD_OUTPUT,
+        },
+        None,
+    )
+    .map_err(|error| invalid(format!("provider command {stage}: {error}")))?;
+    if output.status.success() {
+        return Ok(output.stdout);
     }
-    let mut bytes = Vec::new();
-    let mut stdout = File::open(stdout_path).map_err(io_error)?;
-    stdout
-        .by_ref()
-        .take(MAX_CHILD_OUTPUT + 1)
-        .read_to_end(&mut bytes)
-        .map_err(io_error)?;
-    if bytes.len() as u64 > MAX_CHILD_OUTPUT {
-        return Err(invalid("provider product command exceeded bounded output"));
+    let status = output.status;
+    let summary = format!("provider command {stage} failed ({status})");
+    let details = [&output.stderr, &output.stdout]
+        .into_iter()
+        .find_map(|stream| child_error_fields(stream, key));
+    Err(invalid(match details {
+        Some(details) => format!("{summary}: {details}"),
+        None => summary,
+    }))
+}
+
+fn child_error_fields(stream: &str, key: &str) -> Option<String> {
+    // The CLI emits one JSON error per line, possibly after other diagnostics.
+    // Also accept a complete, pretty-printed object on either stream.
+    std::iter::once(stream)
+        .chain(stream.lines())
+        .find_map(|line| {
+            let error: Value = serde_json::from_str(line).ok()?;
+            let code = scrub_error_field(error.get("error_code")?.as_str()?, key);
+            let message = scrub_error_field(error.get("message")?.as_str()?, key);
+            // Give both fields room even if a child emits an unusually long code.
+            let code = &code[..code.floor_char_boundary(64)];
+            let message =
+                &message[..message.floor_char_boundary(MAX_DIAGNOSTIC_BYTES - code.len() - 2)];
+            Some(format!("{code}: {message}"))
+        })
+}
+
+fn scrub_error_field(value: &str, key: &str) -> String {
+    // Drop the suffix conservatively. Authorization values can contain
+    // arbitrary schemes, quoting, whitespace and multiple parameters.
+    let lower = value.to_ascii_lowercase();
+    let cutoff = ["authorization", "bearer"]
+        .iter()
+        .filter_map(|marker| lower.find(marker))
+        .min();
+    let mut prefix = value;
+    if let Some(cutoff) = cutoff {
+        // If a marker lands inside the key, omit the key's prefix as well.
+        let start = value
+            .match_indices(key)
+            .find(|(start, matched)| *start < cutoff && *start + matched.len() > cutoff)
+            .map_or(cutoff, |(start, _)| start);
+        prefix = &value[..start];
     }
-    Ok(bytes)
+    let mut scrubbed = if key.is_empty() {
+        prefix.to_owned()
+    } else {
+        prefix.replace(key, "[redacted]")
+    };
+    if cutoff.is_some() {
+        scrubbed.push_str("[redacted]");
+    }
+    scrubbed.retain(|character| !character.is_control());
+    scrubbed
 }
 
 fn tiny_png() -> &'static [u8] {
@@ -672,5 +719,85 @@ mod tests {
             .decode()
             .expect("generated image must decode with the production image decoder");
         assert_eq!(image.dimensions(), (1, 1));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod child_tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::{Provider, fs, prepare_isolated_root, run_child};
+
+    fn failed_child(script: &str) -> String {
+        let temp = tempfile::tempdir().unwrap();
+        let root = prepare_isolated_root(&temp.path().join("work")).unwrap();
+        let binary = root.join("fake");
+        fs::write(&binary, format!("#!/bin/sh\n{script}")).unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        run_child(
+            &binary,
+            &root,
+            &root,
+            "index-batch",
+            &["--json", "index", "--online", "--batch"],
+            Provider::Mistral,
+            "fake-key",
+        )
+        .unwrap_err()
+        .to_string()
+    }
+
+    #[test]
+    fn failed_children_report_only_bounded_scrubbed_json() {
+        for (fd, sensitive_suffix) in [
+            (1, "bEaReR other-token"),
+            (2, "Authorization: Basic hidden"),
+        ] {
+            let payload = serde_json::json!({
+                "error_code": "mock_failure",
+                "message": format!("bad fake-key {sensitive_suffix}"),
+                "context": {"raw": "private-context"}
+            });
+            let error = failed_child(&format!(
+                "printf '%s\n' 'raw-body' '{payload}' >&{fd}\nexit 17\n"
+            ));
+            assert!(
+                error.contains("index-batch") && error.contains("exit status: 17"),
+                "{error}"
+            );
+            assert!(
+                error.contains("mock_failure: bad [redacted] [redacted]"),
+                "{error}"
+            );
+            for forbidden in [
+                "fake-key",
+                "other-token",
+                "hidden",
+                "private-context",
+                "raw-body",
+            ] {
+                assert!(!error.contains(forbidden), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn child_failure_bounds_multibyte_message() {
+        let payload = serde_json::json!({"error_code": "test", "message": "界".repeat(512)});
+        let error = failed_child(&format!("printf '%s\n' '{payload}' >&2\nexit 1\n"));
+        let fields = error.split_once("): ").unwrap().1;
+        assert!(fields.starts_with("test: 界"));
+        assert!(fields.len() <= super::MAX_DIAGNOSTIC_BYTES);
+        assert!(fields.len() > super::MAX_DIAGNOSTIC_BYTES - 3);
+    }
+
+    #[test]
+    fn signalled_child_reports_signal_without_raw_output() {
+        let error = failed_child("printf '%s\n' 'raw-body' >&2\nkill -TERM $$");
+        assert!(
+            error.contains("index-batch") && error.contains("signal: 15"),
+            "{error}"
+        );
+        assert!(!error.contains("raw-body"));
     }
 }
