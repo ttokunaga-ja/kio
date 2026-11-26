@@ -144,7 +144,7 @@ mount_probe=$(cat -- "$mount_helper")$'\n"$@"'
 read_mount_plan() { nsenter --target 1 --mount -- /bin/bash -euo pipefail -c "$mount_probe" -- wsl_mount_plan /proc/self/mountinfo; }
 mount_plan=$(read_mount_plan)
 caller_mount_plan=$(wsl_mount_plan /proc/self/mountinfo)
-printf 'Windows filesystem mounts:\n%s\n' "$mount_plan"
+printf 'Windows filesystem masks:\n%s\n' "$mount_plan"
 wsl_mount_policy "$mount_plan" > "$tmp/windows-policy"
 for kind in directory file; do
   wsl_mount_paths "$mount_plan" "$kind" > "$tmp/windows-$kind"
@@ -465,8 +465,8 @@ CONFIG
 PATH=$rootless_path "$engine/dockerd" --validate --config-file "$tmp/dockerd"
 "$tmp/nvidia/usr/bin/nvidia-ctk" cdi generate --help | grep -F -- --nvidia-cdi-hook-path >/dev/null ||
   die "Toolkit lacks the CDI hook path option."
-# CDI discovers files in WSL's driver store, which can itself be a 9p mount.
-# Stage only the driver's referenced files on Linux before hiding the store.
+# Read-only WSL GPU mounts stay visible in the dedicated namespaces.
+# Stage trusted CDI files only when a mask covers their source.
 mkdir -m 0755 "$tmp/cdi"
 nsenter --target 1 --mount -- "$tmp/nvidia/usr/bin/nvidia-ctk" cdi generate --format json \
   --nvidia-cdi-hook-path="$toolkit/nvidia-cdi-hook" --output="$tmp/nvidia-cdi.json"

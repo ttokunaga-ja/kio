@@ -29,6 +29,29 @@ policy=$(wsl_mount_policy "$plan")
 [[ $policy != *"/host/nested"* ]]
 [[ $(wsl_mount_policy 'directory /a%"b') == 'TemporaryFileSystem="/a%%\"b:ro"' ]]
 
+cat > "$tmp/gpu-mountinfo" <<FIXTURE
+42 1 0:40 / /usr/lib/wsl/drivers ro - 9p source ro
+43 1 0:41 / /usr/lib/wsl/lib ro - 9p source ro
+44 1 0:42 / /usr/lib/wsl/drivers/other ro - 9p source ro
+45 1 0:43 / /usr/lib/wsl/drivers-other ro - 9p source ro
+FIXTURE
+gpu_plan=$(wsl_mount_plan "$tmp/gpu-mountinfo")
+gpu_policy=$(wsl_mount_policy "$gpu_plan")
+[[ $gpu_policy != *'"/usr/lib/wsl/drivers"'* && $gpu_policy != *'"/usr/lib/wsl/drivers:ro"'* ]]
+[[ $gpu_policy != *'"/usr/lib/wsl/lib"'* && $gpu_policy != *'"/usr/lib/wsl/lib:ro"'* ]]
+[[ $gpu_policy == *'/usr/lib/wsl/drivers/other'* && $gpu_policy == *'/usr/lib/wsl/drivers-other'* ]]
+wsl_mount_device() {
+  case $1 in
+    /usr/lib/wsl/drivers) printf '0:40\n' ;;
+    /usr/lib/wsl/lib) printf '0:41\n' ;;
+    *) return 1 ;;
+  esac
+}
+sed -n '1,2p' "$tmp/gpu-mountinfo" > "$tmp/gpu-live"
+wsl_mount_verify '' '' "$tmp/gpu-live"
+sed 's@/drivers ro @/drivers rw @' "$tmp/gpu-live" > "$tmp/gpu-live-rw"
+if wsl_mount_verify '' '' "$tmp/gpu-live-rw"; then exit 1; fi
+
 mkdir -p "$tmp/mask" "$tmp/stage"
 chmod 0555 "$tmp/mask"
 trap 'chmod 0755 "$tmp/mask"; rm -r -- "$tmp"' EXIT

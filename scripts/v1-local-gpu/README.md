@@ -387,7 +387,10 @@ sudo -u kio-test sudo -n -- /var/lib/kio-v1-local/shared-gpu-count unexpected
 専用 sshd と `user@<kio-test UID>.service` に個別の mount namespace を使う。
 setup は systemd（PID 1）のマウント一覧から `9p`、`drvfs`、`virtiofs` などを列挙し、
 `/mnt` の外にある `/Docker/host` も対象にする。専用名前空間では該当するディレクトリを
-読み取り専用の空 tmpfs で覆う。対象がファイルならアクセスを遮断する。`/init` と `/run/WSL`
+読み取り専用の空 tmpfs で覆う。対象がファイルならアクセスを遮断する。
+NVIDIA のホスト側照会に必要な `/usr/lib/wsl/drivers` と `/usr/lib/wsl/lib` は、
+そのパス自体が読み取り専用マウントの場合に限り、専用 sshd と user manager から参照できる。
+配下や類似名にある別の Windows マウントにはマスクを適用する。`/init` と `/run/WSL`
 も遮断し、`WSL_INTEROP` を削除する。ディストリビューション間で共有する `/mnt/wsl` と
 `/mnt/wslg` にもマスクを維持する。`/etc/resolv.conf` が `/mnt/wsl/resolv.conf` を参照する場合は、
 専用 sshd と user manager にそのファイルだけを読み取り専用で bind する。
@@ -403,7 +406,8 @@ root 管理のファイルだけを Linux 側の `/opt/kio-v1-local/wsl-cdi` に
 [NVIDIA Toolkit の WSL ドライバーストア参照](https://github.com/NVIDIA/nvidia-container-toolkit/blob/v1.20.1/pkg/nvcdi/driver-wsl.go)
 
 setup は列挙した対象を専用 sshd と user manager の両方で `kio-test` として検査する。
-元のファイルシステムが見えず、書き込み不可であることが合格条件。CUDA smoke の際は
+GPU 用の読み取り専用マウントを除く Windows ファイルシステムが見えず、マスク先が
+書き込み不可であることが合格条件。CUDA smoke の際は
 rootless Engine から見たマスクもコンテナ内で検査する。実機では通常の名前空間で Windows 側の
 マウントと共有ソケットの利用状況を構築前後で比較する。研究室では例えば次を使う。
 

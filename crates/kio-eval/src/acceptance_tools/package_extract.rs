@@ -121,7 +121,9 @@ fn inspect(mut file: File) -> Result<ZipArchive<File>, String> {
         if !names.insert(name.to_owned())
             || entry.is_dir()
             || entry.encrypted()
-            || entry.unix_mode() != Some(0o100644)
+            || entry
+                .unix_mode()
+                .is_some_and(|mode| mode & 0o170000 != 0o100000)
             || name.contains('\\')
             || name.starts_with('/')
             || name
@@ -210,17 +212,29 @@ mod tests {
     use super::*;
     use std::io::Write;
     use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
-    fn zip(names: &[&str]) -> File {
+    fn zip_with_mode(names: &[&str], mode: u32) -> File {
         let mut file = tempfile::tempfile().unwrap();
         {
             let mut writer = ZipWriter::new(&mut file);
-            for name in names {
+            for (index, name) in names.iter().enumerate() {
+                if index == 0 && mode == 0o120777 {
+                    writer
+                        .add_symlink(*name, "target", SimpleFileOptions::default())
+                        .unwrap();
+                    continue;
+                }
+                if index == 0 && mode == 0o40755 {
+                    writer
+                        .add_directory(*name, SimpleFileOptions::default())
+                        .unwrap();
+                    continue;
+                }
                 writer
                     .start_file(
                         *name,
                         SimpleFileOptions::default()
                             .compression_method(CompressionMethod::Stored)
-                            .unix_permissions(0o644),
+                            .unix_permissions(mode),
                     )
                     .unwrap();
                 writer.write_all(b"fixture").unwrap();
@@ -230,6 +244,17 @@ mod tests {
         file.rewind().unwrap();
         file
     }
+    fn zip(names: &[&str]) -> File {
+        zip_with_mode(names, 0o644)
+    }
+
+    #[test]
+    fn accepts_windows_permissions_and_rejects_nonregular_entries() {
+        assert!(inspect(zip_with_mode(NAMES, 0o666)).is_ok());
+        assert!(inspect(zip_with_mode(NAMES, 0o120777)).is_err());
+        assert!(inspect(zip_with_mode(NAMES, 0o40755)).is_err());
+    }
+
     const NAMES: &[&str] = &[
         "target-binding.json",
         "kio-v1-lock-sha256",

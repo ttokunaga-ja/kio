@@ -136,15 +136,14 @@ pub fn run(args: Args) -> Result<(), String> {
                 }))
                 .map_err(|error| format!("cannot encode prepare response: {error}"))
             });
-            let output =
-                finish_after_prepare_error(prepared, || client.invoke(Verb::Finish).map(|_| ()))?;
+            let output = finish_after_error(prepared, || client.invoke(Verb::Finish).map(|_| ()))?;
             println!("{output}");
         }
         Mode::Run => {
             client.load_capability(&args.capability_file)?;
             // The expected-case step may fail after a successful prepare.
             // Its missing artifact must not bypass the always-run cleanup.
-            let inputs = finish_after_prepare_error(RunInputs::from_args(&args), || {
+            let inputs = finish_after_error(RunInputs::from_args(&args), || {
                 client.invoke(Verb::Finish).map(|_| ())
             })?;
             client.run_phases(&args.identity_out, inputs)?;
@@ -160,6 +159,17 @@ enum Verb {
     StartOcr,
     StopOcr,
     Finish,
+}
+
+struct InvokeFailure {
+    code: &'static str,
+    message: String,
+}
+
+impl From<InvokeFailure> for String {
+    fn from(failure: InvokeFailure) -> Self {
+        failure.message
+    }
 }
 
 impl Verb {
@@ -258,9 +268,12 @@ impl Client {
         command
     }
 
-    fn invoke(&mut self, verb: Verb) -> Result<Vec<u8>, String> {
+    fn invoke(&mut self, verb: Verb) -> Result<Vec<u8>, InvokeFailure> {
         if self.capability.is_none() {
-            return Err("lease capability is unavailable".into());
+            return Err(InvokeFailure {
+                code: "CAPABILITY_UNAVAILABLE",
+                message: "lease capability is unavailable code=CAPABILITY_UNAVAILABLE".into(),
+            });
         }
         let command_text = format!(
             "v1 {} {} {} {} {}",
@@ -297,10 +310,13 @@ impl Client {
             } else {
                 "ssh_unknown"
             };
-            format!(
-                "{} failed: ssh_exit=unavailable stage={stage} code={code}",
-                verb.name()
-            )
+            InvokeFailure {
+                code,
+                message: format!(
+                    "{} failed: ssh_exit=unavailable stage={stage} code={code}",
+                    verb.name()
+                ),
+            }
         })?;
         if !output.status.success() {
             let (stage, code) = ssh_failure(output.status.code(), &output.stdout, &output.stderr);
@@ -308,10 +324,19 @@ impl Client {
                 .status
                 .code()
                 .map_or_else(|| "unavailable".into(), |n| n.to_string());
-            return Err(format!(
+            let mut message = format!(
                 "{} failed: ssh_exit={exit} stage={stage} code={code}",
                 verb.name()
-            ));
+            );
+            if code == "LEASE_HELD"
+                && let Some(holder) = super::dispatch::lease_holder(&output.stdout)
+            {
+                message.push_str(&format!(
+                    " run_id={} attempt={} os={}",
+                    holder.run_id, holder.attempt, holder.os
+                ));
+            }
+            return Err(InvokeFailure { code, message });
         }
         Ok(output.stdout.into_bytes())
     }
@@ -377,10 +402,10 @@ impl Client {
 
     fn run_phases(&mut self, identity: &Path, inputs: RunInputs) -> Result<(), String> {
         let result = self.run_phases_inner(identity, &inputs);
-        if result.is_err() {
-            self.cleanup();
-        }
-        result
+        finish_after_error(result, || {
+            let _ = self.invoke(Verb::StopOcr);
+            self.invoke(Verb::Finish).map(|_| ())
+        })
     }
 
     fn run_phases_inner(&mut self, identity: &Path, inputs: &RunInputs) -> Result<(), String> {
@@ -529,12 +554,6 @@ impl Client {
         let _ = self.route.remove_file(Path::new(&identity_leaf));
         result
     }
-
-    fn cleanup(&mut self) {
-        for verb in [Verb::StopOcr, Verb::Finish] {
-            let _ = self.invoke(verb);
-        }
-    }
 }
 
 impl Drop for Client {
@@ -590,25 +609,24 @@ fn prepare_sequence<T>(
     write_capability: impl FnOnce() -> Result<(), String>,
     initialize: impl FnOnce() -> Result<(), String>,
     after_initialize: impl FnOnce() -> Result<T, String>,
-    finish: impl FnOnce() -> Result<(), String>,
+    finish: impl FnOnce() -> Result<(), InvokeFailure>,
 ) -> Result<T, String> {
     write_capability()?;
     let prepared = initialize().and_then(|()| after_initialize());
-    finish_after_prepare_error(prepared, finish)
+    finish_after_error(prepared, finish)
 }
 
-/// A lease exists before any local create-only publication.  If a local
-/// publication fails, its original error remains authoritative while the
-/// authenticated dispatcher finish is attempted exactly once.
-fn finish_after_prepare_error<T>(
+/// Preserve the failure that triggered authenticated cleanup and report
+/// whether finish released the lease.
+fn finish_after_error<T>(
     operation: Result<T, String>,
-    finish: impl FnOnce() -> Result<(), String>,
+    finish: impl FnOnce() -> Result<(), InvokeFailure>,
 ) -> Result<T, String> {
     match operation {
         Ok(value) => Ok(value),
         Err(error) => {
-            let _ = finish();
-            Err(error)
+            let finish_code = finish().map_or_else(|failure| failure.code, |()| "OK");
+            Err(format!("{error}; finish_code={finish_code}"))
         }
     }
 }
@@ -1022,20 +1040,31 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert_eq!(error, "dispatcher init failed: response lost");
+        assert_eq!(
+            error,
+            "dispatcher init failed: response lost; finish_code=OK"
+        );
         assert_eq!(*launcher_calls.borrow(), ["capability", "init", "finish"]);
     }
 
     #[test]
-    fn prepare_preserves_original_error_when_injected_finish_fails() {
+    fn prepare_reports_both_fixed_codes_when_injected_finish_fails() {
         let error = prepare_sequence(
             || Ok(()),
-            || Err("dispatcher unavailable".into()),
+            || Err("init failed: ssh_exit=1 stage=dispatcher code=GPU_SAMPLE_UNAVAILABLE".into()),
             || Ok(()),
-            || Err("finish unavailable".into()),
+            || {
+                Err(InvokeFailure {
+                    code: "CONTROLLER_CLEANUP_FAILED",
+                    message: "private finish detail".into(),
+                })
+            },
         )
         .unwrap_err();
-        assert_eq!(error, "dispatcher unavailable");
+        assert_eq!(
+            error,
+            "init failed: ssh_exit=1 stage=dispatcher code=GPU_SAMPLE_UNAVAILABLE; finish_code=CONTROLLER_CLEANUP_FAILED"
+        );
     }
 
     #[cfg(unix)]

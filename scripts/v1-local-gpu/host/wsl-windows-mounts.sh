@@ -16,6 +16,10 @@ wsl_windows_type() {
   esac
 }
 
+wsl_readonly_gpu_mount() {
+  [[ ,$2, == *,ro,* && ( $1 == /usr/lib/wsl/drivers || $1 == /usr/lib/wsl/lib ) ]]
+}
+
 wsl_mount_decode() {
   local rest=$1 prefix octal byte
   decoded=
@@ -41,19 +45,20 @@ wsl_mount_covers() {
 }
 
 wsl_mount_plan() {
-  local records targets fs device _opts encoded decoded
+  local records targets fs device opts encoded decoded
   local -a dirs=()
   records=$(wsl_mount_records "$1") || return 1
   targets=$(
-    while read -r fs device _opts encoded; do
+    while read -r fs device opts encoded; do
+      if wsl_readonly_gpu_mount "$encoded" "$opts"; then continue; fi
       if wsl_windows_type "$fs" || [[ $encoded == /mnt/wsl || $encoded == /mnt/wslg ]]; then
         printf '%s\n' "$encoded"
       fi
     done <<< "$records" | LC_ALL=C sort -u
   ) || return 1
   if [[ -z $targets ]]; then return 0; fi
-  while read -r fs device _opts encoded; do
-    if wsl_windows_type "$fs"; then printf 'windows %s %s %s\n' "$encoded" "$fs" "$device"; fi
+  while read -r fs device opts encoded; do
+    if wsl_windows_type "$fs" && ! wsl_readonly_gpu_mount "$encoded" "$opts"; then printf 'windows %s %s %s\n' "$encoded" "$fs" "$device"; fi
   done <<< "$records" | LC_ALL=C sort -u
   while IFS= read -r encoded; do
     wsl_mount_decode "$encoded" || return 1
@@ -99,13 +104,14 @@ wsl_mount_device() { stat -Lc '%Hd:%Ld' -- "$1"; }
 
 # A mask can leave an underlying record in mountinfo. Compare the effective device.
 wsl_mount_verify() (
-  local plan=$1 socket=$2 resolver=${4:-} records fs dev _opts encoded decoded kind path effective
+  local plan=$1 socket=$2 resolver=${4:-} records fs dev opts encoded decoded kind path effective
   local rest component found mount_kind mount_dev mount_options mount_path
   local -a entries
   records=$(wsl_mount_records "$3") || return 1
   shopt -s nullglob dotglob
-  while read -r fs dev _opts encoded; do
+  while read -r fs dev opts encoded; do
     wsl_windows_type "$fs" || continue
+    if wsl_readonly_gpu_mount "$encoded" "$opts"; then continue; fi
     wsl_mount_decode "$encoded" || return 1
     if effective=$(wsl_mount_device "$decoded" 2>/dev/null) && [[ $effective == "$dev" ]]; then
       printf 'Windows filesystem still visible: %s\n' "$encoded" >&2

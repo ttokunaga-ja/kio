@@ -12,6 +12,8 @@ OCR_API_IMAGE=ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-vl@sha
 OCR_VLM_IMAGE=ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-genai-vllm-server@sha256:d0d32c04a2119613d25a0a4c292e165ccc107954b74580613cf59e378037f8f5
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+# Reserved for the dispatcher's fixed GPU_SAMPLE_UNAVAILABLE diagnostic.
+gpu_sample_unavailable() { printf 'error: cannot read GPU memory\n' >&2; exit 42; }
 note() { printf '%s\n' "$*"; }
 
 inside_root() {
@@ -87,8 +89,11 @@ gpu_sample() {
 
 gpu_memory() {
   local sample
-  sample=$(gpu_sample) || die "cannot read GPU memory"
-  printf '%s\n' "$sample" | "$TOOLS" gpu-memory "$@" --state-dir "$ROOT/state"
+  sample=$(gpu_sample) || gpu_sample_unavailable
+  if ! printf '%s\n' "$sample" | "$TOOLS" gpu-memory "$@" --state-dir "$ROOT/state"; then
+    if [[ $1 == capture ]]; then gpu_sample_unavailable; fi
+    return 1
+  fi
 }
 
 ocr_project_gone() {
@@ -124,21 +129,25 @@ wait_gone() {
 }
 
 wait_vram() {
-  local deadline=$((SECONDS + 60)) remaining
+  local deadline=$((SECONDS + 60)) remaining status=0 sample_seen=false
   ocr_project_gone
   while [ "$SECONDS" -lt "$deadline" ]; do
     remaining=$((deadline - SECONDS))
     # Bound the sample producer as well as the helper's stdin reader.
     if timeout "${remaining}s" bash -c '
       set -euo pipefail
-      sample=$("$1" --query-gpu=uuid,memory.total,memory.used,memory.free --format=csv,noheader,nounits)
-      printf "%s\n" "$sample" | "$2" gpu-memory check-recovered --state-dir "$3" "${@:4}"
+      sample=$("$1" --query-gpu=uuid,memory.total,memory.used,memory.free --format=csv,noheader,nounits) || exit 42
+      printf "%s\n" "$sample" | "$2" gpu-memory check-recovered --state-dir "$3" "${@:4}" || exit 1
     ' bash "$(gpu_command)" "$TOOLS" "$ROOT/state" "$@"; then
       ocr_project_gone
       return 0
+    else
+      status=$?
+      if [[ $status != 42 && $status != 124 ]]; then sample_seen=true; fi
     fi
     sleep 1
   done
+  if ! $sample_seen && [[ $status == 42 ]]; then gpu_sample_unavailable; fi
   die "GPU memory did not recover to the captured baseline plus 128 MiB within 60 seconds"
 }
 
@@ -261,7 +270,7 @@ init() {
   type -P docker >/dev/null || die "missing command: docker"
   for name in openssl curl timeout; do command -v "$name" >/dev/null || die "missing command: $name"; done
   [ -x "$TOOLS" ] && [ ! -L "$TOOLS" ] || die "reviewed acceptance tools binary is missing"
-  gpu_command >/dev/null || die "missing nvidia-smi"
+  gpu_command >/dev/null || gpu_sample_unavailable
   ensure_root
   ocr_project_gone
   for name in state tls-authority tls-server ocr; do private_dir "$ROOT/$name"; done

@@ -8,10 +8,13 @@ pub fn run(args: Args) -> Result<(), String> {
     {
         unix::run(args).map_err(|message| {
             use std::io::Write;
-            let code = error_code(&message);
-            let _ = std::io::stdout()
-                .lock()
-                .write_all(error_response(code).as_bytes());
+            let (code, response) = if lease_holder(&message).is_some() {
+                ("LEASE_HELD", message)
+            } else {
+                let code = error_code(&message);
+                (code, error_response(code))
+            };
+            let _ = std::io::stdout().lock().write_all(response.as_bytes());
             code.into()
         })
     }
@@ -34,6 +37,11 @@ const ERROR_CODES: &[(&str, &str)] = &[
         "PRIVATE_ROOT_UNAVAILABLE",
     ),
     ("GPU lease is already held", "LEASE_HELD"),
+    ("controller init failed", "CONTROLLER_INIT_FAILED"),
+    ("controller start-ocr failed", "CONTROLLER_START_OCR_FAILED"),
+    ("controller stop-ocr failed", "CONTROLLER_STOP_OCR_FAILED"),
+    ("controller cleanup failed", "CONTROLLER_CLEANUP_FAILED"),
+    ("GPU sample unavailable", "GPU_SAMPLE_UNAVAILABLE"),
     (
         "candidate is not installed deployment",
         "CANDIDATE_MISMATCH",
@@ -55,12 +63,43 @@ fn error_response(code: &'static str) -> String {
 }
 
 pub(super) fn response_code(stdout: &str) -> Option<&'static str> {
+    if lease_holder(stdout).is_some() {
+        return Some("LEASE_HELD");
+    }
     let received = stdout.strip_prefix("{\"code\":\"")?.strip_suffix("\"}\n")?;
     ERROR_CODES
         .iter()
         .map(|&(_, code)| code)
         .chain([REJECTED])
         .find(|&code| code == received)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct LeaseHolder<'a> {
+    pub run_id: &'a str,
+    pub attempt: &'a str,
+    pub os: &'a str,
+    code: &'a str,
+}
+
+pub(super) fn lease_holder(stdout: &str) -> Option<LeaseHolder<'_>> {
+    if !stdout.ends_with('\n') || stdout.len() > 128 {
+        return None;
+    }
+    let holder: LeaseHolder<'_> = serde_json::from_str(stdout).ok()?;
+    (holder.code == "LEASE_HELD"
+        && positive_decimal(holder.run_id, 19)
+        && positive_decimal(holder.attempt, 10)
+        && matches!(holder.os, "linux" | "macos" | "windows"))
+    .then_some(holder)
+}
+
+fn positive_decimal(value: &str, max: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max
+        && value.as_bytes()[0] != b'0'
+        && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 #[cfg(all(unix, test))]
@@ -87,7 +126,7 @@ mod unix {
         FIXED_SOURCES, MAX_BINARY_BYTES, MAX_FIXED_BYTES, SCHEMA, checked_digest, checked_open,
         valid_sha,
     };
-    use super::Args;
+    use super::{Args, positive_decimal};
     use kio_core::{
         private_fs::{
             read_private_file_at, verify_private_directory, verify_private_directory_handle,
@@ -158,12 +197,6 @@ mod unix {
             && positive_decimal(p[3], 19)
             && positive_decimal(p[4], 10)
             && matches!(p[5], "linux" | "macos" | "windows")
-    }
-    fn positive_decimal(value: &str, max: usize) -> bool {
-        !value.is_empty()
-            && value.len() <= max
-            && value.as_bytes()[0] != b'0'
-            && value.bytes().all(|byte| byte.is_ascii_digit())
     }
     fn same_capability(expected: &str, supplied: &str) -> bool {
         valid_sha(expected, 64)
@@ -447,6 +480,20 @@ mod unix {
         }
         Ok(d)
     }
+    fn controller_error(action: &str, status: Option<i32>) -> &'static str {
+        // gpu-phase.sh reserves 42 for failures to obtain a GPU sample.
+        if status == Some(42) {
+            return "GPU sample unavailable";
+        }
+        match action {
+            "init" => "controller init failed",
+            "start-ocr" => "controller start-ocr failed",
+            "stop-ocr" => "controller stop-ocr failed",
+            "cleanup" => "controller cleanup failed",
+            _ => "controller phase is invalid",
+        }
+    }
+
     fn invoke(root: &Path, action: &str) -> Result<(), String> {
         let mut c = Command::new("/bin/bash");
         c.arg(Path::new(SOURCE).join("scripts/v1-local-gpu/gpu-phase.sh"))
@@ -471,11 +518,11 @@ mod unix {
             },
             None,
         )
-        .map_err(|_| "fixed controller failed".to_string())?;
+        .map_err(|_| controller_error(action, None))?;
         if o.status.success() {
             Ok(())
         } else {
-            Err("fixed controller failed".into())
+            Err(controller_error(action, o.status.code()).into())
         }
     }
     pub(super) fn run(_: Args) -> Result<(), String> {
@@ -584,6 +631,18 @@ mod unix {
                 .contains_entry(Path::new("lease.json"))
                 .map_err(|_| "lease unavailable")?
             {
+                if let Ok((lease, _)) = private_json::<Lease>(base, "lease.json")
+                    && lease.schema == LEASE_SCHEMA
+                    && positive_decimal(&lease.tuple.run_id, 19)
+                    && positive_decimal(&lease.tuple.attempt, 10)
+                    && matches!(lease.tuple.os.as_str(), "linux" | "macos" | "windows")
+                {
+                    let reply = serde_json::json!({
+                        "attempt": lease.tuple.attempt, "code": "LEASE_HELD",
+                        "os": lease.tuple.os, "run_id": lease.tuple.run_id,
+                    });
+                    return Err(format!("{reply}\n"));
+                }
                 return Err("GPU lease is already held".into());
             }
             if relative_present(base, &root_relative)? {
@@ -705,6 +764,7 @@ mod unix {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::acceptance_tools::dispatch::response_code;
 
         fn fixture() -> (tempfile::TempDir, StoreDirectory) {
             let temp = tempfile::tempdir().unwrap();
@@ -880,6 +940,41 @@ mod unix {
                 assert!(!valid(&bad));
             }
         }
+        #[test]
+        fn conflicting_init_reports_the_existing_holder() {
+            let (_temp, base) = fixture();
+            init(&base, &mut Vec::new());
+            let other = request(&format!("v1 init {} 99 2 windows", "a".repeat(40))).unwrap();
+            let error = handle(&base, &other, Some(&"c".repeat(64)), &mut |_, _| {
+                panic!("conflicting init invoked the controller")
+            })
+            .unwrap_err();
+            assert_eq!(
+                error,
+                "{\"attempt\":\"1\",\"code\":\"LEASE_HELD\",\"os\":\"linux\",\"run_id\":\"12\"}\n"
+            );
+            assert_eq!(response_code(&error), Some("LEASE_HELD"));
+        }
+
+        #[test]
+        fn controller_errors_distinguish_action_and_sample_unavailability() {
+            for (action, code) in [
+                ("init", "CONTROLLER_INIT_FAILED"),
+                ("start-ocr", "CONTROLLER_START_OCR_FAILED"),
+                ("stop-ocr", "CONTROLLER_STOP_OCR_FAILED"),
+                ("cleanup", "CONTROLLER_CLEANUP_FAILED"),
+            ] {
+                assert_eq!(
+                    super::super::error_code(controller_error(action, None)),
+                    code
+                );
+                assert_eq!(
+                    super::super::error_code(controller_error(action, Some(42))),
+                    "GPU_SAMPLE_UNAVAILABLE"
+                );
+            }
+        }
+
         #[test]
         fn wrong_capability_or_tuple_cannot_invoke_controller() {
             let (_temp, base) = fixture();
