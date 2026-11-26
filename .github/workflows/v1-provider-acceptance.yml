@@ -33,7 +33,7 @@ jobs:
             run) [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]] && [[ "$PACKAGE_RUN_ID" =~ ^[1-9][0-9]*$ ]] ;;
             *) exit 1 ;;
           esac
-          main_sha="$(gh api "/repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')"
+          main_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')"
           test "$GITHUB_SHA" = "$main_sha"
           if test "$OPERATION" = run; then test "$GITHUB_SHA" = "$CANDIDATE_SHA"; fi
           echo eligible=true >> "$GITHUB_OUTPUT"
@@ -137,7 +137,7 @@ jobs:
           test "$ACTUAL_APP_SLUG" = "$EXPECTED_APP_SLUG"
           test "$ACTUAL_INSTALLATION_ID" = "$EXPECTED_INSTALLATION_ID"
           # One bounded page, with total_count checked: never accept a truncated list.
-          gh api '/installation/repositories?per_page=2' | jq -e '
+          gh api 'installation/repositories?per_page=2' | jq -e '
             .total_count == 1 and (.repositories | length) == 1 and
             .repositories[0].id == 1220844216 and
             .repositories[0].full_name == "ttokunaga-ja/kio"' >/dev/null
@@ -155,7 +155,7 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$WORKFLOW_SHA256" =~ ^[0-9a-f]{64}$ ]]
-          main_sha="$(gh api "/repos/${REPOSITORY}/git/ref/heads/main" --jq '.object.sha')"
+          main_sha="$(gh api "repos/${REPOSITORY}/git/ref/heads/main" --jq '.object.sha')"
           test "$main_sha" = "$GITHUB_SHA"
           if test "$OPERATION" = run; then test "$CANDIDATE_SHA" = "$GITHUB_SHA"; fi
           if test "$OPERATION" = initialize; then
@@ -216,7 +216,7 @@ jobs:
           git fetch --no-tags origin main
           test "$CANDIDATE_SHA" = "$(git rev-parse HEAD)"
           test "$CANDIDATE_SHA" = "$(git rev-parse origin/main)"
-          gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${PACKAGE_RUN_ID}" | jq -e --arg sha "$CANDIDATE_SHA" '.event == "workflow_dispatch" and .status == "completed" and .conclusion == "success" and .head_sha == $sha and .path == ".github/workflows/v1-acceptance.yml"' >/dev/null
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${PACKAGE_RUN_ID}" | jq -e --arg sha "$CANDIDATE_SHA" '.event == "workflow_dispatch" and .status == "completed" and .conclusion == "success" and .head_sha == $sha and .path == ".github/workflows/v1-acceptance.yml"' >/dev/null
       - uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
       - name: Build exact candidate acceptance binaries before credential
         working-directory: candidate
@@ -247,12 +247,12 @@ jobs:
         run: |
           set -euo pipefail
           os="$OS_NAME"; test "$os" = macos || test "$os" = linux || test "$os" = windows
-          row="$(gh api --paginate "/repos/${GITHUB_REPOSITORY}/actions/runs/${PACKAGE_RUN_ID}/artifacts?per_page=100" --jq '.artifacts[] | [.id,.name,(.expired|tostring),.size_in_bytes] | @tsv' | awk -F '\t' -v n="kio-v1-package-${os}-${CANDIDATE_SHA}" '$2 == n {print}')"
+          row="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/runs/${PACKAGE_RUN_ID}/artifacts?per_page=100" --jq '.artifacts[] | [.id,.name,(.expired|tostring),.size_in_bytes] | @tsv' | awk -F '\t' -v n="kio-v1-package-${os}-${CANDIDATE_SHA}" '$2 == n {print}')"
           test "$(printf '%s\n' "$row" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
           IFS=$'\t' read -r artifact_id artifact_name expired artifact_bytes <<< "$row"
           test "$expired" = false; test "$artifact_bytes" -le 805306368
           root="$RUNNER_TEMP/kio-v1-package-$os"; (umask 077; mkdir "$root")
-          gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" > "$root/package.zip"
+          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" > "$root/package.zip"
           "$KIO_ACCEPTANCE_TOOLS" package-extract --archive "$root/package.zip" --output "$root/package"
           root="$root/package"
           archive="$(find "$root" -maxdepth 1 -type f -name '*.tar.gz' -print)"; checksums="$(find "$root" -maxdepth 1 -type f -name '*.checksums.json' -print)"

@@ -129,7 +129,7 @@ jobs:
             local workflow_sha256
             git cat-file -e "${expected_head}:${workflow_path}"
             workflow_sha256="$(git show "${expected_head}:${workflow_path}" | shasum -a 256 | awk '{print $1}')"
-            metadata="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}")"
+            metadata="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}")"
             jq -e \
               --arg repository "$GITHUB_REPOSITORY" \
               --argjson repository_id "$GITHUB_REPOSITORY_ID" \
@@ -192,7 +192,7 @@ jobs:
             [[ "$source_attempt" =~ ^[1-9][0-9]*$ ]]
             [[ "$source_workflow_sha256" =~ ^[0-9a-f]{64}$ ]]
             rows="$(gh api --paginate \
-              "/repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/artifacts?per_page=100" \
+              "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/artifacts?per_page=100" \
               --jq '.artifacts[] | [.id, .name, (.expired | tostring), .size_in_bytes] | @tsv')"
             while IFS=$'\t' read -r artifact_id artifact_name expired artifact_bytes; do
               test -n "$artifact_id" || continue
@@ -235,7 +235,7 @@ jobs:
               artifact_dir="$root/${label}-${artifact_id}"
               mkdir "$artifact_dir"
               archive="$artifact_dir/source.zip"
-              gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" > "$archive"
+              gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" > "$archive"
               mapfile -t entries < <(unzip -Z1 "$archive")
               test "${#entries[@]}" -gt 0
               test "${#entries[@]}" -le 128

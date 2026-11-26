@@ -81,6 +81,10 @@ jobs:
             fi
           done <<< "$references"
           test "$invalid" -eq 0
+      - name: Check gh api endpoints for MSYS path rewriting
+        run: |
+          python3 scripts/ci/test-gh-api-endpoints.py
+          python3 scripts/ci/check-gh-api-endpoints.py
       - uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
         with:
           components: clippy, rustfmt

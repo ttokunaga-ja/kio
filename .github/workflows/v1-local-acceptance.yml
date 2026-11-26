@@ -98,9 +98,9 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]; [[ "$PACKAGE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
-          main_sha="$(gh api "/repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)"
+          main_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)"
           test "$GITHUB_SHA" = "$main_sha"; test "$GITHUB_SHA" = "$CANDIDATE_SHA"
-          gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${PACKAGE_RUN_ID}" | jq -e --arg sha "$CANDIDATE_SHA" \
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${PACKAGE_RUN_ID}" | jq -e --arg sha "$CANDIDATE_SHA" \
             '.event == "workflow_dispatch" and .status == "completed" and .conclusion == "success" and .head_sha == $sha and .path == ".github/workflows/v1-acceptance.yml"' >/dev/null
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -123,11 +123,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          row="$(gh api --paginate "/repos/${GITHUB_REPOSITORY}/actions/runs/${PACKAGE_RUN_ID}/artifacts?per_page=100" --jq '.artifacts[] | [.id,.name,(.expired|tostring),.size_in_bytes] | @tsv' | awk -F '\t' -v n="kio-v1-package-${{ matrix.os }}-${CANDIDATE_SHA}" '$2 == n {print}')"
+          row="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/runs/${PACKAGE_RUN_ID}/artifacts?per_page=100" --jq '.artifacts[] | [.id,.name,(.expired|tostring),.size_in_bytes] | @tsv' | awk -F '\t' -v n="kio-v1-package-${{ matrix.os }}-${CANDIDATE_SHA}" '$2 == n {print}')"
           test "$(printf '%s\n' "$row" | sed '/^$/d' | wc -l | tr -d ' ')" = 1; IFS=$'\t' read -r id _ expired bytes <<< "$row"
           test "$expired" = false; test "$bytes" -le 805306368
           root="$RUNNER_TEMP/kio-v1-local-package"; (umask 077; mkdir "$root")
-          gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${id}/zip" > "$root/package.zip"
+          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${id}/zip" > "$root/package.zip"
           "$KIO_ACCEPTANCE_TOOLS" package-extract --archive "$root/package.zip" --output "$root/package"
           root="$root/package"
           archive="$(find "$root" -maxdepth 1 -name '*.tar.gz' -type f -print)"; sums="$(find "$root" -maxdepth 1 -name '*.checksums.json' -type f -print)"
