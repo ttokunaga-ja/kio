@@ -134,7 +134,7 @@ jobs:
           eval_bin=target/debug/kio-eval; test "$RUNNER_OS" != Windows || eval_bin="${eval_bin}.exe"
           lock="$(<"$root/kio-v1-lock-sha256")"; hash="$($eval_bin release archive-sha256 --archive "$archive")"
           "$eval_bin" release verify --archive "$archive" --checksums "$sums" --expected-archive-sha256 "$hash" --source-repo "$GITHUB_WORKSPACE" --expected-commit "$CANDIDATE_SHA" --expected-lock-sha256 "$lock"
-          mkdir "$root/extract"; tar -xzf "$archive" -C "$root/extract"; release="$(find "$root/extract" -mindepth 1 -maxdepth 1 -type d -print)"; test -n "$release"
+          mkdir "$root/extract"; tar -xzf - -C "$root/extract" < "$archive"; release="$(find "$root/extract" -mindepth 1 -maxdepth 1 -type d -print)"; test -n "$release"
           bin="$release/bin/kio"; test "$RUNNER_OS" != Windows || bin="${bin}.exe"; test -f "$bin"
           printf 'KIO_EVAL=%s\nKIO_RELEASE_BIN=%s\nKIO_PACKAGE_ROOT=%s\n' "$eval_bin" "$bin" "$root" >> "$GITHUB_ENV"
 

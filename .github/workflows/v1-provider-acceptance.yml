@@ -288,7 +288,7 @@ jobs:
           lock_sha256="$(<"$root/kio-v1-lock-sha256")"; eval_bin=target/debug/kio-eval; test "$RUNNER_OS" != Windows || eval_bin="${eval_bin}.exe"
           archive_sha256="$("$eval_bin" release archive-sha256 --archive "$archive")"
           "$eval_bin" release verify --archive "$archive" --checksums "$checksums" --expected-archive-sha256 "$archive_sha256" --source-repo "$GITHUB_WORKSPACE/candidate" --expected-commit "$CANDIDATE_SHA" --expected-lock-sha256 "$lock_sha256"
-          extract="$root/extract"; mkdir "$extract"; tar -xzf "$archive" -C "$extract"
+          extract="$root/extract"; mkdir "$extract"; tar -xzf - -C "$extract" < "$archive"
           release_root="$(find "$extract" -mindepth 1 -maxdepth 1 -type d -print)"; test "$(printf '%s\n' "$release_root" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
           release_bin="$release_root/bin/kio"; test "$RUNNER_OS" != Windows || release_bin="${release_bin}.exe"; test -f "$release_bin"
           target="$RUNNER_TEMP/kio-v1-provider-target.json"; expected="$RUNNER_TEMP/kio-v1-provider-a08-expected.json"
