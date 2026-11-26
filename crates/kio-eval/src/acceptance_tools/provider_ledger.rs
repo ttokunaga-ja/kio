@@ -413,20 +413,26 @@ impl Api for GitHubApi {
                 Some(&json!({"sha": new, "force": false})),
             )?
         };
-        if result.is_none() {
+        let Some(result) = result else {
             return Err("ledger ref update was rejected".to_owned());
+        };
+        // The successful update response is authoritative. A read-back alone
+        // can lag the write on GitHub, so it only settles other responses.
+        if ref_sha(&result) == Some(new) {
+            return Ok(());
         }
-        let current = self.reference()?;
-        if current
-            .as_ref()
-            .and_then(|value| value.pointer("/object/sha"))
-            .and_then(Value::as_str)
-            != Some(new)
-        {
-            return Err("ledger ref update has unknown outcome".to_owned());
+        for delay in [0, 1, 2, 4, 8] {
+            std::thread::sleep(Duration::from_secs(delay));
+            if self.reference()?.as_ref().and_then(ref_sha) == Some(new) {
+                return Ok(());
+            }
         }
-        Ok(())
+        Err("ledger ref update has unknown outcome".to_owned())
     }
+}
+
+fn ref_sha(reference: &Value) -> Option<&str> {
+    reference.pointer("/object/sha").and_then(Value::as_str)
 }
 
 fn canonical(value: &Value) -> Result<Vec<u8>> {
@@ -1120,6 +1126,16 @@ mod tests {
     use std::{collections::BTreeMap, fs};
 
     use super::*;
+
+    #[test]
+    fn ref_update_response_names_the_updated_commit() {
+        let response = json!({
+            "ref": format!("refs/heads/{BRANCH}"),
+            "object": {"type": "commit", "sha": "a".repeat(40)},
+        });
+        assert_eq!(ref_sha(&response), Some("a".repeat(40).as_str()));
+        assert_eq!(ref_sha(&json!({"object": {}})), None);
+    }
 
     #[derive(Default)]
     struct FakeApi {
