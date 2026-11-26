@@ -21,13 +21,21 @@ pub(super) fn assert_pid_absent(pid: u32) -> Result<(), AcceptanceError> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn scheduler_query(
     deadline: Instant,
     program: &str,
     args: &[&str],
 ) -> Result<crate::runner::BoundedProcessOutput, AcceptanceError> {
+    scheduler_observation(deadline, Command::new(program).args(args))
+}
+
+fn scheduler_observation(
+    deadline: Instant,
+    command: &mut Command,
+) -> Result<crate::runner::BoundedProcessOutput, AcceptanceError> {
     run_bounded_command(
-        Command::new(program).args(args),
+        command,
         BoundedProcessOptions {
             timeout: remaining_budget(
                 deadline,

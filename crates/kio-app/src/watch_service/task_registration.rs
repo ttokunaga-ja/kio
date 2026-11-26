@@ -9,30 +9,6 @@ pub(crate) const TASK_SCRIPT: &str = concat!(
     include_str!("../platform/windows/watch_task.ps1"),
 );
 
-pub(crate) fn automation_command(
-    program: &std::path::Path,
-    windows: &std::path::Path,
-    script: &str,
-) -> Result<std::process::Command> {
-    let mut command = std::process::Command::new(program);
-    command
-        .args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            script,
-        ])
-        .current_dir(
-            program
-                .parent()
-                .ok_or_else(|| service_error("OS tool has no installation directory"))?,
-        )
-        .env_clear()
-        .env("SystemRoot", windows);
-    Ok(command)
-}
-
 pub(crate) fn automation_request(
     operation: &str,
     id: &str,
@@ -58,24 +34,29 @@ fn automation_uses_fixed_noninteractive_arguments_and_a_framed_data_request() {
 
     let program = Path::new("Windows/System32/WindowsPowerShell/v1.0/powershell.exe");
     let script = TASK_SCRIPT;
-    let command = automation_command(program, Path::new("Windows"), script).unwrap();
+    let command = kio_process::windows_powershell(program, Path::new("Windows"), script);
     assert_eq!(command.get_program(), program);
     let args = command
         .get_args()
         .map(|arg| arg.to_str().unwrap())
         .collect::<Vec<_>>();
     assert_eq!(
-        args,
-        [
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            script
-        ]
+        &args[..4],
+        &["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]
+    );
+    assert_eq!(args.len(), 5);
+    assert!(args[4].starts_with("$PSModuleAutoLoadingPreference = 'None'"));
+    assert!(args[4].contains(r"$env:SystemRoot + '\System32\WindowsPowerShell\v1.0\Modules\Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1'"));
+    assert!(args[4].ends_with(script));
+    assert_eq!(
+        command.get_envs().collect::<Vec<_>>(),
+        [(
+            std::ffi::OsStr::new("SystemRoot"),
+            Some(std::ffi::OsStr::new("Windows"))
+        )]
     );
     // Windows PowerShell receives fixed script text as a single command argument.
-    assert!(!script.contains('"'));
+    assert!(!args[4].contains('"'));
     assert!(script.contains("[Console]::In.ReadLine()"));
     assert!(script.contains("$folder.GetTask($request.id)"));
     assert!(!script.contains("GetTasks("));
@@ -301,8 +282,9 @@ mod tests {
         let program = windows.join("System32/WindowsPowerShell/v1.0/powershell.exe");
         let fixtures =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/platform/windows");
-        let script = "& ([ScriptBlock]::Create([IO.File]::ReadAllText((Join-Path (Get-Location).Path 'watch_task_compare_test.ps1')))) (Get-Location).Path";
-        let mut command = automation_command(&program, &windows, script).unwrap();
+        let script =
+            "& ([ScriptBlock]::Create([IO.File]::ReadAllText('watch_task_compare_test.ps1'))) '.'";
+        let mut command = kio_process::windows_powershell(&program, &windows, script);
         command.current_dir(fixtures);
         let output = kio_process::run_bounded_command(
             &mut command,

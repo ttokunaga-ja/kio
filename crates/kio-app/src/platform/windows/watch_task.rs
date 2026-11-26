@@ -1,7 +1,7 @@
 //! Language-independent Task Scheduler automation through the OS COM API.
 //! The script is embedded program code; request data is JSON, never script text.
 use super::watch_task_registration::{
-    TASK_SCRIPT, TaskQuery, TaskRecord, automation_command, automation_request, record_mismatch,
+    TASK_SCRIPT, TaskQuery, TaskRecord, automation_request, record_mismatch,
     scheduler_operation_error, validate_query,
 };
 use crate::watch_service::{ServiceManifest, service_error};
@@ -39,7 +39,7 @@ fn invoke(
     let windows = directory
         .parent()
         .ok_or_else(|| service_error("OS system directory has no parent"))?;
-    let mut command = automation_command(&program, windows, TASK_SCRIPT)?;
+    let mut command = kio_process::windows_powershell(&program, windows, TASK_SCRIPT);
     let failed = |error: &dyn std::fmt::Display| {
         service_error(format!("Task Scheduler {operation} for {id}: {error}"))
     };

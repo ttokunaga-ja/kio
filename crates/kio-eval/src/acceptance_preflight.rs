@@ -301,29 +301,24 @@ fn check_windows(report: &mut PreflightReport) {
     let system_root = std::env::var_os("SystemRoot")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"C:\\Windows"));
-    check_windows_scheduler(report, &system_root.join("System32"), command_record);
+    check_windows_scheduler(report, &system_root.join("System32"), record_command);
 }
 
 fn check_windows_scheduler(
     report: &mut PreflightReport,
     system_dir: &Path,
-    mut query: impl FnMut(&Path, &[&str]) -> CommandRecord,
+    mut query: impl FnMut(&mut Command) -> CommandRecord,
 ) {
     // Reach the same service and root folder used by watch registration
     // without enumerating tasks or requiring any particular task to exist.
     let powershell = system_dir.join("WindowsPowerShell/v1.0/powershell.exe");
     let sc = system_dir.join("sc.exe");
     if powershell.is_file() {
-        let check = query(
+        let check = query(&mut kio_process::windows_powershell(
             &powershell,
-            &[
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                TASK_SCHEDULER_PROBE,
-            ],
-        );
+            system_dir.parent().expect("System32 has a parent"),
+            TASK_SCHEDULER_PROBE,
+        ));
         require(
             &check,
             "Task Scheduler COM root query failed",
@@ -336,7 +331,7 @@ fn check_windows_scheduler(
             .push("Windows PowerShell is unavailable for the Task Scheduler COM query".into());
     }
     if sc.is_file() {
-        let check = query(&sc, &["query", "Schedule"]);
+        let check = query(Command::new(&sc).args(["query", "Schedule"]));
         require(
             &check,
             "Task Scheduler service query failed",
@@ -361,14 +356,16 @@ fn check_windows_scheduler(
 }
 
 fn command_record(program: &Path, args: &[&str]) -> CommandRecord {
-    let argv = std::iter::once(program)
-        .map(|path| path.to_string_lossy().into_owned())
-        .chain(args.iter().map(|arg| (*arg).to_owned()))
+    record_command(Command::new(program).args(args))
+}
+
+fn record_command(command: &mut Command) -> CommandRecord {
+    let argv = std::iter::once(command.get_program())
+        .chain(command.get_args())
+        .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
-    let mut command = Command::new(program);
-    command.args(args);
     match run_bounded_command(
-        &mut command,
+        command,
         BoundedProcessOptions {
             timeout: COMMAND_TIMEOUT,
             max_stdout_bytes: MAX_CAPTURE_BYTES,
@@ -464,18 +461,26 @@ mod tests {
                 office_converter: None,
                 status: "failed",
             };
-            check_windows_scheduler(&mut report, system_dir.path(), |program, args| {
-                let (ok, stdout) = if program == powershell {
+            check_windows_scheduler(&mut report, system_dir.path(), |command| {
+                let program = command.get_program();
+                let args: Vec<_> = command
+                    .get_args()
+                    .map(|arg| arg.to_str().unwrap())
+                    .collect();
+                let (ok, stdout) = if program == powershell.as_os_str() {
                     assert_eq!(
                         &args[..4],
                         &["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]
                     );
+                    assert!(args[4].starts_with("$PSModuleAutoLoadingPreference = 'None'"));
+                    assert_eq!(command.get_envs().count(), 1);
+                    assert_eq!(command.get_envs().next().unwrap().0, "SystemRoot");
                     assert!(args[4].contains("$service.Connect()"));
                     assert!(args[4].contains(r"$service.GetFolder('\')"));
                     assert!(!args[4].contains("GetTasks"));
                     (com_ok, "")
                 } else {
-                    assert_eq!(program, sc);
+                    assert_eq!(program, sc.as_os_str());
                     assert_eq!(args, &["query", "Schedule"]);
                     (
                         true,

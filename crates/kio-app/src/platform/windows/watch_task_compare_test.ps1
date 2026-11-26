@@ -1,6 +1,6 @@
 param([string]$fixtures = $PSScriptRoot)
 $ErrorActionPreference = 'Stop'
-. ([ScriptBlock]::Create([IO.File]::ReadAllText((Join-Path $fixtures 'watch_task_compare.ps1'))))
+. ([ScriptBlock]::Create([IO.File]::ReadAllText([IO.Path]::Combine($fixtures, 'watch_task_compare.ps1'))))
 $taskId = 'io.kio.watch.fixture'
 $taskPath = '\' + $taskId
 $sid = 'S-1-5-21-100-200-300-1001'

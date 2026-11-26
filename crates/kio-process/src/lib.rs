@@ -25,6 +25,30 @@ use std::{
 
 use thiserror::Error;
 
+/// Build a non-interactive Windows PowerShell 5.1 command for a trusted
+/// system executable. Core cmdlets are built in. The scheduler scripts use
+/// Utility for JSON, COM construction and sleep.
+#[must_use]
+pub fn windows_powershell(
+    program: &std::path::Path,
+    system_root: &std::path::Path,
+    script: &str,
+) -> Command {
+    const PRELUDE: &str = r#"$PSModuleAutoLoadingPreference = 'None'
+Import-Module ($env:SystemRoot + '\System32\WindowsPowerShell\v1.0\Modules\Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1') -ErrorAction Stop
+"#;
+    let mut command = Command::new(program);
+    command
+        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+        .arg(format!("{PRELUDE}{script}"))
+        .env_clear()
+        .env("SystemRoot", system_root);
+    if let Some(directory) = program.parent() {
+        command.current_dir(directory);
+    }
+    command
+}
+
 pub const DEFAULT_PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_PROCESS_OUTPUT_LIMIT: usize = 1024 * 1024;
 

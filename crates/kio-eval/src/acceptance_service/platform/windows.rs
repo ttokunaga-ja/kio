@@ -59,8 +59,8 @@ pub(in crate::acceptance_service) fn assert_native_unregistered(
     }
     let system_root = std::env::var_os("SystemRoot")
         .ok_or_else(|| invalid("SystemRoot is unavailable for native task verification"))?;
-    let powershell =
-        PathBuf::from(system_root).join("System32/WindowsPowerShell/v1.0/powershell.exe");
+    let system_root = PathBuf::from(system_root);
+    let powershell = system_root.join("System32/WindowsPowerShell/v1.0/powershell.exe");
     // An access or transport error is not proof of absence. Only GetTask's
     // file/path-not-found HRESULTs are accepted, independent of locale.
     let script = format!(
@@ -78,16 +78,9 @@ catch {{
 }}
 throw 'Task Scheduler still has service after uninstall'"#
     );
-    let output = scheduler_query(
+    let output = scheduler_observation(
         deadline,
-        path_arg(&powershell)?,
-        &[
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            &script,
-        ],
+        &mut kio_process::windows_powershell(&powershell, &system_root, &script),
     )?;
     if !output.status.success() || output.stdout.trim() != "absent" {
         return Err(invalid(format!(
