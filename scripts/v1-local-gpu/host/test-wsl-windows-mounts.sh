@@ -101,4 +101,19 @@ jq -e --arg native "$tmp/native/libdxcore.so" '.containerEdits.mounts == [
 cmp "$tmp/Docker/host/nvidia-smi" "$tmp/stage/driver-0"
 wsl_cdi_driver_file() { return 1; }
 if wsl_stage_cdi "$plan" "$tmp/spec" "$tmp/stage" /opt/kio/cdi; then exit 1; fi
+cat > "$tmp/cuda-cdi.json" <<'FIXTURE'
+{"containerEdits":{"mounts":[
+  {"hostPath":"/usr/lib/wsl/drivers/nvidia/libcuda.so.1.1","containerPath":"/usr/lib/wsl/drivers/nvidia/libcuda.so.1.1","options":["ro"]},
+  {"hostPath":"/usr/lib/wsl/drivers/nvidia/libcuda_loader.so","containerPath":"/usr/lib/wsl/drivers/nvidia/libcuda_loader.so","options":["ro"]},
+  {"hostPath":"/usr/lib/wsl/drivers/older/libcuda.so.1.1","containerPath":"/usr/lib/wsl/drivers/older/libcuda.so.1.1","options":["ro"]},
+  {"hostPath":"/usr/lib/wsl/drivers/older/libcuda.so","containerPath":"/usr/lib/wsl/drivers/older/libcuda.so","options":["ro"]}
+]}}
+FIXTURE
+wsl_cdi_cuda_linker_mount "$tmp/cuda-cdi.json" > "$tmp/cuda-linker.json"
+jq -e '.containerEdits.mounts | length == 5 and
+  .[4] == {hostPath:"/usr/lib/wsl/drivers/nvidia/libcuda_loader.so",
+           containerPath:"/usr/lib/wsl/drivers/nvidia/libcuda.so",options:["ro"]}' \
+  "$tmp/cuda-linker.json" >/dev/null
+wsl_cdi_cuda_linker_mount "$tmp/cuda-linker.json" > "$tmp/cuda-linker-again.json"
+cmp "$tmp/cuda-linker.json" "$tmp/cuda-linker-again.json"
 printf 'Windows mount and CDI fixtures passed\n'

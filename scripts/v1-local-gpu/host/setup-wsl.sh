@@ -427,6 +427,11 @@ InaccessiblePaths=-/init -/run/WSL
 UnsetEnvironment=WSL_INTEROP
 UNIT
 cat "$tmp/windows-policy" >> "$tmp/interop-policy"
+# WSL can present its GPU libraries as a writable overlay. Preserve visibility
+# while making the library mount read-only in both dedicated namespaces.
+if ! masked_path /usr/lib/wsl/lib; then
+  printf 'BindReadOnlyPaths=/usr/lib/wsl/lib\n' >> "$tmp/interop-policy"
+fi
 if [[ -n $resolver ]]; then printf 'BindReadOnlyPaths=%s\n' "$resolver" >> "$tmp/interop-policy"; fi
 {
   printf '[Service]\n'
@@ -470,8 +475,9 @@ PATH=$rootless_path "$engine/dockerd" --validate --config-file "$tmp/dockerd"
 mkdir -m 0755 "$tmp/cdi"
 nsenter --target 1 --mount -- "$tmp/nvidia/usr/bin/nvidia-ctk" cdi generate --format json \
   --nvidia-cdi-hook-path="$toolkit/nvidia-cdi-hook" --output="$tmp/nvidia-cdi.json"
+wsl_cdi_cuda_linker_mount "$tmp/nvidia-cdi.json" > "$tmp/nvidia-cdi-linker.json"
 nsenter --target 1 --mount -- /bin/bash -euo pipefail -c "$mount_probe" -- wsl_stage_cdi \
-  "$mount_plan" "$tmp/nvidia-cdi.json" "$tmp/cdi" "$cdi_dir"
+  "$mount_plan" "$tmp/nvidia-cdi-linker.json" "$tmp/cdi" "$cdi_dir"
 cat > "$tmp/docker-unit" <<UNIT
 [Unit]
 Description=Kio v1 local rootless Docker
@@ -794,6 +800,10 @@ verify_windows_namespace() {
   [[ $pid =~ ^[1-9][0-9]*$ ]]
   nsenter --target "$pid" --mount -- runuser -u "$user" -- \
     /bin/bash -euo pipefail -c "$mount_probe" -- wsl_mount_verify "$mount_plan" "$visible_socket" /proc/self/mountinfo "$resolver"
+  nsenter --target "$pid" --mount -- runuser -u "$user" -- \
+    /bin/bash -euc 'test -r /usr/lib/wsl/lib && test ! -w /usr/lib/wsl/lib'
+  nsenter --target "$pid" --mount -- runuser -u "$user" -- \
+    timeout 5 /usr/lib/wsl/lib/nvidia-smi --query-gpu=name --format=csv,noheader
   nsenter --target "$pid" --mount -- runuser -u "$user" -- timeout 10 getent ahostsv4 registry-1.docker.io >/dev/null
   # shellcheck disable=SC2016
   nsenter --target "$pid" --mount -- /bin/bash -ec '

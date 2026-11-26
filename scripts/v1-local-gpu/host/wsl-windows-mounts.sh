@@ -177,6 +177,26 @@ wsl_cdi_driver_file() {
   done
 }
 
+# Triton links with -lcuda, so the versioned driver alone is insufficient.
+wsl_cdi_cuda_linker_mount() {
+  jq '
+    def library_dir: .containerPath | sub("/[^/]+$"; "");
+    .containerEdits.mounts |= (
+      . as $mounts
+      | map(select((.containerPath | startswith("/usr/lib/wsl/drivers/"))
+                   and (.options | index("ro"))))
+      | map(select(.containerPath | endswith("/libcuda_loader.so")
+                                    or endswith("/libcuda.so.1.1")))
+      | group_by(library_dir)
+      | map((map(select(.containerPath | endswith("/libcuda_loader.so"))) + .)[0]
+            | .containerPath = (library_dir + "/libcuda.so"))
+      | map(select(.containerPath as $path |
+                   all($mounts[]; .containerPath != $path)))
+      | $mounts + .
+    )
+  ' "$1"
+}
+
 wsl_stage_cdi() {
   local plan=$1 spec=$2 destination=$3 installed=$4 path resolved name previous count=0
   local -a masks=()
