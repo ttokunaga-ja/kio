@@ -1,0 +1,20 @@
+name: probe-mistral-models
+# Temporary: list Mistral OCR model ids/aliases/deprecation (free GET /v1/models). Remove after use.
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  models:
+    runs-on: ubuntu-latest
+    environment: v1-provider-acceptance
+    timeout-minutes: 5
+    steps:
+      - name: List Mistral OCR models
+        env:
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$MISTRAL_API_KEY"
+          curl -sS --fail-with-body --max-time 30 -H "Authorization: Bearer $MISTRAL_API_KEY" https://api.mistral.ai/v1/models > models.json
+          jq -c '.data[] | select((.id|test("ocr")) or ((.aliases // [])|map(test("ocr"))|any)) | {id, aliases, deprecation, deprecation_replacement_model, created, capabilities}' models.json
