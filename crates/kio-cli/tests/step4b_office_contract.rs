@@ -768,9 +768,10 @@ fn office_isolation_component_faults_reach_cli_without_blocking_extraction_or_se
                                 && text.contains("searchable"),
                             "{text}"
                         );
-                    } else if json {
-                        // Search returns the index-time reason persisted per file
-                        // (07-adapter-spec `readiness_reason`), never a fresh probe.
+                    } else {
+                        // Search prints JSON in both output modes and returns the
+                        // index-time reason persisted per file (07-adapter-spec
+                        // `readiness_reason`), never a fresh probe.
                         let mut value: Value = serde_json::from_str(&text).unwrap();
                         let files = value["index_status"]["office_conversion_unavailable"]["files"]
                             .as_array_mut()
@@ -792,11 +793,6 @@ fn office_isolation_component_faults_reach_cli_without_blocking_extraction_or_se
                             !value
                                 .to_string()
                                 .contains(&format!("{expected} is {state}")),
-                            "{fault}: {text}"
-                        );
-                    } else {
-                        assert!(
-                            !text.contains(&format!("{expected} is {state}")),
                             "{fault}: {text}"
                         );
                     }
