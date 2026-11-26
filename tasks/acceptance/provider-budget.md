@@ -6,15 +6,24 @@ in `crates/kio-eval/src/acceptance_tools/provider_ledger.rs` and is invoked as
 `kio-acceptance-tools provider-ledger`. Its contract tests are part of the Rust
 workspace; the superseded Python implementation has been removed.
 
-Initialize exactly one immutable campaign before any provider call. Its root
+Initialize the first immutable campaign before any provider call. Its root
 commit contains only the campaign bootstrap and binds the hash of
 `.github/workflows/v1-provider-acceptance.yml`. Each later reservation commit
 atomically reserves all six provider/OS lanes: Mistral and Gemini on Linux,
 macOS, and Windows. Reservations are `reserved_unknown`, so prior failures and
 unknown outcomes remain charged; they are not retried for free.
 
-The cumulative ceiling is USD 10 for each provider, including all earlier
-failures. Each six-lane reservation consumes USD 0.30 per provider at the
+One successor may be appended through the same protected authority. Its commit
+contains only the successor campaign record, with a new ID and the SHA-256 of
+the exact reviewed workflow bytes on current `main`. The record binds the
+predecessor campaign ID and its final tip, which must be the immediate Git
+parent. The earlier bootstrap and reservations remain in Git history. New
+reservations must name the active campaign. Historical reservations still
+verify at their original commit using the campaign and workflow hash in force
+there.
+
+The cumulative ceiling is USD 10 for each provider across both campaigns,
+including all earlier reservations. Each six-lane reservation consumes USD 0.30 per provider at the
 current USD 0.10 lane allocation. A new campaign or any larger spend requires
 fresh explicit budget authority and must never reset or replace the existing
 branch.
@@ -46,7 +55,7 @@ access grants at action time: App creation/installation and permissions,
 environment credential access, and the App's ruleset bypass. Once those grants
 are confirmed and the gates below pass, execute initialization and subsequent
 dispatches under the existing authorization without requesting it again.
-Do not start a paid run before initialization and protection verification are
+Do not start a paid run before campaign setup and protection verification are
 complete.
 
 1. Create a dedicated **private** GitHub App under `ttokunaga-ja`. Grant only
@@ -90,11 +99,37 @@ complete.
    authority job under the installed protections; read back the root, bootstrap,
    workflow hash, run result, and protections again. Reconcile any partial or
    failed attempt before retrying; never delete or replace an existing ledger.
-5. Only after that evidence passes, execute `operation: run` for the exact current
+5. For an approved successor, follow the transition procedure below. Only
+   after the applicable read-back passes, execute `operation: run` for the exact current
    candidate SHA, successful native package run ID, and same campaign. Preserve
    the USD 10 per-provider cumulative caps and `reserved_unknown` charges.
-   A workflow hash change after bootstrap fails the immutable campaign binding;
-   it is not permission to reset the campaign or ledger.
+   A workflow hash change requires an approved transition before further
+   reservations.
+
+## F4 successor
+
+D-20261126-01 approves one six-lane rerun under `v1-f4-2026-11b`.
+Run 45788229324 already reserved USD 0.30 per provider under
+`v1-f4-2026-11` and remains `reserved_unknown`. Its reservation commit was
+`96f41efa1548f61c3be3b3f7a8fb1c00034ad298`. Check the live ref to establish
+the actual final predecessor tip and total prior reservations.
+
+After merging, review the workflow bytes on current `main`, read back the
+environment and rulesets as in setup, and dispatch the provider workflow on
+`main` with `operation=transition`, `campaign_id=v1-f4-2026-11b`,
+`predecessor_campaign_id=v1-f4-2026-11`, and
+`predecessor_tip=<verified current ledger tip>`. Leave `candidate_sha` and
+`package_run_id` empty. No paid jobs execute. Require a successful authority
+job, then read back the protected tip, its parent, the successor record and
+workflow hash, the retained reservation, and the protections again. Reconcile
+any partial or unknown outcome by reading back the ref before any retry.
+
+After the successful exact-candidate native package run and successor
+read-back, dispatch once on `main` with `operation=run`,
+`campaign_id=v1-f4-2026-11b`, the exact `candidate_sha`, and the successful
+`package_run_id`. Leave both predecessor inputs empty. This reserves another
+USD 0.30 per provider. Preserve all charges and reconcile the result before
+considering any further paid action.
 
 The workflow validates the configured nonsecret identity formats before minting,
 compares the pinned action's App slug and installation ID outputs to the approved
@@ -117,10 +152,6 @@ workflow hash and platform-enforced exact ruleset actor jointly constrain the
 writer under that configuration. Do not describe this as workflow-level identity
 enforcement or cryptographic principal attestation by the ledger format.
 
-All ledger-helper GitHub REST reads are bounded (at most 34 linear commits, seven tree
+All ledger-helper GitHub REST reads are bounded (at most 35 linear commits, seven tree
 entries per commit, and 16 KiB JSON blobs). The helper neither downloads nor
 extracts an Actions ZIP while validating the authority chain.
-
-No provider campaign bootstrap, reservation, paid call, or acceptance receipt
-currently exists. A workflow file or local helper build is not provider
-acceptance.

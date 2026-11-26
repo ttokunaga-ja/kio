@@ -24,7 +24,8 @@ const ALLOCATION: u64 = 100_000;
 const PROVIDERS: [&str; 2] = ["mistral", "gemini"];
 const OSES: [&str; 3] = ["linux", "macos", "windows"];
 const MAX_BLOB: usize = 16_384;
-const MAX_HISTORY: usize = 34;
+// One bootstrap, one approved transition, and at most 33 full reservations.
+const MAX_HISTORY: usize = 35;
 const GITHUB_API: &str = "https://api.github.com";
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -42,6 +43,14 @@ enum Command {
     Initialize {
         #[command(flatten)]
         common: CommonArgs,
+    },
+    Transition {
+        #[command(flatten)]
+        common: CommonArgs,
+        #[arg(long)]
+        predecessor_campaign_id: String,
+        #[arg(long)]
+        predecessor_tip: String,
     },
     #[command(name = "reserve-all")]
     ReserveAll {
@@ -93,6 +102,22 @@ struct CommonArgs {
     workflow_sha256: String,
 }
 
+impl CommonArgs {
+    fn campaign_request(self) -> Request {
+        Request {
+            campaign_id: self.campaign_id,
+            candidate_sha: None,
+            workflow_sha256: Some(self.workflow_sha256),
+            run_id: self.run_id,
+            attempt: self.attempt,
+            reservation_commit: None,
+            provider: None,
+            os_name: None,
+            state_dir: None,
+        }
+    }
+}
+
 /// Execute one bounded authority action and print its canonical JSON result.
 pub fn run(args: Args) -> Result<()> {
     let token = env::var("GITHUB_TOKEN").map_err(|_| "GITHUB_TOKEN is required".to_owned())?;
@@ -101,25 +126,23 @@ pub fn run(args: Args) -> Result<()> {
     }
     let repository = match &args.command {
         Command::Initialize { common }
+        | Command::Transition { common, .. }
         | Command::ReserveAll { common, .. }
         | Command::Verify { common, .. }
         | Command::ExportState { common, .. } => &common.repository,
     };
     let mut api = GitHubApi::new(repository, token)?;
     let result = match args.command {
-        Command::Initialize { common } => initialize(
+        Command::Initialize { common } => initialize(&mut api, &common.campaign_request())?,
+        Command::Transition {
+            common,
+            predecessor_campaign_id,
+            predecessor_tip,
+        } => transition(
             &mut api,
-            &Request {
-                campaign_id: common.campaign_id,
-                candidate_sha: None,
-                workflow_sha256: Some(common.workflow_sha256),
-                run_id: common.run_id,
-                attempt: common.attempt,
-                reservation_commit: None,
-                provider: None,
-                os_name: None,
-                state_dir: None,
-            },
+            &common.campaign_request(),
+            &predecessor_campaign_id,
+            &predecessor_tip,
         )?,
         Command::ReserveAll {
             common,
@@ -725,20 +748,30 @@ fn load_verified<A: Api>(api: &mut A, expected_commit: Option<&str>) -> Result<V
     if root_files.len() != 1 || !root_files.contains_key("campaign.json") {
         return Err("ledger root is not an immutable bootstrap".to_owned());
     }
-    let campaign = root_files
+    let mut campaign = root_files
         .get("campaign.json")
         .cloned()
         .ok_or_else(|| "ledger root is not an immutable bootstrap".to_owned())?;
     validate_campaign(&campaign)?;
+    if get_object(&campaign)?.len() != 9 {
+        return Err("ledger root has unexpected campaign fields".to_owned());
+    }
     let mut allocations = BTreeMap::new();
     let mut seen = BTreeSet::new();
     let mut totals = BTreeMap::from(PROVIDERS.map(|provider| (provider.to_owned(), 0_u64)));
     for (index, (_, commit)) in commits.iter().enumerate().skip(1) {
         let files = tree_files(api, commit)?;
+        let parent = &commits[index - 1].0;
+        if let Some(successor) = files.get("campaign.json")
+            && files.len() == 1
+        {
+            validate_transition(successor, &campaign, parent)?;
+            campaign = successor.clone();
+            continue;
+        }
         if files.len() != 6 || files.contains_key("campaign.json") {
             return Err("reservation commit must atomically contain all six lanes".to_owned());
         }
-        let parent = &commits[index - 1].0;
         let mut lanes = BTreeSet::new();
         let mut transaction = BTreeSet::new();
         for (path, record) in &files {
@@ -792,7 +825,7 @@ fn load_verified<A: Api>(api: &mut A, expected_commit: Option<&str>) -> Result<V
     })
 }
 
-fn initialize<A: Api>(api: &mut A, args: &Request) -> Result<Value> {
+fn new_campaign(args: &Request) -> Result<Map<String, Value>> {
     require_id(&args.campaign_id, "campaign id")?;
     let workflow_sha256 = args
         .workflow_sha256
@@ -801,9 +834,6 @@ fn initialize<A: Api>(api: &mut A, args: &Request) -> Result<Value> {
     require_digest(workflow_sha256, "workflow digest")?;
     require_positive(args.run_id, "initialization run")?;
     require_positive(args.attempt, "initialization attempt")?;
-    if api.reference()?.is_some() {
-        return Err("ledger branch already exists; bootstrap is immutable".to_owned());
-    }
     let mut epoch_bytes = [0_u8; 32];
     getrandom::fill(&mut epoch_bytes)
         .map_err(|error| format!("cannot create campaign epoch: {error}"))?;
@@ -813,11 +843,54 @@ fn initialize<A: Api>(api: &mut A, args: &Request) -> Result<Value> {
         "workflow_path": ".github/workflows/v1-provider-acceptance.yml", "workflow_sha256": workflow_sha256,
         "initialize_run_id": args.run_id, "initialize_attempt": args.attempt,
     });
-    validate_campaign(&campaign)?;
+    Ok(get_object(&campaign)?.clone())
+}
+
+fn initialize<A: Api>(api: &mut A, args: &Request) -> Result<Value> {
+    if api.reference()?.is_some() {
+        return Err("ledger branch already exists; bootstrap is immutable".to_owned());
+    }
+    let campaign = Value::Object(new_campaign(args)?);
     let files = BTreeMap::from([("campaign.json".to_owned(), campaign)]);
     let commit = api.create_commit(&files, None)?;
     api.cas_ref(None, &commit, true)?;
     Ok(json!({"commit": commit, "campaign_id": args.campaign_id}))
+}
+
+fn validate_transition(successor: &Value, predecessor: &Value, parent: &str) -> Result<()> {
+    validate_campaign(successor)?;
+    if get_object(successor)?.len() != 11
+        || predecessor.get("predecessor_tip").is_some()
+        || get_string(successor, "predecessor_campaign_id")?
+            != get_string(predecessor, "campaign_id")?
+        || get_string(successor, "predecessor_tip")? != parent
+        || get_string(successor, "campaign_id")? == get_string(predecessor, "campaign_id")?
+    {
+        return Err("invalid successor or predecessor campaign binding".to_owned());
+    }
+    Ok(())
+}
+
+fn transition<A: Api>(
+    api: &mut A,
+    args: &Request,
+    predecessor_campaign_id: &str,
+    predecessor_tip: &str,
+) -> Result<Value> {
+    require_id(predecessor_campaign_id, "predecessor campaign id")?;
+    require_sha(predecessor_tip, "predecessor ledger tip")?;
+    let state = load_verified(api, None)?;
+    let mut successor = new_campaign(args)?;
+    successor.insert(
+        "predecessor_campaign_id".to_owned(),
+        json!(predecessor_campaign_id),
+    );
+    successor.insert("predecessor_tip".to_owned(), json!(predecessor_tip));
+    let successor = Value::Object(successor);
+    validate_transition(&successor, &state.campaign, &state.tip)?;
+    let records = BTreeMap::from([("campaign.json".to_owned(), successor.clone())]);
+    let commit = append(api, &state.tip, &records)?;
+    Ok(json!({"commit": commit, "campaign": successor}))
 }
 
 fn require_campaign_workflow(args: &Request, campaign: &Value) -> Result<()> {
@@ -827,7 +900,7 @@ fn require_campaign_workflow(args: &Request, campaign: &Value) -> Result<()> {
         .ok_or_else(|| "--workflow-sha256 is required".to_owned())?;
     require_digest(requested, "workflow digest")?;
     if get_string(campaign, "workflow_sha256")? != requested {
-        return Err("workflow digest does not match immutable campaign bootstrap".to_owned());
+        return Err("workflow digest does not match immutable campaign binding".to_owned());
     }
     Ok(())
 }
@@ -842,10 +915,10 @@ fn reserve_all<A: Api>(api: &mut A, args: &Request) -> Result<Value> {
     require_positive(args.run_id, "reservation run")?;
     require_positive(args.attempt, "reservation attempt")?;
     let state = load_verified(api, None)?;
-    require_campaign_workflow(args, &state.campaign)?;
     if get_string(&state.campaign, "campaign_id")? != args.campaign_id {
-        return Err("campaign id does not match immutable bootstrap".to_owned());
+        return Err("campaign id does not match active campaign".to_owned());
     }
+    require_campaign_workflow(args, &state.campaign)?;
     for provider in PROVIDERS {
         if state.totals[provider]
             .checked_add((OSES.len() as u64) * ALLOCATION)
@@ -878,20 +951,25 @@ fn reserve_all<A: Api>(api: &mut A, args: &Request) -> Result<Value> {
             records.insert(format!("reservation-{allocation}.json"), record);
         }
     }
-    let commit = api.create_commit(&records, Some(&state.tip))?;
+    let commit = append(api, &state.tip, &records)?;
+    Ok(
+        json!({"commit": commit, "allocations": records.values().map(|record| get_string(record, "allocation_id").map(str::to_owned)).collect::<Result<Vec<_>>>()?}),
+    )
+}
+
+fn append<A: Api>(api: &mut A, parent: &str, files: &BTreeMap<String, Value>) -> Result<String> {
+    let commit = api.create_commit(files, Some(parent))?;
     let current = api.reference()?;
     if current
         .as_ref()
         .and_then(|value| value.pointer("/object/sha"))
         .and_then(Value::as_str)
-        != Some(state.tip.as_str())
+        != Some(parent)
     {
         return Err("ledger conflict before ref update".to_owned());
     }
-    api.cas_ref(Some(&state.tip), &commit, false)?;
-    Ok(
-        json!({"commit": commit, "allocations": records.values().map(|record| get_string(record, "allocation_id").map(str::to_owned)).collect::<Result<Vec<_>>>()?}),
-    )
+    api.cas_ref(Some(parent), &commit, false)?;
+    Ok(commit)
 }
 
 fn verify<A: Api>(api: &mut A, args: &Request) -> Result<Value> {
@@ -926,7 +1004,9 @@ fn verify<A: Api>(api: &mut A, args: &Request) -> Result<Value> {
         .allocations
         .get(&allocation)
         .ok_or_else(|| "exact durable allocation is absent".to_owned())?;
-    if get_string(record, "candidate_sha")? != candidate_sha {
+    if get_string(record, "candidate_sha")? != candidate_sha
+        || record.get("sequence").and_then(Value::as_u64) != Some(state.commits - 1)
+    {
         return Err("exact durable allocation is absent".to_owned());
     }
     Ok(
@@ -1121,6 +1201,118 @@ mod tests {
             state_dir: None,
         }
     }
+    fn successor() -> Request {
+        let mut request = args();
+        request.campaign_id = "campaign-2".to_owned();
+        request.workflow_sha256 = Some("c".repeat(64));
+        request.run_id += 1;
+        request
+    }
+
+    #[test]
+    fn transition_preserves_history_and_binds_successor_reservations() {
+        let mut api = FakeApi::default();
+        initialize(&mut api, &args()).unwrap();
+        let first = reserve_all(&mut api, &args()).unwrap();
+        let predecessor_tip = first["commit"].as_str().unwrap();
+        let (commits, trees, blobs) = (api.commits.clone(), api.trees.clone(), api.blobs.clone());
+
+        let mut next = successor();
+        let transition_commit = transition(&mut api, &next, "campaign-1", predecessor_tip).unwrap();
+        let tip = transition_commit["commit"].as_str().unwrap();
+        assert_eq!(api.head.as_deref(), Some(tip));
+        assert_eq!(
+            api.commits[tip]["parents"],
+            json!([{"sha": predecessor_tip}])
+        );
+        for (old, current) in [(&commits, &api.commits), (&blobs, &api.blobs)] {
+            for (oid, bytes) in old {
+                assert_eq!(&current[oid], bytes);
+            }
+        }
+        for (oid, entries) in &trees {
+            assert_eq!(&api.trees[oid], entries);
+        }
+
+        let mut closed = args();
+        closed.run_id = 99;
+        assert!(reserve_all(&mut api, &closed).is_err());
+        closed.run_id = args().run_id;
+        closed.reservation_commit = Some(predecessor_tip.to_owned());
+        assert!(verify(&mut api, &closed).is_ok());
+
+        let reservation = reserve_all(&mut api, &next).unwrap();
+        next.reservation_commit = Some(reservation["commit"].as_str().unwrap().to_owned());
+        assert!(verify(&mut api, &next).is_ok());
+        let original_hash = next.workflow_sha256.replace("b".repeat(64));
+        assert!(verify(&mut api, &next).is_err());
+        next.workflow_sha256 = original_hash;
+        let successor_run = next.run_id;
+        next.run_id = args().run_id;
+        assert!(verify(&mut api, &next).is_err());
+
+        next.run_id = successor_run;
+        let tree = api.commits[tip]["tree"]["sha"].as_str().unwrap();
+        let blob = api.trees[tree][0]["sha"].as_str().unwrap();
+        let mut invalid = transition_commit["campaign"].clone();
+        invalid["predecessor_tip"] = json!("f".repeat(40));
+        api.blobs.get_mut(blob).unwrap()["content"] =
+            json!(BASE64.encode(canonical(&invalid).unwrap()));
+        assert!(verify(&mut api, &next).unwrap_err().contains("predecessor"));
+    }
+
+    #[test]
+    fn transition_rejects_non_tip_unknown_and_reused_predecessors() {
+        let mut api = FakeApi::default();
+        let root = initialize(&mut api, &args()).unwrap();
+        reserve_all(&mut api, &args()).unwrap();
+        let tip = api.head.clone().unwrap();
+        let count = api.counter;
+        let next = successor();
+        assert!(
+            transition(
+                &mut api,
+                &next,
+                "campaign-1",
+                root["commit"].as_str().unwrap()
+            )
+            .is_err()
+        );
+        assert!(transition(&mut api, &next, "campaign-1", &"f".repeat(40)).is_err());
+        assert!(transition(&mut api, &next, "unknown", &tip).is_err());
+        assert!(transition(&mut api, &args(), "campaign-1", &tip).is_err());
+        assert_eq!(
+            (api.head.as_deref(), api.counter),
+            (Some(tip.as_str()), count)
+        );
+        transition(&mut api, &next, "campaign-1", &tip).unwrap();
+        assert!(transition(&mut api, &next, "campaign-1", &tip).is_err());
+    }
+
+    #[test]
+    fn successor_cap_includes_predecessor_unknown_reservations() {
+        let mut api = FakeApi::default();
+        initialize(&mut api, &args()).unwrap();
+        for run_id in 100..132 {
+            let mut request = args();
+            request.run_id = run_id;
+            reserve_all(&mut api, &request).unwrap();
+        }
+        let tip = api.head.clone().unwrap();
+        let mut next = successor();
+        transition(&mut api, &next, "campaign-1", &tip).unwrap();
+        reserve_all(&mut api, &next).unwrap();
+        let state = load_verified(&mut api, None).unwrap();
+        assert_eq!(
+            state.totals,
+            BTreeMap::from(PROVIDERS.map(|provider| (provider.to_owned(), 9_900_000)))
+        );
+        let count = api.counter;
+        next.run_id += 1;
+        assert!(reserve_all(&mut api, &next).unwrap_err().contains("cap"));
+        assert_eq!(api.counter, count);
+    }
+
     #[test]
     fn bootstrap_reserve_and_verify_exact_six_lanes() {
         let mut api = FakeApi::default();

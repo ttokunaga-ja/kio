@@ -3,10 +3,12 @@ run-name: v1 provider acceptance ${{ inputs.operation }} / ${{ inputs.campaign_i
 on:
   workflow_dispatch:
     inputs:
-      operation: { required: true, type: choice, options: [initialize, run] }
+      operation: { required: true, type: choice, options: [initialize, transition, run] }
       candidate_sha: { required: false, type: string }
       package_run_id: { required: false, type: string }
       campaign_id: { required: true, type: string }
+      predecessor_campaign_id: { required: false, type: string }
+      predecessor_tip: { required: false, type: string }
 
 # One shared budget authority across campaigns, retries, providers, and OSes.
 concurrency: { group: v1-provider-acceptance-ledger-global, cancel-in-progress: false }
@@ -25,14 +27,33 @@ jobs:
           CANDIDATE_SHA: ${{ inputs.candidate_sha }}
           PACKAGE_RUN_ID: ${{ inputs.package_run_id }}
           CAMPAIGN_ID: ${{ inputs.campaign_id }}
+          PREDECESSOR_CAMPAIGN_ID: ${{ inputs.predecessor_campaign_id }}
+          PREDECESSOR_TIP: ${{ inputs.predecessor_tip }}
         run: |
           set -euo pipefail
           [[ "$CAMPAIGN_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$ ]]
           case "$OPERATION" in
-            initialize) test -z "$CANDIDATE_SHA" && test -z "$PACKAGE_RUN_ID" ;;
-            run) [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]] && [[ "$PACKAGE_RUN_ID" =~ ^[1-9][0-9]*$ ]] ;;
+            initialize)
+              test -z "$CANDIDATE_SHA"
+              test -z "$PACKAGE_RUN_ID"
+              ;;
+            transition)
+              test -z "$CANDIDATE_SHA"
+              test -z "$PACKAGE_RUN_ID"
+              [[ "$PREDECESSOR_CAMPAIGN_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$ ]]
+              [[ "$PREDECESSOR_TIP" =~ ^[0-9a-f]{40}$ ]]
+              test "$PREDECESSOR_CAMPAIGN_ID" != "$CAMPAIGN_ID"
+              ;;
+            run)
+              [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]
+              [[ "$PACKAGE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+              ;;
             *) exit 1 ;;
           esac
+          if test "$OPERATION" != transition; then
+            test -z "$PREDECESSOR_CAMPAIGN_ID"
+            test -z "$PREDECESSOR_TIP"
+          fi
           main_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')"
           test "$GITHUB_SHA" = "$main_sha"
           if test "$OPERATION" = run; then test "$GITHUB_SHA" = "$CANDIDATE_SHA"; fi
@@ -147,6 +168,8 @@ jobs:
           GITHUB_TOKEN: ${{ steps.ledger-app.outputs.token }}
           OPERATION: ${{ inputs.operation }}
           CAMPAIGN_ID: ${{ inputs.campaign_id }}
+          PREDECESSOR_CAMPAIGN_ID: ${{ inputs.predecessor_campaign_id }}
+          PREDECESSOR_TIP: ${{ inputs.predecessor_tip }}
           CANDIDATE_SHA: ${{ inputs.candidate_sha }}
           REPOSITORY: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
@@ -158,14 +181,22 @@ jobs:
           main_sha="$(gh api "repos/${REPOSITORY}/git/ref/heads/main" --jq '.object.sha')"
           test "$main_sha" = "$GITHUB_SHA"
           if test "$OPERATION" = run; then test "$CANDIDATE_SHA" = "$GITHUB_SHA"; fi
-          if test "$OPERATION" = initialize; then
-            "$KIO_ACCEPTANCE_TOOLS" provider-ledger initialize --repository "$REPOSITORY" --campaign-id "$CAMPAIGN_ID" --workflow-sha256 "$WORKFLOW_SHA256" --run-id "$RUN_ID" --attempt "$ATTEMPT"
-          else
-            result="$("$KIO_ACCEPTANCE_TOOLS" provider-ledger reserve-all --repository "$REPOSITORY" --campaign-id "$CAMPAIGN_ID" --workflow-sha256 "$WORKFLOW_SHA256" --candidate-sha "$CANDIDATE_SHA" --run-id "$RUN_ID" --attempt "$ATTEMPT")"
-            commit="$(jq -er .commit <<< "$result")"
-            [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
-            echo "reservation_commit=$commit" >> "$GITHUB_OUTPUT"
-          fi
+          common=(--repository "$REPOSITORY" --campaign-id "$CAMPAIGN_ID" --workflow-sha256 "$WORKFLOW_SHA256" --run-id "$RUN_ID" --attempt "$ATTEMPT")
+          case "$OPERATION" in
+            initialize)
+              "$KIO_ACCEPTANCE_TOOLS" provider-ledger initialize "${common[@]}"
+              ;;
+            transition)
+              "$KIO_ACCEPTANCE_TOOLS" provider-ledger transition "${common[@]}" --predecessor-campaign-id "$PREDECESSOR_CAMPAIGN_ID" --predecessor-tip "$PREDECESSOR_TIP"
+              ;;
+            run)
+              result="$("$KIO_ACCEPTANCE_TOOLS" provider-ledger reserve-all "${common[@]}" --candidate-sha "$CANDIDATE_SHA")"
+              commit="$(jq -er .commit <<< "$result")"
+              [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+              echo "reservation_commit=$commit" >> "$GITHUB_OUTPUT"
+              ;;
+            *) exit 1 ;;
+          esac
 
   provider-a08:
     name: ${{ matrix.os }} ${{ matrix.provider }} A08 live-provider guard

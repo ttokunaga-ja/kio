@@ -315,3 +315,9 @@
 - **保護と残るリスク**：プロセス数・メモリ・CPU 時間・Job close 時の終了、`CREATE_NO_WINDOW`、時間と出力を制限した I/O、呼出しごとの private profile と scratch、実行ファイルの同一性・digest・D-20261122-01 の署名検証を維持する。Office は呼出し元ユーザーの権限でファイル、レジストリ、IPC、ネットワークにアクセスできる。Job はそれらのアクセスを制限しない。
 - **v1 後の対応**：許可を限定したホスト側のパイプ仲介、または LibreOffice 上流での AppContainer 対応を検討し、AppContainer を復元する。
 - **関係する資料**：[Adapter 仕様 §5.1](07-adapter-spec.md#51-prepare)、[運用 §4.3](10-operations.md#43-kio-created-object-boundary)。
+
+### D-20261126-01 F4 の後継キャンペーンと 6 レーンの再実行を承認
+
+- **内容**：保護された台帳に後継キャンペーンを追記し、F4 の有料 6 レーンを 1 回再実行する。先行キャンペーンの予約をすべて引き継ぎ、上限は各プロバイダー累計 USD 10 のままとする。
+- **理由**：Windows Git Bash が GitHub API の引数をファイルパスへ変換し、先行実行が失敗した。修正後のワークフローのハッシュを後継キャンペーンに結び付ける。
+- **関係する資料**：`tasks/acceptance/provider-budget.md`。
