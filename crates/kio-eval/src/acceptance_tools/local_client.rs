@@ -16,7 +16,9 @@ use kio_core::{
     private_fs::{read_private_file, verify_private_directory},
     store_dir::{Publication, StoreDirectory},
 };
-use kio_process::{BoundedProcessOptions, BoundedStdin, SupervisedChild, run_bounded_command};
+use kio_process::{
+    BoundedProcessError, BoundedProcessOptions, BoundedStdin, SupervisedChild, run_bounded_command,
+};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -58,9 +60,15 @@ fn write_route_material(root: &Path, key: &str, hosts: &str) -> Result<(), Strin
         .map_err(|_| "route root must be a new private directory")?;
     let directory =
         StoreDirectory::from_retained(handle, absolute).map_err(|_| "cannot retain route root")?;
-    for (name, bytes) in [("id", key.as_bytes()), ("known_hosts", hosts.as_bytes())] {
+    for (name, material) in [("id", key), ("known_hosts", hosts)] {
+        // OpenSSH requires the closing line of its private key to end in LF.
+        // GitHub secret values can arrive without that final byte.
+        let mut bytes = material.as_bytes().to_vec();
+        if !bytes.ends_with(b"\n") {
+            bytes.push(b'\n');
+        }
         directory
-            .write_atomic(Path::new(name), bytes, Publication::CreateOnly)
+            .write_atomic(Path::new(name), &bytes, Publication::CreateOnly)
             .map_err(|_| "cannot publish private route material")?;
     }
     Ok(())
@@ -238,18 +246,15 @@ impl Client {
 
     fn ssh_command(&self) -> Command {
         let mut command = Command::new("ssh");
-        command.arg("-F").arg(self.config_path()).args([
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=20",
-        ]);
+        command.env("LC_ALL", "C").arg("-F").arg(self.config_path());
         command
     }
 
     fn base_command(&self) -> Command {
         let mut command = self.ssh_command();
-        command.arg("kio-lab-wsl");
+        // Both hops write trace lines to bounded stderr. Only fixed categories
+        // derived from those lines can be reported.
+        command.args(["-v", "kio-lab-wsl"]);
         command
     }
 
@@ -280,9 +285,33 @@ impl Client {
             },
             stdin,
         )
-        .map_err(|error| format!("dispatcher {} failed: {error}", verb.name()))?;
+        .map_err(|error| {
+            let code = match error {
+                BoundedProcessError::Spawn(_) => "SSH_START_FAILED",
+                BoundedProcessError::Timeout { .. } => "PROCESS_TIMEOUT",
+                BoundedProcessError::OutputLimit { .. } => "OUTPUT_LIMIT",
+                _ => "PROCESS_FAILED",
+            };
+            let stage = if code == "SSH_START_FAILED" {
+                "jump_connect"
+            } else {
+                "ssh_unknown"
+            };
+            format!(
+                "{} failed: ssh_exit=unavailable stage={stage} code={code}",
+                verb.name()
+            )
+        })?;
         if !output.status.success() {
-            return Err(format!("dispatcher rejected {}", verb.name()));
+            let (stage, code) = ssh_failure(output.status.code(), &output.stdout, &output.stderr);
+            let exit = output
+                .status
+                .code()
+                .map_or_else(|| "unavailable".into(), |n| n.to_string());
+            return Err(format!(
+                "{} failed: ssh_exit={exit} stage={stage} code={code}",
+                verb.name()
+            ));
         }
         Ok(output.stdout.into_bytes())
     }
@@ -704,11 +733,62 @@ fn validate_observation(original: &Value, live: &Value, phase: &str) -> Result<(
     Ok(())
 }
 
+fn ssh_failure(exit: Option<i32>, stdout: &str, stderr: &str) -> (&'static str, &'static str) {
+    if exit == Some(1) {
+        if let Some(code) = super::dispatch::response_code(stdout) {
+            return ("dispatcher", code);
+        }
+        return ("forced_command", "UNCLASSIFIED");
+    }
+
+    let mut stage = "ssh_unknown";
+    let mut code = "UNCLASSIFIED";
+    for line in stderr.lines() {
+        if line.starts_with("debug1: Sending command:") || line.starts_with("Authenticated to ") {
+            stage = "forced_command";
+        } else if stage == "ssh_unknown" && line.starts_with("debug1: Authenticating to ") {
+            stage = "jump_auth";
+        }
+        if line.starts_with("kio-test@127.0.0.1: Permission denied") {
+            return ("forced_command", "WSL_AUTH_FAILED");
+        }
+        if line.starts_with("kio-ci@") && line.contains(": Permission denied") {
+            return ("jump_auth", "JUMP_AUTH_FAILED");
+        }
+        if line.starts_with("Load key ") {
+            let stage = if stage == "forced_command" {
+                stage
+            } else {
+                "jump_auth"
+            };
+            return (stage, "IDENTITY_LOAD_FAILED");
+        }
+        if line == "Host key verification failed." {
+            let stage = if stage == "forced_command" {
+                stage
+            } else {
+                "jump_auth"
+            };
+            return (stage, "HOST_KEY_VERIFICATION_FAILED");
+        }
+        if line.starts_with("ssh: connect to host ") {
+            return ("jump_connect", "TCP_CONNECT_FAILED");
+        }
+        if line.starts_with("channel 0: open failed:") {
+            return ("forced_command", "JUMP_FORWARD_FAILED");
+        }
+        if line.starts_with("Connection closed ") || line.starts_with("Connection reset ") {
+            code = "CONNECTION_LOST";
+        }
+    }
+    (stage, code)
+}
+
 fn ssh_config(args: &Args) -> Result<String, String> {
     let known = ssh_path(&args.known_hosts)?;
     let key = ssh_path(&args.identity_file)?;
     Ok(format!(
-        "Host kio-lab-jump\n  HostName {}\n  User kio-ci\n  Port 22\n  IdentityFile \"{key}\"\n  IdentitiesOnly yes\n  StrictHostKeyChecking yes\n  UserKnownHostsFile \"{known}\"\n  GlobalKnownHostsFile none\n  HostKeyAlias kio-lab-jump\nHost kio-lab-wsl\n  HostName 127.0.0.1\n  User kio-test\n  Port 2222\n  ProxyJump kio-lab-jump\n  IdentityFile \"{key}\"\n  IdentitiesOnly yes\n  StrictHostKeyChecking yes\n  UserKnownHostsFile \"{known}\"\n  GlobalKnownHostsFile none\n  HostKeyAlias kio-lab-wsl\n",
+        "Host kio-lab-jump\n  HostName {}\n  User kio-ci\n  Port 22\n  HostKeyAlias kio-lab-jump\nHost kio-lab-wsl\n  HostName 127.0.0.1\n  User kio-test\n  Port 2222\n  ProxyJump kio-lab-jump\n  HostKeyAlias kio-lab-wsl\nHost *\n  IdentityFile \"{key}\"\n  IdentitiesOnly yes\n  StrictHostKeyChecking yes\n  UserKnownHostsFile \"{known}\"\n  GlobalKnownHostsFile none\n  BatchMode yes\n  ConnectTimeout 15\n",
         args.jump_host
     ))
 }
@@ -787,16 +867,70 @@ mod tests {
     fn route_material_is_private_at_birth_and_existing_paths_are_unchanged() {
         let temp = super::super::canonical_tempdir();
         let path = temp.path().join("route");
-        write_route_material(&path, "private test key\n", "pinned test hosts\n").unwrap();
+        write_route_material(&path, "private test key", "pinned test hosts").unwrap();
         verify_private_directory(&path).unwrap();
         assert_eq!(
             read_private_file(&path.join("id"), PUBLIC_MAX as u64).unwrap(),
+            b"private test key\n"
+        );
+        assert_eq!(
+            read_private_file(&path.join("known_hosts"), PUBLIC_MAX as u64).unwrap(),
+            b"pinned test hosts\n"
+        );
+        let terminated = temp.path().join("terminated");
+        write_route_material(&terminated, "private test key\n", "pinned test hosts\n").unwrap();
+        assert_eq!(
+            read_private_file(&terminated.join("id"), PUBLIC_MAX as u64).unwrap(),
             b"private test key\n"
         );
         assert!(write_route_material(&path, "replacement", "replacement").is_err());
         assert_eq!(
             read_private_file(&path.join("id"), PUBLIC_MAX as u64).unwrap(),
             b"private test key\n"
+        );
+    }
+
+    #[test]
+    fn ssh_failure_reports_only_fixed_diagnostics() {
+        assert_eq!(
+            ssh_failure(
+                Some(255),
+                "",
+                "Load key \"/private/test\": error in libcrypto"
+            ),
+            ("jump_auth", "IDENTITY_LOAD_FAILED")
+        );
+        assert_eq!(
+            ssh_failure(
+                Some(255),
+                "",
+                "kio-test@127.0.0.1: Permission denied (publickey)."
+            ),
+            ("forced_command", "WSL_AUTH_FAILED")
+        );
+        assert_eq!(
+            ssh_failure(
+                Some(255),
+                "",
+                "ssh: connect to host address port 22: Connection timed out"
+            ),
+            ("jump_connect", "TCP_CONNECT_FAILED")
+        );
+        assert_eq!(
+            ssh_failure(
+                Some(255),
+                "",
+                "debug1: Authenticating to address:22 as 'kio-ci'\nConnection closed by peer"
+            ),
+            ("jump_auth", "CONNECTION_LOST")
+        );
+        assert_eq!(
+            ssh_failure(Some(1), "{\"code\":\"LEASE_HELD\"}\n", ""),
+            ("dispatcher", "LEASE_HELD")
+        );
+        assert_eq!(
+            ssh_failure(Some(1), "{\"code\":\"arbitrary text\"}\n", ""),
+            ("forced_command", "UNCLASSIFIED")
         );
     }
 
@@ -941,7 +1075,9 @@ mod tests {
         let config = String::from_utf8(config).unwrap();
         assert!(config.contains("Host kio-lab-jump"));
         assert!(config.contains("Host kio-lab-wsl"));
-        assert_eq!(config.matches("GlobalKnownHostsFile none").count(), 2);
+        assert!(config.contains("Host *\n"));
+        assert!(config.contains("BatchMode yes\n  ConnectTimeout 15\n"));
+        assert_eq!(config.matches("GlobalKnownHostsFile none").count(), 1);
         assert!(!config.contains('\\'));
     }
 

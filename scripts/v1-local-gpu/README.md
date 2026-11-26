@@ -526,7 +526,7 @@ Linux helper と固定入力を準備する。初期構築用のコミットは 
 1. クリーンな候補の Linux ビルド環境で、候補からビルドした helper を使って proposal を生成する。
    `F4_CANDIDATE_SHA` に承認済み候補の完全な SHA を、`bundle` にリポジトリ外の一時ディレクトリを
    指定する。canonical manifest は proposal の
-   `deployment` オブジェクトだけを、キー順でコンパクトにシリアライズし、末尾改行なしで保存する。
+   `deployment` オブジェクトだけを、キー順でコンパクトにシリアライズし、末尾に LF を 1 つ付けて保存する。
 
    ```bash
    (
@@ -540,7 +540,7 @@ Linux helper と固定入力を準備する。初期構築用のコミットは 
      "$bundle/kio-acceptance-tools" route-preflight \
        --repository "$PWD" --candidate "$candidate" \
        --tools-binary "$bundle/kio-acceptance-tools" > "$bundle/proposal.json"
-     jq -cSj -e '.deployment | objects' "$bundle/proposal.json" > "$bundle/deployment.json"
+     jq -cS -e '.deployment | objects' "$bundle/proposal.json" > "$bundle/deployment.json"
    )
    ```
 

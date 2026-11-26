@@ -6,12 +6,78 @@ pub struct Args {}
 pub fn run(args: Args) -> Result<(), String> {
     #[cfg(unix)]
     {
-        unix::run(args)
+        unix::run(args).map_err(|message| {
+            use std::io::Write;
+            let code = error_code(&message);
+            let _ = std::io::stdout()
+                .lock()
+                .write_all(error_response(code).as_bytes());
+            code.into()
+        })
     }
     #[cfg(not(unix))]
     {
         let _ = args;
         Err("GPU dispatcher is supported only on Linux".into())
+    }
+}
+
+const ERROR_CODES: &[(&str, &str)] = &[
+    (
+        "deployment is not canonical JSON",
+        "DEPLOYMENT_NONCANONICAL",
+    ),
+    ("deployment is not JSON", "DEPLOYMENT_NONCANONICAL"),
+    ("GPU host setup is in progress", "MAINTENANCE_BUSY"),
+    (
+        "private dispatcher root is unavailable",
+        "PRIVATE_ROOT_UNAVAILABLE",
+    ),
+    ("GPU lease is already held", "LEASE_HELD"),
+    (
+        "candidate is not installed deployment",
+        "CANDIDATE_MISMATCH",
+    ),
+];
+const REJECTED: &str = "DISPATCHER_REJECTED";
+
+#[cfg(unix)]
+fn error_code(message: &str) -> &'static str {
+    ERROR_CODES
+        .iter()
+        .find_map(|&(detail, code)| (detail == message).then_some(code))
+        .unwrap_or(REJECTED)
+}
+
+#[cfg(unix)]
+fn error_response(code: &'static str) -> String {
+    format!("{{\"code\":\"{code}\"}}\n")
+}
+
+pub(super) fn response_code(stdout: &str) -> Option<&'static str> {
+    let received = stdout.strip_prefix("{\"code\":\"")?.strip_suffix("\"}\n")?;
+    ERROR_CODES
+        .iter()
+        .map(|&(_, code)| code)
+        .chain([REJECTED])
+        .find(|&code| code == received)
+}
+
+#[cfg(all(unix, test))]
+mod protocol_tests {
+    use super::*;
+
+    #[test]
+    fn only_fixed_errors_round_trip() {
+        for &(detail, code) in ERROR_CODES {
+            assert_eq!(error_code(detail), code);
+            let reply = error_response(code);
+            assert!(reply.len() < 64);
+            assert_eq!(response_code(&reply), Some(code));
+            assert_eq!(response_code(reply.trim_end()), None);
+        }
+        assert_eq!(error_code("unexpected private detail"), REJECTED);
+        assert_eq!(response_code(&error_response(REJECTED)), Some(REJECTED));
     }
 }
 
@@ -457,8 +523,10 @@ mod unix {
                     .into(),
             );
         }
-        lock.try_lock_shared()
-            .map_err(|_| "GPU host setup is in progress")?;
+        lock.try_lock_shared().map_err(|error| match error {
+            std::fs::TryLockError::WouldBlock => "GPU host setup is in progress",
+            std::fs::TryLockError::Error(_) => "cannot acquire maintenance lock",
+        })?;
         Ok(DispatcherGate(lock))
     }
 
