@@ -4178,6 +4178,7 @@ esac
         assert!(verify_a09_gc_tag(&dir, &response, tag, &commit).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn native_embedding_acceptance_a05_initializes_ledger_before_index() {
         assert_native_ledger_bootstrap(AcceptanceCase::A05, "initialized");
