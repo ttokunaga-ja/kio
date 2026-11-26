@@ -177,11 +177,10 @@ jobs:
           WORKFLOW_SHA256: ${{ needs.tools-build.outputs.workflow_sha256 }}
         run: |
           set -euo pipefail
-          [[ "$WORKFLOW_SHA256" =~ ^[0-9a-f]{64}$ ]]
           main_sha="$(gh api "repos/${REPOSITORY}/git/ref/heads/main" --jq '.object.sha')"
           test "$main_sha" = "$GITHUB_SHA"
           if test "$OPERATION" = run; then test "$CANDIDATE_SHA" = "$GITHUB_SHA"; fi
-          common=(--repository "$REPOSITORY" --campaign-id "$CAMPAIGN_ID" --workflow-sha256 "$WORKFLOW_SHA256" --run-id "$RUN_ID" --attempt "$ATTEMPT")
+          common=(--repository "$REPOSITORY" --campaign-id "$CAMPAIGN_ID" --run-id "$RUN_ID" --attempt "$ATTEMPT")
           case "$OPERATION" in
             initialize)
               "$KIO_ACCEPTANCE_TOOLS" provider-ledger initialize "${common[@]}"
@@ -190,7 +189,7 @@ jobs:
               "$KIO_ACCEPTANCE_TOOLS" provider-ledger transition "${common[@]}" --predecessor-campaign-id "$PREDECESSOR_CAMPAIGN_ID" --predecessor-tip "$PREDECESSOR_TIP"
               ;;
             run)
-              result="$("$KIO_ACCEPTANCE_TOOLS" provider-ledger reserve-all "${common[@]}" --candidate-sha "$CANDIDATE_SHA")"
+              result="$("$KIO_ACCEPTANCE_TOOLS" provider-ledger reserve-all "${common[@]}" --candidate-sha "$CANDIDATE_SHA" --workflow-sha256 "$WORKFLOW_SHA256")"
               commit="$(jq -er .commit <<< "$result")"
               [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
               echo "reservation_commit=$commit" >> "$GITHUB_OUTPUT"
@@ -258,18 +257,16 @@ jobs:
           if [[ "$RUNNER_OS" == Windows ]]; then tools_bin="${tools_bin}.exe"; fi
           test -f "$tools_bin"
           printf 'KIO_ACCEPTANCE_TOOLS=%s\n' "$GITHUB_WORKSPACE/candidate/$tools_bin" >> "$GITHUB_ENV"
-          printf 'KIO_PROVIDER_WORKFLOW_SHA256=%s\n' "$(shasum -a 256 .github/workflows/v1-provider-acceptance.yml | awk '{print $1}')" >> "$GITHUB_ENV"
-      - name: Verify exact ledger root, chain, and reservation before credential
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
-          RUN_ID: ${{ github.run_id }}
-          ATTEMPT: ${{ github.run_attempt }}
-        run: |
-          set -euo pipefail
-          [[ "$RESERVATION_COMMIT" =~ ^[0-9a-f]{40}$ ]]
-          [[ "$KIO_PROVIDER_WORKFLOW_SHA256" =~ ^[0-9a-f]{64}$ ]]
-          "$KIO_ACCEPTANCE_TOOLS" provider-ledger verify --repository "$REPOSITORY" --campaign-id "$CAMPAIGN_ID" --workflow-sha256 "$KIO_PROVIDER_WORKFLOW_SHA256" --candidate-sha "$CANDIDATE_SHA" --run-id "$RUN_ID" --attempt "$ATTEMPT" --reservation-commit "$RESERVATION_COMMIT" --provider "$PROVIDER" --os "$OS_NAME"
+          if command -v sha256sum >/dev/null 2>&1; then
+            workflow_sha256="$(sha256sum .github/workflows/v1-provider-acceptance.yml | awk '{print $1}')"
+          else
+            workflow_sha256="$(shasum -a 256 .github/workflows/v1-provider-acceptance.yml | awk '{print $1}')"
+          fi
+          if ! [[ "$workflow_sha256" =~ ^[0-9a-fA-F]{64}$ ]]; then
+            echo "Invalid workflow SHA-256" >&2
+            exit 1
+          fi
+          printf 'KIO_PROVIDER_WORKFLOW_SHA256=%s\n' "$workflow_sha256" >> "$GITHUB_ENV"
       - name: Verify and unpack the selected native package with bounded leaves
         id: package
         working-directory: candidate
@@ -307,8 +304,7 @@ jobs:
         run: |
           set -euo pipefail
           state="$RUNNER_TEMP/kio-v1-provider-budget-$PROVIDER"
-          [[ "$KIO_PROVIDER_WORKFLOW_SHA256" =~ ^[0-9a-f]{64}$ ]]
-          "$KIO_ACCEPTANCE_TOOLS" provider-ledger export-state --repository "$REPOSITORY" --campaign-id "$CAMPAIGN_ID" --workflow-sha256 "$KIO_PROVIDER_WORKFLOW_SHA256" --candidate-sha "$CANDIDATE_SHA" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --reservation-commit "$RESERVATION_COMMIT" --provider "$PROVIDER" --os "$OS_NAME" --state-dir "$state"
+          "$KIO_ACCEPTANCE_TOOLS" provider-ledger export-state --repository "$REPOSITORY" --campaign-id "$CAMPAIGN_ID" --candidate-sha "$CANDIDATE_SHA" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --reservation-commit "$RESERVATION_COMMIT" --provider "$PROVIDER" --os "$OS_NAME" --state-dir "$state"
           echo "state_dir=$state" >> "$GITHUB_OUTPUT"
       - name: Execute Mistral A08 once
         if: matrix.provider == 'mistral'

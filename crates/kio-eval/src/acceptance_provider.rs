@@ -9,7 +9,8 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process::Command,
-    time::Duration,
+    thread,
+    time::{Duration, Instant},
 };
 
 use kio_process::{BoundedProcessOptions, run_bounded_command};
@@ -26,7 +27,9 @@ use crate::{
 };
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(90);
-const POLL_LIMIT: usize = 8;
+const POLL_TIMEOUT: Duration = Duration::from_secs(45 * 60);
+const POLL_INTERVAL: Duration = Duration::from_secs(30);
+const BATCH_RESUME_ARGS: &[&str] = &["--json", "batch", "resume", "--online"];
 const MAX_CHILD_OUTPUT: usize = 256 * 1024;
 const MAX_DIAGNOSTIC_BYTES: usize = 512;
 const FIXTURE_MAX_BYTES: u64 = 64 * 1024;
@@ -358,7 +361,15 @@ fn run_mistral(
         Provider::Mistral,
         key,
     )?;
-    poll_until_complete(&options.binary, root, scope, Provider::Mistral, key)?;
+    poll_until_complete(
+        &options.binary,
+        root,
+        scope,
+        Provider::Mistral,
+        key,
+        Instant::now() + POLL_TIMEOUT,
+        POLL_INTERVAL,
+    )?;
     assert_provenance(scope, "markdown")?;
     assert_settled_usage(root, "markdownize")
 }
@@ -430,7 +441,15 @@ fn run_gemini(
         Provider::Gemini,
         key,
     )?;
-    poll_until_complete(&options.binary, root, scope, Provider::Gemini, key)?;
+    poll_until_complete(
+        &options.binary,
+        root,
+        scope,
+        Provider::Gemini,
+        key,
+        Instant::now() + POLL_TIMEOUT,
+        POLL_INTERVAL,
+    )?;
     assert_provenance(scope, "embedding")?;
     assert_settled_usage(root, "embedding")
 }
@@ -441,23 +460,35 @@ fn poll_until_complete(
     scope: &Path,
     provider: Provider,
     key: &str,
+    deadline: Instant,
+    interval: Duration,
 ) -> Result<Value, AcceptanceError> {
-    for attempt in 1..=POLL_LIMIT {
-        let value = run_json(
+    for attempt in 1.. {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let stage = format!("batch-resume#{attempt}");
+        let output = run_child(
             binary,
             root,
             scope,
-            &format!("batch-resume#{attempt}"),
-            &["--json", "batch", "resume", "--online"],
+            ChildCommand {
+                stage: &stage,
+                args: BATCH_RESUME_ARGS,
+                timeout: COMMAND_TIMEOUT.min(remaining),
+            },
             provider,
             key,
-        )?;
+        );
+        let value = parse_child_json(&output?, &stage)?;
         if value.pointer("/tasks_inflight").and_then(Value::as_u64) == Some(0) {
             return Ok(value);
         }
+        thread::sleep(interval.min(deadline.saturating_duration_since(Instant::now())));
     }
     Err(invalid(
-        "provider batch remained unknown after the bounded poll deadline",
+        "provider batch was still in flight at the poll deadline",
     ))
 }
 
@@ -523,17 +554,41 @@ fn run_json(
     provider: Provider,
     key: &str,
 ) -> Result<Value, AcceptanceError> {
-    let output = run_child(binary, root, scope, stage, args, provider, key)?;
-    serde_json::from_str(&output)
+    let output = run_child(
+        binary,
+        root,
+        scope,
+        ChildCommand {
+            stage,
+            args,
+            timeout: COMMAND_TIMEOUT,
+        },
+        provider,
+        key,
+    )?;
+    parse_child_json(&output, stage)
+}
+
+fn parse_child_json(output: &str, stage: &str) -> Result<Value, AcceptanceError> {
+    serde_json::from_str(output)
         .map_err(|_| invalid(format!("provider command {stage} emitted invalid JSON")))
+}
+
+struct ChildCommand<'a> {
+    stage: &'a str,
+    args: &'a [&'a str],
+    timeout: Duration,
 }
 
 fn run_child(
     binary: &Path,
     root: &Path,
     scope: &Path,
-    stage: &str,
-    args: &[&str],
+    ChildCommand {
+        stage,
+        args,
+        timeout,
+    }: ChildCommand<'_>,
     provider: Provider,
     key: &str,
 ) -> Result<String, AcceptanceError> {
@@ -553,14 +608,14 @@ fn run_child(
     let output = run_bounded_command(
         &mut command,
         BoundedProcessOptions {
-            timeout: COMMAND_TIMEOUT,
+            timeout,
             max_stdout_bytes: MAX_CHILD_OUTPUT,
             max_stderr_bytes: MAX_CHILD_OUTPUT,
         },
         None,
     )
     .map_err(|error| invalid(format!("provider command {stage}: {error}")))?;
-    if output.status.success() {
+    if output.status.success() || (args == BATCH_RESUME_ARGS && output.status.code() == Some(3)) {
         return Ok(output.stdout);
     }
     let status = output.status;
@@ -728,6 +783,67 @@ mod child_tests {
 
     use super::{Provider, fs, prepare_isolated_root, run_child};
 
+    fn poll_fake(
+        script: &str,
+        timeout: std::time::Duration,
+    ) -> Result<serde_json::Value, super::AcceptanceError> {
+        let temp = tempfile::tempdir().unwrap();
+        let root = prepare_isolated_root(&temp.path().join("work")).unwrap();
+        let binary = root.join("fake");
+        fs::write(&binary, format!("#!/bin/sh\n{script}")).unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        super::poll_until_complete(
+            &binary,
+            &root,
+            &root,
+            Provider::Mistral,
+            "fake-key",
+            std::time::Instant::now() + timeout,
+            std::time::Duration::ZERO,
+        )
+    }
+
+    #[test]
+    fn batch_exit_three_then_zero_succeeds() {
+        let result = poll_fake(
+            r#"if [ ! -f polled ]; then
+                touch polled
+                echo '{"tasks_inflight":1}'
+                exit 3
+            fi
+            echo '{"tasks_inflight":0}'"#,
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(result["tasks_inflight"], 0);
+    }
+
+    #[test]
+    fn batch_exit_four_fails() {
+        let err = poll_fake(
+            r#"echo '{"tasks_inflight":0}'; exit 4"#,
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("exit status: 4"));
+    }
+
+    #[test]
+    fn batch_exit_three_requires_json() {
+        let err = poll_fake("exit 3", std::time::Duration::from_secs(5)).unwrap_err();
+        assert!(err.to_string().contains("invalid JSON"));
+    }
+
+    #[test]
+    fn batch_deadline_reports_in_flight() {
+        let err = poll_fake(
+            r#"echo '{"tasks_inflight":1}'; exit 3"#,
+            std::time::Duration::from_millis(100),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("still in flight"));
+    }
+
     fn failed_child(script: &str) -> String {
         let temp = tempfile::tempdir().unwrap();
         let root = prepare_isolated_root(&temp.path().join("work")).unwrap();
@@ -738,8 +854,11 @@ mod child_tests {
             &binary,
             &root,
             &root,
-            "index-batch",
-            &["--json", "index", "--online", "--batch"],
+            super::ChildCommand {
+                stage: "index-batch",
+                args: &["--json", "index", "--online", "--batch"],
+                timeout: super::COMMAND_TIMEOUT,
+            },
             Provider::Mistral,
             "fake-key",
         )

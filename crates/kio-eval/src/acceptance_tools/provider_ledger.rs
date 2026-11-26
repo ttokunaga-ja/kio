@@ -25,7 +25,7 @@ const PROVIDERS: [&str; 2] = ["mistral", "gemini"];
 const OSES: [&str; 3] = ["linux", "macos", "windows"];
 const MAX_BLOB: usize = 16_384;
 // One bootstrap, one approved transition, and at most 33 full reservations.
-const MAX_HISTORY: usize = 35;
+const MAX_HISTORY: usize = 256;
 const GITHUB_API: &str = "https://api.github.com";
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -58,6 +58,8 @@ enum Command {
         common: CommonArgs,
         #[arg(long)]
         candidate_sha: String,
+        #[arg(long)]
+        workflow_sha256: String,
     },
     Verify {
         #[command(flatten)]
@@ -98,8 +100,6 @@ struct CommonArgs {
     run_id: u64,
     #[arg(long)]
     attempt: u64,
-    #[arg(long)]
-    workflow_sha256: String,
 }
 
 impl CommonArgs {
@@ -107,7 +107,7 @@ impl CommonArgs {
         Request {
             campaign_id: self.campaign_id,
             candidate_sha: None,
-            workflow_sha256: Some(self.workflow_sha256),
+            workflow_sha256: None,
             run_id: self.run_id,
             attempt: self.attempt,
             reservation_commit: None,
@@ -147,12 +147,13 @@ pub fn run(args: Args) -> Result<()> {
         Command::ReserveAll {
             common,
             candidate_sha,
+            workflow_sha256,
         } => reserve_all(
             &mut api,
             &Request {
                 campaign_id: common.campaign_id,
                 candidate_sha: Some(candidate_sha),
-                workflow_sha256: Some(common.workflow_sha256),
+                workflow_sha256: Some(workflow_sha256),
                 run_id: common.run_id,
                 attempt: common.attempt,
                 reservation_commit: None,
@@ -167,20 +168,23 @@ pub fn run(args: Args) -> Result<()> {
             reservation_commit,
             provider,
             os_name,
-        } => verify(
-            &mut api,
-            &Request {
-                campaign_id: common.campaign_id,
-                candidate_sha: Some(candidate_sha),
-                workflow_sha256: Some(common.workflow_sha256),
-                run_id: common.run_id,
-                attempt: common.attempt,
-                reservation_commit: Some(reservation_commit),
-                provider: Some(provider),
-                os_name: Some(os_name),
-                state_dir: None,
-            },
-        )?,
+        } => {
+            verify(
+                &mut api,
+                &Request {
+                    campaign_id: common.campaign_id,
+                    candidate_sha: Some(candidate_sha),
+                    workflow_sha256: None,
+                    run_id: common.run_id,
+                    attempt: common.attempt,
+                    reservation_commit: Some(reservation_commit),
+                    provider: Some(provider),
+                    os_name: Some(os_name),
+                    state_dir: None,
+                },
+            )?
+            .0
+        }
         Command::ExportState {
             common,
             candidate_sha,
@@ -193,7 +197,7 @@ pub fn run(args: Args) -> Result<()> {
             &Request {
                 campaign_id: common.campaign_id,
                 candidate_sha: Some(candidate_sha),
-                workflow_sha256: Some(common.workflow_sha256),
+                workflow_sha256: None,
                 run_id: common.run_id,
                 attempt: common.attempt,
                 reservation_commit: Some(reservation_commit),
@@ -595,7 +599,9 @@ fn validate_campaign(campaign: &Value) -> Result<()> {
     if get_string(campaign, "workflow_path")? != ".github/workflows/v1-provider-acceptance.yml" {
         return Err("campaign workflow path differs".to_owned());
     }
-    require_digest(get_string(campaign, "workflow_sha256")?, "workflow digest")?;
+    if object.contains_key("workflow_sha256") {
+        require_digest(get_string(campaign, "workflow_sha256")?, "workflow digest")?;
+    }
     for key in ["initialize_run_id", "initialize_attempt"] {
         if object
             .get(key)
@@ -642,7 +648,7 @@ fn validate_reservation(
         "state",
     ];
     let object = get_object(record)?;
-    if object.len() != REQUIRED.len()
+    if object.len() != REQUIRED.len() + usize::from(object.contains_key("workflow_sha256"))
         || REQUIRED.iter().any(|key| !object.contains_key(*key))
         || get_string(record, "schema")? != SCHEMA
         || get_string(record, "kind")? != "reservation"
@@ -654,6 +660,9 @@ fn validate_reservation(
         || !OSES.contains(&get_string(record, "os")?)
     {
         return Err("reservation campaign or lane mismatch".to_owned());
+    }
+    if object.contains_key("workflow_sha256") {
+        require_digest(get_string(record, "workflow_sha256")?, "workflow digest")?;
     }
     require_sha(get_string(record, "candidate_sha")?, "candidate sha")?;
     require_id(get_string(record, "allocation_id")?, "allocation id")?;
@@ -693,6 +702,7 @@ fn validate_reservation(
     Ok(())
 }
 
+#[derive(Debug)]
 struct VerifiedState {
     tip: String,
     root: String,
@@ -700,6 +710,7 @@ struct VerifiedState {
     allocations: BTreeMap<String, Value>,
     totals: BTreeMap<String, u64>,
     commits: u64,
+    campaign_ids: BTreeSet<String>,
 }
 
 fn load_verified<A: Api>(api: &mut A, expected_commit: Option<&str>) -> Result<VerifiedState> {
@@ -759,9 +770,10 @@ fn load_verified<A: Api>(api: &mut A, expected_commit: Option<&str>) -> Result<V
         .cloned()
         .ok_or_else(|| "ledger root is not an immutable bootstrap".to_owned())?;
     validate_campaign(&campaign)?;
-    if get_object(&campaign)?.len() != 9 {
+    if get_object(&campaign)?.len() != 8 + usize::from(campaign.get("workflow_sha256").is_some()) {
         return Err("ledger root has unexpected campaign fields".to_owned());
     }
+    let mut campaign_ids = BTreeSet::from([get_string(&campaign, "campaign_id")?.to_owned()]);
     let mut allocations = BTreeMap::new();
     let mut seen = BTreeSet::new();
     let mut totals = BTreeMap::from(PROVIDERS.map(|provider| (provider.to_owned(), 0_u64)));
@@ -772,6 +784,9 @@ fn load_verified<A: Api>(api: &mut A, expected_commit: Option<&str>) -> Result<V
             && files.len() == 1
         {
             validate_transition(successor, &campaign, parent)?;
+            if !campaign_ids.insert(get_string(successor, "campaign_id")?.to_owned()) {
+                return Err("campaign id already exists in ledger history".to_owned());
+            }
             campaign = successor.clone();
             continue;
         }
@@ -796,6 +811,7 @@ fn load_verified<A: Api>(api: &mut A, expected_commit: Option<&str>) -> Result<V
                 get_string(record, "candidate_sha")?.to_owned(),
                 record.get("run_id").and_then(Value::as_u64).unwrap_or(0),
                 record.get("attempt").and_then(Value::as_u64).unwrap_or(0),
+                record.get("workflow_sha256").and_then(Value::as_str),
             ));
             let total = totals
                 .get_mut(provider)
@@ -828,16 +844,12 @@ fn load_verified<A: Api>(api: &mut A, expected_commit: Option<&str>) -> Result<V
         allocations,
         totals,
         commits: commits.len() as u64,
+        campaign_ids,
     })
 }
 
 fn new_campaign(args: &Request) -> Result<Map<String, Value>> {
     require_id(&args.campaign_id, "campaign id")?;
-    let workflow_sha256 = args
-        .workflow_sha256
-        .as_deref()
-        .ok_or_else(|| "--workflow-sha256 is required".to_owned())?;
-    require_digest(workflow_sha256, "workflow digest")?;
     require_positive(args.run_id, "initialization run")?;
     require_positive(args.attempt, "initialization attempt")?;
     let mut epoch_bytes = [0_u8; 32];
@@ -846,7 +858,7 @@ fn new_campaign(args: &Request) -> Result<Map<String, Value>> {
     let campaign = json!({
         "schema": SCHEMA, "kind": "campaign", "campaign_id": args.campaign_id,
         "epoch": hex(&epoch_bytes), "caps_microusd": {"mistral": CAP, "gemini": CAP},
-        "workflow_path": ".github/workflows/v1-provider-acceptance.yml", "workflow_sha256": workflow_sha256,
+        "workflow_path": ".github/workflows/v1-provider-acceptance.yml",
         "initialize_run_id": args.run_id, "initialize_attempt": args.attempt,
     });
     Ok(get_object(&campaign)?.clone())
@@ -865,8 +877,7 @@ fn initialize<A: Api>(api: &mut A, args: &Request) -> Result<Value> {
 
 fn validate_transition(successor: &Value, predecessor: &Value, parent: &str) -> Result<()> {
     validate_campaign(successor)?;
-    if get_object(successor)?.len() != 11
-        || predecessor.get("predecessor_tip").is_some()
+    if get_object(successor)?.len() != 10 + usize::from(successor.get("workflow_sha256").is_some())
         || get_string(successor, "predecessor_campaign_id")?
             != get_string(predecessor, "campaign_id")?
         || get_string(successor, "predecessor_tip")? != parent
@@ -886,6 +897,9 @@ fn transition<A: Api>(
     require_id(predecessor_campaign_id, "predecessor campaign id")?;
     require_sha(predecessor_tip, "predecessor ledger tip")?;
     let state = load_verified(api, None)?;
+    if state.campaign_ids.contains(&args.campaign_id) {
+        return Err("campaign id already exists in ledger history".to_owned());
+    }
     let mut successor = new_campaign(args)?;
     successor.insert(
         "predecessor_campaign_id".to_owned(),
@@ -895,20 +909,11 @@ fn transition<A: Api>(
     let successor = Value::Object(successor);
     validate_transition(&successor, &state.campaign, &state.tip)?;
     let records = BTreeMap::from([("campaign.json".to_owned(), successor.clone())]);
+    if state.commits >= MAX_HISTORY as u64 {
+        return Err("ledger history is at its bound".to_owned());
+    }
     let commit = append(api, &state.tip, &records)?;
     Ok(json!({"commit": commit, "campaign": successor}))
-}
-
-fn require_campaign_workflow(args: &Request, campaign: &Value) -> Result<()> {
-    let requested = args
-        .workflow_sha256
-        .as_deref()
-        .ok_or_else(|| "--workflow-sha256 is required".to_owned())?;
-    require_digest(requested, "workflow digest")?;
-    if get_string(campaign, "workflow_sha256")? != requested {
-        return Err("workflow digest does not match immutable campaign binding".to_owned());
-    }
-    Ok(())
 }
 
 fn reserve_all<A: Api>(api: &mut A, args: &Request) -> Result<Value> {
@@ -924,7 +929,11 @@ fn reserve_all<A: Api>(api: &mut A, args: &Request) -> Result<Value> {
     if get_string(&state.campaign, "campaign_id")? != args.campaign_id {
         return Err("campaign id does not match active campaign".to_owned());
     }
-    require_campaign_workflow(args, &state.campaign)?;
+    let workflow_sha256 = args
+        .workflow_sha256
+        .as_deref()
+        .ok_or_else(|| "--workflow-sha256 is required".to_owned())?;
+    require_digest(workflow_sha256, "workflow digest")?;
     for provider in PROVIDERS {
         if state.totals[provider]
             .checked_add((OSES.len() as u64) * ALLOCATION)
@@ -945,6 +954,7 @@ fn reserve_all<A: Api>(api: &mut A, args: &Request) -> Result<Value> {
             let mut record = json!({
                 "schema": SCHEMA, "kind": "reservation", "campaign_id": args.campaign_id,
                 "candidate_sha": candidate_sha, "provider": provider, "os": os_name,
+                "workflow_sha256": workflow_sha256,
                 "allocation_id": allocation, "allocated_microusd": ALLOCATION,
                 "run_id": args.run_id, "attempt": args.attempt, "predecessor_oid": state.tip,
                 "sequence": state.commits, "state": "reserved_unknown",
@@ -956,6 +966,9 @@ fn reserve_all<A: Api>(api: &mut A, args: &Request) -> Result<Value> {
                 .insert("chain_digest".to_owned(), Value::String(chain_digest));
             records.insert(format!("reservation-{allocation}.json"), record);
         }
+    }
+    if state.commits >= MAX_HISTORY as u64 {
+        return Err("ledger history is at its bound".to_owned());
     }
     let commit = append(api, &state.tip, &records)?;
     Ok(
@@ -978,7 +991,7 @@ fn append<A: Api>(api: &mut A, parent: &str, files: &BTreeMap<String, Value>) ->
     Ok(commit)
 }
 
-fn verify<A: Api>(api: &mut A, args: &Request) -> Result<Value> {
+fn verify<A: Api>(api: &mut A, args: &Request) -> Result<(Value, VerifiedState)> {
     let reservation_commit = args
         .reservation_commit
         .as_deref()
@@ -1001,7 +1014,6 @@ fn verify<A: Api>(api: &mut A, args: &Request) -> Result<Value> {
         return Err("provider or OS lane is invalid".to_owned());
     }
     let state = load_verified(api, Some(reservation_commit))?;
-    require_campaign_workflow(args, &state.campaign)?;
     if get_string(&state.campaign, "campaign_id")? != args.campaign_id {
         return Err("campaign differs".to_owned());
     }
@@ -1015,17 +1027,14 @@ fn verify<A: Api>(api: &mut A, args: &Request) -> Result<Value> {
     {
         return Err("exact durable allocation is absent".to_owned());
     }
-    Ok(
+    Ok((
         json!({"reservation_commit": reservation_commit, "allocation_id": allocation, "root_commit": state.root}),
-    )
+        state,
+    ))
 }
 
 fn export_state<A: Api>(api: &mut A, args: &Request) -> Result<Value> {
-    let checked = verify(api, args)?;
-    let reservation_commit = args
-        .reservation_commit
-        .as_deref()
-        .ok_or_else(|| "--reservation-commit is required".to_owned())?;
+    let (checked, state) = verify(api, args)?;
     let provider = args
         .provider
         .as_deref()
@@ -1034,8 +1043,6 @@ fn export_state<A: Api>(api: &mut A, args: &Request) -> Result<Value> {
         .state_dir
         .as_deref()
         .ok_or_else(|| "--state-dir is required".to_owned())?;
-    let state = load_verified(api, Some(reservation_commit))?;
-    require_campaign_workflow(args, &state.campaign)?;
     let directory = create_private_state_directory(state_dir)?;
     let campaign_id = get_string(&state.campaign, "campaign_id")?;
     write_state(
@@ -1260,9 +1267,6 @@ mod tests {
         let reservation = reserve_all(&mut api, &next).unwrap();
         next.reservation_commit = Some(reservation["commit"].as_str().unwrap().to_owned());
         assert!(verify(&mut api, &next).is_ok());
-        let original_hash = next.workflow_sha256.replace("b".repeat(64));
-        assert!(verify(&mut api, &next).is_err());
-        next.workflow_sha256 = original_hash;
         let successor_run = next.run_id;
         next.run_id = args().run_id;
         assert!(verify(&mut api, &next).is_err());
@@ -1339,7 +1343,7 @@ mod tests {
         verify_args.reservation_commit = Some(reserved["commit"].as_str().unwrap().to_owned());
         let verified = verify(&mut api, &verify_args).unwrap();
         assert_eq!(
-            verified["allocation_id"],
+            verified.0["allocation_id"],
             "mistral-linux-aaaaaaaaaaaa-r42-a3"
         );
         let state = load_verified(&mut api, verify_args.reservation_commit.as_deref()).unwrap();
@@ -1355,48 +1359,58 @@ mod tests {
         );
     }
     #[test]
-    fn wrong_workflow_digest_refuses_reservation_before_creating_a_commit() {
+    fn edited_workflow_reserves_with_provenance_and_verifies_without_hash() {
         let mut api = FakeApi::default();
         initialize(&mut api, &args()).unwrap();
-        let head = api.head.clone();
-        let counter = api.counter;
         let mut request = args();
-        request.workflow_sha256 = Some("c".repeat(64));
-        assert!(reserve_all(&mut api, &request).is_err());
-        assert_eq!((api.head, api.counter), (head, counter));
-    }
-    #[test]
-    fn wrong_workflow_digest_refuses_verification() {
-        let mut api = FakeApi::default();
-        initialize(&mut api, &args()).unwrap();
-        let reservation = reserve_all(&mut api, &args()).unwrap();
-        let mut request = args();
+        let workflow_sha256 = "c".repeat(64);
+        request.workflow_sha256 = Some(workflow_sha256.clone());
+        let reservation = reserve_all(&mut api, &request).unwrap();
         request.reservation_commit = Some(reservation["commit"].as_str().unwrap().to_owned());
-        request.workflow_sha256 = Some("c".repeat(64));
-        let head = api.head.clone();
-        let counter = api.counter;
-        assert!(verify(&mut api, &request).is_err());
-        assert_eq!((api.head, api.counter), (head, counter));
+        request.workflow_sha256 = None;
+        let state = load_verified(&mut api, None).unwrap();
+        for record in state.allocations.values() {
+            assert_eq!(record["workflow_sha256"], workflow_sha256);
+        }
+        assert!(verify(&mut api, &request).is_ok());
     }
+
     #[test]
-    fn wrong_workflow_digest_refuses_export_before_creating_state() {
+    fn successor_can_transition_again_but_campaign_id_cannot_be_reused() {
         let mut api = FakeApi::default();
-        initialize(&mut api, &args()).unwrap();
-        let reservation = reserve_all(&mut api, &args()).unwrap();
-        let root = super::super::canonical_tempdir();
-        let private = root.path().join("private");
-        let _private = super::super::private_fixture_directory(&private);
-        let state = private.join("state");
-        let mut request = args();
-        request.reservation_commit = Some(reservation["commit"].as_str().unwrap().to_owned());
-        request.workflow_sha256 = Some("c".repeat(64));
-        request.state_dir = Some(state.clone());
-        let head = api.head.clone();
-        let counter = api.counter;
-        assert!(export_state(&mut api, &request).is_err());
-        assert!(!state.exists());
-        assert_eq!((api.head, api.counter), (head, counter));
+        let root = initialize(&mut api, &args()).unwrap();
+        let next = successor();
+        let second = transition(
+            &mut api,
+            &next,
+            "campaign-1",
+            root["commit"].as_str().unwrap(),
+        )
+        .unwrap();
+        let mut third = successor();
+        third.campaign_id = "campaign-3".to_owned();
+        let third_commit = transition(
+            &mut api,
+            &third,
+            "campaign-2",
+            second["commit"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert!(
+            transition(
+                &mut api,
+                &args(),
+                "campaign-3",
+                third_commit["commit"].as_str().unwrap()
+            )
+            .is_err()
+        );
+        assert_eq!(
+            load_verified(&mut api, None).unwrap().campaign["campaign_id"],
+            "campaign-3"
+        );
     }
+
     #[test]
     fn replay_is_refused_and_tampered_chain_is_refused() {
         let mut api = FakeApi::default();

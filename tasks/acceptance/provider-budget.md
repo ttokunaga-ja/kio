@@ -7,22 +7,20 @@ in `crates/kio-eval/src/acceptance_tools/provider_ledger.rs` and is invoked as
 workspace; the superseded Python implementation has been removed.
 
 Initialize the first immutable campaign before any provider call. Its root
-commit contains only the campaign bootstrap and binds the hash of
-`.github/workflows/v1-provider-acceptance.yml`. Each later reservation commit
+commit contains only the campaign bootstrap. Each later reservation commit
 atomically reserves all six provider/OS lanes: Mistral and Gemini on Linux,
 macOS, and Windows. Reservations are `reserved_unknown`, so prior failures and
-unknown outcomes remain charged; they are not retried for free.
+unknown outcomes remain charged.
 
-One successor may be appended through the same protected authority. Its commit
-contains only the successor campaign record, with a new ID and the SHA-256 of
-the exact reviewed workflow bytes on current `main`. The record binds the
-predecessor campaign ID and its final tip, which must be the immediate Git
-parent. The earlier bootstrap and reservations remain in Git history. New
-reservations must name the active campaign. Historical reservations still
-verify at their original commit using the campaign and workflow hash in force
-there.
+An approved successor may follow any active campaign. Its campaign record
+uses a globally unique ID and identifies the predecessor campaign and final
+tip, which must be the immediate Git parent. New reservations name the
+active campaign and record the reserving workflow's SHA-256 as provenance.
+Campaign hashes are historical metadata. Workflow edits do not require a
+transition. Earlier reservations remain verifiable at their original commits,
+including records written before per-reservation hashes were recorded.
 
-The cumulative ceiling is USD 10 for each provider across both campaigns,
+The cumulative ceiling is USD 10 for each provider across all campaigns,
 including all earlier reservations. Each six-lane reservation consumes USD 0.30 per provider at the
 current USD 0.10 lane allocation. A new campaign or any larger spend requires
 fresh explicit budget authority and must never reset or replace the existing
@@ -41,7 +39,7 @@ preceding main-SHA check uses the read-only built-in token as `GH_TOKEN`.
 
 Paid jobs retain the separate `v1-provider-acceptance` environment and read-only
 repository credentials. They receive a specific reservation commit, then verify
-that commit's bounded complete ancestry, immutable campaign workflow hash,
+that commit's bounded complete ancestry, campaign,
 candidate, and lane allocation before a provider credential is exposed.
 Artifacts are diagnostic receipts only; they never authorize spend. Candidate
 jobs also require the exact current `main` SHA and a successful candidate-bound
@@ -92,44 +90,33 @@ complete.
    protection. A writer bypass must never bypass immutable history rules.
    Stop if the platform cannot express or enforce this configuration; do not
    broaden a bypass, exempt administrators, or weaken history protection.
-4. After the approved workflow is on current `main`, inspect its exact bytes/hash
-   and configuration, then execute an `operation: initialize` dispatch with the
+4. After the approved workflow is on current `main`, inspect its
+   configuration, then execute an `operation: initialize` dispatch with the
    one approved campaign ID and empty candidate/package inputs. No paid jobs
    execute for this operation. Prove the App can create the root through this
    authority job under the installed protections; read back the root, bootstrap,
-   workflow hash, run result, and protections again. Reconcile any partial or
+   run result, and protections again. Reconcile any partial or
    failed attempt before retrying; never delete or replace an existing ledger.
 5. For an approved successor, follow the transition procedure below. Only
    after the applicable read-back passes, execute `operation: run` for the exact current
    candidate SHA, successful native package run ID, and same campaign. Preserve
    the USD 10 per-provider cumulative caps and `reserved_unknown` charges.
-   A workflow hash change requires an approved transition before further
-   reservations.
 
 ## F4 successor
 
-D-20261126-01 approves one six-lane rerun under `v1-f4-2026-11b`.
-Run 45788229324 already reserved USD 0.30 per provider under
-`v1-f4-2026-11` and remains `reserved_unknown`. Its reservation commit was
-`96f41efa1548f61c3be3b3f7a8fb1c00034ad298`. Check the live ref to establish
-the actual final predecessor tip and total prior reservations.
+D-20261126-01 approved the transition from `v1-f4-2026-11` to
+`v1-f4-2026-11b`, recorded at `10797ac9`. The initial reservation
+(`96f41efa1548f61c3be3b3f7a8fb1c00034ad298`, run 45788229324) and the successor
+reservation (`8bf3eb05`, run 45859763559) each charge USD 0.30 per provider.
+D-20261127-01 permits using the active campaign after workflow edits. Check
+the protected ref for the current tip and cumulative reservations.
 
-After merging, review the workflow bytes on current `main`, read back the
-environment and rulesets as in setup, and dispatch the provider workflow on
-`main` with `operation=transition`, `campaign_id=v1-f4-2026-11b`,
-`predecessor_campaign_id=v1-f4-2026-11`, and
-`predecessor_tip=<verified current ledger tip>`. Leave `candidate_sha` and
-`package_run_id` empty. No paid jobs execute. Require a successful authority
-job, then read back the protected tip, its parent, the successor record and
-workflow hash, the retained reservation, and the protections again. Reconcile
-any partial or unknown outcome by reading back the ref before any retry.
-
-After the successful exact-candidate native package run and successor
-read-back, dispatch once on `main` with `operation=run`,
-`campaign_id=v1-f4-2026-11b`, the exact `candidate_sha`, and the successful
-`package_run_id`. Leave both predecessor inputs empty. This reserves another
-USD 0.30 per provider. Preserve all charges and reconcile the result before
-considering any further paid action.
+For a future approved transition, dispatch `operation=transition` on `main`
+with the new `campaign_id`, current `predecessor_campaign_id` and verified
+`predecessor_tip`. Leave the candidate and package inputs empty. After a
+successful authority job, read back the tip, parent, campaign record and
+retained reservations. Reconcile any unknown outcome against the ref before
+retrying.
 
 The workflow validates the configured nonsecret identity formats before minting,
 compares the pinned action's App slug and installation ID outputs to the approved
@@ -147,11 +134,10 @@ GitHub App restrictions do not identify an individual workflow or job. Keeping
 this control-plane job the only writer also depends on trusted changes to main,
 the private key's environment isolation, approval policy, and repository/App
 configuration. A repository or App administrator can change those protections
-or credentials; the ledger cannot defend against that authority. The immutable
-workflow hash and platform-enforced exact ruleset actor jointly constrain the
-writer under that configuration. Do not describe this as workflow-level identity
+or credentials; the ledger cannot defend against that authority. The platform-enforced exact ruleset actor constrains the writer under that
+configuration. Do not describe this as workflow-level identity
 enforcement or cryptographic principal attestation by the ledger format.
 
-All ledger-helper GitHub REST reads are bounded (at most 35 linear commits, seven tree
+All ledger-helper GitHub REST reads are bounded (at most 256 linear commits, seven tree
 entries per commit, and 16 KiB JSON blobs). The helper neither downloads nor
 extracts an Actions ZIP while validating the authority chain.

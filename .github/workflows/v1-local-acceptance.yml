@@ -165,7 +165,16 @@ jobs:
       - name: Bind the A08 expected case after public identity observation
         run: |
           set -euo pipefail; root="$KIO_PACKAGE_ROOT"; target="$RUNNER_TEMP/kio-v1-local-target.json"; expected="$RUNNER_TEMP/kio-v1-local-a08-expected.json"
-          hash="$($KIO_EVAL release archive-sha256 --archive "$(find "$root" -maxdepth 1 -name '*.tar.gz' -type f -print)")"; workflow_hash="$(shasum -a 256 .github/workflows/v1-local-acceptance.yml | awk '{print $1}')"
+          hash="$($KIO_EVAL release archive-sha256 --archive "$(find "$root" -maxdepth 1 -name '*.tar.gz' -type f -print)")"
+          if command -v sha256sum >/dev/null 2>&1; then
+            workflow_hash="$(sha256sum .github/workflows/v1-local-acceptance.yml | awk '{print $1}')"
+          else
+            workflow_hash="$(shasum -a 256 .github/workflows/v1-local-acceptance.yml | awk '{print $1}')"
+          fi
+          if ! [[ "$workflow_hash" =~ ^[0-9a-fA-F]{64}$ ]]; then
+            echo "Invalid workflow SHA-256" >&2
+            exit 1
+          fi
           "$KIO_EVAL" acceptance target-binding --candidate-sha "$CANDIDATE_SHA" --os '${{ matrix.os }}' --target "$(jq -er .target "$root/target-binding.json")" --archive-sha256 "$hash" --binary-sha256 "$(jq -er .binary_sha256 "$root/target-binding.json")" --version "$(jq -er .version "$root/target-binding.json")" --out "$target"
           "$KIO_EVAL" acceptance expected-case --target-binding "$target" --case A08 --lane provider-live --subcase authenticated-local --os '${{ matrix.os }}' --fixture-id v1-authenticated-local-public --fixture-sha256 8a61250a8a21ac49d3edaa03b55e5a9e0b45e7bda92f678c53811ffc080e2cc3 --workflow-path .github/workflows/v1-local-acceptance.yml --workflow-sha256 "$workflow_hash" --workflow-commit "$CANDIDATE_SHA" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --architecture "$(uname -m)" --service-identity-sha256 '${{ steps.prepare.outputs.service_identity_sha256 }}' --out "$expected"
       - name: Run authenticated OCR, clean its lease, and validate native EG2
