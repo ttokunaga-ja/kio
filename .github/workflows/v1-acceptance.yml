@@ -382,9 +382,6 @@ jobs:
             # untrusted principal can mutate (kio rejects the hosted D:\a
             # tree); the runner account's profile is owner/SYSTEM/Administrators.
             extract_dir="$LOCALAPPDATA\\kio-v1-extract"
-            for acl_path in "${RUNNER_TEMP%%\\*}\\" "$RUNNER_TEMP" "$LOCALAPPDATA"; do
-              icacls "$acl_path" || true
-            done
           fi
           mkdir "$extract_dir"
           # release verify rejects unsafe archive entries before this extraction.
