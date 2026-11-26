@@ -474,6 +474,7 @@ fn b3_create_job_crash_window_reconcile_found_then_resume_collects() {
         "state_path": state.display().to_string(),
         "capture_path": capture.display().to_string(),
         "job_metadata": listing_metadata,
+        "job_model": "mistral-ocr-2505",
         "jobs_listing": [{
             "job_id": "batch-mock-job-1",
             "status": "QUEUED",

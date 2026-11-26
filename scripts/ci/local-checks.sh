@@ -170,9 +170,6 @@ ci_checks() (
     done <<< "$references"
     test "$invalid" -eq 0
 
-    python3 scripts/ci/test-gh-api-endpoints.py
-    python3 scripts/ci/check-gh-api-endpoints.py
-
     for script in scripts/v1-local-gpu/gpu-phase.sh scripts/v1-local-gpu/ocr_api_entrypoint.sh \
         scripts/ci/prepare-linux-confinement.sh; do
         bash -n "$script"

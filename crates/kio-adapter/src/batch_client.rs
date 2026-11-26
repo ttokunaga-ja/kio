@@ -705,6 +705,10 @@ pub struct MockBatchScript {
     /// poll uses only attribution retained from a successful mock submission.
     #[serde(default)]
     pub job_metadata: Option<serde_json::Value>,
+    /// Model reported for a job with no retained mock submission, such as a
+    /// job rediscovered by reconcile after a create_job crash window.
+    #[serde(default)]
+    pub job_model: Option<String>,
     /// Shared provider state for separate CLI invocations. When omitted, a
     /// companion of state_path or capture_path is used when either is set.
     #[serde(default)]
@@ -837,7 +841,8 @@ impl MockBatchClient {
             model: submitted
                 .as_ref()
                 .and_then(|job| job["model"].as_str())
-                .map(str::to_owned),
+                .map(str::to_owned)
+                .or_else(|| self.script.job_model.clone()),
             output_file_id: matches!(status, BatchJobStatus::Success)
                 .then(|| format!("{}-output", self.script.job_id)),
             status,

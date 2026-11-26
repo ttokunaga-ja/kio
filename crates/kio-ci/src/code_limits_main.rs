@@ -1,5 +1,7 @@
 //! Report repository code size and OS separation without changing source.
 mod code_limits;
+#[cfg(test)]
+mod gh_api_endpoint_tests;
 
 fn main() {
     match code_limits::entry(std::env::args_os().skip(1).collect()) {
