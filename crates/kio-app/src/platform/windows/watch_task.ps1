@@ -55,11 +55,11 @@ try {
     $phase = 'prepare expected definition'
     $expected = $null
     $definition = $null
-    if ($request.template -and ($null -ne $task -or $request.operation -eq 'create')) {
+    if ($request.template -and ($null -ne $task -or (Same-TaskString $request.operation 'create'))) {
         $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
         $expected = Read-TaskFields $request.template ${function:Resolve-TaskSid}
         $expected['Task/Principals/Principal/UserId'] = $sid
-        if ($request.operation -eq 'create') {
+        if ((Same-TaskString $request.operation 'create')) {
             $definition = $service.NewTask(0)
             $definition.XmlText = $request.template
             $definition.Principal.UserId = $sid
@@ -67,8 +67,8 @@ try {
     }
     $phase = 'apply operation'
     switch ($request.operation) {
-        'query' { }
-        'create' {
+        { Same-TaskString $_ 'query' } { }
+        { Same-TaskString $_ 'create' } {
             if ($null -ne $task) { throw 'Refusing to overwrite an existing task' }
             $definition.Settings.Enabled = $true
             $phase = 'RegisterTaskDefinition'
@@ -76,16 +76,16 @@ try {
             $phase = 'verify created definition'
             Assert-Owned $task
         }
-        'enable' { Assert-Owned $task; $task.Enabled = $true }
-        'start' { Assert-Owned $task; [void]$task.Run($null) }
-        'stop' {
+        { Same-TaskString $_ 'enable' } { Assert-Owned $task; $task.Enabled = $true }
+        { Same-TaskString $_ 'start' } { Assert-Owned $task; [void]$task.Run($null) }
+        { Same-TaskString $_ 'stop' } {
             Assert-Owned $task
             $task.Enabled = $false
             $task = Get-Registered
             Assert-Owned $task
             Stop-Registered $task
         }
-        'delete' {
+        { Same-TaskString $_ 'delete' } {
             if ($null -ne $task) {
                 Assert-Owned $task
                 Stop-Registered $task
@@ -98,7 +98,7 @@ try {
         default { throw 'Unknown native task operation' }
     }
     $phase = 'read resulting definition'
-    if ($request.operation -ne 'query') { $task = Get-Registered }
+    if (!(Same-TaskString $request.operation 'query')) { $task = Get-Registered }
     $result = @{ hresult = 0; lookup_hresult = $script:lookupCode; present = ($null -ne $task); enabled_mismatch = $null; disabled_mismatch = $null; state = 0; arguments = $null }
     if ($null -ne $task) {
         if ($null -ne $expected) {

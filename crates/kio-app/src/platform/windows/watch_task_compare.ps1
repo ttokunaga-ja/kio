@@ -30,6 +30,15 @@ $taskDefaults = [ordered]@{
     'Task/Settings/IdleSettings/StopOnIdleEnd' = 'true'
     'Task/Settings/IdleSettings/RestartOnIdle' = 'false'
 }
+function Same-TaskString([string]$left, [string]$right) {
+    return [string]::Equals($left, $right, [StringComparison]::Ordinal)
+}
+function Test-TaskStringMember([string]$value, [string[]]$allowed) {
+    foreach ($candidate in $allowed) {
+        if (Same-TaskString $value $candidate) { return $true }
+    }
+    return $false
+}
 function Resolve-TaskSid([string]$identity) {
     if ($identity -cmatch '^S-[0-9-]+$') {
         return [Security.Principal.SecurityIdentifier]::new($identity).Value
@@ -48,29 +57,29 @@ function Read-TaskFields([string]$xml, [scriptblock]$resolveSid) {
         $document.Load($reader)
     } finally { $reader.Dispose() }
     foreach ($node in $document.get_ChildNodes()) {
-        if ($node.get_NodeType() -notin 'Element', 'XmlDeclaration', 'Comment', 'Whitespace') {
+        if ($node.get_NodeType() -notin [Xml.XmlNodeType]::Element, [Xml.XmlNodeType]::XmlDeclaration, [Xml.XmlNodeType]::Comment, [Xml.XmlNodeType]::Whitespace) {
             throw 'Unexpected task XML document node'
         }
     }
     $fields = [Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
     function Visit-TaskElement($node, [string]$key, [int]$depth) {
         if ($depth -gt 12 -or $key.Length -gt 180) { throw 'Task XML exceeds ownership inspection limits' }
-        if ($node.get_NamespaceURI() -cne 'http://schemas.microsoft.com/windows/2004/02/mit/task') {
+        if (!(Same-TaskString $node.get_NamespaceURI() 'http://schemas.microsoft.com/windows/2004/02/mit/task')) {
             throw ('Unexpected task XML namespace at ' + $key)
         }
         if ($fields.ContainsKey($key)) { throw ('Duplicate task XML field ' + $key) }
         foreach ($attribute in $node.get_Attributes()) {
-            if ($attribute.NamespaceURI -ceq 'http://www.w3.org/2000/xmlns/') { continue }
+            if (Same-TaskString $attribute.NamespaceURI 'http://www.w3.org/2000/xmlns/') { continue }
             if ($attribute.NamespaceURI) { throw ('Unexpected task XML attribute namespace at ' + $key) }
             $fields.Add(($key + '/@' + $attribute.Name), $attribute.Value)
         }
-        $elements = @($node.get_ChildNodes() | Where-Object { $_.get_NodeType() -eq 'Element' })
+        $elements = @($node.get_ChildNodes() | Where-Object { $_.get_NodeType() -eq [Xml.XmlNodeType]::Element })
         $text = ''
         foreach ($child in $node.get_ChildNodes()) {
             switch ($child.get_NodeType()) {
-                'Element' { }
-                'Comment' { }
-                { $_ -in 'Text', 'CDATA', 'Whitespace', 'SignificantWhitespace' } { $text += $child.get_Value() }
+                { $_ -eq [Xml.XmlNodeType]::Element } { }
+                { $_ -eq [Xml.XmlNodeType]::Comment } { }
+                { $_ -in [Xml.XmlNodeType]::Text, [Xml.XmlNodeType]::CDATA, [Xml.XmlNodeType]::Whitespace, [Xml.XmlNodeType]::SignificantWhitespace } { $text += $child.get_Value() }
                 default { throw ('Unexpected task XML node at ' + $key) }
             }
         }
@@ -78,7 +87,7 @@ function Read-TaskFields([string]$xml, [scriptblock]$resolveSid) {
             if (![string]::IsNullOrWhiteSpace($text)) { throw ('Mixed task XML content at ' + $key) }
             $text = ''
         }
-        if ($key -cin @('Task/Principals/Principal/UserId', 'Task/Triggers/LogonTrigger/UserId') -and $text) {
+        if ((Test-TaskStringMember $key @('Task/Principals/Principal/UserId', 'Task/Triggers/LogonTrigger/UserId')) -and $text) {
             try { $text = & $resolveSid $text }
             catch { throw ('Cannot resolve task SID at ' + $key) }
         }
@@ -94,7 +103,7 @@ function Read-TaskFields([string]$xml, [scriptblock]$resolveSid) {
 }
 function Convert-TaskField([string]$key, [string]$value, [string]$default) {
     try {
-        if ($default -cin @('true', 'false')) {
+        if (Test-TaskStringMember $default @('true', 'false')) {
             return [Xml.XmlConvert]::ToBoolean($value.Trim())
         }
         if ($default.StartsWith('PT', [StringComparison]::Ordinal)) {
@@ -103,13 +112,13 @@ function Convert-TaskField([string]$key, [string]$value, [string]$default) {
             if ($value.Trim() -cnotmatch '^P(?:[0-9]+D)?(?:T[0-9HMS.]+)?$') { return $null }
             return [Xml.XmlConvert]::ToTimeSpan($value.Trim())
         }
-        if ($key -ceq 'Task/Settings/Priority') { return [Xml.XmlConvert]::ToInt32($value.Trim()) }
+        if ((Same-TaskString $key 'Task/Settings/Priority')) { return [Xml.XmlConvert]::ToInt32($value.Trim()) }
         return $value
     } catch { return $null }
 }
 function Compare-TaskDefinition($actual, $expected, [string]$registeredPath, [string]$taskId) {
     $count = 0
-    if ($registeredPath -cne ('\' + $taskId)) { 'RegisteredTask/Path'; $count++ }
+    if (!(Same-TaskString $registeredPath ('\' + $taskId))) { 'RegisteredTask/Path'; $count++ }
     $keys = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $keys.UnionWith($actual.Keys)
     $keys.UnionWith($expected.Keys)
@@ -118,23 +127,23 @@ function Compare-TaskDefinition($actual, $expected, [string]$registeredPath, [st
     foreach ($key in $orderedKeys) {
         $hasActual = $actual.ContainsKey($key)
         $hasExpected = $expected.ContainsKey($key)
-        if ($key -ceq 'Task/@version' -and $actual[$key] -cin @('1.2', '1.3', '1.4', '1.5', '1.6') -and
-            $expected[$key] -cin @('1.2', '1.3', '1.4', '1.5', '1.6')) { continue }
+        if ((Same-TaskString $key 'Task/@version') -and (Test-TaskStringMember $actual[$key] @('1.2', '1.3', '1.4', '1.5', '1.6')) -and
+            (Test-TaskStringMember $expected[$key] @('1.2', '1.3', '1.4', '1.5', '1.6'))) { continue }
         # Scheduler-authored registration metadata with no effect on launch.
-        if (!$hasExpected -and $key -cin @('Task/RegistrationInfo/Author', 'Task/RegistrationInfo/Date')) { continue }
-        if ($key -ceq 'Task/RegistrationInfo/URI' -and !$hasActual -and
-            $expected[$key] -ceq $registeredPath) { continue }
+        if (!$hasExpected -and (Test-TaskStringMember $key @('Task/RegistrationInfo/Author', 'Task/RegistrationInfo/Date'))) { continue }
+        if ((Same-TaskString $key 'Task/RegistrationInfo/URI') -and !$hasActual -and
+            (Same-TaskString $expected[$key] $registeredPath)) { continue }
         # The host can materialize either engine selector when the template
         # leaves it unspecified. This exception applies only to this one field.
-        if (!$hasExpected -and $key -ceq 'Task/Settings/UseUnifiedSchedulingEngine' -and
+        if (!$hasExpected -and (Same-TaskString $key 'Task/Settings/UseUnifiedSchedulingEngine') -and
             $null -ne (Convert-TaskField $key $actual[$key] 'false')) { continue }
-        if ($taskDefaults.Keys -ccontains $key) {
+        if (Test-TaskStringMember $key $taskDefaults.Keys) {
             $default = $taskDefaults[$key]
             $left = if ($hasActual) { Convert-TaskField $key $actual[$key] $default } else { Convert-TaskField $key $default $default }
             $right = if ($hasExpected) { Convert-TaskField $key $expected[$key] $default } else { Convert-TaskField $key $default $default }
-            $different = $null -eq $left -or $null -eq $right -or $left -cne $right
+            $different = $null -eq $left -or $null -eq $right -or $(if ($left -is [string]) { !(Same-TaskString $left $right) } else { $left -ne $right })
         } else {
-            $different = $hasActual -ne $hasExpected -or $actual[$key] -cne $expected[$key]
+            $different = $hasActual -ne $hasExpected -or !(Same-TaskString $actual[$key] $expected[$key])
         }
         if ($different) {
             $key

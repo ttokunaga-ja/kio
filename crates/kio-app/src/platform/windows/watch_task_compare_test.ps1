@@ -6,11 +6,9 @@ $taskPath = '\' + $taskId
 $sid = 'S-1-5-21-100-200-300-1001'
 $resolve = {
     param($identity)
-    switch -CaseSensitive ($identity) {
-        'BUILDER\runner' { $sid }
-        'BUILDER\other' { 'S-1-5-21-100-200-300-1002' }
-        default { $identity }
-    }
+    if (Same-TaskString $identity 'BUILDER\runner') { return $sid }
+    if (Same-TaskString $identity 'BUILDER\other') { return 'S-1-5-21-100-200-300-1002' }
+    return $identity
 }
 $expected = @'
 <?xml version='1.0' encoding='UTF-16'?>
@@ -50,11 +48,20 @@ $baseline = Read-TaskFields $expected $resolve
 function Assert-Difference($xml, $expectedField, $path = $taskPath) {
     $actual = Read-TaskFields $xml $resolve
     $difference = @(Compare-TaskDefinition $actual $baseline $path $taskId) -join ', '
-    if ($difference -cne $expectedField) { throw "Expected '$expectedField', got '$difference'" }
+    if (!(Same-TaskString $difference $expectedField)) { throw "Expected '$expectedField', got '$difference'" }
 }
 Assert-Difference $registered ''
 Assert-Difference ($registered.Replace('<UseUnifiedSchedulingEngine>true', '<UseUnifiedSchedulingEngine>0')) ''
 Assert-Difference $registered 'RegisteredTask/Path' '\foreign'
+$softHyphen = [char]0x00AD
+Assert-Difference ($registered.Replace('kio.exe', ('ki' + $softHyphen + 'o.exe'))) 'Task/Actions/Exec/Command'
+$composed = 'caf' + [char]0x00E9 + '.exe'
+$decomposed = 'cafe' + [char]0x0301 + '.exe'
+$originalBaseline = $baseline
+$baseline = Read-TaskFields ($expected.Replace('kio.exe', $composed)) $resolve
+Assert-Difference ($registered.Replace('kio.exe', $composed)) ''
+Assert-Difference ($registered.Replace('kio.exe', $decomposed)) 'Task/Actions/Exec/Command'
+$baseline = $originalBaseline
 foreach ($case in @(
     @('kio.exe</Command>', 'other.exe</Command>', 'Task/Actions/Exec/Command'),
     @('watch.json"</Arguments>', 'other.json"</Arguments>', 'Task/Actions/Exec/Arguments'),
@@ -103,7 +110,7 @@ if (@(Compare-TaskDefinition (Read-TaskFields $tooMany $resolve) $baseline $task
     throw 'Task difference count must be capped at ten'
 }
 $nonAscii = ('x' * 8191) + [char]0x754C
-if ((Limit-RegisteredXml $nonAscii) -cne ('x' * 8191)) { throw 'Task XML split a UTF-8 character' }
+if (!(Same-TaskString (Limit-RegisteredXml $nonAscii) ('x' * 8191))) { throw 'Task XML split a UTF-8 character' }
 
 foreach ($invalidXml in @(
     $registered.Replace('</Actions>', '<Exec><Command>other</Command></Exec></Actions>'),
@@ -115,8 +122,8 @@ foreach ($invalidXml in @(
 
 if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
     $current = [Security.Principal.WindowsIdentity]::GetCurrent()
-    if ((Resolve-TaskSid $current.Name) -cne $current.User.Value -or
-        (Resolve-TaskSid $current.User.Value) -cne $current.User.Value) {
+    if (!(Same-TaskString (Resolve-TaskSid $current.Name) $current.User.Value) -or
+        !(Same-TaskString (Resolve-TaskSid $current.User.Value) $current.User.Value)) {
         throw 'Windows account name did not resolve to the current logon SID'
     }
 }
