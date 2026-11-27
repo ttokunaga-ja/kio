@@ -180,7 +180,10 @@ fn observe(args: Observe) -> Result<(), String> {
     let observed = Observed {
         schema: OBSERVED_SCHEMA,
         phase: args.phase.clone(),
-        identity_sha256: sha256_id(&identity),
+        identity_sha256: Sha256::digest(&identity)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
         running_image_ids,
     };
     let mut bytes = canonical(&observed)?;
@@ -398,6 +401,43 @@ mod tests {
         assert!(hex("abcdef", 6));
         assert!(!hex("ABCDEF", 6));
     }
+    #[test]
+    fn observation_binds_compact_identity_with_sha256() {
+        let temp = super::super::canonical_tempdir();
+        let (binding, _, _) = fixture(temp.path());
+        let state = binding.state_dir.clone();
+        create(Create {
+            binding,
+            run_nonce: "nonce".into(),
+        })
+        .unwrap();
+        let identity = fs::read(state.join("identity.json")).unwrap();
+        let identity_sha256: String = Sha256::digest(&identity)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let first = format!("sha256:{}", "a".repeat(64));
+        let second = format!("sha256:{}", "b".repeat(64));
+        observe(Observe {
+            state_dir: state.clone(),
+            phase: "ocr".into(),
+            first_image_id: first.clone(),
+            second_image_id: Some(second.clone()),
+        })
+        .unwrap();
+        let observed: serde_json::Value =
+            serde_json::from_slice(&fs::read(state.join("ocr-observed.json")).unwrap()).unwrap();
+        assert_eq!(
+            observed,
+            serde_json::json!({
+                "schema": OBSERVED_SCHEMA,
+                "phase": "ocr",
+                "identity_sha256": identity_sha256,
+                "running_image_ids": [first, second],
+            })
+        );
+    }
+
     #[test]
     fn create_check_and_inconsistent_source_are_deterministic() {
         let temp = super::super::canonical_tempdir();
