@@ -11,8 +11,10 @@ use crate::markdownize::execution::PreparedOnlineMarkdownizeInput;
 use crate::markdownize::execution::TaskExecutionFailure;
 use crate::markdownize::execution::adapter_unit_kind;
 use crate::markdownize::execution::classify_markdownize_source;
-use crate::markdownize::execution::materialize_online_markdownize_response;
 use crate::markdownize::execution::task_failure_from_adapter;
+use crate::markdownize::execution::{
+    OnlineMaterializationFailure, materialize_online_markdownize_response,
+};
 use crate::object_persistence::adapter_to_kio;
 use crate::object_persistence::pipeline_to_kio;
 use crate::online_task::targets_standard_online_markdownize;
@@ -1039,11 +1041,12 @@ fn collect_batch_markdownize_output(
     );
     let outcome = match materialized {
         Ok(outcome) => outcome,
-        Err(failure) if failure.retry_kind == RetryErrorKind::ContractViolation => {
-            repo.control().append_event_log_in_session(repo.lock_session(),
+        Err(OnlineMaterializationFailure::Contract(reason)) => {
+            repo.control().append_event_log_in_session(
+                repo.lock_session(),
                 "KIO-E-ADAPTER-CONTRACT-001",
                 "batch OCR materialize failed acceptance; settled as contract_violation",
-                json!({ "input_path": task.input_path, "detail": format!("materialize reject: {:?}", failure.retry_kind) }),
+                json!({ "input_path": task.input_path, "reason": reason }),
             )?;
             return settle_batch_contract_reject(
                 store,
@@ -1054,10 +1057,10 @@ fn collect_batch_markdownize_output(
                 job_id,
                 task,
                 estimated,
-                MistralBatchFailure::InvalidMarkdownizeOutput,
+                reason,
             );
         }
-        Err(_failure) => {
+        Err(OnlineMaterializationFailure::Persistence(_)) => {
             // Persist-side fault (I/O etc.): the ledger row stays open and the
             // fetched output is re-collected on a later pass (the §5.8 crash
             // window between collect and the terminal Tx, replayed).

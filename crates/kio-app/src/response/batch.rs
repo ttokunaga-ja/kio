@@ -16,7 +16,14 @@ pub enum MistralBatchFailure {
     InvalidJobModel,
     ResponseModelMismatch,
     InvalidOcrResponse,
-    InvalidMarkdownizeOutput,
+    OcrDiscoveryRetry,
+    InvalidOcrDiscovery,
+    MarkdownizeResponseContract,
+    EmptyMarkdown,
+    InvalidImageOwnership,
+    InvalidMarkdownFormat,
+    MissingRetryInstance,
+    NormalizedUnitContract,
 }
 
 #[derive(Debug, Serialize)]

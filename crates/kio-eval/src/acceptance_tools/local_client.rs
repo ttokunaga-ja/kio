@@ -195,6 +195,7 @@ impl Verb {
 struct Client {
     route: StoreDirectory,
     route_path: PathBuf,
+    ssh_program: PathBuf,
     config_leaf: String,
     candidate: String,
     run_id: String,
@@ -225,6 +226,14 @@ impl Client {
         read_private_file(&args.identity_file, PRIVATE_MAX)
             .map_err(|error| format!("dedicated SSH key is unsafe: {error}"))?;
 
+        #[cfg(windows)]
+        let ssh_program = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .ok_or("SystemRoot is unavailable for Windows OpenSSH")?
+            .join(r"System32\OpenSSH\ssh.exe");
+        #[cfg(not(windows))]
+        let ssh_program = PathBuf::from("ssh");
+
         let config_leaf = format!("kio-acceptance-ssh-{}.conf", random_suffix()?);
         let config = ssh_config(args)?;
         route
@@ -241,6 +250,7 @@ impl Client {
         Ok(Self {
             route,
             route_path,
+            ssh_program,
             config_leaf,
             candidate: args.candidate.clone(),
             run_id: args.run_id.clone(),
@@ -255,8 +265,11 @@ impl Client {
     }
 
     fn ssh_command(&self) -> Command {
-        let mut command = Command::new("ssh");
-        command.env("LC_ALL", "C").arg("-F").arg(self.config_path());
+        let mut command = Command::new(&self.ssh_program);
+        command
+            .env("LC_ALL", "C")
+            .arg("-F")
+            .arg(ssh_path_display(&self.config_path()));
         command
     }
 
@@ -812,14 +825,28 @@ fn ssh_config(args: &Args) -> Result<String, String> {
 }
 
 fn ssh_path(path: &Path) -> Result<String, String> {
-    let raw = fs::canonicalize(path)
-        .map_err(|error| format!("cannot canonicalize SSH path: {error}"))?
-        .to_string_lossy()
-        .replace('\\', "/");
+    let canonical =
+        fs::canonicalize(path).map_err(|error| format!("cannot canonicalize SSH path: {error}"))?;
+    let raw = ssh_path_display(&canonical);
     if raw.contains(['\0', '\n', '\r', '"']) {
         return Err("unsafe SSH config path".into());
     }
     Ok(raw)
+}
+
+fn ssh_path_display(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    #[cfg(windows)]
+    {
+        let raw = if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{unc}")
+        } else {
+            raw.strip_prefix(r"\\?\").unwrap_or(&raw).to_owned()
+        };
+        raw.replace('\\', "/")
+    }
+    #[cfg(not(windows))]
+    raw.into_owned()
 }
 
 fn canonical_object(raw: &[u8], label: &str) -> Result<Value, String> {
@@ -1067,19 +1094,13 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn route_root_owns_the_pinned_two_hop_configuration() {
-        use std::os::unix::fs::PermissionsExt;
-
         let temp = super::super::canonical_tempdir();
-        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
-        let known_hosts = temp.path().join("known_hosts");
-        let identity_file = temp.path().join("id");
-        fs::write(&known_hosts, "jump ssh-ed25519 AAAA\n").unwrap();
-        fs::write(&identity_file, "private\n").unwrap();
-        fs::set_permissions(&known_hosts, fs::Permissions::from_mode(0o600)).unwrap();
-        fs::set_permissions(&identity_file, fs::Permissions::from_mode(0o600)).unwrap();
+        let route = temp.path().join("route with space");
+        write_route_material(&route, "private", "jump ssh-ed25519 AAAA").unwrap();
+        let known_hosts = route.join("known_hosts");
+        let identity_file = route.join("id");
         let args = Args {
             mode: Mode::Prepare,
             candidate: "a".repeat(40),
@@ -1090,8 +1111,8 @@ mod tests {
             jump_user: "kio-ci".into(),
             known_hosts,
             identity_file,
-            identity_out: temp.path().join("identity.json"),
-            capability_file: temp.path().join("capability"),
+            identity_out: route.join("identity.json"),
+            capability_file: route.join("capability"),
             expected: None,
             eval_bin: None,
             candidate_bin: None,
@@ -1106,6 +1127,15 @@ mod tests {
         assert!(config.contains("Host kio-lab-wsl"));
         assert!(config.contains("Host *\n"));
         assert!(config.contains("BatchMode yes\n  ConnectTimeout 15\n"));
+        assert!(config.contains(&format!(
+            "IdentityFile \"{}\"",
+            ssh_path(&args.identity_file).unwrap()
+        )));
+        assert!(config.contains(&format!(
+            "UserKnownHostsFile \"{}\"",
+            ssh_path(&args.known_hosts).unwrap()
+        )));
+        assert!(!config.contains("//?/"));
         assert_eq!(config.matches("GlobalKnownHostsFile none").count(), 1);
         assert!(!config.contains('\\'));
     }

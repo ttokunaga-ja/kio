@@ -185,6 +185,7 @@ struct MistralClient {
     polls: Cell<usize>,
     fetches: Cell<usize>,
     deletes: Cell<usize>,
+    output: Option<BatchOutputLine>,
 }
 
 impl MistralBatchClient for MistralClient {
@@ -216,7 +217,10 @@ impl MistralBatchClient for MistralClient {
     fn fetch_output(&self, output_file_id: &str) -> kio_adapter::Result<Vec<BatchOutputLine>> {
         assert_eq!(output_file_id, "output-recorded");
         self.fetches.set(self.fetches.get() + 1);
-        Err(unreadable())
+        self.output
+            .clone()
+            .map(|line| vec![line])
+            .ok_or_else(unreadable)
     }
 }
 
@@ -239,6 +243,7 @@ fn mistral_client(row: &BatchRequestRow) -> MistralClient {
         polls: Cell::new(0),
         fetches: Cell::new(0),
         deletes: Cell::new(0),
+        output: None,
     }
 }
 
@@ -377,6 +382,88 @@ fn mistral_collection_holds_unbound_scope_profile_and_job_without_effects() {
             );
         }
     }
+}
+
+#[test]
+fn mistral_collect_normalizes_a08_ocr_markdown_without_final_lf() {
+    if !crate::tests::operation_preconditions_tests::isolated(
+        "batch_recovery_binding_tests::mistral_collect_normalizes_a08_ocr_markdown_without_final_lf",
+    ) {
+        return;
+    }
+    let root = canonical_tempdir();
+    let crate::management::ExplicitRoot::Created(repo) =
+        crate::management::initialize_explicit_root(root.path(), &Default::default()).unwrap()
+    else {
+        panic!("expected a new managed scope");
+    };
+    let fixture = include_bytes!("../../kio-eval/acceptance-fixtures/v1/provider-public/ocr.pdf");
+    fs::write(root.path().join("ocr-batch.pdf"), fixture).unwrap();
+    let ledger = LedgerDb::initialize(root.path().join("device/ledger.sqlite")).unwrap();
+    let profile = standard_online_markdownize_profile();
+    let key = LedgerTaskKey::new(
+        repo.scope_identity().unwrap().scope_id,
+        "markdownize",
+        hash_bytes(fixture),
+        &profile.tool_profile_hash,
+    );
+    let intent = phase1_intent(&ledger, &key, RequestKind::Batch, 1.0, None).unwrap();
+    phase2a_record_provider_scope(&ledger, &key, &intent.intent_token, "mistral:workspace")
+        .unwrap();
+    phase2b_record_job_created(&ledger, &key, &intent.intent_token, "batches/recorded").unwrap();
+    let row = get_batch_request(&ledger, &key).unwrap().unwrap();
+    let mut task = markdown_task(&row);
+    task.bbox_annotation_enabled = Some(true);
+    task.input_path = "ocr-batch.pdf".into();
+    let store = TaskStore::new(repo.kio_dir());
+    store.append(&task).unwrap();
+    let mut client = mistral_client(&row);
+    client.record.model = Some("mistral-ocr-4-1".into());
+    client.output = Some(BatchOutputLine {
+        custom_id: key.input_hash.clone(),
+        status_code: 200,
+        body: json!({
+            "model": "mistral-ocr-4-1-completion",
+            "pages": [{
+                "index": 0,
+                "markdown": "Kio provider OCR fixture",
+                "images": [],
+                "dimensions": {"dpi": 200, "height": 556, "width": 556}
+            }],
+            "document_annotation": null,
+            "usage_info": {"pages_processed": 1, "doc_size_bytes": fixture.len()}
+        }),
+    });
+    let result = poll_one_batch_markdownize_row(
+        &std::sync::Arc::new(kio_adapter::tool_lock::AdapterRuntimeSettings::default()),
+        &repo,
+        &store,
+        &ledger,
+        &client,
+        &row,
+        &profile,
+        &task.output_ref,
+        std::slice::from_ref(&task),
+    )
+    .unwrap();
+    match result {
+        BatchPollDisposition::Collected(_) => {}
+        BatchPollDisposition::Failed(reason, _) => panic!("batch collection rejected: {reason:?}"),
+        BatchPollDisposition::InFlight => panic!("batch collection did not complete"),
+    }
+    let resolved =
+        kio_adapter::mistral_ocr_profile("mistral-ocr-4-1", true, profile.provider_idempotency);
+    let instance = kio_pipeline::markdownize::load_validated_normalized_instance(
+        repo.kio_dir(),
+        &key.input_hash,
+        &resolved.tool_profile_hash,
+        0,
+    )
+    .unwrap();
+    assert_eq!(instance.units.len(), 1);
+    assert_eq!(instance.units[0].unit_key, "page:1");
+    assert_eq!(instance.units[0].prepared_hash, key.input_hash);
+    assert_eq!(instance.units[0].markdown, "Kio provider OCR fixture\n");
 }
 
 #[test]

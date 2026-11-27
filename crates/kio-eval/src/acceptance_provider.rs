@@ -839,12 +839,13 @@ mod child_tests {
     #[test]
     fn batch_exit_four_fails() {
         let err = poll_fake(
-            r#"echo '{"tasks_inflight":0,"mistral_failures":["response_model_mismatch"],"error_code":"KIO-E-BATCH-TASK-FAILED-001","message":"private provider text"}'; exit 4"#,
+            r#"echo '{"tasks_inflight":0,"mistral_failures":["response_model_mismatch","invalid_markdown_format"],"error_code":"KIO-E-BATCH-TASK-FAILED-001","message":"private provider text"}'; exit 4"#,
             std::time::Duration::from_secs(5),
         )
         .unwrap_err();
         assert!(err.to_string().contains("exit status: 4"));
         assert!(err.to_string().contains("response_model_mismatch"));
+        assert!(err.to_string().contains("invalid_markdown_format"));
         assert!(!err.to_string().contains("private provider text"));
     }
 

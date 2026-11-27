@@ -2538,7 +2538,10 @@ fn validate_unit_shapes(
         .collect::<BTreeMap<_, _>>();
     for unit in units {
         if unit.markdown.is_empty() {
-            return Err(contract_violation("markdown must be non-empty"));
+            return Err(PipelineError::contract(
+                "KIO-E-ADAPTER-MARKDOWN-EMPTY-001",
+                "markdown must be non-empty",
+            ));
         }
         if unit.owned_image_hashes.len() > MAX_OWNED_IMAGE_HASHES_PER_UNIT
             || unit
@@ -2546,7 +2549,8 @@ fn validate_unit_shapes(
                 .iter()
                 .any(|hash| !kio_core::cas::is_hash(hash))
         {
-            return Err(contract_violation(
+            return Err(PipelineError::contract(
+                "KIO-E-ADAPTER-MARKDOWN-IMAGE-001",
                 "owned_image_hashes must be bounded canonical SHA-256 hashes",
             ));
         }
@@ -2557,10 +2561,13 @@ fn validate_unit_shapes(
             return Err(contract_violation("unit_type does not match prepared unit"));
         }
         if let Err(reason) = validate_normalized_markdown_v1(&unit.markdown) {
-            return Err(contract_violation(&format!(
-                "unit {} violates Normalized Markdown v1: {reason}",
-                unit.unit_key
-            )));
+            return Err(PipelineError::contract(
+                "KIO-E-ADAPTER-MARKDOWN-FORMAT-001",
+                format!(
+                    "unit {} violates Normalized Markdown v1: {reason}",
+                    unit.unit_key
+                ),
+            ));
         }
     }
     Ok(())

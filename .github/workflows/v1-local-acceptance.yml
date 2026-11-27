@@ -132,7 +132,7 @@ jobs:
           root="$root/package"
           archive="$(find "$root" -maxdepth 1 -name '*.tar.gz' -type f -print)"; sums="$(find "$root" -maxdepth 1 -name '*.checksums.json' -type f -print)"
           eval_bin=target/debug/kio-eval; test "$RUNNER_OS" != Windows || eval_bin="${eval_bin}.exe"
-          lock="$(<"$root/kio-v1-lock-sha256")"; hash="$($eval_bin release archive-sha256 --archive "$archive")"
+          lock="$(<"$root/kio-v1-lock-sha256")"; hash="$("$eval_bin" release archive-sha256 --archive "$archive")"
           "$eval_bin" release verify --archive "$archive" --checksums "$sums" --expected-archive-sha256 "$hash" --source-repo "$GITHUB_WORKSPACE" --expected-commit "$CANDIDATE_SHA" --expected-lock-sha256 "$lock"
           mkdir "$root/extract"; (cd "$root/extract" && tar -xzf -) < "$archive"; release="$(find "$root/extract" -mindepth 1 -maxdepth 1 -type d -print)"; test -n "$release"
           bin="$release/bin/kio"; test "$RUNNER_OS" != Windows || bin="${bin}.exe"; test -f "$bin"
@@ -165,7 +165,7 @@ jobs:
       - name: Bind the A08 expected case after public identity observation
         run: |
           set -euo pipefail; root="$KIO_PACKAGE_ROOT"; target="$RUNNER_TEMP/kio-v1-local-target.json"; expected="$RUNNER_TEMP/kio-v1-local-a08-expected.json"
-          hash="$($KIO_EVAL release archive-sha256 --archive "$(find "$root" -maxdepth 1 -name '*.tar.gz' -type f -print)")"
+          hash="$("$KIO_EVAL" release archive-sha256 --archive "$(find "$root" -maxdepth 1 -name '*.tar.gz' -type f -print)")"
           if command -v sha256sum >/dev/null 2>&1; then
             workflow_hash="$(sha256sum .github/workflows/v1-local-acceptance.yml | awk '{print $1}')"
           else

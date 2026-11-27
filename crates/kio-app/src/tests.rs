@@ -435,13 +435,15 @@ fn materialized_source_image_cas_failure_is_retryable_not_contract_reject() {
     )
     .unwrap_err();
     assert_eq!(
-        failure.retry_kind,
+        failure.into_task_failure().retry_kind,
         kio_pipeline::task::RetryErrorKind::NetworkError
     );
 }
 
 #[test]
 fn invalid_online_markdown_is_rejected_before_normalized_publication() {
+    use crate::markdownize::execution::OnlineMaterializationFailure;
+    use crate::response::batch::MistralBatchFailure;
     use kio_adapter::types::{
         MarkdownUnit, MarkdownizeMode as AdapterMarkdownizeMode, MarkdownizeResponse, UnitKind,
     };
@@ -527,7 +529,14 @@ fn invalid_online_markdown_is_rejected_before_normalized_publication() {
         &[],
     )
     .unwrap_err();
-    assert_eq!(failure.retry_kind, RetryErrorKind::ContractViolation);
+    assert!(matches!(
+        failure,
+        OnlineMaterializationFailure::Contract(MistralBatchFailure::InvalidMarkdownFormat)
+    ));
+    assert_eq!(
+        failure.into_task_failure().retry_kind,
+        RetryErrorKind::ContractViolation
+    );
     response.updated_units[0].unit_key = "image:unknown".to_owned();
     response.updated_units[0].markdown = "otherwise valid text\n".to_owned();
     let unknown_unit = crate::markdownize::execution::materialize_online_markdownize_response(
@@ -556,7 +565,10 @@ fn invalid_online_markdown_is_rejected_before_normalized_publication() {
         &[],
     )
     .unwrap_err();
-    assert_eq!(unknown_unit.retry_kind, RetryErrorKind::ContractViolation);
+    assert!(matches!(
+        unknown_unit,
+        OnlineMaterializationFailure::Contract(MistralBatchFailure::MarkdownizeResponseContract)
+    ));
     assert!(
         !kio_pipeline::markdownize::normalized_instance_dir(
             repo.kio_dir(),
@@ -4852,7 +4864,7 @@ fn secret_typed_owner_cannot_be_bypassed_by_a_public_same_scope_link() {
 }
 
 #[path = "operation_preconditions_tests.rs"]
-mod operation_preconditions_tests;
+pub(crate) mod operation_preconditions_tests;
 
 #[path = "budget_retirement_preconditions_tests.rs"]
 mod budget_retirement_preconditions_tests;

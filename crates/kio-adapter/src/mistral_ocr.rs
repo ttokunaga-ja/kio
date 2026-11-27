@@ -909,6 +909,13 @@ fn build_markdownize_response_from_ocr(
                 })?;
                 let markdown = replace_image_placeholders(&page.markdown, scope_id, &page.images);
                 let markdown = project_bbox_annotations(&markdown, scope_id, &page.images)?;
+                // Provider Markdown has no trailing-LF guarantee. Normalize after
+                // image/annotation projection, keeping empty output rejectable.
+                let markdown = if markdown.is_empty() {
+                    markdown
+                } else {
+                    crate::deterministic::normalize_to_markdown_v1(&markdown)
+                };
                 Ok(MarkdownUnit {
                     unit_key: hint.unit_key.clone(),
                     unit_type: hint.unit_kind,
@@ -2887,7 +2894,7 @@ mod tests {
             .with_bbox_annotation(false)
             .with_verified_raw_bytes(approved.to_vec());
         let response = adapter.markdownize(request).unwrap();
-        assert_eq!(response.updated_units[0].markdown, "verified");
+        assert_eq!(response.updated_units[0].markdown, "verified\n");
         assert_eq!(captured.lock().unwrap().as_slice(), &[approved.to_vec()]);
     }
 
@@ -2946,6 +2953,6 @@ mod tests {
         with_token_request.idempotency_token = Some("intent-token-xyz".to_owned());
         let (adapter, _captured) = build_adapter();
         let response = adapter.markdownize(with_token_request).unwrap();
-        assert_eq!(response.updated_units[0].markdown, "verified");
+        assert_eq!(response.updated_units[0].markdown, "verified\n");
     }
 }

@@ -295,7 +295,7 @@ jobs:
           workflow_sha256="$KIO_PROVIDER_WORKFLOW_SHA256"
           "$eval_bin" acceptance target-binding --candidate-sha "$CANDIDATE_SHA" --os "$os" --target "$(jq -er .target "$root/target-binding.json")" --archive-sha256 "$archive_sha256" --binary-sha256 "$(jq -er .binary_sha256 "$root/target-binding.json")" --version "$(jq -er .version "$root/target-binding.json")" --out "$target"
           "$eval_bin" acceptance expected-case --target-binding "$target" --case A08 --lane provider-live --subcase "$PROVIDER" --os "$os" --fixture-id provider-public-v1 --fixture-sha256 fc6ac89c29025e71da895f61b45d0d7a449989f098f3de1ac01f3f7dd1f02961 --workflow-path .github/workflows/v1-provider-acceptance.yml --workflow-sha256 "$workflow_sha256" --workflow-commit "$CANDIDATE_SHA" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --architecture "$(uname -m)" --out "$expected"
-          printf 'release_bin=%s\nexpected=%s\nfixture=%s\n' "$release_bin" "$expected" "$GITHUB_WORKSPACE/candidate/crates/kio-eval/acceptance-fixtures/v1/provider-public" >> "$GITHUB_OUTPUT"
+          printf 'release_bin=%s\neval_bin=%s\nexpected=%s\nfixture=%s\n' "$release_bin" "$eval_bin" "$expected" "$GITHUB_WORKSPACE/candidate/crates/kio-eval/acceptance-fixtures/v1/provider-public" >> "$GITHUB_OUTPUT"
       - name: Export verified ledger allocation in the existing executor format
         id: state
         env:
@@ -311,17 +311,27 @@ jobs:
         working-directory: candidate
         env:
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          KIO_EVAL: ${{ steps.package.outputs.eval_bin }}
+          KIO_EXPECTED: ${{ steps.package.outputs.expected }}
+          KIO_RELEASE_BIN: ${{ steps.package.outputs.release_bin }}
+          KIO_FIXTURE: ${{ steps.package.outputs.fixture }}
+          KIO_STATE_DIR: ${{ steps.state.outputs.state_dir }}
         run: |
           set -euo pipefail; test -n "$MISTRAL_API_KEY"
-          target/debug/kio-eval acceptance run --expected-case "${{ steps.package.outputs.expected }}" --case A08 --lane provider-live --subcase mistral --os "$OS_NAME" --bin "${{ steps.package.outputs.release_bin }}" --fixture "${{ steps.package.outputs.fixture }}" --work-dir "$RUNNER_TEMP/kio-v1-provider-work-mistral" --receipt "$RUNNER_TEMP/kio-v1-provider-a08-mistral-receipt.json" --provider mistral --reservation-state-dir "${{ steps.state.outputs.state_dir }}" --campaign-id "$CAMPAIGN_ID" --allocation-id "mistral-${OS_NAME}-${CANDIDATE_SHA:0:12}-r${GITHUB_RUN_ID}-a${GITHUB_RUN_ATTEMPT}"
+          "$KIO_EVAL" acceptance run --expected-case "$KIO_EXPECTED" --case A08 --lane provider-live --subcase mistral --os "$OS_NAME" --bin "$KIO_RELEASE_BIN" --fixture "$KIO_FIXTURE" --work-dir "$RUNNER_TEMP/kio-v1-provider-work-mistral" --receipt "$RUNNER_TEMP/kio-v1-provider-a08-mistral-receipt.json" --provider mistral --reservation-state-dir "$KIO_STATE_DIR" --campaign-id "$CAMPAIGN_ID" --allocation-id "mistral-${OS_NAME}-${CANDIDATE_SHA:0:12}-r${GITHUB_RUN_ID}-a${GITHUB_RUN_ATTEMPT}"
       - name: Execute Gemini A08 once
         if: matrix.provider == 'gemini'
         working-directory: candidate
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          KIO_EVAL: ${{ steps.package.outputs.eval_bin }}
+          KIO_EXPECTED: ${{ steps.package.outputs.expected }}
+          KIO_RELEASE_BIN: ${{ steps.package.outputs.release_bin }}
+          KIO_FIXTURE: ${{ steps.package.outputs.fixture }}
+          KIO_STATE_DIR: ${{ steps.state.outputs.state_dir }}
         run: |
           set -euo pipefail; test -n "$GEMINI_API_KEY"
-          target/debug/kio-eval acceptance run --expected-case "${{ steps.package.outputs.expected }}" --case A08 --lane provider-live --subcase gemini --os "$OS_NAME" --bin "${{ steps.package.outputs.release_bin }}" --fixture "${{ steps.package.outputs.fixture }}" --work-dir "$RUNNER_TEMP/kio-v1-provider-work-gemini" --receipt "$RUNNER_TEMP/kio-v1-provider-a08-gemini-receipt.json" --provider gemini --reservation-state-dir "${{ steps.state.outputs.state_dir }}" --campaign-id "$CAMPAIGN_ID" --allocation-id "gemini-${OS_NAME}-${CANDIDATE_SHA:0:12}-r${GITHUB_RUN_ID}-a${GITHUB_RUN_ATTEMPT}"
+          "$KIO_EVAL" acceptance run --expected-case "$KIO_EXPECTED" --case A08 --lane provider-live --subcase gemini --os "$OS_NAME" --bin "$KIO_RELEASE_BIN" --fixture "$KIO_FIXTURE" --work-dir "$RUNNER_TEMP/kio-v1-provider-work-gemini" --receipt "$RUNNER_TEMP/kio-v1-provider-a08-gemini-receipt.json" --provider gemini --reservation-state-dir "$KIO_STATE_DIR" --campaign-id "$CAMPAIGN_ID" --allocation-id "gemini-${OS_NAME}-${CANDIDATE_SHA:0:12}-r${GITHUB_RUN_ID}-a${GITHUB_RUN_ATTEMPT}"
       - name: Publish diagnostic receipt only
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:

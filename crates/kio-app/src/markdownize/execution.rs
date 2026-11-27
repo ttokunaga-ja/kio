@@ -1243,6 +1243,26 @@ pub(crate) fn execute_online_markdownize_task(
         outcome.response,
         &outcome.effective_prepared_unit_hints,
     )
+    .map_err(OnlineMaterializationFailure::into_task_failure)
+}
+
+#[derive(Debug)]
+pub(crate) enum OnlineMaterializationFailure {
+    Contract(crate::response::batch::MistralBatchFailure),
+    Persistence(TaskExecutionFailure),
+}
+
+impl OnlineMaterializationFailure {
+    pub(crate) fn into_task_failure(self) -> TaskExecutionFailure {
+        match self {
+            Self::Contract(_) => TaskExecutionFailure {
+                resource_limit: None,
+                retry_kind: RetryErrorKind::ContractViolation,
+                retry_after_ms: None,
+            },
+            Self::Persistence(failure) => failure,
+        }
+    }
 }
 
 /// The response half of [`execute_online_markdownize_task`] — everything that
@@ -1264,14 +1284,13 @@ pub(crate) fn materialize_online_markdownize_response(
     profile_tool_hash: String,
     response: kio_adapter::types::MarkdownizeResponse,
     effective_prepared_unit_hints: &[PreparedUnitHint],
-) -> std::result::Result<OnlineExecutionOutcome, TaskExecutionFailure> {
+) -> std::result::Result<OnlineExecutionOutcome, OnlineMaterializationFailure> {
+    use crate::response::batch::MistralBatchFailure;
+    use OnlineMaterializationFailure::{Contract, Persistence};
+
     if prepared_units.is_empty() {
         if retry_units.is_some() {
-            return Err(TaskExecutionFailure {
-                resource_limit: None,
-                retry_kind: RetryErrorKind::ContractViolation,
-                retry_after_ms: None,
-            });
+            return Err(Contract(MistralBatchFailure::OcrDiscoveryRetry));
         }
         prepared_units = prepared_units_from_ocr_discovery(
             effective_prepared_unit_hints,
@@ -1280,11 +1299,7 @@ pub(crate) fn materialize_online_markdownize_response(
             bytes,
             &builtin_prepare_profile().tool_profile_hash,
         )
-        .map_err(|_| TaskExecutionFailure {
-            resource_limit: None,
-            retry_kind: RetryErrorKind::ContractViolation,
-            retry_after_ms: None,
-        })?;
+        .map_err(|_| Contract(MistralBatchFailure::InvalidOcrDiscovery))?;
         // No page artifact exists before OCR for a scanned PDF. The already-verified
         // immutable raw object is the bounded prepared source shared by each discovered
         // unit; publish it under the same content hash before the manifest can refer to it.
@@ -1293,10 +1308,12 @@ pub(crate) fn materialize_online_markdownize_response(
                 kio_pipeline::prepare::publish_prepared_source(&root, &task.input_hash, bytes)
                     .map_err(pipeline_to_kio)
             })
-            .map_err(|error| TaskExecutionFailure {
-                resource_limit: error.resource_limit().cloned(),
-                retry_kind: persist_failure_retry_kind(),
-                retry_after_ms: None,
+            .map_err(|error| {
+                Persistence(TaskExecutionFailure {
+                    resource_limit: error.resource_limit().cloned(),
+                    retry_kind: persist_failure_retry_kind(),
+                    retry_after_ms: None,
+                })
             })?;
     }
     // QA17 (docs/07-adapter-spec.md §4): carry the adapter's
@@ -1312,21 +1329,28 @@ pub(crate) fn materialize_online_markdownize_response(
         .cloned()
         .collect::<Vec<_>>();
     let hints = all_changed_hints(&response_prepared_units);
-    let acceptance = validate_markdownize_response(&response, &hints, &response_prepared_units);
-    // Normalized Markdown is immutable once published. Every origin, including
-    // paid sync and collected Batch output, must pass the same v1 acceptance gate
-    // before any normalized CAS object is written. A fallback control response is
-    // not archival content and is rejected here as well.
-    let strict_valid = matches!(
-        acceptance,
-        Ok(kio_pipeline::markdownize::MarkdownizeAcceptance::Accepted)
-    );
-    if !strict_valid {
-        return Err(TaskExecutionFailure {
-            resource_limit: None,
-            retry_kind: RetryErrorKind::ContractViolation,
-            retry_after_ms: None,
-        });
+    // Archival content must pass the v1 gate before normalized CAS writes.
+    // Publish only fixed diagnostics; pipeline error details can contain unit keys.
+    use kio_pipeline::{PipelineError, markdownize::MarkdownizeAcceptance};
+    let violation = match validate_markdownize_response(&response, &hints, &response_prepared_units)
+    {
+        Ok(MarkdownizeAcceptance::Accepted) => None,
+        Err(PipelineError::Contract {
+            code: "KIO-E-ADAPTER-MARKDOWN-EMPTY-001",
+            ..
+        }) => Some(MistralBatchFailure::EmptyMarkdown),
+        Err(PipelineError::Contract {
+            code: "KIO-E-ADAPTER-MARKDOWN-IMAGE-001",
+            ..
+        }) => Some(MistralBatchFailure::InvalidImageOwnership),
+        Err(PipelineError::Contract {
+            code: "KIO-E-ADAPTER-MARKDOWN-FORMAT-001",
+            ..
+        }) => Some(MistralBatchFailure::InvalidMarkdownFormat),
+        _ => Some(MistralBatchFailure::MarkdownizeResponseContract),
+    };
+    if let Some(violation) = violation {
+        return Err(Contract(violation));
     }
     let generated_at = repo.control().now_utc_seconds();
     // R11-6: preserve previously-done units (first-instance-wins). Load the prior
@@ -1343,11 +1367,7 @@ pub(crate) fn materialize_online_markdownize_response(
                 repo.control(),
                 true,
             )
-            .map_err(|_| TaskExecutionFailure {
-                resource_limit: None,
-                retry_kind: RetryErrorKind::ContractViolation,
-                retry_after_ms: None,
-            })?,
+            .map_err(|_| Contract(MistralBatchFailure::MissingRetryInstance))?,
         )
     } else {
         None
@@ -1365,7 +1385,10 @@ pub(crate) fn materialize_online_markdownize_response(
         MarkdownizeMode::Full,
         &generated_at,
     )
-    .map_err(NormalizedUnitsError::task_failure)?;
+    .map_err(|error| match error {
+        NormalizedUnitsError::Contract(_) => Contract(MistralBatchFailure::NormalizedUnitContract),
+        NormalizedUnitsError::LocalPersistence(_) => Persistence(error.task_failure()),
+    })?;
     // R11-6: merge in the previously-done units the retry did not target. The retry
     // request omitted them, so the adapter never returned them — keep the FIRST
     // instance's output verbatim (first-instance-wins).
@@ -1414,7 +1437,7 @@ pub(crate) fn materialize_online_markdownize_response(
     attach_resource_limits(&mut manifest, &response, previous.as_ref());
     let _stamped_manifest =
         persist_normalized_instance_with_control(repo.kio_dir(), &manifest, &units, repo.control())
-            .map_err(task_failure_from_pipeline)?;
+            .map_err(|error| Persistence(task_failure_from_pipeline(error)))?;
     Ok(OnlineExecutionOutcome::full(
         normalized_output_ref(repo, &task.input_hash, &profile_tool_hash, 0),
         status,

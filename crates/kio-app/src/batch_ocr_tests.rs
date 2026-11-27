@@ -72,7 +72,7 @@ fn batch_ocr_image_is_owned_reopenable_and_retained_for_its_source_unit() {
     let expected_uri = format!("kio://{scope_id}/object/image/{raw_hash}");
     assert_eq!(
         response.updated_units[0].markdown,
-        format!("![provider figure]({expected_uri})")
+        format!("![provider figure]({expected_uri})\n")
     );
     assert_eq!(
         response.updated_units[0].owned_image_hashes,

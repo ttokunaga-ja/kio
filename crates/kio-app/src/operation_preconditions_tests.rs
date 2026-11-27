@@ -18,7 +18,7 @@ const PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIBWTCB/6ADAgECAhR5P0J0YMFaZPlr
 
 // As in contextual_embedding_tests, no ambient credentials, selectors or XDG
 // roots enter the child. Unlike that helper this does NOT initialize billing.
-pub(super) fn isolated(test: &str) -> bool {
+pub(crate) fn isolated(test: &str) -> bool {
     const CHILD: &str = "KIO_OPERATION_PRECONDITIONS_CHILD";
     if std::env::var(CHILD).as_deref() == Ok(test) {
         return true;
