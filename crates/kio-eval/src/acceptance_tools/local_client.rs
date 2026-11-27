@@ -204,6 +204,15 @@ struct Client {
     capability: Option<String>,
 }
 
+const TUNNEL_ARGS: [&str; 6] = [
+    "-N",
+    "-o",
+    "ExitOnForwardFailure=yes",
+    "-L",
+    "127.0.0.1:18443:127.0.0.1:18443",
+    "kio-lab-wsl",
+];
+
 impl Client {
     fn new(args: &Args) -> Result<Self, String> {
         validate_args(args)?;
@@ -440,15 +449,7 @@ impl Client {
 
     fn start_tunnel(&self) -> Result<SupervisedChild, String> {
         let mut command = self.ssh_command();
-        command.args([
-            "-N",
-            "-o",
-            "ExitOnForwardFailure=yes",
-            "-L",
-            "127.0.0.1:18443:127.0.0.1:18443",
-            "-L",
-            "kio-lab-wsl",
-        ]);
+        command.args(TUNNEL_ARGS);
         SupervisedChild::spawn(&mut command, Duration::from_secs(1_300))
             .map_err(|error| format!("cannot start owned SSH tunnel: {error}"))
     }
@@ -907,6 +908,21 @@ fn random_suffix() -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tunnel_forwards_only_the_ocr_port_to_the_route_host() {
+        assert_eq!(
+            TUNNEL_ARGS.as_slice(),
+            [
+                "-N",
+                "-o",
+                "ExitOnForwardFailure=yes",
+                "-L",
+                "127.0.0.1:18443:127.0.0.1:18443",
+                "kio-lab-wsl",
+            ]
+        );
+    }
 
     #[test]
     fn route_material_is_private_at_birth_and_existing_paths_are_unchanged() {
