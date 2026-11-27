@@ -122,25 +122,11 @@ pub fn run_a08_provider(
         Provider::Gemini => run_gemini(options, &isolated, &scope, &key)?,
     }
     let mut runtime = runtime_from_scope(&scope)?;
-    let adapter_kind = match options.provider {
-        Provider::Mistral => "markdownize",
-        Provider::Gemini => "embedding",
+    let ledger_profile = match options.provider {
+        Provider::Mistral => None,
+        Provider::Gemini => Some(observed_batch_profile(&isolated, "embedding")?),
     };
-    let ledger_profile = observed_batch_profile(&isolated, adapter_kind)?;
-    if !runtime
-        .tools
-        .iter()
-        .any(|tool| tool.tool_profile_hash == ledger_profile)
-    {
-        return Err(invalid(
-            "provider ledger profile does not match persisted tool identity",
-        ));
-    }
-    runtime.tools.retain(|tool| {
-        tool.tool_profile_hash == ledger_profile
-            || (options.provider == Provider::Mistral && tool.tool_id == "mistral_ocr_markdownize")
-            || (options.provider == Provider::Gemini && tool.tool_id == "gemini_embedding_2")
-    });
+    runtime.tools = receipt_tools(options.provider, runtime.tools, ledger_profile.as_deref())?;
 
     let receipt = AcceptanceReceipt {
         schema: "kio.acceptance.receipt/v4".to_owned(),
@@ -531,6 +517,34 @@ fn assert_settled_usage(root: &Path, adapter_kind: &str) -> Result<(), Acceptanc
     Ok(())
 }
 
+/// Mistral reserves its batch under the network-free discovery profile and
+/// executes under the resolved model pin, so its ledger row never carries the
+/// executed hash; the receipt binds the executed tool by its id instead.
+fn receipt_tools(
+    provider: Provider,
+    mut tools: Vec<crate::acceptance::ObservedToolIdentity>,
+    ledger_profile: Option<&str>,
+) -> Result<Vec<crate::acceptance::ObservedToolIdentity>, AcceptanceError> {
+    let tool_id = match provider {
+        Provider::Mistral => "mistral_ocr_markdownize",
+        Provider::Gemini => "gemini_embedding_2",
+    };
+    if let Some(profile) = ledger_profile
+        && !tools.iter().any(|tool| tool.tool_profile_hash == profile)
+    {
+        return Err(invalid(
+            "provider ledger profile does not match persisted tool identity",
+        ));
+    }
+    tools.retain(|tool| {
+        tool.tool_id == tool_id || ledger_profile == Some(tool.tool_profile_hash.as_str())
+    });
+    if tools.is_empty() {
+        return Err(invalid("provider tool identity was not persisted"));
+    }
+    Ok(tools)
+}
+
 fn observed_batch_profile(root: &Path, adapter_kind: &str) -> Result<String, AcceptanceError> {
     let database = root.join("xdg-data").join("kio").join("cost-ledger.sqlite");
     let connection =
@@ -716,8 +730,36 @@ mod tests {
 
     use super::{
         Provider, expected_fixture_digest, load_fixture, materialize_fixture,
-        prepare_isolated_root, tiny_png, write_tools_config,
+        prepare_isolated_root, receipt_tools, tiny_png, write_tools_config,
     };
+    use crate::acceptance::ObservedToolIdentity;
+
+    fn tool(id: &str, hash: &str) -> ObservedToolIdentity {
+        ObservedToolIdentity {
+            tool_id: id.to_owned(),
+            tool_profile_hash: hash.to_owned(),
+        }
+    }
+
+    #[test]
+    fn mistral_receipt_binds_executed_tool_by_id() {
+        let tools = vec![
+            tool("mistral_ocr_markdownize", "sha256:executed"),
+            tool("other", "sha256:x"),
+        ];
+        assert_eq!(
+            receipt_tools(Provider::Mistral, tools, None).unwrap(),
+            vec![tool("mistral_ocr_markdownize", "sha256:executed")]
+        );
+        assert!(receipt_tools(Provider::Mistral, vec![tool("other", "sha256:x")], None).is_err());
+    }
+
+    #[test]
+    fn gemini_receipt_requires_ledger_profile_match() {
+        let tools = vec![tool("gemini_embedding_2", "sha256:g")];
+        assert!(receipt_tools(Provider::Gemini, tools.clone(), Some("sha256:g")).is_ok());
+        assert!(receipt_tools(Provider::Gemini, tools, Some("sha256:other")).is_err());
+    }
 
     #[test]
     fn provider_private_root_supports_offline_preparation_and_refuses_reuse() {
