@@ -560,7 +560,11 @@ impl Client {
             )
             .map_err(|error| format!("authenticated-local {phase} failed: {error}"))?;
             if !output.status.success() {
-                return Err(format!("authenticated-local {phase} failed"));
+                return Err(evaluator_failure(
+                    phase,
+                    &output.status.to_string(),
+                    &output.stderr,
+                ));
             }
             Ok(())
         })();
@@ -568,6 +572,23 @@ impl Client {
         let _ = self.route.remove_file(Path::new(&identity_leaf));
         result
     }
+}
+
+fn evaluator_failure(phase: &str, status: &str, stderr: &str) -> String {
+    const MAX_DIAGNOSTIC_BYTES: usize = 2048;
+    let diagnostics = stderr
+        .lines()
+        .filter(|line| line.starts_with("kio-eval: "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let start =
+        diagnostics.ceil_char_boundary(diagnostics.len().saturating_sub(MAX_DIAGNOSTIC_BYTES));
+    let mut error = format!("authenticated-local {phase} failed ({status})");
+    if !diagnostics.is_empty() {
+        error.push('\n');
+        error.push_str(&diagnostics[start..]);
+    }
+    error
 }
 
 impl Drop for Client {
@@ -908,6 +929,29 @@ fn random_suffix() -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn evaluator_failure_includes_bounded_utf8_diagnostics() {
+        let stderr = format!(
+            "kio-eval: old\n{}\nkio-eval: {}\nkio-eval: 最新の失敗\n",
+            "raw child output",
+            "界".repeat(1000)
+        );
+        let error = evaluator_failure("embedding", "exit status: 1", &stderr);
+        let (summary, detail) = error.split_once('\n').unwrap();
+        assert_eq!(
+            summary,
+            "authenticated-local embedding failed (exit status: 1)"
+        );
+        assert!(detail.len() <= 2048);
+        assert!(detail.ends_with("kio-eval: 最新の失敗"));
+        assert!(!detail.contains("old"));
+        assert!(!detail.contains("raw child output"));
+        assert!(
+            !evaluator_failure("ocr", "exit status: 1", "raw child output")
+                .contains("raw child output")
+        );
+    }
 
     #[test]
     fn tunnel_forwards_only_the_ocr_port_to_the_route_host() {

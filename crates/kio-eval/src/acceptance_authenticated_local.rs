@@ -317,7 +317,8 @@ pub fn run_embedding(
             "--offline",
         ],
     )?;
-    let image_uri = require_image_result(&image)?;
+    let fixture_image_sha256 = sha256_bytes(&bounded_file(&scope.join(IMAGE_PNG))?);
+    let image_uri = require_image_result(&image, &fixture_image_sha256)?;
     let image_rows_before_repair = stable_result_rows(&image)?;
     let opened = json(&binary, &private, &scope, &["open", &image_uri])?;
     assert_opened_image(&opened, &scope.join(IMAGE_PNG))?;
@@ -378,7 +379,7 @@ pub fn run_embedding(
     )?;
     require_results(&rebuilt_text, "rebuilt text query")?;
     require_results(&rebuilt_image, "rebuilt hybrid query")?;
-    require_image_result(&rebuilt_image)?;
+    require_image_result(&rebuilt_image, &fixture_image_sha256)?;
     if stable_result_rows(&rebuilt_text)? != stored_text_rows
         || stable_result_rows(&rebuilt_image)? != image_rows_before_repair
     {
@@ -716,20 +717,26 @@ fn require_results(value: &Value, label: &str) -> Result<(), AcceptanceError> {
     }
     Ok(())
 }
-fn require_image_result(value: &Value) -> Result<String, AcceptanceError> {
+fn require_image_result(value: &Value, fixture_sha256: &str) -> Result<String, AcceptanceError> {
+    let fixture_path = format!("object/image/sha256:{fixture_sha256}");
     value
         .pointer("/results")
         .and_then(Value::as_array)
         .and_then(|results| {
             results
                 .iter()
-                .find(|row| row.get("result_type").and_then(Value::as_str) == Some("image"))
+                .filter(|row| row.get("result_type").and_then(Value::as_str) == Some("image"))
+                .filter_map(|row| row.get("payload_uri").and_then(Value::as_str))
+                .find(|uri| {
+                    uri.strip_prefix("kio://")
+                        .and_then(|rest| rest.split_once('/'))
+                        .is_some_and(|(scope, path)| !scope.is_empty() && path == fixture_path)
+                })
         })
-        .and_then(|row| row.get("payload_uri"))
-        .and_then(Value::as_str)
-        .filter(|uri| uri.starts_with("kio://") && uri.contains("/object/image/sha256:"))
         .map(ToOwned::to_owned)
-        .ok_or_else(|| invalid("image vector query returned no image object URI"))
+        .ok_or_else(|| {
+            invalid("image vector query returned no image object URI matching the fixture")
+        })
 }
 fn assert_opened_image(value: &Value, expected: &Path) -> Result<(), AcceptanceError> {
     let path = value
@@ -1342,6 +1349,23 @@ mod tests {
     }
 
     #[test]
+    fn image_search_selects_fixture_by_content() {
+        let fixture_sha256 = sha256_bytes(b"fixture");
+        let other_uri = format!("kio://scope/object/image/sha256:{}", sha256_bytes(b"other"));
+        let fixture_uri = format!("kio://scope/object/image/sha256:{fixture_sha256}");
+        let mut response = serde_json::json!({"results": [
+            {"result_type": "image", "payload_uri": other_uri},
+            {"result_type": "image", "payload_uri": fixture_uri},
+        ]});
+        assert_eq!(
+            require_image_result(&response, &fixture_sha256).unwrap(),
+            fixture_uri
+        );
+        response["results"].as_array_mut().unwrap().pop();
+        assert!(require_image_result(&response, &fixture_sha256).is_err());
+    }
+
+    #[test]
     fn image_query_diagnostic_preserves_a_three_row_response_create_only() {
         let temporary = tempfile::tempdir().unwrap();
         let private = prepare_private_root(temporary.path()).unwrap();
@@ -1358,7 +1382,7 @@ mod tests {
             .join(ImageQueryStage::BeforeRepair.diagnostic_name());
         assert_eq!(fs::read(&path).unwrap(), response);
         let captured: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert!(require_image_result(&captured).is_err());
+        assert!(require_image_result(&captured, &sha256_bytes(b"fixture")).is_err());
         assert!(
             write_image_query_diagnostic(&private, ImageQueryStage::BeforeRepair, response)
                 .is_err()
