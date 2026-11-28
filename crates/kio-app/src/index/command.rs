@@ -1,7 +1,6 @@
 use crate::approvals;
 use crate::commands::IndexArgs;
 use crate::commands::ReindexArgs;
-use crate::context::EvidenceRegistry;
 use crate::discovery;
 use crate::egress::active_markdownize_profile_for;
 use crate::egress::embedding_online_allowed;
@@ -71,7 +70,6 @@ use crate::response::status::BudgetStatusResponse;
 use crate::response::{CommandResponse, Completion, ResponseBody};
 use crate::scope_access::ensure_raw_ingest_allowed;
 use crate::scope_access::register_scope;
-use crate::scope_access::resolve_evidence_scope_target;
 use crate::scope_access::scope_id;
 use crate::search::projection::mark_replica_rebuilding_or_log;
 use crate::search::projection::maybe_inject_replica_after_head_fault;
@@ -509,21 +507,7 @@ fn run_index_for_repo_inner(
     // well as paid sends. Check an owned read-only registry snapshot before
     // GC recovery, grants or any index mutation can begin.
     if !args.preview {
-        if super::extraction_retirement::has_journal(repo)? {
-            crate::scope_access::validate_extraction_recovery_registration(ctx.cwd(), repo)?;
-            let _lock = repo.lock_store_in_session(repo.lock_session())?;
-            admission_policy.revalidate().map_err(pipeline_to_kio)?;
-            super::extraction_retirement::recover_for_index(repo)?;
-        } else {
-            let scope_id = repo.scope_identity()?.scope_id;
-            resolve_evidence_scope_target(
-                ctx.cwd(),
-                &EvidenceRegistry::default(),
-                &scope_id,
-                Some(&repo.canonical_root().display().to_string()),
-                ctx.control,
-            )?;
-        }
+        crate::scope_access::validate_writer_registration(ctx.cwd(), repo)?;
     }
     let lane_override = LaneOverride::new(args.realtime, args.batch);
     let mut child_discovery = if discover_children && args.preview {
@@ -688,9 +672,11 @@ fn run_index_for_repo_inner(
     // only then constructs a fresh preview, binding approvals and writes to the
     // current tree rather than a stale pre-lock observation. The lock is
     // reentrant, so the internal auto-snapshot re-acquisition does not deadlock.
-    let lock = repo.lock_store_for_publication()?;
+    let admission_lock = repo.lock_store_in_session(repo.lock_session())?;
     admission_policy.revalidate().map_err(pipeline_to_kio)?;
     super::extraction_retirement::recover(repo)?;
+    let lock = repo.lock_store_for_publication()?;
+    drop(admission_lock);
     management::reconcile_child_lifecycle(repo)?;
     // Lifecycle reconciliation may legitimately change management records.
     // Bind scanning and publication to the resulting live policy snapshot.
@@ -1992,10 +1978,7 @@ fn current_dispositions(
 /// Unsupported paths must be raw-only in the selected tree.
 type HeadDispositions = (Option<TreeObject>, DiskRecords<UnsupportedInputDisposition>);
 
-pub(super) fn dispositions_at_head(
-    repo: &Repository,
-    head: Option<&str>,
-) -> Result<HeadDispositions> {
+fn dispositions_at_head(repo: &Repository, head: Option<&str>) -> Result<HeadDispositions> {
     let store = UnsupportedInputStore::new(repo.kio_dir())
         .with_record_stages(repo.object_store().scratch_record_stages());
     let Some(head) = head else {
@@ -2148,15 +2131,32 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
         Some(&repo.kio_dir().join("config.toml")),
         ctx.control,
     )?;
+    if parsed.at.is_none() {
+        if !parsed.force {
+            return Err(KioError::invalid_usage(
+                "reindex requires --regenerate in Step 3",
+            ));
+        }
+        if !parsed.yes {
+            return Err(KioError::new(
+                "KIO-E-CONFIRM-REJECTED-001",
+                "reindex --regenerate requires confirmation; pass --yes in non-interactive mode",
+                json!({}),
+                ExitCode::ConfirmationRejected,
+            ));
+        }
+    }
     // M1(a): serialize both HEAD reindex and historical enrichment against
     // concurrent index/repair/reindex. Historical enrichment is derived-state
     // only, but still appends to the chunk ledger and SQLite projection.
     let _lock = repo.lock_store_in_session(repo.lock_session())?;
     publication_policy.revalidate().map_err(pipeline_to_kio)?;
     validate_repo_tool_lock(&repo)?;
-    if parsed.force && parsed.yes && super::extraction_retirement::has_journal(&repo)? {
-        crate::scope_access::validate_extraction_recovery_registration(ctx.cwd(), &repo)?;
-        super::extraction_retirement::recover_for_index(&repo)?;
+    if repo.has_pending_publication()?
+        || (parsed.force && super::extraction_retirement::has_journal(&repo)?)
+    {
+        crate::scope_access::validate_writer_registration(ctx.cwd(), &repo)?;
+        super::extraction_retirement::recover(&repo)?;
     }
     let _publication_lock = repo.lock_store_for_publication()?;
     // CL45/item 5: reconcile any stale `request_kind='sync'` cost-ledger.sqlite
@@ -2206,19 +2206,6 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
             crate::batch::command::recheck_resource_limit,
         )?;
         return historical_reindex::run(ctx, &repo, at, parsed.online, parsed.offline);
-    }
-    if !parsed.force {
-        return Err(KioError::invalid_usage(
-            "reindex requires --regenerate in Step 3",
-        ));
-    }
-    if !parsed.yes {
-        return Err(KioError::new(
-            "KIO-E-CONFIRM-REJECTED-001",
-            "reindex --regenerate requires confirmation; pass --yes in non-interactive mode",
-            json!({}),
-            ExitCode::ConfirmationRejected,
-        ));
     }
     crate::index::pipeline::retry_local_extractions(ctx, &repo, &store, args.resource_tier)?;
     let head = repo

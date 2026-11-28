@@ -473,3 +473,69 @@ fn nc2_watch_reconciles_unsupported_at_the_same_head_path() {
         "{view}"
     );
 }
+
+#[cfg(debug_assertions)]
+#[test]
+fn watch_and_cli_serialize_interrupted_history_publication() {
+    use kio_core::scope::Repository;
+
+    let fixture = Fixture::new();
+    let repo = Repository::open(&fixture.root).unwrap();
+    let note = fixture.root.join("note.md");
+    fs::write(&note, "# Before\n").unwrap();
+    let before = repo.snapshot(None, None).unwrap().commit_hash.unwrap();
+    fs::write(&note, "# Interrupted child\n").unwrap();
+
+    let ready = fixture.home.join("publication-ready");
+    let watch = Guard::new(
+        fixture
+            .command(&["watch", "run", "--reconcile-interval-seconds", "1"])
+            .env("KIO_TEST_DURABILITY_POINT", "publication_journal")
+            .env("KIO_TEST_DURABILITY_READY", &ready)
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(25);
+    while !ready.is_file() {
+        assert!(Instant::now() < deadline, "watch never reached publication");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let journal = repo.kio_dir().join("publication-v1.json");
+    let journal_bytes = fs::read(&journal).unwrap();
+    let intent: Value = serde_json::from_slice(&journal_bytes).unwrap();
+    let child = intent["new_head"].as_str().unwrap();
+    let cli = fixture.command(&["index", "--offline"]).output().unwrap();
+    assert_eq!(cli.status.code(), Some(3), "{cli:?}");
+    assert!(
+        String::from_utf8_lossy(&cli.stdout).contains("KIO-E-STORE-LOCKED-001")
+            || String::from_utf8_lossy(&cli.stderr).contains("KIO-E-STORE-LOCKED-001"),
+        "{cli:?}"
+    );
+    assert_eq!(fs::read(&journal).unwrap(), journal_bytes);
+    assert_eq!(
+        repo.head_commit_hash().unwrap().as_deref(),
+        Some(before.as_str())
+    );
+    watch.crash();
+
+    fs::write(&note, "# Latest\n").unwrap();
+    let watcher = fixture.start("1");
+    let deadline = Instant::now() + Duration::from_secs(25);
+    loop {
+        let head = repo.head_commit_hash().unwrap().unwrap();
+        if head != before && head != child && !journal.exists() {
+            assert_eq!(
+                repo.read_commit(&head).unwrap().parent.as_deref(),
+                Some(child)
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "watch did not resume history publication"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(watcher);
+}

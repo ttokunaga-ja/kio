@@ -94,7 +94,7 @@ ST11	低／対象者限定	子scope登録はvolume跨ぎと移動・identity不�
 ST12	低／対象者限定	読取専用操作にもformat完全一致と恒久store-gateを要求	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:5411
 ST14	低／対象者限定	object・schema・control recordのbytes上限	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:5464
 ST16	低／対象者限定	native filesystem primitive不対応時はfallbackせず拒否	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:5512
-ST17	低／対象者限定	中断restore/publication/GCと登録pendingが通常操作を停止	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:5554
+ST17	低／対象者限定	中断restore/publication/GCと登録pendingが通常操作を停止	keep	検証可能な通常の履歴 publication は writer が排他下で自動再開。競合・検証失敗、managed restore、purge、GC、登録 pending の扱いは維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:5554
 ST18	低／対象者限定	restore・履歴は現行policy、線形chain、作業bytesを保持	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:5607
 ST21	低／対象者限定	不完全projectionとpolicy binding列挙超過を拒否	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:5665
 ST22	低／対象者限定	embedding vector・provenance・chunk identityを厳密検証	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:5718

@@ -112,11 +112,17 @@ impl Repository {
         Ok(Some(value))
     }
 
-    pub(super) fn ensure_no_pending_publication(&self) -> Result<()> {
+    pub fn has_pending_publication(&self) -> Result<bool> {
+        self.store_directory()?
+            .contains_entry(Path::new(PUBLICATION_JOURNAL_LEAF))
+    }
+
+    /// Reject an unfinished history publication without modifying it.
+    pub fn ensure_no_pending_publication(&self) -> Result<()> {
         if self.publication_journal()?.is_some() {
             return Err(KioError::new(
                 "KIO-E-PUBLICATION-RECOVERY-REQUIRED-001",
-                "an incomplete history publication requires explicit recovery",
+                "an incomplete history publication is pending",
                 json!({ "journal": PUBLICATION_JOURNAL_LEAF }),
                 ExitCode::PartialFailure,
             ));
@@ -125,11 +131,17 @@ impl Repository {
     }
 
     /// Enter a writer transaction whose decisions depend on the published HEAD.
-    /// An incomplete publication must be resolved through explicit recovery
-    /// before a new writer can mutate its dependencies.
+    /// Finish a verified ordinary publication under the same writer lock.
     pub fn lock_store_for_publication(&self) -> Result<RetainedStoreLock> {
         let lock = self.lock_store_in_session(&self.lock_session)?;
-        self.ensure_no_pending_publication()?;
+        self.ensure_no_pending_managed_restore()?;
+        if self.has_pending_publication()? {
+            // An active purge owns its history and destructive phases.
+            if self.purge_state()?.read_journal()?.is_some() {
+                self.ensure_no_pending_publication()?;
+            }
+            self.recover_publication()?;
+        }
         Ok(lock)
     }
 
@@ -185,20 +197,15 @@ impl Repository {
 
     /// Finish the repository publication associated with a saved extraction
     /// retirement. An unrelated pending publication keeps its own owner.
-    pub fn recover_extraction_publication(
-        &self,
-        expected: &str,
-        before_recovery: impl FnOnce() -> Result<()>,
-    ) -> Result<bool> {
+    pub fn recover_extraction_publication(&self, expected: &str) -> Result<()> {
         let _lock = self.lock_store_in_session(&self.lock_session)?;
         if self
             .publication_journal()?
             .is_some_and(|journal| journal.new_head == expected)
         {
-            before_recovery()?;
-            return self.recover_publication();
+            let _publication = self.lock_store_for_publication()?;
         }
-        Ok(false)
+        Ok(())
     }
 
     pub(super) fn publish_with_journal(
