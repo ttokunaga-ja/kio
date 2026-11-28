@@ -151,26 +151,29 @@ pub fn builtin_offline_markdownize_adapter() -> Box<dyn MarkdownizeAdapter> {
 /// signal, and the mock stays reachable only through the env seam. That
 /// asymmetry is what stops a `tools.toml` entry from silently writing mock
 /// Markdown into a real archive.
-#[must_use]
-pub fn active_local_ocr_execution(settings: &AdapterRuntimeSettings) -> Option<LocalOcrExecution> {
-    active_local_ocr_execution_with_control(settings, &ControlHandle::default())
-}
-
 pub fn active_local_ocr_execution_with_control(
     settings: &AdapterRuntimeSettings,
     control: &ControlHandle,
 ) -> Option<LocalOcrExecution> {
+    // Optional enrichment can continue without OCR. Invocation diagnostics
+    // expose rejected role configuration through settings.readiness_reasons().
+    local_ocr_execution_with_control(settings, control).unwrap_or_default()
+}
+
+/// Resolve local OCR for an explicit request, preserving its readiness error.
+pub fn local_ocr_execution_with_control(
+    settings: &AdapterRuntimeSettings,
+    control: &ControlHandle,
+) -> Result<Option<LocalOcrExecution>> {
+    settings.role_configuration_ready("markdown")?;
     #[cfg(debug_assertions)]
     match test_control::local_ocr(control) {
-        Some("mock") => return Some(LocalOcrExecution::Mock),
-        Some(_) => return None,
+        Some("mock") => return Ok(Some(LocalOcrExecution::Mock)),
+        Some(_) => return Ok(None),
         None => {}
     }
     let _ = control;
-    if settings.role_configuration_ready("markdown").is_err() {
-        return None;
-    }
-    declared_offline_markdownize(settings).then_some(LocalOcrExecution::Real)
+    Ok(declared_offline_markdownize(settings).then_some(LocalOcrExecution::Real))
 }
 
 /// Whether `tools.toml` declares the markdown role as `offline_api`.
@@ -251,10 +254,14 @@ pub fn local_ocr_markdownize_adapter_with_control(
     Ok(adapter)
 }
 
-/// The adopted embedding model pin, re-exported so the CLI's Batch lane can
-/// name the model a job is created with without reaching into the private
-/// adapter module.
-pub use crate::gemini_embedding::ADOPTED_MODEL_PIN as ADOPTED_EMBEDDING_MODEL_PIN;
+/// The same concrete Gemini pin feeds the online profile, preflights and provider requests.
+#[must_use]
+pub fn configured_gemini_model_pin(settings: &AdapterRuntimeSettings) -> String {
+    settings
+        .declared_adapter("embedding")
+        .and_then(|declared| declared.model)
+        .unwrap_or_else(|| ADOPTED_MODEL_PIN.to_owned())
+}
 
 #[must_use]
 pub fn adopted_embedding_profile() -> AdapterProfile {
@@ -1161,9 +1168,9 @@ fn offline_embedding_declaration(
 /// `profile()` (hence `execution_mode`, `allow_network`, `billable_kinds`) and
 /// `preferred_request_kind()`, which is every input the offline forks need. It
 /// simply had one implementor. Note the seam is at the *adapter* level and not
-/// at `GeminiEmbeddingClient`, whose `resolve_model_pin` and
-/// `(model_pin, dimensions, idempotency_header)` signature encode Gemini's
-/// model catalog and `outputDimensionality` and describe no other provider.
+/// at `GeminiEmbeddingClient`, whose
+/// `(model_pin, dimensions, idempotency_header)` signature encodes Gemini's
+/// concrete resource name and `outputDimensionality`.
 pub fn embedding_adapter_for(
     settings: Arc<AdapterRuntimeSettings>,
     execution: EmbeddingExecution,
@@ -1199,12 +1206,9 @@ pub fn embedding_adapter_for_with_control(
             if let Some(declared) = declared.as_ref() {
                 crate::tool_lock::validate_declared_runtime_target("embedding", declared)?;
             }
-            let configured_model = declared
-                .and_then(|declared| declared.model)
-                .unwrap_or_else(|| ADOPTED_MODEL_PIN.to_owned());
             Ok(Box::new(GeminiEmbeddingAdapter::new(
                 crate::gemini_embedding::EnvGeminiEmbeddingClient::new(settings.clone())?,
-                configured_model,
+                configured_gemini_model_pin(&settings),
                 ADOPTED_DIMENSIONS,
             )))
         }
@@ -1215,7 +1219,7 @@ pub fn embedding_adapter_for_with_control(
                     MockAdoptedEmbeddingClient {
                         execution: AdoptedEmbeddingExecution::RequireIdempotencyToken,
                     },
-                    ADOPTED_MODEL_PIN,
+                    configured_gemini_model_pin(&settings),
                     ADOPTED_DIMENSIONS,
                 )
                 .with_provider_idempotency(ProviderIdempotency::HttpHeader(
@@ -1226,7 +1230,7 @@ pub fn embedding_adapter_for_with_control(
         #[cfg(debug_assertions)]
         EmbeddingExecution::Online(other) => Ok(Box::new(GeminiEmbeddingAdapter::new(
             MockAdoptedEmbeddingClient { execution: other },
-            ADOPTED_MODEL_PIN,
+            configured_gemini_model_pin(&settings),
             ADOPTED_DIMENSIONS,
         ))),
     }
@@ -1309,7 +1313,10 @@ pub fn declared_embedding_profile_for(
     execution: EmbeddingExecution,
 ) -> Result<DeclaredEmbeddingProfile> {
     Ok(match execution {
-        EmbeddingExecution::Online(seam) => declared_adopted_embedding_profile(seam),
+        EmbeddingExecution::Online(mode) => declared_gemini_embedding_profile(
+            mode,
+            embedding_adapter_profile_with_control(settings, execution, &settings.control)?,
+        ),
         EmbeddingExecution::Native => declared_native_embedding_profile(),
         EmbeddingExecution::Offline => {
             let profile = offline_embedding_profile(settings)?;
@@ -1354,7 +1361,13 @@ pub fn declared_deterministic_embedding_profile() -> DeclaredEmbeddingProfile {
 pub fn declared_adopted_embedding_profile(
     execution: AdoptedEmbeddingExecution,
 ) -> DeclaredEmbeddingProfile {
-    let adopted = adopted_embedding_profile();
+    declared_gemini_embedding_profile(execution, adopted_embedding_profile())
+}
+
+fn declared_gemini_embedding_profile(
+    execution: AdoptedEmbeddingExecution,
+    adopted: AdapterProfile,
+) -> DeclaredEmbeddingProfile {
     match execution {
         #[cfg(debug_assertions)]
         AdoptedEmbeddingExecution::IncompatibleProfile => DeclaredEmbeddingProfile {
@@ -1570,11 +1583,8 @@ pub fn embedding_adapter_profile_with_control(
             if let Some(declared) = &declared {
                 crate::tool_lock::validate_declared_runtime_target("embedding", declared)?;
             }
-            let model = declared
-                .and_then(|declared| declared.model)
-                .unwrap_or_else(|| ADOPTED_MODEL_PIN.to_owned());
             Ok(crate::gemini_embedding::gemini_embedding_profile(
-                &model,
+                &configured_gemini_model_pin(settings),
                 ADOPTED_DIMENSIONS,
                 ProviderIdempotency::NotProvided,
             ))
@@ -1582,14 +1592,14 @@ pub fn embedding_adapter_profile_with_control(
         #[cfg(debug_assertions)]
         EmbeddingExecution::Online(AdoptedEmbeddingExecution::RequireIdempotencyToken) => {
             Ok(crate::gemini_embedding::gemini_embedding_profile(
-                ADOPTED_MODEL_PIN,
+                &configured_gemini_model_pin(settings),
                 ADOPTED_DIMENSIONS,
                 ProviderIdempotency::HttpHeader("Idempotency-Key".to_owned()),
             ))
         }
         #[cfg(debug_assertions)]
         EmbeddingExecution::Online(_) => Ok(crate::gemini_embedding::gemini_embedding_profile(
-            ADOPTED_MODEL_PIN,
+            &configured_gemini_model_pin(settings),
             ADOPTED_DIMENSIONS,
             ProviderIdempotency::NotProvided,
         )),
@@ -1687,10 +1697,6 @@ pub fn mock_embedding_dispatch_count() -> u64 {
 
 #[cfg(debug_assertions)]
 impl GeminiEmbeddingClient for MockAdoptedEmbeddingClient {
-    fn resolve_model_pin(&self, _configured_model: &str) -> Result<String> {
-        Ok(ADOPTED_MODEL_PIN.to_owned())
-    }
-
     fn embed(
         &self,
         items: &[EmbeddingItem],
@@ -1987,6 +1993,28 @@ mod tests {
             resolve_standard_online_markdownize_profile(settings, "fixture"),
             Err(AdapterError::Auth(_))
         ));
+    }
+
+    #[test]
+    fn configured_gemini_model_separates_the_index_and_query_profiles() {
+        let execution = EmbeddingExecution::Online(AdoptedEmbeddingExecution::Real);
+        let mut settings = AdapterRuntimeSettings::default();
+        let old = declared_embedding_profile_for(&settings, execution).unwrap();
+        settings.declarations.insert(
+            "embedding".into(),
+            crate::tool_lock::DeclaredAdapter {
+                tool_id: Some("gemini_embedding_2".into()),
+                model: Some("gemini-embedding-3".into()),
+                ..Default::default()
+            },
+        );
+        let index = declared_embedding_profile_for(&settings, execution).unwrap();
+        let query =
+            embedding_adapter_profile_with_control(&settings, execution, &ControlHandle::default())
+                .unwrap();
+        assert_ne!(index.profile_hash, old.profile_hash);
+        assert_eq!(index.dimensions, old.dimensions);
+        assert_eq!(index.profile_hash, query.tool_profile_hash);
     }
 
     #[test]

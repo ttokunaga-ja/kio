@@ -43,17 +43,17 @@ PROC-12	中	時計の巻戻りで定期 snapshot を全体エラーにする	rel
 APP-27	中	初回ローカルscanの確認要求が実装から消えた後もCLI文書に残る	remove	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:2446
 AD-02	低／対象者限定	ローカルHTTPSのCA固定とprivate file検査	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:2494
 AD-03	低／対象者限定	ローカルHTTPにも完全一致のscope/device送信grantを要求する	user decision	main実装あり（静的確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:2556
-AD-04	低／対象者限定	tools設定・同梱adapter・cmd/argsの制限	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:2661
+AD-04	低／対象者限定	tools設定・同梱adapter・cmd/argsの制限	keep	ローカル OCR の設定拒否理由を明示時にも保持。同梱 runtime と weights digest の制限を維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:2661
 AD-05	低／対象者限定	plain認証情報は現在のowner-private toolsファイルを要求する	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:2733
 AD-09	低／対象者限定	scanのno-follow・同一handle・変更検出	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:2790
 AD-12	低／対象者限定	prepare入力bytesとraw hashの一致を要求する	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:2857
 AD-13	低／対象者限定	非text・弱いPDF textをdeterministic検索本文にしない	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:2904
 AD-18	低／対象者限定	Office実行体fingerprintと時間・byte上限	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:2966
 AD-19	低／対象者限定	大きいunit alignmentは全unit変更へ縮退する	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:3033
-AD-20	低／対象者限定	normalized応答の完全一致・構造・容量受入検査	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:3085
+AD-20	低／対象者限定	normalized応答の同一モデル・構造・容量受入検査	keep	Mistral OCR の同期・Batch で pin と pin-completion を同一視	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:3085
 AD-21	低／対象者限定	OCR・annotationの件数と展開後byte上限	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:3157
 AD-22	低／対象者限定	embeddingのsource/wire上限とvector整合性検査	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:3229
-AD-23	低／対象者限定	model aliasとprofile pinの制限	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:3306
+AD-23	低／対象者限定	model aliasとprofile pinの制限	keep	Mistral OCR は対象系列・一意性を維持し廃止情報を警告化。Gemini は具体名・能力・768次元を検証し別 profile で再索引	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:3306
 AD-24	低／対象者限定	Batch回復の完全なcredential bindingとinventory上限	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:3373
 AD-25	低／対象者限定	有料の結果不明・retry lockが自動重複支出を止める	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:3445
 AD-26	低／対象者限定	予算の既定上限と設定schema制約	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:3507

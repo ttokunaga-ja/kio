@@ -342,6 +342,52 @@ fn index_submits_a_batch_job_instead_of_embedding_inline() {
     );
 }
 
+#[test]
+fn changing_gemini_model_reindexes_into_a_separate_space() {
+    let dir = scope();
+    let script = r#"{"state_sequence":["BATCH_STATE_PENDING"]}"#;
+    let search = || json(&dir, script, &["search", "TTL"]);
+    json(&dir, script, &["index", "--online", "--realtime"]);
+
+    let read_profile = || {
+        let lock = std::fs::read(root(&dir).join(".kio/tool-lock.json")).unwrap();
+        serde_json::from_slice::<Value>(&lock).unwrap()["embedding"]["profile_hash"].clone()
+    };
+    let old_profile = read_profile();
+    assert_ne!(search()["resolved_mode"], "text", "old vectors are usable");
+
+    let config = dir.path().join("home/config/kio");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("tools.toml"),
+        "[embedding.gemini_embedding_2]\nmodel = 'gemini-embedding-3'\n",
+    )
+    .unwrap();
+    approve_online_profiles(&dir);
+    assert_eq!(search()["resolved_mode"], "text");
+
+    let capture = root(&dir).join("reindex-batch.jsonl");
+    let submit_script = serde_json::json!({
+        "state_sequence": ["BATCH_STATE_PENDING"],
+        "job_name": "batches/new-model",
+        "capture_path": capture,
+    })
+    .to_string();
+    json(
+        &dir,
+        &submit_script,
+        &["reindex", "--regenerate", "--yes", "--online"],
+    );
+    assert_ne!(read_profile(), old_profile);
+    assert_eq!(search()["resolved_mode"], "text");
+
+    let calls = std::fs::read_to_string(capture).unwrap();
+    assert!(calls.lines().any(|line| {
+        let call: Value = serde_json::from_str(line).unwrap();
+        call["call"] == "create_embedding_job" && call["model"] == "gemini-embedding-3"
+    }));
+}
+
 /// `batch resume` polls, collects the inline results, writes the vectors, and
 /// settles the row — including clearing the `intent_token`, which an inline
 /// lane MUST do (no upload residue exists, so terminal is cleanup-complete;

@@ -115,6 +115,13 @@ pub(super) fn current_endpoints(
     settings: &Arc<AdapterRuntimeSettings>,
     selected: Option<&str>,
 ) -> Result<Vec<(DeviceEndpointBinding, EndpointDisclosure)>> {
+    use kio_adapter::local_ocr_markdownize::LOCAL_OCR_ADAPTER_ID;
+    let selected_ocr = if selected == Some(LOCAL_OCR_ADAPTER_ID) {
+        kio_adapter::catalog::local_ocr_execution_with_control(settings, &settings.control)
+            .map_err(crate::object_persistence::adapter_to_kio)?
+    } else {
+        None
+    };
     let mut endpoints = Vec::new();
     for role in [AdapterRole::Markdown, AdapterRole::Embedding] {
         let Some(declared) = settings.declared_adapter(role.as_str()) else {
@@ -125,7 +132,7 @@ pub(super) fn current_endpoints(
         }
         let tool = match (declared.tool_id.as_deref(), role) {
             (Some(tool), _) => tool,
-            (None, AdapterRole::Markdown) => "paddleocr_vl_local",
+            (None, AdapterRole::Markdown) => LOCAL_OCR_ADAPTER_ID,
             (None, AdapterRole::Embedding) => continue,
         };
         if selected.is_some_and(|selected| selected != tool) {
@@ -133,10 +140,15 @@ pub(super) fn current_endpoints(
         }
         let (tool, profile) = match role {
             AdapterRole::Markdown => {
-                let Some(execution) = kio_adapter::catalog::active_local_ocr_execution_with_control(
-                    settings,
-                    &settings.control,
-                ) else {
+                let execution = if selected == Some(LOCAL_OCR_ADAPTER_ID) {
+                    selected_ocr
+                } else {
+                    kio_adapter::catalog::active_local_ocr_execution_with_control(
+                        settings,
+                        &settings.control,
+                    )
+                };
+                let Some(execution) = execution else {
                     continue;
                 };
                 let profile = kio_adapter::local_ocr_markdownize::profile_for(execution);
@@ -451,6 +463,19 @@ fn approved(tool: &str, grant: Option<String>, secret: Option<String>) -> Result
 mod tests {
     use super::*;
     use kio_adapter::tool_lock::{declared_adapter_for_role, parse_tools_toml_for_roles};
+
+    #[test]
+    fn selected_local_ocr_reports_rejected_role_configuration() {
+        let mut settings = AdapterRuntimeSettings::default();
+        settings.unavailable_roles.insert(
+            "markdown".into(),
+            Arc::new(KioError::schema(
+                "unsupported markdown model for paddleocr_vl_local",
+            )),
+        );
+        let error = current_endpoints(&Arc::new(settings), Some("paddleocr_vl_local")).unwrap_err();
+        assert!(error.to_string().contains("unsupported markdown model"));
+    }
 
     #[test]
     fn generic_local_embedding_wire_changes_disclosure_without_changing_endpoint_approval() {

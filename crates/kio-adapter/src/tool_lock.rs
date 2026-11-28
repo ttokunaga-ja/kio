@@ -355,7 +355,6 @@ struct EmbeddingRuntimeTarget {
     /// `execution_mode` as spelled in `tools.toml`.
     kind: &'static str,
     mode: &'static str,
-    model: Option<&'static str>,
     dimensions: i64,
     distance: &'static str,
     modality: &'static str,
@@ -369,7 +368,6 @@ const EMBEDDING_RUNTIME_TARGETS: &[EmbeddingRuntimeTarget] = &[
         tool_id: "gemini_embedding_2",
         kind: "online_api",
         mode: "online",
-        model: Some("gemini-embedding-2"),
         dimensions: 768,
         distance: "cosine",
         modality: "multimodal",
@@ -378,7 +376,6 @@ const EMBEDDING_RUNTIME_TARGETS: &[EmbeddingRuntimeTarget] = &[
         tool_id: GENERIC_LOCAL_EMBEDDING_TOOL_ID,
         kind: "offline_api",
         mode: "offline",
-        model: None,
         dimensions: 768,
         distance: "cosine",
         modality: "multimodal",
@@ -665,14 +662,10 @@ fn validate_supported_runtime_target(
             if target.tool_id == GENERIC_LOCAL_EMBEDDING_TOOL_ID {
                 LocalEmbeddingSpec::from_declaration(&declared_adapter(tool_id, table))?;
             }
-            if let Some(expected_model) = target.model
+            if target.kind == "online_api"
                 && let Some(model) = table.get("model").and_then(toml::Value::as_str)
-                && model != expected_model
             {
-                return Err(AdapterError::ConfigSchema(format!(
-                    "unsupported embedding model `{model}`; expected `{}` for `{}`",
-                    expected_model, target.tool_id
-                )));
+                crate::gemini_embedding::validate_gemini_model_pin(model)?;
             }
             if table
                 .get("dimensions")
@@ -1576,22 +1569,11 @@ pub fn validate_declared_runtime_target(role: &str, declared: &DeclaredAdapter) 
             "local embedding options require [embedding.local_embedding]".to_owned(),
         ));
     }
-    if let Some(expected_model) = embedding_target.and_then(|target| target.model)
-        && declared
-            .model
-            .as_deref()
-            .is_some_and(|model| model != expected_model)
+    if embedding_target.is_some_and(|target| target.kind == "online_api")
+        && let Some(model) = declared.model.as_deref()
     {
-        return Err(AdapterError::ConfigSchema(format!(
-            "declared embedding model does not match effective `{}` runtime",
-            expected_model
-        )));
+        crate::gemini_embedding::validate_gemini_model_pin(model)?;
     }
-    // The Mistral-prefixed markdown model check that used to live here is gone:
-    // the `markdown_target` block above does the same job against the resolved
-    // target's prefix. Leaving both in place made the local pipeline pass the
-    // first check and fail the second with a message naming Mistral, which is
-    // precisely the two-gates-disagree failure this function exists to prevent.
     Ok(())
 }
 
@@ -2254,6 +2236,33 @@ auth = "env:MISTRAL_API_KEY"
     /// gate. When it did not, a declaration accepted at startup was refused at
     /// the moment of use.
     #[test]
+    fn gemini_accepts_a_concrete_model_but_not_an_alias_or_route() {
+        for (model, accepted) in [
+            ("gemini-embedding-3", true),
+            ("gemini-embedding-latest", false),
+            ("../other", false),
+            ("gemini-embedding-3:other", false),
+        ] {
+            let source = format!("[embedding.gemini_embedding_2]\nmodel = \"{model}\"\n");
+            assert_eq!(
+                validate_tools_toml(source.as_bytes()).is_ok(),
+                accepted,
+                "{model}"
+            );
+            let declared = DeclaredAdapter {
+                tool_id: Some("gemini_embedding_2".to_owned()),
+                model: Some(model.to_owned()),
+                ..DeclaredAdapter::default()
+            };
+            assert_eq!(
+                validate_declared_runtime_target("embedding", &declared).is_ok(),
+                accepted,
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
     fn declared_runtime_target_agrees_with_the_config_gate() {
         let offline = |url: &str| DeclaredAdapter {
             tool_id: Some(GENERIC_LOCAL_EMBEDDING_TOOL_ID.to_owned()),
@@ -2269,7 +2278,7 @@ auth = "env:MISTRAL_API_KEY"
                 .expect_err("a remote url must be refused at execution time too");
         assert!(error.to_string().contains("KIO-E-LOCAL-PEER-URL-001"));
 
-        // The online target is unchanged: still no url, still Gemini's model.
+        // The online target still uses the fixed Gemini origin.
         let online_with_url = DeclaredAdapter {
             tool_id: Some("gemini_embedding_2".to_owned()),
             url: Some("http://127.0.0.1:8000".to_owned()),

@@ -22,7 +22,7 @@ Adapter の実行設定 (cmd / args / url / 認証情報) は **`.kio/` の共�
 
 同梱 runtime が実行できる online target は `mistral_ocr_markdownize` と
 `gemini_embedding_2` の built-in 実装に限定する。これらの role では `cmd` / `args` /
-`url` による実行先の差し替えを受理せず、宣言された model と built-in target の一致を
+`url` による実行先の差し替えを受理せず、宣言された model が built-in target の契約に適合することを
 その role を利用するコマンドの設定読取り時と実行直前に検証する。未使用 role は起動条件にしない
 ([操作別前提条件](10-operations.md#113-設定ファイル-schema-validation))。
 利用者管理のローカル endpoint の送信境界は §3.1、embedding endpoint の設定は §5.3 に従う。
@@ -185,7 +185,9 @@ active な CA の実体を固定・検証し、dispatch までその lock を保
 に従い、承認情報に CA の元パスや証明書本文を保存しない。`ca_pem_path` による直接指定は拒否する。
 
 ローカル窓の接続先は device の tools 設定に置き、`cmd` / `args` は受理しない。
-Markdownize OCR は `POST {url}/layout-parsing` を使う。Embedding の wire は §5.3 に従う。
+Markdownize OCR は `POST {url}/layout-parsing` を使う。Markdownize role の設定が拒否された場合は
+診断に理由を表示し、明示的なローカル OCR の照合でも理由を引き継ぐ。現在のローカル実装は
+PaddleOCR-VL の計測済み weights digest を profile に pin する。Embedding の wire は §5.3 に従う。
 EG2 はローカル窓ではなく native 実行であり、この HTTP/CA/送信 grant の対象外である。
 
 ---
@@ -621,10 +623,10 @@ GIF の変換は animation 全体の取り込み検証を迂回しない。独�
 
 | 項目 | 契約 |
 | --- | --- |
-| model / 出力 | `models/gemini-embedding-2` / 768 次元 / cosine / multimodal |
+| model / 出力 | `models/<pin>`（既定 `models/gemini-embedding-2`）/ 768 次元 / cosine / multimodal |
 | text | 現行 filename context・query 入力・profile hash を維持。taskType/title/retrieval prefix を追加しない |
 | image | 1 member = 1 image、`content.parts[].inlineData {mimeType,data}`。text と image を一つの member に混ぜない |
-| sync | `POST /v1beta/models/gemini-embedding-2:batchEmbedContents`、`requests[]` の model/content/`embedContentConfig.outputDimensionality=768` |
+| sync | `POST /v1beta/models/<pin>:batchEmbedContents`、`requests[]` の model/content/`embedContentConfig.outputDimensionality=768` |
 | Batch | `:asyncBatchEmbedContent`、`batch {model,displayName,inputConfig:{requests:{requests:[{request,metadata:{key}}]}}}`。displayName に intent attribution、key に member 対応を固定 |
 | 回収 | long-running operation の metadata/state、一覧の operations、`metadata.output.inlinedResponses.inlinedResponses[]` または `response.inlinedResponses.inlinedResponses[]` の metadata/key と response を検証。sync は入力順との対応を検証 |
 | 上限 | 全 modality 合計 8,192 tokens/member。PNG/JPEG。sync/Batch の encoded body は base64/JSON 込み 16 MiB 以下（Kio の保守上限） |
@@ -632,6 +634,16 @@ GIF の変換は animation 全体の取り込み検証を迂回しない。独�
 | 単価 USD/1M | Standard: text 0.20 / image 0.45、Batch: text 0.10 / image 0.225。単位は tokens_in / image_tokens_in |
 | 予約 | member ごとに 8,192 × 当該 modality の token 単価を合算。image は Standard $0.0036864 / Batch $0.0018432 を予約。実際の画像 token 数を固定する意味ではない |
 | usage | promptTokenDetails の TEXT/IMAGE を対応単位へ写像。total 整合、非負、未知/重複 modality、予約上界を検査。sync は call 合計、Batch は各 member の usage を扱うため text/image は別 job |
+
+tools.toml の `[embedding.gemini_embedding_2]` の `model` に Gemini Developer API
+で利用できる具体名（例 `gemini-embedding-2`）を指定できる。固定の提供元・API・出力契約に従う。
+可変 alias は受理せず、一覧からモデルを推定しない。既定以外のモデルは送信前に
+`GET /v1beta/models/<pin>` で同じモデルの embedding 対応を確認する。テキスト・画像は
+既存の wire 契約による実際の応答で検証し、全結果で 768 次元を要求する。
+モデル変更時は別の profile とベクトル空間になる。`kio index` または `kio reindex --regenerate` が
+新しい profile を tool-lock に反映する。再索引で対応ベクトルが利用可能になるまで、
+自動モードの検索は全文検索に縮退する。明示的なベクトル検索には profile の互換性検査を適用する。
+別モデルの単価が表の既定と異なる場合は §4 の既存の pricing 設定で指定する。
 
 usage 欠落・不正・不完全な回収は予約額による Estimated 精算とし、請求一致とは表現しない。
 sync 失敗を無料と推測しない。価格は意味的 profile の対象外。request body、画像 bytes、key はログへ出さない。
@@ -808,9 +820,17 @@ Markdownize の Batch は 1 job = 1 task、custom_id = task の input_hash、job
 
 `tool_lock_hash` は **[03-data-model.md §5.2](03-data-model.md) の canonical 入力** (spec_version + 各 role の tool_id / profile_hash — embedding のみ + dimensions / distance / modality) を JCS 畳み込みした identity — **tool-lock.json 全体ではない**。`kind` / `capabilities` / `mode` は作業コピーの表示・検証用 field であり identity に含めない (toollock object へ保存されるのも §5.2 の canonical bytes)。
 
-config (`~/.config/kio/tools.toml`) では `mistral-ocr-latest` のような可変 alias を指定できる。Adapter はモデル一覧で設定値と完全一致する `id` を探し、その行の `id` と `aliases` を候補とする。`-latest` で終わる名前と、`deprecation` が非 null の候補は除外する。設定 alias 自体が廃止済みの場合や、候補の行が一覧にない場合は契約違反とする。
-残った候補のうち、他の全候補をハイフン区切りの接頭辞として持つ一意の名前を選ぶ（例: `mistral-ocr-4` → `mistral-ocr-4-1`）。候補が空、または選択が曖昧な場合は契約違反とする。
-`-latest` で終わらない設定値は一覧照会せずに使う。同期リクエストと Batch job の作成には解決済みの pin を使い、OCR 処理結果と `tool_profile_hash` の `model_version_pin` にその pin を記録する ([03-data-model.md §5.1](03-data-model.md))。Batch 回収では帰属を照合した job の `model` から送信時の pin を取得する。応答本文に `model` がある場合は pin と完全一致が必要とする。Mistral OCR の Batch 結果では、公式出力例にある応答表記 `<pin>-completion` も同じ pin として扱う。それ以外の不一致は、一覧にある alias を含めて契約違反とする。モデル更新は `tool_changed` として扱われ、再 Markdownize は first-instance-wins / gen の既存機構 (§9) に乗る。
+config (`~/.config/kio/tools.toml`) で指定した Mistral OCR の具体名は、一覧照会せずに使う。
+`mistral-ocr-latest` などの `-latest` は、対応する系列内で一覧がその alias に結び付ける具体名だけを候補とする。
+廃止情報は警告として表示する。候補が複数の場合は、一覧上の候補のうち他の全候補をハイフン区切りの
+接頭辞として持つ一意の名前だけを選ぶ。空または曖昧で解決できないときは tools.toml での具体名指定を案内する。
+
+同期リクエストと Batch job の作成には解決済み pin を使う。Batch 回収では帰属を照合した job の
+`model` から送信時の pin を取得する。両経路で応答本文の `model` は pin または既知の同一モデル表記
+`<pin>-completion` の場合に受理する。省略時も要求 pin を使い、その他の値は契約違反とする。
+OCR 処理結果と `tool_profile_hash` の `model_version_pin` には要求 pin を記録する
+([03-data-model.md §5.1](03-data-model.md))。モデル更新は `tool_changed` として扱われ、
+再 Markdownize は first-instance-wins / gen の既存機構 (§9) に乗る。
 
 ---
 

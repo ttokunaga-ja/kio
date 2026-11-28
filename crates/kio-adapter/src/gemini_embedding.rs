@@ -3,8 +3,8 @@
 //! Mirrors the Mistral OCR adapter structure: a `GeminiEmbeddingClient` trait
 //! (network boundary) with an `Env`-backed HTTP implementation and a generic
 //! `GeminiEmbeddingAdapter<C>` that implements [`EmbeddingAdapter`]. The adopted
-//! profile is the single multimodal profile fixed on 2026-07-03: `gemini-embedding-2`
-//! (GA, pinned at startup) / 768 dims (MRL) / cosine / `modality="multimodal"`.
+//! profile defaults to `gemini-embedding-2` and pins the configured concrete model.
+//! The output contract is 768 dimensions, cosine, and multimodal.
 //!
 //! Rooted local HTTP tests exercise the serialized wire contract without a
 //! provider connection. CLI tests use the mock seam. `profile()` never performs
@@ -48,10 +48,6 @@ pub fn validate_gemini_sync_inputs(
 
 /// Network boundary for the Gemini embedding backend.
 pub trait GeminiEmbeddingClient: Clone {
-    /// Resolve a possibly-mutable configured model alias to an immutable GA
-    /// version at startup (07 §6: mutable aliases must never be pinned).
-    fn resolve_model_pin(&self, configured_model: &str) -> Result<String>;
-
     /// Embed the batch of items, returning one vector per item (order
     /// preserved). QA13 (docs/04-pipeline.md §5.5):
     /// `idempotency_header` is the ADAPTER-resolved `(header name, token)`
@@ -138,67 +134,52 @@ impl EnvGeminiEmbeddingClient {
     }
 }
 
-impl GeminiEmbeddingClient for EnvGeminiEmbeddingClient {
-    fn resolve_model_pin(&self, configured_model: &str) -> Result<String> {
-        if !is_mutable_model_alias(configured_model) {
-            return Ok(configured_model.to_owned());
-        }
-        let response = self
-            .http
-            .agent()
-            .get(&format!("{}/v1beta/models", self.base_url()))
-            .header("x-goog-api-key", self.api_key.clone())
-            .header("Accept-Encoding", "identity")
-            .call()
-            .map_err(http_error)
-            .and_then(|response| require_success(response, http_status_error))?;
-        let value = read_json_bounded(
-            response,
-            MODEL_CATALOG_MAX_BYTES,
-            "Gemini model catalog response",
-        )?;
-        // Model ids arrive as "models/<family>-NNN"; pick the max stable version
-        // of the configured family, rejecting any remaining "-latest" alias.
-        let family = configured_model
-            .trim_end_matches("-latest")
-            .rsplit('/')
-            .next()
-            .unwrap_or(configured_model);
-        let models = value
-            .get("models")
-            .and_then(Value::as_array)
-            .ok_or_else(|| {
-                AdapterError::ContractViolation("Gemini model catalog missing models".to_owned())
-            })?;
-        if models.len() > 10_000 {
-            return Err(AdapterError::ContractViolation(
-                "Gemini model catalog has too many entries".to_owned(),
-            ));
-        }
-        if models.iter().any(|model| {
-            model
-                .get("name")
-                .and_then(Value::as_str)
-                .is_some_and(|name| name.len() > 512)
-        }) {
-            return Err(AdapterError::ContractViolation(
-                "Gemini model identifier exceeds 512 bytes".to_owned(),
-            ));
-        }
-        models
-            .iter()
-            .filter_map(|model| model.get("name").and_then(Value::as_str))
-            .map(|name| name.rsplit('/').next().unwrap_or(name))
-            .filter(|id| id.starts_with(family) && !id.ends_with("-latest"))
-            .max()
-            .map(str::to_owned)
-            .ok_or_else(|| {
-                AdapterError::ContractViolation(format!(
-                    "no versioned model found for {configured_model}"
-                ))
-            })
+pub(crate) fn validate_gemini_model_pin(model: &str) -> Result<()> {
+    let ascii_id_char = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+    if !model.bytes().next().is_some_and(ascii_id_char)
+        || !model.bytes().last().is_some_and(ascii_id_char)
+        || model.len() > 512
+        || is_mutable_model_alias(model)
+        || !model
+            .bytes()
+            .all(|byte| ascii_id_char(byte) || byte == b'-')
+    {
+        return Err(AdapterError::ConfigSchema(
+            "Gemini embedding requires a concrete, unqualified model name in tools.toml".into(),
+        ));
     }
+    Ok(())
+}
 
+/// Verify the configured resource and embedding method before sending content.
+pub(crate) fn check_gemini_model_capability(
+    model: &str,
+    get_model: impl FnOnce() -> Result<Value>,
+) -> Result<()> {
+    validate_gemini_model_pin(model)?;
+    if model == ADOPTED_MODEL_PIN {
+        return Ok(());
+    }
+    let metadata = get_model()?;
+    let name = format!("models/{model}");
+    if metadata.get("name").and_then(Value::as_str) != Some(name.as_str())
+        || !metadata
+            .get("supportedGenerationMethods")
+            .and_then(Value::as_array)
+            .is_some_and(|methods| {
+                methods
+                    .iter()
+                    .any(|method| method.as_str() == Some("embedContent"))
+            })
+    {
+        return Err(AdapterError::ContractViolation(format!(
+            "Gemini model {model} does not advertise the required embedContent capability"
+        )));
+    }
+    Ok(())
+}
+
+impl GeminiEmbeddingClient for EnvGeminiEmbeddingClient {
     fn embed(
         &self,
         items: &[EmbeddingItem],
@@ -214,6 +195,18 @@ impl GeminiEmbeddingClient for EnvGeminiEmbeddingClient {
         // 2026-07-24 correction in 07 §5.3. (The earlier comment here claimed
         // Vertex has no batch inference; this adapter does not call Vertex.)
         let (body, kind, count) = wire::sync_body(model_pin, dimensions, items)?;
+        check_gemini_model_capability(model_pin, || {
+            let response = self
+                .http
+                .agent()
+                .get(&format!("{}/v1beta/models/{model_pin}", self.base_url()))
+                .header("x-goog-api-key", self.api_key.clone())
+                .header("Accept-Encoding", "identity")
+                .call()
+                .map_err(http_error)
+                .and_then(|response| require_success(response, http_status_error))?;
+            read_json_bounded(response, MODEL_CATALOG_MAX_BYTES, "Gemini model metadata")
+        })?;
         let mut http_request = self
             .http
             .agent()
@@ -386,16 +379,6 @@ impl<C> GeminiEmbeddingAdapter<C> {
 }
 
 fn gemini_embedding_profile_value(configured_model: &str, dimensions: u32) -> Value {
-    // Network-free (like Mistral): if an unresolved mutable alias is still
-    // held, use a deterministic placeholder rather than resolving over HTTP.
-    let model_pin = if is_mutable_model_alias(configured_model) {
-        format!(
-            "{}-unresolved",
-            configured_model.trim_end_matches("-latest")
-        )
-    } else {
-        configured_model.to_owned()
-    };
     json!({
         "adapter_kind": "embedding",
         "adapter_role": "multimodal",
@@ -412,7 +395,7 @@ fn gemini_embedding_profile_value(configured_model: &str, dimensions: u32) -> Va
         "input_construction": "chunk_filename_context_v1",
         "modality": "multimodal",
         "model_or_tool_family": ADOPTED_MODEL_FAMILY,
-        "model_version_pin": model_pin,
+        "model_version_pin": configured_model,
         "runtime_kind": "cloud",
         "spec_version": 1
     })
@@ -479,17 +462,16 @@ impl<C: GeminiEmbeddingClient> EmbeddingAdapter for GeminiEmbeddingAdapter<C> {
         // QA13 (docs/04-pipeline.md §5.5): resolve (and
         // fail closed on) the provider idempotency header BEFORE any network
         // call — a `HttpHeader`-declaring provider with no caller-supplied
-        // token must never reach the model-pin lookup or the embed call.
+        // token must never reach the capability lookup or the embed call.
         // `NotProvided` (the real, shipped adapter's permanent posture) never
         // inspects `request.idempotency_token` and never errors here.
         let idempotency_header = crate::http_policy::resolve_idempotency_header(
             &self.provider_idempotency,
             request.idempotency_token.as_deref(),
         )?;
-        let model_pin = self.client.resolve_model_pin(&self.configured_model)?;
         let batch = self.client.embed(
             &request.items,
-            &model_pin,
+            &self.configured_model,
             self.dimensions,
             idempotency_header
                 .as_ref()
@@ -569,9 +551,6 @@ mod o2_image_guard_first_tests {
     #[derive(Clone, Default)]
     struct CountingClient(Arc<AtomicUsize>);
     impl GeminiEmbeddingClient for CountingClient {
-        fn resolve_model_pin(&self, _: &str) -> Result<String> {
-            Ok(ADOPTED_MODEL_PIN.into())
-        }
         fn embed(
             &self,
             items: &[EmbeddingItem],
@@ -661,14 +640,26 @@ mod tests {
     use super::*;
     use crate::types::{EmbeddingContent, EmbeddingInputType};
 
+    #[test]
+    fn other_gemini_models_require_matching_embedding_metadata() {
+        let pin = "gemini-embedding-3";
+        for (name, method, expected) in [
+            ("models/gemini-embedding-3", "embedContent", true),
+            ("models/gemini-embedding-3", "generateContent", false),
+            ("models/gemini-embedding-2", "embedContent", false),
+        ] {
+            let metadata = json!({"name": name, "supportedGenerationMethods": [method]});
+            assert_eq!(
+                check_gemini_model_capability(pin, || Ok(metadata)).is_ok(),
+                expected
+            );
+        }
+    }
+
     #[derive(Clone)]
     struct StubClient;
 
     impl GeminiEmbeddingClient for StubClient {
-        fn resolve_model_pin(&self, _configured_model: &str) -> Result<String> {
-            Ok(ADOPTED_MODEL_PIN.to_owned())
-        }
-
         fn embed(
             &self,
             items: &[EmbeddingItem],
@@ -1031,10 +1022,6 @@ mod tests {
     }
 
     impl GeminiEmbeddingClient for RecordingImageClient {
-        fn resolve_model_pin(&self, configured_model: &str) -> Result<String> {
-            StubClient.resolve_model_pin(configured_model)
-        }
-
         fn embed(
             &self,
             items: &[EmbeddingItem],
@@ -1189,7 +1176,8 @@ mod tests {
                     requests.push(String::from_utf8(bytes).unwrap());
                     let body = if ordinal == 0 {
                         assert!(
-                            requests[0].starts_with("GET /v1beta/models "),
+                            requests[0]
+                                .starts_with("GET /v1beta/models/gemini-embedding-fixture-001 "),
                             "fixture must reach a genuine model lookup before credential mutation"
                         );
                         // Mutation occurs after credential consumption for GET,
@@ -1199,7 +1187,7 @@ mod tests {
                             "[embedding]\nauth = \"plain:changed-key\"\n",
                         )
                         .unwrap();
-                        r#"{"models":[{"name":"models/fixture-001"}]}"#
+                        r#"{"name":"models/gemini-embedding-fixture-001","supportedGenerationMethods":["embedContent"]}"#
                     } else {
                         r#"{"embeddings":[{"values":[1.0,0.0]}]}"#
                     };
@@ -1212,7 +1200,7 @@ mod tests {
                 EnvGeminiEmbeddingClient::with_base_url(Arc::new(settings.clone()), base_url)
                     .unwrap();
             client.http = http;
-            let adapter = GeminiEmbeddingAdapter::new(client, "fixture-latest", 2);
+            let adapter = GeminiEmbeddingAdapter::new(client, "gemini-embedding-fixture-001", 2);
             let result = adapter.embed(EmbeddingRequest {
                 input_type: crate::types::EmbeddingInputType::Query,
                 items: vec![EmbeddingItem::text("query", "snapshot fixture")],

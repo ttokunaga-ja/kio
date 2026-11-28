@@ -192,21 +192,29 @@ impl EnvMistralOcrClient {
 impl MistralOcrClient for EnvMistralOcrClient {
     fn resolve_model_pin(&self, configured_model: &str) -> Result<String> {
         if !configured_model.ends_with("-latest") {
+            if crate::identity::is_mutable_model_alias(configured_model) {
+                return Err(AdapterError::ContractViolation(
+                    explicit_model_guidance().to_owned(),
+                ));
+            }
             return Ok(configured_model.to_owned());
         }
         let api_key = self.api_key()?;
-        let response = authenticated_agent(self.http_policy)
+        let value = authenticated_agent(self.http_policy)
             .get(&format!("{}/v1/models", self.base_url()))
             .header("Authorization", &format!("Bearer {api_key}"))
             .header("Accept-Encoding", "identity")
             .call()
             .map_err(http_error)
-            .and_then(|response| require_success(response, http_status_error))?;
-        let value = read_json_bounded(
-            response,
-            MODEL_CATALOG_MAX_BYTES,
-            "Mistral model catalog response",
-        )?;
+            .and_then(|response| require_success(response, http_status_error))
+            .and_then(|response| {
+                read_json_bounded(
+                    response,
+                    MODEL_CATALOG_MAX_BYTES,
+                    "Mistral model catalog response",
+                )
+            })
+            .inspect_err(|_| eprintln!("kio: {}", explicit_model_guidance()))?;
         catalog_model_pin(&value, configured_model)
     }
 
@@ -261,49 +269,53 @@ impl MistralOcrClient for EnvMistralOcrClient {
     }
 }
 
+fn explicit_model_guidance() -> &'static str {
+    "set a concrete Mistral OCR model in tools.toml to skip catalog lookup"
+}
+
 fn catalog_model_pin(value: &Value, configured_model: &str) -> Result<String> {
-    let models = value.get("data").and_then(Value::as_array).ok_or_else(|| {
-        AdapterError::ContractViolation("Mistral model catalog missing data".to_owned())
-    })?;
-    if models.len() > 10_000 {
-        return Err(AdapterError::ContractViolation(
-            "Mistral model catalog has too many entries".to_owned(),
-        ));
-    }
-    let mut entries = BTreeMap::new();
-    for model in models {
-        let Some(id) = model.get("id").and_then(Value::as_str) else {
-            continue;
-        };
-        if id.len() > 512 || entries.insert(id, model).is_some() {
-            return Err(AdapterError::ContractViolation(
-                "invalid or duplicate Mistral catalog identifier".to_owned(),
-            ));
-        }
-    }
-    let deprecated = |entry: &Value| entry.get("deprecation").is_some_and(|date| !date.is_null());
     let unresolved = || {
         AdapterError::ContractViolation(format!(
-            "no unique active versioned model for {configured_model}"
+            "no unique versioned model for {configured_model}; {}",
+            explicit_model_guidance()
         ))
     };
-    let entry = entries.get(configured_model).ok_or_else(unresolved)?;
-    if deprecated(entry) {
-        return Err(unresolved());
+    let family_prefix = configured_model
+        .strip_suffix("latest")
+        .ok_or_else(unresolved)?;
+    let in_family = |id: &str| id.starts_with(family_prefix);
+    let models = value
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(unresolved)?;
+    let mut entries = BTreeMap::new();
+    for model in models {
+        let Some(id) = model
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| in_family(id))
+        else {
+            continue;
+        };
+        if id.len() > 512 || entries.insert(id, model).is_some() || entries.len() > 10_000 {
+            return Err(unresolved());
+        }
     }
     let mut candidates = BTreeSet::new();
-    // The configured entry is a -latest id, so only its aliases can survive.
-    for alias in entry
-        .get("aliases")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let id = alias
-            .as_str()
-            .filter(|id| id.len() <= 512)
-            .ok_or_else(unresolved)?;
-        if !id.ends_with("-latest") && !deprecated(entries.get(id).ok_or_else(unresolved)?) {
+    if let Some(entry) = entries.get(configured_model) {
+        for id in model_aliases(entry)
+            .filter(|id| in_family(id) && !crate::identity::is_mutable_model_alias(id))
+        {
+            if !entries.contains_key(id) {
+                return Err(unresolved());
+            }
+            candidates.insert(id);
+        }
+    }
+    for (&id, entry) in &entries {
+        if !crate::identity::is_mutable_model_alias(id)
+            && model_aliases(entry).any(|alias| alias == configured_model)
+        {
             candidates.insert(id);
         }
     }
@@ -320,7 +332,26 @@ fn catalog_model_pin(value: &Value, configured_model: &str) -> Result<String> {
     }) {
         return Err(unresolved());
     }
+    if [configured_model, pin].iter().any(|id| {
+        entries
+            .get(id)
+            .and_then(|entry| entry.get("deprecation"))
+            .is_some_and(|date| !date.is_null())
+    }) {
+        eprintln!(
+            "kio: warning: Mistral catalog marks the OCR alias or selected model as deprecated"
+        );
+    }
     Ok(pin.to_owned())
+}
+
+fn model_aliases(entry: &Value) -> impl Iterator<Item = &str> {
+    entry
+        .get("aliases")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
 }
 
 /// Read the OCR response under the existing wire-byte ceiling, then reject a
@@ -812,13 +843,7 @@ pub fn materialize_mistral_batch_ocr_body(
         })
         .transpose()
         .map_err(BatchOcrMaterializationError::Contract)?;
-    // The batch service can append a completion suffix to the job's model
-    // pin in the result body. Compare against that same pin after normalization.
-    if body.get("model").is_some_and(|model| {
-        let model = model.as_str();
-        model != Some(model_pin)
-            && model.and_then(|id| id.strip_suffix("-completion")) != Some(model_pin)
-    }) {
+    if !ocr_response_matches_pin(body, model_pin) {
         return Err(BatchOcrMaterializationError::ResponseModelMismatch);
     }
     let ocr = parse_ocr_pages(
@@ -1140,6 +1165,14 @@ fn ocr_request_body(
     body
 }
 
+fn ocr_response_matches_pin(body: &Value, pin: &str) -> bool {
+    body.get("model").is_none_or(|value| {
+        value
+            .as_str()
+            .is_some_and(|model| model == pin || model.strip_suffix("-completion") == Some(pin))
+    })
+}
+
 fn parse_ocr_response(
     value: Value,
     model_pin: &str,
@@ -1147,10 +1180,7 @@ fn parse_ocr_response(
     policy: OcrResponsePolicy,
     bbox_annotation_enabled: bool,
 ) -> Result<OcrResponse> {
-    if value
-        .get("model")
-        .is_some_and(|model| model.as_str() != Some(model_pin))
-    {
+    if !ocr_response_matches_pin(&value, model_pin) {
         return Err(AdapterError::ContractViolation(
             "OCR response model does not match the requested pin".to_owned(),
         ));
@@ -1804,30 +1834,53 @@ mod tests {
     }
 
     #[test]
+    fn concrete_ocr_pin_does_not_need_credentials_or_a_catalog() {
+        let client = EnvMistralOcrClient::new(Arc::new(AdapterRuntimeSettings::default()));
+        assert_eq!(
+            client.resolve_model_pin("mistral-ocr-4-1").unwrap(),
+            "mistral-ocr-4-1"
+        );
+        assert!(client.resolve_model_pin("mistral-ocr-LATEST").is_err());
+    }
+
+    #[test]
+    fn catalog_ignores_other_families_and_accepts_deprecated_ocr() {
+        let catalog = json!({"data": [
+            {"id": "unrelated"},
+            {"id": "unrelated"},
+            {"id": "mistral-ocr-latest", "aliases": ["unrelated", "mistral-ocr-4"],
+             "deprecation": "2026-11-26"},
+            {"id": "mistral-ocr-4", "deprecation": "2026-11-26"}
+        ]});
+        assert_eq!(
+            catalog_model_pin(&catalog, "mistral-ocr-latest").unwrap(),
+            "mistral-ocr-4"
+        );
+    }
+
+    #[test]
     fn catalog_rejects_unresolvable_or_oversized_aliases() {
         for data in [
             json!([{"id":"ocr-latest","aliases":["ocr-4-1","ocr-4-2"]},
                    {"id":"ocr-4-1"},{"id":"ocr-4-2"}]),
-            json!([{"id":"ocr-latest","aliases":["ocr-4"]},
-                   {"id":"ocr-4","deprecation":"2026-11-26"}]),
-            json!([{"id":"ocr-latest","aliases":["ocr-4"],"deprecation":"2026-11-26"},
-                   {"id":"ocr-4"}]),
             json!([{"id":"ocr-4"}]),
             json!([{"id":"ocr-latest","aliases":["ocr-4"]}]),
-            json!([{"id":"ocr-latest","aliases":["x".repeat(513)]}]),
+            json!([{"id":"ocr-latest","aliases":[format!("ocr-{}", "x".repeat(513))]}]),
             json!(vec![json!({"id":"ocr-4"}); 10_001]),
         ] {
-            assert!(matches!(
-                catalog_model_pin(&json!({"data": data}), "ocr-latest"),
-                Err(AdapterError::ContractViolation(_))
-            ));
+            let error = catalog_model_pin(&json!({"data": data}), "ocr-latest").unwrap_err();
+            assert!(error.to_string().contains(explicit_model_guidance()));
         }
     }
 
     #[test]
     fn ocr_response_checks_model_and_records_requested_pin() {
         let pin = "mistral-ocr-4-1";
-        for value in [json!({"pages": []}), json!({"pages": [], "model": pin})] {
+        for value in [
+            json!({"pages": []}),
+            json!({"pages": [], "model": pin}),
+            json!({"pages": [], "model": format!("{pin}-completion")}),
+        ] {
             assert_eq!(
                 parse_ocr_response(value, pin, None, OcrResponsePolicy::default(), false)
                     .unwrap()
@@ -1835,7 +1888,11 @@ mod tests {
                 pin
             );
         }
-        for model in [json!("mistral-ocr-4"), Value::Null] {
+        for model in [
+            json!("mistral-ocr-4"),
+            json!("mistral-ocr-4-completion"),
+            Value::Null,
+        ] {
             assert!(matches!(
                 parse_ocr_response(
                     json!({"pages": [], "model": model}),
