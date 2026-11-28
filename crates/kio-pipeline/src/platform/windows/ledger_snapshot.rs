@@ -9,14 +9,14 @@ pub(crate) struct Identity {
     volume_serial_number: Option<u32>,
     file_index: Option<u64>,
 }
-pub(crate) struct PrivateStorage(super::snapshot_windows_security::LedgerSnapshotPrivateDir);
+pub(crate) struct PrivateStorage(kio_core::platform::PrivateSnapshotDirectory);
 impl PrivateStorage {
     pub(crate) fn create(
         #[cfg(test)] hooks: Option<&crate::ledger::snapshot::SnapshotTestHooks>,
     ) -> Result<Self, AttemptError> {
         #[cfg(test)]
         crate::ledger::snapshot::run_private_storage_create_hook(hooks)?;
-        super::snapshot_windows_security::LedgerSnapshotPrivateDir::create()
+        kio_core::platform::PrivateSnapshotDirectory::create_ledger()
             .map(Self)
             .map_err(|e| {
                 crate::ledger::snapshot::snapshot_io_error("create private ledger snapshot dir", e)

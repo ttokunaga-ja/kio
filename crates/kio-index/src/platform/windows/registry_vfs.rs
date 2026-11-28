@@ -30,14 +30,14 @@ pub(super) fn bind(path: &Path, directory: &StoreDirectory) -> Result<Binding> {
 pub(super) fn bind_snapshot(
     path: &Path,
     directory: &StoreDirectory,
-    snapshot: &super::registry_security::RegistrySnapshotPrivateDir,
+    snapshot: &kio_core::platform::PrivateSnapshotDirectory,
 ) -> Result<Binding> {
     bind_with_snapshot(path, directory, Some(snapshot))
 }
 fn bind_with_snapshot(
     path: &Path,
     directory: &StoreDirectory,
-    snapshot: Option<&super::registry_security::RegistrySnapshotPrivateDir>,
+    snapshot: Option<&kio_core::platform::PrivateSnapshotDirectory>,
 ) -> Result<Binding> {
     use cap_fs::OpenOptionsExt;
     use std::os::windows::fs::OpenOptionsExt as StdOpenOptionsExt;

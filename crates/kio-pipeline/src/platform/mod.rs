@@ -28,9 +28,6 @@ pub(crate) mod ledger_lifecycle;
 #[cfg(windows)]
 #[path = "windows/ledger_lifecycle.rs"]
 pub(crate) mod ledger_lifecycle;
-#[cfg(windows)]
-#[path = "windows/ledger_snapshot_security.rs"]
-pub(crate) mod snapshot_windows_security;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[path = "unix/ledger_lifecycle.rs"]
 mod unix_ledger_lifecycle;

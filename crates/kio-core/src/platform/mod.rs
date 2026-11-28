@@ -213,6 +213,8 @@ pub(crate) use windows::{
 
 #[cfg(target_os = "windows")]
 pub use windows::private_fs::verify_owner_private_handle;
+#[cfg(windows)]
+pub use windows::private_snapshot::PrivateSnapshotDirectory;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) use unix::{
