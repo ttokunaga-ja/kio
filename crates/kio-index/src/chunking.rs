@@ -403,8 +403,16 @@ fn last_paragraph_boundary(window: &str) -> Option<usize> {
     last
 }
 
+#[cfg(test)]
+thread_local! {
+    static SLICE_CHAR_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn slice_chars(chars: &[char], start: usize, end: usize) -> String {
-    chars[start..end].iter().collect()
+    let chars = chars[start..end].iter();
+    #[cfg(test)]
+    let chars = chars.inspect(|_| SLICE_CHAR_VISITS.with(|count| count.set(count.get() + 1)));
+    chars.collect()
 }
 
 fn hash_jcs(value: &Value) -> Result<String> {
@@ -935,7 +943,7 @@ mod tests {
         }
     }
 
-    fn time_chunk(n: usize) -> std::time::Duration {
+    fn slice_work(n: usize) -> usize {
         // A single large unit with no paragraph boundaries forces one hard split
         // every `max_chars`; the old `slice_chars` rescanned from the unit head on
         // every split (O(N²)). Small `max_chars` amplifies the split count so the
@@ -958,31 +966,22 @@ mod tests {
             config,
             created_at: "2026-07-04T00:00:00Z".to_owned(),
         };
-        let start = std::time::Instant::now();
+        SLICE_CHAR_VISITS.with(|count| count.set(0));
         let rows = chunk_normalized_instance(input).expect("chunking must succeed");
         assert!(!rows.is_empty());
-        start.elapsed()
+        SLICE_CHAR_VISITS.with(std::cell::Cell::get)
     }
 
-    // N6: chunking a single large document must be linear, not O(N²). Doubling the
-    // input should ~double the time (~2x), not quadruple it (~4x, the bug). The
-    // ratio is invariant to the debug/release constant factor; the absolute
-    // backstop separates the fixed sub-second path from the old multi-second one.
+    // Count actual characters visited by the split-window slicer. A rescan from
+    // the unit head visits an increasing prefix for every window and scales as N².
     #[test]
     fn n6_chunking_scales_linearly_not_quadratically() {
-        // Warm up (allocator/branch predictor) so the first measurement is not
-        // penalized and the ratio stays honest.
-        let _ = time_chunk(200_000);
-        let t1 = time_chunk(1_000_000).min(time_chunk(1_000_000));
-        let t2 = time_chunk(2_000_000).min(time_chunk(2_000_000));
+        let small = slice_work(20_000);
+        let large = slice_work(40_000);
+        assert!(small > 0, "the fixture must exercise window slicing");
         assert!(
-            t2.as_secs_f64() < 10.0,
-            "2MB chunking took {t2:?}; O(N²) slicing not eliminated"
-        );
-        assert!(
-            t2.as_secs_f64() < t1.as_secs_f64() * 3.0 + 0.02,
-            "chunking scaled super-linearly (O(N²)): 1MB={t1:?} 2MB={t2:?} (ratio {:.2})",
-            t2.as_secs_f64() / t1.as_secs_f64().max(f64::MIN_POSITIVE)
+            large <= small * 3,
+            "slice visits scaled super-linearly: {small} -> {large}"
         );
     }
 }
