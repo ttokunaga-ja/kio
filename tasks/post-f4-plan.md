@@ -24,10 +24,10 @@
 
 | ID | 内容 | 担当 | 人日 | 依存 | 状態 |
 | --- | --- | --- | --- | --- | --- |
-| T2-1 | 有料処理の中断で残った台帳 journal のうち、整合性を確かめられるものを次の有料処理のロック内で自動回復する。予算上限による pause の案内を 1 つにまとめる（監査 #6） | Codex `post-ledger` | 3 | — | 実装済み・検証中 |
-| T2-2 | 中断した履歴の publication を、writer のロック下で HEAD と子 commit を確かめられる場合に自動で完了する（監査 #9） | Codex `post-history` | 4 | — | 実装済み・検証中 |
-| T2-3 | `n6_chunking_scales_linearly_not_quadratically` の実時間比較を、処理量の計測に置き換える（本体に `cfg(test)` の計測を入れることを許可） | Codex `post-chunking` | 0.5 | — | 進行中 |
-| T2-4 | 差分の確認、サンドボックス外のテスト、統合、ローカル検証 | 統括 | 1 | T2-1〜3 | 未着手 |
+| T2-1 | 有料処理の中断で残った台帳 journal のうち、整合性を確かめられるものを次の有料処理のロック内で自動回復する。予算上限による pause の案内を 1 つにまとめる（監査 #6） | Codex `post-ledger` | 3 | — | 統合済み |
+| T2-2 | 中断した履歴の publication を、writer のロック下で HEAD と子 commit を確かめられる場合に自動で完了する（監査 #9） | Codex `post-history` | 4 | — | 統合済み |
+| T2-3 | `n6_chunking_scales_linearly_not_quadratically` の実時間比較を、処理量の計測に置き換える（本体に `cfg(test)` の計測を入れることを許可） | Codex `post-chunking` | 0.5 | — | 統合済み |
+| T2-4 | 差分の確認、サンドボックス外のテスト、統合、ローカル検証 | 統括 | 1 | T2-1〜3 | 進行中 |
 | T2-5 | push と通常 CI の確認 | 統括 | 0.25 | T2-4 | 未着手 |
 
 - 人日の合計：8.75。暦日（並列）：T2-2 → T2-4 → T2-5 の 5.25 日。Codex の実時間では T2-1〜3 が数時間、全体で 1 日以内の見込み。
@@ -46,7 +46,7 @@
 
 | ID | 内容 | 担当 | 人日 | 依存 | 状態 |
 | --- | --- | --- | --- | --- | --- |
-| T4-1 | Windows のコード規模を上限（14000 行）から下げ、余裕を作る | Codex `post-winsize` | 2 | — | 進行中 |
+| T4-1 | Windows のコード規模を上限（14000 行）から下げ、余裕を作る | Codex `post-winsize` | 2 | — | 統合済み（13286 行） |
 | T4-2 | runner が強制的に失われたときの GPU リースの独立回収と、root 専用の残留リースの回復 | Codex | 3 | CP3 | 未着手 |
 | T4-3 | 研究室ホストへ OCR イメージを digest を保って移し、`KIO_LAB_JUMP_HOST` を研究室に戻せるようにする | 統括 | 1 | — | 未着手 |
 | T4-4 | S4U の keepalive をサインアウト後に確かめる（ホストでの利用者の操作が要る） | 利用者＋統括 | 0.5 | — | 保留 |
@@ -57,16 +57,21 @@
 
 ### P5：利用者の判断と実装（CP5）
 
-監査で NEEDS-USER-DECISION とした項目。2026-11-29 に決定した（D-20261129-01）。
+監査で NEEDS-USER-DECISION とした項目と、設定の棚卸し（`scratch/reports/post/survey-settings.md`）の結果。2026-11-29 に決定した（D-20261129-01・02）。
 
-| ID | 決定 | 実装の担当 | 人日 | 状態 |
+| ID | 決定 | 担当 | 人日 | 状態 |
 | --- | --- | --- | --- | --- |
-| T5-0 | 利用者が求めていない細かすぎる設定・承認・確認の棚卸し（T5-1 の設計を含む） | Codex 調査 `survey-settings` | 1 | 進行中 |
-| T5-1 | 外部送信を一括の許可 1 つにする（許可すれば全外部 Adapter、不可なら全て不可） | Codex（T5-0 の後） | 3 | 未着手 |
-| T5-2 | loopback の HTTP embedding は承認なし | T5-1 と同じ単位 | 0.5 | 未着手 |
-| T5-3 | 隔離できない環境でも、明示設定があれば Office を隔離なしで変換 | Codex | 1 | 未着手 |
-| T5-4 | provider 受入の Environment を 1 つにし、専用 App をやめて workflow の GITHUB_TOKEN で台帳を書く | Codex `post-provider-env`＋統括（GitHub 設定） | 1.5 | 進行中 |
-| T5-5 | T5-0 で見つかった他の設定の簡素化 | Codex（複数単位） | 調査後に見積もる | 未着手 |
+| T5-0 | 細かすぎる設定・承認・確認の棚卸し | Codex 調査 | 1 | 完了 |
+| T5-1 | 外部送信を端末全体の許可 1 つにする（既定 OFF。OFF でも送信済み Batch の回収は続ける。秘密は `--send-secrets` を残す）。loopback は承認なし。`--online` を削除 | Codex `post-extsend` | 5 | 未着手 |
+| T5-3 | 隔離できない環境でも、端末設定で明示すれば Office を隔離なしで変換 | Codex `post-office` | 1.5 | 未着手 |
+| T5-4 | provider 受入の Environment を 1 つにし、台帳を workflow の GITHUB_TOKEN で書く | Codex＋統括（GitHub 設定） | 1.5 | 統合済み・GitHub 設定待ち |
+| T5-5 | 検索の調整値を内部化し、`--offset` を削除 | Codex `post-search` | 1.5 | 未着手 |
+| T5-6 | レーンを Batch 既定と `--realtime` だけにし、警告率・soft-stop・`--override-budget` を削除 | Codex `post-budget` | 2 | 未着手 |
+| T5-7 | Adapter の固定値設定、chunking・Markdownize のしきい値、watch の秒数、EG2 のモデル名を簡素化 | Codex `post-config` | 2 | 未着手 |
+| T5-8 | 統合（共有ファイルの競合解消）、サンドボックス外のテスト、ローカル検証、CI | 統括 | 2 | 未着手 |
+
+- 人日の合計：17。暦日（並列）：T5-1 → T5-8 の 7 日。T5-3・T5-5〜7 は T5-1 と並べる。
+- GitHub 設定（T5-4）：push 後に Environment `v1-provider-ledger-authority` と ruleset `v1-provider-ledger-creation-update-restriction` を削除する。専用 App の削除は利用者が GitHub の Developer settings で行う。
 
 ### P6：v1 後の機能（CP6）
 
@@ -89,9 +94,9 @@
 | P2 | 8.75 | 5.25 |
 | P3 | 2 | 2 |
 | P4 | 8.6 | 5 |
-| P5（T5-5 を除く） | 7 | 3 |
+| P5 | 17 | 7 |
 | P6 | 48.5 | 14〜16 |
-| 合計（T5-5 を除く） | 約 75 | 約 29〜31 |
+| 合計 | 約 85 | 約 33〜35 |
 
 - 暦日の合計は P2 → P3 → P6 を直列に置き、P4 と P5 を P3・P6 と並べた場合。P5 の決定で実装が増えると、その分だけ延びる。
 - Codex に委譲した場合は、実装の時間が数分の一になり、CI と実機の確認（1 回 1.5 時間前後）が律速になる。
