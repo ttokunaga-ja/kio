@@ -42,8 +42,11 @@ repository credentials. They receive a specific reservation commit, then verify
 that commit's bounded complete ancestry, campaign,
 candidate, and lane allocation before a provider credential is exposed.
 Artifacts are diagnostic receipts only; they never authorize spend. Candidate
-jobs also require the exact current `main` SHA and a successful candidate-bound
-native package workflow before they use a provider credential.
+jobs also require the exact current `main` SHA and verify the native package for
+their OS before using a provider credential. Before reservation, the common
+guard checks the completed source run and successful publication of all three
+primary packages. Native acceptance and A12 reproduction are checked at final
+aggregation.
 
 ## Setup and approval order
 
@@ -99,7 +102,7 @@ complete.
    failed attempt before retrying; never delete or replace an existing ledger.
 5. For an approved successor, follow the transition procedure below. Only
    after the applicable read-back passes, execute `operation: run` for the exact current
-   candidate SHA, successful native package run ID, and same campaign. Preserve
+   candidate SHA, completed native run ID with three published packages, and same campaign. Preserve
    the USD 10 per-provider cumulative caps and `reserved_unknown` charges.
 
 ## F4 successor
@@ -112,8 +115,9 @@ D-20261127-01 permits using the active campaign after workflow edits. Check
 the protected ref for the current tip and cumulative reservations.
 
 For a future approved transition, dispatch `operation=transition` on `main`
-with the new `campaign_id`, current `predecessor_campaign_id` and verified
-`predecessor_tip`. Leave the candidate and package inputs empty. After a
+with the new `campaign_id` and current `predecessor_campaign_id`. The helper verifies
+and records the current ledger tip as the parent. Leave the candidate and package
+inputs empty. After a
 successful authority job, read back the tip, parent, campaign record and
 retained reservations. Reconcile any unknown outcome against the ref before
 retrying.

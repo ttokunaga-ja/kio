@@ -26,11 +26,34 @@ pub fn run(args: Args) -> Result<(), String> {
 }
 
 const ERROR_CODES: &[(&str, &str)] = &[
+    ("deployment path is missing", "DEPLOYMENT_MISSING"),
+    ("deployment is not JSON", "DEPLOYMENT_INVALID"),
+    ("deployment contract differs", "DEPLOYMENT_INVALID"),
     (
-        "deployment is not canonical JSON",
-        "DEPLOYMENT_NONCANONICAL",
+        "deployment source list differs",
+        "DEPLOYMENT_INPUT_MISMATCH",
     ),
-    ("deployment is not JSON", "DEPLOYMENT_NONCANONICAL"),
+    ("installed source hash differs", "DEPLOYMENT_INPUT_MISMATCH"),
+    (
+        "installed shared GPU query hash differs",
+        "DEPLOYMENT_INPUT_MISMATCH",
+    ),
+    (
+        "tools executable differs from deployment",
+        "DEPLOYMENT_INPUT_MISMATCH",
+    ),
+    ("GPU dispatcher is busy", "DISPATCHER_BUSY"),
+    (
+        "cannot inspect shared Docker GPU containers",
+        "SHARED_GPU_QUERY_FAILED",
+    ),
+    ("GPU is busy", "GPU_BUSY"),
+    (
+        "cannot inspect dedicated Docker containers",
+        "DEDICATED_ENGINE_QUERY_FAILED",
+    ),
+    ("GPU VRAM is insufficient", "GPU_VRAM_INSUFFICIENT"),
+    ("OCR compose failed", "OCR_COMPOSE_FAILED"),
     ("GPU host setup is in progress", "MAINTENANCE_BUSY"),
     (
         "private dispatcher root is unavailable",
@@ -159,8 +182,37 @@ mod unix {
         candidate: String,
         repo_rel: String,
         tools_binary_sha256: String,
+        #[serde(deserialize_with = "unique_sources")]
         sources: std::collections::BTreeMap<String, String>,
     }
+    fn unique_sources<'de, D>(
+        deserializer: D,
+    ) -> Result<std::collections::BTreeMap<String, String>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{Error, MapAccess, Visitor};
+        struct Sources;
+        impl<'de> Visitor<'de> for Sources {
+            type Value = std::collections::BTreeMap<String, String>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("deployment source digests with unique paths")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut sources = Self::Value::new();
+                while let Some((path, digest)) = map.next_entry()? {
+                    if sources.insert(path, digest).is_some() {
+                        return Err(A::Error::custom("duplicate deployment source path"));
+                    }
+                }
+                Ok(sources)
+            }
+        }
+        deserializer.deserialize_map(Sources)
+    }
+
     #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
     struct LeaseTuple {
         candidate: String,
@@ -444,9 +496,6 @@ mod unix {
         }
         let d: Deployment =
             serde_json::from_slice(&b).map_err(|_| "deployment is not JSON".to_string())?;
-        if canonical(&d)? != b {
-            return Err("deployment is not canonical JSON".into());
-        }
         if d.schema != SCHEMA
             || d.repo_rel != "../.."
             || !valid_sha(&d.candidate, 40)
@@ -481,15 +530,17 @@ mod unix {
         Ok(d)
     }
     fn controller_error(action: &str, status: Option<i32>) -> &'static str {
-        // gpu-phase.sh reserves 42 for failures to obtain a GPU sample.
-        if status == Some(42) {
-            return "GPU sample unavailable";
-        }
-        match action {
-            "init" => "controller init failed",
-            "start-ocr" => "controller start-ocr failed",
-            "stop-ocr" => "controller stop-ocr failed",
-            "cleanup" => "controller cleanup failed",
+        match (action, status) {
+            (_, Some(42)) => "GPU sample unavailable",
+            ("init" | "start-ocr", Some(43)) => "cannot inspect shared Docker GPU containers",
+            ("init" | "start-ocr", Some(44)) => "GPU is busy",
+            ("init" | "start-ocr", Some(45)) => "cannot inspect dedicated Docker containers",
+            ("start-ocr", Some(46)) => "GPU VRAM is insufficient",
+            ("start-ocr", Some(47)) => "OCR compose failed",
+            ("init", _) => "controller init failed",
+            ("start-ocr", _) => "controller start-ocr failed",
+            ("stop-ocr", _) => "controller stop-ocr failed",
+            ("cleanup", _) => "controller cleanup failed",
             _ => "controller phase is invalid",
         }
     }
@@ -976,6 +1027,34 @@ mod unix {
         }
 
         #[test]
+        fn deployment_format_allows_whitespace_but_refuses_duplicate_source_paths() {
+            let flexible = r#"{
+                "sources": {"file": "digest"}, "candidate": "abc",
+                "repo_rel": "../..", "schema": "schema", "tools_binary_sha256": "digest"
+            }"#;
+            assert!(serde_json::from_str::<Deployment>(flexible).is_ok());
+            let duplicate =
+                flexible.replace(r#""file": "digest""#, r#""file": "old", "file": "digest""#);
+            assert!(serde_json::from_str::<Deployment>(&duplicate).is_err());
+        }
+
+        #[test]
+        fn start_ocr_prechecks_report_fixed_codes() {
+            for (status, code) in [
+                (43, "SHARED_GPU_QUERY_FAILED"),
+                (44, "GPU_BUSY"),
+                (45, "DEDICATED_ENGINE_QUERY_FAILED"),
+                (46, "GPU_VRAM_INSUFFICIENT"),
+                (47, "OCR_COMPOSE_FAILED"),
+            ] {
+                assert_eq!(
+                    super::super::error_code(controller_error("start-ocr", Some(status))),
+                    code
+                );
+            }
+        }
+
+        #[test]
         fn wrong_capability_or_tuple_cannot_invoke_controller() {
             let (_temp, base) = fixture();
             let mut calls = Vec::new();
@@ -1162,7 +1241,7 @@ shift 2
 case "$*" in
   'ps -a --filter label=com.docker.compose.project=kio-v1-local-gpu-ocr -q')
     case "$KIO_FIXTURE_DOCKER" in
-      empty) exit 0 ;;
+      empty|shared-cleanup|broken-cleanup) exit 0 ;;
       container) echo retained-container ;;
       *) exit 7 ;;
     esac ;;
@@ -1211,11 +1290,8 @@ esac
                 ),
                 ("foreign", "gpu_guard", Some("unrelated container")),
                 ("shared", "gpu_guard", Some("shared Docker GPU container")),
-                (
-                    "shared-cleanup",
-                    "cleanup",
-                    Some("shared Docker GPU container"),
-                ),
+                ("shared-cleanup", "cleanup", None),
+                ("broken-cleanup", "cleanup", None),
                 (
                     "malformed",
                     "gpu_guard",
@@ -1223,13 +1299,13 @@ esac
                 ),
                 (
                     "broken",
-                    "cleanup",
+                    "gpu_guard",
                     Some("cannot inspect shared Docker GPU containers"),
                 ),
             ] {
                 std::fs::write(
                     &script,
-                    format!("{definitions}\nlock() {{ :; }}\n{operation}\n"),
+                    format!("{definitions}\nlock() {{ :; }}\nprivate_dir() {{ mkdir -p \"$1\"; }}\ngpu_memory() {{ return 1; }}\n{operation}\n"),
                 )
                 .unwrap();
                 let mut command = Command::new("/bin/bash");

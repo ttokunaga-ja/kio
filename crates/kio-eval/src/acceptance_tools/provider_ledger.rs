@@ -24,7 +24,7 @@ const ALLOCATION: u64 = 100_000;
 const PROVIDERS: [&str; 2] = ["mistral", "gemini"];
 const OSES: [&str; 3] = ["linux", "macos", "windows"];
 const MAX_BLOB: usize = 16_384;
-// One bootstrap, one approved transition, and at most 33 full reservations.
+// Bound API traversal while leaving room for approved transitions and 33 full reservations.
 const MAX_HISTORY: usize = 256;
 const GITHUB_API: &str = "https://api.github.com";
 
@@ -49,8 +49,6 @@ enum Command {
         common: CommonArgs,
         #[arg(long)]
         predecessor_campaign_id: String,
-        #[arg(long)]
-        predecessor_tip: String,
     },
     #[command(name = "reserve-all")]
     ReserveAll {
@@ -137,12 +135,10 @@ pub fn run(args: Args) -> Result<()> {
         Command::Transition {
             common,
             predecessor_campaign_id,
-            predecessor_tip,
         } => transition(
             &mut api,
             &common.campaign_request(),
             &predecessor_campaign_id,
-            &predecessor_tip,
         )?,
         Command::ReserveAll {
             common,
@@ -888,14 +884,8 @@ fn validate_transition(successor: &Value, predecessor: &Value, parent: &str) -> 
     Ok(())
 }
 
-fn transition<A: Api>(
-    api: &mut A,
-    args: &Request,
-    predecessor_campaign_id: &str,
-    predecessor_tip: &str,
-) -> Result<Value> {
+fn transition<A: Api>(api: &mut A, args: &Request, predecessor_campaign_id: &str) -> Result<Value> {
     require_id(predecessor_campaign_id, "predecessor campaign id")?;
-    require_sha(predecessor_tip, "predecessor ledger tip")?;
     let state = load_verified(api, None)?;
     if state.campaign_ids.contains(&args.campaign_id) {
         return Err("campaign id already exists in ledger history".to_owned());
@@ -905,7 +895,7 @@ fn transition<A: Api>(
         "predecessor_campaign_id".to_owned(),
         json!(predecessor_campaign_id),
     );
-    successor.insert("predecessor_tip".to_owned(), json!(predecessor_tip));
+    successor.insert("predecessor_tip".to_owned(), json!(state.tip));
     let successor = Value::Object(successor);
     validate_transition(&successor, &state.campaign, &state.tip)?;
     let records = BTreeMap::from([("campaign.json".to_owned(), successor.clone())]);
@@ -1241,7 +1231,7 @@ mod tests {
         let (commits, trees, blobs) = (api.commits.clone(), api.trees.clone(), api.blobs.clone());
 
         let mut next = successor();
-        let transition_commit = transition(&mut api, &next, "campaign-1", predecessor_tip).unwrap();
+        let transition_commit = transition(&mut api, &next, "campaign-1").unwrap();
         let tip = transition_commit["commit"].as_str().unwrap();
         assert_eq!(api.head.as_deref(), Some(tip));
         assert_eq!(
@@ -1282,31 +1272,22 @@ mod tests {
     }
 
     #[test]
-    fn transition_rejects_non_tip_unknown_and_reused_predecessors() {
+    fn transition_uses_verified_tip_and_requires_the_active_predecessor() {
         let mut api = FakeApi::default();
-        let root = initialize(&mut api, &args()).unwrap();
+        initialize(&mut api, &args()).unwrap();
         reserve_all(&mut api, &args()).unwrap();
         let tip = api.head.clone().unwrap();
         let count = api.counter;
         let next = successor();
-        assert!(
-            transition(
-                &mut api,
-                &next,
-                "campaign-1",
-                root["commit"].as_str().unwrap()
-            )
-            .is_err()
-        );
-        assert!(transition(&mut api, &next, "campaign-1", &"f".repeat(40)).is_err());
-        assert!(transition(&mut api, &next, "unknown", &tip).is_err());
-        assert!(transition(&mut api, &args(), "campaign-1", &tip).is_err());
+        assert!(transition(&mut api, &next, "unknown").is_err());
+        assert!(transition(&mut api, &args(), "campaign-1").is_err());
         assert_eq!(
             (api.head.as_deref(), api.counter),
             (Some(tip.as_str()), count)
         );
-        transition(&mut api, &next, "campaign-1", &tip).unwrap();
-        assert!(transition(&mut api, &next, "campaign-1", &tip).is_err());
+        let successor = transition(&mut api, &next, "campaign-1").unwrap();
+        assert_eq!(successor["campaign"]["predecessor_tip"], tip);
+        assert!(transition(&mut api, &next, "campaign-1").is_err());
     }
 
     #[test]
@@ -1318,9 +1299,8 @@ mod tests {
             request.run_id = run_id;
             reserve_all(&mut api, &request).unwrap();
         }
-        let tip = api.head.clone().unwrap();
         let mut next = successor();
-        transition(&mut api, &next, "campaign-1", &tip).unwrap();
+        transition(&mut api, &next, "campaign-1").unwrap();
         reserve_all(&mut api, &next).unwrap();
         let state = load_verified(&mut api, None).unwrap();
         assert_eq!(
@@ -1378,33 +1358,13 @@ mod tests {
     #[test]
     fn successor_can_transition_again_but_campaign_id_cannot_be_reused() {
         let mut api = FakeApi::default();
-        let root = initialize(&mut api, &args()).unwrap();
+        initialize(&mut api, &args()).unwrap();
         let next = successor();
-        let second = transition(
-            &mut api,
-            &next,
-            "campaign-1",
-            root["commit"].as_str().unwrap(),
-        )
-        .unwrap();
+        transition(&mut api, &next, "campaign-1").unwrap();
         let mut third = successor();
         third.campaign_id = "campaign-3".to_owned();
-        let third_commit = transition(
-            &mut api,
-            &third,
-            "campaign-2",
-            second["commit"].as_str().unwrap(),
-        )
-        .unwrap();
-        assert!(
-            transition(
-                &mut api,
-                &args(),
-                "campaign-3",
-                third_commit["commit"].as_str().unwrap()
-            )
-            .is_err()
-        );
+        transition(&mut api, &third, "campaign-2").unwrap();
+        assert!(transition(&mut api, &args(), "campaign-3").is_err());
         assert_eq!(
             load_verified(&mut api, None).unwrap().campaign["campaign_id"],
             "campaign-3"

@@ -9,19 +9,19 @@ on:
         type: string
       ci_run_id:
         description: Successful ci.yml push run ID for the dispatched main commit
-        required: true
+        required: false
         type: string
       native_run_id:
         description: Successful v1-acceptance.yml workflow_dispatch run ID
-        required: true
+        required: false
         type: string
       provider_run_id:
         description: Successful v1-provider-acceptance.yml workflow_dispatch run ID
-        required: true
+        required: false
         type: string
       local_run_id:
         description: Successful v1-local-acceptance.yml workflow_dispatch run ID
-        required: true
+        required: false
         type: string
 
 # This workflow only reads prior immutable Actions evidence and writes a new
@@ -42,29 +42,52 @@ jobs:
       run:
         shell: bash
     steps:
-      - name: Validate explicit immutable inputs
+      - name: Resolve and validate immutable source runs
         env:
           CANDIDATE_SHA: ${{ inputs.candidate_sha }}
-          CI_RUN_ID: ${{ inputs.ci_run_id }}
-          NATIVE_RUN_ID: ${{ inputs.native_run_id }}
-          PROVIDER_RUN_ID: ${{ inputs.provider_run_id }}
-          LOCAL_RUN_ID: ${{ inputs.local_run_id }}
+          GH_TOKEN: ${{ github.token }}
+          CI_INPUT: ${{ inputs.ci_run_id }}
+          NATIVE_INPUT: ${{ inputs.native_run_id }}
+          PROVIDER_INPUT: ${{ inputs.provider_run_id }}
+          LOCAL_INPUT: ${{ inputs.local_run_id }}
         run: |
           set -euo pipefail
           [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
           test "$GITHUB_EVENT_NAME" = workflow_dispatch
           test "$GITHUB_REF" = refs/heads/main
-          [[ "$CI_RUN_ID" =~ ^[1-9][0-9]*$ ]] || exit 1
-          test "$CI_RUN_ID" != "$NATIVE_RUN_ID"
-          test "$CI_RUN_ID" != "$PROVIDER_RUN_ID"
-          test "$CI_RUN_ID" != "$LOCAL_RUN_ID"
-          [[ "$NATIVE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
-          [[ "$PROVIDER_RUN_ID" =~ ^[1-9][0-9]*$ ]]
-          [[ "$LOCAL_RUN_ID" =~ ^[1-9][0-9]*$ ]]
-          test "$NATIVE_RUN_ID" != "$PROVIDER_RUN_ID"
-          test "$NATIVE_RUN_ID" != "$LOCAL_RUN_ID"
-          test "$PROVIDER_RUN_ID" != "$LOCAL_RUN_ID"
+          resolve_run() {
+            local input="$1" workflow="$2" sha="$3" event="$4" branch="$5" title="$6"
+            if [[ -n "$input" ]]; then
+              [[ "$input" =~ ^[1-9][0-9]*$ ]] || return 1
+              printf '%s\n' "$input"
+              return
+            fi
+            local ids
+            ids="$(gh api --paginate --slurp --method GET \
+              "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow/runs" \
+              -f head_sha="$sha" -f event="$event" -f status=success -f per_page=100 |
+              jq -r --arg branch "$branch" --arg title "$title" '
+                [.[].workflow_runs[] | select(
+                  .status == "completed" and .conclusion == "success" and
+                  ($branch == "" or .head_branch == $branch) and
+                  (.display_title | startswith($title))
+                ) | .id] | unique | .[]
+              ')"
+            if [[ ! "$ids" =~ ^[1-9][0-9]*$ ]]; then
+              echo "$workflow: expected one matching successful run; supply its ID explicitly" >&2
+              return 1
+            fi
+            printf '%s\n' "$ids"
+          }
+
+          CI_RUN_ID="$(resolve_run "$CI_INPUT" ci.yml "$GITHUB_SHA" push main '')"
+          NATIVE_RUN_ID="$(resolve_run "$NATIVE_INPUT" v1-acceptance.yml "$CANDIDATE_SHA" workflow_dispatch '' '')"
+          PROVIDER_RUN_ID="$(resolve_run "$PROVIDER_INPUT" v1-provider-acceptance.yml "$CANDIDATE_SHA" workflow_dispatch main 'v1 provider acceptance run / ')"
+          LOCAL_RUN_ID="$(resolve_run "$LOCAL_INPUT" v1-local-acceptance.yml "$CANDIDATE_SHA" workflow_dispatch main 'v1 local GPU run ')"
+          test "$(printf '%s\n' "$CI_RUN_ID" "$NATIVE_RUN_ID" "$PROVIDER_RUN_ID" "$LOCAL_RUN_ID" | sort -u | wc -l)" -eq 4
+          printf 'CI_RUN_ID=%s\nNATIVE_RUN_ID=%s\nPROVIDER_RUN_ID=%s\nLOCAL_RUN_ID=%s\n' \
+            "$CI_RUN_ID" "$NATIVE_RUN_ID" "$PROVIDER_RUN_ID" "$LOCAL_RUN_ID" >> "$GITHUB_ENV"
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -101,10 +124,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CANDIDATE_SHA: ${{ inputs.candidate_sha }}
-          CI_RUN_ID: ${{ inputs.ci_run_id }}
-          NATIVE_RUN_ID: ${{ inputs.native_run_id }}
-          PROVIDER_RUN_ID: ${{ inputs.provider_run_id }}
-          LOCAL_RUN_ID: ${{ inputs.local_run_id }}
         run: |
           set -euo pipefail
           reports="$KIO_V1_VERIFY_REPORTS"
@@ -164,23 +183,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CANDIDATE_SHA: ${{ inputs.candidate_sha }}
-          NATIVE_RUN_ID: ${{ inputs.native_run_id }}
-          PROVIDER_RUN_ID: ${{ inputs.provider_run_id }}
-          LOCAL_RUN_ID: ${{ inputs.local_run_id }}
         run: |
           set -euo pipefail
           root="$RUNNER_TEMP/kio-v1-verify-inputs"
           expected_root="$root/expected"
           receipt_root="$root/receipts"
           mkdir "$root" "$expected_root" "$receipt_root"
-          native_seen=''
           max_artifact_bytes=16777216
           max_evidence_bytes=65536
 
           select_artifacts() {
             local label="$1"
             local run_id="$2"
-            local matched=0
+            local matched=0 os_seen='' os
             local rows
             local source_report="$KIO_V1_VERIFY_REPORTS/${label}-run.json"
             test -f "$source_report"
@@ -201,20 +216,24 @@ jobs:
                 native)
                   if [[ "$artifact_name" =~ ^kio-v1-native-(linux|macos|windows)-${CANDIDATE_SHA}$ ]]; then
                     os="${BASH_REMATCH[1]}"
-                    case " $native_seen " in *" $os "*)
+                    case " $os_seen " in *" $os "*)
                       echo "duplicate native evidence artifact for $os" >&2; exit 1 ;;
                     esac
-                    native_seen="$native_seen $os"
+                    os_seen="$os_seen $os"
                   else
                     continue
                   fi
                   ;;
                 provider)
-                  [[ "$artifact_name" == v1-provider-a08-* ]] || continue
+                  [[ "$artifact_name" == v1-provider-a08-*-"$run_id"-"$source_attempt" ]] || continue
                   ;;
                 local)
-                  # Receipt artifacts from the private local source workflow.
-                  [[ "$artifact_name" == "kio-v1-local-${CANDIDATE_SHA}-"* ]] || continue
+                  [[ "$artifact_name" =~ ^kio-v1-local-${CANDIDATE_SHA}-(linux|macos|windows)-attempt-${source_attempt}$ ]] || continue
+                  os="${BASH_REMATCH[1]}"
+                  case " $os_seen " in *" $os "*)
+                    echo "duplicate local evidence artifact for $os" >&2; exit 1 ;;
+                  esac
+                  os_seen="$os_seen $os"
                   ;;
                 *) exit 1 ;;
               esac
@@ -255,6 +274,12 @@ jobs:
                 echo "$label artifact has no expected/receipt evidence: $artifact_name" >&2
                 exit 1
               }
+              if test "$label" = local; then
+                test "${#wanted[@]}" = 2
+                for leaf in kio-v1-local-a08-{expected,receipt}.json; do
+                  printf '%s\n' "${wanted[@]}" | grep -Fxq -- "$leaf"
+                done
+              fi
               evidence_dir="$artifact_dir/evidence"
               mkdir "$evidence_dir"
               for entry in "${wanted[@]}"; do
@@ -286,6 +311,9 @@ jobs:
                     and .workflow.workflow_commit == $candidate
                     and .workflow.workflow_path == $workflow_path
                     and .workflow.workflow_sha256 == $workflow_sha256' "$file" >/dev/null
+                if test "$label" = local; then
+                  jq -e --arg os "$os" '.requirement.os == $os and .requirement.subcase == "authenticated_local"' "$file" >/dev/null
+                fi
                 base="$entry"
                 case "$base" in
                   kio-v1-*-expected.json)
@@ -302,10 +330,10 @@ jobs:
               echo "verified $label run has no matching acceptance artifacts" >&2
               exit 1
             }
-            if test "$label" = native; then
+            if [[ "$label" == native || "$label" == local ]]; then
               test "$matched" = 3
-              test "$(printf '%s\n' $native_seen | sort | tr '\n' ' ')" = 'linux macos windows ' || {
-                echo 'native evidence does not cover Linux, macOS, and Windows exactly once' >&2
+              test "$(printf '%s\n' $os_seen | sort | tr '\n' ' ')" = 'linux macos windows ' || {
+                echo "$label evidence does not cover Linux, macOS, and Windows exactly once" >&2
                 exit 1
               }
             fi
@@ -346,7 +374,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: kio-v1-final-verify-${{ inputs.candidate_sha }}-${{ github.run_id }}
+          name: kio-v1-final-verify-${{ inputs.candidate_sha }}-${{ github.run_id }}-attempt-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/kio-v1-verify-reports/*.json
             ${{ runner.temp }}/kio-v1-full-expected.json

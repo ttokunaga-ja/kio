@@ -4,12 +4,18 @@
 
 ## 実行前の条件と順序
 
-1. [受入ホストの構築](../scripts/v1-local-gpu/README.md#受入ホストの構築)に従い、検証済みの初期構築用 Linux helper と共有 GPU 照会だけを root 管理で先に配置する。WSL と Windows を構築し、候補未配置の状態で 2 段 SSH の `deployment path is missing` を確認する。
-2. 整理後の `main` の完全な 40 桁 SHA を候補にし、同じ SHA の `ci.yml` の push run が成功したことを確かめ、候補 SHA と run ID を記録する。
-3. 下記の読み取り確認で外部資源 9 件の準備状況を確認する。F4 前に両台で同じ候補の dispatcher・固定入力・canonical な deployment を照合して配置する。その後 D-20261121-05 に従って GPU ホストを選び、固定 OCR image を用意して接続を確認する。[候補の固定入力と配置](../scripts/v1-local-gpu/README.md#candidate-bound-deployment-proposal)に従う。台帳・権限・予算の確認と初期化条件は [provider 予算台帳](acceptance/provider-budget.md) に従う。全経路の準備が揃ってから dispatch に進む。GPU の経路は、候補を配置する前に [GPU 受入](../.github/workflows/v1-local-acceptance.yml) を `operation=route-probe` で dispatch し、`tag:kio-ci` の runner から両台の TCP 22 と WSL のホスト鍵の照合が成功し、TCP 2222・18443 と管理 Mac の TCP 22 が拒否されることを確かめる。
-4. `main` を ref とし、[ネイティブ受入](../.github/workflows/v1-acceptance.yml) を `candidate_sha` で実行する。42 件と 3 OS の候補 package の成功後に、この run ID を外部 2 workflow の `package_run_id` に渡す。
+1. [受入ホストの構築](../scripts/v1-local-gpu/README.md#受入ホストの構築)に従って、初期構築用 helper と共有 GPU 照会を root 管理で配置する。初期構築時の候補未配置は、2 段 SSH の `DEPLOYMENT_MISSING` で確認する。GPU 経路の構築・変更時は [GPU 受入](../.github/workflows/v1-local-acceptance.yml) の `operation=route-probe` で、両台への Windows TCP 22 と WSL ホスト鍵の照合、および許可外の経路が到達不能であることを確認する。この診断は有料 provider・台帳の準備に先行できる。
+2. `main` の完全な 40 桁 SHA を候補にし、同じ SHA の `ci.yml` の push run が成功したことを確かめる。
+3. F4 の前に両台へ同じ候補の dispatcher と固定 OCR 入力を配置する。[候補の固定入力と配置](../scripts/v1-local-gpu/README.md#candidate-bound-deployment-proposal)に従い、D-20261121-05 のホスト選択と固定 OCR image の用意を行う。有料レーンの確認は [provider 予算台帳](acceptance/provider-budget.md) に従う。
+4. `main` を ref とし、[ネイティブ受入](../.github/workflows/v1-acceptance.yml) を `candidate_sha` で実行する。3 OS の候補 package が発行された完了済み run の ID を、有料受入の `package_run_id` に渡す。GPU 受入と最終集約はネイティブ run の全件成功を必要とする。A12 は独立に再ビルドしたアーカイブも検証する。
 5. [provider 受入](../.github/workflows/v1-provider-acceptance.yml) は `operation=run`、`campaign_id`、`candidate_sha`、`package_run_id` を使う。[GPU 受入](../.github/workflows/v1-local-acceptance.yml) は `operation=run` と同じ `candidate_sha`・`package_run_id` を使う。台帳の予約は失敗・結果不明も消費として扱う。
-6. 3 run の成功後、[最終集約](../.github/workflows/v1-acceptance-verify.yml) を同じ候補で実行する。`candidate_sha`、`ci_run_id`、`native_run_id`、`provider_run_id`、`local_run_id` を渡し、集約成功と 51 件の証跡を確認する。候補 SHA、各 run ID、パッケージと集約の証跡を記録する。
+6. [最終集約](../.github/workflows/v1-acceptance-verify.yml) を同じ `candidate_sha` で実行する。成功 run が一意なら自動で選ぶ。複数ある場合は該当する `ci_run_id`、`native_run_id`、`provider_run_id`、`local_run_id` を指定する。集約成功と 51 件の受領書、候補 SHA、使用した run ID とパッケージを記録する。
+
+## ローカル A08 の証跡
+
+各 OS で候補 package を照合し、GPU リース取得前に独立した runner 上の作業領域で CPU の EG2 を実行する。公開テキストと PNG のオフライン索引、検索、画像 open、再構築、native producer と台帳 0 を確認する。モデルの初回インストールには公開配布元への到達が必要。OCR 側は TLS トンネルで HTTP 200 を確認し、実 OCR の正規化、検索、grant の取り消しと台帳 0 を検証する。
+
+EG2 の成功記録はバイナリ・fixture・プロファイルを結び付ける。OCR 側がこの記録と実測 service identity を照合し、両方のツールを含む `kio.acceptance.receipt/v4` を OS ごとに 1 件作る。OCR と EG2 は別の作業領域を使う。Workflow は expected・receipt・EG2 記録・初期 identity・OCR 観測の存在を各 OS で検査し、リース回収も成功して初めて合格する。最終集約はバインディングを照合し、同一 run の最新 attempt に完全一致する Linux・macOS・Windows の受領書を各 1 件取り込む。ローカル受入を再実行するときは 3 OS を同じ attempt にそろえる。
 
 ## 外部資源の読み取り確認
 
@@ -21,7 +27,7 @@
 
 | Environment | 確認対象 |
 | --- | --- |
-| `v1-provider-acceptance` | `GEMINI_API_KEY`、`MISTRAL_API_KEY`、`GEMINI_TEST_BUDGET_USD` と `MISTRAL_TEST_BUDGET_USD`（各 USD 10） |
+| `v1-provider-acceptance` | `GEMINI_API_KEY`、`MISTRAL_API_KEY` |
 | `v1-provider-ledger-authority` | `KIO_LEDGER_APP_PRIVATE_KEY`、`KIO_LEDGER_APP_CLIENT_ID`、`KIO_LEDGER_APP_ID`、`KIO_LEDGER_APP_SLUG`、`KIO_LEDGER_INSTALLATION_ID` |
 | `v1-local-acceptance` | `KIO_LAB_SSH_PRIVATE_KEY`、`KIO_LAB_JUMP_HOST`、`KIO_LAB_JUMP_USER`、`KIO_LAB_KNOWN_HOSTS`、`KIO_TS_CLIENT_ID`、`KIO_TS_AUDIENCE` |
 
@@ -36,10 +42,10 @@
 1. **Google AI Studio / Google Cloud（Gemini）**
    - Environment の `GEMINI_API_KEY` に当たる鍵が、今も有効なものとして一覧にあるか（作成日 2026-09-08 前後、末尾表示が出るならその一致）。削除・無効化・制限の変更がないか。
    - 鍵の属するプロジェクトで課金が有効か。無料枠のままか。
-   - embedding のモデル `gemini-embedding-2` が使えるか。予算・上限の設定（Environment の変数では 1 回の受入あたり USD 10）。
+   - embedding のモデル `gemini-embedding-2` が使えるか。課金設定を初回・設定変更・障害時に確認する。受入台帳の上限は provider ごとに全キャンペーン累計 USD 10。
 2. **Mistral（La Plateforme の console）**
    - `MISTRAL_API_KEY` に当たる鍵が有効か（作成日 2026-09-08 前後）。
-   - workspace の課金・支払い方法が有効か。月の上限・残高。正式受入で指定する OCR モデル（`mistral-ocr-4-1`）と Batch が使える plan か。固定モデルは [受入コード](../crates/kio-eval/src/acceptance_provider.rs) を参照する。
+   - workspace の課金・支払い方法が有効か。月の上限・残高。初回・設定変更・障害時に Batch と正式受入の固定モデルが利用可能かを確認する。モデルは [受入コード](../crates/kio-eval/src/acceptance_provider.rs) を参照する。
 3. **GitHub App（ledger 用）**
    - GitHub の Settings → Developer settings → GitHub Apps に、`KIO_LEDGER_APP_SLUG` の名前の App があるか。repo `ttokunaga-ja/kio` に install されていて、その installation の権限が Contents の read/write を含み、対象 repo が kio だけか。
    - App の秘密鍵の登録日と状態を一覧で確かめる。

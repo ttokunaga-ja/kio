@@ -1,4 +1,4 @@
-//! Closed six-leaf Actions package envelope, validated before materialization.
+//! Bounded Actions package envelope, validated before materialization.
 use std::{
     collections::BTreeSet,
     fs::File,
@@ -64,8 +64,8 @@ fn envelope(file: &mut File) -> Result<(), String> {
     let end_position = size - count as u64 + end as u64;
     if u16_at(4) != 0
         || u16_at(6) != 0
-        || u16_at(8) != 6
-        || u16_at(10) != 6
+        || u16_at(8) != 4
+        || u16_at(10) != 4
         || directory_size > MAX_DIRECTORY
         || directory_start.checked_add(directory_size) != Some(end_position)
     {
@@ -78,7 +78,7 @@ fn envelope(file: &mut File) -> Result<(), String> {
     file.read_exact(&mut directory)
         .map_err(|_| "cannot read directory")?;
     let mut at = 0;
-    for _ in 0..6 {
+    for _ in 0..4 {
         if directory.len().saturating_sub(at) < 46 || directory[at..at + 4] != *b"PK\x01\x02" {
             return Err("ZIP central record count differs".into());
         }
@@ -107,11 +107,8 @@ fn inspect(mut file: File) -> Result<ZipArchive<File>, String> {
         file,
     )
     .map_err(|_| "invalid package ZIP")?;
-    if archive.len() != 6 {
-        return Err("package requires exactly six leaves".into());
-    }
     let mut names = BTreeSet::new();
-    let mut kinds = [0_u8; 6];
+    let mut kinds = [0_u8; 4];
     let mut total = 0_u64;
     for index in 0..archive.len() {
         let entry = archive
@@ -125,10 +122,7 @@ fn inspect(mut file: File) -> Result<ZipArchive<File>, String> {
                 .unix_mode()
                 .is_some_and(|mode| mode & 0o170000 != 0o100000)
             || name.contains('\\')
-            || name.starts_with('/')
-            || name
-                .split('/')
-                .any(|part| part.is_empty() || part == "." || part == "..")
+            || name.contains('/')
             || name.bytes().any(|b| b < 32 || b == 127 || b == b':')
         {
             return Err("unsafe or duplicate package leaf".into());
@@ -137,20 +131,10 @@ fn inspect(mut file: File) -> Result<ZipArchive<File>, String> {
             0
         } else if name == "kio-v1-lock-sha256" {
             1
-        } else if !name.contains('/') && name.ends_with(".tar.gz") {
+        } else if name.ends_with(".tar.gz") {
             2
-        } else if !name.contains('/') && name.ends_with(".checksums.json") {
+        } else if name.ends_with(".checksums.json") {
             3
-        } else if name.starts_with("reproducible/")
-            && name.matches('/').count() == 1
-            && name.ends_with(".tar.gz")
-        {
-            4
-        } else if name.starts_with("reproducible/")
-            && name.matches('/').count() == 1
-            && name.ends_with(".checksums.json")
-        {
-            5
         } else {
             return Err("unexpected package leaf".into());
         };
@@ -162,7 +146,7 @@ fn inspect(mut file: File) -> Result<ZipArchive<File>, String> {
             return Err("package decoded bytes exceed bound".into());
         }
     }
-    if kinds != [1; 6] {
+    if kinds != [1; 4] {
         return Err("package leaf set differs".into());
     }
     Ok(archive)
@@ -185,10 +169,6 @@ pub fn run(args: Args) -> Result<(), String> {
         let mut entry = archive
             .by_index(index)
             .map_err(|_| "cannot read package leaf")?;
-        // Reproducibility leaves are verified in the envelope but are not consumed here.
-        if entry.name().contains('/') {
-            continue;
-        }
         let name = PathBuf::from(entry.name());
         let expected = entry.size();
         let mut bytes = Vec::new();
@@ -260,8 +240,6 @@ mod tests {
         "kio-v1-lock-sha256",
         "kio.tar.gz",
         "kio.checksums.json",
-        "reproducible/kio.tar.gz",
-        "reproducible/kio.checksums.json",
     ];
     #[test]
     fn accepts_only_exact_closed_leaf_set() {
@@ -273,7 +251,10 @@ mod tests {
         assert!(inspect(zip(&names)).is_err());
         names[2] = "unexpected.json";
         assert!(inspect(zip(&names)).is_err());
-        assert!(inspect(zip(&NAMES[..5])).is_err());
+        assert!(inspect(zip(&NAMES[..3])).is_err());
+        names = NAMES.to_vec();
+        names.push("reproducible/kio.tar.gz");
+        assert!(inspect(zip(&names)).is_err());
     }
     #[test]
     fn rejects_forged_directory_count_before_library_indexing() {

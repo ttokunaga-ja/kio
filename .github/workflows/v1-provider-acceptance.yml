@@ -8,7 +8,6 @@ on:
       package_run_id: { required: false, type: string }
       campaign_id: { required: true, type: string }
       predecessor_campaign_id: { required: false, type: string }
-      predecessor_tip: { required: false, type: string }
 
 # One shared budget authority across campaigns, retries, providers, and OSes.
 concurrency: { group: v1-provider-acceptance-ledger-global, cancel-in-progress: false }
@@ -28,7 +27,6 @@ jobs:
           PACKAGE_RUN_ID: ${{ inputs.package_run_id }}
           CAMPAIGN_ID: ${{ inputs.campaign_id }}
           PREDECESSOR_CAMPAIGN_ID: ${{ inputs.predecessor_campaign_id }}
-          PREDECESSOR_TIP: ${{ inputs.predecessor_tip }}
         run: |
           set -euo pipefail
           [[ "$CAMPAIGN_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$ ]]
@@ -41,7 +39,6 @@ jobs:
               test -z "$CANDIDATE_SHA"
               test -z "$PACKAGE_RUN_ID"
               [[ "$PREDECESSOR_CAMPAIGN_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$ ]]
-              [[ "$PREDECESSOR_TIP" =~ ^[0-9a-f]{40}$ ]]
               test "$PREDECESSOR_CAMPAIGN_ID" != "$CAMPAIGN_ID"
               ;;
             run)
@@ -52,11 +49,27 @@ jobs:
           esac
           if test "$OPERATION" != transition; then
             test -z "$PREDECESSOR_CAMPAIGN_ID"
-            test -z "$PREDECESSOR_TIP"
           fi
           main_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')"
           test "$GITHUB_SHA" = "$main_sha"
-          if test "$OPERATION" = run; then test "$GITHUB_SHA" = "$CANDIDATE_SHA"; fi
+          if test "$OPERATION" = run; then
+            test "$GITHUB_SHA" = "$CANDIDATE_SHA"
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$PACKAGE_RUN_ID" |
+              jq -e --arg sha "$CANDIDATE_SHA" '.event == "workflow_dispatch" and .status == "completed" and .head_sha == $sha and .path == ".github/workflows/v1-acceptance.yml"' >/dev/null
+            gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/runs/$PACKAGE_RUN_ID/jobs?filter=latest&per_page=100" |
+              jq -e '[
+                .[].jobs[] | select(
+                  (.name | test("^(Linux|macOS|Windows) candidate archive$")) and
+                  any(.steps[]; .name == "Upload candidate archive and target binding" and .conclusion == "success")
+                ) | .name
+              ] | sort == ["Linux candidate archive", "Windows candidate archive", "macOS candidate archive"]' >/dev/null
+            gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/runs/$PACKAGE_RUN_ID/artifacts?per_page=100" |
+              jq -e --arg sha "$CANDIDATE_SHA" '
+                [.[].artifacts[] | select(.name | test("^kio-v1-package-(linux|macos|windows)-" + $sha + "$"))] |
+                length == 3 and ([.[].name] | unique | length == 3) and
+                all(.[]; .expired == false and .size_in_bytes > 0 and .size_in_bytes <= 805306368)
+              ' >/dev/null
+          fi
           echo eligible=true >> "$GITHUB_OUTPUT"
 
   tools-build:
@@ -169,7 +182,6 @@ jobs:
           OPERATION: ${{ inputs.operation }}
           CAMPAIGN_ID: ${{ inputs.campaign_id }}
           PREDECESSOR_CAMPAIGN_ID: ${{ inputs.predecessor_campaign_id }}
-          PREDECESSOR_TIP: ${{ inputs.predecessor_tip }}
           CANDIDATE_SHA: ${{ inputs.candidate_sha }}
           REPOSITORY: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
@@ -186,7 +198,7 @@ jobs:
               "$KIO_ACCEPTANCE_TOOLS" provider-ledger initialize "${common[@]}"
               ;;
             transition)
-              "$KIO_ACCEPTANCE_TOOLS" provider-ledger transition "${common[@]}" --predecessor-campaign-id "$PREDECESSOR_CAMPAIGN_ID" --predecessor-tip "$PREDECESSOR_TIP"
+              "$KIO_ACCEPTANCE_TOOLS" provider-ledger transition "${common[@]}" --predecessor-campaign-id "$PREDECESSOR_CAMPAIGN_ID"
               ;;
             run)
               result="$("$KIO_ACCEPTANCE_TOOLS" provider-ledger reserve-all "${common[@]}" --candidate-sha "$CANDIDATE_SHA" --workflow-sha256 "$WORKFLOW_SHA256")"
@@ -237,16 +249,14 @@ jobs:
           path: candidate
           fetch-depth: 0
           persist-credentials: false
-      - name: Bind exact candidate and successful package source run
+      - name: Bind exact candidate and confirm current main
         working-directory: candidate
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          git fetch --no-tags origin main
           test "$CANDIDATE_SHA" = "$(git rev-parse HEAD)"
-          test "$CANDIDATE_SHA" = "$(git rev-parse origin/main)"
-          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${PACKAGE_RUN_ID}" | jq -e --arg sha "$CANDIDATE_SHA" '.event == "workflow_dispatch" and .status == "completed" and .conclusion == "success" and .head_sha == $sha and .path == ".github/workflows/v1-acceptance.yml"' >/dev/null
+          test "$CANDIDATE_SHA" = "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
       - uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
       - name: Build exact candidate acceptance binaries before credential
         working-directory: candidate

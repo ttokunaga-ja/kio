@@ -1,8 +1,6 @@
-//! A08 acceptance uses the authenticated OCR peer, then runs EG2 on the client.
-//! The create-only OCR checkpoint binds the source and device state across phases.
+//! A08 combines authenticated GPU OCR with independent runner-local EG2 evidence.
 
 use std::{
-    collections::BTreeMap,
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -36,14 +34,10 @@ const CANDIDATE_COPY: &str = "device/candidate/kio";
 #[cfg(windows)]
 const CANDIDATE_COPY: &str = "device/candidate/kio.exe";
 const CA_COPY: &str = "device/trust/ca.pem";
-const SERVICE_IDENTITY_COPY: &str = "device/service-identity.json";
-const CHECKPOINT: &str = "checkpoints/ocr.json";
 const IMAGE_QUERY_DIAGNOSTICS: &str = "diagnostics";
 const MAX_OUTPUT: usize = 1024 * 1024;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(300);
-const MAX_TREE_FILES: usize = 16_384;
-const MAX_TREE_DEPTH: usize = 32;
-const MAX_TREE_BYTES: u64 = 512 * 1024 * 1024;
+const EG2_TEXT: &str = "Kio acceptance checks local embedding with a public text fixture.";
 
 #[derive(Debug, Clone)]
 pub struct AuthenticatedLocalOptions {
@@ -51,33 +45,34 @@ pub struct AuthenticatedLocalOptions {
     /// Public directory with the reviewed OCR PDF and standalone PNG input.
     pub fixture: PathBuf,
     pub expected: ExpectedReceipt,
-    /// Kept across phases and must be private to one client host.
     pub work_dir: PathBuf,
     pub receipt: PathBuf,
     pub ocr_endpoint: String,
-    /// One pre-existing public CA used by both phase endpoints.
     pub ca_pem: PathBuf,
     pub service_identity: PathBuf,
-    pub service_identity_sha256: String,
+    pub eg2_evidence: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OcrCheckpoint {
-    schema: String,
-    expected: ExpectedReceipt,
+struct Eg2Evidence {
     binary_sha256: String,
     fixture_sha256: String,
-    ca_sha256: String,
-    ocr_endpoint_sha256: String,
-    tools_toml_sha256: String,
-    tool_lock_sha256: String,
-    service_identity_sha256: String,
-    normalized_objects_sha256: String,
-    protected_state_sha256: String,
-    device_state_sha256: String,
-    index_result_sha256: String,
-    text_search_result_sha256: String,
+    profile_hash: String,
+}
+
+impl Eg2Evidence {
+    fn verify(&self, binary_sha256: &str, fixture_sha256: &str) -> Result<(), AcceptanceError> {
+        if self.binary_sha256 != binary_sha256
+            || self.fixture_sha256 != fixture_sha256
+            || self.profile_hash != kio_core::eg2::profile_hash()
+        {
+            return Err(invalid(
+                "EG2 evidence differs from the expected candidate, fixture, or profile",
+            ));
+        }
+        Ok(())
+    }
 }
 
 struct CapturedFixture {
@@ -105,10 +100,15 @@ impl ImageQueryStage {
     }
 }
 
-/// Run the OCR half and write a canonical, create-only checkpoint.  It does
-/// not write an acceptance receipt.
-pub fn run_ocr(options: &AuthenticatedLocalOptions) -> Result<OcrCheckpoint, AcceptanceError> {
-    validate_ocr_options(options)?;
+/// Exercise authenticated OCR and combine it with completed runner-local EG2.
+pub fn run_ocr(options: &AuthenticatedLocalOptions) -> Result<AcceptanceReceipt, AcceptanceError> {
+    validate_base(options)?;
+    let eg2: Eg2Evidence = serde_json::from_slice(&bounded_file(&options.eg2_evidence)?)
+        .map_err(|_| invalid("runner-local EG2 evidence is malformed"))?;
+    eg2.verify(
+        &options.expected.candidate.binary_sha256,
+        &options.expected.fixture.sha256,
+    )?;
     if options.work_dir.exists() || options.receipt.exists() {
         return Err(invalid(
             "authenticated-local OCR work directory and receipt must be create-only",
@@ -119,14 +119,7 @@ pub fn run_ocr(options: &AuthenticatedLocalOptions) -> Result<OcrCheckpoint, Acc
     let ca = bounded_file(&options.ca_pem)?;
     let (service_identity, service_identity_sha256) =
         read_service_identity(&options.service_identity)?;
-    if service_identity_sha256 != options.service_identity_sha256
-        || service_identity_sha256
-            != options
-                .expected
-                .service_identity_sha256
-                .clone()
-                .unwrap_or_default()
-    {
+    if options.expected.service_identity_sha256.as_deref() != Some(&service_identity_sha256) {
         return Err(invalid("service identity differs from expected binding"));
     }
     validate_captured_service_binding(&service_identity, &ca, &options.ocr_endpoint)?;
@@ -145,11 +138,7 @@ pub fn run_ocr(options: &AuthenticatedLocalOptions) -> Result<OcrCheckpoint, Acc
     let root = fs::canonicalize(&options.work_dir).map_err(io)?;
     let private = prepare_private_root(&root)?;
     write_private_candidate(&root, &candidate)?;
-    stage_native_library(options, &root)?;
     let staged_ca = write_private_ca(&root, &ca)?;
-    let identity_copy = root.join(SERVICE_IDENTITY_COPY);
-    fs::write(&identity_copy, canonical(&service_identity)?).map_err(io)?;
-    private_file(&identity_copy)?;
     let scope = root.join("scope");
     fs::create_dir(&scope).map_err(io)?;
     private_dir(&scope)?;
@@ -202,60 +191,69 @@ pub fn run_ocr(options: &AuthenticatedLocalOptions) -> Result<OcrCheckpoint, Acc
     )?;
     require_results(&searchable, "OCR text search")?;
 
-    let normalized_objects_sha256 = verify_ocr_units(&scope)?;
-    let tool_lock = scope.join(".kio/tool-lock.json");
-    let tool_lock_sha256 = sha256_regular_file(&tool_lock, MAX_FIXTURE_BYTES)?;
-    let checkpoint = OcrCheckpoint {
-        schema: "kio.acceptance.authenticated-local-ocr/v2".into(),
-        expected: options.expected.clone(),
-        binary_sha256: sha256_regular_file(&binary, MAX_BINARY_BYTES)?,
-        fixture_sha256: fixture.sha256,
-        ca_sha256: sha256_regular_file(&staged_ca, MAX_FIXTURE_BYTES)?,
-        ocr_endpoint_sha256: sha256_bytes(options.ocr_endpoint.as_bytes()),
-        tools_toml_sha256: sha256_regular_file(
-            &private.join("xdg-config/kio/tools.toml"),
-            MAX_FIXTURE_BYTES,
-        )?,
-        tool_lock_sha256,
-        service_identity_sha256: service_identity_sha256.clone(),
-        normalized_objects_sha256,
-        protected_state_sha256: tree_digest(&scope.join(".kio"), true)?,
-        device_state_sha256: tree_digest(&private, true)?,
-        index_result_sha256: json_hash(&indexed)?,
-        text_search_result_sha256: json_hash(&searchable)?,
+    let normalized_ocr = verify_ocr_units(&scope)?;
+    let revoked = json(&binary, &private, &scope, &["adapter", "revoke", OCR_TOOL])?;
+    if revoked.get("status").and_then(Value::as_str) != Some("revoked") {
+        return Err(invalid("OCR grant revocation did not take effect"));
+    }
+    if verify_ocr_units(&scope)? != normalized_ocr {
+        return Err(invalid("OCR grant revocation changed normalized objects"));
+    }
+    ensure_ledger_zero(&private)?;
+    if sha256_regular_file(&binary, MAX_BINARY_BYTES)? != options.expected.candidate.binary_sha256
+        || fixture_digest_from_scope(&scope)? != options.expected.fixture.sha256
+    {
+        return Err(invalid("candidate binary or fixture changed during OCR"));
+    }
+    let runtime = observed_runtime(&scope, eg2.profile_hash)?;
+    let receipt = AcceptanceReceipt {
+        schema: "kio.acceptance.receipt/v4".into(),
+        requirement: options.expected.requirement.clone(),
+        candidate: options.expected.candidate.clone(),
+        fixture: options.expected.fixture.clone(),
+        workflow: options.expected.workflow.clone(),
+        evaluator_sha256: current_evaluator_sha256_matches(&options.expected.evaluator_sha256)?,
+        service_identity_sha256: Some(service_identity_sha256),
+        contract_binary_sha256: options.expected.contract_binary_sha256.clone(),
+        runtime,
+        passed: true,
     };
-    write_checkpoint(&root.join(CHECKPOINT), &checkpoint)?;
-    Ok(checkpoint)
+    write_receipt_create_only(&options.receipt, &receipt)?;
+    Ok(receipt)
 }
 
-/// Complete embedding and query verification from an exact OCR checkpoint,
-/// then write the one final A08 receipt.
-pub fn run_embedding(
-    options: &AuthenticatedLocalOptions,
-) -> Result<AcceptanceReceipt, AcceptanceError> {
-    validate_embedding_options(options)?;
-    if !options.work_dir.is_dir() || options.receipt.exists() {
+/// Exercise EG2 in a separate runner-local scope without any OCR tool or route.
+pub fn run_eg2(
+    candidate_bin: &Path,
+    fixture_dir: &Path,
+    target: &str,
+    expected_binary_sha256: &str,
+    work_dir: &Path,
+    evidence: &Path,
+) -> Result<(), AcceptanceError> {
+    reject_test_controls()?;
+    let candidate = bounded_file_with_limit(candidate_bin, MAX_BINARY_BYTES)?;
+    let binary_sha256 = sha256_bytes(&candidate);
+    if binary_sha256 != expected_binary_sha256 {
         return Err(invalid(
-            "authenticated-local embedding requires an existing OCR work directory and new receipt",
+            "EG2 candidate binary differs from the verified package",
         ));
     }
-    let root = fs::canonicalize(&options.work_dir).map_err(io)?;
-    let checkpoint = read_checkpoint(&root.join(CHECKPOINT))?;
-    let private = root.join("device");
+    let fixture = capture_fixture(fixture_dir)?;
+    fs::create_dir(work_dir).map_err(io)?;
+    private_dir(work_dir)?;
+    let root = fs::canonicalize(work_dir).map_err(io)?;
+    let private = prepare_private_root(&root)?;
+    write_private_candidate(&root, &candidate)?;
+    stage_native_library(candidate_bin, target, &root)?;
     let scope = root.join("scope");
-    if !private.is_dir() || !scope.is_dir() {
-        return Err(invalid("OCR checkpoint layout is incomplete"));
-    }
-    verify_checkpoint(options, &root, &checkpoint)?;
-    let (service_identity, identity_sha256) =
-        read_service_identity(&root.join(SERVICE_IDENTITY_COPY))?;
-    if identity_sha256 != checkpoint.service_identity_sha256
-        || service_identity.ocr_endpoint != options.ocr_endpoint
-    {
-        return Err(invalid("private service identity checkpoint mismatch"));
-    }
+    fs::create_dir(&scope).map_err(io)?;
+    private_dir(&scope)?;
+    fs::write(scope.join(IMAGE_PNG), &fixture.image).map_err(io)?;
+    fs::write(scope.join("embedding.md"), EG2_TEXT).map_err(io)?;
     let binary = root.join(CANDIDATE_COPY);
-
+    json(&binary, &private, &scope, &["init"])?;
+    json(&binary, &private, &scope, &["ledger", "init"])?;
     json(
         &binary,
         &private,
@@ -275,33 +273,18 @@ pub fn run_embedding(
             "embedding phase did not complete an index operation",
         ));
     }
-    if verify_ocr_units(&scope)? != checkpoint.normalized_objects_sha256 {
-        return Err(invalid("embedding phase changed OCR normalized objects"));
-    }
     let text = json(
         &binary,
         &private,
         &scope,
-        &[
-            "search",
-            "Kio provider OCR fixture",
-            "--mode",
-            "vector",
-            "--offline",
-        ],
+        &["search", EG2_TEXT, "--mode", "vector", "--offline"],
     )?;
     require_results(&text, "text vector query")?;
     let hybrid = json(
         &binary,
         &private,
         &scope,
-        &[
-            "search",
-            "Kio provider OCR fixture",
-            "--mode",
-            "hybrid",
-            "--offline",
-        ],
+        &["search", EG2_TEXT, "--mode", "hybrid", "--offline"],
     )?;
     require_results(&hybrid, "hybrid text query")?;
     let image = captured_image_query(
@@ -328,13 +311,7 @@ pub fn run_embedding(
         &binary,
         &private,
         &scope,
-        &[
-            "search",
-            "Kio provider OCR fixture",
-            "--mode",
-            "text",
-            "--offline",
-        ],
+        &["search", EG2_TEXT, "--mode", "text", "--offline"],
     )?;
     require_results(&stored_text, "stored text query")?;
     let stored_text_rows = stable_result_rows(&stored_text)?;
@@ -356,13 +333,7 @@ pub fn run_embedding(
         &binary,
         &private,
         &scope,
-        &[
-            "search",
-            "Kio provider OCR fixture",
-            "--mode",
-            "text",
-            "--offline",
-        ],
+        &["search", EG2_TEXT, "--mode", "text", "--offline"],
     )?;
     let rebuilt_image = captured_image_query(
         &binary,
@@ -388,54 +359,29 @@ pub fn run_embedding(
         ));
     }
 
-    let revoked = json(&binary, &private, &scope, &["adapter", "revoke", OCR_TOOL])?;
-    if revoked.get("status").and_then(Value::as_str) != Some("revoked") {
-        return Err(invalid("OCR grant revocation did not take effect"));
-    }
-    let after_revoke = json(
-        &binary,
-        &private,
-        &scope,
-        &[
-            "search",
-            "Kio provider OCR fixture",
-            "--mode",
-            "vector",
-            "--offline",
-        ],
-    )?;
-    require_results(&after_revoke, "EG2 vector query after OCR grant revocation")?;
     ensure_ledger_zero(&private)?;
-
-    if sha256_regular_file(&binary, MAX_BINARY_BYTES)? != options.expected.candidate.binary_sha256
-        || fixture_digest_from_scope(&scope)? != options.expected.fixture.sha256
+    if sha256_regular_file(&binary, MAX_BINARY_BYTES)? != binary_sha256
+        || bounded_file(&scope.join(IMAGE_PNG))? != fixture.image
+        || bounded_file(&scope.join("embedding.md"))? != EG2_TEXT.as_bytes()
     {
-        return Err(invalid(
-            "candidate binary or fixture changed during authenticated-local acceptance",
-        ));
+        return Err(invalid("candidate binary or fixture changed during EG2"));
     }
-    let runtime = observed_runtime(&scope)?;
-    for required in [OCR_TOOL, EMBEDDING_TOOL] {
-        if !runtime.tools.iter().any(|tool| tool.tool_id == required) {
-            return Err(invalid(
-                "authenticated-local provenance lacks a required tool",
-            ));
-        }
-    }
-    let receipt = AcceptanceReceipt {
-        schema: "kio.acceptance.receipt/v4".into(),
-        requirement: options.expected.requirement.clone(),
-        candidate: options.expected.candidate.clone(),
-        fixture: options.expected.fixture.clone(),
-        workflow: options.expected.workflow.clone(),
-        evaluator_sha256: current_evaluator_sha256_matches(&options.expected.evaluator_sha256)?,
-        service_identity_sha256: Some(options.service_identity_sha256.clone()),
-        contract_binary_sha256: options.expected.contract_binary_sha256.clone(),
-        runtime,
-        passed: true,
+    let proof = Eg2Evidence {
+        binary_sha256,
+        fixture_sha256: fixture.sha256,
+        profile_hash: tool_profile(
+            &scope.join(".kio/tool-lock.json"),
+            "embedding",
+            EMBEDDING_TOOL,
+        )?,
     };
-    write_receipt_create_only(&options.receipt, &receipt)?;
-    Ok(receipt)
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(evidence)
+        .map_err(io)?;
+    file.write_all(&canonical(&proof)?).map_err(io)?;
+    file.sync_all().map_err(io)
 }
 
 fn validate_base(options: &AuthenticatedLocalOptions) -> Result<(), AcceptanceError> {
@@ -451,21 +397,7 @@ fn validate_base(options: &AuthenticatedLocalOptions) -> Result<(), AcceptanceEr
         ));
     }
     current_evaluator_sha256_matches(&options.expected.evaluator_sha256)?;
-    if !is_lower_hex_service_hash(&options.service_identity_sha256)
-        || options.expected.service_identity_sha256.as_deref()
-            != Some(options.service_identity_sha256.as_str())
-    {
-        return Err(invalid(
-            "authenticated-local service identity hash is invalid",
-        ));
-    }
     Ok(())
-}
-fn is_lower_hex_service_hash(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
 }
 
 fn validate_captured_service_binding(
@@ -482,13 +414,6 @@ fn validate_captured_service_binding(
     }
     Ok(())
 }
-fn validate_ocr_options(options: &AuthenticatedLocalOptions) -> Result<(), AcceptanceError> {
-    validate_base(options)
-}
-fn validate_embedding_options(options: &AuthenticatedLocalOptions) -> Result<(), AcceptanceError> {
-    validate_base(options)
-}
-
 fn prepare_private_root(root: &Path) -> Result<PathBuf, AcceptanceError> {
     let private = root.join("device");
     for part in ["", "xdg-config", "xdg-data", "xdg-cache", "tmp"] {
@@ -503,14 +428,10 @@ fn prepare_private_root(root: &Path) -> Result<PathBuf, AcceptanceError> {
     Ok(private)
 }
 
-fn stage_native_library(
-    options: &AuthenticatedLocalOptions,
-    root: &Path,
-) -> Result<(), AcceptanceError> {
-    let bundle = kio_core::litert::Bundle::for_target(&options.expected.candidate.target)
+fn stage_native_library(binary: &Path, target: &str, root: &Path) -> Result<(), AcceptanceError> {
+    let bundle = kio_core::litert::Bundle::for_target(target)
         .ok_or_else(|| invalid("unsupported EG2 runtime target"))?;
-    let package = options
-        .binary
+    let package = binary
         .parent()
         .and_then(Path::parent)
         .ok_or_else(|| invalid("candidate binary has no distribution root"))?;
@@ -1008,35 +929,29 @@ fn verify_ocr_units(scope: &Path) -> Result<String, AcceptanceError> {
     }
     Ok(sha256_bytes(&evidence))
 }
-fn observed_runtime(scope: &Path) -> Result<crate::acceptance::AcceptanceRuntime, AcceptanceError> {
-    let locked = runtime_from_scope(scope)?;
-    observed_runtime_from_lock(locked, &real_ocr_profile())
-}
-
-/// The global markdown declaration is the prepare pipeline's default and does
-/// not describe the profile that produced locally OCR-normalized instances.
-/// Keep only the tools that actually executed in this acceptance, then add the
-/// independently validated per-file OCR identity.
-fn observed_runtime_from_lock(
-    locked: AcceptanceRuntime,
-    real_ocr_profile: &str,
+fn observed_runtime(
+    scope: &Path,
+    eg2_profile: String,
 ) -> Result<AcceptanceRuntime, AcceptanceError> {
+    let locked = runtime_from_scope(scope)?;
     let mut tools: Vec<_> = locked
         .tools
         .into_iter()
-        .filter(|tool| matches!(tool.tool_id.as_str(), "prepare_default" | EMBEDDING_TOOL))
+        .filter(|tool| tool.tool_id == "prepare_default")
         .collect();
-    for required in ["prepare_default", EMBEDDING_TOOL] {
-        if !tools.iter().any(|tool| tool.tool_id == required) {
-            return Err(invalid(
-                "authenticated-local tool-lock lacks an executed required tool",
-            ));
-        }
+    if tools.is_empty() {
+        return Err(invalid("authenticated OCR tool-lock lacks prepare_default"));
     }
-    tools.push(ObservedToolIdentity {
-        tool_id: OCR_TOOL.to_owned(),
-        tool_profile_hash: real_ocr_profile.to_owned(),
-    });
+    tools.extend([
+        ObservedToolIdentity {
+            tool_id: OCR_TOOL.to_owned(),
+            tool_profile_hash: real_ocr_profile(),
+        },
+        ObservedToolIdentity {
+            tool_id: EMBEDDING_TOOL.to_owned(),
+            tool_profile_hash: eg2_profile,
+        },
+    ]);
     tools.sort_by(|left, right| left.tool_id.cmp(&right.tool_id));
     let runtime = AcceptanceRuntime {
         tools,
@@ -1057,138 +972,9 @@ fn is_real_ocr_profile(stored_profile: &str, expected_profile: &str) -> bool {
     stored_profile == expected_profile
 }
 
-fn verify_checkpoint(
-    options: &AuthenticatedLocalOptions,
-    root: &Path,
-    checkpoint: &OcrCheckpoint,
-) -> Result<(), AcceptanceError> {
-    if checkpoint.schema != "kio.acceptance.authenticated-local-ocr/v2"
-        || checkpoint.expected != options.expected
-        || checkpoint.binary_sha256
-            != sha256_regular_file(&root.join(CANDIDATE_COPY), MAX_BINARY_BYTES)?
-        || checkpoint.fixture_sha256 != fixture_digest_from_scope(&root.join("scope"))?
-        || checkpoint.ca_sha256 != sha256_regular_file(&root.join(CA_COPY), MAX_FIXTURE_BYTES)?
-        || checkpoint.ocr_endpoint_sha256 != sha256_bytes(options.ocr_endpoint.as_bytes())
-        || checkpoint.tools_toml_sha256
-            != sha256_regular_file(
-                &root.join("device/xdg-config/kio/tools.toml"),
-                MAX_FIXTURE_BYTES,
-            )?
-        || checkpoint.tool_lock_sha256
-            != sha256_regular_file(&root.join("scope/.kio/tool-lock.json"), MAX_FIXTURE_BYTES)?
-        || checkpoint.normalized_objects_sha256 != verify_ocr_units(&root.join("scope"))?
-        || checkpoint.protected_state_sha256 != tree_digest(&root.join("scope/.kio"), true)?
-        || checkpoint.device_state_sha256 != tree_digest(&root.join("device"), true)?
-        || checkpoint.service_identity_sha256
-            != sha256_regular_file(&root.join(SERVICE_IDENTITY_COPY), MAX_FIXTURE_BYTES)?
-    {
-        return Err(invalid(
-            "OCR checkpoint does not bind the current protected state",
-        ));
-    }
-    // The per-file OCR manifests and their profiles were checked above; the
-    // global markdown slot remains the prepare pipeline's builtin declaration.
-    Ok(())
-}
-fn write_checkpoint(path: &Path, checkpoint: &OcrCheckpoint) -> Result<(), AcceptanceError> {
-    let bytes = canonical(checkpoint)?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| invalid("checkpoint has no parent"))?;
-    fs::create_dir_all(parent).map_err(io)?;
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(io)?;
-    file.write_all(&bytes).map_err(io)?;
-    file.sync_all().map_err(io)
-}
-fn read_checkpoint(path: &Path) -> Result<OcrCheckpoint, AcceptanceError> {
-    let bytes = bounded_file(path)?;
-    let value: Value =
-        serde_json::from_slice(&bytes).map_err(|_| invalid("OCR checkpoint is malformed"))?;
-    if kio_core::cas::canonical_json_bytes(&value)
-        .map_err(|e| AcceptanceError::Json(e.to_string()))?
-        != bytes
-    {
-        return Err(invalid("OCR checkpoint is not canonical"));
-    }
-    serde_json::from_value(value).map_err(|_| invalid("OCR checkpoint shape is invalid"))
-}
 fn canonical<T: Serialize>(value: &T) -> Result<Vec<u8>, AcceptanceError> {
     let value = serde_json::to_value(value).map_err(|e| AcceptanceError::Json(e.to_string()))?;
     kio_core::cas::canonical_json_bytes(&value).map_err(|e| AcceptanceError::Json(e.to_string()))
-}
-fn json_hash(value: &Value) -> Result<String, AcceptanceError> {
-    Ok(sha256_bytes(
-        &kio_core::cas::canonical_json_bytes(value)
-            .map_err(|e| AcceptanceError::Json(e.to_string()))?,
-    ))
-}
-
-fn tree_digest(path: &Path, require_nonempty: bool) -> Result<String, AcceptanceError> {
-    fn visit(
-        root: &Path,
-        current: &Path,
-        depth: usize,
-        total: &mut u64,
-        out: &mut BTreeMap<PathBuf, String>,
-    ) -> Result<(), AcceptanceError> {
-        if depth > MAX_TREE_DEPTH {
-            return Err(invalid("protected state exceeds its depth limit"));
-        }
-        for entry in fs::read_dir(current).map_err(io)? {
-            if out.len() >= MAX_TREE_FILES {
-                return Err(invalid("protected state exceeds its entry limit"));
-            }
-            let entry = entry.map_err(io)?;
-            let path = entry.path();
-            let meta = fs::symlink_metadata(&path).map_err(io)?;
-            if meta.file_type().is_symlink() {
-                return Err(invalid("protected state contains a symlink"));
-            }
-            if meta.is_dir() {
-                out.insert(
-                    path.strip_prefix(root)
-                        .map_err(|_| invalid("protected state path escaped its root"))?
-                        .to_path_buf(),
-                    "directory".to_owned(),
-                );
-                visit(root, &path, depth + 1, total, out)?;
-            } else if meta.is_file() {
-                *total = total
-                    .checked_add(meta.len())
-                    .ok_or_else(|| invalid("protected state byte count overflow"))?;
-                if *total > MAX_TREE_BYTES {
-                    return Err(invalid("protected state exceeds its byte limit"));
-                }
-                out.insert(
-                    path.strip_prefix(root)
-                        .map_err(|_| invalid("protected state path escaped its root"))?
-                        .to_path_buf(),
-                    sha256_regular_file(&path, MAX_BINARY_BYTES)?,
-                );
-            } else {
-                return Err(invalid("protected state contains an unsupported entry"));
-            }
-        }
-        Ok(())
-    }
-    let mut files = BTreeMap::new();
-    let mut total = 0;
-    visit(path, path, 0, &mut total, &mut files)?;
-    if require_nonempty && files.is_empty() {
-        return Err(invalid("required persisted state is empty"));
-    }
-    let mut bytes = Vec::new();
-    for (path, hash) in files {
-        bytes.extend_from_slice(path.to_string_lossy().as_bytes());
-        bytes.push(0);
-        bytes.extend_from_slice(hash.as_bytes());
-        bytes.push(0);
-    }
-    Ok(sha256_bytes(&bytes))
 }
 fn utf8_path<'a>(path: &'a Path, name: &str) -> Result<&'a str, AcceptanceError> {
     path.to_str()
@@ -1300,6 +1086,22 @@ mod tests {
     }
 
     #[test]
+    fn eg2_evidence_requires_the_same_candidate_fixture_and_profile() {
+        let mut evidence = Eg2Evidence {
+            binary_sha256: "a".repeat(64),
+            fixture_sha256: "b".repeat(64),
+            profile_hash: kio_core::eg2::profile_hash().to_owned(),
+        };
+        let binary = "a".repeat(64);
+        let fixture = "b".repeat(64);
+        assert!(evidence.verify(&binary, &fixture).is_ok());
+        assert!(evidence.verify(&fixture, &fixture).is_err());
+        assert!(evidence.verify(&binary, &binary).is_err());
+        evidence.profile_hash = "sha256:wrong".into();
+        assert!(evidence.verify(&binary, &fixture).is_err());
+    }
+
+    #[test]
     fn captured_service_binding_rejects_ca_or_endpoint_mismatch_before_cli() {
         let ca = b"captured-ca";
         let identity = crate::acceptance::ServiceIdentity {
@@ -1356,7 +1158,7 @@ mod tests {
         .unwrap();
 
         let real_profile = real_ocr_profile();
-        let runtime = observed_runtime(scope).unwrap();
+        let runtime = observed_runtime(scope, kio_core::eg2::profile_hash().to_owned()).unwrap();
 
         assert!(is_real_ocr_profile(&real_profile, &real_profile));
         assert_eq!(
