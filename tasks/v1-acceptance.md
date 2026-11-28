@@ -23,12 +23,11 @@ EG2 の成功記録はバイナリ・fixture・プロファイルを結び付け
 
 ### 確認済みの記録と未確認の前提
 
-2026-11-21 に三つの Environment が `main` 専用であることを確認した。これらは当日の記録であり、実行前に再確認する。
+受入で使う以下の Environment は `main` 専用とする。実行前に設定を確認する。
 
 | Environment | 確認対象 |
 | --- | --- |
 | `v1-provider-acceptance` | `GEMINI_API_KEY`、`MISTRAL_API_KEY` |
-| `v1-provider-ledger-authority` | `KIO_LEDGER_APP_PRIVATE_KEY`、`KIO_LEDGER_APP_CLIENT_ID`、`KIO_LEDGER_APP_ID`、`KIO_LEDGER_APP_SLUG`、`KIO_LEDGER_INSTALLATION_ID` |
 | `v1-local-acceptance` | `KIO_LAB_SSH_PRIVATE_KEY`、`KIO_LAB_JUMP_HOST`、`KIO_LAB_JUMP_USER`、`KIO_LAB_KNOWN_HOSTS`、`KIO_TS_CLIENT_ID`、`KIO_TS_AUDIENCE` |
 
 **GPU ホストは研究室の RTX 4060 と個人デスクトップの RTX 4070。** 両台とも WSL 内の kio-test 専用 rootless Docker Engine と NVIDIA Container Toolkit の CDI を使う。Mac 作業中は 4060、停止中・利用不可なら 4070、4070 で作業中は 4070 を使う。両台の構築・接続確認は実行前に行う。同一の受入鍵と両台の Windows・WSL ホスト鍵を登録し、run 開始前に `KIO_LAB_JUMP_HOST` のみを手動で切り替える。3 OS の実行とリース回収が完了するまで接続先を固定する。[構築・切り替え手順](../scripts/v1-local-gpu/README.md#受入ホストの構築)
@@ -37,7 +36,7 @@ EG2 の成功記録はバイナリ・fixture・プロファイルを結び付け
 
 各項目について、**状態**（使える／使えない／不明）と**根拠**（どの画面で何を見たか）を書く。
 
-#### A. 有料 provider（6 件）
+#### A. 有料 provider（5 件）
 
 1. **Google AI Studio / Google Cloud（Gemini）**
    - Environment の `GEMINI_API_KEY` に当たる鍵が、今も有効なものとして一覧にあるか（作成日 2026-09-08 前後、末尾表示が出るならその一致）。削除・無効化・制限の変更がないか。
@@ -46,20 +45,17 @@ EG2 の成功記録はバイナリ・fixture・プロファイルを結び付け
 2. **Mistral（La Plateforme の console）**
    - `MISTRAL_API_KEY` に当たる鍵が有効か（作成日 2026-09-08 前後）。
    - workspace の課金・支払い方法が有効か。月の上限・残高。初回・設定変更・障害時に Batch と正式受入の固定モデルが利用可能かを確認する。モデルは [受入コード](../crates/kio-eval/src/acceptance_provider.rs) を参照する。
-3. **GitHub App（ledger 用）**
-   - GitHub の Settings → Developer settings → GitHub Apps に、`KIO_LEDGER_APP_SLUG` の名前の App があるか。repo `ttokunaga-ja/kio` に install されていて、その installation の権限が Contents の read/write を含み、対象 repo が kio だけか。
-   - App の秘密鍵の登録日と状態を一覧で確かめる。
 
 #### B. GPU 経由のローカル（3 件）
 
-4. **Tailscale の管理画面**
+3. **Tailscale の管理画面**
    - Access controls の policy に `tag:kio-ci` の `tagOwners` と、`tag:kio-ci` から両 GPU ホストの `tcp:22` だけへ到達できる grant があるか。wildcard の grant（`src:["*"], dst:["*"]`）が残っているか。報告には該当する規則と判定根拠を書く。
    - Settings の OAuth clients / Trust credentials（workload identity federation）に、`KIO_TS_CLIENT_ID` と同じ ID のものがあるか。GitHub の OIDC が対象 repo・Environment・main・workflow に束縛され、`tag:kio-ci` だけを要求できるか。
    - Machines で両ホストのアドレス、最終接続日時、key の有効期限、tag を確かめる。
-5. **両ホストの準備状況**
+4. **両ホストの準備状況**
    - Windows の `kio-ci` と制限付き転送、WSL の `kio-test`・forced command・専用 rootless Docker/GPU を両台で確認する。
    - 接続先の WSL が稼働し、空き VRAM が 6,269 MiB 以上あり、Windows・WSL の他ワークロードが GPU を使用していないことを管理者が確認する。受入コントローラは専用 Docker 内の他コンテナ、共有 Docker の稼働中 DeviceRequests 件数、ホスト全体の VRAM を検査する。
 
 初期構築では OIDC/grant、固定 host key、Windows の制限付き forwarding、WSL の forced command と候補未配置時の拒否、既存管理者経路の維持を確かめる。F4 前には選んだホストの候補に束縛された deployment を照合する。GitHub の dispatch 権限を持つ主体も再確認する。main 専用 Environment の branch 制限と、dispatch できる利用者の権限は別に確かめる。整理後の候補 SHA から、移管済みの OCR 設定を含む deployment を生成する。[候補の固定入力と配置の手順](../scripts/v1-local-gpu/README.md#candidate-bound-deployment-proposal) に従う。
 
-確認結果は `scratch/reports/f4/external-status.md` に、9 件を実行できるか、項目番号ごとの状態と根拠、利用者が決めたホスト、必要な対応と担当を記録する。
+確認結果は `scratch/reports/f4/external-status.md` に、8 件を実行できるか、項目番号ごとの状態と根拠、利用者が決めたホスト、必要な対応と担当を記録する。
