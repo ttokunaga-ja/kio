@@ -9,12 +9,12 @@ kio の作業環境は時期によって丸ごと切り替わる（D-20261121-02
 - **F4（正式な受入）は完了した。** 候補は main の `18eead30`。通常 CI（run 46090663831）、native（46097516326）、local（46143557661）、provider（46145639826、campaign `v1-f4-2026-11b`）がそれぞれ成功し、`v1-acceptance-verify.yml`（run 46146328760）が受領書の全体行列を照合して成功した。
 - provider の台帳（branch `codex/provider-acceptance-ledger`）には、この campaign で各 provider USD 1.80 の予約がある（上限 USD 10）。この branch は消さない。
 - GPU 受入は 4070 で行った。研究室は OCR イメージを取得できない（§1）ため、`KIO_LAB_JUMP_HOST` は `100.97.109.109` のままにしている。研究室へ戻すには、イメージを digest を保って移すか、研究室ネットワークで許可を得る必要がある。dispatcher は配置済みの候補しか受け付けないので、候補の SHA が変わるたびに両ホストへ再配置する。
-- F4 後の課題：
-  - 監査で挙がった簡素化と、過剰に厳しい検査の見直し。
-  - EG2 の確認を OCR から切り離す（EG2 は CPU だけで動く）。
-  - local 受入の改善：OCR 起動前の失敗箇所を固定コードで返す。エラー時の cleanup の範囲を Finish までに限る。証跡の artifact 名に attempt を入れる。
-  - 時間に依存するテストの不安定さ：nc2、chunking、`connection_owner_remains_send`、Windows の `windows_scheduler_semantic_comparison_fixtures`。
-  - §1 の LibreOffice と S4U。
+- F4 後の第 1 段（main の `e054b23a` まで）で次を統合した：受入ツールの簡素化（EG2 を GPU のリース前に各 OS で確認、OCR 起動前の固定コード、cleanup を Finish までに限定、artifact 名に attempt、配置する固定ファイルを 5 件に削減）、全文検索・export の tool-lock 一律検査の削除、Office の形式別 probe と LibreOffice 26.8.3.1 のフォントキャッシュ symlink の許容（実変換を確認）、Mistral latest の系列内解決・OCR 応答モデル名の照合統一・Gemini モデルの設定化（`docs/07` を更新）、時間依存テスト 3 件の修正。
+  - 受入ツールの変更で配置する固定ファイルが変わったため、次の local 受入の前に両ホストへ再配置する。
+- 残る課題：
+  - provider 台帳と履歴の回復の自動化（監査 #6・#9）。
+  - chunking の不安定なテスト（該当テスト未特定）。
+  - §1 の S4U。
   - 調査用 branch の `probe/appcontainer`、`probe/win-timing`、`probe/office` を残している。
 
 ## 1. 最後に環境を切り替えた時点の状態（2026-11-21、WSL → Mac）
