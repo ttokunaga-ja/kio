@@ -294,7 +294,6 @@ fn checkpoint_before_commit_interruption_is_explicitly_recoverable() {
     drop(raw);
     assert!(companion(&path, ".write.pending.json").exists());
     assert!(LedgerDb::open_existing(&path).is_err());
-    assert!(db.write(|_| Ok(())).is_err());
     assert_eq!(
         LedgerDb::recover_pending_write(&path).unwrap(),
         PendingWriteRecovery::RestoredBeforeCheckpoint
@@ -308,6 +307,26 @@ fn checkpoint_before_commit_interruption_is_explicitly_recoverable() {
             .unwrap(),
         "ok"
     );
+}
+
+#[test]
+fn next_writer_recovers_matching_journal_before_writing() {
+    let (_dir, path) = fixture();
+    let db = LedgerDb::initialize(&path).unwrap();
+    let before = read_checkpoint(&path);
+    write_pending(&path, &pending_write(&db.authority, &before));
+
+    db.write(|_| Ok(())).unwrap();
+
+    assert!(!companion(&path, ".write.pending.json").exists());
+    assert_eq!(read_checkpoint(&path).seq, before.seq + 1);
+
+    let before = read_checkpoint(&path);
+    write_pending(&path, &pending_write(&db.authority, &before));
+    let reopened = LedgerDb::open_writer_with_control(&path, ControlHandle::default()).unwrap();
+    assert!(!companion(&path, ".write.pending.json").exists());
+    assert_eq!(read_checkpoint(&path), before);
+    assert_eq!(reopened.integrity_check().unwrap(), "ok");
 }
 
 #[test]
@@ -331,10 +350,8 @@ fn recovery_classifies_abort_and_committed_checkpoint_gaps_without_replaying_sql
     let pending = pending_write(&db.authority, &before);
     apply_database_after(&path, &pending);
     write_pending(&path, &pending);
-    assert_eq!(
-        LedgerDb::recover_pending_write(&path).unwrap(),
-        PendingWriteRecovery::PublishedAfterCheckpoint
-    );
+    LedgerDb::open_writer_with_control(&path, ControlHandle::default()).unwrap();
+    assert!(!companion(&path, ".write.pending.json").exists());
     assert_eq!(read_checkpoint(&path).seq, 1);
 
     // A committed checkpointed write only needs finalization of the exact
@@ -393,6 +410,8 @@ fn recovery_refuses_tampered_or_foreign_journal_without_mutation() {
         error_code(LedgerDb::recover_pending_write(&path).unwrap_err()),
         "KIO-E-LEDGER-WRITE-RECOVERY-001"
     );
+    let error = LedgerDb::open_writer_with_control(&path, ControlHandle::default()).unwrap_err();
+    assert!(error.to_string().contains("kio ledger recover"));
     assert_eq!(fs::read(journal).unwrap(), original);
     assert_eq!(read_checkpoint(&path), before);
 }
@@ -443,6 +462,13 @@ fn stale_handle_refuses_another_era_and_database_ahead_is_rejected() {
         error_code(LedgerDb::open_existing(&path).unwrap_err()),
         "KIO-E-LEDGER-SEQUENCE-MISMATCH-001"
     );
+    let error = LedgerDb::open_writer_with_control(&path, ControlHandle::default()).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("without a pending-write journal")
+    );
+    assert!(error.to_string().contains("kio ledger recover"));
     let mut authority = db.authority.clone();
     authority.era = random_id().unwrap();
     fs::write(

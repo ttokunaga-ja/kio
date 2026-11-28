@@ -12,7 +12,7 @@ use crate::embedding::admission::query_embedding_send_lane;
 use crate::invocation::Invocation;
 use crate::ledger_access::TASK_SYNC_EFFECTIVE_TIMEOUT_SECONDS;
 use crate::ledger_access::budget_cap_config;
-use crate::ledger_access::open_optional_ledger_db;
+use crate::ledger_access::open_optional_paid_ledger_db;
 use crate::ledger_access::settle_task_charge_success;
 use crate::ledger_access::settle_task_charge_unknown;
 use crate::markdownize::execution::TaskExecutionFailure;
@@ -422,7 +422,7 @@ pub(crate) fn compute_query_embedding_page1(
     if !embedding_is_free(adapter_settings, execution, invocation.control)?
         && let Some(error) = budget_error
     {
-        return Err(error);
+        crate::ledger_access::recover_after_unsafe_budget_snapshot(error, invocation.control)?;
     }
     run_query_embedding_job(invocation, execution, query, Some(authorizing_repo))
 }
@@ -446,7 +446,7 @@ fn run_query_embedding_job(
     if embedding_is_free(adapter_settings, execution, invocation.control)? {
         return run_free_query_embedding_job(invocation, execution, query, authorizing_repo);
     }
-    let Some(ledger) = open_optional_ledger_db(invocation.control)? else {
+    let Some(ledger) = open_optional_paid_ledger_db(invocation.control)? else {
         return Ok(None);
     };
     let input_hash = device_input_hash(query);

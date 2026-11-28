@@ -944,8 +944,9 @@ authority、checkpoint を検証してから結果を利用・公開する。
 正確な SQLite image を指すことを照合する。既存 DB、pending write、古い世代、変更された artifact、
 欠けた証明は拒否する。台帳 backup/restore で scope の知識、承認、device trust は復元しない。
 
-書込みが中断し整合性が確定するまで後続の書込み・有料処理を止める。回復は
-[ledger recover](06-cli-spec.md#device-global-ledger-recovery) の明示実行に限る。provider 側の
+後続の有料処理は、lifecycle lock 内で中断した書込みの整合性を検証し、証明できれば自動回復する。
+証拠が不足・不一致の場合は有料処理を止め、[ledger recover](06-cli-spec.md#device-global-ledger-recovery)
+による明示検査・回復を案内する。provider 側の
 job 一覧が取得できても、失われた、または照会できない依頼の費用を確定したことにはならない。
 課金状態を確認できる証拠がそろうまで、不明状態を表示して新規の有料処理を止める。
 

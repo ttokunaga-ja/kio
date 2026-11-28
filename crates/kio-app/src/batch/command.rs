@@ -96,6 +96,28 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+pub(crate) fn report_budget_pause(
+    ctx: &Invocation<'_>,
+    layer: kio_pipeline::ledger::ops::CapLayer,
+    candidate_usd: f64,
+    adapter_kind: &str,
+) {
+    use kio_pipeline::ledger::ops::CapLayer;
+    let cap = match layer {
+        CapLayer::Device => "device monthly cap".to_owned(),
+        CapLayer::Folder => "folder monthly cap".to_owned(),
+        CapLayer::PerAdapter => format!("device monthly cap for adapter {adapter_kind}"),
+    };
+    let lane = if crate::embedding::admission::realtime_lane_requested() {
+        "--realtime"
+    } else {
+        "--batch"
+    };
+    ctx.interaction.diagnostic(&format!(
+        "kio: Budget paused by the {cap}. The reservation needs USD {candidate_usd}. After raising the cap, run `kio batch resume --recheck-budget --online {lane}` in this scope."
+    ));
+}
+
 pub(crate) fn run_batch(ctx: &Invocation<'_>, args: BatchArgs) -> Result<CommandResponse> {
     let adapter_settings = ctx.settings;
 

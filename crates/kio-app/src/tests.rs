@@ -3992,7 +3992,31 @@ fn serial_task_charges_reread_and_enforce_the_cap() {
         RequestKind::Sync,
     )
     .unwrap();
-    assert!(matches!(second, TaskChargeOutcome::BudgetExceeded));
+    assert!(matches!(
+        second,
+        TaskChargeOutcome::BudgetExceeded(kio_pipeline::ledger::ops::CapLayer::Device)
+    ));
+
+    let diagnostic =
+        std::sync::Arc::new(crate::test_support::DiagnosticInteraction::new(None, false));
+    crate::batch::command::report_budget_pause(
+        &crate::invocation::Invocation {
+            context: &diagnostic.context(),
+            settings: &std::sync::Arc::new(
+                kio_adapter::tool_lock::AdapterRuntimeSettings::default(),
+            ),
+            control: ledger.control(),
+            locks: &kio_core::scope::LockSession::default(),
+        },
+        kio_pipeline::ledger::ops::CapLayer::Device,
+        0.6,
+        "embedding",
+    );
+    assert_eq!(
+        String::from_utf8(diagnostic.bytes()).unwrap(),
+        "kio: Budget paused by the device monthly cap. The reservation needs USD 0.6. After raising the cap, run `kio batch resume --recheck-budget --online --batch` in this scope.
+"
+    );
 
     // `override_budget` bypasses the same denial (docs/04 §5.4 `kio batch resume
     // --override-budget`).
