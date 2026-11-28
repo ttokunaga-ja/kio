@@ -293,6 +293,11 @@ fn cand_064_malformed_tool_lock_blocks_batch_before_task_mutation() {
             "deadline": null,
             "heartbeat_at": null,
             "fallback_reason": "budget_exceeded",
+            "bbox_annotation_enabled": true,
+            "hold_reason": "budget",
+            "reserved_usd": null,
+            "reserved_month": null,
+            "reservation_id": null,
             "created_at": "2026-07-12T00:00:00Z"
         }),
         json!({
@@ -312,15 +317,18 @@ fn cand_064_malformed_tool_lock_blocks_batch_before_task_mutation() {
             "deadline": null,
             "heartbeat_at": null,
             "fallback_reason": "network_error",
+            "bbox_annotation_enabled": true,
+            "hold_reason": null,
+            "reserved_usd": null,
+            "reserved_month": null,
+            "reservation_id": null,
             "created_at": "2026-07-12T00:00:01Z"
         }),
     ];
-    let mut task_jsonl = String::new();
-    for row in rows {
-        task_jsonl.push_str(&serde_json::to_string(&row).unwrap());
-        task_jsonl.push('\n');
-    }
-    fs::write(&task_path, task_jsonl).unwrap();
+    let tasks = rows.map(|row| serde_json::from_value(row).unwrap());
+    kio_pipeline::task::TaskStore::new(scope.join(".kio"))
+        .replace_all(&tasks)
+        .unwrap();
     let before = fs::read(&task_path).unwrap();
 
     fs::write(
@@ -354,8 +362,8 @@ fn cand_064_malformed_tool_lock_blocks_batch_before_task_mutation() {
         let err = json_failure(&scope, &xdg, args, 2);
         assert_eq!(err["error_code"], "KIO-E-CONFIG-SCHEMA-001");
         assert!(
-            err["message"].as_str().unwrap().contains("tool-lock"),
-            "missing tool-lock must block persisted batch authority: {err}"
+            err["message"].as_str().unwrap().contains("run `kio index`"),
+            "missing tool-lock must explain how to regenerate it: {err}"
         );
         assert_eq!(
             fs::read(&task_path).unwrap(),

@@ -290,12 +290,13 @@ renderer は `KIO_OFFICE_CONVERTER` で指定できる。未指定時は PATH �
 配布元名、固定 install prefix、最低 version の文字列だけで可否を決めない。
 実 executable identity と必要 runtime resource を特定・検証し、同じ実行条件で時間・資源を制限した実変換 probe で
 headless PDF 出力 capability を確認する。名称・version・配布物 digest は provenance と診断に残す。
-実変換 probe は Office 入力の索引・処理と、明示的な診断コマンド `kio status` で行う。
+索引・処理中は変換する形式だけを probe する。明示的な診断コマンド `kio status` は DOCX と PPTX を
+個別に probe し、失敗した形式と理由を表示する。
 `kio search` は renderer の解決や probe を行わず、`index_status.office_conversion_unavailable` に
 現在の公開済み HEAD に対応するファイル別の記録を返す。現在の renderer の利用可否と理由は
 `kio status` で確認する。利用不能時は同コマンドの `office_readiness` に理由を表示する。
-同じ索引実行内では DOCX/PPTX の準備とタスク計画が一つの renderer 判定を共有する。実変換時の
-runtime 検証は各入力で行う。索引時に renderer が利用不能だったファイルは `kio status` の
+同じ索引実行内では検証済み renderer 実体の形式別 probe 結果（成功・失敗）を再利用し、準備と
+タスク計画に使う。一方の形式の probe 失敗は他方の形式の可否に影響しない。実変換時の runtime 検証は各入力で行う。索引時に renderer が利用不能だったファイルは `kio status` の
 `unsupported_inputs` にも表示する。これらのファイル別記録の `readiness_reason` は、索引時の probe の理由を
 UTF-8 の文字境界で最大 1024 バイトまで保持する。変換後の PDF に抽出できるテキストがなく、OCR タスクも
 計画できないファイルには `office_conversion_without_local_text` を記録する。
@@ -317,7 +318,7 @@ Windows の Office renderer は AppContainer を使わず、専用の Job で re
 ネットワークにアクセスできる。Job はそれらのアクセスを制限しない。この実行条件を Windows Office の
 準備 profile に結び付ける。
 Windows は、GUI launcher の `--version` がコンソール入力を待つため、別プロセスでの version 照会を省略し、
-provenance の version を `unknown` とする。DOCX と PPTX の両方の実変換で readiness を判定する。
+provenance の version を `unknown` とする。
 version 応答の形式差だけを「未導入」と扱わず、検出済みだが利用不能なら具体的な理由を表示する。
 CI の配布物 SHA pin は再現性のため維持し、製品の一般的な版許可リストにはしない。
 
@@ -341,7 +342,9 @@ renderer scratch は [Kio 作成物の保護](10-operations.md#43-kio-created-ob
 Linux と macOS は関連のない private file とネットワークへのアクセスを隔離し、隔離できなければ変換を拒否する。
 Office 入力は 100 MiB、PDF 出力は 250 MiB とする。変換の wall-clock と CPU 時間の上限は各 300 秒、
 対応環境のアドレス空間・Job メモリの上限は 2 GiB とする。scratch 増加の監視はカーネルの disk quota を
-提供しない。終了時はプロセスツリーを後始末する。
+提供しない。macOS の scratch 監視では、`cache/fontconfig` にある Fontconfig の互換キャッシュ名が
+同じディレクトリにある同一キャッシュの通常ファイルを指す場合、リンクをたどらず、実ファイルのサイズを数える。
+変換 PDF は保持済みの出力ディレクトリからリンクをたどらずに読む。終了時はプロセスツリーを後始末する。
 
 Windows では renderer を `CREATE_NO_WINDOW` 付きで起動し、Job に最大 8 プロセス、2 GiB のメモリ、
 300 秒の CPU 時間の上限を適用する。標準入出力のハンドルだけを渡し、stdout と stderr の採取量を制限する。

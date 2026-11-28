@@ -4,9 +4,9 @@ use crate::object_persistence::adapter_to_kio;
 use crate::search::query::toml_f64;
 use crate::search::query::toml_u64;
 use kio_adapter::catalog::declared_deterministic_embedding_profile;
-use kio_adapter::tool_lock::MAX_TOOLS_TOML_BYTES;
 use kio_adapter::tool_lock::load_tool_lock;
 use kio_adapter::tool_lock::parse_tools_toml_for_roles;
+use kio_adapter::tool_lock::{MAX_TOOLS_TOML_BYTES, ToolLock};
 use kio_adapter::types::ExecutionMode;
 use kio_core::KioError;
 use kio_core::Result;
@@ -500,25 +500,11 @@ fn validate_device_config_path(path: &Path, usage: DeviceConfigUse<'_>) -> Resul
 }
 
 pub(crate) fn validate_repo_tool_lock(repo: &Repository) -> Result<()> {
-    let path = repo.kio_dir().join("tool-lock.json");
-    match fs::symlink_metadata(&path) {
-        Ok(metadata) if metadata.file_type().is_file() => {}
-        Ok(_) => return Err(KioError::schema("tool-lock must be a regular file")),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(KioError::io(error.to_string(), path.display().to_string())),
-    }
-    let bytes =
-        fs::read(&path).map_err(|err| KioError::io(err.to_string(), path.display().to_string()))?;
-    load_tool_lock(&bytes).map(|_| ()).map_err(adapter_to_kio)
+    load_working_tool_lock(repo.kio_dir()).map(|_| ())
 }
 
-/// The persisted current embedding profile that selects the one vector space a
-/// `repair rebuild-db` may replay.  This intentionally does not consult the
-/// active adapter: recovery must work while its environment is unavailable.
-/// A missing lock or a lock without `embedding` means text-only replay.
-pub(crate) fn rebuild_embedding_entry_from_tool_lock(
-    kio_dir: &Path,
-) -> Result<Option<kio_adapter::tool_lock::EmbeddingToolLockEntry>> {
+fn load_working_tool_lock(kio_dir: &Path) -> Result<Option<ToolLock>> {
+    const MAX_TOOL_LOCK_BYTES: u64 = 1024 * 1024;
     let path = kio_dir.join("tool-lock.json");
     match fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.file_type().is_file() => {}
@@ -526,10 +512,17 @@ pub(crate) fn rebuild_embedding_entry_from_tool_lock(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(KioError::io(error.to_string(), path.display().to_string())),
     }
-    let bytes = fs::read(&path)
-        .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?;
-    let lock = load_tool_lock(&bytes).map_err(adapter_to_kio)?;
-    Ok(lock.embedding)
+    let bytes = read_bounded_regular_file(&path, MAX_TOOL_LOCK_BYTES)?;
+    load_tool_lock(&bytes).map(Some).map_err(adapter_to_kio)
+}
+
+/// The persisted current embedding profile that selects the one vector space a
+/// `repair rebuild-db` may replay. This intentionally does not consult the
+/// active adapter. A missing lock or a lock without embedding means text-only replay.
+pub(crate) fn rebuild_embedding_entry_from_tool_lock(
+    kio_dir: &Path,
+) -> Result<Option<kio_adapter::tool_lock::EmbeddingToolLockEntry>> {
+    Ok(load_working_tool_lock(kio_dir)?.and_then(|lock| lock.embedding))
 }
 
 pub(crate) fn embedding_profile_summary(
@@ -571,15 +564,13 @@ pub(crate) fn rebuild_embedding_profile_from_tool_lock(
 }
 
 pub(crate) fn require_repo_tool_lock(repo: &Repository) -> Result<()> {
-    let path = repo.kio_dir().join("tool-lock.json");
-    match fs::symlink_metadata(&path) {
-        Ok(metadata) if metadata.file_type().is_file() => validate_repo_tool_lock(repo),
-        Ok(_) => Err(KioError::schema("tool-lock must be a regular file")),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(KioError::schema(
-            "tool-lock is required before executing persisted batch tasks; run `kio index` to regenerate it",
-        )),
-        Err(error) => Err(KioError::io(error.to_string(), path.display().to_string())),
-    }
+    load_working_tool_lock(repo.kio_dir())?
+        .map(|_| ())
+        .ok_or_else(|| {
+            KioError::schema(
+                "tool-lock is required for the selected batch work; run `kio index` in this scope to regenerate .kio/tool-lock.json",
+            )
+        })
 }
 
 fn user_tools_toml_path(control: &ControlHandle) -> Option<PathBuf> {

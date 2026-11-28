@@ -53,7 +53,9 @@ use kio_adapter::catalog::standard_online_markdownize_profile;
 use kio_adapter::catalog::standard_online_markdownize_profile_with_bbox;
 #[cfg(debug_assertions)]
 use kio_adapter::identity::tool_profile_hash;
-use kio_adapter::office_convert::{is_office_media, resolve_office_converter_with_control};
+use kio_adapter::office_convert::{
+    OfficeConverter, OfficeUnavailable, is_office_media, resolve_office_converter_with_control,
+};
 use kio_adapter::tool_lock::AdapterRuntimeSettings;
 use kio_adapter::traits::MarkdownizeAdapter;
 #[cfg(debug_assertions)]
@@ -94,9 +96,9 @@ use kio_pipeline::markdownize::{
 };
 use kio_pipeline::prepare::PreparedUnit;
 use kio_pipeline::prepare::map_units;
+use kio_pipeline::prepare::prepare_staged_with_converter;
 use kio_pipeline::prepare::unsupported_reason_for_content;
 use kio_pipeline::prepare::{ExtractionBudget, PrepareStageBytesRequest};
-use kio_pipeline::prepare::{prepare_staged, prepare_staged_with_converter};
 use kio_pipeline::scan::ScanCandidate;
 use kio_pipeline::scan::ScanPreview;
 use kio_pipeline::task::TaskStatus;
@@ -1131,10 +1133,12 @@ pub(crate) fn run_index_pipeline(
         );
         let office = is_office_media(&candidate.media_type);
         let readiness = office.then(|| {
-            &*office_readiness
-                .get_or_insert_with(|| resolve_office_converter_with_control(repo.control()))
+            probe_office_format(&mut office_readiness, &candidate.media_type, repo.control())
         });
-        let converter = readiness.and_then(|result| result.as_ref().ok());
+        let converter = readiness
+            .as_ref()
+            .and_then(|result| result.as_ref().ok())
+            .copied();
         let staged = match prepare_staged_with_converter(
             &extraction_store,
             PrepareStageBytesRequest {
@@ -1837,6 +1841,19 @@ pub(crate) fn run_index_pipeline(
     Ok((result, unsupported_observations))
 }
 
+fn probe_office_format<'a>(
+    renderer: &'a mut Option<std::result::Result<OfficeConverter, OfficeUnavailable>>,
+    media_type: &str,
+    control: &kio_core::control::ControlHandle,
+) -> std::result::Result<&'a OfficeConverter, OfficeUnavailable> {
+    let converter = renderer
+        .get_or_insert_with(|| resolve_office_converter_with_control(control))
+        .as_ref()
+        .map_err(Clone::clone)?;
+    converter.probe(media_type)?;
+    Ok(converter)
+}
+
 /// Resume local holds whose original is still the archived and live input.
 /// Promote only their normalization refs, leaving the other HEAD entries alone.
 pub(crate) fn retry_local_extractions(
@@ -1879,6 +1896,7 @@ pub(crate) fn retry_local_extractions(
             })?;
             completed.push(&retry_retirement(task, normalize))
         };
+    let mut office_readiness = None;
     for task in tasks.iter() {
         let task = task?;
         if task.output_ref != EXTRACTION_HOLD_OUTPUT_REF || task.resource_limit.is_none() {
@@ -1928,7 +1946,12 @@ pub(crate) fn retry_local_extractions(
             continue;
         }
         let result = (|| {
-            let staged = prepare_staged(
+            let converter = is_office_media(media_type)
+                .then(|| {
+                    probe_office_format(&mut office_readiness, media_type, repo.control()).ok()
+                })
+                .flatten();
+            let staged = prepare_staged_with_converter(
                 &directory,
                 PrepareStageBytesRequest {
                     raw_hash: &task.input_hash,
@@ -1938,6 +1961,7 @@ pub(crate) fn retry_local_extractions(
                     bytes: &verified.bytes,
                 },
                 ExtractionBudget::new(tier),
+                converter,
             )
             .map_err(pipeline_to_kio)?;
             if matches!(media_type, "image/png" | "image/jpeg" | "image/webp") {

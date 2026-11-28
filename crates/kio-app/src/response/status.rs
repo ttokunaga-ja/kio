@@ -75,12 +75,34 @@ pub struct OfficeReadiness {
 pub(crate) fn office_readiness(
     control: &kio_core::control::ControlHandle,
 ) -> Option<OfficeReadiness> {
-    match kio_adapter::office_convert::resolve_office_converter_with_control(control) {
-        Ok(_) => None,
-        Err(error) => Some(OfficeReadiness {
-            state: error.state,
-            reason: error.reason,
-            alternatives: "Text and Markdown, PDF text layer and direct XLSX extraction remain available; existing content remains searchable.",
-        }),
-    }
+    use kio_adapter::office_convert::{
+        DOCX_MEDIA_TYPE, OfficeUnavailable, PPTX_MEDIA_TYPE, resolve_office_converter_with_control,
+    };
+
+    let unavailable = match resolve_office_converter_with_control(control) {
+        Err(error) => error,
+        Ok(converter) => {
+            let reasons = [("DOCX", DOCX_MEDIA_TYPE), ("PPTX", PPTX_MEDIA_TYPE)]
+                .into_iter()
+                .filter_map(|(format, media_type)| {
+                    converter
+                        .probe(media_type)
+                        .err()
+                        .map(|error| format!("{format}: {}", error.reason))
+                })
+                .collect::<Vec<_>>();
+            if reasons.is_empty() {
+                return None;
+            }
+            OfficeUnavailable {
+                state: "unusable",
+                reason: reasons.join(" | "),
+            }
+        }
+    };
+    Some(OfficeReadiness {
+        state: unavailable.state,
+        reason: unavailable.reason,
+        alternatives: "Text and Markdown, PDF text layer and direct XLSX extraction remain available; existing content remains searchable.",
+    })
 }

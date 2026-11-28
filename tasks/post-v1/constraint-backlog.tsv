@@ -1,6 +1,6 @@
 ID	優先度	内容	当時の提案	今回の整理	出典
 APP-03	高	管理CAの異常が無関係なローカルコマンドを止める	relax	main実装あり（静的確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:62
-APP-04	高	Adapterを使わない処理も全体設定の検証で停止する	relax	main実装あり（静的確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:115
+APP-04	高	Adapterを使わない処理も全体設定の検証で停止する	relax	全文検索・原本 export の作業用 tool-lock 一律検査を削除。Batch の検査を対象タスクに限定	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:115
 APP-02	高	課金台帳の異常でテキスト検索・状態照会・オフライン索引作成も失敗する	relax	main実装あり（静的確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:157
 AD-01	高	合意済みのloopback HTTPが実装では引き続き拒否される	relax	main実装あり（静的確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:205
 APP-01	高	無料のローカル埋め込みにも課金台帳が必要	relax	main実装あり（静的確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:288
@@ -9,7 +9,7 @@ ST04	高	原本512 MiB・scope合計4 GiBでarchive/statusを停止	relax	残件
 APP-26	高	前処理出力の変化で通常索引更新と監視が停止する	remove	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:470
 AD-14	高	PDFの固定page/object/展開上限で通常の大きい文書も拒否する	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:507
 AD-16	高	XLSXのsheet/row/cell上限とvisual未抽出	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:574
-AD-17	高	Office rendererの配布元・版・path・sandbox前提	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:646
+AD-17	高	Office rendererの配布元・版・path・sandbox前提	relax	Office の probe を renderer 実体・形式ごとに再利用。macOS Fontconfig の内部互換リンクに対応、実変換の確認は未完	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:646
 PROC-01	高	Linux の systemd/cgroup 必須構成が、通常の個人用 PC でも Office 変換を制限する	user decision	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:728
 ST01	高	管理ルート・私有状態に祖先のACL・mode・所有者条件を要求	relax	main実装あり（静的確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:796
 AD-30	高	task/unsupported追記journalの固定寿命上限	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:883
@@ -48,7 +48,7 @@ AD-05	低／対象者限定	plain認証情報は現在のowner-private toolsフ�
 AD-09	低／対象者限定	scanのno-follow・同一handle・変更検出	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:2790
 AD-12	低／対象者限定	prepare入力bytesとraw hashの一致を要求する	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:2857
 AD-13	低／対象者限定	非text・弱いPDF textをdeterministic検索本文にしない	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:2904
-AD-18	低／対象者限定	Office実行体fingerprintと時間・byte上限	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:2966
+AD-18	低／対象者限定	Office実行体fingerprintと時間・byte上限	relax	形式別 probe の成功・失敗を再利用。実変換時の fingerprint・隔離・時間・byte 上限を維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:2966
 AD-19	低／対象者限定	大きいunit alignmentは全unit変更へ縮退する	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:3033
 AD-20	低／対象者限定	normalized応答の完全一致・構造・容量受入検査	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:3085
 AD-21	低／対象者限定	OCR・annotationの件数と展開後byte上限	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:3157
