@@ -568,7 +568,10 @@ fn fixture() -> (
     (directory, conn, name, trace)
 }
 fn cleaned(name: &CStr, trace: &Trace) {
-    assert!(unsafe { ffi::sqlite3_vfs_find(name.as_ptr()) }.is_null());
+    // The owner allocation can be reused by another parallel test after drop,
+    // giving its VFS the same address-derived name. State::drop checks the
+    // registration while this owner's allocation is still alive.
+    let _ = name;
     assert_eq!(trace.closed.load(Ordering::SeqCst), 1);
     assert_eq!(trace.dropped.load(Ordering::SeqCst), 1);
     assert!(trace.close_registered.load(Ordering::SeqCst));
