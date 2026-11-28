@@ -26,35 +26,28 @@ use windows_sys::Win32::{
     },
     Security::Authorization::{ConvertStringSidToSidW, GetSecurityInfo, SE_FILE_OBJECT},
     Security::{
-        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_REVISION, ACL_SIZE_INFORMATION,
-        AddAccessAllowedAce, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation,
-        GetLengthSid, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
-        GetSecurityDescriptorOwner, GetTokenInformation, INHERIT_ONLY_ACE, InitializeAcl,
-        InitializeSecurityDescriptor, IsValidSid, IsWellKnownSid, OWNER_SECURITY_INFORMATION,
-        PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, SECURITY_DESCRIPTOR,
-        SetSecurityDescriptorControl, SetSecurityDescriptorDacl, SetSecurityDescriptorOwner,
-        TOKEN_QUERY, TOKEN_USER, TokenUser, WinBuiltinAdministratorsSid, WinLocalSystemSid,
+        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION, EqualSid,
+        GetAce, GetAclInformation, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
+        INHERIT_ONLY_ACE, IsValidSid, IsWellKnownSid, OWNER_SECURITY_INFORMATION, PSID,
+        WinBuiltinAdministratorsSid, WinLocalSystemSid,
     },
     Storage::FileSystem::{
         FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
         FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, READ_CONTROL,
         SYNCHRONIZE,
     },
-    System::{
-        IO::IO_STATUS_BLOCK,
-        Threading::{GetCurrentProcess, OpenProcessToken},
-        WindowsProgramming::FILE_CREATED,
-    },
+    System::{IO::IO_STATUS_BLOCK, WindowsProgramming::FILE_CREATED},
 };
 
+use super::private_snapshot::{
+    AclShape, CurrentUserSid, OwnerOnlyDescriptor, SecurityDescriptor, SidProbe, verify_descriptor,
+};
 use crate::Result;
 use crate::private_fs::{oversized_file, raced_file, unsafe_file};
 use crate::store_dir::StoreDirectory;
 
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
 const ACL_SIZE_INFORMATION_CLASS: i32 = 2;
-const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
-const FILE_ALL_ACCESS: u32 = 0x001f_01ff;
 const ACCESS_DENIED_ACE_TYPE: u8 = 1;
 const GENERIC_ALL: u32 = 0x1000_0000;
 const GENERIC_WRITE: u32 = 0x4000_0000;
@@ -100,22 +93,8 @@ pub(crate) fn create_new_private_at(
     {
         return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
     }
-    let owner = CurrentUserSid::current()?;
-    let (_acl, acl_ptr) = private_acl(&owner)?;
-    let mut descriptor = SECURITY_DESCRIPTOR::default();
-    let descriptor_ptr: PSECURITY_DESCRIPTOR = (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast();
-    // SAFETY: `descriptor_ptr` is the Windows binding's erased mutable
-    // pointer to the absolute descriptor. It, the aligned ACL, and the
-    // owner SID remain live through NtCreateFile below.
-    if unsafe { InitializeSecurityDescriptor(descriptor_ptr, SECURITY_DESCRIPTOR_REVISION) } == 0
-        || unsafe { SetSecurityDescriptorOwner(descriptor_ptr, owner.as_psid(), 0) } == 0
-        || unsafe { SetSecurityDescriptorDacl(descriptor_ptr, 1, acl_ptr, 0) } == 0
-        || unsafe {
-            SetSecurityDescriptorControl(descriptor_ptr, SE_DACL_PROTECTED, SE_DACL_PROTECTED)
-        } == 0
-    {
-        return Err(std::io::Error::last_os_error());
-    }
+    let owner = CurrentUserSid::current(SidProbe::SizeOnly)?;
+    let mut descriptor = OwnerOnlyDescriptor::new(&owner, None)?;
     let mut unicode = UNICODE_STRING {
         Length: (name.len() * mem::size_of::<u16>()) as u16,
         MaximumLength: (name.len() * mem::size_of::<u16>()) as u16,
@@ -126,7 +105,7 @@ pub(crate) fn create_new_private_at(
         RootDirectory: parent.as_raw_handle() as HANDLE,
         ObjectName: &mut unicode,
         Attributes: OBJ_CASE_INSENSITIVE,
-        SecurityDescriptor: &descriptor,
+        SecurityDescriptor: descriptor.as_raw().cast(),
         SecurityQualityOfService: ptr::null(),
     };
     let (desired_access, file_attributes, create_options) = match kind {
@@ -251,27 +230,10 @@ pub(crate) fn create_new_private_at(
     Ok(file)
 }
 
-fn private_acl(owner: &CurrentUserSid) -> std::io::Result<(Vec<u32>, *mut ACL)> {
-    let bytes = mem::size_of::<ACL>()
-        .saturating_add(mem::size_of::<ACCESS_ALLOWED_ACE>() - mem::size_of::<u32>())
-        .saturating_add(owner.len());
-    let mut acl = vec![0_u32; bytes.div_ceil(mem::size_of::<u32>())];
-    let acl_ptr = acl.as_mut_ptr().cast::<ACL>();
-    // SAFETY: DWORD-aligned storage has at least `bytes` bytes for the
-    // ACL and owner SID, and both remain live for the caller's use.
-    if unsafe { InitializeAcl(acl_ptr, bytes as u32, ACL_REVISION) } == 0
-        || unsafe { AddAccessAllowedAce(acl_ptr, ACL_REVISION, FILE_ALL_ACCESS, owner.as_psid()) }
-            == 0
-    {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok((acl, acl_ptr))
-}
-
 /// Verify a retained Windows handle's owner-private ACL before another crate
 /// creates operational artifacts beneath it. This never repairs permissions.
 pub fn verify_owner_private_handle(file: &File) -> Result<()> {
-    let owner = CurrentUserSid::current()
+    let owner = CurrentUserSid::current(SidProbe::SizeOnly)
         .map_err(|_| unsafe_file("cannot determine current Windows user", None))?;
     verify_owner_only(file, &owner, Path::new("<retained>"))
 }
@@ -279,7 +241,7 @@ pub fn verify_owner_private_handle(file: &File) -> Result<()> {
 /// Require that a retained Windows file or directory belongs to the current
 /// user without changing its security descriptor.
 pub(crate) fn verify_current_owner_handle(file: &File) -> Result<()> {
-    let owner = CurrentUserSid::current()
+    let owner = CurrentUserSid::current(SidProbe::SizeOnly)
         .map_err(|_| unsafe_file("cannot determine current Windows user", None))?;
     verify_current_owner(file, &owner, Path::new("<retained>"))
 }
@@ -287,7 +249,7 @@ pub(crate) fn verify_current_owner_handle(file: &File) -> Result<()> {
 pub(crate) fn verify_private_directory_handle(directory: &StoreDirectory) -> Result<()> {
     let handle = directory.root_handle();
     verify_real_directory(&handle, directory.path())?;
-    let owner = CurrentUserSid::current().map_err(|_| {
+    let owner = CurrentUserSid::current(SidProbe::SizeOnly).map_err(|_| {
         unsafe_file(
             "cannot determine current Windows user",
             Some(directory.path()),
@@ -338,7 +300,7 @@ pub(crate) fn verify_private_directory(
     control: crate::control::ControlHandle,
 ) -> Result<StoreDirectory> {
     let (root_path, components) = windows_absolute_components(path)?;
-    let owner = CurrentUserSid::current()
+    let owner = CurrentUserSid::current(SidProbe::SizeOnly)
         .map_err(|_| unsafe_file("cannot determine current Windows user", Some(path)))?;
     let root = cap_fs::open_ambient_dir(&root_path, ambient_authority())
         .map_err(|_| unsafe_file("cannot open Windows filesystem root", Some(path)))?;
@@ -386,7 +348,7 @@ pub(crate) fn read_private_file(
     _control: crate::control::ControlHandle,
 ) -> Result<Vec<u8>> {
     let (root_path, components) = windows_absolute_components(path)?;
-    let owner = CurrentUserSid::current()
+    let owner = CurrentUserSid::current(SidProbe::SizeOnly)
         .map_err(|_| unsafe_file("cannot determine current Windows user", Some(path)))?;
     let root = cap_fs::open_ambient_dir(&root_path, ambient_authority())
         .map_err(|_| unsafe_file("cannot open Windows filesystem root", Some(path)))?;
@@ -419,7 +381,7 @@ pub(crate) fn read_private_file_at_path(
     deadline: Option<std::time::Instant>,
 ) -> Result<Vec<u8>> {
     let leaf = direct_leaf(name, parent.path())?;
-    let owner = CurrentUserSid::current().map_err(|_| {
+    let owner = CurrentUserSid::current(SidProbe::SizeOnly).map_err(|_| {
         crate::private_fs::unsafe_file("cannot determine current Windows user", Some(parent.path()))
     })?;
     let handle = parent.root_handle();
@@ -527,7 +489,7 @@ pub(crate) fn verify_trusted_system_tool(path: &Path) -> Result<()> {
 
 fn verify_executable(path: &Path, system_tool: bool) -> Result<()> {
     let (root_path, components) = windows_absolute_components(path)?;
-    let current = CurrentUserSid::current()
+    let current = CurrentUserSid::current(SidProbe::SizeOnly)
         .map_err(|_| unsafe_file("cannot determine current Windows user", Some(path)))?;
     let root = cap_fs::open_ambient_dir(&root_path, ambient_authority())
         .map_err(|_| unsafe_file("cannot open scheduler executable root", Some(path)))?;
@@ -701,121 +663,20 @@ fn verify_current_owner(file: &File, owner: &CurrentUserSid, path: &Path) -> Res
 }
 
 fn verify_owner_only(file: &File, owner: &CurrentUserSid, path: &Path) -> Result<()> {
-    let mut returned = ptr::null_mut();
-    // SAFETY: the handle is retained by `file`; Windows allocates the
-    // returned self-relative descriptor, which is freed below.
-    let status = unsafe {
-        GetSecurityInfo(
-            file.as_raw_handle() as HANDLE,
-            SE_FILE_OBJECT,
-            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-            ptr::null_mut(),
-            ptr::null_mut(),
-            ptr::null_mut(),
-            ptr::null_mut(),
-            &mut returned,
-        )
-    };
-    if status != 0 || returned.is_null() {
-        if !returned.is_null() {
-            // SAFETY: GetSecurityInfo allocated the partial descriptor.
-            unsafe { LocalFree(returned as _) };
-        }
-        return Err(unsafe_file(
-            "cannot inspect private trust file Windows ACL",
-            Some(path),
-        ));
-    }
-    let result = verify_descriptor(returned, owner);
-    // SAFETY: returned by GetSecurityInfo above.
-    unsafe { LocalFree(returned as _) };
+    let descriptor = SecurityDescriptor::read(file)
+        .map_err(|_| unsafe_file("cannot inspect private trust file Windows ACL", Some(path)))?;
+    let result = verify_descriptor(
+        &descriptor,
+        owner,
+        AclShape::ExactCreated(0),
+        std::io::ErrorKind::PermissionDenied,
+    );
     result.map_err(|_| {
         unsafe_file(
             "private trust file Windows ACL is not protected owner-only",
             Some(path),
         )
     })
-}
-
-fn verify_descriptor(
-    descriptor: PSECURITY_DESCRIPTOR,
-    owner: &CurrentUserSid,
-) -> std::io::Result<()> {
-    let mut actual_owner = ptr::null_mut();
-    let mut owner_defaulted = 0;
-    let mut dacl_present = 0;
-    let mut dacl = ptr::null_mut();
-    let mut dacl_defaulted = 0;
-    let mut control = 0_u16;
-    let mut revision = 0_u32;
-    // SAFETY: descriptor came from GetSecurityInfo and all out-pointers
-    // reference writable storage of the required layouts.
-    if unsafe { GetSecurityDescriptorOwner(descriptor, &mut actual_owner, &mut owner_defaulted) }
-        == 0
-        || unsafe {
-            GetSecurityDescriptorDacl(
-                descriptor,
-                &mut dacl_present,
-                &mut dacl,
-                &mut dacl_defaulted,
-            )
-        } == 0
-        || unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0
-    {
-        return Err(std::io::Error::last_os_error());
-    }
-    if actual_owner.is_null()
-        || unsafe { EqualSid(actual_owner, owner.as_psid()) } == 0
-        || dacl_present == 0
-        || dacl.is_null()
-        || owner_defaulted != 0
-        || dacl_defaulted != 0
-        || revision != SECURITY_DESCRIPTOR_REVISION
-        || control & SE_DACL_PROTECTED == 0
-    {
-        return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
-    }
-    let mut info = ACL_SIZE_INFORMATION::default();
-    // SAFETY: DACL came from the validated descriptor; output size matches.
-    if unsafe {
-        GetAclInformation(
-            dacl,
-            (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
-            mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
-            ACL_SIZE_INFORMATION_CLASS,
-        )
-    } == 0
-    {
-        return Err(std::io::Error::last_os_error());
-    }
-    if info.AceCount != 1 {
-        return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
-    }
-    let mut ace = ptr::null_mut();
-    // SAFETY: index zero exists because AceCount is exactly one.
-    if unsafe { GetAce(dacl, 0, &mut ace) } == 0 || ace.is_null() {
-        return Err(std::io::Error::last_os_error());
-    }
-    let header = ace.cast::<ACE_HEADER>();
-    let allowed = ace.cast::<ACCESS_ALLOWED_ACE>();
-    if unsafe { (*header).AceType } != ACCESS_ALLOWED_ACE_TYPE
-        || unsafe { (*header).AceFlags } != 0
-        || unsafe { (*allowed).Mask } != FILE_ALL_ACCESS
-        || unsafe { (*header).AceSize as usize }
-            != mem::size_of::<ACCESS_ALLOWED_ACE>() - mem::size_of::<u32>() + owner.len()
-    {
-        return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
-    }
-    // SAFETY: the ACE size above bounds the variable SID at SidStart.
-    let ace_sid = unsafe {
-        (&(*allowed).SidStart as *const u32)
-            .cast_mut()
-            .cast::<c_void>()
-    };
-    if unsafe { EqualSid(ace_sid, owner.as_psid()) } == 0 {
-        return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
-    }
-    Ok(())
 }
 
 fn verify_trusted_acl(
@@ -979,67 +840,6 @@ fn trusted_system_sid(sid: PSID) -> bool {
         unsafe { LocalFree(trusted_installer as _) };
     }
     trusted
-}
-
-struct CurrentUserSid {
-    bytes: Vec<usize>,
-}
-impl CurrentUserSid {
-    fn current() -> std::io::Result<Self> {
-        let mut token = ptr::null_mut();
-        // SAFETY: current-process pseudo handle and output token pointer are valid.
-        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let result = Self::from_token(token);
-        // SAFETY: OpenProcessToken returned this handle.
-        unsafe { CloseHandle(token) };
-        result
-    }
-    fn from_token(token: HANDLE) -> std::io::Result<Self> {
-        let mut needed = 0_u32;
-        // SAFETY: null buffer is the documented size probe.
-        let _ = unsafe { GetTokenInformation(token, TokenUser, ptr::null_mut(), 0, &mut needed) };
-        if needed == 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let mut words = vec![0_usize; (needed as usize).div_ceil(mem::size_of::<usize>())];
-        // SAFETY: allocation has at least `needed` bytes and correct alignment.
-        if unsafe {
-            GetTokenInformation(
-                token,
-                TokenUser,
-                words.as_mut_ptr().cast(),
-                needed,
-                &mut needed,
-            )
-        } == 0
-        {
-            return Err(std::io::Error::last_os_error());
-        }
-        let sid = unsafe { (*(words.as_ptr().cast::<TOKEN_USER>())).User.Sid };
-        if sid.is_null() {
-            return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
-        }
-        let length = unsafe { GetLengthSid(sid) } as usize;
-        if length == 0 || length > needed as usize {
-            return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
-        }
-        let mut bytes = vec![0_usize; length.div_ceil(mem::size_of::<usize>())];
-        // SAFETY: both regions are valid, non-overlapping SID buffers.
-        unsafe {
-            ptr::copy_nonoverlapping(sid.cast::<u8>(), bytes.as_mut_ptr().cast::<u8>(), length)
-        };
-        Ok(Self { bytes })
-    }
-    fn as_psid(&self) -> PSID {
-        self.bytes.as_ptr().cast_mut().cast()
-    }
-    fn len(&self) -> usize {
-        // SAFETY: `self` owns the validated SID buffer returned by the
-        // current-process token query.
-        unsafe { GetLengthSid(self.as_psid()) as usize }
-    }
 }
 
 pub(crate) fn resolve_inherited_private_root(

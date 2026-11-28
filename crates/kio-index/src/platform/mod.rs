@@ -4,9 +4,6 @@ mod registry_linux;
 #[cfg(target_os = "macos")]
 #[path = "macos/registry.rs"]
 mod registry_macos;
-#[cfg(windows)]
-#[path = "windows/registry_security.rs"]
-mod registry_security;
 #[cfg(unix)]
 #[path = "unix/registry.rs"]
 mod registry_unix;

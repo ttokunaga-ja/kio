@@ -541,12 +541,10 @@ pub(crate) fn observe_leaf(
     }))
 }
 
-pub(crate) struct PrivateSnapshotStorage(
-    crate::platform::registry_security::RegistrySnapshotPrivateDir,
-);
+pub(crate) struct PrivateSnapshotStorage(kio_core::platform::PrivateSnapshotDirectory);
 impl PrivateSnapshotStorage {
     pub(crate) fn create() -> std::result::Result<Self, SnapshotAttemptError> {
-        crate::platform::registry_security::RegistrySnapshotPrivateDir::create()
+        kio_core::platform::PrivateSnapshotDirectory::create_registry()
             .map(Self)
             .map_err(|error| {
                 SnapshotAttemptError::Unstable(format!(

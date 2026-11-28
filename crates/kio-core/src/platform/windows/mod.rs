@@ -39,6 +39,8 @@ pub(crate) mod primitives;
 #[cfg(windows)]
 pub(crate) mod private_fs;
 #[cfg(windows)]
+pub(super) mod private_snapshot;
+#[cfg(windows)]
 pub(crate) mod profile;
 #[cfg(windows)]
 pub(crate) mod removal_semantics;
