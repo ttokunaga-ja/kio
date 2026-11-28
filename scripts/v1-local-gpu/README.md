@@ -3,9 +3,10 @@
 `gpu-phase.sh` is the host-side PaddleOCR controller for both acceptance hosts.
 Run it as `kio-test`. The private route binds the pinned
 OCR service and public TLS identity to the exact release candidate.
-A08 stops OCR and releases its GPU lease before the Actions client explicitly
-installs and verifies EG2 in its isolated device state. The packaged native
-runtime on the client runs indexing and queries with `--offline`.
+Each A08 runner checks CPU EG2 before connecting to the GPU route. It uses
+the packaged native runtime in a separate work directory and runs indexing
+and queries with `--offline`. The OCR phase binds that evidence into the
+per-OS receipt.
 
 The controller uses the reviewed `kio-acceptance-tools` binary from
 `crates/kio-eval/src/acceptance_tools` and `acceptance_tools_main.rs`.
@@ -47,9 +48,10 @@ including exited containers. A failed cleanup preserves the lease as unknown.
 
 Before starting, the controller proves the OCR project absent and captures an
 immutable private GPU baseline. It checks the GPU UUID and total memory,
-requires 6,141 MiB plus 128 MiB of free memory, and refuses unrelated running containers on the dedicated engine. Cleanup waits for the same GPU to return to within 128 MiB of
-its recorded used memory. After interrupted init, cleanup without a baseline
-requires a valid GPU sample and proof that the exact OCR project is absent.
+requires 6,141 MiB plus 128 MiB of free memory, and refuses unrelated running
+containers on the dedicated engine. After proving project absence, cleanup
+records the host-wide VRAM observation in private `state/vram-recovery`.
+The next start checks its own free-memory sample and shared GPU count again.
 
 ## 受入ホストの構築
 
@@ -469,7 +471,7 @@ Windows 側のマウントの追加・移動時は再適用と再検証を行う
 初期構築では、候補と manifest が未配置であることによる拒否を 2 段 SSH で確認する。
 WSL 側で `maintenance.lock` が root:kio-test の 0640 で存在し、`deployment.json` が未配置であることを
 先に確かめる。`id` の拒否だけでは manifest の検査まで到達したことを確認できない。試験用の値で
-読み取り専用 `identity` 要求を送り、失敗し、標準エラーに `deployment path is missing` が
+読み取り専用 `identity` 要求を送り、失敗し、応答に `DEPLOYMENT_MISSING` が
 含まれることを確認する。
 
 ```bash
@@ -531,8 +533,7 @@ Linux helper と固定入力を準備する。初期構築用のコミットは 
    `F4_CANDIDATE_SHA` に承認済み候補の完全な SHA を、`bundle` にリポジトリ外の一時ディレクトリを
    指定する。同じ helper を OCR API イメージ内の TLS proxy として起動するため、
    候補の Linux helper は C ランタイムを静的にリンクする。
-   canonical manifest は proposal の
-   `deployment` オブジェクトだけを、キー順でコンパクトにシリアライズし、末尾に LF を 1 つ付けて保存する。
+   proposal の `deployment` オブジェクトを JSON として保存する。
 
    ```bash
    (
@@ -551,13 +552,13 @@ Linux helper と固定入力を準備する。初期構築用のコミットは 
      "$bundle/kio-acceptance-tools" route-preflight \
        --repository "$PWD" --candidate "$candidate" \
        --tools-binary "$bundle/kio-acceptance-tools" > "$bundle/proposal.json"
-     jq -cS -e '.deployment | objects' "$bundle/proposal.json" > "$bundle/deployment.json"
+     jq -e '.deployment | objects' "$bundle/proposal.json" > "$bundle/deployment.json"
    )
    ```
 
    helper は release ビルドを `$bundle` へ単一リンクで複製して渡す。preflight は絶対パス・リンク数 1・256 MiB 以下の
    ファイルだけを受け付け、cargo の `target/*/kio-acceptance-tools` は `deps/` へのハードリンク、debug ビルドは上限超過で拒否される。
-   Preflight は exact HEAD、Rust 定義の `FIXED_SOURCES` と helper の SHA-256 を検査する。
+   Preflight は exact HEAD、実行時に読む 5 ファイル（`FIXED_SOURCES`）と helper の SHA-256 を検査する。
    candidate、scope、各 digest を独立したレビュー経路で確認する。同じ経路から受け取った hash
    との一致は転送の完全性を示す。候補ビルドの出どころは承認済みの exact `main` とビルド記録で確認する。
 2. manifest の `sources` に列挙されたパスと同一の相対パスを保って固定入力を転送し、
@@ -570,7 +571,7 @@ Linux helper と固定入力を準備する。初期構築用のコミットは 
    `/var/lib/kio-v1-local/shared-gpu-count` の両方を照合して配置する。
    実行ファイルは 0755、manifest は 0644。ファイルと全祖先は root 所有、
    group/other 書込不可、非 symlink とする。配置後の digest を再確認し、
-   最後に canonical な `deployment.json` を `source/scripts/v1-local-gpu/` に置いてロックを解放する。
+   最後に `deployment.json` を `source/scripts/v1-local-gpu/` に置いてロックを解放する。
    dispatcher は要求された候補 SHA、manifest、実行中の helper、固定入力、実行用照会を照合する。
 3. F4 に使うホストを固定し、専用 Engine に固定 OCR image を pull する。
 
@@ -578,9 +579,10 @@ Linux helper と固定入力を準備する。初期構築用のコミットは 
 Windows・WSL の他ワークロードによる GPU 使用がないことを管理者が確かめる。コントローラは
 専用 Engine のコンテナを列挙し、VRAM の起動前後はホスト全体の実測で照合する。
 共有 Engine には root 管理の引数なし照会だけを使う。sudoers の規則は `NOSETENV` を指定する。
-構築時の CUDA スモークテストにも件数 0 が必要。admission・停止・cleanup の前に、
-DeviceRequests を持つ稼働コンテナが 1 件以上、または照会に失敗した場合は中断する。
-cleanup の中断時はリースを保持する。
+構築時の CUDA スモークテストと起動前の admission は、共有 GPU 件数 0 を必要とする。
+起動時は共有照会失敗、GPU 使用中、専用 Engine 照会失敗、VRAM 不足、Compose 失敗を
+固定コードで返す。cleanup で専用 Engine 上の所有プロジェクトの不在を確認できない場合は、
+リースを保持する。
 
 ```bash
 uid=$(id -u kio-test)

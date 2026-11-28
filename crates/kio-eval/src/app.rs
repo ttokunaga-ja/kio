@@ -25,7 +25,7 @@ use kio_eval::{
         read_acceptance_binding, read_expected_manifest, read_expected_receipt, read_receipt,
         run_a01, run_a05, run_a06, run_a09, write_expected_manifest_create_only,
     },
-    acceptance_authenticated_local::{AuthenticatedLocalOptions, run_embedding, run_ocr},
+    acceptance_authenticated_local::{AuthenticatedLocalOptions, run_eg2, run_ocr},
     acceptance_distribution::{ExpectedCaseOptions, write_expected_case},
     acceptance_failure::{FailureOptions, run_a08 as run_a08_failure},
     acceptance_fault::{FaultOptions, run_a10},
@@ -199,11 +199,8 @@ enum Commands {
 
 #[derive(Debug, Subcommand)]
 enum AcceptanceCommands {
-    /// Execute A08 with authenticated local OCR and client-side EG2.
-    /// OCR writes a checkpoint; embedding verifies it and emits the final receipt.
+    /// Exercise authenticated OCR and bind the runner-local EG2 evidence.
     AuthenticatedLocal {
-        #[arg(long, value_enum)]
-        phase: AuthenticatedLocalPhase,
         #[arg(long)]
         expected_case: PathBuf,
         #[arg(long, value_parser = parse_native_os)]
@@ -223,7 +220,22 @@ enum AcceptanceCommands {
         #[arg(long)]
         service_identity: PathBuf,
         #[arg(long)]
-        service_identity_sha256: String,
+        eg2_evidence: PathBuf,
+    },
+    /// Exercise native CPU EG2 without OCR or a GPU lease.
+    LocalEg2 {
+        #[arg(long)]
+        bin: PathBuf,
+        #[arg(long)]
+        fixture: PathBuf,
+        #[arg(long)]
+        target: String,
+        #[arg(long)]
+        binary_sha256: String,
+        #[arg(long)]
+        work_dir: PathBuf,
+        #[arg(long)]
+        evidence: PathBuf,
     },
     TargetBinding {
         #[arg(long)]
@@ -422,12 +434,6 @@ enum AcceptanceCommands {
         #[arg(long)]
         allocation_id: Option<String>,
     },
-}
-
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
-enum AuthenticatedLocalPhase {
-    Ocr,
-    Embedding,
 }
 
 #[derive(Debug, Subcommand)]
@@ -2305,7 +2311,6 @@ pub fn run(args: Args) -> Result<ExitCode, AppError> {
             },
             Commands::Acceptance { command } => match command {
                 AcceptanceCommands::AuthenticatedLocal {
-                    phase,
                     expected_case,
                     os,
                     bin,
@@ -2315,7 +2320,7 @@ pub fn run(args: Args) -> Result<ExitCode, AppError> {
                     ocr_endpoint,
                     ca_pem,
                     service_identity,
-                    service_identity_sha256,
+                    eg2_evidence,
                 } => {
                     let expected = read_expected_receipt(expected_case)
                         .map_err(|error| AppError::Input(error.to_string()))?;
@@ -2339,22 +2344,23 @@ pub fn run(args: Args) -> Result<ExitCode, AppError> {
                         ocr_endpoint: ocr_endpoint.clone(),
                         ca_pem: ca_pem.clone(),
                         service_identity: service_identity.clone(),
-                        service_identity_sha256: service_identity_sha256.clone(),
+                        eg2_evidence: eg2_evidence.clone(),
                     };
-                    match phase {
-                        AuthenticatedLocalPhase::Ocr => {
-                            run_ocr(&options)
-                                .map_err(|error| AppError::Input(error.to_string()))?;
-                            println!(
-                                "[ok] authenticated-local OCR checkpoint written; embedding phase remains"
-                            );
-                        }
-                        AuthenticatedLocalPhase::Embedding => {
-                            run_embedding(&options)
-                                .map_err(|error| AppError::Input(error.to_string()))?;
-                            println!("[ok] authenticated-local acceptance receipt written");
-                        }
-                    }
+                    run_ocr(&options).map_err(|error| AppError::Input(error.to_string()))?;
+                    println!("[ok] authenticated-local acceptance receipt written");
+                    Ok(ExitCode::Success)
+                }
+                AcceptanceCommands::LocalEg2 {
+                    bin,
+                    fixture,
+                    target,
+                    binary_sha256,
+                    work_dir,
+                    evidence,
+                } => {
+                    run_eg2(bin, fixture, target, binary_sha256, work_dir, evidence)
+                        .map_err(|error| AppError::Input(error.to_string()))?;
+                    println!("[ok] runner-local EG2 evidence written");
                     Ok(ExitCode::Success)
                 }
                 AcceptanceCommands::TargetBinding {

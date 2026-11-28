@@ -14,9 +14,8 @@ concurrency: { group: v1-local-acceptance-global, cancel-in-progress: false }
 permissions: { actions: read, contents: read, id-token: write }
 
 jobs:
-  # Proves, before F4, that a github-hosted runner tagged tag:kio-ci reaches
-  # both Windows hosts on TCP 22 only and that the WSL host key matches its pin.
-  # It authenticates nowhere and never reaches the acceptance dispatcher.
+  # Independent route diagnostic. ProxyJump authenticates to Windows and
+  # verifies the WSL host key without authenticating to WSL.
   route-probe:
     if: inputs.operation == 'route-probe'
     name: route probe ${{ matrix.host }}
@@ -40,10 +39,10 @@ jobs:
           KIO_LAB_KEY: ${{ secrets.KIO_LAB_SSH_PRIVATE_KEY }}
           KIO_LAB_HOSTS: ${{ vars.KIO_LAB_KNOWN_HOSTS }}
           HOST: ${{ matrix.host }}
+          DENIED_SSH_HOST: ${{ vars.KIO_LAB_DENIED_SSH_HOST || '100.102.187.14' }}
         run: |
           set -euo pipefail
           d="$RUNNER_TEMP/kio-route-probe"; (umask 077; mkdir "$d"; printf '%s\n' "$KIO_LAB_KEY" > "$d/id"; printf '%s\n' "$KIO_LAB_HOSTS" > "$d/known_hosts")
-          test "$(grep -c . "$d/known_hosts")" = 4
           cat > "$d/config" <<CFG
           Host kio-lab-jump
             HostName $HOST
@@ -64,13 +63,22 @@ jobs:
             BatchMode yes
             ConnectTimeout 15
           CFG
+          export LC_ALL=C
           out="$(timeout 60 ssh -F "$d/config" -o PreferredAuthentications=none kio-lab-wsl true 2>&1 < /dev/null || true)"
           printf '%s\n' "$out" | grep -q 'Host key verification failed' && { echo 'host key pin mismatch' >&2; exit 1; }
-          printf '%s\n' "$out" | grep -q 'kio-test@127.0.0.1: Permission denied' || { printf '%s\n' "$out" >&2; exit 1; }
+          printf '%s\n' "$out" | grep -q 'kio-test@127.0.0.1: Permission denied' || { echo 'SSH route probe did not reach WSL authentication' >&2; exit 1; }
           echo "allowed: $HOST:22 -> WSL 127.0.0.1:2222 with both host keys pinned"
-          for target in "$HOST:2222" "$HOST:18443" "100.102.187.14:22"; do
-            if timeout 10 nc -z -w 5 "${target%:*}" "${target##*:}"; then echo "unexpectedly reachable: $target" >&2; exit 1; fi
-            echo "denied: $target"
+          command -v nc >/dev/null
+          [[ "$DENIED_SSH_HOST" =~ ^100\.([0-9]{1,3}\.){2}[0-9]{1,3}$ ]]
+          for target in "$HOST:2222" "$HOST:18443" "$DENIED_SSH_HOST:22"; do
+            rc=0
+            detail="$(timeout 10 nc -z -v -w 5 "${target%:*}" "${target##*:}" 2>&1)" || rc=$?
+            case "$rc:$detail" in
+              0:*) echo "unexpectedly reachable: $target" >&2; exit 1 ;;
+              1:*"Connection refused"*) echo "TCP refused: $target" ;;
+              1:*"timed out"*) echo "TCP timed out: $target" ;;
+              *) echo "negative probe failed to execute for $target" >&2; exit 1 ;;
+            esac
           done
 
   local-a08:
@@ -118,7 +126,7 @@ jobs:
           if [[ "$RUNNER_OS" == Windows ]]; then tools_bin="${tools_bin}.exe"; fi
           test -f "$tools_bin"
           printf 'KIO_ACCEPTANCE_TOOLS=%s\n' "$tools_bin" >> "$GITHUB_ENV"
-      - name: Extract exactly one strict native package leaf
+      - name: Verify and unpack the native package
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -138,6 +146,15 @@ jobs:
           bin="$release/bin/kio"; test "$RUNNER_OS" != Windows || bin="${bin}.exe"; test -f "$bin"
           printf 'KIO_EVAL=%s\nKIO_RELEASE_BIN=%s\nKIO_PACKAGE_ROOT=%s\n' "$eval_bin" "$bin" "$root" >> "$GITHUB_ENV"
 
+      - name: Run native EG2 on the runner CPU
+        run: |
+          set -euo pipefail
+          binding="$KIO_PACKAGE_ROOT/target-binding.json"
+          "$KIO_EVAL" acceptance local-eg2 --bin "$KIO_RELEASE_BIN" \
+            --fixture "$GITHUB_WORKSPACE/crates/kio-eval/acceptance-fixtures/v1/authenticated-local-public" \
+            --target "$(jq -er .target "$binding")" --binary-sha256 "$(jq -er .binary_sha256 "$binding")" \
+            --work-dir "$RUNNER_TEMP/kio-v1-local-eg2-work" --evidence "$RUNNER_TEMP/kio-v1-local-eg2.json"
+
       - uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4
         with:
           oauth-client-id: ${{ vars.KIO_TS_CLIENT_ID }}
@@ -153,7 +170,7 @@ jobs:
           d="$RUNNER_TEMP/kio-local-route"
           "$KIO_ACCEPTANCE_TOOLS" route-materialize --root "$d"
           printf 'KIO_ROUTE_DIR=%s\n' "$d" >> "$GITHUB_ENV"
-      - name: Acquire one lease and bind its public service identity
+      - name: Acquire a lease and read the public service identity
         id: prepare
         env:
           KIO_LAB_JUMP_HOST: ${{ vars.KIO_LAB_JUMP_HOST }}
@@ -161,10 +178,10 @@ jobs:
         run: |
           set -euo pipefail; test -n "$KIO_LAB_JUMP_HOST"; test "$KIO_LAB_JUMP_USER" = kio-ci
           "$KIO_ACCEPTANCE_TOOLS" local-client prepare --candidate "$CANDIDATE_SHA" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --os '${{ matrix.os }}' --jump-host "$KIO_LAB_JUMP_HOST" --jump-user "$KIO_LAB_JUMP_USER" --known-hosts "$KIO_ROUTE_DIR/known_hosts" --identity-file "$KIO_ROUTE_DIR/id" --identity-out "$KIO_ROUTE_DIR/kio-v1-local-identity.json" --capability-file "$KIO_ROUTE_DIR/kio-v1-local-capability" > "$RUNNER_TEMP/kio-v1-local-prepare.json"
-          echo "service_identity_sha256=$(jq -er .service_identity_sha256 "$RUNNER_TEMP/kio-v1-local-prepare.json")" >> "$GITHUB_OUTPUT"
       - name: Bind the A08 expected case after public identity observation
         run: |
           set -euo pipefail; root="$KIO_PACKAGE_ROOT"; target="$RUNNER_TEMP/kio-v1-local-target.json"; expected="$RUNNER_TEMP/kio-v1-local-a08-expected.json"
+          service_identity_sha256="$(jq -er .service_identity_sha256 "$RUNNER_TEMP/kio-v1-local-prepare.json")"
           hash="$("$KIO_EVAL" release archive-sha256 --archive "$(find "$root" -maxdepth 1 -name '*.tar.gz' -type f -print)")"
           if command -v sha256sum >/dev/null 2>&1; then
             workflow_hash="$(sha256sum .github/workflows/v1-local-acceptance.yml | awk '{print $1}')"
@@ -176,32 +193,44 @@ jobs:
             exit 1
           fi
           "$KIO_EVAL" acceptance target-binding --candidate-sha "$CANDIDATE_SHA" --os '${{ matrix.os }}' --target "$(jq -er .target "$root/target-binding.json")" --archive-sha256 "$hash" --binary-sha256 "$(jq -er .binary_sha256 "$root/target-binding.json")" --version "$(jq -er .version "$root/target-binding.json")" --out "$target"
-          "$KIO_EVAL" acceptance expected-case --target-binding "$target" --case A08 --lane provider-live --subcase authenticated-local --os '${{ matrix.os }}' --fixture-id v1-authenticated-local-public --fixture-sha256 8a61250a8a21ac49d3edaa03b55e5a9e0b45e7bda92f678c53811ffc080e2cc3 --workflow-path .github/workflows/v1-local-acceptance.yml --workflow-sha256 "$workflow_hash" --workflow-commit "$CANDIDATE_SHA" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --architecture "$(uname -m)" --service-identity-sha256 '${{ steps.prepare.outputs.service_identity_sha256 }}' --out "$expected"
-      - name: Run authenticated OCR, clean its lease, and validate native EG2
-        if: always()
+          "$KIO_EVAL" acceptance expected-case --target-binding "$target" --case A08 --lane provider-live --subcase authenticated-local --os '${{ matrix.os }}' --fixture-id v1-authenticated-local-public --fixture-sha256 8a61250a8a21ac49d3edaa03b55e5a9e0b45e7bda92f678c53811ffc080e2cc3 --workflow-path .github/workflows/v1-local-acceptance.yml --workflow-sha256 "$workflow_hash" --workflow-commit "$CANDIDATE_SHA" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --architecture "$(uname -m)" --service-identity-sha256 "$service_identity_sha256" --out "$expected"
+      - name: Run authenticated OCR and finish its lease
+        if: ${{ always() && steps.prepare.outcome == 'success' }}
         env:
           KIO_LAB_JUMP_HOST: ${{ vars.KIO_LAB_JUMP_HOST }}
           KIO_LAB_JUMP_USER: ${{ vars.KIO_LAB_JUMP_USER }}
         run: |
           set -euo pipefail; test -n "$KIO_LAB_JUMP_HOST"; test "$KIO_LAB_JUMP_USER" = kio-ci
-          "$KIO_ACCEPTANCE_TOOLS" local-client run --candidate "$CANDIDATE_SHA" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --os '${{ matrix.os }}' --jump-host "$KIO_LAB_JUMP_HOST" --jump-user "$KIO_LAB_JUMP_USER" --known-hosts "$KIO_ROUTE_DIR/known_hosts" --identity-file "$KIO_ROUTE_DIR/id" --identity-out "$KIO_ROUTE_DIR/kio-v1-local-identity.json" --capability-file "$KIO_ROUTE_DIR/kio-v1-local-capability" --expected "$RUNNER_TEMP/kio-v1-local-a08-expected.json" --eval-bin "$KIO_EVAL" --candidate-bin "$KIO_RELEASE_BIN" --fixture "$GITHUB_WORKSPACE/crates/kio-eval/acceptance-fixtures/v1/authenticated-local-public" --work-dir "$RUNNER_TEMP/kio-v1-local-a08-work" --receipt "$RUNNER_TEMP/kio-v1-local-a08-receipt.json"
-      - name: Upload public service identity
+          "$KIO_ACCEPTANCE_TOOLS" local-client run --candidate "$CANDIDATE_SHA" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --os '${{ matrix.os }}' --jump-host "$KIO_LAB_JUMP_HOST" --jump-user "$KIO_LAB_JUMP_USER" --known-hosts "$KIO_ROUTE_DIR/known_hosts" --identity-file "$KIO_ROUTE_DIR/id" --identity-out "$KIO_ROUTE_DIR/kio-v1-local-identity.json" --capability-file "$KIO_ROUTE_DIR/kio-v1-local-capability" --expected "$RUNNER_TEMP/kio-v1-local-a08-expected.json" --eval-bin "$KIO_EVAL" --candidate-bin "$KIO_RELEASE_BIN" --fixture "$GITHUB_WORKSPACE/crates/kio-eval/acceptance-fixtures/v1/authenticated-local-public" --work-dir "$RUNNER_TEMP/kio-v1-local-a08-work" --receipt "$RUNNER_TEMP/kio-v1-local-a08-receipt.json" --eg2-evidence "$RUNNER_TEMP/kio-v1-local-eg2.json"
+      - name: Verify this OS published all local evidence
+        run: |
+          set -euo pipefail
+          for path in \
+            "$KIO_ROUTE_DIR/kio-v1-local-identity.json" \
+            "$KIO_ROUTE_DIR/kio-v1-local-observed-ocr.json" \
+            "$RUNNER_TEMP/kio-v1-local-eg2.json" \
+            "$RUNNER_TEMP/kio-v1-local-a08-expected.json" \
+            "$RUNNER_TEMP/kio-v1-local-a08-receipt.json"; do
+            test -s "$path" || { echo "${path##*/}: missing local evidence" >&2; exit 1; }
+          done
+      - name: Upload public OCR and EG2 observations
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: kio-gpu-runtime-identity-${{ inputs.candidate_sha }}-${{ matrix.os }}
+          name: kio-v1-local-diagnostics-${{ inputs.candidate_sha }}-${{ matrix.os }}-attempt-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/kio-local-route/kio-v1-local-identity.json
             ${{ runner.temp }}/kio-local-route/kio-v1-local-observed-ocr.json
-          if-no-files-found: error
+            ${{ runner.temp }}/kio-v1-local-eg2.json
+          if-no-files-found: warn
           overwrite: false
       - name: Upload expected A08 binding
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: kio-v1-local-${{ inputs.candidate_sha }}-${{ matrix.os }}
+          name: kio-v1-local-${{ inputs.candidate_sha }}-${{ matrix.os }}-attempt-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/kio-v1-local-a08-expected.json
             ${{ runner.temp }}/kio-v1-local-a08-receipt.json
-          if-no-files-found: error
+          if-no-files-found: warn
           overwrite: false

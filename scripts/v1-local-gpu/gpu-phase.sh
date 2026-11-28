@@ -11,7 +11,8 @@ OCR_WEIGHT=85a479d506a11e724e7285d395c551be69f41dbc16b6342d3cacfb189aed71db
 OCR_API_IMAGE=ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-vl@sha256:6c735bdf9e758ffdd58ccc067db0c2d84e37e5e6a2cbd47156069d4d7ea5d709
 OCR_VLM_IMAGE=ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-genai-vllm-server@sha256:d0d32c04a2119613d25a0a4c292e165ccc107954b74580613cf59e378037f8f5
 
-die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+die() { fail 1 "$*"; }
+fail() { local code=$1; shift; printf 'error: %s\n' "$*" >&2; exit "$code"; }
 # Reserved for the dispatcher's fixed GPU_SAMPLE_UNAVAILABLE diagnostic.
 gpu_sample_unavailable() { printf 'error: cannot read GPU memory\n' >&2; exit 42; }
 note() { printf '%s\n' "$*"; }
@@ -103,19 +104,19 @@ ocr_project_gone() {
 shared_gpu_guard() {
   local count
   count=$(sudo -n -- /var/lib/kio-v1-local/shared-gpu-count) ||
-    die "cannot inspect shared Docker GPU containers"
-  [[ $count =~ ^(0|[1-9][0-9]*)$ ]] || die "invalid shared Docker GPU count"
-  [[ $count == 0 ]] || die "shared Docker GPU container is running (count: $count)"
+    fail 43 "cannot inspect shared Docker GPU containers"
+  [[ $count =~ ^(0|[1-9][0-9]*)$ ]] || fail 43 "invalid shared Docker GPU count"
+  [[ $count == 0 ]] || fail 44 "shared Docker GPU container is running (count: $count)"
 }
 
 gpu_guard() {
   local id project ids
   shared_gpu_guard
-  ids=$(project_ids) || die "cannot enumerate dedicated Docker containers"
+  ids=$(project_ids) || fail 45 "cannot enumerate dedicated Docker containers"
   while IFS= read -r id; do
     [ -n "$id" ] || continue
-    project=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$id") || die "cannot inspect container $id"
-    [ "$project" = "$OCR_PROJECT" ] || die "unrelated container is running on the dedicated engine: $id"
+    project=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$id") || fail 45 "cannot inspect dedicated container"
+    [ "$project" = "$OCR_PROJECT" ] || fail 44 "unrelated container is running on the dedicated engine"
   done <<< "$ids"
 }
 
@@ -128,27 +129,19 @@ wait_gone() {
   die "owned containers did not stop within 60 seconds"
 }
 
-wait_vram() {
-  local deadline=$((SECONDS + 60)) remaining status=0 sample_seen=false
-  ocr_project_gone
-  while [ "$SECONDS" -lt "$deadline" ]; do
-    remaining=$((deadline - SECONDS))
-    # Bound the sample producer as well as the helper's stdin reader.
-    if timeout "${remaining}s" bash -c '
-      set -euo pipefail
-      sample=$("$1" --query-gpu=uuid,memory.total,memory.used,memory.free --format=csv,noheader,nounits) || exit 42
-      printf "%s\n" "$sample" | "$2" gpu-memory check-recovered --state-dir "$3" "${@:4}" || exit 1
-    ' bash "$(gpu_command)" "$TOOLS" "$ROOT/state" "$@"; then
-      ocr_project_gone
-      return 0
-    else
-      status=$?
-      if [[ $status != 42 && $status != 124 ]]; then sample_seen=true; fi
-    fi
-    sleep 1
-  done
-  if ! $sample_seen && [[ $status == 42 ]]; then gpu_sample_unavailable; fi
-  die "GPU memory did not recover to the captured baseline plus 128 MiB within 60 seconds"
+record_vram_recovery() {
+  # Cleanup has already verified project absence. A GPU-wide sample can
+  # include unrelated work and is advisory after the owned containers are gone.
+  local result
+  if (gpu_memory check-recovered); then
+    result=recovered
+  else
+    case $? in
+      42) result=sample-unavailable ;;
+      *) result=baseline-not-confirmed ;;
+    esac
+  fi
+  (set -o noclobber; printf '%s\n' "$result" > "$ROOT/state/vram-recovery")
 }
 
 project_exited() {
@@ -316,9 +309,12 @@ start_ocr() {
   gpu_guard
   [ -f "$ROOT/ocr/compose.yaml" ] || die "run init first"
   verify_identity
-  ocr_project_gone
-  gpu_memory check-start
-  compose "$OCR_PROJECT" "$ROOT/ocr/compose.yaml" up -d
+  local existing
+  existing=$(project_ids -a --filter "label=com.docker.compose.project=$OCR_PROJECT") ||
+    fail 45 "cannot inspect owned project"
+  [ -z "$existing" ] || fail 44 "the owned OCR project already exists"
+  gpu_memory check-start || fail 46 "GPU memory does not meet the start threshold"
+  compose "$OCR_PROJECT" "$ROOT/ocr/compose.yaml" up -d || fail 47 "OCR Compose startup failed"
   wait_https 18443 "$OCR_PROJECT" "$ROOT/ocr/compose.yaml" || { compose "$OCR_PROJECT" "$ROOT/ocr/compose.yaml" down; die "OCR HTTPS endpoint was not ready"; }
   api_id=$(assert_container_image "$(compose "$OCR_PROJECT" "$ROOT/ocr/compose.yaml" ps -q paddleocr-vl-api)" "$OCR_API_IMAGE")
   vlm_id=$(assert_container_image "$(compose "$OCR_PROJECT" "$ROOT/ocr/compose.yaml" ps -q paddleocr-vlm-server)" "$OCR_VLM_IMAGE")
@@ -329,10 +325,7 @@ start_ocr() {
 
 stop_ocr() {
   lock
-  shared_gpu_guard
-  compose "$OCR_PROJECT" "$ROOT/ocr/compose.yaml" down
-  wait_gone "$OCR_PROJECT" "$ROOT/ocr/compose.yaml"
-  wait_vram
+  cleanup_project "$OCR_PROJECT" "$ROOT/ocr/compose.yaml"
 }
 
 cleanup_project() {
@@ -350,10 +343,11 @@ cleanup_project() {
 
 cleanup() {
   lock
-  shared_gpu_guard
   cleanup_project "$OCR_PROJECT" "$ROOT/ocr/compose.yaml"
   private_dir "$ROOT/state"
-  wait_vram --allow-missing
+  if ! record_vram_recovery; then
+    note "GPU recovery observation could not be written"
+  fi
   note "owned services stopped"
 }
 

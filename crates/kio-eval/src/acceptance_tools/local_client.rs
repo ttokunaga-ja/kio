@@ -80,8 +80,8 @@ pub enum Mode {
     Run,
 }
 
-/// Arguments retained from `actions-client.py`.  The route root is derived
-/// from `--identity-file`; outputs must remain in that owner-private root.
+/// The route root is derived from `--identity-file`. Route state must remain
+/// in that owner-private directory.
 #[derive(Debug, ClapArgs)]
 pub struct Args {
     #[arg(value_enum)]
@@ -118,6 +118,8 @@ pub struct Args {
     pub work_dir: Option<PathBuf>,
     #[arg(long)]
     pub receipt: Option<PathBuf>,
+    #[arg(long)]
+    pub eg2_evidence: Option<PathBuf>,
 }
 
 pub fn run(args: Args) -> Result<(), String> {
@@ -146,7 +148,7 @@ pub fn run(args: Args) -> Result<(), String> {
             let inputs = finish_after_error(RunInputs::from_args(&args), || {
                 client.invoke(Verb::Finish).map(|_| ())
             })?;
-            client.run_phases(&args.identity_out, inputs)?;
+            client.run_ocr(&args.identity_out, &inputs)?;
         }
     }
     Ok(())
@@ -157,7 +159,6 @@ enum Verb {
     Init,
     Identity,
     StartOcr,
-    StopOcr,
     Finish,
 }
 
@@ -178,7 +179,6 @@ impl Verb {
             Self::Init => "init",
             Self::Identity => "identity",
             Self::StartOcr => "start-ocr",
-            Self::StopOcr => "stop-ocr",
             Self::Finish => "finish",
         }
     }
@@ -187,7 +187,7 @@ impl Verb {
         match self {
             Self::Identity => IDENTITY_TIMEOUT,
             Self::Init | Self::Finish => INIT_TIMEOUT,
-            Self::StartOcr | Self::StopOcr => PHASE_TIMEOUT,
+            Self::StartOcr => PHASE_TIMEOUT,
         }
     }
 }
@@ -422,29 +422,27 @@ impl Client {
             .map_err(|error| format!("{label} is not owner-private: {error}"))
     }
 
-    fn run_phases(&mut self, identity: &Path, inputs: RunInputs) -> Result<(), String> {
-        let result = self.run_phases_inner(identity, &inputs);
-        finish_after_error(result, || {
-            let _ = self.invoke(Verb::StopOcr);
-            self.invoke(Verb::Finish).map(|_| ())
-        })
+    fn run_ocr(&mut self, identity: &Path, inputs: &RunInputs) -> Result<(), String> {
+        let result = self.run_ocr_and_finish(identity, inputs);
+        finish_after_error(result, || self.invoke(Verb::Finish).map(|_| ()))
     }
 
-    fn run_phases_inner(&mut self, identity: &Path, inputs: &RunInputs) -> Result<(), String> {
+    fn run_ocr_and_finish(&mut self, identity: &Path, inputs: &RunInputs) -> Result<(), String> {
         let identity_value = read_identity(identity)?;
         self.invoke(Verb::StartOcr)?;
         self.observe(&identity_value, "ocr")?;
         let mut tunnel = self.start_tunnel()?;
         let result = (|| {
             self.health(&identity_value, &mut tunnel)?;
-            self.evaluate("ocr", inputs, &identity_value)?;
-            self.invoke(Verb::StopOcr)?;
-            self.invoke(Verb::Finish)?;
-            self.evaluate("embedding", inputs, &identity_value)?;
-            Ok(())
+            self.evaluate(inputs, &identity_value)
         })();
-        let _ = tunnel.terminate_and_wait();
-        result
+        let tunnel_closed = tunnel
+            .terminate_and_wait()
+            .map_err(|error| format!("cannot close owned SSH tunnel: {error}"));
+        result?;
+        tunnel_closed?;
+        self.invoke(Verb::Finish)?;
+        Ok(())
     }
 
     fn start_tunnel(&self) -> Result<SupervisedChild, String> {
@@ -456,20 +454,7 @@ impl Client {
 
     fn health(&self, identity: &Value, tunnel: &mut SupervisedChild) -> Result<(), String> {
         let pem = public_ca(identity)?;
-        let certificate = ureq::tls::Certificate::from_pem(pem.as_bytes())
-            .map_err(|error| format!("public CA PEM is invalid: {error}"))?;
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .max_redirects(0)
-            .http_status_as_error(false)
-            .timeout_connect(Some(Duration::from_secs(2)))
-            .timeout_global(Some(Duration::from_secs(4)))
-            .tls_config(
-                ureq::tls::TlsConfig::builder()
-                    .root_certs(ureq::tls::RootCerts::new_with_certs(&[certificate]))
-                    .build(),
-            )
-            .build()
-            .into();
+        let agent = health_agent(pem)?;
         let endpoint = "https://127.0.0.1:18443/health";
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
@@ -480,11 +465,20 @@ impl Client {
             {
                 return Err("owned SSH tunnel failed to start".into());
             }
-            if agent.get(endpoint).call().is_ok() {
-                return Ok(());
-            }
+            let failure = match agent.get(endpoint).call() {
+                Ok(response) => match health_status(response.status().as_u16()) {
+                    None => return Ok(()),
+                    Some(failure) => failure,
+                },
+                Err(ureq::Error::Tls(_) | ureq::Error::Rustls(_)) => {
+                    "TLS verification failed".into()
+                }
+                Err(_) => "transport failed".into(),
+            };
             if std::time::Instant::now() >= deadline {
-                return Err("forwarded local GPU health check failed".into());
+                return Err(format!(
+                    "forwarded local GPU health check failed: {failure}"
+                ));
             }
             std::thread::sleep(Duration::from_secs(1));
         }
@@ -506,32 +500,26 @@ impl Client {
             .map_err(|error| format!("observed phase record is unsafe: {error}"))
     }
 
-    fn evaluate(&self, phase: &str, inputs: &RunInputs, identity: &Value) -> Result<(), String> {
-        let ca_leaf = format!("kio-v1-local-{phase}-ca.pem");
-        let identity_leaf = format!("kio-v1-local-{phase}-service-identity.json");
+    fn evaluate(&self, inputs: &RunInputs, identity: &Value) -> Result<(), String> {
+        let ca_leaf = "kio-v1-local-ocr-ca.pem";
+        let identity_leaf = "kio-v1-local-ocr-service-identity.json";
         let ca = public_ca(identity)?;
         let identity_bytes = compact_json(&identity["identity"])?;
         self.route
-            .write_atomic(Path::new(&ca_leaf), ca.as_bytes(), Publication::CreateOnly)
+            .write_atomic(Path::new(ca_leaf), ca.as_bytes(), Publication::CreateOnly)
             .map_err(|error| format!("cannot create public CA file: {error}"))?;
         self.route
             .write_atomic(
-                Path::new(&identity_leaf),
+                Path::new(identity_leaf),
                 &identity_bytes,
                 Publication::CreateOnly,
             )
             .map_err(|error| format!("cannot create service identity file: {error}"))?;
-        let ca_path = self.route_path.join(&ca_leaf);
-        let service_path = self.route_path.join(&identity_leaf);
+        let ca_path = self.route_path.join(ca_leaf);
+        let service_path = self.route_path.join(identity_leaf);
         let result = (|| {
             let mut command = Command::new(&inputs.eval_bin);
-            command.args([
-                "acceptance",
-                "authenticated-local",
-                "--phase",
-                phase,
-                "--expected-case",
-            ]);
+            command.args(["acceptance", "authenticated-local", "--expected-case"]);
             command
                 .arg(&inputs.expected)
                 .args(["--os", &self.os, "--bin"])
@@ -547,8 +535,8 @@ impl Client {
                 .arg(&ca_path)
                 .arg("--service-identity")
                 .arg(&service_path)
-                .arg("--service-identity-sha256")
-                .arg(sha256(&identity_bytes));
+                .arg("--eg2-evidence")
+                .arg(&inputs.eg2_evidence);
             let output = run_bounded_command(
                 &mut command,
                 BoundedProcessOptions {
@@ -558,20 +546,42 @@ impl Client {
                 },
                 None,
             )
-            .map_err(|error| format!("authenticated-local {phase} failed: {error}"))?;
+            .map_err(|error| format!("authenticated-local OCR failed: {error}"))?;
             if !output.status.success() {
                 return Err(evaluator_failure(
-                    phase,
+                    "ocr",
                     &output.status.to_string(),
                     &output.stderr,
                 ));
             }
             Ok(())
         })();
-        let _ = self.route.remove_file(Path::new(&ca_leaf));
-        let _ = self.route.remove_file(Path::new(&identity_leaf));
+        let _ = self.route.remove_file(Path::new(ca_leaf));
+        let _ = self.route.remove_file(Path::new(identity_leaf));
         result
     }
+}
+
+fn health_agent(pem: &str) -> Result<ureq::Agent, String> {
+    let certificate = ureq::tls::Certificate::from_pem(pem.trim().as_bytes())
+        .map_err(|error| format!("public CA PEM is invalid: {error}"))?;
+    Ok(ureq::Agent::config_builder()
+        .max_redirects(0)
+        .proxy(None)
+        .http_status_as_error(false)
+        .timeout_connect(Some(Duration::from_secs(2)))
+        .timeout_global(Some(Duration::from_secs(4)))
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .root_certs(ureq::tls::RootCerts::new_with_certs(&[certificate]))
+                .build(),
+        )
+        .build()
+        .into())
+}
+
+fn health_status(status: u16) -> Option<String> {
+    (status != 200).then(|| format!("HTTP {status}"))
 }
 
 fn evaluator_failure(phase: &str, status: &str, stderr: &str) -> String {
@@ -604,6 +614,7 @@ struct RunInputs {
     fixture: PathBuf,
     work_dir: PathBuf,
     receipt: PathBuf,
+    eg2_evidence: PathBuf,
 }
 
 impl RunInputs {
@@ -615,8 +626,10 @@ impl RunInputs {
             fixture: required(&args.fixture, "fixture")?,
             work_dir: required(&args.work_dir, "work-dir")?,
             receipt: required(&args.receipt, "receipt")?,
+            eg2_evidence: required(&args.eg2_evidence, "eg2-evidence")?,
         };
         if !inputs.expected.is_file()
+            || !inputs.eg2_evidence.is_file()
             || !inputs.eval_bin.is_file()
             || !inputs.candidate_bin.is_file()
             || !inputs.fixture.is_dir()
@@ -896,14 +909,10 @@ fn read_identity(path: &Path) -> Result<Value, String> {
 }
 
 fn public_ca(identity: &Value) -> Result<&str, String> {
-    let pem = identity
+    identity
         .get("public_ca_pem")
         .and_then(Value::as_str)
-        .ok_or_else(|| "public CA PEM is absent".to_owned())?;
-    if !pem.ends_with('\n') || pem.ends_with("\n\n") {
-        return Err("public CA PEM must have exactly one final newline".into());
-    }
-    Ok(pem)
+        .ok_or_else(|| "public CA PEM is absent".to_owned())
 }
 
 fn sha256(bytes: &[u8]) -> String {
@@ -929,6 +938,23 @@ fn random_suffix() -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn health_rejects_every_status_except_http_200() {
+        assert_eq!(health_status(200), None);
+        for status in [201, 204, 301, 302, 404, 500, 503] {
+            assert_eq!(health_status(status), Some(format!("HTTP {status}")));
+        }
+    }
+
+    #[test]
+    fn health_agent_checks_raw_responses_without_a_proxy() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let agent = health_agent(cert.cert.pem().trim()).unwrap();
+        assert!(agent.config().proxy().is_none());
+        assert_eq!(agent.config().max_redirects(), 0);
+        assert!(!agent.config().http_status_as_error());
+    }
 
     #[test]
     fn evaluator_failure_includes_bounded_utf8_diagnostics() {
@@ -1179,6 +1205,7 @@ mod tests {
             fixture: None,
             work_dir: None,
             receipt: None,
+            eg2_evidence: None,
         };
         let client = Client::new(&args).unwrap();
         let config = read_private_file(&client.config_path(), PRIVATE_MAX).unwrap();

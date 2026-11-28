@@ -1256,6 +1256,8 @@ false への変更は明示設定のみで行える。
 
 Reading Path の正本は [README.md §1](README.md)。docs/ 直下のファイル名の数字プレフィックスがそのまま読む順番であり、本書で別の順序を定義しない。
 
+正式受入の候補、workflow、受領書の契約は [v1 正式受入](../tasks/v1-acceptance.md) を参照する。GPU ホストの固定入力または配置 helper が変わった場合の再配置は、[GPU ホストの運用手順](../scripts/v1-local-gpu/README.md#candidate-bound-deployment-proposal) に従う。
+
 ---
 
 # 12. RC draft artifact の検証と導入

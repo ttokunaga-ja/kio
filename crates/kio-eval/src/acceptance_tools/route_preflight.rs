@@ -14,20 +14,8 @@ use std::{
 pub const SCHEMA: &str = "kio.v1.local_gpu.deployment/v2";
 pub const MAX_FIXED_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_BINARY_BYTES: u64 = 256 * 1024 * 1024;
+// Files read by the deployed helper/controller. The helper itself has a separate digest.
 pub(crate) const FIXED_SOURCES: &[&str] = &[
-    "Cargo.toml",
-    "Cargo.lock",
-    "crates/kio-eval/Cargo.toml",
-    "crates/kio-eval/src/acceptance_tools_main.rs",
-    "crates/kio-eval/src/acceptance_tools/mod.rs",
-    "crates/kio-eval/src/acceptance_tools/dispatch.rs",
-    "crates/kio-eval/src/acceptance_tools/route_preflight.rs",
-    "crates/kio-eval/src/acceptance_tools/provider_ledger.rs",
-    "crates/kio-eval/src/acceptance_tools/local_client.rs",
-    "crates/kio-eval/src/acceptance_tools/ocr_proxy.rs",
-    "crates/kio-eval/src/acceptance_tools/gpu_identity.rs",
-    "crates/kio-eval/src/acceptance_tools/gpu_memory.rs",
-    "crates/kio-eval/src/acceptance_tools/package_extract.rs",
     "scripts/v1-local-gpu/gpu-phase.sh",
     "scripts/v1-local-gpu/host/shared-gpu-count",
     "scripts/v1-local-gpu/ocr_api_entrypoint.sh",
@@ -378,6 +366,7 @@ mod tests {
         let (_temp, root, _git, binary, candidate) = private_fixture();
         let proposal = preflight(root.path(), &candidate, &binary).expect("clean exact candidate");
         let sources = proposal["deployment"]["sources"].as_object().unwrap();
+        assert!(!sources.contains_key("crates/kio-eval/src/acceptance_tools/provider_ledger.rs"));
         for config in [
             "scripts/v1-local-gpu/config/backend-config.yaml",
             "scripts/v1-local-gpu/config/compose.yaml",

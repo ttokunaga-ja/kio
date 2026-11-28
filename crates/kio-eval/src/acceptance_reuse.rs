@@ -24,6 +24,7 @@ pub struct EvidenceReuseReport {
 const NEUTRAL_FILES: &[&str] = &[
     ".github/workflows/ci.yml",
     ".gitignore",
+    "AGENTS.md",
     "CONTRIBUTING.md",
     "README.md",
     "SECURITY.md",
@@ -268,6 +269,7 @@ mod tests {
             "crates/kio-process/tests/support/mod.rs",
             ".github/workflows/ci.yml",
             "README.md",
+            "AGENTS.md",
             "CONTRIBUTING.md",
             "SECURITY.md",
             ".gitignore",
