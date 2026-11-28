@@ -1157,6 +1157,13 @@ credential を使う前にその保護を確認する。managed CA の取得・�
 [ローカル窓の送信境界](07-adapter-spec.md#31-ローカル窓の送信境界) の dispatch までの lock 保持に従う。
 ローカル policy、内容の整合性、コード実行の安全性に必要な前提は各操作で引き続き検証する。
 
+全文検索と原本 export は作業用 `.kio/tool-lock.json` に依存しない。ベクトル検索は検索レプリカに記録した
+ベクトル profile と選択した Adapter profile を照合する。原本 export は履歴オブジェクトの hash を検証し、
+evidence 指定では履歴に記録された派生物の profile と世代も照合する。
+`batch resume` / `batch retry` は処理する永続タスクが来歴の公開またはベクトル空間の選択に関わる場合に
+作業用 lock を検証する。必要な lock が欠落した場合は、対象 scope での `kio index` による再生成を案内する。
+台帳の行を直接選択する操作は、選択した行とタスクに適用される照合を行う。
+
 ```text
 ~/.config/kio/tools.toml          → schemas/tools.schema.json
 ~/.config/kio/config.toml         → schemas/user-config.schema.json

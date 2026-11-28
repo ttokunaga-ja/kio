@@ -119,14 +119,8 @@ pub(crate) fn run_batch(ctx: &Invocation<'_>, args: BatchArgs) -> Result<Command
     // runs interleave the ledger and double-send held tasks. Reentrant with any
     // inner auto-snapshot; losers fail fast with KIO-E-STORE-LOCKED-001 (exit 3).
     let _lock = repo.lock_store_in_session(repo.lock_session())?;
-    // Persisted recovery work is executable authority. Revalidate the repository's
-    // current tool lock after acquiring the store lock and before reading or
-    // mutating tasks, so resume/retry cannot bypass the same adapter policy used by
-    // index and repair paths.
-    require_repo_tool_lock(&repo)?;
-    // Ledger-only mutations must not poll or collect unrelated provider work
-    // before their own confirmation. They still run under the same repository
-    // lock and current tool-lock validation as every other batch mutation.
+    // These selectors act on ledger rows. They have their own scope/profile
+    // checks and dispatch before general task recovery or provider polling.
     match &args.command {
         Some(BatchCommand::Retry(retry)) if retry.reset_violations.is_some() => {
             return run_batch_reset_violations(
@@ -158,13 +152,19 @@ pub(crate) fn run_batch(ctx: &Invocation<'_>, args: BatchArgs) -> Result<Command
         crate::index::pipeline::optional_role_planning_ready(adapter_settings, "markdown")?;
     let embedding_ready =
         crate::index::pipeline::optional_role_planning_ready(adapter_settings, "embedding")?;
+    let tasks = store.all().map_err(pipeline_to_kio)?;
+    let retry = matches!(args.command, Some(BatchCommand::Retry(_)));
+    if tasks
+        .iter()
+        .any(|task| batch_task_uses_tool_lock(task, retry, markdown_ready, embedding_ready))
+    {
+        require_repo_tool_lock(&repo)?;
+    }
+
     // Incidental recovery must not acquire billing authority for free work.
     // Unknown observations retain paid state for explicit selected recovery.
-    let has_paid_stamp = store
-        .all()
-        .map_err(pipeline_to_kio)?
-        .iter()
-        .any(|task| task.reservation_id.is_some());
+    let has_paid_stamp = tasks.iter().any(|task| task.reservation_id.is_some());
+    drop(tasks);
     let recovery_ledger = if !batch_offline {
         match incidental_paid_recovery_available(
             &scope_id(repo.kio_dir())?,
@@ -454,6 +454,36 @@ pub(crate) fn run_batch(ctx: &Invocation<'_>, args: BatchArgs) -> Result<Command
         }
         Some(BatchCommand::Abandon(_)) => unreachable!("handled before polling"),
         None => Err(KioError::not_implemented("batch command")),
+    }
+}
+
+// Recovery can republish normalized provenance or project an embedding
+// profile. Finished baseline rows and unavailable roles cannot do that work.
+fn batch_task_uses_tool_lock(
+    task: &TaskDescriptor,
+    retry: bool,
+    markdown_ready: bool,
+    embedding_ready: bool,
+) -> bool {
+    if task.output_ref == kio_pipeline::task::EXTRACTION_HOLD_OUTPUT_REF {
+        return retry && task.resource_limit.is_some();
+    }
+    match task.task_type {
+        TaskType::Markdownize if markdown_ready => match task.status {
+            TaskStatus::Done => matches!(
+                task.fallback_reason.as_deref(),
+                Some("online_adapter_done" | "local_adapter_done")
+            ),
+            TaskStatus::Failed => retry,
+            TaskStatus::Skipped => false,
+            _ => true,
+        },
+        TaskType::Embedding if embedding_ready => match task.status {
+            TaskStatus::Done | TaskStatus::Skipped => false,
+            TaskStatus::Failed => retry,
+            _ => true,
+        },
+        _ => false,
     }
 }
 
@@ -1869,4 +1899,45 @@ fn resource_task_input_matches(repo: &Repository, task: &TaskDescriptor) -> Resu
             && task.embedding_target.as_ref()
                 == Some(&crate::embedding::plan::chunk_task_target(chunk, &profile))
     }))
+}
+
+#[cfg(test)]
+mod tool_lock_tests {
+    use super::*;
+    use crate::commands::AbandonArgs;
+
+    #[test]
+    fn ledger_only_batch_dispatch_ignores_working_tool_lock() {
+        let directory = crate::test_support::PrivateTempDir::new();
+        let repo = Repository::init(directory.path()).unwrap();
+        let context = crate::context::test_support::context(directory.path());
+        let settings = Arc::new(AdapterRuntimeSettings::default());
+        let control = ControlHandle::default();
+        let locks = kio_core::scope::LockSession::default();
+        let invocation = Invocation {
+            context: &context,
+            settings: &settings,
+            control: &control,
+            locks: &locks,
+        };
+        for malformed in [false, true] {
+            let path = repo.kio_dir().join("tool-lock.json");
+            if malformed {
+                std::fs::write(path, b"invalid json").unwrap();
+            } else {
+                std::fs::remove_file(path).unwrap();
+            }
+            let error = run_batch(
+                &invocation,
+                BatchArgs {
+                    command: Some(BatchCommand::Abandon(AbandonArgs {
+                        selector: "invalid/selector".into(),
+                        yes: true,
+                    })),
+                },
+            )
+            .unwrap_err();
+            assert!(error.message().starts_with("selector must be"), "{error}");
+        }
+    }
 }

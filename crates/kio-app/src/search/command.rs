@@ -90,7 +90,6 @@ use crate::search_time::validate_cursor_cutoff;
 use crate::settings::cursor_signing_key;
 use crate::settings::related_images_min_area_ratio;
 use crate::settings::user_config_toml_path;
-use crate::settings::validate_repo_tool_lock;
 use kio_core::ExitCode;
 use kio_core::KioError;
 use kio_core::Result;
@@ -148,7 +147,6 @@ fn run_search_inner(
         ));
     }
     let repo = ctx.open_search_repository()?;
-    validate_repo_tool_lock(&repo)?;
 
     let multi_scope_settings = multi_scope::effective_settings(
         &repo.kio_dir().join("config.toml"),
@@ -1958,4 +1956,54 @@ fn run_search_inner(
         body: ResponseBody::Search(response),
         completion,
     })
+}
+
+#[cfg(test)]
+mod tool_lock_tests {
+    use super::*;
+    use kio_core::control::ControlHandle;
+    use kio_core::test_control::{TestEnvGuard, test_env_lock};
+    use std::sync::Arc;
+
+    #[test]
+    fn text_search_validates_the_cursor_with_a_malformed_working_tool_lock() {
+        let _lock = test_env_lock().lock().unwrap();
+        let device = crate::test_support::PrivateTempDir::new();
+        let _home = TestEnvGuard::isolated_home(device.path());
+        let scope = crate::test_support::PrivateTempDir::new();
+        let repo = Repository::init(scope.path()).unwrap();
+        let context = crate::context::test_support::context(scope.path());
+        let settings = Arc::new(kio_adapter::tool_lock::AdapterRuntimeSettings::default());
+        let control = ControlHandle::default();
+        let locks = kio_core::scope::LockSession::default();
+        let invocation = Invocation {
+            context: &context,
+            settings: &settings,
+            control: &control,
+            locks: &locks,
+        };
+        std::fs::write(repo.kio_dir().join("tool-lock.json"), b"invalid json").unwrap();
+
+        let error = run_search(
+            &invocation,
+            SearchArgs {
+                query: Some("example".into()),
+                mode: Some(crate::commands::SearchMode::Text),
+                scope: Some(scope.path().to_path_buf()),
+                descendants: false,
+                all_scopes: false,
+                at: None,
+                all_history: false,
+                include_deleted: false,
+                since: None,
+                limit: 10,
+                offset: None,
+                cursor: Some("invalid cursor".into()),
+                online: false,
+                offline: true,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.error_code(), "KIO-E-SEARCH-CURSOR-001", "{error}");
+    }
 }

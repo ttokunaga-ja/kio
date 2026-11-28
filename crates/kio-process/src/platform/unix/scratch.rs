@@ -99,6 +99,73 @@ pub(crate) fn sampled_scratch_bytes(
         Directory::open(fd)
     }
 
+    #[cfg(target_os = "macos")]
+    fn is_fontconfig_cache_alias(
+        parent: libc::c_int,
+        name: &CStr,
+        relative: &std::path::Path,
+    ) -> bool {
+        if relative != std::path::Path::new("cache/fontconfig") {
+            return false;
+        }
+        // Fontconfig writes compatibility names for older cache formats as
+        // relative aliases of the current cache file in the same directory.
+        fn cache_name(bytes: &[u8]) -> Option<(&str, u32)> {
+            let (prefix, version) = std::str::from_utf8(bytes).ok()?.rsplit_once(".cache-")?;
+            let digest = prefix.strip_suffix("-le64")?;
+            if digest.len() != 32 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return None;
+            }
+            Some((prefix, version.parse().ok()?))
+        }
+
+        let Some((prefix, alias_version)) = cache_name(name.to_bytes()) else {
+            return false;
+        };
+        let mut target = [0_u8; libc::PATH_MAX as usize];
+        // SAFETY: The live directory descriptor anchors the link lookup.
+        // readlinkat writes at most target.len() bytes and never follows the link.
+        let length = unsafe {
+            libc::readlinkat(
+                parent,
+                name.as_ptr(),
+                target.as_mut_ptr().cast(),
+                target.len(),
+            )
+        };
+        let Ok(length) = usize::try_from(length) else {
+            return false;
+        };
+        if length == target.len() {
+            return false;
+        }
+        let leaf = &target[..length];
+        let Some((target_prefix, target_version)) = cache_name(leaf) else {
+            return false;
+        };
+        if target_prefix != prefix || target_version <= alias_version {
+            return false;
+        }
+        let Ok(leaf) = CString::new(leaf) else {
+            return false;
+        };
+        let mut target_stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: leaf is a single component, target_stat is writable and the
+        // no-follow lookup inspects only that sibling's own metadata.
+        let result = unsafe {
+            libc::fstatat(
+                parent,
+                leaf.as_ptr(),
+                target_stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        // The normal scan accounts for the regular cache file independently.
+        result == 0
+            // SAFETY: successful fstatat initialized target_stat.
+            && unsafe { target_stat.assume_init() }.st_mode & libc::S_IFMT == libc::S_IFREG
+    }
+
     fn same_identity(left: &libc::stat, right: &libc::stat) -> bool {
         left.st_dev == right.st_dev && left.st_ino == right.st_ino
     }
@@ -106,6 +173,7 @@ pub(crate) fn sampled_scratch_bytes(
     fn visit(
         directory: Directory,
         depth: usize,
+        #[cfg(target_os = "macos")] relative: &std::path::Path,
         total: &mut u64,
         entries: &mut usize,
         started: Instant,
@@ -180,9 +248,23 @@ pub(crate) fn sampled_scratch_bytes(
                             "renderer scratch directory changed during scan",
                         ));
                     }
-                    visit(child, depth + 1, total, entries, started)?;
+                    #[cfg(target_os = "macos")]
+                    use std::os::unix::ffi::OsStrExt as _;
+                    visit(
+                        child,
+                        depth + 1,
+                        #[cfg(target_os = "macos")]
+                        &relative.join(std::ffi::OsStr::from_bytes(name.to_bytes())),
+                        total,
+                        entries,
+                        started,
+                    )?;
                 }
                 libc::S_IFLNK => {
+                    #[cfg(target_os = "macos")]
+                    if is_fontconfig_cache_alias(parent, &name, relative) {
+                        continue;
+                    }
                     return Err(std::io::Error::other("renderer scratch contains a symlink"));
                 }
                 // LibreOffice's confined single-instance IPC is a pathname
@@ -208,7 +290,15 @@ pub(crate) fn sampled_scratch_bytes(
     let mut total = 0;
     let mut entries = 0;
     let directory = open_directory(root.as_raw_fd(), c".")?;
-    visit(directory, 0, &mut total, &mut entries, Instant::now())?;
+    visit(
+        directory,
+        0,
+        #[cfg(target_os = "macos")]
+        std::path::Path::new(""),
+        &mut total,
+        &mut entries,
+        Instant::now(),
+    )?;
     Ok(total)
 }
 
@@ -246,6 +336,59 @@ mod unix_renderer_scratch_tests {
                 .to_string()
                 .contains("changed after retained monitor setup")
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_counts_private_file_with_a_scratch_alias_once() {
+        use std::os::unix::fs::symlink;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let cache = scratch.path().join("cache/fontconfig");
+        fs::create_dir_all(&cache).unwrap();
+        let target = "0123456789abcdef0123456789abcdef-le64.cache-12";
+        fs::write(cache.join(target), b"data").unwrap();
+        for version in [9, 10, 11] {
+            symlink(
+                target,
+                cache.join(format!(
+                    "0123456789abcdef0123456789abcdef-le64.cache-{version}"
+                )),
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            sampled_scratch_bytes(&File::open(scratch.path()).unwrap(), scratch.path()).unwrap(),
+            4
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn rejects_scratch_aliases_that_escape_or_chain() {
+        use std::os::unix::fs::symlink;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let cache = scratch.path().join("cache/fontconfig");
+        fs::create_dir_all(&cache).unwrap();
+        let cache12 = "0123456789abcdef0123456789abcdef-le64.cache-12";
+        let cache13 = "0123456789abcdef0123456789abcdef-le64.cache-13";
+        let alias = cache.join("0123456789abcdef0123456789abcdef-le64.cache-11");
+        let retained = File::open(scratch.path()).unwrap();
+
+        fs::write(scratch.path().join(cache12), b"outside the cache directory").unwrap();
+        symlink(format!("../../{cache12}"), &alias).unwrap();
+        let error = sampled_scratch_bytes(&retained, scratch.path()).unwrap_err();
+        assert!(error.to_string().contains("contains a symlink"));
+        fs::remove_file(&alias).unwrap();
+
+        fs::write(cache.join(cache13), b"data").unwrap();
+        symlink(cache13, cache.join(cache12)).unwrap();
+        assert!(sampled_scratch_bytes(&retained, scratch.path()).is_ok());
+        symlink(cache12, &alias).unwrap();
+        let error = sampled_scratch_bytes(&retained, scratch.path()).unwrap_err();
+        assert!(error.to_string().contains("contains a symlink"));
     }
 
     #[test]

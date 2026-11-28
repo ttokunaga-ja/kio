@@ -181,7 +181,6 @@ fn resolve_evidence_source(
         ctx.control,
     )?;
     let repo = Repository::open_in_session(&target.repo_root, ctx.control.clone(), ctx.locks)?;
-    crate::settings::validate_repo_tool_lock(&repo)?;
 
     let commit = match repo.read_commit(&pointer.commit) {
         Ok(commit) => commit,
@@ -304,7 +303,6 @@ fn resolve_local_source(
     operand: &str,
 ) -> Result<ExportSource> {
     let repo = ctx.open_recovery_repository()?;
-    crate::settings::validate_repo_tool_lock(&repo)?;
     let target = crate::scope_access::scope_target(repo.root(), ctx.control)?;
 
     if operand == "HEAD" {
@@ -2208,6 +2206,33 @@ mod tests {
             .collect::<Vec<_>>();
         names.sort();
         names
+    }
+
+    #[test]
+    fn original_export_ignores_malformed_working_tool_lock() {
+        let directory = crate::test_support::PrivateTempDir::new();
+        let repo = kio_core::scope::Repository::init(directory.path()).unwrap();
+        let context = crate::context::test_support::context(directory.path());
+        let settings =
+            std::sync::Arc::new(kio_adapter::tool_lock::AdapterRuntimeSettings::default());
+        let control = ControlHandle::default();
+        let locks = kio_core::scope::LockSession::default();
+        let invocation = crate::invocation::Invocation {
+            context: &context,
+            settings: &settings,
+            control: &control,
+            locks: &locks,
+        };
+        let bytes = b"original export fixture";
+        fs::write(directory.path().join("doc.md"), bytes).unwrap();
+        repo.snapshot(None, None).unwrap();
+        fs::write(repo.kio_dir().join("tool-lock.json"), b"invalid json").unwrap();
+        for operand in ["HEAD", "doc.md"] {
+            let source = super::resolve_local_source(&invocation, operand).unwrap();
+            assert_eq!(source.files.len(), 1);
+            assert_eq!(source.files[0].path_at_commit, "doc.md");
+            assert_eq!(source.files[0].raw_hash, kio_core::cas::hash_bytes(bytes));
+        }
     }
 
     #[test]

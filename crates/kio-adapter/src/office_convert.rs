@@ -21,6 +21,7 @@ use kio_core::control::ControlHandle;
 use std::{
     ffi::OsString,
     path::{Path, PathBuf},
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -44,7 +45,7 @@ use crate::{AdapterError, Result};
 /// Test seam env var: its value is a path to a fixture PDF returned
 /// VERBATIM for any input — already deterministic, so
 /// [`OfficeConverter::convert_to_pdf`] skips normalization for this backend.
-/// `version()` reports `"test-converter"`. Checked before
+/// `probe()` reports `"test-converter"`. Checked before
 /// [`OFFICE_CONVERTER_ENV`].
 #[cfg(debug_assertions)]
 pub const TEST_OFFICE_CONVERT_ENV: &str = "KIO_TEST_OFFICE_CONVERT";
@@ -52,7 +53,7 @@ pub const TEST_OFFICE_CONVERT_ENV: &str = "KIO_TEST_OFFICE_CONVERT";
 pub const OFFICE_CONVERTER_ENV: &str = "KIO_OFFICE_CONVERTER";
 pub(crate) const MAX_OFFICE_PROBE_PDF_BYTES: usize = 2 * 1024 * 1024;
 const MAX_OFFICE_PROBE_SCRATCH_BYTES: u64 = 8 * 1024 * 1024;
-// One budget for runtime verification and both fixture conversions on cold CI hosts.
+// Runtime discovery and each requested format have separate bounded deadlines.
 const OFFICE_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 const OFFICE_CONVERT_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_OFFICE_INPUT_BYTES: usize = 100 * 1024 * 1024;
@@ -62,9 +63,9 @@ const OFFICE_NORMALIZATION_PROFILE: &str = "pdf-volatile-fields-v1";
 const OFFICE_SCRATCH_CACHE: &str = "cache";
 const MACOS_UNO_FILTER_VERSION: &str = "macos-spell-component-v1";
 
-const DOCX_MEDIA_TYPE: &str =
+pub const DOCX_MEDIA_TYPE: &str =
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
-const PPTX_MEDIA_TYPE: &str =
+pub const PPTX_MEDIA_TYPE: &str =
     "application/vnd.openxmlformats-officedocument.presentationml.presentation";
 
 const DOCX_PROBE_FIXTURE: &[u8] = include_bytes!("../fixtures/office-probe.docx");
@@ -108,7 +109,7 @@ struct RealRenderer {
 #[derive(Debug, Clone)]
 pub struct OfficeConverter {
     backend: ConverterBackend,
-    version: String,
+    probes: Arc<OfficeProbes>,
 }
 
 impl OfficeConverter {
@@ -120,12 +121,32 @@ impl OfficeConverter {
         self
     }
 
-    /// The renderer's self-reported version (provenance-only — never a hash
-    /// input, 07 §5.1). `"unknown"` if no usable version was reported, or
-    /// `"test-converter"` for the test seam.
-    #[must_use]
-    pub fn version(&self) -> &str {
-        &self.version
+    /// Verify readiness for this format and return its provenance version.
+    /// Clones share the result for the same verified renderer, including failure.
+    pub fn probe(&self, media_type: &str) -> std::result::Result<&str, OfficeUnavailable> {
+        let format =
+            OfficeFormat::from_media_type(media_type).map_err(OfficeUnavailable::unusable)?;
+        match &self.backend {
+            #[cfg(debug_assertions)]
+            ConverterBackend::Seam { .. } => Ok("test-converter"),
+            ConverterBackend::Real(renderer) => self.probes.get(format, || {
+                let deadline = Instant::now() + OFFICE_PROBE_TIMEOUT;
+                probe_renderer_capability(
+                    format,
+                    // The Windows GUI launcher can wait for console input.
+                    OFFICE_QUERY_VERSION.then_some(|| renderer.renderer_version(deadline)),
+                    |fixture, media_type| {
+                        renderer.render_pdf(
+                            fixture,
+                            media_type,
+                            MAX_OFFICE_PROBE_PDF_BYTES,
+                            deadline,
+                        )
+                    },
+                    deadline,
+                )
+            }),
+        }
     }
 
     /// Stable preparation-profile input for this renderer. It binds the
@@ -188,6 +209,8 @@ impl OfficeConverter {
             }),
             ConverterBackend::Real(renderer) => {
                 crate::ooxml_package::validate_real_office_package(input, media_type)?;
+                self.probe(media_type)
+                    .map_err(|error| AdapterError::ContractViolation(error.to_string()))?;
                 let deadline = Instant::now() + OFFICE_CONVERT_TIMEOUT;
                 renderer
                     .verify_runtime("before conversion", deadline)
@@ -200,10 +223,59 @@ impl OfficeConverter {
 }
 
 /// An unavailable renderer is either absent or detected but unusable.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct OfficeUnavailable {
     pub state: &'static str,
     pub reason: String,
+}
+
+impl OfficeUnavailable {
+    fn unusable(error: AdapterError) -> Self {
+        Self {
+            state: "unusable",
+            reason: error.to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum OfficeFormat {
+    Docx,
+    Pptx,
+}
+
+impl OfficeFormat {
+    fn from_media_type(media_type: &str) -> Result<Self> {
+        match media_type {
+            DOCX_MEDIA_TYPE => Ok(Self::Docx),
+            PPTX_MEDIA_TYPE => Ok(Self::Pptx),
+            _ => Err(AdapterError::InvalidInput(format!(
+                "unsupported Office media type: {media_type}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct OfficeProbes {
+    docx: OnceLock<std::result::Result<String, OfficeUnavailable>>,
+    pptx: OnceLock<std::result::Result<String, OfficeUnavailable>>,
+}
+
+impl OfficeProbes {
+    fn get(
+        &self,
+        format: OfficeFormat,
+        probe: impl FnOnce() -> Result<String>,
+    ) -> std::result::Result<&str, OfficeUnavailable> {
+        match format {
+            OfficeFormat::Docx => &self.docx,
+            OfficeFormat::Pptx => &self.pptx,
+        }
+        .get_or_init(|| probe().map_err(OfficeUnavailable::unusable))
+        .as_deref()
+        .map_err(Clone::clone)
+    }
 }
 
 impl std::fmt::Display for OfficeUnavailable {
@@ -212,6 +284,8 @@ impl std::fmt::Display for OfficeUnavailable {
     }
 }
 
+/// Resolve the executable and verify its runtime. Format readiness is checked
+/// by `OfficeConverter::probe` and enforced before converting an input.
 pub fn resolve_office_converter() -> std::result::Result<OfficeConverter, OfficeUnavailable> {
     resolve_office_converter_with_control(&ControlHandle::default())
 }
@@ -220,10 +294,7 @@ pub fn resolve_office_converter_with_control(
     control: &ControlHandle,
 ) -> std::result::Result<OfficeConverter, OfficeUnavailable> {
     let deadline = Instant::now() + OFFICE_PROBE_TIMEOUT;
-    let unusable = |error: AdapterError| OfficeUnavailable {
-        state: "unusable",
-        reason: error.to_string(),
-    };
+    let unusable = OfficeUnavailable::unusable;
     #[cfg(debug_assertions)]
     if let Some(fixture_path) = &control.debug().adapters.office_convert {
         if fixture_path.is_empty() {
@@ -236,7 +307,7 @@ pub fn resolve_office_converter_with_control(
             backend: ConverterBackend::Seam {
                 fixture_path: fixture_path.clone(),
             },
-            version: "test-converter".to_owned(),
+            probes: Arc::default(),
         });
     }
     let requested = std::env::var_os(OFFICE_CONVERTER_ENV)
@@ -271,7 +342,7 @@ pub fn resolve_office_converter_with_control(
             reason: error.to_string(),
         });
     }
-    probe_real_converter_diagnostic(program, control, deadline).map_err(unusable)
+    resolve_real_converter(program, control, deadline).map_err(unusable)
 }
 
 fn renderer_candidate_exists(program: &Path, deadline: Instant) -> Result<bool> {
@@ -314,7 +385,7 @@ fn find_program_candidate<T>(
     Ok(None)
 }
 
-fn probe_real_converter_diagnostic(
+fn resolve_real_converter(
     program: PathBuf,
     control: &ControlHandle,
     deadline: Instant,
@@ -329,18 +400,9 @@ fn probe_real_converter_diagnostic(
         deadline,
     )?;
     renderer.verify_initial_runtime(deadline)?;
-    let version = probe_renderer_capability(
-        // The Windows GUI launcher opens a separate console for --version
-        // and waits for input. Conversion readiness does not use that query.
-        OFFICE_QUERY_VERSION.then_some(|| renderer.renderer_version(deadline)),
-        |fixture, media_type| {
-            renderer.render_pdf(fixture, media_type, MAX_OFFICE_PROBE_PDF_BYTES, deadline)
-        },
-        deadline,
-    )?;
     Ok(OfficeConverter {
         backend: ConverterBackend::Real(renderer),
-        version,
+        probes: Arc::default(),
     })
 }
 
@@ -477,35 +539,35 @@ fn advisory_version_output(
 }
 
 fn probe_renderer_capability(
+    format: OfficeFormat,
     query_version: Option<impl FnOnce() -> Result<String>>,
-    mut convert_fixture: impl FnMut(&[u8], &str) -> Result<Vec<u8>>,
+    convert_fixture: impl FnOnce(&[u8], &str) -> Result<Vec<u8>>,
     deadline: Instant,
 ) -> Result<String> {
-    for (extension, media_type, fixture, expected) in [
-        ("docx", DOCX_MEDIA_TYPE, DOCX_PROBE_FIXTURE, DOCX_PROBE_TEXT),
-        ("pptx", PPTX_MEDIA_TYPE, PPTX_PROBE_FIXTURE, PPTX_PROBE_TEXT),
-    ] {
-        check_renderer_deadline(deadline)?;
-        let pdf = convert_fixture(fixture, media_type).map_err(|error| {
-            AdapterError::ContractViolation(format!(
-                "Office renderer probe could not convert the {extension} fixture: {error}"
-            ))
-        })?;
-        if pdf.len() > MAX_OFFICE_PROBE_PDF_BYTES {
-            return Err(AdapterError::ContractViolation(
-                "Office renderer probe PDF exceeds its byte limit".to_owned(),
-            ));
-        }
-        let text = crate::pdf_decode::office_probe_page_text(&pdf, deadline)?;
-        check_renderer_deadline(deadline)?;
-        if !match text {
-            Some(text) => probe_text_matches(&text, expected, deadline)?,
-            None => false,
-        } {
-            return Err(AdapterError::ContractViolation(format!(
-                "Office renderer probe PDF did not contain the expected {extension} page"
-            )));
-        }
+    let (extension, media_type, fixture, expected) = match format {
+        OfficeFormat::Docx => ("docx", DOCX_MEDIA_TYPE, DOCX_PROBE_FIXTURE, DOCX_PROBE_TEXT),
+        OfficeFormat::Pptx => ("pptx", PPTX_MEDIA_TYPE, PPTX_PROBE_FIXTURE, PPTX_PROBE_TEXT),
+    };
+    check_renderer_deadline(deadline)?;
+    let pdf = convert_fixture(fixture, media_type).map_err(|error| {
+        AdapterError::ContractViolation(format!(
+            "Office renderer probe could not convert the {extension} fixture: {error}"
+        ))
+    })?;
+    if pdf.len() > MAX_OFFICE_PROBE_PDF_BYTES {
+        return Err(AdapterError::ContractViolation(
+            "Office renderer probe PDF exceeds its byte limit".to_owned(),
+        ));
+    }
+    let text = crate::pdf_decode::office_probe_page_text(&pdf, deadline)?;
+    check_renderer_deadline(deadline)?;
+    if !match text {
+        Some(text) => probe_text_matches(&text, expected, deadline)?,
+        None => false,
+    } {
+        return Err(AdapterError::ContractViolation(format!(
+            "Office renderer probe PDF did not contain the expected {extension} page"
+        )));
     }
     let stdout = query_version
         .map(|query| query())
@@ -1177,6 +1239,14 @@ mod tests {
         Instant::now() + Duration::from_secs(10)
     }
 
+    fn accepted_test_probes() -> Arc<OfficeProbes> {
+        let probes = Arc::new(OfficeProbes::default());
+        for format in [OfficeFormat::Docx, OfficeFormat::Pptx] {
+            probes.get(format, || Ok("unknown".into())).unwrap();
+        }
+        probes
+    }
+
     fn fixture_converter(script: &Path) -> (OfficeConverter, PathBuf) {
         let program = script.canonicalize().unwrap();
         let package = program.with_extension("runtime");
@@ -1202,7 +1272,7 @@ mod tests {
         (
             OfficeConverter {
                 backend: ConverterBackend::Real(renderer),
-                version: "unknown".to_owned(),
+                probes: accepted_test_probes(),
             },
             package,
         )
@@ -1313,7 +1383,7 @@ mod tests {
             kio_core::test_control::DebugTestControl::from_env(),
         ))
         .expect("seam converter resolves");
-        assert_eq!(converter.version(), "test-converter");
+        assert_eq!(converter.probe(DOCX_MEDIA_TYPE).unwrap(), "test-converter");
 
         // "returned verbatim for ANY input" — arbitrary bytes/media type.
         let out = converter
@@ -1344,7 +1414,7 @@ mod tests {
             kio_core::test_control::DebugTestControl::from_env(),
         ))
         .expect("seam must win over explicit");
-        assert_eq!(converter.version(), "test-converter");
+        assert_eq!(converter.probe(DOCX_MEDIA_TYPE).unwrap(), "test-converter");
     }
 
     #[test]
@@ -1423,7 +1493,7 @@ mod tests {
         );
         let _secret = kio_core::test_control::TestEnvGuard::set("KIO_CONVERTER_SECRET", "leak");
         let (converter, _) = fixture_converter(&script);
-        assert_eq!(converter.version(), "unknown");
+        assert_eq!(converter.probe(DOCX_MEDIA_TYPE).unwrap(), "unknown");
         let pdf = converter
             .convert_to_pdf(DOCX_PROBE_FIXTURE, DOCX_MEDIA_TYPE)
             .expect("secret must not be inherited and special paths must work");
@@ -2075,20 +2145,53 @@ mod tests {
     }
 
     #[test]
-    fn probe_requires_both_fixture_conversions_without_a_version_line() {
-        let mut media_types = Vec::new();
-        let version = probe_renderer_capability(
-            Some(|| Ok("  \r\n".to_owned())),
-            |bytes, media_type| {
-                crate::ooxml_package::validate_real_office_package(bytes, media_type)?;
-                media_types.push(media_type.to_owned());
-                Ok(rendered_probe_fixture(media_type))
-            },
-            test_deadline(),
-        )
-        .expect("successful fixture conversions establish capability");
-        assert_eq!(media_types, [DOCX_MEDIA_TYPE, PPTX_MEDIA_TYPE]);
-        assert_eq!(version, "unknown");
+    fn format_probes_are_independent_and_reuse_successes_and_failures() {
+        for (failing, working, working_media) in [
+            (OfficeFormat::Docx, OfficeFormat::Pptx, PPTX_MEDIA_TYPE),
+            (OfficeFormat::Pptx, OfficeFormat::Docx, DOCX_MEDIA_TYPE),
+        ] {
+            let probes = OfficeProbes::default();
+            probes
+                .get(failing, || {
+                    probe_renderer_capability(
+                        failing,
+                        None::<fn() -> Result<String>>,
+                        |_, _| {
+                            Err(AdapterError::ContractViolation(
+                                "fixture conversion failed".into(),
+                            ))
+                        },
+                        test_deadline(),
+                    )
+                })
+                .unwrap_err();
+            let version = probes
+                .get(working, || {
+                    probe_renderer_capability(
+                        working,
+                        None::<fn() -> Result<String>>,
+                        |bytes, media_type| {
+                            assert_eq!(media_type, working_media);
+                            crate::ooxml_package::validate_real_office_package(bytes, media_type)?;
+                            Ok(rendered_probe_fixture(media_type))
+                        },
+                        test_deadline(),
+                    )
+                })
+                .unwrap();
+            assert_eq!(version, "unknown");
+            assert!(
+                probes
+                    .get(failing, || panic!("failed format probed twice"))
+                    .is_err()
+            );
+            assert_eq!(
+                probes
+                    .get(working, || panic!("ready format probed twice"))
+                    .unwrap(),
+                version
+            );
+        }
     }
 
     // The supplied soffice capture exercises the Writer TJ text run.
@@ -2101,23 +2204,25 @@ mod tests {
     const LIBREOFFICE_CLIPPED_PPTX_PROBE_PDF: &[u8] =
         include_bytes!("../fixtures/office-probe-libreoffice-pptx-clipped.pdf");
 
-    fn probe_captured_libreoffice_pdfs(presentation: &[u8]) -> Result<String> {
-        probe_renderer_capability(
-            Some(|| Ok("LibreOffice 24.2".to_owned())),
-            |_, media_type| match media_type {
-                DOCX_MEDIA_TYPE => Ok(LIBREOFFICE_DOCX_PROBE_PDF.to_vec()),
-                PPTX_MEDIA_TYPE => Ok(presentation.to_vec()),
-                _ => panic!("unexpected probe media type: {media_type}"),
-            },
-            test_deadline(),
-        )
+    fn probe_captured_libreoffice_pdfs(presentation: &[u8]) -> Result<()> {
+        for (format, pdf) in [
+            (OfficeFormat::Docx, LIBREOFFICE_DOCX_PROBE_PDF),
+            (OfficeFormat::Pptx, presentation),
+        ] {
+            probe_renderer_capability(
+                format,
+                None::<fn() -> Result<String>>,
+                |_, _| Ok(pdf.to_vec()),
+                test_deadline(),
+            )?;
+        }
+        Ok(())
     }
 
     #[test]
     fn probe_accepts_captured_libreoffice_docx_and_pptx() {
-        let version = probe_captured_libreoffice_pdfs(LIBREOFFICE_PPTX_PROBE_PDF)
+        probe_captured_libreoffice_pdfs(LIBREOFFICE_PPTX_PROBE_PDF)
             .expect("real LibreOffice PDFs contain both expected probe pages");
-        assert_eq!(version, "LibreOffice 24.2");
     }
 
     #[test]
@@ -2268,6 +2373,7 @@ mod tests {
     #[test]
     fn probe_refuses_large_renderer_output_before_decoding() {
         let result = probe_renderer_capability(
+            OfficeFormat::Docx,
             Some(|| panic!("version queried with oversized PDF")),
             |_, media| {
                 let mut pdf = rendered_probe_fixture(media);
@@ -2287,6 +2393,7 @@ mod tests {
     #[test]
     fn probe_rejects_unreachable_page_with_pdf_markers() {
         let result = probe_renderer_capability(
+            OfficeFormat::Docx,
             Some(|| Ok("test renderer".to_owned())),
             |_, _| Ok(b"%PDF-1.4\n1 0 obj\n<< /Type /Page >>\nendobj\n%%EOF\n".to_vec()),
             test_deadline(),
@@ -2321,22 +2428,6 @@ mod tests {
     }
 
     #[test]
-    fn probe_without_version_query_still_requires_both_conversions() {
-        let mut converted = Vec::new();
-        let version = probe_renderer_capability(
-            None::<fn() -> Result<String>>,
-            |_, media_type| {
-                converted.push(media_type.to_owned());
-                Ok(rendered_probe_fixture(media_type))
-            },
-            test_deadline(),
-        )
-        .unwrap();
-        assert_eq!(converted, [DOCX_MEDIA_TYPE, PPTX_MEDIA_TYPE]);
-        assert_eq!(version, "unknown");
-    }
-
-    #[test]
     fn probe_preserves_capability_after_clean_version_timeout_or_output_limit() {
         for error in [
             BoundedProcessError::Timeout { timeout_ms: 10 },
@@ -2346,6 +2437,7 @@ mod tests {
             },
         ] {
             let version = probe_renderer_capability(
+                OfficeFormat::Docx,
                 Some(|| {
                     advisory_version_output(Err(error.into()))
                         .map_err(|error| AdapterError::ContractViolation(error.to_string()))
@@ -2362,6 +2454,7 @@ mod tests {
     #[test]
     fn probe_rejects_pptx_pdf_with_docx_content_even_with_a_version_line() {
         let error = probe_renderer_capability(
+            OfficeFormat::Pptx,
             Some(|| Ok("LibreOffice 26.8.0.3".to_owned())),
             |_, _| Ok(probe_pdf(DOCX_PROBE_TEXT, false)),
             test_deadline(),
@@ -2388,6 +2481,7 @@ mod tests {
     #[test]
     fn probe_rejects_an_expired_budget_before_rendering() {
         let result = probe_renderer_capability(
+            OfficeFormat::Docx,
             Some(|| panic!("version queried after the deadline")),
             |_, _| panic!("renderer invoked after the deadline"),
             Instant::now(),
@@ -2399,6 +2493,7 @@ mod tests {
     fn probe_checks_remaining_budget_again_after_reading_output() {
         let deadline = Instant::now() + Duration::from_millis(50);
         let result = probe_renderer_capability(
+            OfficeFormat::Docx,
             Some(|| panic!("version queried after the deadline")),
             |_, _| {
                 std::thread::sleep(
@@ -2417,9 +2512,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let program = directory.path().canonicalize().unwrap().join("standalone");
         std::fs::write(&program, b"fixture").unwrap();
-        let error =
-            probe_real_converter_diagnostic(program, &ControlHandle::default(), test_deadline())
-                .unwrap_err();
+        let error = resolve_real_converter(program, &ControlHandle::default(), test_deadline())
+            .unwrap_err();
         assert!(
             error.to_string().contains("cannot identify its package"),
             "{error}"
@@ -2530,14 +2624,18 @@ mod tests {
         ))
     }
 
-    fn required_real_office_converter() -> Option<OfficeConverter> {
+    fn required_real_office_converter(media_type: &str) -> Option<OfficeConverter> {
         let deadline = Instant::now() + OFFICE_PROBE_TIMEOUT;
         let program = required_real_office_program(deadline)?;
         let _clear_seam = kio_core::test_control::TestEnvGuard::remove(TEST_OFFICE_CONVERT_ENV);
-        let converter =
-            probe_real_converter_diagnostic(program, &ControlHandle::default(), deadline)
-                .expect("KIO_REAL_OFFICE=1 requires a working sandboxed Office converter");
-        assert_ne!(converter.version(), "test-converter");
+        let converter = resolve_real_converter(program, &ControlHandle::default(), deadline)
+            .expect("KIO_REAL_OFFICE=1 requires a working sandboxed Office converter");
+        assert_ne!(
+            converter
+                .probe(media_type)
+                .expect("the requested format must pass its real probe"),
+            "test-converter"
+        );
         Some(converter)
     }
 
@@ -2585,7 +2683,7 @@ mod tests {
             .expect("verify copied bundle signature");
         let converter = OfficeConverter {
             backend: ConverterBackend::Real(renderer),
-            version: "unknown".to_owned(),
+            probes: accepted_test_probes(),
         };
         let catalog = private_bundle.join("Contents/Resources/services/services.rdb");
         let replacement = temp.path().join("replacement.rdb");
@@ -2607,7 +2705,7 @@ mod tests {
         let _lock = kio_core::test_control::test_env_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(converter) = required_real_office_converter()
+        let Some(converter) = required_real_office_converter(DOCX_MEDIA_TYPE)
             .map(OfficeConverter::with_native_acceptance_diagnostics)
         else {
             return;
@@ -2658,7 +2756,7 @@ mod tests {
         let _lock = kio_core::test_control::test_env_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(converter) = required_real_office_converter()
+        let Some(converter) = required_real_office_converter(PPTX_MEDIA_TYPE)
             .map(OfficeConverter::with_native_acceptance_diagnostics)
         else {
             return;

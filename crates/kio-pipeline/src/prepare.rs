@@ -252,7 +252,9 @@ fn resolve_prepare_converter(
     control: &ControlHandle,
 ) -> Option<kio_adapter::office_convert::OfficeConverter> {
     if kio_adapter::office_convert::is_office_media(media_type) {
-        kio_adapter::office_convert::resolve_office_converter_with_control(control).ok()
+        kio_adapter::office_convert::resolve_office_converter_with_control(control)
+            .ok()
+            .filter(|converter| converter.probe(media_type).is_ok())
     } else {
         None
     }
@@ -408,17 +410,26 @@ fn prepare_units_emitting(
         match converter {
             None => return Ok(empty_prepare_output()),
             Some(converter) => {
+                let pdf = converter
+                    .convert_to_pdf(bytes, media_type)
+                    .map_err(|error| {
+                        prepare_adapter_error("KIO-E-PREPARE-OFFICE-CONVERT-001", error)
+                    })?;
+                let version = converter.probe(media_type).map_err(|error| {
+                    prepare_adapter_error(
+                        "KIO-E-PREPARE-OFFICE-CONVERT-001",
+                        kio_adapter::AdapterError::ContractViolation(error.to_string()),
+                    )
+                })?;
                 renderer = Some(RendererIdentity {
                     name: "LibreOffice".to_owned(),
-                    version: converter.version().to_owned(),
+                    version: version.to_owned(),
                 });
                 preparation_profile_hash = office_preparation_profile_hash(
                     request.tool_profile_hash,
                     &converter.profile_identity(),
                 );
-                Some(converter.convert_to_pdf(bytes, media_type).map_err(|err| {
-                    prepare_adapter_error("KIO-E-PREPARE-OFFICE-CONVERT-001", err)
-                })?)
+                Some(pdf)
             }
         }
     } else {
