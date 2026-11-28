@@ -4,6 +4,19 @@
 
 kio の作業環境は時期によって丸ごと切り替わる（D-20261121-02）。通常は Mac、学会などで Mac を安定して使えない期間は個人デスクトップ WSL を使う。切り替えは利用者が指示し、作業内容によって環境を使い分けない。同時に両方の環境で作業しない。どちらの環境でも、この文書と `git pull` で作業を再開できる。切り替えるときは「6. 環境の切り替え」の手順に従い、この冒頭と「1」を書き換える。
 
+## 0. 現在の状態（2026-11-28）
+
+- **F4（正式な受入）は完了した。** 候補は main の `18eead30`。通常 CI（run 46090663831）、native（46097516326）、local（46143557661）、provider（46145639826、campaign `v1-f4-2026-11b`）がそれぞれ成功し、`v1-acceptance-verify.yml`（run 46146328760）が受領書の全体行列を照合して成功した。
+- provider の台帳（branch `codex/provider-acceptance-ledger`）には、この campaign で各 provider USD 1.80 の予約がある（上限 USD 10）。この branch は消さない。
+- GPU 受入は 4070 で行った。研究室は OCR イメージを取得できない（§1）ため、`KIO_LAB_JUMP_HOST` は `100.97.109.109` のままにしている。研究室へ戻すには、イメージを digest を保って移すか、研究室ネットワークで許可を得る必要がある。dispatcher は配置済みの候補しか受け付けないので、候補の SHA が変わるたびに両ホストへ再配置する。
+- F4 後の課題：
+  - 監査で挙がった簡素化と、過剰に厳しい検査の見直し。
+  - EG2 の確認を OCR から切り離す（EG2 は CPU だけで動く）。
+  - local 受入の改善：OCR 起動前の失敗箇所を固定コードで返す。エラー時の cleanup の範囲を Finish までに限る。証跡の artifact 名に attempt を入れる。
+  - 時間に依存するテストの不安定さ：nc2、chunking、`connection_owner_remains_send`、Windows の `windows_scheduler_semantic_comparison_fixtures`。
+  - §1 の LibreOffice と S4U。
+  - 調査用 branch の `probe/appcontainer`、`probe/win-timing`、`probe/office` を残している。
+
 ## 1. 最後に環境を切り替えた時点の状態（2026-11-21、WSL → Mac）
 
 - 計画（`tasks/v1-plan.md`）の残りは **F4（正式な受入）だけ**である。F3（実装完了の判定）は main の `2c270c5` で完了した。ローカル検証と、通常の CI の 3 つの OS の全 job（run 44786625755）が成功している。
