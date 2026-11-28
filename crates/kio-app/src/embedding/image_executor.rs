@@ -616,7 +616,7 @@ pub(crate) fn run_image_embedding_enrichment(
             if embedding_is_online(embedding.execution)
                 && kio_adapter::catalog::validate_gemini_sync_inputs(
                     &items,
-                    kio_adapter::catalog::ADOPTED_EMBEDDING_MODEL_PIN,
+                    &kio_adapter::catalog::configured_gemini_model_pin(ctx.settings),
                     u32::try_from(embedding.profile.dimensions)
                         .map_err(|_| KioError::schema("embedding dimensions exceed u32"))?,
                 )

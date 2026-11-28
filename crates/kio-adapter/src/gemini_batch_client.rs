@@ -585,6 +585,13 @@ impl GeminiBatchClient for EnvGeminiBatchClient {
         inputs: &[GeminiBatchEmbedInput],
     ) -> Result<EmbeddingOutcome> {
         let body = inline_embed_batch_body(model, display_name, dimensions, inputs)?;
+        crate::gemini_embedding::check_gemini_model_capability(model, || {
+            self.get_json(
+                &format!("{}/v1beta/models/{model}", self.base_url()),
+                crate::http_policy::MODEL_CATALOG_MAX_BYTES,
+                "Gemini model metadata",
+            )
+        })?;
         let api_key = self.identity.credential();
         let url = format!(
             "{}/v1beta/{}:asyncBatchEmbedContent",

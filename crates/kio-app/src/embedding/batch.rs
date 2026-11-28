@@ -560,6 +560,7 @@ pub(crate) fn submit_embedding_batch_jobs(
     if plan.to_send.is_empty() {
         return Ok(Some(outcome));
     }
+    let model_pin = kio_adapter::catalog::configured_gemini_model_pin(adapter_settings);
     let caps = budget_cap_config(budget_caps, scope_id, EMBEDDING_ADAPTER_KIND);
     let bypass_cap_denial = override_budget || !budget_caps.hard_stop;
     for job_groups in plan.to_send.chunks(EMBEDDING_BATCH_JOB_MAX_MEMBERS) {
@@ -737,7 +738,7 @@ pub(crate) fn submit_embedding_batch_jobs(
             continue;
         }
         let pending = match client.submit_job(
-            kio_adapter::catalog::ADOPTED_EMBEDDING_MODEL_PIN,
+            &model_pin,
             u32::try_from(profile.dimensions).unwrap_or(u32::MAX),
             &kio_adapter::gemini_batch_client::batch_display_name(&intent_token),
             &inputs,
@@ -1348,6 +1349,7 @@ pub(crate) fn submit_image_embedding_job(
     else {
         return Ok(ImageBatchDispatch::Sync(prepared));
     };
+    let model_pin = kio_adapter::catalog::configured_gemini_model_pin(ctx.settings);
     let dimensions = u32::try_from(profile.dimensions)
         .map_err(|_| KioError::schema("embedding dimensions exceed u32"))?;
     let inputs = vec![kio_adapter::gemini_batch_client::GeminiBatchEmbedInput {
@@ -1365,7 +1367,7 @@ pub(crate) fn submit_image_embedding_job(
         "00000000-0000-7000-8000-000000000000",
     );
     if kio_adapter::gemini_batch_client::validate_gemini_batch_inputs(
-        kio_adapter::catalog::ADOPTED_EMBEDDING_MODEL_PIN,
+        &model_pin,
         dimensions,
         &preflight_name,
         &inputs,
@@ -1461,7 +1463,7 @@ pub(crate) fn submit_image_embedding_job(
         requires_secret,
     )?;
     let pending = match client.submit_job(
-        kio_adapter::catalog::ADOPTED_EMBEDDING_MODEL_PIN,
+        &model_pin,
         dimensions,
         &kio_adapter::gemini_batch_client::batch_display_name(&job.intent_token),
         &inputs,

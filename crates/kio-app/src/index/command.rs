@@ -14,6 +14,7 @@ use crate::egress::secrets_send_approved;
 use crate::egress::write_approval_record;
 use crate::embedding::admission::LaneOverride;
 use crate::embedding::admission::resolve_invocation_lane;
+use crate::embedding::admission::{embedding_execution, embedding_is_online};
 use crate::embedding::batch::poll_batch_embedding_jobs;
 use crate::embedding::executor::generate_scope_embeddings;
 use crate::embedding::executor::run_embedding_enrichment;
@@ -2343,6 +2344,11 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
         &closing_preview,
         classified.deferred_inputs,
     )?;
+    // Rebuilding projects vectors against the working tool-lock. Publish the
+    // configured online profile before rebuilding or scheduling its embeddings.
+    if embedding_execution(adapter_settings, ctx.control).is_some_and(embedding_is_online) {
+        materialize_tool_lock(adapter_settings, &repo)?;
+    }
     let (outcome, deferred_inputs) = repo.auto_snapshot_scanned(
         "kio reindex --force",
         &inputs,
