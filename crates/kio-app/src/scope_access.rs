@@ -620,10 +620,9 @@ pub(crate) fn resolve_evidence_scope_target(
     )
 }
 
-pub(crate) fn validate_extraction_recovery_registration(
-    cwd: &Path,
-    repo: &Repository,
-) -> Result<()> {
+pub(crate) fn validate_writer_registration(cwd: &Path, repo: &Repository) -> Result<()> {
+    // A pending publication hides the writer's own scope from read-only opens.
+    // Use its validated retained identity while checking the registry for conflicts.
     let identity = repo.scope_identity()?;
     let target = ScopeTarget {
         scope_id: identity.scope_id.clone(),

@@ -16034,17 +16034,10 @@ fn nc2_retry_keeps_reason_for_pending_publication() {
             );
         }
 
-        fs::write(&path, b"\xfd").unwrap();
-        if extraction {
-            let error = json_failure(&dir, command, 3);
-            assert_eq!(
-                error["error_code"],
-                "KIO-E-PUBLICATION-RECOVERY-REQUIRED-001"
-            );
-        } else {
-            kio(&dir, command).assert().failure();
-        }
-        json_success(&dir, &["init"]);
+        // Retry the same bytes so the recovered publication remains the live
+        // disposition and no new observation can mask a missing replay.
+        kio(&dir, command).assert().success();
+        assert!(!dir.path().join(".kio/publication-v1.json").exists());
         let status = json_success(&dir, &["status"]);
         assert_eq!(
             status["unsupported_inputs"][0]["raw_hash"],

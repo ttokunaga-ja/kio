@@ -2130,6 +2130,13 @@ mod tests {
             repo.recover_publication().unwrap_err().error_code(),
             "KIO-E-MANAGED-RESTORE-RECOVERY-REQUIRED-001"
         );
+        assert_eq!(
+            repo.lock_store_for_publication()
+                .err()
+                .unwrap()
+                .error_code(),
+            "KIO-E-MANAGED-RESTORE-RECOVERY-REQUIRED-001"
+        );
         assert_eq!(fs::read(repo.kio_dir().join("HEAD")).unwrap(), before_head);
         assert_eq!(
             fs::read(directory.path().join("a.txt")).unwrap(),

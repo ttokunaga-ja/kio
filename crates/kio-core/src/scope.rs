@@ -4578,10 +4578,7 @@ mod tests {
             "KIO-E-PUBLICATION-RECOVERY-REQUIRED-001"
         );
         let recover = Repository::open_for_recovery(dir.path()).unwrap();
-        let _lock = recover
-            .lock_store_in_session(recover.lock_session())
-            .unwrap();
-        assert!(recover.recover_publication().unwrap());
+        let _lock = recover.lock_store_for_publication().unwrap();
         assert_eq!(recover.head_commit_hash().unwrap(), Some(c2_hash.clone()));
         assert!(
             !repo
@@ -4596,22 +4593,31 @@ mod tests {
             .unwrap()
             .commit_hash
             .unwrap();
-        let conflicting = super::PublicationJournal {
+        let journal_path = repo.kio_dir().join(super::PUBLICATION_JOURNAL_LEAF);
+        let mut conflicting = super::PublicationJournal {
             version: 1,
             expected_head: Some(c1_hash),
             new_head: c2_hash,
             manifest,
         };
-        fs::write(
-            repo.kio_dir().join(super::PUBLICATION_JOURNAL_LEAF),
-            canonical_json_bytes(&serde_json::to_value(conflicting).unwrap()).unwrap(),
-        )
-        .unwrap();
+        let bytes = |journal: &super::PublicationJournal| {
+            canonical_json_bytes(&serde_json::to_value(journal).unwrap()).unwrap()
+        };
+        fs::write(&journal_path, bytes(&conflicting)).unwrap();
         assert_eq!(
-            recover.recover_publication().unwrap_err().error_code(),
+            recover
+                .lock_store_for_publication()
+                .err()
+                .unwrap()
+                .error_code(),
             "KIO-E-PUBLICATION-CONFLICT-001"
         );
+        conflicting.expected_head = Some(c3_hash.clone());
+        fs::write(&journal_path, bytes(&conflicting)).unwrap();
+        let error = recover.lock_store_for_publication().err().unwrap();
+        assert!(error.to_string().contains("not the expected HEAD child"));
         assert_eq!(recover.head_commit_hash().unwrap(), Some(c3_hash));
+        assert_eq!(fs::read(journal_path).unwrap(), bytes(&conflicting));
     }
 
     #[test]
@@ -4731,6 +4737,27 @@ mod tests {
             .expect("purge's own snapshot must not trip its own journal barrier");
         let commit = outcome.commit.unwrap();
         assert_eq!(commit.commit_type, CommitType::Purged);
+        let publication_path = repo.kio_dir().join(super::PUBLICATION_JOURNAL_LEAF);
+        let publication = super::PublicationJournal {
+            version: 1,
+            expected_head: commit.parent.clone(),
+            new_head: outcome.commit_hash.unwrap(),
+            manifest: super::Manifest::read(
+                &repo.object_store().record_stages().unwrap(),
+                fs::File::open(repo.kio_dir().join("manifest.json")).unwrap(),
+            )
+            .unwrap(),
+        };
+        let bytes = canonical_json_bytes(&serde_json::to_value(publication).unwrap()).unwrap();
+        fs::write(&publication_path, &bytes).unwrap();
+        assert_eq!(
+            repo.lock_store_for_publication()
+                .err()
+                .unwrap()
+                .error_code(),
+            "KIO-E-PUBLICATION-RECOVERY-REQUIRED-001"
+        );
+        assert_eq!(fs::read(publication_path).unwrap(), bytes);
         let tree = repo.read_tree(&commit.tree).unwrap();
         assert_eq!(
             tree.entries

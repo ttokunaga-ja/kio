@@ -108,26 +108,6 @@ pub(super) fn has_journal(repo: &Repository) -> Result<bool> {
 }
 
 pub(super) fn recover(repo: &Repository) -> Result<bool> {
-    recover_with(repo, |_| Ok(()))
-}
-
-pub(super) fn recover_for_index(repo: &Repository) -> Result<bool> {
-    recover_with(repo, |journal| {
-        let (_, before) = super::command::dispositions_at_head(repo, journal.parent.as_deref())?;
-        let (_, pending) = super::command::dispositions_at_head(repo, Some(&journal.head))?;
-        if before != pending {
-            // The pending publication owns an unsupported-input change. It must
-            // be resolved before a new index can record additional observations.
-            let _lock = repo.lock_store_for_publication()?;
-        }
-        Ok(())
-    })
-}
-
-fn recover_with(
-    repo: &Repository,
-    before_history_recovery: impl FnOnce(&Journal) -> Result<()>,
-) -> Result<bool> {
     let directory = bound_extraction_store(repo)?;
     let path = Path::new(JOURNAL);
     let stages = repo.object_store().record_stages()?;
@@ -152,7 +132,7 @@ fn recover_with(
             ));
         }
     }
-    repo.recover_extraction_publication(&journal.head, || before_history_recovery(&journal))?;
+    repo.recover_extraction_publication(&journal.head)?;
     let mut current = repo.head_commit_hash()?;
     while let Some(head) = current {
         if head == journal.head {

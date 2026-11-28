@@ -108,7 +108,8 @@ pub(crate) fn run(
     // the store lock before preview/working-copy refusal so a tombstoned raw temp
     // is removed even when the requested purge cannot proceed.
     {
-        let _store_lock = repo.lock_store_for_publication()?;
+        let _store_lock = repo.lock_store_in_session(repo.lock_session())?;
+        repo.ensure_no_pending_publication()?;
         repo.ensure_no_pending_managed_restore()?;
         let state = PurgeState::open_with_control(repo.kio_dir(), repo.control().clone())?;
         if state.read_journal()?.is_some() {
@@ -561,7 +562,8 @@ fn execute_phase_machine(
     args: &PurgeArgs,
     preview: &PurgePreview,
 ) -> Result<PurgeResponse> {
-    let _store_lock = repo.lock_store_for_publication()?;
+    let _store_lock = repo.lock_store_in_session(repo.lock_session())?;
+    repo.ensure_no_pending_publication()?;
     let locked_plan = resolve_plan(repo, args)?;
     if locked_plan != preview.plan {
         return Err(KioError::new(

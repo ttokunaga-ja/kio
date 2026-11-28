@@ -199,6 +199,11 @@ kio evidence verify --batch <pointers.jsonl> [--strict]  # <pointer> と --batch
 kio evidence retarget <pointer> --at <commit> # exact-only read-only retarget。--at は full canonical sha256 commit 必須。--latest/default/alias/fallback はない (08 §5)
 ```
 
+中断した通常の履歴 publication は、次の `kio index`、watch の再照合、または `kio reindex` が
+書き込みロックを取得し、HEAD・子 commit・manifest を照合できた場合に自動で完了する。
+HEAD 競合や検証エラーがあれば journal を残す。managed restore は `kio repair recover-restore`、
+purge は既存の purge 回復手順を使う。
+
 本表はコマンド全量の spec である。MVP の対象は [09-mvp-scope.md §1](09-mvp-scope.md) を参照する。
 
 `tag --delete` への commit 指定は
