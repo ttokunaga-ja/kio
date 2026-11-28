@@ -540,12 +540,19 @@ fn write_private_candidate(root: &Path, bytes: &[u8]) -> Result<(), AcceptanceEr
 }
 
 fn write_private_ca(root: &Path, bytes: &[u8]) -> Result<PathBuf, AcceptanceError> {
-    let directory = root.join("device/trust");
-    fs::create_dir(&directory).map_err(io)?;
-    private_dir(&directory)?;
+    use kio_core::{control::ControlHandle, private_fs};
+
     let path = root.join(CA_COPY);
-    fs::write(&path, bytes).map_err(io)?;
-    private_file(&path)?;
+    let directory = private_fs::retain_or_create_external_directory_with_control(
+        &root.join("device/trust"),
+        &ControlHandle::default(),
+    )
+    .map_err(|error| AcceptanceError::Io(error.to_string()))?;
+    directory
+        .create_private_file(Path::new("ca.pem"))
+        .map_err(|error| AcceptanceError::Io(error.to_string()))?
+        .write_all(bytes)
+        .map_err(io)?;
     Ok(path)
 }
 
@@ -1240,6 +1247,37 @@ fn io(error: std::io::Error) -> AcceptanceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staged_ca_passes_private_file_admission() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        prepare_private_root(&root).unwrap();
+
+        let bytes = b"staged CA";
+        let path = write_private_ca(&root, bytes).unwrap();
+
+        assert_eq!(path, root.join(CA_COPY));
+        let parent = path.parent().unwrap();
+        let retained = kio_core::private_fs::retain_external_directory(parent).unwrap();
+        assert_eq!(
+            kio_core::private_fs::read_private_file_at_path(
+                &retained,
+                Path::new(path.file_name().unwrap()),
+                MAX_FIXTURE_BYTES,
+            )
+            .unwrap(),
+            bytes
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&path), 0o600);
+            assert_eq!(mode(parent), 0o700);
+        }
+    }
 
     #[test]
     fn tools_configuration_contains_only_declared_roles_and_escapes_endpoint() {
