@@ -334,3 +334,13 @@
 - **内容**：利用者の指示により、Codex に委譲するときの reasoning effort の既定を medium から low に変える。難しい調査・設計・レビューでは、統括がその作業に限って上げる。
 - **理由**：Codex の利用量を抑える。kio 以外の repo と `~/.codex` の既定も同じく low にする。
 - **関係する資料**：`AGENTS.md`（エージェント運用）、`tasks/handoff.md` §4。
+
+### D-20261129-01 外部送信を一括の許可にし、loopback の承認と Office の隔離を見直す
+
+- **内容**：利用者の決定（2026-11-29）。
+  1. 外部 Adapter への送信は、Adapter・宛先・出力 profile ごとの承認ではなく、外部送信の許可 1 つで扱う。許可すれば設定した外部 Adapter をすべて使え、許可しなければすべて使わない。
+  2. loopback（127.0.0.1 など）の HTTP embedding への送信は承認を要しない。
+  3. Linux・macOS で LibreOffice の隔離を作れない環境でも、利用者が設定で明示した場合は隔離なしで Office を変換する。明示がなければ現状どおり変換しない。
+  4. provider 受入の Environment と専用 App を統合する。
+- **理由**：Adapter ごとの承認は利用者の認知負荷を上げるだけで、利用者が想定するセキュリティ要件は外部送信の可否で満たせる。利用者が求めていない細かすぎる設定もあわせて簡潔にするため、調査する。
+- **関係する資料**：[F4 後の作業計画](../tasks/post-f4-plan.md) P5、`docs/07-adapter-spec.md`、`tasks/acceptance/provider-budget.md`。
