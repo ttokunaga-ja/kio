@@ -289,7 +289,9 @@ mod tests {
         let output = kio_process::run_bounded_command(
             &mut command,
             kio_process::BoundedProcessOptions {
-                timeout: std::time::Duration::from_secs(30),
+                // A cold PowerShell startup on a loaded Windows runner can take
+                // longer than the comparison itself.
+                timeout: std::time::Duration::from_secs(120),
                 max_stdout_bytes: 8192,
                 max_stderr_bytes: 8192,
             },

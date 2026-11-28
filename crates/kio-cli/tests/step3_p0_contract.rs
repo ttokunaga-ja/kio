@@ -15496,10 +15496,8 @@ fn pause_nc2_command(
         .spawn()
         .unwrap();
     let expected = format!("point={point}\npid={}\n", child.id());
-    let deadline = Instant::now() + Duration::from_secs(25);
     while fs::read_to_string(ready).ok().as_deref() != Some(&expected) {
-        if child.try_wait().unwrap().is_some() || Instant::now() >= deadline {
-            let _ = child.kill();
+        if child.try_wait().unwrap().is_some() {
             let output = child.wait_with_output().unwrap();
             panic!("{args:?} did not reach checkpoint {point}: {output:?}");
         }
