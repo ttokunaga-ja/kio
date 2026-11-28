@@ -110,10 +110,11 @@ kio ledger backup --to <absolute-directory>
                                         # lifecycle lock 下の coherent, create-only backup
 kio ledger restore --from <absolute-directory>
                                         # authority-bound backup から missing device ledger だけを restore
-kio ledger recover                      # exact private pending-write journal だけを明示回復
+kio ledger recover                      # 台帳の保留書込みを明示検査・回復
 kio batch resume [--recheck-budget|--override-budget] [--online|--offline]
                                         # 中断タスクの再開。--recheck-budget は上限を変更した後に
                                         # 現在の hard cap を再判定して budget pause を再開する。
+                                        # 新規の予算停止時は該当上限・予約必要額・再開コマンドを stderr に表示。
                                         # --override-budget は current cap 自体を無視するため別用途。
                                         # --online は grant を作らず、各 Adapter の宛先に応じた既存 grant を
                                         # 置き換えない。--offline は外部ネットワーク dispatch を
@@ -256,8 +257,9 @@ HTTPS の trust 状態は既存の managed CA status に従う。producer の認
 `finalized_committed`、`published_after_checkpoint` のいずれかである。`no_pending` は current
 authority/checkpoint/database の strict validation を通した冪等成功である。
 
-通常の `ledger status`、search、その他の通常操作は pending write を自動回復しない。pending
-write がある間の通常 write は fail-closed であり、operator は `ledger recover` を明示実行する。
+有料処理は lifecycle lock 内で、整合性を証明できる pending write を自動回復する。
+読み取り専用の `ledger status` や検索は復旧による書込みを行わない。証拠が不足・不一致の場合は
+理由を表示し、`kio ledger recover` による明示検査・回復を案内する。
 回復は private journal の exact sequence と旧/新 security token、authority、checkpoint、database
 state の組だけを受理する。authority/schema の不一致、破損、未知の状態は blocked のままにする。
 回復は checkpoint の巻戻しまたは publication/finalization だけを行い、SQL replay、送信の再実行、

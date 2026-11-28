@@ -104,7 +104,7 @@ pub enum EmbeddingReservationOutcome {
     Reserved(EmbeddingJob),
     KnownResult(EmbeddingJob),
     InFlight(EmbeddingJob),
-    BudgetExceeded,
+    BudgetExceeded(super::ops::CapLayer),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -379,9 +379,9 @@ pub fn reserve_embedding_job(
             request_kind,
             timeout_seconds,
         )?;
-        if matches!(cap, super::ops::CapCheckResult::Denied(_)) {
+        if let super::ops::CapCheckResult::Denied(layer) = cap {
             if !bypass_cap_denial {
-                return Ok(EmbeddingReservationOutcome::BudgetExceeded);
+                return Ok(EmbeddingReservationOutcome::BudgetExceeded(layer));
             }
             super::ops_sql::phase1_intent(
                 tx.connection(),

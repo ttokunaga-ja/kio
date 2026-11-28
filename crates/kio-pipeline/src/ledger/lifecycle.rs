@@ -3,8 +3,8 @@
 //! Public operations hold an immutable locator, never a writable connection.
 //! Each durable domain operation validates the same connection it uses, under
 //! the device filesystem lease. Writes publish an exact private recovery
-//! journal before their checkpoint, then require explicit recovery after a
-//! process interruption.
+//! journal before their checkpoint. A later writer resolves an exact journal
+//! under the same lease before starting a new operation.
 
 use super::{
     backup::{LedgerBackup, RestoreReadiness},
@@ -214,16 +214,29 @@ impl LedgerDb {
         path: impl AsRef<Path>,
         control: ControlHandle,
     ) -> Result<Self> {
-        let path = path.as_ref();
+        Self::open_existing_inner(path.as_ref(), control, false)
+    }
+
+    /// Open for paid work, resolving an exact interrupted write under the lifecycle lock.
+    pub fn open_writer_with_control(
+        path: impl AsRef<Path>,
+        control: ControlHandle,
+    ) -> Result<Self> {
+        Self::open_existing_inner(path.as_ref(), control, true)
+    }
+
+    fn open_existing_inner(path: &Path, control: ControlHandle, writer: bool) -> Result<Self> {
         let fs = FsSession::acquire_with_control(path, false, control.clone())?;
-        let (authority, checkpoint) = read_authority(&fs)?;
-        let mut bound = fs.open_existing_sqlite(READ_WRITE)?;
-        let result = (|| {
-            validate_bound_connection(bound.connection(), &authority, &checkpoint)?;
-            bound.revalidate_open()
-        })();
-        let close = bound.finish();
-        result.and(close)?;
+        if writer {
+            Self::recover_write_locked(&fs, None)?;
+        }
+        let authority = validate_existing_locked(&fs).map_err(|error| {
+            if writer {
+                missing_write_evidence(error)
+            } else {
+                error
+            }
+        })?;
         Ok(Self {
             path: path.to_path_buf(),
             authority,
@@ -245,21 +258,37 @@ impl LedgerDb {
         let path = path.as_ref();
         let fs = FsSession::acquire_with_control(path, false, control.clone())?;
         fs.recover_atomic_storage()?;
+        let outcome = Self::recover_write_locked(&fs, None)?;
+        if outcome == PendingWriteRecovery::NoPending {
+            // An empty recovery request still has to validate existing authority.
+            validate_existing_locked(&fs).map_err(missing_write_evidence)?;
+        }
+        Ok(outcome)
+    }
+
+    /// Try exact journal recovery when an approved paid operation's read-only
+    /// preflight could not read the ledger. Unrelated snapshot errors still
+    /// block the caller when there was no journal to recover.
+    pub fn recover_writer_journal_with_control(
+        path: impl AsRef<Path>,
+        control: ControlHandle,
+    ) -> Result<bool> {
+        let fs = FsSession::acquire_with_control(path.as_ref(), false, control)?;
+        Ok(Self::recover_write_locked(&fs, None)? != PendingWriteRecovery::NoPending)
+    }
+
+    fn recover_write_locked(
+        fs: &FsSession,
+        expected_authority: Option<&Authority>,
+    ) -> Result<PendingWriteRecovery> {
         let Some(bytes) = fs.read_optional_private(&fs.names().write_pending, MAX_RECORD)? else {
-            // Preserve the normal strict validation even for an empty recovery
-            // request; it must never bless a malformed ledger as recoverable.
-            let (authority, checkpoint) = read_authority(&fs)?;
-            let mut bound = fs.open_existing_sqlite(READ_WRITE)?;
-            let result = (|| {
-                validate_bound_connection(bound.connection(), &authority, &checkpoint)?;
-                bound.revalidate_open()
-            })();
-            let close = bound.finish();
-            result.and(close)?;
             return Ok(PendingWriteRecovery::NoPending);
         };
         let pending: PendingWrite = decode(&bytes).map_err(|_| recovery_invalid())?;
-        let (authority, checkpoint, checkpoint_bytes) = read_authority_for_recovery(&fs)?;
+        let (authority, checkpoint, checkpoint_bytes) = read_authority_for_recovery(fs)?;
+        if expected_authority.is_some_and(|expected| *expected != authority) {
+            return Err(authority_changed());
+        }
         validate_pending(&pending, &authority)?;
         let before = checkpoint_from_state(&authority, &pending.before);
         let after = checkpoint_from_state(&authority, &pending.after);
@@ -278,6 +307,7 @@ impl LedgerDb {
             let db_after = actual == pending.after;
             let checkpoint_before = checkpoint == before;
             let checkpoint_after = checkpoint == after;
+            bound.revalidate_open()?;
             let outcome = match (db_before, checkpoint_before, db_after, checkpoint_after) {
                 (true, true, false, false) => PendingWriteRecovery::Aborted,
                 (true, false, false, true) => {
@@ -504,6 +534,7 @@ impl LedgerDb {
         prepared: impl FnOnce() -> Result<()>,
     ) -> Result<T> {
         let fs = FsSession::acquire_with_control(&self.path, false, self.control.clone())?;
+        Self::recover_write_locked(&fs, Some(&self.authority))?;
         let (authority, checkpoint) = self.expected_authority(&fs)?;
         let next = checkpoint
             .seq
@@ -537,7 +568,8 @@ impl LedgerDb {
             let conn = bound.connection();
             conn.busy_timeout(Duration::from_secs(5))?;
             conn.execute_batch("PRAGMA synchronous=FULL; BEGIN IMMEDIATE;")?;
-            validate_bound_connection(conn, &authority, &checkpoint)?;
+            validate_bound_connection(conn, &authority, &checkpoint)
+                .map_err(missing_write_evidence)?;
             let value = {
                 let mut tx = LedgerWriteTxn {
                     conn,
@@ -593,12 +625,39 @@ impl LedgerDb {
     fn expected_authority(&self, fs: &FsSession) -> Result<(Authority, Checkpoint)> {
         let (actual, checkpoint) = read_authority(fs)?;
         if actual != self.authority {
-            return Err(contract(
-                "KIO-E-LEDGER-AUTHORITY-CHANGED-001",
-                "ledger authority changed since this handle was opened",
-            ));
+            return Err(authority_changed());
         }
         Ok((actual, checkpoint))
+    }
+}
+
+fn validate_existing_locked(fs: &FsSession) -> Result<Authority> {
+    let (authority, checkpoint) = read_authority(fs)?;
+    let bound = fs.open_existing_sqlite(READ_WRITE)?;
+    let result = validate_bound_connection(bound.connection(), &authority, &checkpoint);
+    result.and(bound.finish())?;
+    Ok(authority)
+}
+
+fn authority_changed() -> PipelineError {
+    contract(
+        "KIO-E-LEDGER-AUTHORITY-CHANGED-001",
+        "ledger authority changed since this handle was opened",
+    )
+}
+
+fn missing_write_evidence(error: PipelineError) -> PipelineError {
+    match error {
+        PipelineError::Contract {
+            code:
+                code @ ("KIO-E-LEDGER-SEQUENCE-MISMATCH-001"
+                | "KIO-E-LEDGER-SECURITY-STATE-MISMATCH-001"),
+            ..
+        } => contract(
+            code,
+            "database and checkpoint differ without a pending-write journal; run `kio ledger recover` to check recovery evidence",
+        ),
+        other => other,
     }
 }
 
@@ -877,7 +936,7 @@ fn validate_pending(pending: &PendingWrite, authority: &Authority) -> Result<()>
 fn recovery_invalid() -> PipelineError {
     contract(
         "KIO-E-LEDGER-WRITE-RECOVERY-001",
-        "pending ledger write is missing, malformed, foreign, or does not name an exact recoverable state",
+        "pending-write evidence is missing, malformed, or inconsistent with ledger authority, checkpoint, or database state. Run `kio ledger recover` to check recovery evidence.",
     )
 }
 /// Validate a private snapshot against lifecycle artifacts through the parent

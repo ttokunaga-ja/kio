@@ -102,3 +102,4 @@ ST23	低／対象者限定	未対応config値とcommand確認無効化を拒否	
 F4-LOCAL-01	中	ローカル A08 の EG2 と OCR リースが同じ作業状態に依存	simplify	CPU EG2 をリース取得前に分離し、OS ごとの受領書で合流	tasks/v1-acceptance.md
 F4-LOCAL-02	中	GPU 全体の VRAM が回復しないと所有プロジェクト停止後もリースが残る	simplify	回収は所有プロジェクトの不在で判定し、VRAM 観測は独立して記録	scripts/v1-local-gpu/README.md
 F4-PROVIDER-01	中	ネイティブの再現ビルド失敗と無効な package run が有料レーンに波及	simplify	候補 package の発行を予約前に照合し、A12 は最終集約で要求	tasks/acceptance/provider-budget.md
+F4-PRODUCT-06	中	課金台帳の中断復旧と予算停止の案内	simplify	整合する書込みジャーナルを有料処理のロック内で復旧し、予算停止時は上限・予約必要額・再開コマンドを表示	docs/06-cli-spec.md#device-global-ledger-recovery

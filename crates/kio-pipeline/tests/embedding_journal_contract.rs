@@ -347,7 +347,7 @@ fn expect_job(outcome: EmbeddingReservationOutcome) -> EmbeddingJob {
         EmbeddingReservationOutcome::Reserved(job)
         | EmbeddingReservationOutcome::KnownResult(job)
         | EmbeddingReservationOutcome::InFlight(job) => job,
-        EmbeddingReservationOutcome::BudgetExceeded => panic!("unexpected budget denial"),
+        EmbeddingReservationOutcome::BudgetExceeded(_) => panic!("unexpected budget denial"),
     }
 }
 

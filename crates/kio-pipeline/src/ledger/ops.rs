@@ -151,7 +151,7 @@ pub enum ReserveOrReuseOutcome {
         intent_token: String,
         estimated_usd: f64,
     },
-    BudgetExceeded,
+    BudgetExceeded(CapLayer),
 }
 
 /// Preserve the check/read/reserve relationship under one ledger write
@@ -216,7 +216,7 @@ pub fn reserve_or_reuse(
                     estimated_usd: candidate_usd,
                 })
             }
-            CapCheckResult::Denied(_) => Ok(ReserveOrReuseOutcome::BudgetExceeded),
+            CapCheckResult::Denied(layer) => Ok(ReserveOrReuseOutcome::BudgetExceeded(layer)),
         }
     })
 }

@@ -1224,6 +1224,9 @@ member の descriptor による見積り**を対象とし、再利用 chunk (API
 9   confirm 拒否 (purge 等の確認プロンプトで no)
 ```
 
+予約時に上限に達した場合は、該当する月次上限（device / folder / per-adapter）、予約に必要な USD 額、
+現在の送信レーンを指定した再開コマンドを一つの stderr 診断にまとめる。
+
 ## 5.7 Resume と Repair
 
 - `kio batch resume`: 中断状態 (running stale, pending) を再開

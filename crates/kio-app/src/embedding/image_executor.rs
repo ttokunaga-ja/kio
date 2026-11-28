@@ -936,15 +936,16 @@ pub(crate) fn run_image_embedding_enrichment(
                 )?;
                 continue;
             }
+            let candidate_usd = 8192.0
+                * crate::embedding::admission::embedding_image_usd_per_token(
+                    adapter_settings,
+                    PreferredRequestKind::Sync,
+                );
             let job = match reserve_embedding_job(
                 ledger,
                 &EmbeddingReserveRequest {
                     key: &key,
-                    candidate_usd: 8192.0
-                        * crate::embedding::admission::embedding_image_usd_per_token(
-                            adapter_settings,
-                            PreferredRequestKind::Sync,
-                        ),
+                    candidate_usd,
                     caps: &caps,
                     request_kind: RequestKind::Sync,
                     timeout_seconds: Some(
@@ -978,7 +979,13 @@ pub(crate) fn run_image_embedding_enrichment(
                     set_image_task_status(task_store, &image_output_ref, false, None)?;
                     continue;
                 }
-                EmbeddingReservationOutcome::BudgetExceeded => {
+                EmbeddingReservationOutcome::BudgetExceeded(layer) => {
+                    crate::batch::command::report_budget_pause(
+                        ctx,
+                        layer,
+                        candidate_usd,
+                        EMBEDDING_ADAPTER_KIND,
+                    );
                     task_store
                         .update_matching(|task| {
                             if task.output_ref != image_output_ref {

@@ -47,6 +47,7 @@ use crate::invocation::Invocation;
 use crate::ledger_access::RETIRED_NON_LIVE;
 use crate::ledger_access::budget_cap_config;
 use crate::ledger_access::open_optional_ledger_db;
+use crate::ledger_access::open_optional_paid_ledger_db;
 use crate::ledger_access::release_task_charge_if_open;
 use crate::ledger_access::settle_task_charge_success;
 use crate::ledger_access::settle_task_charge_unknown;
@@ -234,12 +235,14 @@ fn run_embedding_enrichment_for_instances(
     )?;
     // Billing authority is consumed only by paid execution. A retained paid
     // Task is not converted to local work by selecting a free profile.
+    let execute_now = online || !execution.uses_endpoint();
     let ledger = if free_execution {
         None
+    } else if execute_now {
+        open_optional_paid_ledger_db(invocation.control)?
     } else {
         open_optional_ledger_db(invocation.control)?
     };
-    let execute_now = online || !execution.uses_endpoint();
     let db_path = sqlite_path(repo.kio_dir());
     if !db_path.exists() {
         return Ok(ExecOutcome::default());
@@ -1114,7 +1117,13 @@ fn run_embedding_enrichment_for_instances(
                     outcome.inflight += group.members.len();
                     continue;
                 }
-                EmbeddingReservationOutcome::BudgetExceeded => {
+                EmbeddingReservationOutcome::BudgetExceeded(layer) => {
+                    crate::batch::command::report_budget_pause(
+                        &invocation,
+                        layer,
+                        candidate_usd,
+                        EMBEDDING_ADAPTER_KIND,
+                    );
                     record_embedding_transitions(
                         &mut transitions,
                         group.members.iter().copied(),

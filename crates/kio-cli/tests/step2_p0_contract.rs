@@ -1678,12 +1678,28 @@ fn r11_2_batch_resume_budget_pause_exits_6() {
         "[budget]\nmonthly_usd_cap = 50\n[budget.per_adapter]\nmarkdownize = 0.0\n",
     )
     .unwrap();
-    let resumed = json_code_stdout_with_env(
-        &dir,
-        ["batch", "resume"],
-        6,
-        &[(TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "mock")],
+    let mut command = kio(&dir, ["batch", "resume", "--batch", "--json"]);
+    let assertion = command
+        .env(TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "mock")
+        .assert()
+        .code(6);
+    let output = assertion.get_output();
+    let resumed: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut pauses = stderr
+        .lines()
+        .filter(|line| line.starts_with("kio: Budget paused"));
+    let pause = pauses.next().expect("budget pause diagnostic");
+    assert!(
+        pause.contains("device monthly cap for adapter markdownize"),
+        "{pause}"
     );
+    assert!(pause.contains("reservation needs USD "), "{pause}");
+    assert!(
+        pause.contains("`kio batch resume --recheck-budget --online --batch`"),
+        "{pause}"
+    );
+    assert_eq!(pauses.next(), None, "{stderr}");
     assert!(
         resumed["tasks_paused"].as_u64().unwrap() > 0,
         "resume must disclose the budget pause it caused: {resumed}"

@@ -690,7 +690,13 @@ pub(crate) fn submit_embedding_batch_jobs(
         )
         .map_err(pipeline_to_kio)?;
         let reserved_job = match reservation {
-            EmbeddingReservationOutcome::BudgetExceeded => {
+            EmbeddingReservationOutcome::BudgetExceeded(layer) => {
+                crate::batch::command::report_budget_pause(
+                    ctx,
+                    layer,
+                    candidate_usd,
+                    EMBEDDING_ADAPTER_KIND,
+                );
                 record_embedding_transitions(
                     transitions,
                     job_groups
@@ -1426,7 +1432,13 @@ pub(crate) fn submit_image_embedding_job(
         EmbeddingReservationOutcome::KnownResult(_) | EmbeddingReservationOutcome::InFlight(_) => {
             return Ok(ImageBatchDispatch::Handled(ExecOutcome::default()));
         }
-        EmbeddingReservationOutcome::BudgetExceeded => {
+        EmbeddingReservationOutcome::BudgetExceeded(layer) => {
+            crate::batch::command::report_budget_pause(
+                ctx,
+                layer,
+                candidate_usd,
+                EMBEDDING_ADAPTER_KIND,
+            );
             tasks
                 .update_matching(|task| {
                     if task.embedding_target.as_ref() != Some(&plan.target) {

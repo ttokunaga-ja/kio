@@ -2,6 +2,7 @@ use crate::approvals;
 use crate::batch::command::PartialRetryBudget;
 use crate::batch::command::partial_retry_plan_from_instance;
 use crate::batch::command::reclaim_orphaned_running_tasks;
+use crate::batch::command::report_budget_pause;
 use crate::egress::SECRETS_TIER_B_HOLD;
 use crate::egress::embedding_online_allowed;
 use crate::egress::persistent_network_allowed;
@@ -742,7 +743,7 @@ fn execute_pending_markdownize_tasks(
             request_kind,
         )?;
         let (intent_token, reserved_usd) = match charge {
-            TaskChargeOutcome::BudgetExceeded => {
+            TaskChargeOutcome::BudgetExceeded(layer) => {
                 update_tasks_preserving_resource_holds(store, |candidate| {
                     if candidate.task_id == task_id {
                         candidate.status = TaskStatus::Paused;
@@ -754,6 +755,7 @@ fn execute_pending_markdownize_tasks(
                     }
                 })
                 .map_err(pipeline_to_kio)?;
+                report_budget_pause(ctx, layer, candidate_usd, markdownize_adapter_kind);
                 // R11-2: a Pending task budget-paused THIS pass → docs/04 §5.6 exit 6.
                 counts.paused += 1;
                 continue;

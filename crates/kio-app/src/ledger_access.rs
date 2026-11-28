@@ -25,6 +25,7 @@ use kio_pipeline::ledger::RequestKind;
 use kio_pipeline::ledger::TaskKey as LedgerTaskKey;
 use kio_pipeline::ledger::ops::BilledAmount;
 use kio_pipeline::ledger::ops::BudgetCapConfig;
+use kio_pipeline::ledger::ops::CapLayer;
 use kio_pipeline::ledger::ops::TerminalWrite;
 use kio_pipeline::ledger::ops::get_batch_request;
 use kio_pipeline::ledger::ops::recovery_settle_unknown;
@@ -312,20 +313,45 @@ pub(crate) fn ledger_snapshot_to_kio(path: &str, error: LedgerSnapshotError) -> 
     }
 }
 
-/// Open the device-global `cost-ledger.sqlite`. Every ledger-touching command (`kio status`,
-/// `kio batch *`, `kio index`, `kio search --vector`/`--hybrid` page 1, `kio
-/// purge`) opens the ledger through this one function, so every command uses
-/// the current SQLite store. `LedgerDb::open` fails closed
-/// if retired JSONL ledger files are present, leaving their bytes untouched.
+/// Open the device ledger for paid work or explicit paid recovery.
 pub(crate) fn open_ledger_db(control: &ControlHandle) -> Result<LedgerDb> {
-    LedgerDb::open_existing_with_control(ledger_db_path(control), control.clone())
+    LedgerDb::open_writer_with_control(ledger_db_path(control), control.clone())
         .map_err(pipeline_to_kio)
+}
+
+/// A paid operation can retry unsafe snapshot preflight only by proving and
+/// recovering a pending write under the lifecycle lock.
+pub(crate) fn recover_after_unsafe_budget_snapshot(
+    error: KioError,
+    control: &ControlHandle,
+) -> Result<()> {
+    if error.error_code() == "KIO-E-LEDGER-SNAPSHOT-UNSAFE-001"
+        && LedgerDb::recover_writer_journal_with_control(ledger_db_path(control), control.clone())
+            .map_err(pipeline_to_kio)?
+    {
+        return Ok(());
+    }
+    Err(error)
+}
+
+pub(crate) fn open_optional_paid_ledger_db(control: &ControlHandle) -> Result<Option<LedgerDb>> {
+    optional_ledger(LedgerDb::open_writer_with_control(
+        ledger_db_path(control),
+        control.clone(),
+    ))
 }
 
 /// Absence is optional only for callers that do not authorize paid work.
 /// Partial, replaced or corrupt state always keeps its original error.
 pub(crate) fn open_optional_ledger_db(control: &ControlHandle) -> Result<Option<LedgerDb>> {
-    match LedgerDb::open_existing_with_control(ledger_db_path(control), control.clone()) {
+    optional_ledger(LedgerDb::open_existing_with_control(
+        ledger_db_path(control),
+        control.clone(),
+    ))
+}
+
+fn optional_ledger(opened: kio_pipeline::Result<LedgerDb>) -> Result<Option<LedgerDb>> {
+    match opened {
         Ok(ledger) => Ok(Some(ledger)),
         Err(kio_pipeline::PipelineError::Contract {
             code: "KIO-E-LEDGER-UNINITIALIZED-001",
@@ -519,7 +545,7 @@ pub(crate) enum TaskChargeOutcome {
         estimated_usd: f64,
     },
     /// The device/folder/per_adapter cap would be exceeded (CL56-58).
-    BudgetExceeded,
+    BudgetExceeded(CapLayer),
 }
 
 /// CL41-44/CL56-61: reserve (phase 1, check-then-reserve, atomic with the cap
@@ -598,7 +624,7 @@ pub(crate) fn reserve_or_reuse_task_charge(
             intent_token,
             estimated_usd,
         },
-        ReserveOrReuseOutcome::BudgetExceeded => TaskChargeOutcome::BudgetExceeded,
+        ReserveOrReuseOutcome::BudgetExceeded(layer) => TaskChargeOutcome::BudgetExceeded(layer),
     })
 }
 
