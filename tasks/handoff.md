@@ -56,9 +56,9 @@ LiteRT ZIP を設定したシェルから [ローカル検証スクリプト](..
 
 ## 4. Codex への委譲（AGENTS.md「エージェント運用」に従う）
 
-- 実装：`codex exec -m gpt-6.2-sol -c model_reasoning_effort=medium -s workspace-write -C <worktree> --add-dir ~/.cargo -o <報告> "$(cat <指示書>)" < /dev/null`。作業量が「小」の単位は `gpt-6.1-terra` から始める。
+- 実装：`codex exec -m gpt-6.2-sol -c model_reasoning_effort=low -s workspace-write -C <worktree> --add-dir ~/.cargo -o <報告> "$(cat <指示書>)" < /dev/null`。作業量が「小」の単位は `gpt-6.1-terra` から始める。
 - レビュー：同じ形で `-s read-only` にする。
-- 続きの依頼：`codex exec resume <session id> -m gpt-6.2-sol -c model_reasoning_effort=medium -c sandbox_mode=workspace-write -c "sandbox_workspace_write.writable_roots=[\"$HOME/.cargo\"]" -o <報告> "<依頼>" < /dev/null` を worktree の中で実行する。`resume` は `-s`・`-C` を受け付けない。session id は最初の実行のログの `session id:` の行にある。
+- 続きの依頼：`codex exec resume <session id> -m gpt-6.2-sol -c model_reasoning_effort=low -c sandbox_mode=workspace-write -c "sandbox_workspace_write.writable_roots=[\"$HOME/.cargo\"]" -o <報告> "<依頼>" < /dev/null` を worktree の中で実行する。`resume` は `-s`・`-C` を受け付けない。session id は最初の実行のログの `session id:` の行にある。
 - worktree：`scratch/wt/<単位>` に `wt/<単位>` の branch で作る。統括が差分を確かめ、`git add -A` で commit し（範囲を絞ると `Cargo.lock` が漏れる）、main に `--no-ff` で merge してから、worktree と branch を消す。
 - 個別の指示書は [委譲用の雛形](agent/brief-template.md) に作業範囲と受入条件を記入して渡す。
 - Codex のサンドボックスでは `.git` に書けない。削除・stage・commit は統括が行う。Codex には具体的な対象の一覧（数十件まで）を渡す。

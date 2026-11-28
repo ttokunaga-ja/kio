@@ -328,3 +328,9 @@
 - **理由**：ワークフロー変更後も既存の `v1-f4-2026-11b` を使えるようにする。D-20261126-01 のハッシュ束縛に関する判断を更新する。
 - **保護**：main 限定の dispatch、専用 GitHub App による台帳更新、レーン単位の予約、全履歴を通算したプロバイダーごとの USD 10 上限、払い戻しなしを維持する。
 - **関係する資料**：`tasks/acceptance/provider-budget.md`。
+
+### D-20261128-01 Codex の reasoning effort の既定を low に変更
+
+- **内容**：利用者の指示により、Codex に委譲するときの reasoning effort の既定を medium から low に変える。難しい調査・設計・レビューでは、統括がその作業に限って上げる。
+- **理由**：Codex の利用量を抑える。kio 以外の repo と `~/.codex` の既定も同じく low にする。
+- **関係する資料**：`AGENTS.md`（エージェント運用）、`tasks/handoff.md` §4。
