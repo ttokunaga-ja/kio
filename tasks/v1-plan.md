@@ -46,6 +46,8 @@ push すると通常の CI が動き、全体で約 85 分かかる（Windows �
 
 ## 6. v1 後
 
+F4 後の残件を含む作業の一覧・チェックポイント・人日の概算は [F4 後の作業計画](post-f4-plan.md) で管理する。
+
 - 文書単位の検索結果（D-20261113-01、[post-v1/search-result-presentation.md](post-v1/search-result-presentation.md)）。
 - 版ごとの状態の表示、tag による引用の保持、復元の操作の表示（D-20261003-01、[post-v1/knowledge-ux.md](post-v1/knowledge-ux.md)）。
 - 制約の緩和の中・低の 41 件（D-20261113-09。[post-v1/constraint-backlog.tsv](post-v1/constraint-backlog.tsv) の「今回の整理」が「残件候補」で、優先度が「中」「低」の行）。
